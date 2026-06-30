@@ -2332,6 +2332,7 @@ mod tests {
                 cte_id,
                 alias: "cte".to_string(),
                 output_columns: consume_output_columns.clone(),
+                producer_column_ids: vec![ColumnId::new_for_test(1101)],
             }),
             vec![],
             consume_output_columns.clone(),

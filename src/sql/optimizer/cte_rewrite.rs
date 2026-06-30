@@ -367,10 +367,12 @@ mod tests {
     }
 
     fn consume_plan(cte_id: CteId, alias: &str) -> OptExpr {
+        let output_columns = output_columns();
         OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
             cte_id: cte_id,
             alias: alias.to_string(),
-            output_columns: output_columns(),
+            producer_column_ids: output_columns.iter().map(|c| c.column_id).collect(),
+            output_columns,
         }))
     }
 
@@ -379,9 +381,11 @@ mod tests {
         alias: &str,
         output_columns: Vec<OutputColumn>,
     ) -> OptExpr {
+        let producer_column_ids = output_columns.iter().map(|c| c.column_id).collect();
         OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
             cte_id: cte_id,
             alias: alias.to_string(),
+            producer_column_ids,
             output_columns: output_columns,
         }))
     }

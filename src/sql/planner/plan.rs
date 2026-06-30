@@ -403,6 +403,7 @@ pub(crate) struct LogicalCTEConsumeNode {
     pub cte_id: crate::sql::analysis::cte::CteId,
     pub alias: String,
     pub output_columns: Vec<crate::sql::analysis::OutputColumn>,
+    pub producer_column_ids: Vec<crate::sql::column_id::ColumnId>,
 }
 
 pub(crate) type LogicalWindowNode = PlanWindowNode;

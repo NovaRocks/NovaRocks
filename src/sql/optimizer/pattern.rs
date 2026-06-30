@@ -242,6 +242,7 @@ mod tests {
                     cte_id: 1,
                     alias: "c".to_string(),
                     output_columns: vec![],
+                    producer_column_ids: vec![],
                 }),
                 OpKind::CTEConsume,
             ),

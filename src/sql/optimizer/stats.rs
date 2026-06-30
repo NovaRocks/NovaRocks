@@ -4877,6 +4877,7 @@ mod tests {
                     nullable: false,
                     is_internal: false,
                 }],
+                producer_column_ids: vec![ColumnId::UNSET],
             }),
             vec![],
             None,
@@ -4947,6 +4948,7 @@ mod tests {
                 cte_id,
                 alias: "t_s_firstyear".to_string(),
                 output_columns: vec![stats_output_column(7, "customer_id")],
+                producer_column_ids: vec![ColumnId::new_for_test(1)],
             }),
             children: vec![],
         };
@@ -5037,6 +5039,7 @@ mod tests {
                     cte_id,
                     alias: alias.to_string(),
                     output_columns: vec![stats_output_column(col_id, "customer_id")],
+                    producer_column_ids: vec![ColumnId::new_for_test(100)],
                 }),
                 children: vec![],
             };
@@ -5123,6 +5126,7 @@ mod tests {
                     nullable: false,
                     is_internal: false,
                 }],
+                producer_column_ids: vec![test_col_id("id")],
             }),
             vec![],
             None,

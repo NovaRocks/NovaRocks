@@ -1805,6 +1805,11 @@ mod tests {
                 make_output_column(ColumnId::new_for_test(102), "k1"),
                 make_output_column(ColumnId::new_for_test(103), "k2"),
             ],
+            producer_column_ids: vec![
+                ColumnId::new_for_test(10),
+                ColumnId::new_for_test(20),
+                ColumnId::new_for_test(30),
+            ],
         }));
 
         let anchor = OptExpr::new(
@@ -1858,6 +1863,11 @@ mod tests {
                 make_output_column(ColumnId::new_for_test(102), "k1"),
                 make_output_column(ColumnId::new_for_test(103), "k2"),
             ],
+            producer_column_ids: vec![
+                ColumnId::new_for_test(10),
+                ColumnId::new_for_test(20),
+                ColumnId::new_for_test(30),
+            ],
         }));
         let consume2 = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
             cte_id,
@@ -1866,6 +1876,11 @@ mod tests {
                 make_output_column(ColumnId::new_for_test(201), "m0"),
                 make_output_column(ColumnId::new_for_test(202), "m1"),
                 make_output_column(ColumnId::new_for_test(203), "m2"),
+            ],
+            producer_column_ids: vec![
+                ColumnId::new_for_test(10),
+                ColumnId::new_for_test(20),
+                ColumnId::new_for_test(30),
             ],
         }));
 
@@ -2509,6 +2524,11 @@ mod tests {
                 make_output_column(ColumnId::new_for_test(20), "y"),
                 make_output_column(ColumnId::new_for_test(30), "z"),
             ],
+            producer_column_ids: vec![
+                ColumnId::new_for_test(10),
+                ColumnId::new_for_test(20),
+                ColumnId::new_for_test(30),
+            ],
         }));
 
         let tagged = tag_cte_consume(consume, None);
@@ -2558,6 +2578,7 @@ mod tests {
                 make_output_column(ColumnId::new_for_test(101), "p"),
                 make_output_column(ColumnId::new_for_test(102), "q"),
             ],
+            producer_column_ids: vec![ColumnId::new_for_test(10), ColumnId::new_for_test(20)],
         }));
 
         let anchor = OptExpr::new(

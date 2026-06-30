@@ -153,6 +153,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             cte_id: op.cte_id,
             alias: op.alias.clone(),
             output_columns: op.output_columns.clone(),
+            producer_column_ids: op.producer_column_ids.clone(),
         }),
 
         Operator::LogicalCTEAnchor(op) => {

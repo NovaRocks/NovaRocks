@@ -2,6 +2,7 @@ use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
 use crate::sql::analysis::*;
+use crate::sql::column_id::ColumnId;
 
 use super::helpers::eval_const_i64;
 use super::iceberg_metadata::{metadata_table_schema_for_source, split_metadata_suffix};
@@ -441,6 +442,8 @@ impl<'a> super::AnalyzerContext<'a> {
                         // WITH definition; if multiple consumes shared them,
                         // downstream operators could not tell aliases apart
                         // (e.g. `cte a, cte b WHERE a.x=1 AND b.x=2`).
+                        let producer_column_ids: Vec<ColumnId> =
+                            producer_columns.iter().map(|col| col.column_id).collect();
                         let output_columns: Vec<OutputColumn> = producer_columns
                             .into_iter()
                             .map(|col| {
@@ -474,6 +477,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                 cte_id: entry_id,
                                 alias: alias_name,
                                 output_columns,
+                                producer_column_ids,
                             },
                             scope,
                         ));

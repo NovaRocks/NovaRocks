@@ -5082,6 +5082,40 @@ mod tests {
     }
 
     #[test]
+    fn cte_consume_records_producer_column_ids_parallel_to_consumer_outputs() {
+        let sql = "WITH c AS (SELECT o_orderkey AS k, o_custkey AS c FROM orders) \
+                   SELECT a.k, a.c FROM c a";
+        let (resolved, registry) =
+            parse_and_analyze_with_registry(sql).expect("analysis should succeed");
+        let entry = registry
+            .entries
+            .iter()
+            .find(|entry| entry.name == "c")
+            .expect("cte entry");
+        let producer_ids: Vec<_> = entry.output_columns.iter().map(|c| c.column_id).collect();
+
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        let Relation::CTEConsume {
+            output_columns,
+            producer_column_ids,
+            ..
+        } = select.from.as_ref().expect("from relation")
+        else {
+            panic!("expected direct CTEConsume");
+        };
+
+        let consumer_ids: Vec<_> = output_columns.iter().map(|c| c.column_id).collect();
+        assert_eq!(producer_column_ids, &producer_ids);
+        assert_eq!(producer_column_ids.len(), output_columns.len());
+        assert_ne!(
+            consumer_ids, producer_ids,
+            "consumer aliases must use fresh ColumnIds"
+        );
+    }
+
+    #[test]
     fn test_forward_cte_reference_is_rejected() {
         let sql = "WITH a AS (SELECT 1 AS x) \
                    SELECT * FROM (\

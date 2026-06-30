@@ -255,6 +255,7 @@ fn logical_plan_to_opt_expr_unchecked(
                 cte_id: node.cte_id,
                 alias: node.alias.clone(),
                 output_columns: node.output_columns.clone(),
+                producer_column_ids: node.producer_column_ids.clone(),
             });
             OptExpr::leaf(op)
         }
@@ -526,6 +527,7 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
             cte_id: op.cte_id,
             alias: op.alias,
             output_columns: op.output_columns,
+            producer_column_ids: op.producer_column_ids,
         }),
         Operator::LogicalDecode(op) => PlanNodeKind::Decode(LogicalDecodeNode {
             mappings: op.mappings,
@@ -951,6 +953,7 @@ mod tests {
                 cte_id: 7,
                 alias: "t".to_string(),
                 output_columns: dummy_output_columns(),
+                producer_column_ids: dummy_output_columns().iter().map(|c| c.column_id).collect(),
             }),
             vec![],
             None,

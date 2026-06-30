@@ -307,6 +307,46 @@ pub(crate) struct CTEConsumeOp {
     pub cte_id: CteId,
     pub alias: String,
     pub output_columns: Vec<OutputColumn>,
+    pub producer_column_ids: Vec<ColumnId>,
+}
+
+#[allow(dead_code)]
+impl CTEConsumeOp {
+    pub(crate) fn validate_mapping(&self) -> Result<(), String> {
+        if self.output_columns.len() != self.producer_column_ids.len() {
+            return Err(format!(
+                "CTEConsume output/producers arity mismatch for cte_id={}",
+                self.cte_id
+            ));
+        }
+        let mut seen = HashSet::new();
+        for column in &self.output_columns {
+            if !seen.insert(column.column_id) {
+                return Err(format!(
+                    "CTEConsume duplicate output column {} for cte_id={}",
+                    column.column_id.0, self.cte_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn producer_column_for_consumer(
+        &self,
+        consumer_column_id: ColumnId,
+    ) -> Option<ColumnId> {
+        self.output_columns
+            .iter()
+            .position(|column| column.column_id == consumer_column_id)
+            .and_then(|idx| self.producer_column_ids.get(idx).copied())
+    }
+
+    pub(crate) fn first_mapping_pair(&self) -> Option<(ColumnId, ColumnId)> {
+        self.output_columns
+            .first()
+            .zip(self.producer_column_ids.first())
+            .map(|(consumer, producer)| (consumer.column_id, *producer))
+    }
 }
 
 #[derive(Clone, Debug)]

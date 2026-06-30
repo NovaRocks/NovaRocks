@@ -2552,6 +2552,7 @@ mod tests {
                 cte_id: cte_id,
                 alias: "c".to_string(),
                 output_columns: vec![s_output_column()],
+                producer_column_ids: vec![s_output_column().column_id],
             }),
             vec![],
             None,

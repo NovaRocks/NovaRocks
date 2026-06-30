@@ -142,6 +142,7 @@ pub(crate) enum Relation {
         cte_id: cte::CteId,
         alias: String,
         output_columns: Vec<OutputColumn>,
+        producer_column_ids: Vec<ColumnId>,
     },
 }
 

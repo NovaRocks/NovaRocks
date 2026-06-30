@@ -98,6 +98,7 @@ mod tests {
                 make_output_column(id_b, "b"),
                 make_output_column(id_c, "c"),
             ],
+            producer_column_ids: vec![id_a, id_b, id_c],
         }));
         expr.required_output_columns = Some(needed);
 
@@ -118,6 +119,7 @@ mod tests {
             cte_id: 2u32,
             alias: "cte2".to_string(),
             output_columns: vec![make_output_column(id_a, "a")],
+            producer_column_ids: vec![id_a],
         }));
         // required_output_columns = None (default)
 
@@ -139,6 +141,7 @@ mod tests {
             cte_id: 3u32,
             alias: "cte3".to_string(),
             output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
+            producer_column_ids: vec![id_a, id_b],
         }));
         expr.required_output_columns = Some(HashSet::new());
 
