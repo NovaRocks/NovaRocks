@@ -633,8 +633,10 @@ pub(super) fn window_spec_from_aggregate(
     name: String,
     args: Vec<ScalarId>,
     _result_type: DataType,
+    output_column_id: ColumnId,
 ) -> ScalarWindowSpec {
     ScalarWindowSpec {
+        output_column_id,
         name,
         args,
         distinct: false,

@@ -2828,6 +2828,7 @@ mod tests {
         let mut node = PhysicalPlanNode {
             op: Operator::PhysicalWindow(WindowOp {
                 window_exprs: vec![ScalarWindowSpec {
+                    output_column_id: ColumnId::new_for_test(201),
                     name: "sum".to_string(),
                     args: vec![a_mul_b],
                     distinct: false,

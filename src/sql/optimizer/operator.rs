@@ -92,6 +92,7 @@ pub(crate) struct ScalarAggregateSpec {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScalarWindowSpec {
+    pub output_column_id: ColumnId,
     pub name: String,
     pub args: Vec<ScalarId>,
     pub distinct: bool,

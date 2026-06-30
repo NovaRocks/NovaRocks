@@ -85,8 +85,9 @@ mod tests {
         }
     }
 
-    fn make_window_spec(output_name: &str) -> ScalarWindowSpec {
+    fn make_window_spec(output_column_id: ColumnId) -> ScalarWindowSpec {
         ScalarWindowSpec {
+            output_column_id,
             name: "row_number".to_string(),
             args: vec![],
             distinct: false,
@@ -148,7 +149,7 @@ mod tests {
 
         let mut expr = OptExpr::new(
             Operator::LogicalWindow(WindowOp {
-                window_exprs: vec![make_window_spec("rn1"), make_window_spec("rn2")],
+                window_exprs: vec![make_window_spec(id_rn1), make_window_spec(id_rn2)],
                 output_columns: vec![
                     make_output_column(id_a, "a"),
                     make_output_column(id_rn1, "rn1"),
@@ -175,7 +176,7 @@ mod tests {
 
         let expr = OptExpr::new(
             Operator::LogicalWindow(WindowOp {
-                window_exprs: vec![make_window_spec("rn")],
+                window_exprs: vec![make_window_spec(id_rn)],
                 output_columns: vec![
                     make_output_column(id_a, "a"),
                     make_output_column(id_rn, "rn"),
@@ -202,7 +203,7 @@ mod tests {
 
         let mut expr = OptExpr::new(
             Operator::LogicalWindow(WindowOp {
-                window_exprs: vec![make_window_spec("rn")],
+                window_exprs: vec![make_window_spec(id_rn)],
                 output_columns: vec![
                     make_output_column(id_a, "a"),
                     make_output_column(id_rn, "rn"),

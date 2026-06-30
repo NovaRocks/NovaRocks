@@ -530,12 +530,14 @@ mod tests {
     fn make_window_spec_opt(
         arena: &mut ScalarArena,
         fn_name: &str,
+        output_column_id: ColumnId,
         p_id: ColumnId,
     ) -> ScalarWindowSpec {
         let partition_expr =
             crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
         let sort_key = make_sort_key(arena, p_id);
         ScalarWindowSpec {
+            output_column_id,
             name: fn_name.to_string(),
             args: vec![],
             distinct: false,
@@ -549,6 +551,7 @@ mod tests {
     fn make_window_spec_opt_with_order(
         arena: &mut ScalarArena,
         fn_name: &str,
+        output_column_id: ColumnId,
         p_id: ColumnId,
         order_id: ColumnId,
     ) -> ScalarWindowSpec {
@@ -556,6 +559,7 @@ mod tests {
             crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
         let order_key = make_sort_key(arena, order_id);
         ScalarWindowSpec {
+            output_column_id,
             name: fn_name.to_string(),
             args: vec![],
             distinct: false,
@@ -624,7 +628,7 @@ mod tests {
         k: i64,
     ) -> OptExpr {
         let sort = make_sort_opt(arena, p_id);
-        let w_spec = make_window_spec_opt(arena, fn_name, p_id);
+        let w_spec = make_window_spec_opt(arena, fn_name, rk_id, p_id);
         let window = window_opt(sort, vec![w_spec], vec![output_col(rk_id, fn_name)]);
         filter_opt(
             arena,
@@ -752,7 +756,7 @@ mod tests {
         let p_id = ColumnId::new_for_test(2);
         let mut arena = ScalarArena::new();
         let sort = make_sort_opt(&mut arena, p_id);
-        let w_spec = make_window_spec_opt(&mut arena, "rank", p_id);
+        let w_spec = make_window_spec_opt(&mut arena, "rank", rk_id, p_id);
         let window = window_opt(
             sort,
             vec![w_spec],
@@ -782,7 +786,8 @@ mod tests {
 
         let mut arena = ScalarArena::new();
         let sort = make_sort_opt(&mut arena, region_id);
-        let window_spec = make_window_spec_opt_with_order(&mut arena, "rank", region_id, amount_id);
+        let window_spec =
+            make_window_spec_opt_with_order(&mut arena, "rank", rank_id, region_id, amount_id);
         let window = window_opt(
             sort,
             vec![window_spec],
@@ -859,8 +864,8 @@ mod tests {
         let window = window_opt(
             sort,
             vec![
-                make_window_spec_opt(&mut arena, "rank", p_id),
-                make_window_spec_opt(&mut arena, "avg", p_id),
+                make_window_spec_opt(&mut arena, "rank", rk_id, p_id),
+                make_window_spec_opt(&mut arena, "avg", avg_id, p_id),
             ],
             vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
         );
@@ -890,7 +895,7 @@ mod tests {
         let sort = make_sort_no_partition_opt(&mut arena, p_id);
         let window = window_opt(
             sort,
-            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", rk_id, p_id)],
             vec![output_col(rk_id, "rank")],
         );
         let plan = filter_opt(
@@ -919,7 +924,7 @@ mod tests {
         let sort = make_sort_opt(&mut arena, p_id);
         let window = window_opt(
             sort,
-            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", rk_id, p_id)],
             vec![output_col(rk_id, "rank")],
         );
         let plan = filter_opt(
@@ -948,7 +953,7 @@ mod tests {
         let sort = make_sort_opt_with_limit(&mut arena, p_id, 2);
         let window = window_opt(
             sort,
-            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", rk_id, p_id)],
             vec![output_col(rk_id, "rank")],
         );
         let plan = filter_opt(
@@ -980,7 +985,7 @@ mod tests {
         let sort = make_sort_opt(&mut arena, p_id);
         let window = window_opt(
             sort,
-            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", rk_id, p_id)],
             vec![output_col(rk_id, "rank")],
         );
         // Project: proj_rk_id <- rk_id (bare passthrough)
@@ -1020,8 +1025,8 @@ mod tests {
         let window = window_opt(
             sort,
             vec![
-                make_window_spec_opt(&mut arena, "rank", p_id),
-                make_window_spec_opt(&mut arena, "avg", p_id),
+                make_window_spec_opt(&mut arena, "rank", rk_id, p_id),
+                make_window_spec_opt(&mut arena, "avg", avg_id, p_id),
             ],
             vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
         );
@@ -1062,7 +1067,7 @@ mod tests {
         let sort = make_sort_opt(&mut arena, p_id);
         let window = window_opt(
             sort,
-            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", rk_id, p_id)],
             vec![output_col(rk_id, "rank")],
         );
         // Project: proj_rk_id <- rk_id + 1 (NOT a bare passthrough)
@@ -1112,8 +1117,8 @@ mod tests {
             vec![empty_values_opt()],
         );
 
-        let w_a = make_window_spec_opt_with_order(&mut arena, "rank", p_id, a_id);
-        let w_b = make_window_spec_opt_with_order(&mut arena, "rank", p_id, b_id);
+        let w_a = make_window_spec_opt_with_order(&mut arena, "rank", rka_id, p_id, a_id);
+        let w_b = make_window_spec_opt_with_order(&mut arena, "rank", rkb_id, p_id, b_id);
 
         let window = window_opt(
             sort,
@@ -1173,8 +1178,8 @@ mod tests {
             vec![empty_values_opt()],
         );
 
-        let w_rank = make_window_spec_opt_with_order(&mut arena, "rank", p_id, o_id);
-        let w_dense = make_window_spec_opt_with_order(&mut arena, "dense_rank", p_id, o_id);
+        let w_rank = make_window_spec_opt_with_order(&mut arena, "rank", rk_id, p_id, o_id);
+        let w_dense = make_window_spec_opt_with_order(&mut arena, "dense_rank", drk_id, p_id, o_id);
 
         let window = window_opt(
             sort,

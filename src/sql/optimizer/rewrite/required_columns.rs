@@ -1921,6 +1921,7 @@ mod tests {
         let window = OptExpr::new(
             Operator::LogicalWindow(WindowOp {
                 window_exprs: vec![ScalarWindowSpec {
+                    output_column_id: ColumnId::new_for_test(301),
                     name: "row_number".to_string(),
                     args: vec![],
                     distinct: false,
@@ -1971,6 +1972,7 @@ mod tests {
         let window = OptExpr::new(
             Operator::LogicalWindow(WindowOp {
                 window_exprs: vec![ScalarWindowSpec {
+                    output_column_id: ColumnId::new_for_test(301),
                     name: "row_number".to_string(),
                     args: vec![],
                     distinct: false,

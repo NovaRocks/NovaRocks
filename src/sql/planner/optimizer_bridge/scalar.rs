@@ -157,7 +157,13 @@ pub(crate) fn materialize_aggregate_calls(
 }
 
 pub(crate) fn intern_window_expr(arena: &mut ScalarArena, expr: &WindowExpr) -> ScalarWindowSpec {
+    assert!(
+        expr.output_column_id != ColumnId::UNSET,
+        "WindowExpr {} must carry output_column_id before optimizer bridge",
+        expr.output_name
+    );
     ScalarWindowSpec {
+        output_column_id: expr.output_column_id,
         name: expr.name.clone(),
         args: intern_exprs(arena, &expr.args),
         distinct: expr.distinct,
@@ -236,6 +242,45 @@ pub(crate) fn intern_column_sort_key(
         asc: key.asc,
         nulls_first: key.nulls_first,
         display: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+
+    fn window_expr(output_column_id: ColumnId, output_name: &str) -> WindowExpr {
+        WindowExpr {
+            name: "row_number".to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            result_type: DataType::Int64,
+            output_name: output_name.to_string(),
+            output_column_id,
+            ignore_nulls: false,
+        }
+    }
+
+    #[test]
+    fn intern_window_expr_preserves_output_column_id() {
+        let output_id = ColumnId::new_for_test(701);
+        let mut arena = ScalarArena::new();
+
+        let spec = intern_window_expr(&mut arena, &window_expr(output_id, "rn"));
+
+        assert_eq!(spec.output_column_id, output_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "WindowExpr rn must carry output_column_id before optimizer bridge")]
+    fn intern_window_expr_rejects_unset_output_id() {
+        let mut arena = ScalarArena::new();
+
+        let _ = intern_window_expr(&mut arena, &window_expr(ColumnId::UNSET, "rn"));
     }
 }
 

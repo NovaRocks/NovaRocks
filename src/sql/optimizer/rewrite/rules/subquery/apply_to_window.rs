@@ -165,6 +165,7 @@ fn apply_plan_inner(
         true,
     );
     let win_expr = crate::sql::optimizer::operator::ScalarWindowSpec {
+        output_column_id: win_id,
         name: m.inner_agg.name.clone(),
         args: agg_args,
         distinct: false,
