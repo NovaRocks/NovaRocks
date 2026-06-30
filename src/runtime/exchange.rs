@@ -1353,6 +1353,7 @@ mod tests {
         push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
     use crate::common::ids::SlotId;
+    use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::thrift::types;
 
@@ -1545,7 +1546,7 @@ mod tests {
         let payload = encode_chunks(&[chunk], true).expect("encode");
         let expected_schema = Arc::new(
             ChunkSchema::try_new(vec![
-                ChunkSlotSchema::try_from_type_desc(
+                chunk_slot_schema_from_type_desc(
                     SlotId::new(55),
                     "price",
                     true,
@@ -1575,7 +1576,7 @@ mod tests {
         };
         let expected_schema = Arc::new(
             ChunkSchema::try_new(vec![
-                ChunkSlotSchema::try_from_type_desc(
+                chunk_slot_schema_from_type_desc(
                     SlotId::new(55),
                     "price",
                     true,
@@ -1661,7 +1662,7 @@ mod tests {
             .expect("encode");
         let expected_schema = Arc::new(
             ChunkSchema::try_new(vec![
-                ChunkSlotSchema::try_from_type_desc(
+                chunk_slot_schema_from_type_desc(
                     SlotId::new(55),
                     "price",
                     true,

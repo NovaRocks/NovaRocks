@@ -25,7 +25,8 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
@@ -617,7 +618,7 @@ fn build_root_expected_chunk_schema(
             slot_id
         };
         slots.push(
-            ChunkSlotSchema::try_from_type_desc(output_slot_id, name, nullable, type_desc, None)
+            chunk_slot_schema_from_type_desc(output_slot_id, name, nullable, type_desc, None)
                 .map_err(|e| {
                     format!("build root typed result slot schema at index {idx} failed: {e}")
                 })?,

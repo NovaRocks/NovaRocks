@@ -20,6 +20,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::common::ids::SlotId;
+use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::thrift::descriptors;
@@ -89,8 +90,13 @@ fn chunk_slot_schema_lookup(
         let nullable = s.is_nullable.unwrap_or(true);
         let unique_id = s.col_unique_id.filter(|v| *v > 0);
         let key = (parent, id);
-        let schema =
-            ChunkSlotSchema::new(slot_id, name, nullable, Some(slot_type.clone()), unique_id);
+        let schema = chunk_slot_schema_from_type_desc(
+            slot_id,
+            name,
+            nullable,
+            slot_type.clone(),
+            unique_id,
+        )?;
         if by_tuple_slot.insert(key, schema).is_some() {
             return Err(format!(
                 "duplicate slot descriptor for tuple_id={} slot_id={}",
@@ -170,13 +176,13 @@ pub(crate) fn chunk_schema_for_tuple(
         let name = slot_display_name_from_desc(s);
         let nullable = s.is_nullable.unwrap_or(true);
         let unique_id = s.col_unique_id.filter(|v| *v > 0);
-        slots.push(ChunkSlotSchema::new(
+        slots.push(chunk_slot_schema_from_type_desc(
             slot_id,
             name,
             nullable,
-            Some(slot_type.clone()),
+            slot_type.clone(),
             unique_id,
-        ));
+        )?);
     }
 
     if slots.is_empty() {

@@ -94,7 +94,7 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/connector/iceberg/scan_planner.rs": BaselineEntry("domain-leak", "B5", 0, "Iceberg scan planner exposes domain handles and splits only"),
     "src/runtime/lookup.rs": BaselineEntry("domain-leak", "B5", 0, "Runtime lookup consumes DescriptorSnapshot instead of thrift descriptors"),
     "src/exec/chunk/schema.rs": BaselineEntry("domain-leak", "B7", 0, "Execution chunk schema is thrift-free"),
-    "src/exec/chunk/schema_thrift.rs": BaselineEntry("legal-boundary", "B7-wire", 0, "Execution chunk schema thrift adapter builds chunk schemas from FE type descriptors"),
+    "src/exec/chunk/schema_thrift.rs": BaselineEntry("legal-boundary", "B7-wire", 5, "Execution chunk schema thrift adapter builds chunk schemas from FE type descriptors"),
     "src/exec/operators/fetch_processor.rs": BaselineEntry("domain-leak", "B5", 0, "Fetch processor discovers lookup output slots from DescriptorSnapshot"),
     "src/connector/scan_planning.rs": BaselineEntry("domain-leak", "B5", 0, "Shared scan planning trait is domain-only"),
     "src/connector/starrocks/table/scan_planner.rs": BaselineEntry("domain-leak", "B5", 0, "StarRocks table scan planner exposes domain handles and splits only"),

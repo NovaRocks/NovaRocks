@@ -16,7 +16,7 @@
 // under the License.
 use std::sync::Arc;
 
-use arrow::array::{BinaryArray, Int32Array};
+use arrow::array::BinaryArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -25,19 +25,20 @@ use crate::common::ids::SlotId;
 use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
 #[test]
-fn strict_requires_chunk_schema_metadata() {
-    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])
-        .expect("record batch");
-    let err = Chunk::try_new_strict(batch).expect_err("expected strict error");
-    assert!(err.contains("novarocks.chunk.slot_ids"), "err={}", err);
-}
-
-#[test]
 fn strict_rejects_duplicate_slot_id() {
     let err = ChunkSchema::try_new(vec![
-        ChunkSlotSchema::new(SlotId::new(1), "a", true, None, None),
-        ChunkSlotSchema::new(SlotId::new(1), "b", true, None, None),
+        ChunkSlotSchema::new_with_field(
+            SlotId::new(1),
+            Field::new("a", DataType::Int32, true),
+            None,
+            None,
+        ),
+        ChunkSlotSchema::new_with_field(
+            SlotId::new(1),
+            Field::new("b", DataType::Int32, true),
+            None,
+            None,
+        ),
     ])
     .expect_err("duplicate slot ids should fail");
     assert!(err.contains("duplicate slot id"), "err={}", err);

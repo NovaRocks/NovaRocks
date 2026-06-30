@@ -18,6 +18,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
+use crate::exec::chunk::schema_thrift::{
+    chunk_slot_schema_from_optional_type_desc, chunk_slot_schema_from_type_desc,
+};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
@@ -49,13 +52,13 @@ fn project_slot_schema_from_desc(
     let name = slot_display_name_from_desc(desc);
     let nullable = desc.is_nullable.unwrap_or(true);
     let unique_id = desc.col_unique_id.filter(|v| *v > 0);
-    Ok(Some(ChunkSlotSchema::new(
+    Ok(Some(chunk_slot_schema_from_optional_type_desc(
         slot_id,
         name,
         nullable,
         desc.slot_type.clone(),
         unique_id,
-    )))
+    )?))
 }
 
 fn project_slot_schema_from_expr(
@@ -71,13 +74,13 @@ fn project_slot_schema_from_expr(
         .nodes
         .first()
         .ok_or_else(|| format!("project expr for slot_id={} has no root node", slot_id))?;
-    Ok(ChunkSlotSchema::new(
+    Ok(chunk_slot_schema_from_type_desc(
         SlotId::try_from(slot_id)?,
         format!("_expr_{}", slot_id),
         root.is_nullable.unwrap_or(true),
-        Some(root.type_.clone()),
+        root.type_.clone(),
         None,
-    ))
+    )?)
 }
 
 fn project_output_chunk_schema(
@@ -327,6 +330,7 @@ mod tests {
     use super::project_output_chunk_schema;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSlotSchema;
+    use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
     use crate::thrift::types::{TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
 
     fn scalar_type_desc(ty: TPrimitiveType) -> TTypeDesc {
@@ -338,44 +342,25 @@ mod tests {
         }])
     }
 
+    fn slot_schema(slot_id: u32, name: &str, ty: TPrimitiveType) -> ChunkSlotSchema {
+        chunk_slot_schema_from_type_desc(
+            SlotId::new(slot_id),
+            name,
+            true,
+            scalar_type_desc(ty),
+            None,
+        )
+        .expect("chunk slot schema")
+    }
+
     #[test]
     fn project_output_chunk_schema_keeps_common_expr_slots_without_descriptors() {
         let expr_slot_schemas = vec![
-            ChunkSlotSchema::new(
-                SlotId::new(128),
-                "_expr_128",
-                true,
-                Some(scalar_type_desc(TPrimitiveType::BOOLEAN)),
-                None,
-            ),
-            ChunkSlotSchema::new(
-                SlotId::new(129),
-                "_expr_129",
-                true,
-                Some(scalar_type_desc(TPrimitiveType::BOOLEAN)),
-                None,
-            ),
-            ChunkSlotSchema::new(
-                SlotId::new(5),
-                "ss_customer_sk",
-                true,
-                Some(scalar_type_desc(TPrimitiveType::INT)),
-                None,
-            ),
-            ChunkSlotSchema::new(
-                SlotId::new(61),
-                "cs_bill_customer_sk",
-                true,
-                Some(scalar_type_desc(TPrimitiveType::INT)),
-                None,
-            ),
-            ChunkSlotSchema::new(
-                SlotId::new(128),
-                "_expr_128",
-                true,
-                Some(scalar_type_desc(TPrimitiveType::BOOLEAN)),
-                None,
-            ),
+            slot_schema(128, "_expr_128", TPrimitiveType::BOOLEAN),
+            slot_schema(129, "_expr_129", TPrimitiveType::BOOLEAN),
+            slot_schema(5, "ss_customer_sk", TPrimitiveType::INT),
+            slot_schema(61, "cs_bill_customer_sk", TPrimitiveType::INT),
+            slot_schema(128, "_expr_128", TPrimitiveType::BOOLEAN),
         ];
 
         let output_chunk_schema =

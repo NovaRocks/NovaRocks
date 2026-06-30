@@ -1,6 +1,9 @@
 mod chunk_impl;
 mod memory;
 mod schema;
+pub(crate) mod schema_thrift;
+#[cfg(test)]
+mod tests;
 pub(crate) mod type_compatibility;
 
 pub use chunk_impl::Chunk;

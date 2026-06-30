@@ -1701,7 +1701,7 @@ mod tests {
             ChunkSlotSchema::new_with_field(
                 SlotId::new(1),
                 field,
-                Some(ChunkFieldSchema::try_new(None)?),
+                Some(ChunkFieldSchema::empty()),
                 None,
             ),
         ])?);

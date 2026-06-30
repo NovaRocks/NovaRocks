@@ -19,8 +19,6 @@ use std::sync::Arc;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
-use crate::lower::type_lowering::arrow_field_from_desc;
-use crate::thrift::types;
 use crate::types::logical::{LogicalType, logical_type_of_field};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -33,45 +31,12 @@ pub struct ChunkFieldSchema {
 }
 
 impl ChunkFieldSchema {
-    pub fn new(
-        _name: impl Into<String>,
-        _nullable: bool,
-        type_desc: Option<types::TTypeDesc>,
-    ) -> Self {
-        Self::try_new(type_desc).unwrap_or_else(|e| panic!("{e}"))
-    }
-
-    pub fn try_new(type_desc: Option<types::TTypeDesc>) -> Result<Self, String> {
-        match type_desc {
-            Some(desc) => Self::try_from_type_desc("", false, desc),
-            None => Ok(Self {
-                logical_type: None,
-                children: Vec::new(),
-            }),
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            logical_type: None,
+            children: Vec::new(),
         }
-    }
-
-    pub fn try_from_type_desc(
-        name: impl Into<String>,
-        nullable: bool,
-        desc: types::TTypeDesc,
-    ) -> Result<Self, String> {
-        let name = name.into();
-        let nodes = desc
-            .types
-            .as_ref()
-            .ok_or_else(|| "field type desc missing nodes".to_string())?;
-        let next = type_desc_node_span(nodes, 0)?;
-        if next != nodes.len() {
-            return Err(format!(
-                "field type desc has trailing nodes: consumed={} total={}",
-                next,
-                nodes.len()
-            ));
-        }
-        let field = arrow_field_from_desc(&name, nullable, &desc)
-            .ok_or_else(|| "field type desc has unsupported arrow mapping".to_string())?;
-        Self::from_field(&field)
     }
 
     pub fn from_field(field: &Field) -> Result<Self, String> {
@@ -151,33 +116,6 @@ pub struct ChunkSlotSchema {
 }
 
 impl ChunkSlotSchema {
-    pub fn new(
-        slot_id: SlotId,
-        name: impl Into<String>,
-        nullable: bool,
-        type_desc: Option<types::TTypeDesc>,
-        unique_id: Option<i32>,
-    ) -> Self {
-        Self::try_new(slot_id, name, nullable, type_desc, unique_id)
-            .unwrap_or_else(|e| panic!("{e}"))
-    }
-
-    pub fn try_new(
-        slot_id: SlotId,
-        name: impl Into<String>,
-        nullable: bool,
-        type_desc: Option<types::TTypeDesc>,
-        unique_id: Option<i32>,
-    ) -> Result<Self, String> {
-        let Some(type_desc) = type_desc else {
-            return Err(format!(
-                "chunk slot {} missing type_desc; use try_new_with_field for runtime fields",
-                slot_id
-            ));
-        };
-        Self::try_from_type_desc(slot_id, name, nullable, type_desc, unique_id)
-    }
-
     pub fn new_with_field(
         slot_id: SlotId,
         field: Field,
@@ -216,23 +154,6 @@ impl ChunkSlotSchema {
             field_schema: self.field_schema.clone(),
             unique_id: self.unique_id,
         }
-    }
-
-    pub fn try_from_type_desc(
-        slot_id: SlotId,
-        name: impl Into<String>,
-        nullable: bool,
-        type_desc: types::TTypeDesc,
-        unique_id: Option<i32>,
-    ) -> Result<Self, String> {
-        let name = name.into();
-        let field = arrow_field_from_desc(&name, nullable, &type_desc).ok_or_else(|| {
-            format!(
-                "chunk slot {} has unsupported type desc for arrow conversion",
-                slot_id
-            )
-        })?;
-        Self::try_new_with_field(slot_id, field, None, unique_id)
     }
 
     pub fn from_field(
@@ -308,33 +229,6 @@ pub struct ChunkSchema {
 }
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
-
-fn type_desc_node_span(nodes: &[types::TTypeNode], start: usize) -> Result<usize, String> {
-    let node = nodes
-        .get(start)
-        .ok_or_else(|| format!("field type desc ended unexpectedly at node {}", start))?;
-
-    match node.type_ {
-        t if t == types::TTypeNodeType::SCALAR => Ok(start + 1),
-        t if t == types::TTypeNodeType::STRUCT => {
-            let struct_fields = node
-                .struct_fields
-                .as_ref()
-                .ok_or_else(|| "struct type desc missing struct_fields".to_string())?;
-            let mut cursor = start + 1;
-            for _ in struct_fields {
-                cursor = type_desc_node_span(nodes, cursor)?;
-            }
-            Ok(cursor)
-        }
-        t if t == types::TTypeNodeType::ARRAY => type_desc_node_span(nodes, start + 1),
-        t if t == types::TTypeNodeType::MAP => {
-            let next = type_desc_node_span(nodes, start + 1)?;
-            type_desc_node_span(nodes, next)
-        }
-        other => Err(format!("unsupported type desc node {:?}", other)),
-    }
-}
 
 fn check_chunk_data_type(
     expected: &DataType,
@@ -615,8 +509,6 @@ mod tests {
     use super::{ChunkSchema, ChunkSlotSchema};
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
-    use crate::thrift::types::TPrimitiveType;
-    use crate::types::arrow_thrift::thrift_type_desc_from_primitive;
     use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     #[test]
@@ -671,38 +563,6 @@ mod tests {
         assert_eq!(logical_type_of_field(slot.field()), Some(LogicalType::Hll));
         assert_eq!(slot.name(), "a");
         assert_eq!(slot.unique_id(), Some(77));
-    }
-
-    #[test]
-    fn try_from_type_desc_tags_logical_field_metadata() {
-        let cases = [
-            (TPrimitiveType::JSON, DataType::Utf8, LogicalType::Json),
-            (TPrimitiveType::HLL, DataType::Binary, LogicalType::Hll),
-            (
-                TPrimitiveType::OBJECT,
-                DataType::Binary,
-                LogicalType::Object,
-            ),
-            (
-                TPrimitiveType::PERCENTILE,
-                DataType::Binary,
-                LogicalType::Percentile,
-            ),
-        ];
-
-        for (primitive, expected_type, expected_logical) in cases {
-            let slot = ChunkSlotSchema::try_from_type_desc(
-                SlotId::new(9),
-                "payload",
-                true,
-                thrift_type_desc_from_primitive(primitive),
-                None,
-            )
-            .expect("slot from type desc");
-
-            assert_eq!(slot.data_type(), &expected_type);
-            assert_eq!(logical_type_of_field(slot.field()), Some(expected_logical));
-        }
     }
 
     #[test]

@@ -3865,7 +3865,8 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::common::largeint;
-    use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::chunk::schema_thrift::chunk_field_schema_from_type_desc;
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::thrift::types;
     use arrow::array::{
@@ -3998,7 +3999,7 @@ mod tests {
         let cast_expr = arena.push_typed(ExprNode::Cast(child), target_type);
         arena.set_field_schema(
             cast_expr,
-            ChunkFieldSchema::try_from_type_desc("out", true, json_struct_type_desc())
+            chunk_field_schema_from_type_desc("out", true, json_struct_type_desc())
                 .expect("field schema"),
         );
 
