@@ -1773,7 +1773,7 @@ mod cascaded_derivation_tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "win".into(),
-            output_column_id: crate::sql::column_id::ColumnId::UNSET,
+            output_column_id: ColumnId(1000),
             result_type: DataType::Int64,
         };
         let window = Operator::PhysicalWindow(WindowOp {

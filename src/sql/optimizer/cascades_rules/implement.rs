@@ -2009,11 +2009,22 @@ mod join_demotion_tests {
 #[cfg(test)]
 mod window_split_tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::optimizer_bridge::scalar::intern_window_exprs;
     use crate::sql::planner::plan::WindowExpr;
     use arrow::datatypes::DataType;
+
+    fn window_output_id(name: &str) -> ColumnId {
+        let id = match name {
+            "w1" => 1001,
+            "w2" => 1002,
+            "w3" => 1003,
+            "w" => 1004,
+            other => panic!("unexpected window fixture name {other}"),
+        };
+        ColumnId::new_for_test(id)
+    }
 
     fn mk_window_expr(name: &str, partition: Vec<TypedExpr>) -> WindowExpr {
         WindowExpr {
@@ -2025,8 +2036,18 @@ mod window_split_tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: name.into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: window_output_id(name),
             ignore_nulls: false,
+        }
+    }
+
+    fn window_output_column(name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: window_output_id(name),
+            name: name.into(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
         }
     }
 
@@ -2085,7 +2106,7 @@ mod window_split_tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: "w".into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: window_output_id("w"),
             ignore_nulls: false,
         };
         let items = sort_items_for_window(&win);
@@ -2138,7 +2159,7 @@ mod window_split_tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalWindow(WindowOp {
                 window_exprs,
-                output_columns: vec![],
+                output_columns: vec![window_output_column("w1")],
             }),
             children: vec![child_group],
         };

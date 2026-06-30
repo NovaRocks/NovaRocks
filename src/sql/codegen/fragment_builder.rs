@@ -4235,6 +4235,7 @@ mod tests {
                 end: WindowBound::CurrentRow,
             }),
             output_name: "sum_range".to_string(),
+            output_column_id: crate::sql::column_id::ColumnId::new_for_test(7102),
             ..win_rows.clone()
         };
         let window_output_columns = vec![

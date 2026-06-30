@@ -115,7 +115,11 @@ mod tests {
         }
     }
 
-    fn test_window(output_name: &str, partition_by: Vec<TypedExpr>) -> WindowExpr {
+    fn test_window(
+        output_name: &str,
+        output_column_id: ColumnId,
+        partition_by: Vec<TypedExpr>,
+    ) -> WindowExpr {
         WindowExpr {
             name: "cume_dist".into(),
             args: vec![],
@@ -125,7 +129,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: output_name.into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id,
             result_type: arrow::datatypes::DataType::Float64,
         }
     }
@@ -133,9 +137,8 @@ mod tests {
     fn window_op(scalars: &mut ScalarArena, exprs: Vec<WindowExpr>) -> WindowOp {
         let output_columns = exprs
             .iter()
-            .enumerate()
-            .map(|(idx, expr)| OutputColumn {
-                column_id: ColumnId(1000 + idx as u32),
+            .map(|expr| OutputColumn {
+                column_id: expr.output_column_id,
                 name: expr.output_name.clone(),
                 data_type: expr.result_type.clone(),
                 nullable: true,
@@ -169,7 +172,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "win".into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(1001),
             result_type: arrow::datatypes::DataType::Int64,
         };
         let mut scalars = ScalarArena::new();
@@ -195,7 +198,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "win".into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(1002),
             result_type: arrow::datatypes::DataType::Int64,
         };
         let mut scalars = ScalarArena::new();
@@ -210,8 +213,16 @@ mod tests {
         let op = window_op(
             &mut scalars,
             vec![
-                test_window("by_a", vec![test_col(ColumnId(1), "a")]),
-                test_window("by_b", vec![test_col(ColumnId(2), "b")]),
+                test_window(
+                    "by_a",
+                    ColumnId::new_for_test(1101),
+                    vec![test_col(ColumnId(1), "a")],
+                ),
+                test_window(
+                    "by_b",
+                    ColumnId::new_for_test(1102),
+                    vec![test_col(ColumnId(2), "b")],
+                ),
             ],
         );
 
@@ -227,8 +238,16 @@ mod tests {
         let op = window_op(
             &mut scalars,
             vec![
-                test_window("by_a", vec![test_col(ColumnId(1), "a")]),
-                test_window("by_b", vec![test_col(ColumnId(2), "b")]),
+                test_window(
+                    "by_a",
+                    ColumnId::new_for_test(1111),
+                    vec![test_col(ColumnId(1), "a")],
+                ),
+                test_window(
+                    "by_b",
+                    ColumnId::new_for_test(1112),
+                    vec![test_col(ColumnId(2), "b")],
+                ),
             ],
         );
 
@@ -243,9 +262,14 @@ mod tests {
         let op = window_op(
             &mut scalars,
             vec![
-                test_window("by_a", vec![test_col(ColumnId(1), "a")]),
+                test_window(
+                    "by_a",
+                    ColumnId::new_for_test(1201),
+                    vec![test_col(ColumnId(1), "a")],
+                ),
                 test_window(
                     "by_a_b",
+                    ColumnId::new_for_test(1202),
                     vec![test_col(ColumnId(1), "a"), test_col(ColumnId(2), "b")],
                 ),
             ],
@@ -283,7 +307,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "partitioned".into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(1301),
             result_type: arrow::datatypes::DataType::Float64,
         };
         let global = WindowExpr {
@@ -295,7 +319,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "global".into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(1302),
             result_type: arrow::datatypes::DataType::Float64,
         };
         let mut scalars = ScalarArena::new();
@@ -327,7 +351,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "partitioned".into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(1311),
             result_type: arrow::datatypes::DataType::Float64,
         };
         let global = WindowExpr {
@@ -339,7 +363,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "global".into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(1312),
             result_type: arrow::datatypes::DataType::Float64,
         };
         let mut scalars = ScalarArena::new();
@@ -383,7 +407,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "win".into(),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: ColumnId::new_for_test(1401),
             result_type: arrow::datatypes::DataType::Int64,
         };
         let mut scalars = ScalarArena::new();
