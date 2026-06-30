@@ -1,0 +1,60 @@
+-- query 4
+k
+2
+3
+
+-- query 5
+k	payload
+2	200
+3	300
+
+-- query 6
+payload
+300
+
+-- query 9
+Explain String
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+12:SORT BY [l.k ASC NULLS FIRST] stats={rows=3}
+  11:GATHER stats={rows=3}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+10:PROJECT [l.k AS k, r.payload AS payload] stats={rows=3}
+  9:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k]) bcast_verdict=feasible stats={rows=3}
+    build runtime filters:
+    - filter_id = 0, build_expr = (l.k)
+    4:FILTER stats={rows=3}
+      predicate: r.k IS NOT NULL
+      3:EXCHANGE stats={rows=3}
+    8:GATHER stats={rows=1}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: UNPARTITIONED
+7:FILTER stats={rows=1}
+  predicate: l.k IS NOT NULL
+  6:FILTER stats={rows=2}
+    predicate: CAST(l.v AS Int64) >= 20
+    5:EXCHANGE stats={rows=3}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: UNPARTITIONED
+2:PROJECT [k, v, payload] stats={rows=3}
+  1:SCAN db_sqlt_c0ebef7038b04fb9.oq1c_cte_src stats={rows=3}
+       TABLE: db_sqlt_c0ebef7038b04fb9.oq1c_cte_src
+       columns: k, v, payload
+       min-max stats
