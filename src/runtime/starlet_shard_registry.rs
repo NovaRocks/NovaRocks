@@ -333,6 +333,23 @@ mod tests {
         }
     }
 
+    fn resolve_object_store_key_for_test(
+        full_path: &str,
+        cfg: &S3StoreConfig,
+    ) -> Result<String, String> {
+        let object_store_config = cfg.to_object_store_config();
+        let handle = crate::fs::access::FsAccessResolver::new()
+            .resolve_location(full_path, Some(&object_store_config))?;
+        if handle.scheme() != crate::fs::access::FsScheme::ObjectStore {
+            return Err(format!("expected object-store path: {full_path}"));
+        }
+        handle
+            .paths()
+            .first()
+            .map(|path| path.operator_relative_path().to_string())
+            .ok_or_else(|| format!("resolved empty path list for {full_path}"))
+    }
+
     #[test]
     fn path_only_upsert_preserves_existing_s3_config() {
         let _guard = lock_for_test();
@@ -537,9 +554,9 @@ mod tests {
         // longer carries path state, so any tablet path is normalized to a
         // bucket-relative key without depending on cached root state.
         let s3 = sample_s3_config();
-        let (_op, key) = crate::fs::path::resolve_object_store_operator_and_path(
+        let key = resolve_object_store_key_for_test(
             "s3://bucket/brand/new/root/tablet-42/data/seg_0.parquet",
-            &s3.to_object_store_config(),
+            &s3,
         )
         .expect("resolve bucket-relative key");
         assert_eq!(key, "brand/new/root/tablet-42/data/seg_0.parquet");
@@ -571,11 +588,9 @@ mod tests {
         assert_eq!(info.full_path, new_path);
         let preserved = info.s3.expect("cluster S3 profile should be preserved");
         assert_eq!(preserved, sample_s3_config());
-        let (_op, key) = crate::fs::path::resolve_object_store_operator_and_path(
-            &format!("{new_path}/meta/0001.meta"),
-            &preserved.to_object_store_config(),
-        )
-        .expect("resolve key");
+        let key =
+            resolve_object_store_key_for_test(&format!("{new_path}/meta/0001.meta"), &preserved)
+                .expect("resolve key");
         assert_eq!(key, "totally/different/place/tablet-9001/meta/0001.meta");
     }
 

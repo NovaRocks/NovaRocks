@@ -718,6 +718,22 @@ mod tests {
     }
 
     #[test]
+    fn resolver_resolves_file_uri_to_operator_relative_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = temp_dir.path().join("nested").join("a.parquet");
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("create parent");
+        std::fs::write(&file_path, b"payload").expect("write file");
+
+        let uri = format!("file://{}", file_path.to_string_lossy());
+        let handle = FsAccessResolver::new()
+            .resolve_location(&uri, None)
+            .expect("resolve file URI");
+
+        assert_eq!(handle.scheme(), FsScheme::Local);
+        assert_eq!(handle.operator_relative_paths(), vec!["a.parquet"]);
+    }
+
+    #[test]
     fn resolver_rejects_object_store_without_credentials() {
         let resolver = FsAccessResolver::new();
         let err = resolver

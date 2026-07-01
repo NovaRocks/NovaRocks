@@ -615,7 +615,10 @@ fn normalize_s3_endpoint(raw_endpoint: &str) -> Result<String> {
     Ok(format!("{scheme}://{endpoint}"))
 }
 
-pub fn build_object_store_operator(bucket: &str, cfg: &ObjectStoreConfig) -> Result<Operator> {
+pub(crate) fn build_object_store_operator(
+    bucket: &str,
+    cfg: &ObjectStoreConfig,
+) -> Result<Operator> {
     let bucket = bucket.trim();
     if bucket.is_empty() {
         return Err(anyhow!("empty object-store bucket"));
@@ -659,13 +662,6 @@ where
     data_block_on(future)
 }
 
-pub fn resolve_oss_operator_and_path_with_config(
-    full_path: &str,
-    cfg: &ObjectStoreConfig,
-) -> Result<(Operator, String), String> {
-    crate::fs::path::resolve_object_store_operator_and_path(full_path, cfg)
-}
-
 pub(crate) fn object_store_bucket_from_path(full_path: &str) -> Result<String, String> {
     let full = full_path.trim();
     for scheme in ["oss://", "s3://", "s3a://"] {
@@ -683,71 +679,16 @@ pub(crate) fn object_store_bucket_from_path(full_path: &str) -> Result<String, S
     Err(format!("object-store path missing bucket: {full_path}"))
 }
 
-pub fn normalize_oss_path(full: &str, bucket: &str, _root: &str) -> Result<String, String> {
-    // `_root` is a deprecated compatibility parameter. Operators are rooted at
-    // the bucket, so this helper no longer strips a table root prefix.
-    // Expected full path formats:
-    // - oss://<bucket>/<key>
-    // - s3://<bucket>/<key> / s3a://<bucket>/<key>
-    // - <key> (already relative to bucket)
-    // Return value must be relative to the bucket-root OpenDAL operator.
-    let mut s = full.trim().to_string();
-
-    for scheme in ["oss://", "s3://", "s3a://"] {
-        if let Some(rest) = s.strip_prefix(scheme) {
-            let (b, key) = rest
-                .split_once('/')
-                .ok_or_else(|| format!("invalid object url: {full}"))?;
-            if b != bucket {
-                return Err(format!(
-                    "bucket mismatch: url bucket={b} config bucket={bucket}"
-                ));
-            }
-            s = key.to_string();
-            break;
-        }
-    }
-
-    s = s.trim_start_matches('/').to_string();
-
-    Ok(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_OSS_IO_TIMEOUT_MS, DEFAULT_OSS_TIMEOUT_MS, ObjectStoreRetrySettings,
         OssOperatorCacheKey, build_timeout_layer, effective_io_timeout_ms, effective_s3_region,
-        effective_timeout_ms, normalize_oss_path, normalize_s3_endpoint, prefer_virtual_host_style,
+        effective_timeout_ms, normalize_s3_endpoint, prefer_virtual_host_style,
         should_use_path_style,
     };
     use crate::fs::object_store::ObjectStoreConfig;
     use std::collections::BTreeMap;
-
-    #[test]
-    fn normalize_oss_path_returns_bucket_relative_key() {
-        let got = normalize_oss_path("s3://bucket/warehouse/a.parquet", "bucket", "warehouse")
-            .expect("normalize oss path");
-        assert_eq!(got, "warehouse/a.parquet");
-    }
-
-    #[test]
-    fn normalize_oss_path_accepts_s3a_uri() {
-        let got = normalize_oss_path(
-            "s3a://my-bucket/my-prefix/a/b.parquet",
-            "my-bucket",
-            "my-prefix",
-        )
-        .expect("normalize s3a path");
-        assert_eq!(got, "my-prefix/a/b.parquet");
-    }
-
-    #[test]
-    fn normalize_oss_path_rejects_bucket_mismatch() {
-        let err = normalize_oss_path("oss://bucket-a/a/b.parquet", "bucket-b", "")
-            .expect_err("bucket mismatch should fail");
-        assert!(err.contains("bucket mismatch"));
-    }
 
     #[test]
     fn object_store_cache_key_uses_explicit_bucket() {
