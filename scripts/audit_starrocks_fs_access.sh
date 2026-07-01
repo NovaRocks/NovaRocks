@@ -8,6 +8,7 @@ targets=(
   src/connector/starrocks/scan
   src/connector/starrocks/sink
   src/connector/starrocks/table/txn.rs
+  src/connector/starrocks/table/erase.rs
   src/connector/starrocks/lake
   src/runtime/starlet_shard_registry.rs
 )
@@ -38,7 +39,18 @@ fi
 
 # Allow test code in the runtime registry to exercise legacy compatibility until FS-6.
 # Do not allow production StarRocks lake modules to use these old helpers.
-blocked="$(printf '%s\n' "$hits" | rg -v "$allow_pattern" || true)"
+if blocked="$(printf '%s\n' "$hits" | rg -v "$allow_pattern" 2>&1)"; then
+  filter_status=0
+else
+  filter_status=$?
+fi
+if [[ "$filter_status" -eq 1 ]]; then
+  exit 0
+fi
+if [[ "$filter_status" -gt 1 ]]; then
+  printf 'StarRocks FS access audit allow-list filter failed:\n%s\n' "$blocked" >&2
+  exit "$filter_status"
+fi
 if [[ -n "$blocked" ]]; then
   printf 'StarRocks FS access boundary violations:\n%s\n' "$blocked" >&2
   exit 1

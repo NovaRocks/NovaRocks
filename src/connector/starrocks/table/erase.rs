@@ -2,6 +2,7 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::connector::starrocks::fs_access::resolve_tablet_root;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
 use crate::engine::StandaloneState;
 use crate::fs::oss::oss_block_on;
@@ -142,20 +143,19 @@ fn erase_worker_loop(state: Weak<StandaloneState>) {
 }
 
 fn erase_root(root_path: &str, config: &StarRocksTableConfig) -> Result<(), String> {
-    let object_store_cfg = config.s3.to_object_store_config();
-    let (operator, rel_path) =
-        crate::fs::path::resolve_object_store_operator_and_path(root_path, &object_store_cfg)
-            .map_err(|e| format!("resolve erase root `{root_path}` failed: {e}"))?;
-    // Normalize the warehouse URI through the same resolver so the safety
-    // check below compares the requested erase target against the same
-    // bucket-relative key shape (the OpenDAL operator now always operates
-    // from the bucket root, so the warehouse path component lives entirely
-    // in the key prefix).
-    let (_, warehouse_rel) = crate::fs::path::resolve_object_store_operator_and_path(
-        &config.warehouse_uri,
-        &object_store_cfg,
-    )
-    .map_err(|e| {
+    let root_access = resolve_tablet_root(root_path, Some(&config.s3))
+        .map_err(|e| format!("resolve erase root `{root_path}` failed: {e}"))?;
+    let rel_path = root_access
+        .single_relative_path()
+        .map_err(|e| format!("resolve erase root `{root_path}` failed: {e}"))?;
+    let warehouse_access =
+        resolve_tablet_root(&config.warehouse_uri, Some(&config.s3)).map_err(|e| {
+            format!(
+                "resolve StarRocks table warehouse `{}` failed: {e}",
+                config.warehouse_uri
+            )
+        })?;
+    let warehouse_rel = warehouse_access.single_relative_path().map_err(|e| {
         format!(
             "resolve StarRocks table warehouse `{}` failed: {e}",
             config.warehouse_uri
@@ -163,6 +163,7 @@ fn erase_root(root_path: &str, config: &StarRocksTableConfig) -> Result<(), Stri
     })?;
     let erase_prefix = erase_prefix_path(&rel_path, &warehouse_rel)
         .map_err(|e| format!("refuse to erase StarRocks table root `{root_path}`: {e}"))?;
+    let operator = root_access.operator();
     let remove_result = oss_block_on(operator.remove_all(&erase_prefix))
         .map_err(|e| format!("run erase root `{root_path}` failed: {e}"))?;
     remove_result.map_err(|e| format!("erase root `{root_path}` failed: {e}"))?;
@@ -733,5 +734,16 @@ mod tests {
         let err = super::erase_prefix_path("/warehouse/", "warehouse")
             .expect_err("warehouse root with surrounding slashes must be rejected");
         assert!(err.contains("empty"), "err={err}");
+    }
+
+    #[test]
+    fn erase_root_rejects_bucket_mismatch_before_delete() {
+        let config = test_starrocks_table_config();
+        let err = super::erase_root("s3://other/warehouse/db_1/table_10", &config)
+            .expect_err("erase root must reject bucket mismatch");
+
+        assert!(err.contains("other"), "err={err}");
+        assert!(err.contains("test"), "err={err}");
+        assert!(err.contains("resolve erase root"), "err={err}");
     }
 }
