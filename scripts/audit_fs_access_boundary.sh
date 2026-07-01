@@ -86,8 +86,20 @@ collect_opendal_service_import_hits() {
 
   while IFS= read -r file; do
     awk -v file="$file" '
+      function brace_delta(text, copy, opens, closes) {
+        copy = text
+        opens = gsub(/\{/, "{", copy)
+        copy = text
+        closes = gsub(/\}/, "}", copy)
+        return opens - closes
+      }
+
       function has_service_import(text) {
         return text ~ /(^|[^[:alnum:]_])(S3|Fs)([[:space:]]+as[[:space:]]+[[:alnum:]_]+)?([^[:alnum:]_]|$)/
+      }
+
+      function starts_services_import(text) {
+        return text ~ /(^|[^[:alnum:]_])services::[[:space:]]*\{/
       }
 
       function emit_hit() {
@@ -95,12 +107,44 @@ collect_opendal_service_import_hits() {
       }
 
       {
+        if (in_nested_services_import) {
+          if (has_service_import($0)) {
+            emit_hit()
+          }
+          nested_services_depth += brace_delta($0)
+          if (nested_services_depth <= 0) {
+            in_nested_services_import = 0
+          }
+          if ($0 ~ /;/) {
+            in_opendal_import = 0
+            in_nested_services_import = 0
+          }
+          next
+        }
+
         if (in_services_import) {
           if (has_service_import($0)) {
             emit_hit()
           }
           if ($0 ~ /;/) {
             in_services_import = 0
+          }
+          next
+        }
+
+        if (in_opendal_import) {
+          if (starts_services_import($0)) {
+            if (has_service_import($0)) {
+              emit_hit()
+            }
+            nested_services_depth = brace_delta($0)
+            if (nested_services_depth > 0) {
+              in_nested_services_import = 1
+            }
+          }
+          if ($0 ~ /;/) {
+            in_opendal_import = 0
+            in_nested_services_import = 0
           }
           next
         }
@@ -112,6 +156,24 @@ collect_opendal_service_import_hits() {
           }
           if ($0 ~ /;/) {
             in_services_import = 0
+          }
+          next
+        }
+
+        if ($0 ~ /^[[:space:]]*use[[:space:]]+opendal::[[:space:]]*\{/) {
+          in_opendal_import = 1
+          if (starts_services_import($0)) {
+            if (has_service_import($0)) {
+              emit_hit()
+            }
+            nested_services_depth = brace_delta($0)
+            if (nested_services_depth > 0) {
+              in_nested_services_import = 1
+            }
+          }
+          if ($0 ~ /;/) {
+            in_opendal_import = 0
+            in_nested_services_import = 0
           }
           next
         }
