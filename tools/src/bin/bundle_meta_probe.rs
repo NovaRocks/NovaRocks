@@ -1,17 +1,11 @@
-use std::collections::BTreeMap;
+mod fs_access_tooling;
 
-use opendal::Operator;
+use std::collections::BTreeMap;
 
 use novarocks::formats::starrocks::writer::bundle_meta::{
     decode_bundle_metadata_from_bytes, decode_tablet_metadata_from_bundle_bytes,
 };
 use novarocks::formats::starrocks::writer::layout::bundle_meta_file_path;
-
-const FS_S3A_ACCESS_KEY: &str = "fs.s3a.access.key";
-const FS_S3A_SECRET_KEY: &str = "fs.s3a.secret.key";
-const FS_S3A_ENDPOINT: &str = "fs.s3a.endpoint";
-const FS_S3A_ENDPOINT_REGION: &str = "fs.s3a.endpoint.region";
-const FS_S3A_PATH_STYLE: &str = "fs.s3a.path.style.access";
 
 #[derive(Debug)]
 struct ProbeConfig {
@@ -19,12 +13,6 @@ struct ProbeConfig {
     version: i64,
     tablet_ids: Vec<i64>,
     fs_options: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RootPath {
-    Local { root_dir: String },
-    ObjectStore { bucket: String, root_path: String },
 }
 
 fn print_help() {
@@ -36,7 +24,7 @@ fn print_help() {
     println!("  --root <path>             Tablet root path, local or s3://bucket/root");
     println!("  --version <v>             Bundle version (default: 1)");
     println!("  --tablet-id <id>          Target tablet id (repeatable, optional)");
-    println!("  --fs-option <k=v>         FS option, repeatable (s3 endpoint/ak/sk/path style)");
+    println!("  --fs-option <k=v>         FS option, repeatable (S3A endpoint/ak/sk/path style)");
     println!("  -h, --help                Show this help");
 }
 
@@ -100,147 +88,6 @@ fn parse_args() -> Result<ProbeConfig, String> {
         return Err("--version must be positive".to_string());
     }
     Ok(cfg)
-}
-
-fn parse_root(path: &str) -> Result<RootPath, String> {
-    let raw = path.trim().trim_end_matches('/');
-    if raw.is_empty() {
-        return Err("empty root path".to_string());
-    }
-    if let Some(rest) = raw
-        .strip_prefix("s3://")
-        .or_else(|| raw.strip_prefix("oss://"))
-    {
-        let (bucket, root_path) = split_bucket_and_root(rest)?;
-        return Ok(RootPath::ObjectStore { bucket, root_path });
-    }
-    if raw.contains("://") {
-        return Err(format!("unsupported root path scheme: {}", raw));
-    }
-    Ok(RootPath::Local {
-        root_dir: raw.to_string(),
-    })
-}
-
-fn split_bucket_and_root(value: &str) -> Result<(String, String), String> {
-    let trimmed = value.trim_matches('/');
-    let (bucket, root_path) = match trimmed.split_once('/') {
-        Some((bucket, path)) => (bucket.trim(), path.trim_matches('/')),
-        None => (trimmed, ""),
-    };
-    if bucket.is_empty() {
-        return Err(format!("invalid bucket in root path: {}", value));
-    }
-    Ok((bucket.to_string(), root_path.to_string()))
-}
-
-fn parse_bool(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Some(true),
-        "false" | "0" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn build_operator(root: &RootPath, fs_options: &BTreeMap<String, String>) -> Result<Operator, String> {
-    match root {
-        RootPath::Local { root_dir } => {
-            let builder = opendal::services::Fs::default().root(root_dir);
-            let op_builder =
-                Operator::new(builder).map_err(|e| format!("init local operator failed: {}", e))?;
-            Ok(op_builder.finish())
-        }
-        RootPath::ObjectStore { bucket, root_path } => {
-            let endpoint = fs_options
-                .get(FS_S3A_ENDPOINT)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| format!("missing fs option: {}", FS_S3A_ENDPOINT))?;
-            let access_key = fs_options
-                .get(FS_S3A_ACCESS_KEY)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| format!("missing fs option: {}", FS_S3A_ACCESS_KEY))?;
-            let secret_key = fs_options
-                .get(FS_S3A_SECRET_KEY)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| format!("missing fs option: {}", FS_S3A_SECRET_KEY))?;
-
-            let mut builder = opendal::services::S3::default()
-                .bucket(bucket)
-                .root(root_path)
-                .endpoint(endpoint)
-                .access_key_id(access_key)
-                .secret_access_key(secret_key);
-
-            if let Some(region) = fs_options
-                .get(FS_S3A_ENDPOINT_REGION)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-            {
-                builder = builder.region(region);
-            }
-            if let Some(path_style) = fs_options.get(FS_S3A_PATH_STYLE).and_then(|v| parse_bool(v))
-            {
-                if !path_style {
-                    builder = builder.enable_virtual_host_style();
-                }
-            }
-            let op_builder =
-                Operator::new(builder).map_err(|e| format!("init s3 operator failed: {}", e))?;
-            Ok(op_builder.finish())
-        }
-    }
-}
-
-fn to_relative_path(full_path: &str, root: &RootPath) -> Result<String, String> {
-    match root {
-        RootPath::Local { root_dir } => {
-            let prefix = format!("{}/", root_dir.trim_end_matches('/'));
-            if let Some(rest) = full_path.strip_prefix(&prefix) {
-                return Ok(rest.to_string());
-            }
-            if full_path == root_dir {
-                return Ok(String::new());
-            }
-            Err(format!(
-                "path does not belong to local root: path={} root={}",
-                full_path, root_dir
-            ))
-        }
-        RootPath::ObjectStore { bucket, root_path } => {
-            let raw = full_path
-                .strip_prefix("s3://")
-                .or_else(|| full_path.strip_prefix("oss://"))
-                .ok_or_else(|| format!("unexpected object path: {}", full_path))?;
-            let (path_bucket, key) = raw
-                .split_once('/')
-                .ok_or_else(|| format!("invalid object path: {}", full_path))?;
-            if path_bucket != bucket {
-                return Err(format!(
-                    "bucket mismatch: path={} expected_bucket={}",
-                    full_path, bucket
-                ));
-            }
-            let root_trim = root_path.trim_matches('/');
-            if root_trim.is_empty() {
-                return Ok(key.trim_start_matches('/').to_string());
-            }
-            let prefix = format!("{}/", root_trim);
-            let key = key.trim_start_matches('/');
-            if let Some(rest) = key.strip_prefix(&prefix) {
-                return Ok(rest.to_string());
-            }
-            if key == root_trim {
-                return Ok(String::new());
-            }
-            Err(format!(
-                "path does not belong to object root: path={} root={}",
-                full_path, root_path
-            ))
-        }
-    }
 }
 
 fn dump_tablet_meta(tablet_id: i64, meta: &novarocks::service::grpc_client::proto::starrocks::TabletMetadataPb) {
@@ -332,13 +179,16 @@ fn dump_schema_column(
 
 fn main() -> Result<(), String> {
     let cfg = parse_args()?;
-    let root = parse_root(&cfg.root)?;
+    let object_store_config =
+        fs_access_tooling::object_store_config_from_fs_options(&cfg.fs_options)?;
     let meta_path = bundle_meta_file_path(&cfg.root, cfg.version)?;
-    let rel = to_relative_path(&meta_path, &root)?;
+    let access =
+        fs_access_tooling::resolve_tool_location(&meta_path, object_store_config.as_ref())?;
+    let rel = fs_access_tooling::single_relative_path(&access, &meta_path)?;
 
-    let op = build_operator(&root, &cfg.fs_options)?;
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("create tokio runtime failed: {}", e))?;
+    let op = access.operator();
     let bytes = rt
         .block_on(op.read(&rel))
         .map_err(|e| format!("read bundle meta failed: path={} error={}", rel, e))?

@@ -1,11 +1,16 @@
+mod fs_access_tooling;
+
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
-use novarocks::novarocks_config::{init_from_env_or_default, init_from_path};
-use novarocks::novarocks_fs_oss::build_oss_operator;
+use novarocks::fs::object_store::ObjectStoreConfig;
+use novarocks::fs::object_store_credentials::{
+    ObjectStoreCredentials, ObjectStoreCredentialsSource,
+};
+use novarocks::novarocks_config::{NovaRocksConfig, init_from_env_or_default, init_from_path};
 
 #[derive(Clone, Debug)]
 struct ParquetProbe {
@@ -18,6 +23,45 @@ struct ParquetProbe {
     arrow_schema_skip_meta: Option<String>,
     arrow_schema_error: Option<String>,
     arrow_schema_skip_meta_error: Option<String>,
+}
+
+fn object_store_config_from_standalone(app_cfg: &NovaRocksConfig) -> Result<ObjectStoreConfig> {
+    let standalone = app_cfg
+        .standalone_server
+        .as_ref()
+        .context("missing [standalone_server] config")?;
+    let object_store = standalone
+        .object_store
+        .as_ref()
+        .context("missing [standalone_server.object_store] config")?;
+    let credentials = ObjectStoreCredentials::from_parts(
+        ObjectStoreCredentialsSource::StandaloneConfig,
+        object_store.endpoint.as_deref().unwrap_or_default(),
+        object_store.access_key_id.as_deref().unwrap_or_default(),
+        object_store.access_key_secret.as_deref().unwrap_or_default(),
+        object_store.region.as_deref(),
+        object_store.enable_path_style_access,
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(credentials.to_object_store_config())
+}
+
+fn probe_location_from_args(app_cfg: &NovaRocksConfig, prefix: &str) -> Result<String> {
+    let prefix = prefix.trim();
+    if !prefix.is_empty() {
+        return Ok(prefix.to_string());
+    }
+    let standalone = app_cfg
+        .standalone_server
+        .as_ref()
+        .context("missing [standalone_server] config")?;
+    standalone
+        .warehouse_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .context("missing --prefix and standalone_server.warehouse_uri")
 }
 
 fn probe_parquet_bytes(path: &str, bytes: Bytes) -> Result<ParquetProbe> {
@@ -81,7 +125,7 @@ async fn main() -> Result<()> {
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "Usage: oss_parquet_probe [--config <path>] [--prefix <prefix>] [--max-files <n>]"
+                    "Usage: oss_parquet_probe [--config <path>] --prefix <s3://bucket/prefix> [--max-files <n>]"
                 );
                 eprintln!("  Default config path: $NOVAROCKS_CONFIG or ./novarocks.toml");
                 std::process::exit(0);
@@ -94,19 +138,27 @@ async fn main() -> Result<()> {
         Some(p) => init_from_path(p).context("load config")?,
         None => init_from_env_or_default().context("load config")?,
     };
-    let oss_cfg = app_cfg.oss_config().context("load oss config")?;
-    let op = build_oss_operator(&oss_cfg).context("build oss operator")?;
+    let object_store_config = object_store_config_from_standalone(&app_cfg)?;
+    let location = probe_location_from_args(&app_cfg, &prefix)?;
+    let access =
+        fs_access_tooling::resolve_tool_location(&location, Some(&object_store_config))
+            .map_err(anyhow::Error::msg)?;
+    let relative_path = fs_access_tooling::single_relative_path(&access, &location)
+        .map_err(anyhow::Error::msg)?;
+    let list_prefix = fs_access_tooling::list_prefix(&relative_path);
+    let op = access.operator();
 
     eprintln!(
-        "[probe] endpoint={} bucket={} root={} prefix={} max_files={}",
-        oss_cfg.endpoint, oss_cfg.bucket, oss_cfg.root, prefix, max_files
+        "[probe] endpoint={} authority={} root={} location={} prefix={} max_files={}",
+        object_store_config.endpoint,
+        access.authority().unwrap_or("<local>"),
+        access.root().unwrap_or(""),
+        location,
+        list_prefix,
+        max_files
     );
 
     let mut files = Vec::new();
-    let mut list_prefix = prefix.trim().to_string();
-    if !list_prefix.is_empty() && !list_prefix.ends_with('/') {
-        list_prefix.push('/');
-    }
     let mut lister = op
         .lister_with(&list_prefix)
         .recursive(true)
@@ -122,7 +174,7 @@ async fn main() -> Result<()> {
         }
     }
     if files.is_empty() {
-        anyhow::bail!("no .parquet found under prefix={}", prefix);
+        anyhow::bail!("no .parquet found under prefix={}", list_prefix);
     }
 
     for path in files {

@@ -1,20 +1,14 @@
+mod fs_access_tooling;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use opendal::{ErrorKind, Operator};
 
-use novarocks::formats::starrocks::metadata::load_tablet_snapshot;
+use novarocks::formats::starrocks::metadata::load_tablet_snapshot_with_object_store_config;
 use novarocks::formats::starrocks::plan::build_native_read_plan;
 use novarocks::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
-
-const FS_S3A_ACCESS_KEY: &str = "fs.s3a.access.key";
-const FS_S3A_SECRET_KEY: &str = "fs.s3a.secret.key";
-const FS_S3A_SESSION_TOKEN: &str = "fs.s3a.session.token";
-const FS_S3A_ENDPOINT: &str = "fs.s3a.endpoint";
-const FS_S3A_ENDPOINT_REGION: &str = "fs.s3a.endpoint.region";
-const FS_S3A_ENABLE_SSL: &str = "fs.s3a.connection.ssl.enabled";
-const FS_S3A_PATH_STYLE: &str = "fs.s3a.path.style.access";
 
 #[derive(Debug)]
 struct InspectConfig {
@@ -128,10 +122,11 @@ fn parse_args() -> Result<InspectConfig, String> {
 fn decode_footers_from_snapshot_with_io(
     snapshot: &starust::formats::starrocks::metadata::StarRocksTabletSnapshot,
     tablet_root_path: &str,
-    fs_options: &BTreeMap<String, String>,
+    object_store_config: Option<&novarocks::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<StarRocksSegmentFooter>, String> {
-    let root = TabletRoot::parse(tablet_root_path)?;
-    let op = build_operator(&root, fs_options)?;
+    let root_access =
+        fs_access_tooling::resolve_tool_location(tablet_root_path, object_store_config)?;
+    let op = root_access.operator();
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("create tokio runtime for inspect failed: {e}"))?;
 
@@ -191,144 +186,6 @@ fn decode_footers_from_snapshot_with_io(
     Ok(out)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TabletRoot {
-    Local { root_dir: String },
-    ObjectStore { bucket: String, root_path: String },
-}
-
-impl TabletRoot {
-    fn parse(tablet_root_path: &str) -> Result<Self, String> {
-        let raw = tablet_root_path.trim().trim_end_matches('/');
-        if raw.is_empty() {
-            return Err("tablet_root_path is empty".to_string());
-        }
-
-        if let Some(rest) = raw
-            .strip_prefix("s3://")
-            .or_else(|| raw.strip_prefix("oss://"))
-        {
-            let (bucket, root_path) = split_bucket_and_root(rest)?;
-            return Ok(Self::ObjectStore { bucket, root_path });
-        }
-
-        if raw.contains("://") {
-            return Err(format!(
-                "unsupported tablet_root_path scheme for inspect: {raw}"
-            ));
-        }
-        Ok(Self::Local {
-            root_dir: raw.to_string(),
-        })
-    }
-}
-
-fn split_bucket_and_root(value: &str) -> Result<(String, String), String> {
-    let trimmed = value.trim_matches('/');
-    let (bucket, root_path) = match trimmed.split_once('/') {
-        Some((bucket, path)) => (bucket, path),
-        None => (trimmed, ""),
-    };
-    if bucket.trim().is_empty() {
-        return Err(format!("missing bucket in tablet_root_path: {value}"));
-    }
-    Ok((bucket.to_string(), root_path.trim_matches('/').to_string()))
-}
-
-fn build_operator(
-    root: &TabletRoot,
-    fs_options: &BTreeMap<String, String>,
-) -> Result<Operator, String> {
-    match root {
-        TabletRoot::Local { root_dir } => {
-            let builder = opendal::services::Fs::default().root(root_dir);
-            let operator_builder =
-                Operator::new(builder).map_err(|e| format!("init local operator failed: {e}"))?;
-            Ok(operator_builder.finish())
-        }
-        TabletRoot::ObjectStore { bucket, root_path } => {
-            build_s3_operator(bucket, root_path, fs_options)
-        }
-    }
-}
-
-fn build_s3_operator(
-    bucket: &str,
-    root_path: &str,
-    fs_options: &BTreeMap<String, String>,
-) -> Result<Operator, String> {
-    let endpoint = fs_options
-        .get(FS_S3A_ENDPOINT)
-        .ok_or_else(|| "missing fs.s3a.endpoint for inspect".to_string())?;
-    let endpoint = normalize_endpoint(endpoint, fs_options.get(FS_S3A_ENABLE_SSL))?;
-
-    let mut builder = opendal::services::S3::default()
-        .bucket(bucket)
-        .endpoint(&endpoint);
-    if !root_path.is_empty() {
-        builder = builder.root(&format!("/{}", root_path));
-    }
-    if let Some(region) = fs_options
-        .get(FS_S3A_ENDPOINT_REGION)
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-    {
-        builder = builder.region(region);
-    } else {
-        builder = builder.region("us-east-1");
-    }
-    if let Some(access_key) = fs_options
-        .get(FS_S3A_ACCESS_KEY)
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-    {
-        builder = builder.access_key_id(access_key);
-    }
-    if let Some(secret_key) = fs_options
-        .get(FS_S3A_SECRET_KEY)
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-    {
-        builder = builder.secret_access_key(secret_key);
-    }
-    if let Some(token) = fs_options
-        .get(FS_S3A_SESSION_TOKEN)
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-    {
-        builder = builder.session_token(token);
-    }
-
-    let path_style = fs_options
-        .get(FS_S3A_PATH_STYLE)
-        .map(|v| is_true_value(v))
-        .unwrap_or(false);
-    if !path_style {
-        builder = builder.enable_virtual_host_style();
-    }
-
-    let operator_builder =
-        Operator::new(builder).map_err(|e| format!("init object store operator failed: {e}"))?;
-    Ok(operator_builder.finish())
-}
-
-fn normalize_endpoint(raw_endpoint: &str, ssl_option: Option<&String>) -> Result<String, String> {
-    let endpoint = raw_endpoint.trim();
-    if endpoint.is_empty() {
-        return Err("empty fs.s3a.endpoint for inspect".to_string());
-    }
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return Ok(endpoint.to_string());
-    }
-    let enable_ssl = ssl_option.map(|v| is_true_value(v)).unwrap_or(true);
-    let scheme = if enable_ssl { "https" } else { "http" };
-    Ok(format!("{scheme}://{endpoint}"))
-}
-
-fn is_true_value(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case("true") || value.trim() == "1"
-}
-
 fn read_all_bytes(
     rt: &tokio::runtime::Runtime,
     op: &Operator,
@@ -377,8 +234,15 @@ fn main() {
         std::process::exit(2);
     });
 
-    let snapshot = load_tablet_snapshot(cfg.tablet_id, cfg.version, &cfg.root, &cfg.fs_options)
-        .unwrap_or_else(|e| panic!("load_tablet_snapshot failed: {e}"));
+    let object_store_config = fs_access_tooling::object_store_config_from_fs_options(&cfg.fs_options)
+        .unwrap_or_else(|e| panic!("parse fs options failed: {e}"));
+    let snapshot = load_tablet_snapshot_with_object_store_config(
+        cfg.tablet_id,
+        cfg.version,
+        &cfg.root,
+        object_store_config.as_ref(),
+    )
+    .unwrap_or_else(|e| panic!("load_tablet_snapshot failed: {e}"));
     println!(
         "snapshot: tablet_id={}, version={}, segments={}",
         snapshot.tablet_id,
@@ -392,8 +256,9 @@ fn main() {
         );
     }
 
-    let footers = decode_footers_from_snapshot_with_io(&snapshot, &cfg.root, &cfg.fs_options)
-        .unwrap_or_else(|e| panic!("decode_footers_from_snapshot failed: {e}"));
+    let footers =
+        decode_footers_from_snapshot_with_io(&snapshot, &cfg.root, object_store_config.as_ref())
+            .unwrap_or_else(|e| panic!("decode_footers_from_snapshot failed: {e}"));
     for (sidx, footer) in footers.iter().enumerate() {
         println!(
             "footer[{sidx}]: version={:?}, num_rows={:?}, columns={}",
