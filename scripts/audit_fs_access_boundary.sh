@@ -67,6 +67,9 @@ is_allowed_core_hit() {
   fi
   case "$file:$text" in
     src/connector/iceberg/fs_io.rs:*FileIOBuilder::new* ) return 0 ;;
+    src/fs/local.rs:*'opendal::services::Fs::default'* ) return 0 ;;
+    src/fs/object_store.rs:*'opendal::services::S3::default'* ) return 0 ;;
+    src/fs/opendal.rs:*'opendal::services::Fs::default'* ) return 0 ;;
     src/fs/object_store.rs:*'fn build_object_store_operator'* ) return 0 ;;
     src/fs/access.rs:*'crate::fs::object_store::build_object_store_operator'* ) return 0 ;;
   esac
@@ -217,6 +220,11 @@ is_allowed_aws_hit() {
   esac
   case "$file:$text" in
     src/connector/starrocks/scan/op.rs:*'provide aws.s3.*'* ) return 0 ;;
+    src/runtime/starlet_shard_registry.rs:*'"aws.s3.endpoint"'* ) return 0 ;;
+    src/runtime/starlet_shard_registry.rs:*'"aws.s3.accessKeyId"'* ) return 0 ;;
+    src/runtime/starlet_shard_registry.rs:*'"aws.s3.accessKeySecret"'* ) return 0 ;;
+    src/runtime/starlet_shard_registry.rs:*'"aws.s3.region"'* ) return 0 ;;
+    src/runtime/starlet_shard_registry.rs:*'"aws.s3.enable_path_style_access"'* ) return 0 ;;
   esac
   return 1
 }

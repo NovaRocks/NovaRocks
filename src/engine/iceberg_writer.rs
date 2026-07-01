@@ -1317,10 +1317,8 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
         });
     }
 
-    let builder = opendal::services::Fs::default().root("/");
-    let fs = opendal::Operator::new(builder)
-        .map_err(|e| format!("build local-FS operator failed: {e}"))?
-        .finish();
+    let fs = crate::fs::local::build_fs_operator("/")
+        .map_err(|e| format!("build local-FS operator failed: {e}"))?;
     let mapper: CleanupPathMapper =
         Arc::new(|path: &str| path.strip_prefix("file://").unwrap_or(path).to_string());
     Ok(AbortCleanupOperator {

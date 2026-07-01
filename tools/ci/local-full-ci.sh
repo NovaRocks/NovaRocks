@@ -344,6 +344,8 @@ run_fail_fast_stage() {
 run_cargo_gates() {
   run_fail_fast_stage "thrift boundary audit" "thrift-boundary-audit.log" \
     python3 tools/dev/audit_thrift_boundaries.py --strict
+  run_fail_fast_stage "fs access boundary audit" "fs-access-boundary-audit.log" \
+    scripts/audit_fs_access_boundary.sh
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   run_fail_fast_stage "cargo clippy" "cargo-clippy.log" cargo clippy --all-targets
   run_fail_fast_stage "cargo build" "cargo-build.log" cargo build --profile "$NOVA_CI_CARGO_PROFILE"
