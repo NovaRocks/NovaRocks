@@ -43,7 +43,6 @@ use crate::formats::starrocks::writer::bundle_meta::next_rowset_id;
 use crate::formats::starrocks::writer::io::{read_bytes, write_bytes};
 use crate::formats::starrocks::writer::layout::{DATA_DIR, join_tablet_path};
 use crate::formats::starrocks::writer::read_bundle_parquet_snapshot_if_any;
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
     ColumnPb, DelfileWithRowsetId, DelvecMetadataPb, DelvecPagePb, FileMetaPb, KeysType,
@@ -549,28 +548,10 @@ fn build_metadata_object_store_profile(
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
 ) -> Result<Option<ObjectStoreProfile>, String> {
-    match classify_scan_paths([tablet_root_path])? {
-        ScanPathScheme::Local => {
-            if s3_config.is_some() {
-                return Err(format!(
-                    "primary key metadata loader got unexpected S3 config for local path={tablet_root_path}"
-                ));
-            }
-            Ok(None)
-        }
-        ScanPathScheme::Oss => {
-            let s3 = s3_config.ok_or_else(|| {
-                format!(
-                    "missing S3 config while building primary key metadata profile for path={tablet_root_path}"
-                )
-            })?;
-            let profile = ObjectStoreProfile::from_s3_store_config(s3)?;
-            Ok(Some(profile))
-        }
-        ScanPathScheme::Hdfs => Err(format!(
-            "primary key metadata loader does not support hdfs path yet: {tablet_root_path}"
-        )),
-    }
+    crate::connector::starrocks::fs_access::object_store_profile_for_tablet_root(
+        tablet_root_path,
+        s3_config,
+    )
 }
 
 fn encode_primary_keys_from_batch(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, String> {
@@ -1170,6 +1151,7 @@ mod tests {
     use crate::connector::starrocks::lake::delete_payload_codec::encode_delete_keys_payload;
     use crate::formats::starrocks::writer::layout::{DATA_DIR, join_tablet_path};
     use crate::formats::starrocks::writer::{io::write_bytes, write_parquet_file};
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, DelvecMetadataPb, DelvecPagePb, FileMetaPb, KeysType, RowsetMetadataPb,
         TabletMetadataPb, TabletSchemaPb, txn_log_pb,
@@ -1295,6 +1277,29 @@ mod tests {
         let profile = build_metadata_object_store_profile("/tmp/starust/pk_applier_test", None)
             .expect("build object store profile");
         assert!(profile.is_none());
+    }
+
+    #[test]
+    fn build_metadata_profile_rejects_object_store_bucket_mismatch() {
+        let err = build_metadata_object_store_profile(
+            "s3://bucket-b/starrocks/tablet-1",
+            Some(&test_s3_config()),
+        )
+        .expect_err("metadata profile must reject mismatched object-store buckets");
+
+        assert!(err.contains("bucket-b"), "{err}");
+        assert!(err.contains("bucket-a"), "{err}");
+    }
+
+    fn test_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            region: Some("us-east-1".to_string()),
+            enable_path_style_access: Some(true),
+        }
     }
 
     #[test]

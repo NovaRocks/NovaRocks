@@ -65,7 +65,6 @@ use crate::formats::starrocks::writer::{
     build_txn_data_file_name, read_bundle_parquet_snapshot_if_any, sort_batch_for_native_write,
     write_parquet_file,
 };
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::novarocks_logging::info;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
@@ -2262,28 +2261,10 @@ pub(crate) fn build_metadata_object_store_profile_for_partial(
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
 ) -> Result<Option<ObjectStoreProfile>, String> {
-    match classify_scan_paths([tablet_root_path])? {
-        ScanPathScheme::Local => {
-            if s3_config.is_some() {
-                return Err(format!(
-                    "unexpected S3 config for local tablet root while loading partial-update baseline: path={tablet_root_path}"
-                ));
-            }
-            Ok(None)
-        }
-        ScanPathScheme::Oss => {
-            let s3 = s3_config.ok_or_else(|| {
-                format!(
-                    "missing S3 config for object-store tablet while loading partial-update baseline: path={tablet_root_path}"
-                )
-            })?;
-            let profile = ObjectStoreProfile::from_s3_store_config(s3)?;
-            Ok(Some(profile))
-        }
-        ScanPathScheme::Hdfs => Err(format!(
-            "partial-update baseline metadata loader does not support hdfs path yet: {tablet_root_path}"
-        )),
-    }
+    crate::connector::starrocks::fs_access::object_store_profile_for_tablet_root(
+        tablet_root_path,
+        s3_config,
+    )
 }
 
 fn load_delete_keys_from_del_file(
@@ -4078,7 +4059,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        TabletWriteContext, append_lake_txn_log_with_rowset, build_tablet_output_schema,
+        TabletWriteContext, append_lake_txn_log_with_rowset,
+        build_metadata_object_store_profile_for_partial, build_tablet_output_schema,
         parse_default_literal_to_singleton_array, read_txn_log_if_exists, scalar_array_gt,
     };
     use crate::common::ids::SlotId;
@@ -4093,6 +4075,7 @@ mod tests {
     use crate::formats::starrocks::writer::layout::{
         DATA_DIR, join_tablet_path, txn_log_file_path, txn_log_file_path_with_load_id,
     };
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{
         BinaryPredicatePb, ColumnPb, DeletePredicatePb, KeysType, PUniqueId, RowsetMetadataPb,
@@ -5389,6 +5372,29 @@ mod tests {
                 vec![0x78, 0x00, 0x00, 0x80, 0x00, 0x00, 0x02],
             ]
         );
+    }
+
+    #[test]
+    fn partial_metadata_profile_rejects_object_store_bucket_mismatch() {
+        let err = build_metadata_object_store_profile_for_partial(
+            "s3://bucket-b/starrocks/tablet-1",
+            Some(&test_s3_config()),
+        )
+        .expect_err("partial metadata profile must reject mismatched object-store buckets");
+
+        assert!(err.contains("bucket-b"), "{err}");
+        assert!(err.contains("bucket-a"), "{err}");
+    }
+
+    fn test_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            region: Some("us-east-1".to_string()),
+            enable_path_style_access: Some(true),
+        }
     }
 
     #[test]
