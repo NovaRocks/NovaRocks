@@ -3002,7 +3002,6 @@ pub(crate) fn repartition_iceberg_mv(
             &ctx,
             &staging_branch,
             refresh_id,
-            aliases,
             &left_ref,
             &right_ref,
             &new_partition_contract,
@@ -8230,46 +8229,13 @@ fn build_aggregate_repartition_payload(
 
 fn build_join_projection_repartition_payload(
     state: &Arc<StandaloneState>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
-    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+    ctx: &IcebergMvRefreshContext,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
 ) -> Result<RepartitionRebuildPayload, String> {
-    let left_snapshot = pin
-        .get(left_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))?;
-    let right_snapshot = pin
-        .get(right_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))?;
-    let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
-    let mut full_refresh_query = base_query.clone();
-    rewrite_join_full_refresh_query(
-        &mut full_refresh_query,
-        left_ref,
-        left_snapshot,
-        right_ref,
-        right_snapshot,
-        &aliases.left_alias,
-        &aliases.right_alias,
-    )?;
-    let left_uuid = pin
-        .uuid(left_ref)
-        .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))?;
-    let right_uuid = pin
-        .uuid(right_ref)
-        .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))?;
-    let query = crate::engine::mv::iceberg_join_branch::rewrite_join_full_refresh_apply_query(
-        &base_query,
-        full_refresh_query,
-        left_uuid,
-        right_uuid,
-    )?;
-    let branch_catalog = build_join_snapshot_catalog(
-        state,
-        &[(left_ref, left_snapshot), (right_ref, right_snapshot)],
-    )?;
+    let JoinRefreshLogicalPlan { plan, factory, .. } =
+        build_join_full_refresh_logical_plan(state, ctx, left_ref, right_ref)?;
+    let catalog = build_iceberg_mv_planning_catalog(state, ctx)?;
     let connectors_snapshot = state
         .connectors
         .read()
@@ -8279,20 +8245,25 @@ fn build_join_projection_repartition_payload(
         .iceberg_catalogs
         .read()
         .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-    let result = crate::engine::execute_query_with_options(
-        &query,
-        &branch_catalog,
+    let result = crate::engine::execute_logical_plan_with_options(
+        plan,
+        factory,
+        &catalog,
         &connectors_snapshot,
-        current_database,
+        ctx.rewrite.current_database.as_str(),
         state.exchange_port,
         None,
         None,
         Some(&*catalogs_guard),
         None,
+        None,
     )?;
     let chunks = query_result_to_chunks(result)?;
     let chunks = strip_change_op_from_repartition_chunks(chunks)?;
-    Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
+    Ok(RepartitionRebuildPayload::from_chunks(
+        chunks,
+        &ctx.rewrite.pin,
+    ))
 }
 
 fn strip_change_op_from_repartition_chunks(
@@ -10418,7 +10389,6 @@ fn repartition_iceberg_join_mv_overwrite(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
     partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
@@ -10428,17 +10398,8 @@ fn repartition_iceberg_join_mv_overwrite(
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
-    let payload = match build_join_projection_repartition_payload(
-        state,
-        current_database,
-        mv_definition,
-        &ctx.rewrite.pin,
-        aliases,
-        left_ref,
-        right_ref,
-    ) {
+    let payload = match build_join_projection_repartition_payload(state, ctx, left_ref, right_ref) {
         Ok(payload) => payload,
         Err(err) => {
             return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
@@ -11606,6 +11567,31 @@ mod join_delta_append_only_fast_path_tests {
             assert!(
                 !route_body.contains(token),
                 "incremental join refresh production route still references legacy SQL path: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn join_repartition_payload_uses_logical_full_refresh_plan() {
+        let source = std::fs::read_to_string(file!()).expect("read source");
+        let payload_body = source_between(
+            &source,
+            "\nfn build_join_projection_repartition_payload(\n",
+            "\nfn strip_change_op_from_repartition_chunks(",
+        );
+
+        assert!(payload_body.contains("build_join_full_refresh_logical_plan("));
+        assert!(payload_body.contains("execute_logical_plan_with_options("));
+
+        let forbidden = [
+            "rewrite_join_full_refresh_query(",
+            "rewrite_join_full_refresh_apply_query(",
+            "execute_query_with_options(",
+        ];
+        for token in forbidden {
+            assert!(
+                !payload_body.contains(token),
+                "join repartition payload still references legacy SQL path: {token}"
             );
         }
     }
