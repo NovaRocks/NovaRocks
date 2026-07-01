@@ -1,4 +1,5 @@
 pub mod fe_v2_meta;
+pub(crate) mod fs_access;
 pub mod lake;
 mod object_store_profile;
 pub mod scan;
