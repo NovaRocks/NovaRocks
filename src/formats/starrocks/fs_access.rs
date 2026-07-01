@@ -26,6 +26,7 @@ use crate::connector::starrocks::fs_access::{
     StarRocksFsAccess, resolve_runtime_path, resolve_with_profile,
 };
 use crate::fs::access::{FsAccessResolver, FsScheme};
+use crate::fs::object_store::ObjectStoreConfig;
 
 const BUCKET_ROOT_COMPAT_MARKER: &str = "__novarocks_tablet_root_compat__";
 
@@ -83,8 +84,19 @@ pub(crate) fn resolve_format_tablet_access(
     tablet_root_path: &str,
     object_store_profile: Option<&ObjectStoreProfile>,
 ) -> Result<StarRocksFormatTabletAccess, String> {
+    let object_store_config = object_store_profile.map(ObjectStoreProfile::to_object_store_config);
+    resolve_format_tablet_access_with_object_store_config(
+        tablet_root_path,
+        object_store_config.as_ref(),
+    )
+}
+
+pub(crate) fn resolve_format_tablet_access_with_object_store_config(
+    tablet_root_path: &str,
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> Result<StarRocksFormatTabletAccess, String> {
     if is_literal_local_root(tablet_root_path) {
-        if object_store_profile.is_some() {
+        if object_store_config.is_some() {
             return Err(format!(
                 "StarRocks local path must not include object-store profile: path={tablet_root_path}"
             ));
@@ -102,23 +114,29 @@ pub(crate) fn resolve_format_tablet_access(
         // FsLocation requires a non-empty object-store path. Resolve a synthetic
         // path in the same bucket to build the operator while preserving the old
         // bucket-root tablet semantics at this facade boundary.
-        let access = resolve_with_profile(&bucket_root.synthetic_path, object_store_profile)?;
+        let handle = FsAccessResolver::new()
+            .resolve_location(&bucket_root.synthetic_path, object_store_config)?;
         return Ok(StarRocksFormatTabletAccess {
             root_location: bucket_root.normalized_root,
             root_relative_path: String::new(),
-            scheme: access.scheme(),
-            operator: access.operator(),
+            scheme: handle.scheme(),
+            operator: handle.operator(),
         });
     }
 
-    let access = resolve_with_profile(tablet_root_path, object_store_profile)?;
-    let root_relative_path = access.single_relative_path()?.to_string();
+    let handle = FsAccessResolver::new().resolve_location(tablet_root_path, object_store_config)?;
+    let root_relative_path = handle
+        .paths()
+        .first()
+        .ok_or_else(|| "resolved tablet root has no path".to_string())?
+        .operator_relative_path()
+        .to_string();
     let root_location = normalize_root_location(tablet_root_path);
     Ok(StarRocksFormatTabletAccess {
         root_location,
         root_relative_path,
-        scheme: access.scheme(),
-        operator: access.operator(),
+        scheme: handle.scheme(),
+        operator: handle.operator(),
     })
 }
 

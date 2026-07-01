@@ -43,10 +43,18 @@ pub const AWS_S3_CREDENTIAL_PROPERTY_KEYS: &[&str] = &[
     "aws.s3.timeout_ms",
     "aws.s3.io_timeout_ms",
 ];
+pub const FS_S3A_ENDPOINT_KEYS: &[&str] = &["fs.s3a.endpoint"];
+pub const FS_S3A_ACCESS_KEY_ID_KEYS: &[&str] = &["fs.s3a.access.key"];
+pub const FS_S3A_ACCESS_KEY_SECRET_KEYS: &[&str] = &["fs.s3a.secret.key"];
+pub const FS_S3A_SESSION_TOKEN_KEYS: &[&str] = &["fs.s3a.session.token"];
+pub const FS_S3A_REGION_KEYS: &[&str] = &["fs.s3a.endpoint.region"];
+pub const FS_S3A_ENABLE_SSL_KEYS: &[&str] = &["fs.s3a.connection.ssl.enabled"];
+pub const FS_S3A_ENABLE_PATH_STYLE_ACCESS_KEYS: &[&str] = &["fs.s3a.path.style.access"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectStoreCredentialsSource {
     AwsS3Properties,
+    S3AProperties,
     IcebergSinkCloudProperties,
     StandaloneConfig,
     StarRocksObjectStoreProfile,
@@ -57,6 +65,7 @@ impl ObjectStoreCredentialsSource {
     fn label(self) -> &'static str {
         match self {
             Self::AwsS3Properties => "aws_s3_properties",
+            Self::S3AProperties => "s3a_properties",
             Self::IcebergSinkCloudProperties => "iceberg_sink_cloud_properties",
             Self::StandaloneConfig => "standalone_config",
             Self::StarRocksObjectStoreProfile => "starrocks_object_store_profile",
@@ -123,6 +132,58 @@ impl ObjectStoreCredentials {
             retry_max_delay_ms: retry_settings.retry_max_delay_ms,
             timeout_ms: retry_settings.timeout_ms,
             io_timeout_ms: retry_settings.io_timeout_ms,
+        })
+    }
+
+    pub fn from_s3a_properties<S>(
+        source: ObjectStoreCredentialsSource,
+        props: &BTreeMap<S, S>,
+    ) -> Result<Self, String>
+    where
+        S: Borrow<str> + Ord,
+    {
+        let endpoint_raw =
+            required_property(source, props, FS_S3A_ENDPOINT_KEYS, "fs.s3a.endpoint")?;
+        let enable_ssl = parse_optional_bool_property(
+            source,
+            props,
+            FS_S3A_ENABLE_SSL_KEYS[0],
+            FS_S3A_ENABLE_SSL_KEYS,
+        )?;
+        let endpoint = normalize_s3a_endpoint(&endpoint_raw, enable_ssl)?;
+        let access_key_id = required_property(
+            source,
+            props,
+            FS_S3A_ACCESS_KEY_ID_KEYS,
+            "fs.s3a.access.key",
+        )?;
+        let access_key_secret = required_property(
+            source,
+            props,
+            FS_S3A_ACCESS_KEY_SECRET_KEYS,
+            "fs.s3a.secret.key",
+        )?;
+        let session_token = optional_string_property(props, FS_S3A_SESSION_TOKEN_KEYS);
+        let region = optional_string_property(props, FS_S3A_REGION_KEYS);
+        let enable_path_style_access = parse_optional_bool_property(
+            source,
+            props,
+            FS_S3A_ENABLE_PATH_STYLE_ACCESS_KEYS[0],
+            FS_S3A_ENABLE_PATH_STYLE_ACCESS_KEYS,
+        )?;
+
+        Ok(Self {
+            endpoint,
+            access_key_id,
+            access_key_secret,
+            session_token,
+            enable_path_style_access,
+            region,
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
         })
     }
 
@@ -283,6 +344,22 @@ fn parse_bool_value(value: &str) -> Option<bool> {
     }
 }
 
+fn normalize_s3a_endpoint(raw_endpoint: &str, enable_ssl: Option<bool>) -> Result<String, String> {
+    let endpoint = raw_endpoint.trim();
+    if endpoint.is_empty() {
+        return Err("s3a_properties object-store credentials missing fs.s3a.endpoint".to_string());
+    }
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        return Ok(endpoint.to_string());
+    }
+    let scheme = if enable_ssl.unwrap_or(true) {
+        "https"
+    } else {
+        "http"
+    };
+    Ok(format!("{scheme}://{endpoint}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +391,45 @@ mod tests {
         assert_eq!(credentials.access_key_secret, "sk");
         assert_eq!(credentials.region.as_deref(), Some("us-east-1"));
         assert_eq!(credentials.enable_path_style_access, Some(true));
+    }
+
+    #[test]
+    fn s3a_properties_normalize_endpoint_and_path_style() {
+        let credentials = ObjectStoreCredentials::from_s3a_properties(
+            ObjectStoreCredentialsSource::S3AProperties,
+            &props(&[
+                ("fs.s3a.endpoint", "localhost:9000"),
+                ("fs.s3a.access.key", "ak"),
+                ("fs.s3a.secret.key", "sk"),
+                ("fs.s3a.endpoint.region", "us-east-1"),
+                ("fs.s3a.connection.ssl.enabled", "false"),
+                ("fs.s3a.path.style.access", "true"),
+            ]),
+        )
+        .expect("parse s3a properties");
+
+        assert_eq!(credentials.endpoint, "http://localhost:9000");
+        assert_eq!(credentials.access_key_id, "ak");
+        assert_eq!(credentials.access_key_secret, "sk");
+        assert_eq!(credentials.region.as_deref(), Some("us-east-1"));
+        assert_eq!(credentials.enable_path_style_access, Some(true));
+    }
+
+    #[test]
+    fn s3a_properties_require_endpoint_access_key_and_secret() {
+        let err = ObjectStoreCredentials::from_s3a_properties(
+            ObjectStoreCredentialsSource::S3AProperties,
+            &props(&[
+                ("fs.s3a.endpoint", "localhost:9000"),
+                ("fs.s3a.access.key", "ak"),
+            ]),
+        )
+        .expect_err("missing secret key must fail");
+
+        assert!(
+            err.contains("s3a_properties object-store credentials missing fs.s3a.secret.key"),
+            "{err}"
+        );
     }
 
     #[test]

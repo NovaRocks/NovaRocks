@@ -31,7 +31,7 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::formats::starrocks::cache::{segment_footer_cache_get, segment_footer_cache_put};
 use crate::formats::starrocks::fs_access::{
     StarRocksFormatTabletAccess, operator_relative_path_for_tablet_root,
-    resolve_format_tablet_access,
+    resolve_format_tablet_access, resolve_format_tablet_access_with_object_store_config,
 };
 use crate::formats::starrocks::range_read::{ensure_exact_range_read_len, expected_range_len};
 use crate::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
@@ -144,6 +144,31 @@ pub fn load_tablet_snapshot(
     }
 
     let access = resolve_format_tablet_access(tablet_root_path, object_store_profile)?;
+    let rt = data_runtime()?;
+    load_tablet_snapshot_from_root(tablet_id, version, &access, rt.as_ref())
+}
+
+pub fn load_tablet_snapshot_with_object_store_config(
+    tablet_id: i64,
+    version: i64,
+    tablet_root_path: &str,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<StarRocksTabletSnapshot, String> {
+    if tablet_id <= 0 {
+        return Err(format!(
+            "invalid tablet_id for metadata loader: {tablet_id}"
+        ));
+    }
+    if version <= 0 {
+        return Err(format!(
+            "invalid tablet version for metadata loader: {version}"
+        ));
+    }
+
+    let access = resolve_format_tablet_access_with_object_store_config(
+        tablet_root_path,
+        object_store_config,
+    )?;
     let rt = data_runtime()?;
     load_tablet_snapshot_from_root(tablet_id, version, &access, rt.as_ref())
 }
