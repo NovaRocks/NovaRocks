@@ -7,6 +7,9 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::ObjectStoreProfile;
+use crate::connector::starrocks::fs_access::{
+    object_store_profile_for_tablet_root, resolve_tablet_root,
+};
 use crate::connector::starrocks::lake::append_lake_txn_log_with_chunk_rowset;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, update_tablet_runtime_schema,
@@ -22,7 +25,6 @@ use crate::formats::starrocks::data::build_native_record_batch;
 use crate::formats::starrocks::metadata::{load_bundle_segment_footers, load_tablet_snapshot};
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest;
 use crate::meta::repository::starrocks_txn::StoredStarRocksTxn;
 use crate::runtime::query_result::QueryResult;
@@ -1269,23 +1271,23 @@ fn s3_config_for_tablet_path(
     tablet_root_path: &str,
     starrocks_s3: &S3StoreConfig,
 ) -> Result<Option<S3StoreConfig>, String> {
-    match classify_scan_paths([tablet_root_path])? {
-        ScanPathScheme::Local => Ok(None),
-        ScanPathScheme::Oss => Ok(Some(starrocks_s3.clone())),
-        ScanPathScheme::Hdfs => Err(format!(
-            "StarRocks table write does not support hdfs tablet path yet: {tablet_root_path}"
-        )),
+    if resolve_tablet_root(tablet_root_path, None).is_ok() {
+        return Ok(None);
     }
+    resolve_tablet_root(tablet_root_path, Some(starrocks_s3))
+        .map_err(|err| format!("StarRocks table write invalid tablet path: {err}"))?;
+    Ok(Some(starrocks_s3.clone()))
 }
 
 fn object_store_profile_for_tablet_path(
     tablet_root_path: &str,
     starrocks_s3: &S3StoreConfig,
 ) -> Result<Option<ObjectStoreProfile>, String> {
-    s3_config_for_tablet_path(tablet_root_path, starrocks_s3)?
-        .as_ref()
-        .map(ObjectStoreProfile::from_s3_store_config)
-        .transpose()
+    if resolve_tablet_root(tablet_root_path, None).is_ok() {
+        return Ok(None);
+    }
+    object_store_profile_for_tablet_root(tablet_root_path, Some(starrocks_s3))
+        .map_err(|err| format!("StarRocks table write invalid tablet path: {err}"))
 }
 
 /// Drive `publish_version` for a specific txn against the given tablet ids.
@@ -1604,6 +1606,57 @@ mod tests {
             largeint::value_at(values, 2).expect("row 2"),
             i64::MAX as i128
         );
+    }
+
+    #[test]
+    fn object_store_profile_for_tablet_path_rejects_s3_bucket_mismatch() {
+        let starrocks_s3 = S3StoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            region: Some("us-east-1".to_string()),
+            enable_path_style_access: Some(true),
+        };
+
+        let err =
+            object_store_profile_for_tablet_path("s3://bucket-b/warehouse/tablet-1", &starrocks_s3)
+                .expect_err("tablet root bucket must match ambient StarRocks S3 config");
+
+        assert!(err.contains("bucket-b"), "err={err}");
+        assert!(err.contains("bucket-a"), "err={err}");
+    }
+
+    #[test]
+    fn s3_config_for_tablet_path_ignores_ambient_s3_for_local_path() {
+        let starrocks_s3 = test_s3_config();
+
+        let resolved = s3_config_for_tablet_path("/tmp/starrocks/tablet-1", &starrocks_s3)
+            .expect("local tablet path should be valid without attached S3 config");
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn object_store_profile_for_tablet_path_ignores_ambient_s3_for_local_path() {
+        let starrocks_s3 = test_s3_config();
+
+        let resolved =
+            object_store_profile_for_tablet_path("/tmp/starrocks/tablet-1", &starrocks_s3)
+                .expect("local tablet path should not treat ambient S3 as attached config");
+
+        assert_eq!(resolved, None);
+    }
+
+    fn test_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            region: Some("us-east-1".to_string()),
+            enable_path_style_access: Some(true),
+        }
     }
 }
 

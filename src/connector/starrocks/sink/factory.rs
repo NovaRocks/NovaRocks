@@ -28,6 +28,7 @@ use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
     LakeTableIdentity, LakeTabletPartitionRef, resolve_tablet_paths_for_olap_sink,
 };
+use crate::connector::starrocks::fs_access::resolve_tablet_root;
 use crate::connector::starrocks::lake::TabletWriteContext;
 use crate::connector::starrocks::lake::context::{
     AutoIncrementWritePolicy, PartialUpdateWritePolicy, get_tablet_runtime,
@@ -48,10 +49,9 @@ use crate::connector::starrocks::sink::routing::{RowRoutingPlan, build_sink_rout
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::info;
-use crate::runtime::starlet_shard_registry;
+use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId, TabletSchemaPb};
 
 const LOAD_OP_COLUMN: &str = "__op";
@@ -82,6 +82,7 @@ mod tests {
         SinkNodesDescriptor, SinkPartitionDescriptor, SinkPartitionEntry, SinkPartitionIndex,
         SinkSchemaDescriptor, SinkSlotDescriptor, SinkTabletLocation, StarRocksSinkDescriptor,
     };
+    use crate::runtime::starlet_shard_registry::{S3StoreConfig, StarletShardInfo};
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
     };
@@ -362,6 +363,115 @@ mod tests {
 
         assert_eq!(resolved.keys_type, Some(KeysType::DupKeys as i32));
     }
+
+    #[test]
+    fn resolve_s3_for_sink_tablet_rejects_local_path_with_attached_s3_config() {
+        let err = super::resolve_s3_for_sink_tablet(
+            100,
+            "/tmp/starrocks/tablet-100",
+            Some(test_s3_config()),
+            None,
+        )
+        .expect_err("local tablet root must not silently drop selected S3 config");
+
+        assert!(err.contains("OLAP_TABLE_SINK"), "err={err}");
+        assert!(err.contains("local"), "err={err}");
+        assert!(err.contains("S3"), "err={err}");
+    }
+
+    #[test]
+    fn resolve_s3_for_sink_tablet_reports_missing_object_store_config_with_sink_prefix() {
+        let _guard = lock_runtime_test_state();
+        let err =
+            super::resolve_s3_for_sink_tablet(100, "s3://bucket-a/lake/tablet-100", None, None)
+                .expect_err("object-store tablet root requires S3 config");
+
+        assert!(err.contains("OLAP_TABLE_SINK"), "err={err}");
+        assert!(err.contains("missing S3 config"), "err={err}");
+        assert!(err.contains("tablet 100"), "err={err}");
+    }
+
+    #[test]
+    fn resolve_s3_for_sink_tablet_prefers_shard_over_runtime_config() {
+        let mut from_shard = test_s3_config();
+        from_shard.access_key_id = "shard-ak".to_string();
+        let mut from_runtime = test_s3_config();
+        from_runtime.access_key_id = "runtime-ak".to_string();
+
+        let resolved = super::resolve_s3_for_sink_tablet(
+            100,
+            "s3://bucket-a/lake/tablet-100",
+            Some(from_shard.clone()),
+            Some(from_runtime),
+        )
+        .expect("resolve S3 for shard-backed tablet")
+        .expect("object-store path should select S3 config");
+
+        assert_eq!(resolved.access_key_id, from_shard.access_key_id);
+    }
+
+    #[test]
+    fn resolve_s3_for_sink_tablet_prefers_runtime_over_inferred_config() {
+        let _guard = lock_runtime_test_state();
+        let mut inferred = test_s3_config();
+        inferred.access_key_id = "inferred-ak".to_string();
+        let mut from_runtime = test_s3_config();
+        from_runtime.access_key_id = "runtime-ak".to_string();
+        crate::runtime::starlet_shard_registry::upsert_many_infos(vec![(
+            100,
+            StarletShardInfo {
+                full_path: "s3://bucket-a/lake/tablet-100".to_string(),
+                s3: Some(inferred),
+            },
+        )]);
+
+        let resolved = super::resolve_s3_for_sink_tablet(
+            100,
+            "s3://bucket-a/lake/tablet-100",
+            None,
+            Some(from_runtime.clone()),
+        )
+        .expect("resolve S3 for runtime-backed tablet")
+        .expect("object-store path should select S3 config");
+
+        assert_eq!(resolved.access_key_id, from_runtime.access_key_id);
+    }
+
+    #[test]
+    fn resolve_s3_for_sink_tablet_uses_inferred_config_without_shard_or_runtime() {
+        let _guard = lock_runtime_test_state();
+        let mut inferred = test_s3_config();
+        inferred.access_key_id = "inferred-ak".to_string();
+        crate::runtime::starlet_shard_registry::upsert_many_infos(vec![(
+            100,
+            StarletShardInfo {
+                full_path: "s3://bucket-a/lake/tablet-100".to_string(),
+                s3: Some(inferred.clone()),
+            },
+        )]);
+
+        let resolved = super::resolve_s3_for_sink_tablet(
+            100,
+            "s3://bucket-a/lake/tablet-100/data/0001.dat",
+            None,
+            None,
+        )
+        .expect("resolve S3 from inferred registry config")
+        .expect("object-store path should select inferred S3 config");
+
+        assert_eq!(resolved.access_key_id, inferred.access_key_id);
+    }
+
+    fn test_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            region: Some("us-east-1".to_string()),
+            enable_path_style_access: Some(true),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -563,40 +673,21 @@ impl OlapTableSinkFactory {
                         )
                     })?,
                     context: {
-                        let scheme = classify_scan_paths([tablet_root_path.as_str()])?;
-                        let s3_config = match scheme {
-                            ScanPathScheme::Local => None,
-                            ScanPathScheme::Oss => {
-                                let from_shard =
-                                    shard_infos.get(tablet_id).and_then(|info| info.s3.clone());
-                                let from_runtime = if from_shard.is_none() {
-                                    get_tablet_runtime(*tablet_id)
-                                        .ok()
-                                        .and_then(|entry| entry.s3_config.clone())
-                                } else {
-                                    None
-                                };
-                                let inferred = if from_shard.is_none() && from_runtime.is_none() {
-                                    starlet_shard_registry::infer_s3_config_for_path(
-                                        tablet_root_path,
-                                    )
-                                } else {
-                                    None
-                                };
-                                Some(from_shard.or(from_runtime).or(inferred).ok_or_else(|| {
-                                    format!(
-                                        "OLAP_TABLE_SINK missing S3 config for object-store tablet {} (path={})",
-                                        tablet_id, tablet_root_path
-                                    )
-                                })?)
-                            }
-                            ScanPathScheme::Hdfs => {
-                                return Err(format!(
-                                    "OLAP_TABLE_SINK does not support hdfs tablet path yet: tablet_id={} path={}",
-                                    tablet_id, tablet_root_path
-                                ));
-                            }
+                        let from_shard =
+                            shard_infos.get(tablet_id).and_then(|info| info.s3.clone());
+                        let from_runtime = if from_shard.is_none() {
+                            get_tablet_runtime(*tablet_id)
+                                .ok()
+                                .and_then(|entry| entry.s3_config.clone())
+                        } else {
+                            None
                         };
+                        let s3_config = resolve_s3_for_sink_tablet(
+                            *tablet_id,
+                            tablet_root_path,
+                            from_shard,
+                            from_runtime,
+                        )?;
                         TabletWriteContext {
                             db_id: descriptor.db_id,
                             table_id: descriptor.table_id,
@@ -1352,4 +1443,29 @@ fn load_lake_catalog() -> Result<String, String> {
 fn load_lake_data_write_format() -> Result<StarRocksWriteFormat, String> {
     let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
     StarRocksWriteFormat::parse(&cfg.starrocks.lake_data_write_format)
+}
+
+pub(crate) fn resolve_s3_for_sink_tablet(
+    tablet_id: i64,
+    tablet_root_path: &str,
+    from_shard: Option<S3StoreConfig>,
+    from_runtime: Option<S3StoreConfig>,
+) -> Result<Option<S3StoreConfig>, String> {
+    let selected = from_shard
+        .or(from_runtime)
+        .or_else(|| starlet_shard_registry::infer_s3_config_for_path(tablet_root_path));
+    resolve_tablet_root(tablet_root_path, selected.as_ref()).map_err(|err| {
+        if selected.is_none() {
+            format!(
+                "OLAP_TABLE_SINK missing S3 config or invalid tablet root for tablet {} (path={}): {}",
+                tablet_id, tablet_root_path, err
+            )
+        } else {
+            format!(
+                "OLAP_TABLE_SINK invalid tablet root for tablet {} (path={}): {}",
+                tablet_id, tablet_root_path, err
+            )
+        }
+    })?;
+    Ok(selected)
 }

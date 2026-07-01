@@ -76,6 +76,20 @@ pub(crate) fn resolve_with_profile(
     resolve_with_object_store_config(path, object_store_config.as_ref())
 }
 
+pub(crate) fn path_requires_object_store_profile(path: &str) -> Result<bool, String> {
+    let resolver = FsAccessResolver::new();
+    let location = resolver
+        .parse_location(path)
+        .map_err(|err| format!("{err}; path={path}"))?;
+    match location.scheme() {
+        FsScheme::Local => Ok(false),
+        FsScheme::ObjectStore => Ok(true),
+        FsScheme::Hdfs => Err(format!(
+            "HDFS StarRocks fs path is unsupported; path={path}"
+        )),
+    }
+}
+
 pub(crate) fn object_store_profile_for_tablet_root(
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
@@ -333,6 +347,30 @@ mod tests {
         assert!(err.contains("unsupported"), "{err}");
         assert!(
             err.contains("tablet_root_path=hdfs://nn:9000/starrocks/tablet-1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn path_requires_object_store_profile_distinguishes_local_and_object_store() {
+        assert!(
+            !path_requires_object_store_profile("/lake/tablet-1").expect("local path should parse")
+        );
+        assert!(
+            path_requires_object_store_profile("s3://bucket-a/warehouse/tablet-1")
+                .expect("object-store path should parse")
+        );
+    }
+
+    #[test]
+    fn path_requires_object_store_profile_rejects_hdfs() {
+        let err = path_requires_object_store_profile("hdfs://nn:9000/starrocks/tablet-1")
+            .expect_err("HDFS is unsupported");
+
+        assert!(err.contains("HDFS"), "{err}");
+        assert!(err.contains("unsupported"), "{err}");
+        assert!(
+            err.contains("path=hdfs://nn:9000/starrocks/tablet-1"),
             "{err}"
         );
     }

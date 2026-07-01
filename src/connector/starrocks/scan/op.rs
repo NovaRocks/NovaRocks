@@ -20,11 +20,13 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::connector::MinMaxPredicate;
+use crate::connector::starrocks::fs_access::{
+    path_requires_object_store_profile, resolve_with_profile,
+};
 use crate::connector::starrocks::object_store_profile::ObjectStoreProfile;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::starlet_shard_registry;
@@ -473,6 +475,10 @@ fn resolve_object_store_profile<'a>(
     storage_paths: impl Iterator<Item = &'a String>,
 ) -> Result<Option<ObjectStoreProfile>, String> {
     if let Some(profile) = ObjectStoreProfile::from_properties_optional(props)? {
+        let paths = storage_paths.cloned().collect::<Vec<_>>();
+        for path in &paths {
+            resolve_with_profile(path, Some(&profile))?;
+        }
         eprintln!(
             "[DEBUG] starrocks direct read explicit object store profile endpoint={}",
             profile.endpoint
@@ -488,49 +494,56 @@ fn resolve_object_store_profile<'a>(
     if paths.is_empty() {
         return Ok(None);
     }
-    match classify_scan_paths(paths.iter().map(|path| path.as_str()))? {
-        ScanPathScheme::Local => Ok(None),
-        ScanPathScheme::Hdfs => Err(
-            "starrocks direct read does not support hdfs tablet paths without explicit cloud configuration"
-                .to_string(),
-        ),
-        ScanPathScheme::Oss => {
-            let mut selected: Option<crate::runtime::starlet_shard_registry::S3StoreConfig> = None;
-            for path in &paths {
-                let s3 = starlet_shard_registry::infer_s3_config_for_path(path).ok_or_else(|| {
-                    format!(
-                        "missing object store config for direct-read path={path}; provide aws.s3.* \
-                         properties or ensure shard/env credentials can be inferred"
-                    )
-                })?;
-                match selected.as_ref() {
-                    None => selected = Some(s3),
-                    Some(prev) if prev == &s3 => {}
-                    Some(prev) => {
-                        return Err(format!(
-                            "inconsistent inferred object store configs across starrocks direct-read paths: \
-                             current_bucket={} current_endpoint={} previous_bucket={} previous_endpoint={}",
-                            s3.bucket, s3.endpoint, prev.bucket, prev.endpoint
-                        ));
-                    }
-                }
+
+    let mut selected: Option<crate::runtime::starlet_shard_registry::S3StoreConfig> = None;
+    let mut requires_profile_seen: Option<bool> = None;
+    for path in &paths {
+        let requires_profile = path_requires_object_store_profile(path)?;
+        if let Some(prev) = requires_profile_seen {
+            if prev != requires_profile {
+                return Err("mixed scan path schemes are not allowed".to_string());
             }
-            selected
-                .as_ref()
-                .map(|config| {
-                    eprintln!(
-                        "[DEBUG] starrocks direct read inferred object store config bucket={} endpoint={}",
-                        config.bucket, config.endpoint
-                    );
-                    info!(
-                        "starrocks direct read inferred object store config bucket={} endpoint={}",
-                        config.bucket, config.endpoint
-                    );
-                    ObjectStoreProfile::from_s3_store_config(config)
-                })
-                .transpose()
+        } else {
+            requires_profile_seen = Some(requires_profile);
+        }
+        if !requires_profile {
+            resolve_with_profile(path, None)?;
+            continue;
+        }
+        let s3 = starlet_shard_registry::infer_s3_config_for_path(path).ok_or_else(|| {
+            format!(
+                "missing object store config for direct-read path={path}; provide aws.s3.* \
+                 properties or ensure shard/env credentials can be inferred"
+            )
+        })?;
+        let profile = ObjectStoreProfile::from_s3_store_config(&s3)?;
+        resolve_with_profile(path, Some(&profile))?;
+        match selected.as_ref() {
+            None => selected = Some(s3),
+            Some(prev) if prev == &s3 => {}
+            Some(prev) => {
+                return Err(format!(
+                    "inconsistent inferred object store configs across starrocks direct-read paths: \
+                     current_bucket={} current_endpoint={} previous_bucket={} previous_endpoint={}",
+                    s3.bucket, s3.endpoint, prev.bucket, prev.endpoint
+                ));
+            }
         }
     }
+    selected
+        .as_ref()
+        .map(|config| {
+            eprintln!(
+                "[DEBUG] starrocks direct read inferred object store config bucket={} endpoint={}",
+                config.bucket, config.endpoint
+            );
+            info!(
+                "starrocks direct read inferred object store config bucket={} endpoint={}",
+                config.bucket, config.endpoint
+            );
+            ObjectStoreProfile::from_s3_store_config(config)
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -664,5 +677,52 @@ mod tests {
         let err = resolve_object_store_profile(&props, paths.iter())
             .expect_err("must fail fast for unknown cluster profile");
         assert!(err.contains("missing object store config"), "err={err}");
+    }
+
+    #[test]
+    fn direct_read_explicit_profile_rejects_local_storage_path() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "aws.s3.endpoint".to_string(),
+            "http://localhost:9000".to_string(),
+        );
+        props.insert("aws.s3.accessKeyId".to_string(), "ak".to_string());
+        props.insert("aws.s3.accessKeySecret".to_string(), "sk".to_string());
+        let paths = vec!["/tmp/starrocks/tablet-1".to_string()];
+
+        let err = resolve_object_store_profile(&props, paths.iter())
+            .expect_err("explicit object-store profile must be validated against scan paths");
+
+        assert!(err.contains("local"), "err={err}");
+        assert!(err.contains("ObjectStoreProfile"), "err={err}");
+    }
+
+    #[test]
+    fn direct_read_inferred_profile_rejects_mixed_local_and_object_store_paths() {
+        let _guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
+        crate::runtime::starlet_shard_registry::upsert_many_infos(vec![(
+            10,
+            crate::runtime::starlet_shard_registry::StarletShardInfo {
+                full_path: "s3://bucket-a/lake/tablet-10".to_string(),
+                s3: Some(crate::runtime::starlet_shard_registry::S3StoreConfig {
+                    endpoint: "http://localhost:9000".to_string(),
+                    bucket: "bucket-a".to_string(),
+                    access_key_id: "ak".to_string(),
+                    access_key_secret: "sk".to_string(),
+                    region: Some("us-east-1".to_string()),
+                    enable_path_style_access: Some(true),
+                }),
+            },
+        )]);
+        let props = BTreeMap::new();
+        let paths = vec![
+            "/tmp/starrocks/tablet-1".to_string(),
+            "s3://bucket-a/lake/tablet-10/data/0001.dat".to_string(),
+        ];
+
+        let err = resolve_object_store_profile(&props, paths.iter())
+            .expect_err("mixed direct-read path schemes must be rejected");
+
+        assert!(err.contains("mixed"), "err={err}");
     }
 }

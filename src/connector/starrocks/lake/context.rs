@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::ids::SlotId;
+use crate::connector::starrocks::fs_access::resolve_tablet_root;
 use crate::connector::starrocks::sink::plan::FrontendAddress;
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
 use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
 use crate::thrift::types;
@@ -221,32 +221,12 @@ pub(crate) fn register_tablet_runtime(ctx: &TabletWriteContext) -> Result<(), St
     if root_path.is_empty() {
         return Err("tablet_root_path is empty for runtime registry".to_string());
     }
-    let scheme = classify_scan_paths([root_path.as_str()])?;
-    let s3_config = match scheme {
-        ScanPathScheme::Local => {
-            if ctx.s3_config.is_some() {
-                return Err(format!(
-                    "tablet runtime for local path must not include S3 config: tablet_id={} path={}",
-                    ctx.tablet_id, root_path
-                ));
-            }
-            None
-        }
-        ScanPathScheme::Oss => {
-            let raw = ctx.s3_config.as_ref().ok_or_else(|| {
-                format!(
-                    "missing S3 config for object-store tablet runtime: tablet_id={} path={}",
-                    ctx.tablet_id, root_path
-                )
-            })?;
-            Some(normalize_s3_config(raw)?)
-        }
-        ScanPathScheme::Hdfs => {
-            return Err(format!(
-                "tablet runtime does not support hdfs path yet: tablet_id={} path={}",
-                ctx.tablet_id, root_path
-            ));
-        }
+    resolve_tablet_root(&root_path, ctx.s3_config.as_ref())
+        .map_err(|err| format!("tablet runtime invalid root path: {err}"))?;
+    let s3_config = if let Some(raw) = ctx.s3_config.as_ref() {
+        Some(normalize_s3_config(raw)?)
+    } else {
+        None
     };
     let entry = TabletRuntimeEntry {
         root_path: root_path.clone(),
