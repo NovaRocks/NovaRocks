@@ -416,6 +416,37 @@ mod tests {
     }
 
     #[test]
+    fn s3a_properties_require_endpoint() {
+        let err = ObjectStoreCredentials::from_s3a_properties(
+            ObjectStoreCredentialsSource::S3AProperties,
+            &props(&[("fs.s3a.access.key", "ak"), ("fs.s3a.secret.key", "sk")]),
+        )
+        .expect_err("missing endpoint must fail");
+
+        assert!(
+            err.contains("s3a_properties object-store credentials missing fs.s3a.endpoint"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn s3a_properties_require_access_key() {
+        let err = ObjectStoreCredentials::from_s3a_properties(
+            ObjectStoreCredentialsSource::S3AProperties,
+            &props(&[
+                ("fs.s3a.endpoint", "localhost:9000"),
+                ("fs.s3a.secret.key", "sk"),
+            ]),
+        )
+        .expect_err("missing access key must fail");
+
+        assert!(
+            err.contains("s3a_properties object-store credentials missing fs.s3a.access.key"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn s3a_properties_require_endpoint_access_key_and_secret() {
         let err = ObjectStoreCredentials::from_s3a_properties(
             ObjectStoreCredentialsSource::S3AProperties,
