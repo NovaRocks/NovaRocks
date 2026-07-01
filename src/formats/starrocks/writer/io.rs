@@ -36,7 +36,8 @@ pub fn write_bytes(path: &str, bytes: Vec<u8>) -> Result<(), String> {
         }
         FsScheme::ObjectStore => {
             let rel = access.single_relative_path()?.to_string();
-            let write_result = crate::fs::oss::oss_block_on(access.operator().write(&rel, bytes))?;
+            let write_result =
+                crate::fs::object_store::oss_block_on(access.operator().write(&rel, bytes))?;
             write_result.map_err(|e| format!("write object failed: {}", e))?;
             Ok(())
         }
@@ -55,7 +56,8 @@ pub fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
         FsScheme::Local => fs::read(path).map_err(|e| format!("read file failed: {}", e)),
         FsScheme::ObjectStore => {
             let rel = access.single_relative_path()?.to_string();
-            let read_result = crate::fs::oss::oss_block_on(access.operator().read(&rel))?;
+            let read_result =
+                crate::fs::object_store::oss_block_on(access.operator().read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read object failed: {}", e))?;
             Ok(bytes.to_vec())
         }
@@ -81,7 +83,7 @@ pub fn read_bytes_if_exists(path: &str) -> Result<Option<Vec<u8>>, String> {
         }
         FsScheme::ObjectStore => {
             let rel = access.single_relative_path()?.to_string();
-            match crate::fs::oss::oss_block_on(access.operator().read(&rel))? {
+            match crate::fs::object_store::oss_block_on(access.operator().read(&rel))? {
                 Ok(bytes) => Ok(Some(bytes.to_vec())),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(format!("read object failed: {}", e)),
@@ -107,7 +109,7 @@ pub fn delete_path_if_exists(path: &str) -> Result<(), String> {
         }
         FsScheme::ObjectStore => {
             let rel = access.single_relative_path()?.to_string();
-            match crate::fs::oss::oss_block_on(access.operator().delete(&rel))? {
+            match crate::fs::object_store::oss_block_on(access.operator().delete(&rel))? {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(format!("delete object failed: {}", e)),

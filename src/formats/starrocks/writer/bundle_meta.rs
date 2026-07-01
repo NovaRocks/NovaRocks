@@ -560,7 +560,7 @@ fn list_metadata_file_names_object_store(
     } else {
         format!("{}/", rel_root)
     };
-    crate::fs::oss::oss_block_on(async {
+    crate::fs::object_store::oss_block_on(async {
         let mut names = Vec::new();
         let mut lister = access
             .operator()

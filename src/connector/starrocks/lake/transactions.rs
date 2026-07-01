@@ -2105,7 +2105,7 @@ fn file_size_if_exists(
                     format!("resolve object-store stat path failed: path={path}, error={err}")
                 })?
                 .to_string();
-            match crate::fs::oss::oss_block_on(op.stat(&rel))? {
+            match crate::fs::object_store::oss_block_on(op.stat(&rel))? {
                 Ok(meta) => Ok(Some(
                     i64::try_from(meta.content_length()).unwrap_or(i64::MAX),
                 )),

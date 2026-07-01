@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::connector::starrocks::fs_access::resolve_tablet_root;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
 use crate::engine::StandaloneState;
-use crate::fs::oss::oss_block_on;
+use crate::fs::object_store::oss_block_on;
 use crate::novarocks_logging::warn;
 
 const ERASE_RETRY_DELAY_MS: i64 = 5_000;

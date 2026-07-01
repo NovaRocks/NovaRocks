@@ -25,9 +25,3 @@ pub mod opendal;
 pub mod path;
 pub mod range_plan;
 pub mod scan_context;
-
-// Compatibility shim during module migration. New code should use
-// `crate::fs::object_store::*` directly.
-pub mod oss {
-    pub use super::object_store::*;
-}
