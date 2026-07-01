@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use opendal::{ErrorKind, Operator};
 
 use novarocks::formats::starrocks::metadata::load_tablet_snapshot_with_object_store_config;
 use novarocks::formats::starrocks::plan::build_native_read_plan;
@@ -120,18 +119,16 @@ fn parse_args() -> Result<InspectConfig, String> {
 }
 
 fn decode_footers_from_snapshot_with_io(
-    snapshot: &starust::formats::starrocks::metadata::StarRocksTabletSnapshot,
-    tablet_root_path: &str,
+    snapshot: &novarocks::formats::starrocks::metadata::StarRocksTabletSnapshot,
     object_store_config: Option<&novarocks::fs::object_store::ObjectStoreConfig>,
 ) -> Result<Vec<StarRocksSegmentFooter>, String> {
-    let root_access =
-        fs_access_tooling::resolve_tool_location(tablet_root_path, object_store_config)?;
-    let op = root_access.operator();
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("create tokio runtime for inspect failed: {e}"))?;
 
     let mut out = Vec::with_capacity(snapshot.segment_files.len());
     for (idx, seg) in snapshot.segment_files.iter().enumerate() {
+        let access = fs_access_tooling::resolve_tool_location(&seg.path, object_store_config)?;
+        let rel = fs_access_tooling::single_relative_path(&access, &seg.path)?;
         let (mode, decode_bytes) = match (seg.bundle_file_offset, seg.segment_size) {
             (Some(offset), Some(size)) => {
                 let start = u64::try_from(offset).map_err(|_| {
@@ -146,7 +143,7 @@ fn decode_footers_from_snapshot_with_io(
                         seg.path
                     )
                 })?;
-                let bytes = read_range_bytes(&rt, &op, &seg.relative_path, start, end).map_err(|e| {
+                let bytes = read_range_bytes(&rt, &access, &rel, start, end).map_err(|e| {
                     format!(
                         "read bundle segment range failed: index={idx}, path={}, range={}..{}, error={e}",
                         seg.path, start, end
@@ -155,7 +152,7 @@ fn decode_footers_from_snapshot_with_io(
                 ("bundle", bytes)
             }
             (None, Some(_)) | (None, None) => {
-                let bytes = read_all_bytes(&rt, &op, &seg.relative_path).map_err(|e| {
+                let bytes = read_all_bytes(&rt, &access, &rel).map_err(|e| {
                     format!(
                         "read standalone segment failed: index={idx}, path={}, error={e}",
                         seg.path
@@ -188,21 +185,18 @@ fn decode_footers_from_snapshot_with_io(
 
 fn read_all_bytes(
     rt: &tokio::runtime::Runtime,
-    op: &Operator,
+    access: &novarocks::fs::access::FsAccessHandle,
     path: &str,
 ) -> Result<Vec<u8>, String> {
-    rt.block_on(op.read(path)).map(|v| v.to_vec()).map_err(|e| {
-        if e.kind() == ErrorKind::NotFound {
-            format!("segment file not found: {}", path)
-        } else {
-            format!("read segment file failed: path={}, error={}", path, e)
-        }
-    })
+    let op = access.operator();
+    rt.block_on(op.read(path))
+        .map(|v| v.to_vec())
+        .map_err(|e| format!("read segment file failed: path={}, error={}", path, e))
 }
 
 fn read_range_bytes(
     rt: &tokio::runtime::Runtime,
-    op: &Operator,
+    access: &novarocks::fs::access::FsAccessHandle,
     path: &str,
     start: u64,
     end: u64,
@@ -213,17 +207,14 @@ fn read_range_bytes(
             path, start, end
         ));
     }
+    let op = access.operator();
     rt.block_on(op.read_with(path).range(start..end).into_future())
         .map(|v| v.to_vec())
         .map_err(|e| {
-            if e.kind() == ErrorKind::NotFound {
-                format!("segment file not found: {}", path)
-            } else {
-                format!(
-                    "read segment file range failed: path={}, range={}..{}, error={}",
-                    path, start, end, e
-                )
-            }
+            format!(
+                "read segment file range failed: path={}, range={}..{}, error={}",
+                path, start, end, e
+            )
         })
 }
 
@@ -234,8 +225,9 @@ fn main() {
         std::process::exit(2);
     });
 
-    let object_store_config = fs_access_tooling::object_store_config_from_fs_options(&cfg.fs_options)
-        .unwrap_or_else(|e| panic!("parse fs options failed: {e}"));
+    let object_store_config =
+        fs_access_tooling::object_store_config_from_fs_options(&cfg.fs_options)
+            .unwrap_or_else(|e| panic!("parse fs options failed: {e}"));
     let snapshot = load_tablet_snapshot_with_object_store_config(
         cfg.tablet_id,
         cfg.version,
@@ -256,9 +248,8 @@ fn main() {
         );
     }
 
-    let footers =
-        decode_footers_from_snapshot_with_io(&snapshot, &cfg.root, object_store_config.as_ref())
-            .unwrap_or_else(|e| panic!("decode_footers_from_snapshot failed: {e}"));
+    let footers = decode_footers_from_snapshot_with_io(&snapshot, object_store_config.as_ref())
+        .unwrap_or_else(|e| panic!("decode_footers_from_snapshot failed: {e}"));
     for (sidx, footer) in footers.iter().enumerate() {
         println!(
             "footer[{sidx}]: version={:?}, num_rows={:?}, columns={}",

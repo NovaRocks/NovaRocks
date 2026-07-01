@@ -90,7 +90,10 @@ fn parse_args() -> Result<ProbeConfig, String> {
     Ok(cfg)
 }
 
-fn dump_tablet_meta(tablet_id: i64, meta: &novarocks::service::grpc_client::proto::starrocks::TabletMetadataPb) {
+fn dump_tablet_meta(
+    tablet_id: i64,
+    meta: &novarocks::service::grpc_client::proto::starrocks::TabletMetadataPb,
+) {
     println!(
         "tablet={} meta_version={:?} rowsets={} next_rowset_id={:?} commit_time={:?} gtid={:?}",
         tablet_id,
@@ -133,19 +136,13 @@ fn dump_tablet_meta(tablet_id: i64, meta: &novarocks::service::grpc_client::prot
             .copied()
             .collect::<Vec<_>>();
         versions.sort_unstable();
-        println!(
-            "  delvec versions={} detail={:?}",
-            versions.len(),
-            versions
-        );
+        println!("  delvec versions={} detail={:?}", versions.len(), versions);
     } else {
         println!("  delvec none");
     }
 }
 
-fn dump_schema(
-    schema: &novarocks::service::grpc_client::proto::starrocks::TabletSchemaPb,
-) {
+fn dump_schema(schema: &novarocks::service::grpc_client::proto::starrocks::TabletSchemaPb) {
     println!(
         "schema id={:?} schema_version={:?} next_column_unique_id={:?} root_columns={}",
         schema.id,
@@ -221,7 +218,10 @@ fn main() -> Result<(), String> {
             Ok(meta) => {
                 dump_tablet_meta(tablet_id, &meta);
                 if let Some(schema_id) = bundle.tablet_to_schema.get(&tablet_id) {
-                    println!("tablet_to_schema tablet_id={} schema_id={}", tablet_id, schema_id);
+                    println!(
+                        "tablet_to_schema tablet_id={} schema_id={}",
+                        tablet_id, schema_id
+                    );
                     if let Some(schema) = bundle.schemas.get(schema_id) {
                         dump_schema(schema);
                     } else {

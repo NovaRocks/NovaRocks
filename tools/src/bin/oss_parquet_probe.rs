@@ -38,7 +38,10 @@ fn object_store_config_from_standalone(app_cfg: &NovaRocksConfig) -> Result<Obje
         ObjectStoreCredentialsSource::StandaloneConfig,
         object_store.endpoint.as_deref().unwrap_or_default(),
         object_store.access_key_id.as_deref().unwrap_or_default(),
-        object_store.access_key_secret.as_deref().unwrap_or_default(),
+        object_store
+            .access_key_secret
+            .as_deref()
+            .unwrap_or_default(),
         object_store.region.as_deref(),
         object_store.enable_path_style_access,
     )
@@ -140,20 +143,17 @@ async fn main() -> Result<()> {
     };
     let object_store_config = object_store_config_from_standalone(&app_cfg)?;
     let location = probe_location_from_args(&app_cfg, &prefix)?;
-    let access =
-        fs_access_tooling::resolve_tool_location(&location, Some(&object_store_config))
-            .map_err(anyhow::Error::msg)?;
-    let relative_path = fs_access_tooling::single_relative_path(&access, &location)
+    let access = fs_access_tooling::resolve_tool_location(&location, Some(&object_store_config))
         .map_err(anyhow::Error::msg)?;
+    let relative_path =
+        fs_access_tooling::single_relative_path(&access, &location).map_err(anyhow::Error::msg)?;
     let list_prefix = fs_access_tooling::list_prefix(&relative_path);
     let op = access.operator();
 
     eprintln!(
-        "[probe] endpoint={} authority={} root={} location={} prefix={} max_files={}",
+        "[probe] endpoint={} authority={} prefix={} max_files={}",
         object_store_config.endpoint,
         access.authority().unwrap_or("<local>"),
-        access.root().unwrap_or(""),
-        location,
         list_prefix,
         max_files
     );

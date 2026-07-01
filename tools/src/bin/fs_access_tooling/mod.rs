@@ -29,7 +29,9 @@ pub fn resolve_tool_location(
     match parsed.scheme() {
         FsScheme::Local => resolver.resolve_location(location, None),
         FsScheme::ObjectStore => resolver.resolve_location(location, object_store_config),
-        FsScheme::Hdfs => Err(format!("tools do not support hdfs location yet: {location}")),
+        FsScheme::Hdfs => Err(format!(
+            "tools do not support hdfs location yet: {location}"
+        )),
     }
 }
 
