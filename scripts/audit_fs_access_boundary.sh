@@ -6,7 +6,7 @@ cd "$repo_root"
 
 scan_targets=(src tools/src/bin)
 
-deny_pattern='FileIOBuilder::new|S3StorageFactory|build_oss_operator|normalize_oss_path|resolve_oss_operator_and_path_with_config|resolve_object_store_operator_and_path|classify_scan_paths|resolve_opendal_paths|opendal::services::S3::default|opendal::services::Fs::default|novarocks_fs_oss|novarocks_fs_path|crate::fs::oss'
+deny_pattern='FileIOBuilder::new|S3StorageFactory|build_oss_operator|normalize_oss_path|resolve_oss_operator_and_path_with_config|resolve_object_store_operator_and_path|classify_scan_paths|resolve_opendal_paths|opendal::services::S3::default|opendal::services::Fs::default|(^|[^[:alnum:]_:])(S3|Fs)::default[[:space:]]*\(|use[[:space:]]+opendal::services(::|::\{).*\b(S3|Fs)\b|novarocks_fs_oss|novarocks_fs_path|crate::fs::oss'
 
 hits=()
 while IFS= read -r hit; do
