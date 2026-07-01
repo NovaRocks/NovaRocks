@@ -179,6 +179,11 @@ fn erase_prefix_path(rel_path: &str, warehouse_rel: &str) -> Result<String, Stri
     if trimmed.is_empty() || trimmed == warehouse_trimmed {
         return Err("empty StarRocks table root".to_string());
     }
+    if !warehouse_trimmed.is_empty() && !trimmed.starts_with(&format!("{warehouse_trimmed}/")) {
+        return Err(format!(
+            "StarRocks table root `{trimmed}` is outside warehouse `{warehouse_trimmed}`"
+        ));
+    }
     Ok(format!("{trimmed}/"))
 }
 
@@ -734,6 +739,17 @@ mod tests {
         let err = super::erase_prefix_path("/warehouse/", "warehouse")
             .expect_err("warehouse root with surrounding slashes must be rejected");
         assert!(err.contains("empty"), "err={err}");
+    }
+
+    #[test]
+    fn erase_prefix_path_rejects_paths_outside_warehouse_prefix() {
+        let err = super::erase_prefix_path("other-prefix/db_70/table_124", "warehouse")
+            .expect_err("unrelated same-bucket prefix must be rejected");
+        assert!(err.contains("outside warehouse"), "err={err}");
+
+        let err = super::erase_prefix_path("warehouse2/db_70/table_124", "warehouse")
+            .expect_err("lookalike warehouse prefix must be rejected");
+        assert!(err.contains("outside warehouse"), "err={err}");
     }
 
     #[test]
