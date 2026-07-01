@@ -81,6 +81,56 @@ for hit in "${hits[@]}"; do
   fi
 done
 
+collect_opendal_service_import_hits() {
+  local file
+
+  while IFS= read -r file; do
+    awk -v file="$file" '
+      function has_service_import(text) {
+        return text ~ /(^|[^[:alnum:]_])(S3|Fs)([[:space:]]+as[[:space:]]+[[:alnum:]_]+)?([^[:alnum:]_]|$)/
+      }
+
+      function emit_hit() {
+        printf "%s:%d:%s\n", file, NR, $0
+      }
+
+      {
+        if (in_services_import) {
+          if (has_service_import($0)) {
+            emit_hit()
+          }
+          if ($0 ~ /;/) {
+            in_services_import = 0
+          }
+          next
+        }
+
+        if ($0 ~ /^[[:space:]]*use[[:space:]]+opendal::services::[[:space:]]*\{/) {
+          in_services_import = 1
+          if (has_service_import($0)) {
+            emit_hit()
+          }
+          if ($0 ~ /;/) {
+            in_services_import = 0
+          }
+          next
+        }
+
+        if ($0 ~ /^[[:space:]]*use[[:space:]]+opendal::services::[[:space:]]*(S3|Fs)([[:space:]]+as[[:space:]]+[[:alnum:]_]+)?[[:space:]]*;/) {
+          emit_hit()
+        }
+      }
+    ' "$file"
+  done < <(rg --files "${scan_targets[@]}" -g '*.rs')
+}
+
+while IFS= read -r hit; do
+  IFS=: read -r file line text <<<"$hit"
+  if ! is_allowed_core_hit "$file" "$line" "$text"; then
+    blocked+=("$hit")
+  fi
+done < <(collect_opendal_service_import_hits)
+
 aws_hits=()
 while IFS= read -r hit; do
   aws_hits+=("$hit")
