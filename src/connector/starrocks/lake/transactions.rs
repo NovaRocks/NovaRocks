@@ -25,6 +25,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::connector::schema;
+use crate::connector::starrocks::fs_access::{StarRocksFsAccess, resolve_tablet_root};
 use crate::connector::starrocks::lake::abort_executor::abort_one_tablet;
 use crate::connector::starrocks::lake::abort_policy::should_skip_abort_cleanup;
 use crate::connector::starrocks::lake::applier::apply_txn_log_to_metadata;
@@ -57,7 +58,7 @@ use crate::formats::starrocks::writer::layout::{
     DATA_DIR, LOG_DIR, META_DIR, bundle_meta_file_path, join_tablet_path, tablet_meta_rel_path,
     txn_log_file_path, txn_vlog_file_path,
 };
-use crate::fs::path::{ScanPathScheme, classify_scan_paths, resolve_opendal_paths};
+use crate::fs::access::FsScheme;
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
@@ -886,10 +887,7 @@ pub(crate) fn drop_table(request: &DropTableRequest) -> Result<DropTableResponse
             let Some(request_path) = request_path else {
                 return Err(err);
             };
-            let fallback_s3 = match classify_scan_paths([request_path])? {
-                ScanPathScheme::Oss => starmgr::retrieve_s3_config_for_path(request_path)?,
-                _ => None,
-            };
+            let fallback_s3 = starmgr::retrieve_s3_config_for_path(request_path)?;
             warn!(
                 "drop_table location recovery failed, falling back to request path: tablet_id={}, request_path={}, error={}",
                 tablet_id, request_path, err
@@ -1826,8 +1824,9 @@ fn list_directory_file_names(
     dir_path: &str,
     s3_config: Option<&S3StoreConfig>,
 ) -> Result<Vec<String>, String> {
-    match classify_scan_paths([dir_path])? {
-        ScanPathScheme::Local => {
+    let access = resolve_access_for_path(dir_path, s3_config)?;
+    match access.scheme() {
+        FsScheme::Local => {
             let dir = std::path::PathBuf::from(dir_path);
             if !dir.exists() {
                 return Ok(Vec::new());
@@ -1858,19 +1857,16 @@ fn list_directory_file_names(
             }
             Ok(names)
         }
-        ScanPathScheme::Oss => {
-            let object_store_cfg = s3_config
-                .ok_or_else(|| {
-                    format!("missing S3 config for object-store directory listing: path={dir_path}")
+        FsScheme::ObjectStore => {
+            let op = access.operator();
+            let rel_path = access
+                .single_relative_path()
+                .map_err(|err| {
+                    format!(
+                        "resolve object-store directory path failed: path={dir_path}, error={err}"
+                    )
                 })?
-                .to_object_store_config();
-            let input_paths = vec![dir_path.to_string()];
-            let (op, resolved) = resolve_opendal_paths(&input_paths, Some(&object_store_cfg))?;
-            let rel_path = resolved
-                .paths
-                .first()
-                .cloned()
-                .ok_or_else(|| format!("resolved empty path list for path={dir_path}"))?;
+                .to_string();
             let list_prefix = if rel_path.is_empty() {
                 String::new()
             } else {
@@ -1909,10 +1905,17 @@ fn list_directory_file_names(
             })
             .map_err(|e| format!("list object-store directory runtime execution failed: {e}"))?
         }
-        ScanPathScheme::Hdfs => Err(format!(
+        FsScheme::Hdfs => Err(format!(
             "txn log directory listing does not support hdfs path yet: {dir_path}"
         )),
     }
+}
+
+fn resolve_access_for_path(
+    path: &str,
+    s3_config: Option<&S3StoreConfig>,
+) -> Result<StarRocksFsAccess, String> {
+    resolve_tablet_root(path, s3_config)
 }
 
 fn parse_txn_log_file_name(name: &str) -> Option<(i64, i64)> {
@@ -2080,8 +2083,9 @@ fn file_size_if_exists(
     path: &str,
     s3_config: Option<&S3StoreConfig>,
 ) -> Result<Option<i64>, String> {
-    match classify_scan_paths([path])? {
-        ScanPathScheme::Local => {
+    let access = resolve_access_for_path(path, s3_config)?;
+    match access.scheme() {
+        FsScheme::Local => {
             let path_buf = std::path::PathBuf::from(path);
             if !path_buf.exists() {
                 return Ok(None);
@@ -2093,12 +2097,14 @@ fn file_size_if_exists(
             }
             Ok(Some(i64::try_from(metadata.len()).unwrap_or(i64::MAX)))
         }
-        ScanPathScheme::Oss => {
-            let object_store_cfg = s3_config
-                .ok_or_else(|| format!("missing S3 config for object-store stat: path={path}"))?
-                .to_object_store_config();
-            let (op, rel) =
-                crate::fs::path::resolve_object_store_operator_and_path(path, &object_store_cfg)?;
+        FsScheme::ObjectStore => {
+            let op = access.operator();
+            let rel = access
+                .single_relative_path()
+                .map_err(|err| {
+                    format!("resolve object-store stat path failed: path={path}, error={err}")
+                })?
+                .to_string();
             match crate::fs::oss::oss_block_on(op.stat(&rel))? {
                 Ok(meta) => Ok(Some(
                     i64::try_from(meta.content_length()).unwrap_or(i64::MAX),
@@ -2110,43 +2116,26 @@ fn file_size_if_exists(
                 )),
             }
         }
-        ScanPathScheme::Hdfs => Err(format!(
+        FsScheme::Hdfs => Err(format!(
             "txn log file stat does not support hdfs path yet: {path}"
         )),
     }
 }
 
 fn drop_table_path(path: &str, s3_config: Option<&S3StoreConfig>) -> Result<(), String> {
-    let scheme = classify_scan_paths([path])?;
-    if matches!(scheme, ScanPathScheme::Hdfs) {
+    let access = resolve_access_for_path(path, s3_config)
+        .map_err(|err| format!("drop_table resolve path failed: path={path}, error={err}"))?;
+    if matches!(access.scheme(), FsScheme::Hdfs) {
         return Err(format!(
             "drop_table does not support hdfs path yet: {}",
             path
         ));
     }
-    let input_paths = vec![path.to_string()];
-
-    let object_store_cfg = if matches!(scheme, ScanPathScheme::Oss) {
-        Some(
-            s3_config
-                .ok_or_else(|| {
-                    format!(
-                        "drop_table missing S3 config for object-store path={path}; \
-                        expected tablet_id-based location recovery to provide credentials"
-                    )
-                })?
-                .to_object_store_config(),
-        )
-    } else {
-        None
-    };
-
-    let (op, resolved) = resolve_opendal_paths(&input_paths, object_store_cfg.as_ref())?;
-    let rel_path = resolved
-        .paths
-        .first()
-        .ok_or_else(|| format!("drop_table resolved empty path list for path={path}"))?
-        .as_str();
+    let op = access.operator();
+    let rel_path = access
+        .single_relative_path()
+        .map_err(|err| format!("drop_table resolved empty path list for path={path}: {err}"))?
+        .to_string();
     if rel_path.is_empty() {
         return Err(format!(
             "drop_table path resolves to empty relative path: path={path}"
@@ -2155,7 +2144,7 @@ fn drop_table_path(path: &str, s3_config: Option<&S3StoreConfig>) -> Result<(), 
 
     let max_attempts = 3usize;
     for attempt in 1..=max_attempts {
-        let remove_result = data_block_on(op.remove_all(rel_path))
+        let remove_result = data_block_on(op.remove_all(&rel_path))
             .map_err(|e| format!("drop_table runtime execution failed: {e}"))?;
         match remove_result {
             Ok(()) => return Ok(()),
@@ -3093,8 +3082,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        abort_txn, delete_tablet, drop_table, get_tablet_stats, parse_txn_vlog_file_name,
-        publish_log_version, publish_log_version_batch, publish_version, vacuum,
+        abort_txn, delete_tablet, drop_table, drop_table_path, file_size_if_exists,
+        get_tablet_stats, parse_txn_vlog_file_name, publish_log_version, publish_log_version_batch,
+        publish_version, vacuum,
     };
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::lake::context::{
@@ -3114,6 +3104,7 @@ mod tests {
         DATA_DIR, bundle_meta_file_path, combined_txn_log_file_path, initial_meta_file_path,
         join_tablet_path, txn_log_file_path, txn_log_file_path_with_load_id, txn_vlog_file_path,
     };
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{
         AbortTxnRequest, ColumnPb, CombinedTxnLogPb, DeleteTabletRequest, DelvecMetadataPb,
         DropTableRequest, FileMetaPb, KeysType, PUniqueId, PublishLogVersionBatchRequest,
@@ -3161,6 +3152,17 @@ mod tests {
             table_indices: Vec::new(),
             compression_level: None,
             id: Some(schema_id),
+        }
+    }
+
+    fn test_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "bucket-a".to_string(),
+            access_key_id: "access-key".to_string(),
+            access_key_secret: "secret-key".to_string(),
+            region: Some("us-east-1".to_string()),
+            enable_path_style_access: Some(true),
         }
     }
 
@@ -4624,6 +4626,35 @@ mod tests {
         // Idempotency: dropping the same path again should still succeed.
         let resp2 = drop_table(&req).expect("drop table should be idempotent");
         assert_eq!(resp2.status.as_ref().map(|v| v.status_code), Some(0));
+    }
+
+    #[test]
+    fn drop_table_path_rejects_local_path_with_s3_config() {
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().join("drop_table_local_with_s3");
+        std::fs::create_dir_all(&root).expect("create root dir");
+        std::fs::write(root.join("segment.dat"), b"abc").expect("write segment file");
+        let root_str = root.to_string_lossy().to_string();
+
+        let err = drop_table_path(&root_str, Some(&test_s3_config()))
+            .expect_err("local path must not accept S3 config");
+
+        assert!(err.contains("local"), "{err}");
+        assert!(err.contains("S3"), "{err}");
+        assert!(root.exists(), "rejected drop must not remove local path");
+    }
+
+    #[test]
+    fn file_size_if_exists_rejects_object_store_path_without_s3_config() {
+        let err = file_size_if_exists("s3://bucket-a/lake/tablet/meta/0000000000000001.meta", None)
+            .expect_err("object-store path must require S3 config");
+
+        assert!(err.contains("object-store"), "{err}");
+        assert!(err.contains("S3"), "{err}");
+        assert!(
+            err.contains("s3://bucket-a/lake/tablet/meta/0000000000000001.meta"),
+            "{err}"
+        );
     }
 
     #[test]
