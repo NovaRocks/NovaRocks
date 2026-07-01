@@ -242,22 +242,25 @@ pub(crate) fn find_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
     candidate
 }
 
-/// Look up the OSS credentials for a native lake tablet path from the shard registry and
-/// return credentials ready for use with the object-store path resolver.
+/// Look up the S3 credentials for a native lake tablet path from the shard registry.
 ///
 /// This is the entry point for the native lake write/read paths.  Iceberg external tables
 /// must not call this — they receive credentials from `THdfsScanNode.cloud_configuration`.
+pub(crate) fn s3_config_for_path(path: &str) -> Result<S3StoreConfig, String> {
+    find_s3_config_for_path(path).ok_or_else(|| {
+        format!(
+            "missing shard registry config for path={path}; \
+             expected AddShard/runtime registry/StarManager retrieval to provide S3 credentials"
+        )
+    })
+}
+
+// Retained only for FS-6 StarRocks format writer/reader migration compatibility.
+// StarRocks lake production modules must use S3StoreConfig-based access instead.
 pub(crate) fn oss_config_for_path(
     path: &str,
 ) -> Result<crate::fs::object_store::ObjectStoreConfig, String> {
-    find_s3_config_for_path(path)
-        .map(|cfg| cfg.to_object_store_config())
-        .ok_or_else(|| {
-            format!(
-                "missing shard registry config for path={path}; \
-                expected AddShard/runtime registry/StarManager retrieval to provide S3 credentials"
-            )
-        })
+    s3_config_for_path(path).map(|cfg| cfg.to_object_store_config())
 }
 
 /// Pick the cluster-level S3 credentials for `path` when no tablet's
@@ -377,6 +380,22 @@ mod tests {
             .expect("find config for nested path");
         assert_eq!(cfg.bucket, "bucket");
         assert_eq!(cfg.access_key_id, "ak");
+    }
+
+    #[test]
+    fn s3_config_for_path_returns_cluster_profile_without_object_store_conversion() {
+        let _guard = lock_for_test();
+        clear_for_test();
+        let _ = upsert_many_infos(vec![(
+            2051,
+            StarletShardInfo {
+                full_path: "s3://bucket/root/db1/t1".to_string(),
+                s3: Some(sample_s3_config()),
+            },
+        )]);
+        let cfg = super::s3_config_for_path("s3://bucket/root/db1/t1/tablet-1/meta/0001.meta")
+            .expect("find raw S3 config for matching path");
+        assert_eq!(cfg, sample_s3_config());
     }
 
     #[test]
@@ -561,10 +580,10 @@ mod tests {
     }
 
     #[test]
-    fn oss_config_for_path_fails_fast_when_no_matching_tablet_or_bucket() {
+    fn s3_config_for_path_fails_fast_when_no_matching_tablet_or_bucket() {
         let _guard = lock_for_test();
         clear_for_test();
-        let err = super::oss_config_for_path("s3://unknown-bucket/foo/bar")
+        let err = super::s3_config_for_path("s3://unknown-bucket/foo/bar")
             .expect_err("scan/sink path without a known cluster profile must fail fast");
         assert!(err.contains("missing shard registry config"), "err={err}");
     }
