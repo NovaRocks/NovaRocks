@@ -345,19 +345,34 @@ fn parse_bool_value(value: &str) -> Option<bool> {
 }
 
 fn normalize_s3a_endpoint(raw_endpoint: &str, enable_ssl: Option<bool>) -> Result<String, String> {
-    let endpoint = raw_endpoint.trim();
+    let mut endpoint = raw_endpoint.trim();
     if endpoint.is_empty() {
         return Err("s3a_properties object-store credentials missing fs.s3a.endpoint".to_string());
     }
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return Ok(endpoint.to_string());
+
+    let mut inferred_enable_ssl = None;
+    if let Some(rest) = endpoint.strip_prefix("http://") {
+        endpoint = rest;
+        inferred_enable_ssl = Some(false);
+    } else if let Some(rest) = endpoint.strip_prefix("https://") {
+        endpoint = rest;
+        inferred_enable_ssl = Some(true);
     }
-    let scheme = if enable_ssl.unwrap_or(true) {
+
+    if let Some((authority, _)) = endpoint.split_once('/') {
+        endpoint = authority;
+    }
+    let host = endpoint.trim_end_matches('/');
+    if host.is_empty() {
+        return Err("s3a_properties object-store credentials missing fs.s3a.endpoint".to_string());
+    }
+
+    let scheme = if enable_ssl.or(inferred_enable_ssl).unwrap_or(true) {
         "https"
     } else {
         "http"
     };
-    Ok(format!("{scheme}://{endpoint}"))
+    Ok(format!("{scheme}://{host}"))
 }
 
 #[cfg(test)]
@@ -413,6 +428,33 @@ mod tests {
         assert_eq!(credentials.access_key_secret, "sk");
         assert_eq!(credentials.region.as_deref(), Some("us-east-1"));
         assert_eq!(credentials.enable_path_style_access, Some(true));
+    }
+
+    #[test]
+    fn s3a_properties_ssl_setting_overrides_explicit_endpoint_scheme() {
+        let https_to_http = ObjectStoreCredentials::from_s3a_properties(
+            ObjectStoreCredentialsSource::S3AProperties,
+            &props(&[
+                ("fs.s3a.endpoint", "https://localhost:9000"),
+                ("fs.s3a.access.key", "ak"),
+                ("fs.s3a.secret.key", "sk"),
+                ("fs.s3a.connection.ssl.enabled", "false"),
+            ]),
+        )
+        .expect("parse s3a properties with ssl disabled");
+        assert_eq!(https_to_http.endpoint, "http://localhost:9000");
+
+        let http_to_https = ObjectStoreCredentials::from_s3a_properties(
+            ObjectStoreCredentialsSource::S3AProperties,
+            &props(&[
+                ("fs.s3a.endpoint", "http://localhost:9000"),
+                ("fs.s3a.access.key", "ak"),
+                ("fs.s3a.secret.key", "sk"),
+                ("fs.s3a.connection.ssl.enabled", "true"),
+            ]),
+        )
+        .expect("parse s3a properties with ssl enabled");
+        assert_eq!(http_to_https.endpoint, "https://localhost:9000");
     }
 
     #[test]

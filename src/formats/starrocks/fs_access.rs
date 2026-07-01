@@ -98,7 +98,7 @@ pub(crate) fn resolve_format_tablet_access_with_object_store_config(
     if is_literal_local_root(tablet_root_path) {
         if object_store_config.is_some() {
             return Err(format!(
-                "StarRocks local path must not include object-store profile: path={tablet_root_path}"
+                "local StarRocks fs path must not be resolved with object-store config; path={tablet_root_path}"
             ));
         }
         let operator = crate::fs::local::build_fs_operator("/").map_err(|e| e.to_string())?;
@@ -124,7 +124,33 @@ pub(crate) fn resolve_format_tablet_access_with_object_store_config(
         });
     }
 
-    let handle = FsAccessResolver::new().resolve_location(tablet_root_path, object_store_config)?;
+    let resolver = FsAccessResolver::new();
+    let location = resolver
+        .parse_location(tablet_root_path)
+        .map_err(|err| format!("{err}; path={tablet_root_path}"))?;
+    match location.scheme() {
+        FsScheme::Local => {
+            if object_store_config.is_some() {
+                return Err(format!(
+                    "local StarRocks fs path must not be resolved with object-store config; path={tablet_root_path}"
+                ));
+            }
+        }
+        FsScheme::ObjectStore => {
+            if object_store_config.is_none() {
+                return Err(format!(
+                    "object-store StarRocks fs path requires object-store config; path={tablet_root_path}"
+                ));
+            }
+        }
+        FsScheme::Hdfs => {
+            return Err(format!(
+                "HDFS StarRocks fs path is unsupported; path={tablet_root_path}"
+            ));
+        }
+    }
+
+    let handle = resolver.resolve_location(tablet_root_path, object_store_config)?;
     let root_relative_path = handle
         .paths()
         .first()
@@ -256,6 +282,12 @@ mod tests {
         }
     }
 
+    fn sample_object_store_config() -> ObjectStoreConfig {
+        ObjectStoreProfile::from_s3_store_config(&sample_s3_config())
+            .expect("build object-store profile")
+            .to_object_store_config()
+    }
+
     fn expected_local_operator_relative_path(
         tablet_root: &std::path::Path,
         rel_path: &str,
@@ -363,6 +395,38 @@ mod tests {
     }
 
     #[test]
+    fn local_tablet_access_with_object_store_config_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let tablet_root_path = temp_dir.path().join("tablet");
+        let tablet_root = tablet_root_path.to_string_lossy().to_string();
+        let cfg = sample_object_store_config();
+
+        let err = resolve_format_tablet_access_with_object_store_config(&tablet_root, Some(&cfg))
+            .expect_err("local tablet root must reject object-store config");
+
+        assert!(
+            err.contains("local StarRocks fs path must not be resolved with object-store config"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn hdfs_tablet_access_with_object_store_config_is_rejected() {
+        let cfg = sample_object_store_config();
+
+        let err = resolve_format_tablet_access_with_object_store_config(
+            "hdfs://nn:9000/warehouse/db_1/table_2/100",
+            Some(&cfg),
+        )
+        .expect_err("hdfs tablet root must be rejected");
+
+        assert!(
+            err.contains("HDFS StarRocks fs path is unsupported"),
+            "err={err}"
+        );
+    }
+
+    #[test]
     fn parse_only_local_tablet_root_matches_resolved_facade_operator_path() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let tablet_root = temp_dir.path().join("tablet");
@@ -400,7 +464,7 @@ mod tests {
             .expect_err("local root must reject object-store profile");
 
         assert!(
-            err.contains("local path must not include object-store profile"),
+            err.contains("local StarRocks fs path must not be resolved with object-store config"),
             "err={err}"
         );
     }
