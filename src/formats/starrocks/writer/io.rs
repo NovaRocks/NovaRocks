@@ -56,8 +56,7 @@ pub fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
         FsScheme::Local => fs::read(path).map_err(|e| format!("read file failed: {}", e)),
         FsScheme::ObjectStore => {
             let rel = access.single_relative_path()?.to_string();
-            let read_result =
-                crate::fs::object_store::oss_block_on(access.operator().read(&rel))?;
+            let read_result = crate::fs::object_store::oss_block_on(access.operator().read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read object failed: {}", e))?;
             Ok(bytes.to_vec())
         }

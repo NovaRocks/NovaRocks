@@ -140,8 +140,7 @@ pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
         }
         FsScheme::ObjectStore => {
             let rel = access.single_relative_path()?.to_string();
-            let read_result =
-                crate::fs::object_store::oss_block_on(access.operator().read(&rel))?;
+            let read_result = crate::fs::object_store::oss_block_on(access.operator().read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read parquet object failed: {}", e))?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.to_bytes())
                 .map_err(|e| format!("create parquet reader failed: {}", e))?
