@@ -37,6 +37,19 @@ pub(crate) fn synthetic_iceberg_write_table_id() -> i64 {
     -9_000_000_001
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergWriteFragmentSink {
+    pub(crate) descriptor_database: String,
+    pub(crate) spec: IcebergWriteSinkSpec,
+    pub(crate) input: IcebergWriteInputBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergWriteInputBinding {
+    RootOutputByOrdinal,
+    OutputOrdinals(Vec<usize>),
+}
+
 impl IcebergWriteSinkSpec {
     pub(crate) fn set_planned_snapshot_id(
         &mut self,
@@ -239,7 +252,7 @@ mod tests {
 
     #[test]
     fn iceberg_write_sink_domain_module_has_no_thrift_wire_types() {
-        let source = include_str!("iceberg_write_sink.rs");
+        let source = include_str!("write_sink.rs");
         for pattern in [
             concat!("crate::", "thrift"),
             concat!("TType", "Desc"),

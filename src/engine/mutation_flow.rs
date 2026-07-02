@@ -26,10 +26,10 @@ use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
-use crate::sql::codegen::iceberg_write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::sql::parser::ast::{
     InsertSource, MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
 };
+use crate::sql::planner::write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 
 pub(crate) fn execute_update_statement(
     state: &Arc<StandaloneState>,
@@ -1072,13 +1072,15 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,
             commit_plan,
+            #[cfg(test)]
+            topology,
         } = planned;
         *self
             .commit_plan
             .lock()
             .expect("MOR UPDATE change-stream commit plan lock poisoned") = Some(commit_plan);
         #[cfg(test)]
-        if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&plan.dag) {
+        if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
             return Ok(result);
         }
         let result =
@@ -1141,13 +1143,15 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,
             commit_plan,
+            #[cfg(test)]
+            topology,
         } = planned;
         *self
             .commit_plan
             .lock()
             .expect("MOR MERGE change-stream commit plan lock poisoned") = Some(commit_plan);
         #[cfg(test)]
-        if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&plan.dag) {
+        if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
             return Ok(result);
         }
         let result =

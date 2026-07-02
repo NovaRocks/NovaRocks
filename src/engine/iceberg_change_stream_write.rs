@@ -25,10 +25,10 @@ use crate::engine::write_transaction::{
 };
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
-use crate::sql::codegen::iceberg_change_stream_write::{
-    ChangeStreamWriteBranchKind, IcebergChangeStreamWriteDagSpec,
-};
+use crate::sql::codegen::FragmentId;
+use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizerPhysicalNode;
+use crate::sql::planner::{ChangeStreamWriteDagSpec, IcebergChangeStreamWriteTopology};
 
 pub(crate) fn writer_fragment_id_from_finst_lo(finst_lo: i64) -> i32 {
     (finst_lo >> 16) as i32
@@ -36,13 +36,11 @@ pub(crate) fn writer_fragment_id_from_finst_lo(finst_lo: i64) -> i32 {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriterCommitPlan {
-    branch_by_writer_fragment: BTreeMap<i32, ChangeStreamWriteBranchKind>,
+    branch_by_writer_fragment: BTreeMap<i32, ChangeStreamBranchKind>,
 }
 
 impl ChangeStreamWriterCommitPlan {
-    pub(crate) fn new(
-        branch_by_writer_fragment: BTreeMap<i32, ChangeStreamWriteBranchKind>,
-    ) -> Self {
+    pub(crate) fn new(branch_by_writer_fragment: BTreeMap<i32, ChangeStreamBranchKind>) -> Self {
         Self {
             branch_by_writer_fragment,
         }
@@ -52,35 +50,43 @@ impl ChangeStreamWriterCommitPlan {
         self.branch_by_writer_fragment.is_empty()
     }
 
-    pub(crate) fn from_dag(dag: &IcebergChangeStreamWriteDagSpec) -> Result<Self, String> {
+    pub(crate) fn from_topology(
+        topology: &IcebergChangeStreamWriteTopology,
+    ) -> Result<Self, String> {
         let mut branch_by_writer_fragment = BTreeMap::new();
-        for branch in &dag.branches {
-            let writer_fragment_id = branch.writer_fragment_id.ok_or_else(|| {
-                format!(
-                    "change-stream branch {} ({:?}) has no planned writer fragment id",
-                    branch.branch_id, branch.branch_kind
-                )
-            })?;
-            let writer_fragment_id = i32::try_from(writer_fragment_id).map_err(|_| {
-                format!(
-                    "writer fragment id {writer_fragment_id} for change-stream branch {} \
-                     does not fit in commit-plan fragment id field",
-                    branch.branch_id
-                )
-            })?;
-            if branch_by_writer_fragment
-                .insert(writer_fragment_id, branch.branch_kind)
-                .is_some()
-            {
-                return Err(format!(
-                    "duplicate writer fragment id {writer_fragment_id} in change-stream commit plan"
-                ));
-            }
+        for branch in &topology.writer_branches {
+            insert_writer_fragment_branch(
+                &mut branch_by_writer_fragment,
+                branch.writer_fragment_id,
+                branch.branch_id,
+                branch.branch_kind,
+            )?;
         }
         Ok(Self::new(branch_by_writer_fragment))
     }
 
-    fn branch_for_finst_lo(&self, finst_lo: i64) -> Result<ChangeStreamWriteBranchKind, String> {
+    #[cfg(test)]
+    pub(crate) fn writer_fragment_ids_for_topology(
+        &self,
+        topology: &IcebergChangeStreamWriteTopology,
+    ) -> Vec<Option<FragmentId>> {
+        let by_kind = self
+            .branch_by_writer_fragment
+            .iter()
+            .filter_map(|(fragment_id, branch_kind)| {
+                u32::try_from(*fragment_id)
+                    .ok()
+                    .map(|fragment_id| (*branch_kind, fragment_id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        topology
+            .writer_branches
+            .iter()
+            .map(|branch| by_kind.get(&branch.branch_kind).copied())
+            .collect()
+    }
+
+    fn branch_for_finst_lo(&self, finst_lo: i64) -> Result<ChangeStreamBranchKind, String> {
         let fragment_id = writer_fragment_id_from_finst_lo(finst_lo);
         self.branch_by_writer_fragment
             .get(&fragment_id)
@@ -91,6 +97,29 @@ impl ChangeStreamWriterCommitPlan {
                 )
             })
     }
+}
+
+fn insert_writer_fragment_branch(
+    branch_by_writer_fragment: &mut BTreeMap<i32, ChangeStreamBranchKind>,
+    writer_fragment_id: FragmentId,
+    branch_id: i32,
+    branch_kind: ChangeStreamBranchKind,
+) -> Result<(), String> {
+    let writer_fragment_id = i32::try_from(writer_fragment_id).map_err(|_| {
+        format!(
+            "writer fragment id {writer_fragment_id} for change-stream branch {branch_id} \
+             does not fit in commit-plan fragment id field"
+        )
+    })?;
+    if branch_by_writer_fragment
+        .insert(writer_fragment_id, branch_kind)
+        .is_some()
+    {
+        return Err(format!(
+            "duplicate writer fragment id {writer_fragment_id} in change-stream commit plan"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -186,8 +215,8 @@ pub(crate) fn route_change_stream_writer_reports(
                 )
             })?;
         match branch {
-            ChangeStreamWriteBranchKind::FreshData => routed.fresh.extend(writer_files),
-            ChangeStreamWriteBranchKind::DeleteDv | ChangeStreamWriteBranchKind::ReuseData => {
+            ChangeStreamBranchKind::FreshData => routed.fresh.extend(writer_files),
+            ChangeStreamBranchKind::DeleteDv | ChangeStreamBranchKind::ReuseData => {
                 routed.reuse_or_dv.extend(writer_files);
             }
         }
@@ -201,7 +230,7 @@ pub(crate) struct ChangeStreamPhysicalBuildInput {
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
     pub(crate) physical_plan: OptimizerPhysicalNode,
-    pub(crate) dag: IcebergChangeStreamWriteDagSpec,
+    pub(crate) dag: ChangeStreamWriteDagSpec,
     pub(crate) query_opts: Option<StandaloneQueryOptions>,
     pub(crate) mv_refresh_ctx:
         Option<Arc<crate::engine::mv::refresh_context::IcebergMvRefreshContext>>,
@@ -248,6 +277,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,
             commit_plan,
+            ..
         } = planned;
         *self
             .commit_plan
@@ -437,8 +467,8 @@ mod tests {
             vec![(10, "reuse.parquet"), (11, "fresh.parquet")],
         );
         let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([
-            (10, ChangeStreamWriteBranchKind::ReuseData),
-            (11, ChangeStreamWriteBranchKind::FreshData),
+            (10, ChangeStreamBranchKind::ReuseData),
+            (11, ChangeStreamBranchKind::FreshData),
         ]));
 
         route_change_stream_writer_reports(&collector, &metadata, &write_commit, &plan)
@@ -470,7 +500,7 @@ mod tests {
         let write_commit = write_commit_for_fragments(&metadata, vec![(12, "unknown.parquet")]);
         let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([(
             10,
-            ChangeStreamWriteBranchKind::ReuseData,
+            ChangeStreamBranchKind::ReuseData,
         )]));
 
         let err = route_change_stream_writer_reports(&collector, &metadata, &write_commit, &plan)
@@ -488,18 +518,47 @@ mod tests {
     }
 
     #[test]
-    fn change_stream_commit_plan_requires_planned_writer_fragments() {
-        let dag = IcebergChangeStreamWriteDagSpec::for_test(
-            1,
-            Some(2),
-            vec![
-                crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![3]),
-            ],
+    fn change_stream_commit_plan_uses_topology_writer_fragments() {
+        let topology = topology_for_test(vec![(0, ChangeStreamBranchKind::ReuseData, 7)]);
+
+        let plan = ChangeStreamWriterCommitPlan::from_topology(&topology)
+            .expect("topology writer mapping");
+
+        assert_eq!(
+            plan.writer_fragment_ids_for_topology(&topology),
+            vec![Some(7)]
         );
+    }
 
-        let err = ChangeStreamWriterCommitPlan::from_dag(&dag)
-            .expect_err("writer fragments are assigned by the fragment builder");
+    #[test]
+    fn change_stream_commit_plan_rejects_duplicate_writer_fragment() {
+        let topology = topology_for_test(vec![
+            (0, ChangeStreamBranchKind::DeleteDv, 7),
+            (1, ChangeStreamBranchKind::ReuseData, 7),
+        ]);
 
-        assert!(err.contains("has no planned writer fragment id"), "{err}");
+        let err = ChangeStreamWriterCommitPlan::from_topology(&topology)
+            .expect_err("duplicate writer fragment");
+
+        assert!(err.contains("duplicate writer fragment id 7"), "{err}");
+    }
+
+    fn topology_for_test(
+        branches: Vec<(i32, ChangeStreamBranchKind, FragmentId)>,
+    ) -> crate::sql::planner::IcebergChangeStreamWriteTopology {
+        crate::sql::planner::IcebergChangeStreamWriteTopology {
+            writer_branches: branches
+                .into_iter()
+                .map(|(branch_id, branch_kind, writer_fragment_id)| {
+                    crate::sql::planner::IcebergChangeStreamWriterBranch {
+                        branch_id,
+                        branch_kind,
+                        writer_fragment_id,
+                        sink_spec: crate::sql::planner::write_sink::test_support::simple_sink_spec(
+                        ),
+                    }
+                })
+                .collect(),
+        }
     }
 }

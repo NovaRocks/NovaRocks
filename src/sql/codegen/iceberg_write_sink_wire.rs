@@ -6,8 +6,9 @@ use iceberg::spec::{PrimitiveType, Transform, Type};
 use crate::connector::iceberg::position_delete_descriptor::{
     PositionDeleteDescriptorInput, PositionDeleteOutputField, PositionDeletePartitionSourceField,
 };
-use crate::sql::catalog::IcebergTableInfo;
-use crate::sql::codegen::iceberg_write_sink::{
+use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
+use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+use crate::sql::planner::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     transform_to_sink_string,
 };
@@ -74,6 +75,57 @@ pub(crate) fn partition_info_from_serialized_metadata(
             )
         })?;
     partition_info_from_metadata(&metadata)
+}
+
+pub(in crate::sql::codegen) fn add_iceberg_sink_target_table_to_desc_builder(
+    desc_builder: &mut DescriptorTableBuilder,
+    current_database: &str,
+    sink_spec: &IcebergWriteSinkSpec,
+) -> Result<(), String> {
+    let partition_info = partition_info_from_serialized_metadata(&sink_spec.iceberg)?;
+    let equality_delete_schema = equality_delete_schema_for_sink(sink_spec)?;
+    desc_builder.add_iceberg_target_table(
+        sink_spec.target_table_id,
+        current_database,
+        &sink_spec.target_table,
+        &sink_spec.iceberg,
+        partition_info,
+        equality_delete_schema.as_ref(),
+    );
+    Ok(())
+}
+
+fn equality_delete_schema_for_sink(
+    sink_spec: &IcebergWriteSinkSpec,
+) -> Result<Option<IcebergSchemaDef>, String> {
+    if sink_spec.mode != IcebergWriteSinkMode::EqualityDeletes {
+        return Ok(None);
+    }
+    if sink_spec.target_columns.is_empty() {
+        return Err(
+            "iceberg equality-delete sink requires at least one equality column".to_string(),
+        );
+    }
+
+    let mut fields = Vec::with_capacity(sink_spec.target_columns.len());
+    for column in &sink_spec.target_columns {
+        let field = sink_spec
+            .iceberg
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.name.eq_ignore_ascii_case(&column.name))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "iceberg equality-delete sink column `{}` missing from iceberg schema",
+                    column.name
+                )
+            })?;
+        fields.push(field);
+    }
+
+    Ok(Some(IcebergSchemaDef { fields }))
 }
 
 fn data_sink_type(mode: IcebergWriteSinkMode) -> data_sinks::TDataSinkType {
@@ -341,7 +393,7 @@ mod tests {
         PositionDeleteDescriptorInput, PositionDeleteOutputField,
         PositionDeletePartitionSourceField,
     };
-    use crate::sql::codegen::iceberg_write_sink::{
+    use crate::sql::planner::write_sink::{
         IcebergWriteSinkMode, test_support, transform_to_sink_string,
     };
 

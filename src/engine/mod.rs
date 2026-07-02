@@ -3177,7 +3177,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink_spec: crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec,
+    sink_spec: crate::sql::planner::write_sink::IcebergWriteSinkSpec,
     query_opts: Option<StandaloneQueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
@@ -3249,17 +3249,21 @@ pub(crate) fn execute_query_as_iceberg_write(
         crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             &physical,
         )?;
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        crate::sql::codegen::FragmentBuildRequest {
-            distributed_plan: &dp,
-            catalog: &catalog_snapshot,
-            connectors: &connectors_snapshot,
-            mv_refresh_ctx: None,
-            output: crate::sql::codegen::FragmentBuildOutput::IcebergWrite {
-                current_database,
-                sink_spec: &sink_spec,
-            },
+    let dp = crate::sql::planner::with_iceberg_write_sink(
+        dp,
+        crate::sql::planner::IcebergWriteFragmentSink {
+            descriptor_database: current_database.to_string(),
+            spec: sink_spec,
+            input: crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal,
         },
+    )?;
+    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+        crate::sql::codegen::FragmentBuildRequest::result(
+            &dp,
+            &catalog_snapshot,
+            &connectors_snapshot,
+            None,
+        ),
     )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
@@ -3283,8 +3287,7 @@ enum ChangeStreamWriteEntrypoint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChangeStreamWriteBuildObservation {
     entrypoint: ChangeStreamWriteEntrypoint,
-    branch_kinds:
-        Vec<crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind>,
+    branch_kinds: Vec<crate::sql::common::ChangeStreamBranchKind>,
     writer_fragment_ids: Vec<Option<crate::sql::codegen::FragmentId>>,
 }
 
@@ -3350,7 +3353,7 @@ pub(crate) fn install_change_stream_write_test_observer(
 
 #[cfg(test)]
 pub(crate) fn observe_change_stream_write_build_for_test(
-    dag: &crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
+    topology: &crate::sql::planner::IcebergChangeStreamWriteTopology,
 ) -> Option<crate::runtime::coordinator::CoordinatedQueryResult> {
     let mut observer = change_stream_write_test_observer()
         .lock()
@@ -3360,15 +3363,15 @@ pub(crate) fn observe_change_stream_write_build_for_test(
         .observations
         .push(ChangeStreamWriteBuildObservation {
             entrypoint: ChangeStreamWriteEntrypoint::PhysicalPlan,
-            branch_kinds: dag
-                .branches
+            branch_kinds: topology
+                .writer_branches
                 .iter()
                 .map(|branch| branch.branch_kind)
                 .collect(),
-            writer_fragment_ids: dag
-                .branches
+            writer_fragment_ids: topology
+                .writer_branches
                 .iter()
-                .map(|branch| branch.writer_fragment_id)
+                .map(|branch| Some(branch.writer_fragment_id))
                 .collect(),
         });
     if observer.short_circuit_after_build {
@@ -3387,6 +3390,8 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) build_result: crate::sql::codegen::MultiFragmentBuildResult,
     pub(crate) commit_plan:
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
+    #[cfg(test)]
+    pub(crate) topology: crate::sql::planner::IcebergChangeStreamWriteTopology,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3395,7 +3400,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     _current_catalog: Option<&str>,
     current_database: &str,
     physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
-    dag: &mut crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
+    dag: &mut crate::sql::planner::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
     let catalog_snapshot = state
@@ -3413,23 +3418,25 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
             physical_plan,
         )?;
+    let planned_dp =
+        crate::sql::planner::with_iceberg_change_stream_write(dp, current_database, dag.clone())?;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        crate::sql::codegen::FragmentBuildRequest {
-            distributed_plan: &dp,
-            catalog: &catalog_snapshot,
-            connectors: &connectors_snapshot,
+        crate::sql::codegen::FragmentBuildRequest::result(
+            &planned_dp.distributed_plan,
+            &catalog_snapshot,
+            &connectors_snapshot,
             mv_refresh_ctx,
-            output: crate::sql::codegen::FragmentBuildOutput::ChangeStreamWrite {
-                current_database,
-                dag,
-            },
-        },
+        ),
     )?;
     let commit_plan =
-        crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_dag(dag)?;
+        crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
+            &planned_dp.topology,
+        )?;
     Ok(PlannedIcebergChangeStreamWrite {
         build_result,
         commit_plan,
+        #[cfg(test)]
+        topology: planned_dp.topology,
     })
 }
 
@@ -3455,7 +3462,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     current_catalog: Option<&str>,
     current_database: &str,
     physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
-    dag: &mut crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
+    dag: &mut crate::sql::planner::ChangeStreamWriteDagSpec,
     query_opts: Option<StandaloneQueryOptions>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
@@ -3468,7 +3475,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
         mv_refresh_ctx,
     )?;
     #[cfg(test)]
-    if let Some(result) = observe_change_stream_write_build_for_test(dag) {
+    if let Some(result) = observe_change_stream_write_build_for_test(&planned.topology) {
         return Ok(result);
     }
     execute_planned_iceberg_change_stream_write(planned.build_result, query_opts)
@@ -9499,10 +9506,9 @@ path = "meta/operations.sqlite"
     fn coordinated_iceberg_insert_requires_exchange_server() {
         let query = parse_query_for_engine_test("SELECT id FROM missing_table");
         let state = Arc::new(StandaloneState::default());
-        let mut sink_spec =
-            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
         sink_spec.iceberg.serialized_metadata = Some(
-            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
         );
 
         let result = super::execute_query_as_iceberg_write(
@@ -9565,10 +9571,9 @@ path = "meta/operations.sqlite"
         let mut state = StandaloneState::default();
         state.exchange_port = 1;
         let state = Arc::new(state);
-        let mut sink_spec =
-            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
         sink_spec.iceberg.serialized_metadata = Some(
-            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
         );
 
         let result = super::execute_query_as_iceberg_write(
@@ -9604,31 +9609,45 @@ path = "meta/operations.sqlite"
 
     #[test]
     fn planned_change_stream_write_uses_physical_plan_entrypoint() {
-        use crate::sql::codegen::iceberg_change_stream_write::{
-            ChangeStreamWriteBranchKind, ChangeStreamWriteBranchSpec,
-            IcebergChangeStreamWriteDagSpec,
-        };
         use crate::sql::column_id::ColumnId;
+        use crate::sql::common::ChangeStreamBranchKind;
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
         use crate::sql::optimizer::physical_tree::{
             OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
         };
         use crate::sql::optimizer::scalar::ScalarArena;
         use crate::sql::optimizer::statistics::Statistics;
+        use crate::sql::planner::{ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec};
 
         let _test_guard = super::acquire_standalone_test_guard();
         let observer = super::install_change_stream_write_test_observer(true);
-        let output_column = crate::sql::analysis::OutputColumn {
-            column_id: ColumnId::new_for_test(3),
-            name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
-            is_internal: false,
-        };
+        let output_columns = vec![
+            crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::new_for_test(1),
+                name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: true,
+            },
+            crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::new_for_test(2),
+                name: "__change_data_route".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: true,
+            },
+            crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::new_for_test(3),
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            },
+        ];
         let mut physical_plan = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
-                columns: vec![output_column.clone()],
+                columns: output_columns.clone(),
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -9637,16 +9656,15 @@ path = "meta/operations.sqlite"
                 ..Default::default()
             },
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: vec![output_column],
+            output_columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut physical_plan, Arc::new(ScalarArena::new()));
         let state = Arc::new(StandaloneState::default());
-        let mut branch = ChangeStreamWriteBranchSpec::reuse_data_for_test(Vec::new());
-        branch.stream_output_ordinals = Some(vec![0]);
-        let mut dag = IcebergChangeStreamWriteDagSpec::for_test(1, Some(2), vec![branch]);
+        let branch = ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![2]);
+        let mut dag = ChangeStreamWriteDagSpec::for_test(Some(0), Some(1), vec![branch]);
 
         let result = super::execute_physical_plan_as_iceberg_change_stream_write(
             &state,
@@ -9669,16 +9687,12 @@ path = "meta/operations.sqlite"
         );
         assert_eq!(
             observation.branch_kinds,
-            vec![ChangeStreamWriteBranchKind::ReuseData]
+            vec![ChangeStreamBranchKind::ReuseData]
         );
         assert_eq!(observation.writer_fragment_ids.len(), 1);
         assert!(
             observation.writer_fragment_ids[0].is_some(),
             "fragment builder must assign the writer fragment before execution"
-        );
-        assert_eq!(
-            observation.writer_fragment_ids[0],
-            dag.branches[0].writer_fragment_id
         );
     }
 

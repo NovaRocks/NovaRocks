@@ -6,17 +6,17 @@ use crate::engine::StandaloneState;
 use crate::engine::query_options::StandaloneQueryOptions;
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::sql::analysis::OutputColumn;
-use crate::sql::codegen::iceberg_change_stream_write::{
-    ChangeStreamWriteBranchKind, ChangeStreamWriteBranchSpec, IcebergChangeStreamWriteDagSpec,
-};
-use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec;
+use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizerPhysicalNode;
+use crate::sql::planner::{
+    ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergWriteSinkSpec,
+};
 
 pub(crate) const DML_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
 pub(crate) struct DmlChangeStreamWritePlan {
     pub(crate) producer: OptimizerPhysicalNode,
-    pub(crate) dag: IcebergChangeStreamWriteDagSpec,
+    pub(crate) dag: ChangeStreamWriteDagSpec,
     pub(crate) pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
 }
 
@@ -53,11 +53,11 @@ struct DmlChangeStreamWriteBranchSinkSpecs {
 }
 
 impl DmlChangeStreamBranchSet {
-    fn branch_kinds(self) -> Vec<ChangeStreamWriteBranchKind> {
+    fn branch_kinds(self) -> Vec<ChangeStreamBranchKind> {
         match self {
             Self::UpdateMor => vec![
-                ChangeStreamWriteBranchKind::DeleteDv,
-                ChangeStreamWriteBranchKind::ReuseData,
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
             ],
             Self::Merge {
                 matched_update,
@@ -66,13 +66,13 @@ impl DmlChangeStreamBranchSet {
             } => {
                 let mut branches = Vec::with_capacity(3);
                 if matched_update || matched_delete {
-                    branches.push(ChangeStreamWriteBranchKind::DeleteDv);
+                    branches.push(ChangeStreamBranchKind::DeleteDv);
                 }
                 if matched_update {
-                    branches.push(ChangeStreamWriteBranchKind::ReuseData);
+                    branches.push(ChangeStreamBranchKind::ReuseData);
                 }
                 if not_matched_insert {
-                    branches.push(ChangeStreamWriteBranchKind::FreshData);
+                    branches.push(ChangeStreamBranchKind::FreshData);
                 }
                 branches
             }
@@ -115,21 +115,21 @@ pub(crate) fn build_dml_change_stream_write_plan(
         target_partition_source_columns: target_partition_source_column_names(table.metadata())?,
         ..Default::default()
     };
-    if branch_kinds.contains(&ChangeStreamWriteBranchKind::DeleteDv) {
+    if branch_kinds.contains(&ChangeStreamBranchKind::DeleteDv) {
         sink_specs.delete_dv = Some(
             crate::engine::mutation_flow::build_mor_deletion_vector_sink_spec(
                 target, &resolved, &table, &entry, target_ref,
             )?,
         );
     }
-    if branch_kinds.contains(&ChangeStreamWriteBranchKind::ReuseData) {
+    if branch_kinds.contains(&ChangeStreamBranchKind::ReuseData) {
         sink_specs.reuse_data = Some(
             crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
                 target, &resolved, &table, &entry,
             )?,
         );
     }
-    if branch_kinds.contains(&ChangeStreamWriteBranchKind::FreshData) {
+    if branch_kinds.contains(&ChangeStreamBranchKind::FreshData) {
         let write_columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
             table.metadata().current_schema(),
         )?;
@@ -474,7 +474,7 @@ fn build_dml_change_stream_dag_from_sink_specs(
     branch_set: DmlChangeStreamBranchSet,
     producer_output_columns: &[OutputColumn],
     mut sink_specs: DmlChangeStreamWriteBranchSinkSpecs,
-) -> Result<IcebergChangeStreamWriteDagSpec, String> {
+) -> Result<ChangeStreamWriteDagSpec, String> {
     let branch_kinds = branch_set.branch_kinds();
     if branch_kinds.is_empty() {
         return Err("DML change-stream write requires at least one branch".to_string());
@@ -482,7 +482,7 @@ fn build_dml_change_stream_dag_from_sink_specs(
     let has_data_branch = branch_kinds.iter().any(|kind| {
         matches!(
             kind,
-            ChangeStreamWriteBranchKind::ReuseData | ChangeStreamWriteBranchKind::FreshData
+            ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData
         )
     });
     let change_op_output_ordinal = output_ordinal_by_name(
@@ -513,7 +513,7 @@ fn build_dml_change_stream_dag_from_sink_specs(
     let mut branches = Vec::with_capacity(branch_kinds.len());
     for (idx, branch_kind) in branch_kinds.into_iter().enumerate() {
         let (sink_spec, output_partition_ordinals) = match branch_kind {
-            ChangeStreamWriteBranchKind::DeleteDv => {
+            ChangeStreamBranchKind::DeleteDv => {
                 let sink_spec = sink_specs
                     .delete_dv
                     .take()
@@ -526,13 +526,13 @@ fn build_dml_change_stream_dag_from_sink_specs(
                 )?;
                 (sink_spec, vec![file_ordinal])
             }
-            ChangeStreamWriteBranchKind::ReuseData => {
+            ChangeStreamBranchKind::ReuseData => {
                 let sink_spec = sink_specs.reuse_data.take().ok_or_else(|| {
                     "DML change-stream ReuseData sink spec is missing".to_string()
                 })?;
                 (sink_spec, data_partition_ordinals.clone())
             }
-            ChangeStreamWriteBranchKind::FreshData => {
+            ChangeStreamBranchKind::FreshData => {
                 let sink_spec = sink_specs.fresh_data.take().ok_or_else(|| {
                     "DML change-stream FreshData sink spec is missing".to_string()
                 })?;
@@ -546,19 +546,14 @@ fn build_dml_change_stream_dag_from_sink_specs(
                 "DML change-stream branch id overflow while building DAG".to_string()
             })?,
             branch_kind,
-            stream_output_slots: Vec::new(),
-            stream_output_ordinals: Some(stream_output_ordinals),
-            output_partition: unpartitioned_change_stream_output(),
-            output_partition_ordinals: Some(output_partition_ordinals),
+            stream_output_ordinals,
+            output_partition_ordinals,
             sink_spec,
-            writer_fragment_id: None,
         });
     }
 
-    let mut dag = IcebergChangeStreamWriteDagSpec {
-        change_op_slot: -1,
+    let dag = ChangeStreamWriteDagSpec {
         change_op_output_ordinal: Some(change_op_output_ordinal),
-        data_route_slot: None,
         data_route_output_ordinal,
         branches,
     };
@@ -575,9 +570,11 @@ pub(crate) fn execute_dml_change_stream_write(
     let crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
         commit_plan,
+        #[cfg(test)]
+        topology,
     } = plan_dml_change_stream_write(state, target, &mut plan)?;
     #[cfg(test)]
-    if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&plan.dag) {
+    if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
         return dml_change_stream_write_execution(result, commit_plan);
     }
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
@@ -603,11 +600,15 @@ pub(crate) fn plan_dml_change_stream_write(
     let crate::engine::PlannedIcebergChangeStreamWrite {
         mut build_result,
         commit_plan,
+        #[cfg(test)]
+        topology,
     } = planned;
     inject_dml_pre_expand_keyed_assert(&mut build_result, plan.pre_expand_keyed_assert.as_ref())?;
     Ok(crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
         commit_plan,
+        #[cfg(test)]
+        topology,
     })
 }
 
@@ -738,15 +739,6 @@ fn output_ordinal_by_name(
     Ok(ordinal)
 }
 
-fn unpartitioned_change_stream_output() -> crate::thrift::partitions::TDataPartition {
-    crate::thrift::partitions::TDataPartition::new(
-        crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-        None::<Vec<crate::thrift::exprs::TExpr>>,
-        None::<Vec<crate::thrift::partitions::TRangePartition>>,
-        None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,7 +748,7 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind;
+    use crate::sql::common::ChangeStreamBranchKind;
 
     fn output_column(name: &str, ordinal: u32) -> crate::sql::analysis::OutputColumn {
         output_column_with_internal(name, ordinal, name.starts_with('_'))
@@ -800,20 +792,16 @@ mod tests {
     }
 
     fn sink_specs_for_partitioned_target() -> DmlChangeStreamWriteBranchSinkSpecs {
-        let mut delete_dv =
-            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
-        delete_dv.mode =
-            crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::DeletionVectors;
+        let mut delete_dv = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        delete_dv.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::DeletionVectors;
         delete_dv.target_columns = vec![
             column(crate::exec::row_position::ICEBERG_FILE_PATH_COL),
             column(crate::exec::row_position::ICEBERG_ROW_POS_COL),
             column("region"),
         ];
 
-        let mut reuse_data =
-            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
-        reuse_data.mode =
-            crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::RowLineageData;
+        let mut reuse_data = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        reuse_data.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::RowLineageData;
         reuse_data.target_columns = vec![
             column("id"),
             column("region"),
@@ -821,9 +809,8 @@ mod tests {
             column(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL),
         ];
 
-        let mut fresh_data =
-            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
-        fresh_data.mode = crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::Data;
+        let mut fresh_data = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        fresh_data.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::Data;
         fresh_data.target_columns = vec![column("id"), column("region")];
 
         DmlChangeStreamWriteBranchSinkSpecs {
@@ -842,8 +829,8 @@ mod tests {
     }
 
     fn branch_kinds(
-        dag: &crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec,
-    ) -> Vec<ChangeStreamWriteBranchKind> {
+        dag: &crate::sql::planner::ChangeStreamWriteDagSpec,
+    ) -> Vec<ChangeStreamBranchKind> {
         dag.branches
             .iter()
             .map(|branch| branch.branch_kind)
@@ -859,17 +846,33 @@ mod tests {
         use crate::sql::optimizer::scalar::ScalarArena;
         use crate::sql::optimizer::statistics::Statistics;
 
-        let output_column = crate::sql::analysis::OutputColumn {
-            column_id: ColumnId::new_for_test(3),
-            name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
-            is_internal: false,
-        };
+        let output_columns = vec![
+            crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::new_for_test(1),
+                name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: true,
+            },
+            crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::new_for_test(2),
+                name: "__change_data_route".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: true,
+            },
+            crate::sql::analysis::OutputColumn {
+                column_id: ColumnId::new_for_test(3),
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            },
+        ];
         let mut physical_plan = OptimizerPhysicalNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
-                columns: vec![output_column.clone()],
+                columns: output_columns.clone(),
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -878,7 +881,7 @@ mod tests {
                 ..Default::default()
             },
             explain_stats: OptimizerExplainStats::default(),
-            output_columns: vec![output_column],
+            output_columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
@@ -889,14 +892,13 @@ mod tests {
 
     fn execution_test_plan() -> DmlChangeStreamWritePlan {
         let mut branch =
-            crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchSpec::reuse_data_for_test(Vec::new());
-        branch.stream_output_ordinals = Some(vec![0]);
-        branch.output_partition_ordinals = Some(Vec::new());
+            crate::sql::planner::ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![2]);
+        branch.output_partition_ordinals = Vec::new();
         DmlChangeStreamWritePlan {
             producer: physical_values_plan_for_execution_test(),
-            dag: crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec::for_test(
-                1,
-                Some(2),
+            dag: crate::sql::planner::ChangeStreamWriteDagSpec::for_test(
+                Some(0),
+                Some(1),
                 vec![branch],
             ),
             pre_expand_keyed_assert: None,
@@ -1122,7 +1124,7 @@ mod tests {
     }
 
     fn commit_plan_for_branches(
-        branches: &[(i32, ChangeStreamWriteBranchKind)],
+        branches: &[(i32, ChangeStreamBranchKind)],
     ) -> crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan {
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::new(
             branches.iter().copied().collect(),
@@ -1141,16 +1143,16 @@ mod tests {
         assert_eq!(
             branch_kinds(&dag),
             vec![
-                ChangeStreamWriteBranchKind::DeleteDv,
-                ChangeStreamWriteBranchKind::ReuseData,
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
             ]
         );
 
         let execution = dml_change_stream_write_execution(
             empty_writer_result_for_test(),
             commit_plan_for_branches(&[
-                (10, ChangeStreamWriteBranchKind::DeleteDv),
-                (11, ChangeStreamWriteBranchKind::ReuseData),
+                (10, ChangeStreamBranchKind::DeleteDv),
+                (11, ChangeStreamBranchKind::ReuseData),
             ]),
         )
         .expect("zero-row UPDATE should complete with query-level EOS");
@@ -1177,16 +1179,16 @@ mod tests {
         assert_eq!(
             branch_kinds(&dag),
             vec![
-                ChangeStreamWriteBranchKind::DeleteDv,
-                ChangeStreamWriteBranchKind::ReuseData,
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
             ]
         );
 
         let execution = dml_change_stream_write_execution(
             empty_writer_result_for_test(),
             commit_plan_for_branches(&[
-                (10, ChangeStreamWriteBranchKind::DeleteDv),
-                (11, ChangeStreamWriteBranchKind::ReuseData),
+                (10, ChangeStreamBranchKind::DeleteDv),
+                (11, ChangeStreamBranchKind::ReuseData),
             ]),
         )
         .expect("zero-row MERGE matched UPDATE should complete with query-level EOS");
@@ -1210,14 +1212,11 @@ mod tests {
             sink_specs_for_partitioned_target(),
         )
         .expect("not matched insert DAG");
-        assert_eq!(
-            branch_kinds(&dag),
-            vec![ChangeStreamWriteBranchKind::FreshData]
-        );
+        assert_eq!(branch_kinds(&dag), vec![ChangeStreamBranchKind::FreshData]);
 
         let execution = dml_change_stream_write_execution(
             empty_writer_result_for_test(),
-            commit_plan_for_branches(&[(12, ChangeStreamWriteBranchKind::FreshData)]),
+            commit_plan_for_branches(&[(12, ChangeStreamBranchKind::FreshData)]),
         )
         .expect("empty MERGE not-matched INSERT should not require writer files");
 
@@ -1372,8 +1371,8 @@ mod tests {
         assert_eq!(
             branch_kinds(&dag),
             vec![
-                ChangeStreamWriteBranchKind::DeleteDv,
-                ChangeStreamWriteBranchKind::ReuseData,
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
             ]
         );
         assert_eq!(dag.change_op_output_ordinal, Some(6));
@@ -1382,22 +1381,16 @@ mod tests {
         let delete_dv = dag
             .branches
             .iter()
-            .find(|branch| branch.branch_kind == ChangeStreamWriteBranchKind::DeleteDv)
+            .find(|branch| branch.branch_kind == ChangeStreamBranchKind::DeleteDv)
             .expect("delete branch");
-        assert_eq!(
-            delete_dv.output_partition_ordinals.as_deref(),
-            Some(&[0][..])
-        );
+        assert_eq!(delete_dv.output_partition_ordinals.as_slice(), &[0][..]);
 
         let reuse_data = dag
             .branches
             .iter()
-            .find(|branch| branch.branch_kind == ChangeStreamWriteBranchKind::ReuseData)
+            .find(|branch| branch.branch_kind == ChangeStreamBranchKind::ReuseData)
             .expect("reuse branch");
-        assert_eq!(
-            reuse_data.output_partition_ordinals.as_deref(),
-            Some(&[2][..])
-        );
+        assert_eq!(reuse_data.output_partition_ordinals.as_slice(), &[2][..]);
     }
 
     #[test]
@@ -1416,7 +1409,7 @@ mod tests {
         .expect("matched delete DAG");
         assert_eq!(
             branch_kinds(&matched_delete),
-            vec![ChangeStreamWriteBranchKind::DeleteDv]
+            vec![ChangeStreamBranchKind::DeleteDv]
         );
 
         let matched_update = build_dml_change_stream_dag_from_sink_specs(
@@ -1432,8 +1425,8 @@ mod tests {
         assert_eq!(
             branch_kinds(&matched_update),
             vec![
-                ChangeStreamWriteBranchKind::DeleteDv,
-                ChangeStreamWriteBranchKind::ReuseData,
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
             ]
         );
 
@@ -1449,7 +1442,7 @@ mod tests {
         .expect("not matched insert DAG");
         assert_eq!(
             branch_kinds(&insert_only),
-            vec![ChangeStreamWriteBranchKind::FreshData]
+            vec![ChangeStreamBranchKind::FreshData]
         );
 
         let update_and_insert = build_dml_change_stream_dag_from_sink_specs(
@@ -1465,9 +1458,9 @@ mod tests {
         assert_eq!(
             branch_kinds(&update_and_insert),
             vec![
-                ChangeStreamWriteBranchKind::DeleteDv,
-                ChangeStreamWriteBranchKind::ReuseData,
-                ChangeStreamWriteBranchKind::FreshData,
+                ChangeStreamBranchKind::DeleteDv,
+                ChangeStreamBranchKind::ReuseData,
+                ChangeStreamBranchKind::FreshData,
             ]
         );
     }
@@ -1489,11 +1482,11 @@ mod tests {
         let fresh_data = dag
             .branches
             .iter()
-            .find(|branch| branch.branch_kind == ChangeStreamWriteBranchKind::FreshData)
+            .find(|branch| branch.branch_kind == ChangeStreamBranchKind::FreshData)
             .expect("fresh branch");
         assert_eq!(
-            fresh_data.output_partition_ordinals.as_deref(),
-            Some(&[][..])
+            fresh_data.output_partition_ordinals.as_slice(),
+            &[] as &[usize]
         );
     }
 

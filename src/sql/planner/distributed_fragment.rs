@@ -46,11 +46,13 @@ impl DataPartition {
     }
 }
 
-/// Sink intent. This slice only produces the root result sink.
+/// Planner-owned fragment sink intent lowered by codegen.
 #[derive(Clone, Debug)]
 pub(crate) enum DataSink {
     Result,
     Noop,
+    IcebergWrite(crate::sql::planner::IcebergWriteFragmentSink),
+    IcebergChangeStreamRouter(crate::sql::planner::IcebergChangeStreamRouterSink),
 }
 
 #[derive(Clone, Debug)]

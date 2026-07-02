@@ -881,8 +881,7 @@ mod tests {
         edge.edge_kind = FragmentEdgeKind::IcebergChangeStreamRouter {
             router_group_id: 42,
             branch_id: 1,
-            branch_kind:
-                crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind::DeleteDv,
+            branch_kind: crate::sql::common::ChangeStreamBranchKind::DeleteDv,
         };
         edge
     }

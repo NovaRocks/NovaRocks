@@ -68,11 +68,11 @@ use crate::sql::catalog::{
     ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     ScanSource, TableDef,
 };
-use crate::sql::codegen::iceberg_write_sink::{
+use crate::sql::parser::ast::{InsertSource, Literal, SqlType};
+use crate::sql::planner::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     synthetic_iceberg_write_table_id, transform_to_sink_string,
 };
-use crate::sql::parser::ast::{InsertSource, Literal, SqlType};
 
 pub(crate) fn execute_iceberg_insert_or_overwrite(
     state: &Arc<StandaloneState>,

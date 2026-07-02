@@ -24,6 +24,12 @@ use crate::sql::codegen::helpers::{
     join_kind_to_op, split_and_conjuncts_typed, typed_expr_display_name,
     typed_expr_display_name_without_qualifiers,
 };
+use crate::sql::codegen::iceberg_change_stream_router_wire::{
+    build_router_sink_thrift, output_partition_for_ordinals, output_slot_ids_for_ordinals,
+};
+use crate::sql::codegen::iceberg_write_sink_wire::{
+    add_iceberg_sink_target_table_to_desc_builder, build_iceberg_write_sink_thrift,
+};
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::runtime_filter_lowering::{
@@ -45,6 +51,7 @@ use crate::sql::planner::optimizer_bridge::property::{
 };
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::sql::planner::{JoinExecutionMode, WiredRuntimeFilterBuild};
+use crate::thrift::data_sinks;
 use crate::thrift::exprs;
 use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
@@ -71,6 +78,34 @@ pub(crate) fn lower_distributed_plan(
     let edges = lower_fragment_edges(dp, &mut state)?;
     let lowered_fragments = std::mem::take(&mut state.lowered_fragments);
 
+    let mut prepared_fragments = Vec::with_capacity(lowered_fragments.len());
+    for (fragment, lowered) in lowered_fragments {
+        let root_node_id = lowered
+            .plan_nodes
+            .first()
+            .map(|node| node.node_id)
+            .unwrap_or(-1);
+        let (output_sink, output_exprs, output_columns) = lower_fragment_sink(
+            &mut state,
+            &fragment,
+            &lowered.scope,
+            &fragment.output_columns,
+        )?;
+        let query_global_dicts = state
+            .query_global_dicts_per_fragment
+            .remove(&fragment.fragment_id)
+            .filter(|dicts| !dicts.is_empty());
+        prepared_fragments.push((
+            fragment,
+            lowered,
+            output_sink,
+            output_exprs,
+            output_columns,
+            root_node_id,
+            query_global_dicts,
+        ));
+    }
+
     let desc_tbl =
         std::mem::replace(&mut state.desc_builder, DescriptorTableBuilder::new()).build();
     let exec_params = nodes::build_exec_params_multi_with_refresh_context(
@@ -79,34 +114,22 @@ pub(crate) fn lower_distributed_plan(
         mv_refresh_ctx,
     )?;
 
-    let mut fragment_results = Vec::with_capacity(lowered_fragments.len());
-    for (fragment, lowered) in lowered_fragments {
-        let output_columns = output_columns_for_boundary(&fragment.output_columns);
-        let root_node_id = lowered
-            .plan_nodes
-            .first()
-            .map(|node| node.node_id)
-            .unwrap_or(-1);
+    let mut fragment_results = Vec::with_capacity(prepared_fragments.len());
+    for (
+        fragment,
+        lowered,
+        output_sink,
+        output_exprs,
+        output_columns,
+        root_node_id,
+        query_global_dicts,
+    ) in prepared_fragments
+    {
         let boundary_schemas = vec![result_root_boundary_schema_report(
             fragment.fragment_id,
             root_node_id,
             &output_columns,
         )];
-        let query_global_dicts = state
-            .query_global_dicts_per_fragment
-            .remove(&fragment.fragment_id)
-            .filter(|dicts| !dicts.is_empty());
-        let is_root = fragment.fragment_id == dp.root_fragment_id;
-        let output_exprs = if is_root {
-            result_output_exprs_for_columns(&lowered.scope, &fragment.output_columns)?
-        } else {
-            None
-        };
-        let output_sink = if is_root {
-            build_result_sink()
-        } else {
-            build_noop_sink()
-        };
 
         fragment_results.push(FragmentBuildResult {
             fragment_id: fragment.fragment_id,
@@ -180,17 +203,26 @@ fn validate_distributed_plan(
         validate_node_fragment_ownership(fragment.fragment_id, &fragment.root)?;
 
         if fragment.fragment_id == dp.root_fragment_id {
-            if !matches!(fragment.sink, crate::sql::planner::DataSink::Result) {
+            if !matches!(
+                fragment.sink,
+                crate::sql::planner::DataSink::Result
+                    | crate::sql::planner::DataSink::IcebergWrite(_)
+                    | crate::sql::planner::DataSink::IcebergChangeStreamRouter(_)
+            ) {
                 return Err(format!(
-                    "lower_distributed_plan root fragment id={} must use result sink",
+                    "lower_distributed_plan root fragment id={} must use result, Iceberg write, or Iceberg change-stream router sink",
                     fragment.fragment_id
                 ));
             }
             ensure_unpartitioned("root output_partition", &fragment.output_partition)?;
         } else {
-            if !matches!(fragment.sink, crate::sql::planner::DataSink::Noop) {
+            if !matches!(
+                fragment.sink,
+                crate::sql::planner::DataSink::Noop
+                    | crate::sql::planner::DataSink::IcebergWrite(_)
+            ) {
                 return Err(format!(
-                    "lower_distributed_plan non-root fragment id={} must use noop sink",
+                    "lower_distributed_plan non-root fragment id={} must use noop or Iceberg write sink",
                     fragment.fragment_id
                 ));
             }
@@ -265,6 +297,9 @@ fn topological_fragment_order(
                 )
             })?;
         validate_edge_target_node(target, edge)?;
+        if is_router_edge(edge) {
+            continue;
+        }
         adjacency
             .get_mut(&edge.source_fragment_id)
             .expect("validated source fragment id")
@@ -278,11 +313,19 @@ fn topological_fragment_order(
             .expect("validated target fragment id") += 1;
     }
 
+    let router_target_ids = dp
+        .edges
+        .iter()
+        .filter(|edge| is_router_edge(edge))
+        .map(|edge| edge.target_fragment_id)
+        .collect::<BTreeSet<_>>();
+
     validate_non_root_connectivity(
         dp.root_fragment_id,
         fragments_by_id,
         &adjacency,
         &reverse_adjacency,
+        &router_target_ids,
     )?;
 
     let non_root_count = fragments_by_id
@@ -335,11 +378,13 @@ fn validate_non_root_connectivity(
     fragments_by_id: &BTreeMap<FragmentId, &crate::sql::planner::PlanFragment>,
     adjacency: &BTreeMap<FragmentId, Vec<FragmentId>>,
     reverse_adjacency: &BTreeMap<FragmentId, Vec<FragmentId>>,
+    router_target_ids: &BTreeSet<FragmentId>,
 ) -> Result<(), String> {
     for fragment_id in fragments_by_id
         .keys()
         .copied()
         .filter(|fragment_id| *fragment_id != root_fragment_id)
+        .filter(|fragment_id| !router_target_ids.contains(fragment_id))
     {
         if adjacency
             .get(&fragment_id)
@@ -368,6 +413,7 @@ fn validate_non_root_connectivity(
         .keys()
         .copied()
         .filter(|fragment_id| *fragment_id != root_fragment_id)
+        .filter(|fragment_id| !router_target_ids.contains(fragment_id))
     {
         if !reaches_root.contains(&fragment_id) {
             return Err(format!(
@@ -377,6 +423,13 @@ fn validate_non_root_connectivity(
         }
     }
     Ok(())
+}
+
+fn is_router_edge(edge: &crate::sql::codegen::FragmentEdge) -> bool {
+    matches!(
+        edge.edge_kind,
+        crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. }
+    )
 }
 
 fn validate_edge_target_node(
@@ -461,6 +514,21 @@ fn validate_edge_target_node(
             }
             Ok(())
         }
+        (
+            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. },
+            super::kind::ExchangeFlavor::Distribution,
+        ) => {
+            if edge.source_fragment_id != exchange.source_fragment_id {
+                return Err(format!(
+                    "lower_distributed_plan Iceberg change-stream router edge source_fragment_id={} does not match Exchange source_fragment_id={} for target_exchange_node_id={} in target fragment id={}",
+                    edge.source_fragment_id,
+                    exchange.source_fragment_id,
+                    edge.target_exchange_node_id,
+                    target_fragment.fragment_id
+                ));
+            }
+            Ok(())
+        }
         (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
             "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -470,7 +538,10 @@ fn validate_edge_target_node(
             edge.target_exchange_node_id, target_fragment.fragment_id
         )),
         (crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. }, _) => {
-            Err("Iceberg change-stream router edges are not wired yet".to_string())
+            Err(format!(
+                "lower_distributed_plan Iceberg change-stream router edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+                edge.target_exchange_node_id, target_fragment.fragment_id
+            ))
         }
     }
 }
@@ -516,44 +587,143 @@ fn lower_fragment_edges(
 
     for edge in &dp.edges {
         let mut lowered_edge = edge.clone();
-        if matches!(
-            edge.edge_kind,
+        match edge.edge_kind {
             crate::sql::codegen::FragmentEdgeKind::Stream
-                | crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }
-        ) {
-            let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
-            if state
-                .lowered_fragment_output(edge.source_fragment_id)
-                .is_none()
-            {
-                state.ensure_fragment_lowered(edge.source_fragment_id)?;
-            }
-            let source = state
-                .lowered_fragment_output(edge.source_fragment_id)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "lower_distributed_plan edge references source fragment id={} before it was lowered",
-                        edge.source_fragment_id
-                    )
-                })?;
-            lowered_edge.output_partition =
-                lower_exchange_output_partition(exchange, &source.scope, state.slot_allocator())?;
-            if matches!(
-                edge.edge_kind,
-                crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }
-            ) {
-                lowered_edge.output_slot_ids = lower_cte_receive_output_slot_ids(
+            | crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. } => {
+                let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
+                if state
+                    .lowered_fragment_output(edge.source_fragment_id)
+                    .is_none()
+                {
+                    state.ensure_fragment_lowered(edge.source_fragment_id)?;
+                }
+                let source = state
+                    .lowered_fragment_output(edge.source_fragment_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "lower_distributed_plan edge references source fragment id={} before it was lowered",
+                            edge.source_fragment_id
+                        )
+                    })?;
+                lowered_edge.output_partition = lower_exchange_output_partition(
                     exchange,
                     &source.scope,
-                    "lower_fragment_edges",
+                    state.slot_allocator(),
                 )?;
+                if matches!(
+                    edge.edge_kind,
+                    crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }
+                ) {
+                    lowered_edge.output_slot_ids = lower_cte_receive_output_slot_ids(
+                        exchange,
+                        &source.scope,
+                        "lower_fragment_edges",
+                    )?;
+                }
+            }
+            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
+                if state
+                    .lowered_fragment_output(edge.source_fragment_id)
+                    .is_none()
+                {
+                    state.ensure_fragment_lowered(edge.source_fragment_id)?;
+                }
+                let source = state
+                    .lowered_fragment_output(edge.source_fragment_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "lower_distributed_plan router edge references source fragment id={} before it was lowered",
+                            edge.source_fragment_id
+                        )
+                    })?;
+                let route = router_route_for_edge(dp, edge)?;
+                let source_fragment = fragments_by_id
+                    .get(&edge.source_fragment_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "lower_distributed_plan router edge references missing source fragment id={}",
+                            edge.source_fragment_id
+                        )
+                    })?;
+                lowered_edge.output_partition = output_partition_for_ordinals(
+                    &source.scope,
+                    &source_fragment.output_columns,
+                    &route.output_partition_ordinals,
+                    &format!("branch {:?} partition", route.branch_kind),
+                )?;
+                lowered_edge.output_slot_ids = output_slot_ids_for_ordinals(
+                    &source.scope,
+                    &source_fragment.output_columns,
+                    &route.output_ordinals,
+                    &format!("branch {:?} output", route.branch_kind),
+                )?;
+                if state
+                    .lowered_fragment_output(edge.target_fragment_id)
+                    .is_none()
+                {
+                    state.ensure_fragment_lowered(edge.target_fragment_id)?;
+                }
             }
         }
         lowered_edges.push(lowered_edge);
     }
 
     Ok(lowered_edges)
+}
+
+fn router_route_for_edge<'a>(
+    dp: &'a crate::sql::planner::DistributedPlan,
+    edge: &crate::sql::codegen::FragmentEdge,
+) -> Result<&'a crate::sql::planner::IcebergChangeStreamBranchRoute, String> {
+    let crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter {
+        router_group_id,
+        branch_id,
+        branch_kind,
+    } = edge.edge_kind
+    else {
+        return Err("router_route_for_edge called for non-router edge".to_string());
+    };
+    let source_fragment = dp
+        .fragments
+        .iter()
+        .find(|fragment| fragment.fragment_id == edge.source_fragment_id)
+        .ok_or_else(|| {
+            format!(
+                "lower_distributed_plan router edge references missing source fragment id={}",
+                edge.source_fragment_id
+            )
+        })?;
+    let crate::sql::planner::DataSink::IcebergChangeStreamRouter(router) = &source_fragment.sink
+    else {
+        return Err(format!(
+            "lower_distributed_plan router edge source fragment id={} does not use Iceberg change-stream router sink",
+            edge.source_fragment_id
+        ));
+    };
+    if router.group_id != router_group_id {
+        return Err(format!(
+            "lower_distributed_plan router edge group id {} does not match source router group id {}",
+            router_group_id, router.group_id
+        ));
+    }
+    router
+        .branches
+        .iter()
+        .find(|route| {
+            route.branch_id == branch_id
+                && route.branch_kind == branch_kind
+                && route.target_fragment_id == edge.target_fragment_id
+                && route.target_exchange_node_id == edge.target_exchange_node_id
+        })
+        .ok_or_else(|| {
+            format!(
+                "lower_distributed_plan router edge source={} group={} branch_id={} branch_kind={:?} has no matching planner route",
+                edge.source_fragment_id, router_group_id, branch_id, branch_kind
+            )
+        })
 }
 
 fn lower_exchange_output_partition(
@@ -665,7 +835,7 @@ fn edge_boundary_schemas(
             }
             crate::sql::codegen::FragmentEdgeKind::Stream => &source.output_columns,
             crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
-                return Err("Iceberg change-stream router edges are not wired yet".to_string());
+                &exchange.output_columns
             }
         };
         let output_columns = output_columns_for_boundary(edge_output_columns);
@@ -744,6 +914,10 @@ fn target_exchange_for_edge<'a>(
             }
             Ok(exchange)
         }
+        (
+            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. },
+            super::kind::ExchangeFlavor::Distribution,
+        ) => Ok(exchange),
         (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
             "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -753,7 +927,10 @@ fn target_exchange_for_edge<'a>(
             edge.target_exchange_node_id, target_fragment.fragment_id
         )),
         (crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. }, _) => {
-            Err("Iceberg change-stream router edges are not wired yet".to_string())
+            Err(format!(
+                "lower_distributed_plan Iceberg change-stream router edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+                edge.target_exchange_node_id, target_fragment.fragment_id
+            ))
         }
     }
 }
@@ -1508,18 +1685,47 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         match &exchange.flavor {
             super::kind::ExchangeFlavor::Distribution => {
-                let source = self.lower_stream_exchange_source(node, exchange)?;
-                Ok(LoweredDistributedNode {
-                    plan_nodes: vec![nodes::build_exchange_node(
+                if exchange.output_columns.is_empty() {
+                    let source = self.lower_stream_exchange_source(node, exchange)?;
+                    Ok(LoweredDistributedNode {
+                        plan_nodes: vec![nodes::build_exchange_node(
+                            node.node_id,
+                            source.tuple_ids.clone(),
+                            exchange.partition_type,
+                        )],
+                        scope: source.scope,
+                        tuple_ids: source.tuple_ids,
+                        output_columns: source.output_columns,
+                        ordering: OrderingSpec::Any,
+                    })
+                } else {
+                    if self
+                        .state
+                        .lowered_fragment_output(exchange.source_fragment_id)
+                        .is_none()
+                    {
+                        self.state
+                            .ensure_fragment_lowered(exchange.source_fragment_id)?;
+                    }
+                    let exchange_tuple_id = first_tuple_id(node, "Exchange")?;
+                    let (scope, output_columns) = self.lower_exchange_output_scope(
+                        exchange_tuple_id,
                         node.node_id,
-                        source.tuple_ids.clone(),
-                        exchange.partition_type,
-                    )],
-                    scope: source.scope,
-                    tuple_ids: source.tuple_ids,
-                    output_columns: source.output_columns,
-                    ordering: OrderingSpec::Any,
-                })
+                        exchange,
+                        "Distribution",
+                    )?;
+                    Ok(LoweredDistributedNode {
+                        plan_nodes: vec![nodes::build_exchange_node(
+                            node.node_id,
+                            vec![exchange_tuple_id],
+                            exchange.partition_type,
+                        )],
+                        scope,
+                        tuple_ids: vec![exchange_tuple_id],
+                        output_columns,
+                        ordering: OrderingSpec::Any,
+                    })
+                }
             }
             super::kind::ExchangeFlavor::LimitOffset { limit, offset } => {
                 let source = self.lower_stream_exchange_source(node, exchange)?;
@@ -1579,10 +1785,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                         .ensure_fragment_lowered(exchange.source_fragment_id)?;
                 }
                 let exchange_tuple_id = first_tuple_id(node, "Exchange")?;
-                let (scope, output_columns) = self.lower_cte_multicast_exchange_scope(
+                let (scope, output_columns) = self.lower_exchange_output_scope(
                     exchange_tuple_id,
                     node.node_id,
                     exchange,
+                    "CTE multicast",
                 )?;
                 Ok(LoweredDistributedNode {
                     plan_nodes: vec![nodes::build_exchange_node(
@@ -2018,16 +2225,16 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         Ok(source)
     }
 
-    fn lower_cte_multicast_exchange_scope(
+    fn lower_exchange_output_scope(
         &mut self,
         exchange_tuple_id: i32,
         exchange_node_id: i32,
         exchange: &super::kind::DistributedExchangeNode,
+        context: &str,
     ) -> Result<(ExprScope, Vec<AnalysisOutputColumn>), String> {
         if exchange.output_columns.is_empty() {
             return Err(format!(
-                "DistributedPlan CTE multicast Exchange node_id={} has no output columns",
-                exchange_node_id
+                "DistributedPlan {context} Exchange node_id={exchange_node_id} has no output columns",
             ));
         }
         let mut scope = ExprScope::new();
@@ -5011,6 +5218,118 @@ fn project_node_output_columns(
         .collect()
 }
 
+fn lower_fragment_sink(
+    state: &mut OwnedLoweringState<'_>,
+    fragment: &crate::sql::planner::PlanFragment,
+    scope: &ExprScope,
+    output_columns: &[AnalysisOutputColumn],
+) -> Result<
+    (
+        data_sinks::TDataSink,
+        Option<Vec<exprs::TExpr>>,
+        Vec<OutputColumn>,
+    ),
+    String,
+> {
+    let boundary_columns = output_columns_for_boundary(output_columns);
+    match &fragment.sink {
+        crate::sql::planner::DataSink::Result => Ok((
+            build_result_sink(),
+            result_output_exprs_for_columns(scope, output_columns)?,
+            boundary_columns,
+        )),
+        crate::sql::planner::DataSink::Noop => Ok((build_noop_sink(), None, boundary_columns)),
+        crate::sql::planner::DataSink::IcebergWrite(sink) => {
+            add_iceberg_sink_target_table_to_desc_builder(
+                &mut state.desc_builder,
+                &sink.descriptor_database,
+                &sink.spec,
+            )?;
+            let sink_columns = iceberg_sink_columns_for_input(output_columns, &sink.input)?;
+            if sink_columns.len() != sink.spec.target_columns.len() {
+                return Err(format!(
+                    "Iceberg write sink input column count {} does not match target column count {}",
+                    sink_columns.len(),
+                    sink.spec.target_columns.len()
+                ));
+            }
+            let output_exprs =
+                slot_ref_exprs_for_columns(scope, &sink_columns, "iceberg write sink")?;
+            let tuple_id = iceberg_sink_tuple_id(scope, &sink_columns)?;
+            let output_columns = sink
+                .spec
+                .target_columns
+                .iter()
+                .map(|column| OutputColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                })
+                .collect();
+            Ok((
+                build_iceberg_write_sink_thrift(&sink.spec, tuple_id),
+                output_exprs,
+                output_columns,
+            ))
+        }
+        crate::sql::planner::DataSink::IcebergChangeStreamRouter(sink) => Ok((
+            build_router_sink_thrift(sink, scope, output_columns)?,
+            None,
+            boundary_columns,
+        )),
+    }
+}
+
+fn iceberg_sink_columns_for_input(
+    output_columns: &[AnalysisOutputColumn],
+    input: &crate::sql::planner::IcebergWriteInputBinding,
+) -> Result<Vec<AnalysisOutputColumn>, String> {
+    match input {
+        crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal => {
+            Ok(output_columns.to_vec())
+        }
+        crate::sql::planner::IcebergWriteInputBinding::OutputOrdinals(ordinals) => ordinals
+            .iter()
+            .copied()
+            .map(|ordinal| {
+                output_columns.get(ordinal).cloned().ok_or_else(|| {
+                    format!("iceberg write sink output ordinal {ordinal} is out of range")
+                })
+            })
+            .collect(),
+    }
+}
+
+fn iceberg_sink_tuple_id(
+    scope: &ExprScope,
+    output_columns: &[AnalysisOutputColumn],
+) -> Result<i32, String> {
+    let first = output_columns
+        .first()
+        .ok_or_else(|| "iceberg write sink requires at least one output column".to_string())?;
+    let first_binding = scope.resolve_by_id(first.column_id).ok_or_else(|| {
+        format!(
+            "iceberg write sink cannot resolve output column `{}` id={}",
+            first.name, first.column_id.0
+        )
+    })?;
+    for column in output_columns.iter().skip(1) {
+        let binding = scope.resolve_by_id(column.column_id).ok_or_else(|| {
+            format!(
+                "iceberg write sink cannot resolve output column `{}` id={}",
+                column.name, column.column_id.0
+            )
+        })?;
+        if binding.tuple_id != first_binding.tuple_id {
+            return Err(format!(
+                "iceberg write sink output columns span multiple tuples: {} and {}",
+                first_binding.tuple_id, binding.tuple_id
+            ));
+        }
+    }
+    Ok(first_binding.tuple_id)
+}
+
 fn result_output_exprs_for_columns(
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
@@ -5903,6 +6222,141 @@ mod tests {
     }
 
     #[test]
+    fn lower_distributed_plan_lowers_root_iceberg_write_sink() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let mut dp = distributed_project_scan_plan();
+        let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        sink_spec.iceberg.serialized_metadata = Some(
+            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
+        dp.fragments[0].sink =
+            DataSink::IcebergWrite(crate::sql::planner::IcebergWriteFragmentSink {
+                descriptor_database: "test_db".to_string(),
+                spec: sink_spec,
+                input: crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal,
+            });
+
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
+            .expect("lower iceberg write sink");
+        let root = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == result.root_fragment_id)
+            .expect("root fragment");
+
+        assert_eq!(
+            root.output_sink.type_,
+            crate::thrift::data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+        );
+        assert!(root.output_sink.iceberg_table_sink.is_some());
+        assert!(
+            root.output_exprs
+                .as_ref()
+                .is_some_and(|exprs| exprs.len() == 1)
+        );
+        assert!(
+            root.desc_tbl
+                .table_descriptors
+                .as_ref()
+                .is_some_and(|tables| tables.iter().any(|table| table.id == 99))
+        );
+    }
+
+    #[test]
+    fn lower_distributed_plan_lowers_change_stream_router_and_writers() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let output_columns = vec![
+            output_col(1, "op", DataType::Int32, false),
+            output_col(2, "route", DataType::Int32, false),
+            output_col(3, "delete_id", DataType::Int32, false),
+        ];
+        let dp = DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: distributed_values_node(10, 0, 10, output_columns.clone()),
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+        let mut branch =
+            crate::sql::planner::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
+        branch.output_partition_ordinals = vec![2];
+        branch.sink_spec.iceberg.serialized_metadata =
+            Some(crate::sql::planner::write_sink::test_support::unpartitioned_metadata_json());
+        let dag =
+            crate::sql::planner::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
+        let planned = crate::sql::planner::with_iceberg_change_stream_write(dp, "test_db", dag)
+            .expect("plan change-stream write");
+
+        let result =
+            super::lower_distributed_plan(&planned.distributed_plan, &catalog, &connectors, None)
+                .expect("lower change-stream write");
+
+        assert_eq!(result.fragment_results.len(), 2);
+        assert_eq!(result.edges.len(), 1);
+        let root = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == result.root_fragment_id)
+            .expect("root fragment");
+        assert_eq!(
+            root.output_sink.type_,
+            crate::thrift::data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK
+        );
+        let router = root
+            .output_sink
+            .iceberg_change_stream_router_sink
+            .as_ref()
+            .expect("router sink");
+        assert_eq!(router.change_op_slot_id, 1);
+        assert_eq!(router.data_route_slot_id, None);
+        assert_eq!(router.branches.len(), 1);
+        assert_eq!(
+            router.branches[0].stream_sink.output_columns.as_ref(),
+            Some(&vec![3])
+        );
+        assert_eq!(
+            router.branches[0].stream_sink.output_partition.type_,
+            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
+        );
+
+        let edge = &result.edges[0];
+        assert_eq!(edge.source_fragment_id, 0);
+        assert_eq!(edge.target_fragment_id, 1);
+        assert_eq!(edge.output_slot_ids, vec![3]);
+        assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
+        assert_eq!(
+            edge.output_partition.type_,
+            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
+        );
+
+        let writer = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == edge.target_fragment_id)
+            .expect("writer fragment");
+        assert_eq!(
+            writer.output_sink.type_,
+            crate::thrift::data_sinks::TDataSinkType::ICEBERG_DV_SINK
+        );
+        assert!(
+            writer
+                .output_exprs
+                .as_ref()
+                .is_some_and(|exprs| exprs.len() == 1)
+        );
+    }
+
+    #[test]
     fn lower_distributed_plan_lowers_fragments_in_edge_topological_order() {
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
@@ -6022,7 +6476,7 @@ mod tests {
         noop_sink.fragments[0].sink = DataSink::Noop;
         assert_lowering_err(
             &noop_sink,
-            "lower_distributed_plan root fragment id=0 must use result sink",
+            "lower_distributed_plan root fragment id=0 must use result, Iceberg write, or Iceberg change-stream router sink",
         );
 
         let mut random_partition = distributed_project_scan_plan();

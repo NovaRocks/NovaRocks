@@ -32,9 +32,9 @@ use crate::lower::layout::Layout;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::sql::codegen::iceberg_change_stream_write::{
-    CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamRouteKey, ChangeStreamWriteBranchKind,
-    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+use crate::sql::common::{
+    CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind, ChangeStreamRouteKey,
+    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE, branch_kind_from_thrift,
 };
 use crate::thrift::{data_sinks, internal_service, types};
 
@@ -244,15 +244,14 @@ impl IcebergChangeStreamRouterSinkFactory {
             .iter()
             .filter(|branch| {
                 matches!(
-                    ChangeStreamWriteBranchKind::from_thrift(branch.branch_kind),
-                    Ok(ChangeStreamWriteBranchKind::ReuseData)
-                        | Ok(ChangeStreamWriteBranchKind::FreshData)
+                    branch_kind_from_thrift(branch.branch_kind),
+                    Ok(ChangeStreamBranchKind::ReuseData) | Ok(ChangeStreamBranchKind::FreshData)
                 )
             })
             .count();
 
         for branch in raw_branches {
-            let branch_kind = match ChangeStreamWriteBranchKind::from_thrift(branch.branch_kind) {
+            let branch_kind = match branch_kind_from_thrift(branch.branch_kind) {
                 Ok(kind) => kind,
                 Err(err) => {
                     if init_error.is_none() {
@@ -375,13 +374,13 @@ impl OperatorFactory for IcebergChangeStreamRouterSinkFactory {
 
 struct IcebergChangeStreamRouterBranchFactory {
     branch_id: i32,
-    branch_kind: ChangeStreamWriteBranchKind,
+    branch_kind: ChangeStreamBranchKind,
     data_stream: DataStreamSinkFactory,
 }
 
 struct IcebergChangeStreamRouterBranchRuntime {
     branch_id: i32,
-    branch_kind: ChangeStreamWriteBranchKind,
+    branch_kind: ChangeStreamBranchKind,
     op: Box<dyn Operator>,
 }
 

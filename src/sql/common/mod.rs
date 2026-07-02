@@ -8,7 +8,7 @@ pub(crate) mod schema;
 #[allow(unused_imports)]
 pub(crate) use change_stream::{
     CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind, ChangeStreamRouteKey,
-    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE, branch_kind_from_thrift,
 };
 #[allow(unused_imports)]
 pub(crate) use dictionary::{

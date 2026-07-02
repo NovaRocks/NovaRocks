@@ -14262,7 +14262,9 @@ fn execute_imv_change_stream_write(
         refresh_plan.mv_refresh_ctx,
     )?;
     #[cfg(test)]
-    if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&dag) {
+    if let Some(result) =
+        crate::engine::observe_change_stream_write_build_for_test(&planned.topology)
+    {
         return Ok(result);
     }
     let commit_plan = planned.commit_plan.clone();
@@ -14340,7 +14342,7 @@ enum ImvDataRouteMode {
 fn imv_data_route_mode(
     producer_branches: &[ImvChangeStreamProducerBranch],
 ) -> Result<Option<ImvDataRouteMode>, String> {
-    use crate::sql::codegen::iceberg_change_stream_write::{DATA_ROUTE_FRESH, DATA_ROUTE_REUSE};
+    use crate::sql::common::{DATA_ROUTE_FRESH, DATA_ROUTE_REUSE};
 
     let has_reuse = producer_branches
         .iter()
@@ -14449,10 +14451,9 @@ fn imv_data_route_scalar(
     row_lineage_output: Option<&OutputColumn>,
     route_mode: ImvDataRouteMode,
 ) -> Result<crate::sql::optimizer::scalar::ScalarId, String> {
-    use crate::sql::codegen::iceberg_change_stream_write::{
-        CHANGE_OP_INSERT, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+    use crate::sql::common::{
+        BinOp, CHANGE_OP_INSERT, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE, LiteralValue,
     };
-    use crate::sql::common::{BinOp, LiteralValue};
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
     let route_value_expr = match route_mode {
@@ -14557,8 +14558,7 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
     refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
     data_route_output_ordinal: Option<usize>,
-) -> Result<crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec, String>
-{
+) -> Result<crate::sql::planner::ChangeStreamWriteDagSpec, String> {
     let branches = build_imv_change_stream_branches(
         target,
         resolved,
@@ -14573,15 +14573,11 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
     } else {
         None
     };
-    Ok(
-        crate::sql::codegen::iceberg_change_stream_write::IcebergChangeStreamWriteDagSpec {
-            change_op_slot: -1,
-            change_op_output_ordinal,
-            data_route_slot: None,
-            data_route_output_ordinal,
-            branches,
-        },
-    )
+    Ok(crate::sql::planner::ChangeStreamWriteDagSpec {
+        change_op_output_ordinal,
+        data_route_output_ordinal,
+        branches,
+    })
 }
 
 fn imv_change_op_output_ordinal(
@@ -14640,14 +14636,9 @@ fn build_imv_change_stream_branches(
     output_columns: &[OutputColumn],
     producer_branches: &[ImvChangeStreamProducerBranch],
     target_ref: &str,
-) -> Result<
-    Vec<crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchSpec>,
-    String,
-> {
-    use crate::sql::codegen::iceberg_change_stream_write::{
-        ChangeStreamWriteBranchKind, ChangeStreamWriteBranchSpec,
-    };
-    use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode;
+) -> Result<Vec<crate::sql::planner::ChangeStreamWriteBranchSpec>, String> {
+    use crate::sql::common::ChangeStreamBranchKind;
+    use crate::sql::planner::{ChangeStreamWriteBranchSpec, IcebergWriteSinkMode};
 
     producer_branches
         .iter()
@@ -14655,9 +14646,9 @@ fn build_imv_change_stream_branches(
         .enumerate()
         .map(|(idx, producer_branch)| {
             let branch_kind = match producer_branch {
-                ImvChangeStreamProducerBranch::DeleteDv => ChangeStreamWriteBranchKind::DeleteDv,
-                ImvChangeStreamProducerBranch::ReuseData => ChangeStreamWriteBranchKind::ReuseData,
-                ImvChangeStreamProducerBranch::FreshData => ChangeStreamWriteBranchKind::FreshData,
+                ImvChangeStreamProducerBranch::DeleteDv => ChangeStreamBranchKind::DeleteDv,
+                ImvChangeStreamProducerBranch::ReuseData => ChangeStreamBranchKind::ReuseData,
+                ImvChangeStreamProducerBranch::FreshData => ChangeStreamBranchKind::FreshData,
             };
             let (sink_spec, partition_ordinals) = match producer_branch {
                 ImvChangeStreamProducerBranch::DeleteDv => {
@@ -14713,20 +14704,12 @@ fn build_imv_change_stream_branches(
                     "IMV change-stream branch id overflow while building DAG".to_string()
                 })?,
                 branch_kind,
-                stream_output_slots: Vec::new(),
-                stream_output_ordinals: Some(stream_output_ordinals),
-                output_partition: unpartitioned_change_stream_output(),
-                output_partition_ordinals: Some(partition_ordinals),
+                stream_output_ordinals,
+                output_partition_ordinals: partition_ordinals,
                 sink_spec,
-                writer_fragment_id: None,
             })
         })
         .collect()
-}
-
-fn unpartitioned_change_stream_output()
--> crate::sql::codegen::iceberg_change_stream_write::ChangeStreamOutputPartition {
-    crate::sql::codegen::iceberg_change_stream_write::unpartitioned_change_stream_output_partition()
 }
 
 fn output_ordinals_for_sink_columns(
@@ -14828,14 +14811,13 @@ enum ImvBranchShape {
 #[cfg(test)]
 fn build_imv_change_stream_branches_for_test(
     shape: ImvBranchShape,
-) -> Vec<crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchSpec> {
-    use crate::sql::codegen::iceberg_change_stream_write::{
-        ChangeStreamWriteBranchKind, ChangeStreamWriteBranchSpec,
-    };
+) -> Vec<crate::sql::planner::ChangeStreamWriteBranchSpec> {
+    use crate::sql::common::ChangeStreamBranchKind;
+    use crate::sql::planner::ChangeStreamWriteBranchSpec;
     match shape {
         ImvBranchShape::DeleteAndReuse => vec![
-            ChangeStreamWriteBranchSpec::for_test(0, ChangeStreamWriteBranchKind::DeleteDv),
-            ChangeStreamWriteBranchSpec::for_test(1, ChangeStreamWriteBranchKind::ReuseData),
+            ChangeStreamWriteBranchSpec::for_test(0, ChangeStreamBranchKind::DeleteDv, Vec::new()),
+            ChangeStreamWriteBranchSpec::for_test(1, ChangeStreamBranchKind::ReuseData, Vec::new()),
         ],
     }
 }
@@ -15632,14 +15614,16 @@ mod tests {
     #[test]
     fn imv_change_stream_branch_set_can_include_zero_row_branch() {
         let branches = build_imv_change_stream_branches_for_test(ImvBranchShape::DeleteAndReuse);
-        assert!(branches.iter().any(|b| {
-            b.branch_kind
-                == crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind::DeleteDv
-        }));
-        assert!(branches.iter().any(|b| {
-            b.branch_kind
-                == crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind::ReuseData
-        }));
+        assert!(
+            branches
+                .iter()
+                .any(|b| { b.branch_kind == crate::sql::common::ChangeStreamBranchKind::DeleteDv })
+        );
+        assert!(
+            branches.iter().any(|b| {
+                b.branch_kind == crate::sql::common::ChangeStreamBranchKind::ReuseData
+            })
+        );
     }
 
     #[test]

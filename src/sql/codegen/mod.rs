@@ -12,8 +12,7 @@ pub(crate) mod fallback_audit;
 pub(crate) mod fragment_builder;
 pub(crate) mod fragment_request;
 pub(crate) mod helpers;
-pub(crate) mod iceberg_change_stream_write;
-pub(crate) mod iceberg_write_sink;
+pub(crate) mod iceberg_change_stream_router_wire;
 pub(crate) mod iceberg_write_sink_wire;
 pub(crate) mod ir;
 pub(crate) mod nodes;
@@ -35,7 +34,7 @@ use super::column_id::ColumnId;
 
 pub(crate) type FragmentId = u32;
 
-pub(crate) use fragment_request::{FragmentBuildOutput, FragmentBuildRequest};
+pub(crate) use fragment_request::FragmentBuildRequest;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -59,7 +58,7 @@ pub(crate) enum FragmentEdgeKind {
     IcebergChangeStreamRouter {
         router_group_id: i32,
         branch_id: i32,
-        branch_kind: crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind,
+        branch_kind: crate::sql::common::ChangeStreamBranchKind,
     },
 }
 

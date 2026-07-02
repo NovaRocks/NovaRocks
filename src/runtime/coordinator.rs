@@ -971,12 +971,13 @@ fn wrap_iceberg_change_stream_router_sink(
                 edge.source_fragment_id, edge.target_fragment_id
             ));
         };
-        let thrift_branch_kind = branch_kind.to_thrift();
         let template_branch = template
             .branches
             .iter()
             .find(|branch| {
-                branch.branch_id == branch_id && branch.branch_kind == thrift_branch_kind
+                branch.branch_id == branch_id
+                    && crate::sql::common::branch_kind_from_thrift(branch.branch_kind)
+                        .is_ok_and(|template_kind| template_kind == branch_kind)
             })
             .ok_or_else(|| {
                 format!(
@@ -1014,7 +1015,7 @@ fn wrap_iceberg_change_stream_router_sink(
 
         branches.push(data_sinks::TIcebergChangeStreamRouterBranch::new(
             branch_id,
-            thrift_branch_kind,
+            template_branch.branch_kind,
             stream_sink,
             destinations,
         ));
@@ -2568,7 +2569,7 @@ mod tests {
         target_exchange_node_id: i32,
         router_group_id: i32,
         branch_id: i32,
-        branch_kind: crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind,
+        branch_kind: crate::sql::common::ChangeStreamBranchKind,
     ) -> FragmentEdge {
         FragmentEdge {
             source_fragment_id,
@@ -2920,11 +2921,11 @@ mod tests {
 
     #[test]
     fn coordinator_groups_multiple_router_edges_from_same_source() {
-        use crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind;
+        use crate::sql::common::ChangeStreamBranchKind;
 
         let edges = vec![
-            fake_router_edge(1, 2, 11, 7, 0, ChangeStreamWriteBranchKind::DeleteDv),
-            fake_router_edge(1, 3, 12, 7, 1, ChangeStreamWriteBranchKind::ReuseData),
+            fake_router_edge(1, 2, 11, 7, 0, ChangeStreamBranchKind::DeleteDv),
+            fake_router_edge(1, 3, 12, 7, 1, ChangeStreamBranchKind::ReuseData),
         ];
         let grouped = group_router_edges_by_source(&edges).expect("router groups");
         assert_eq!(grouped.len(), 1);
@@ -2933,11 +2934,11 @@ mod tests {
 
     #[test]
     fn coordinator_rejects_router_edges_with_duplicate_target_exchange() {
-        use crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind;
+        use crate::sql::common::ChangeStreamBranchKind;
 
         let edges = vec![
-            fake_router_edge(1, 2, 11, 7, 0, ChangeStreamWriteBranchKind::DeleteDv),
-            fake_router_edge(1, 2, 11, 7, 1, ChangeStreamWriteBranchKind::ReuseData),
+            fake_router_edge(1, 2, 11, 7, 0, ChangeStreamBranchKind::DeleteDv),
+            fake_router_edge(1, 2, 11, 7, 1, ChangeStreamBranchKind::ReuseData),
         ];
         let err = group_router_edges_by_source(&edges).expect_err("duplicate target exchange");
         assert!(
@@ -2965,9 +2966,9 @@ mod tests {
 
     #[test]
     fn router_sink_wrapper_uses_edge_exchange_node_and_preserves_projection() {
-        use crate::sql::codegen::iceberg_change_stream_write::ChangeStreamWriteBranchKind;
+        use crate::sql::common::ChangeStreamBranchKind;
 
-        let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamWriteBranchKind::DeleteDv);
+        let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
         edge.output_partition = partitions::TDataPartition::new(
             partitions::TPartitionType::HASH_PARTITIONED,
             None::<Vec<crate::thrift::exprs::TExpr>>,
@@ -2989,7 +2990,7 @@ mod tests {
             Some(4),
             vec![data_sinks::TIcebergChangeStreamRouterBranch::new(
                 0,
-                ChangeStreamWriteBranchKind::DeleteDv.to_thrift(),
+                data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV,
                 template_stream_sink,
                 vec![],
             )],
