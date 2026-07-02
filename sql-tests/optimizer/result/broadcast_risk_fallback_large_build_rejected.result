@@ -2,7 +2,7 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-15:PROJECT [count(*) AS cnt] (rows=1 cost={cpu=0.0100 memory=0.1600 network=0 total=0.3250}) stats={rows=1 conf=estimated}
+15:PROJECT [count(*) AS cnt] (rows=1 cost={cpu=0.0100 memory=0 network=0 total=0.0050}) stats={rows=1 conf=estimated}
   14:HASH AGGREGATE (GLOBAL) (rows=1 cost={cpu=2.4000 memory=8 network=0 total=17.2000}) stats={rows=1 conf=estimated}
     aggregations: count()
     13:GATHER (rows=1 cost={cpu=16777216 memory=0.4000 network=8 total=8388620.8000}) stats={rows=1 conf=estimated}
@@ -23,8 +23,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 10
     PARTITION: HASH_PARTITIONED (k)
-9:PROJECT [k] (rows=100000000 cost={cpu=1000000 memory=16000000 network=0 total=32500000}) colstats={col#4[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000 conf=estimated}
-  8:PROJECT [generate_series AS k] (rows=100000000 cost={cpu=1000000 memory=16000000 network=0 total=32500000}) colstats={col#2[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000 conf=estimated}
+9:PROJECT [k] (rows=100000000 cost={cpu=1000000 memory=0 network=0 total=500000}) colstats={col#4[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000 conf=estimated}
+  8:PROJECT [generate_series AS k] (rows=100000000 cost={cpu=1000000 memory=0 network=0 total=500000}) colstats={col#2[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000 conf=estimated}
     7:GENERATE_SERIES(1, 100000000, 1) (rows=100000000 cost={cpu=2000000 memory=0 network=0 total=1000000}) colstats={col#2[min=1 max=100000000 ndv=100000000 null_frac=0]} stats={rows=100000000}
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
@@ -32,6 +32,6 @@ PLAN FRAGMENT 3
   STREAM DATA SINK
     EXCHANGE ID: 5
     PARTITION: HASH_PARTITIONED (k)
-4:PROJECT [k] (rows=1000000 cost={cpu=10000 memory=160000 network=0 total=325000}) colstats={col#3[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
-  3:PROJECT [generate_series AS k] (rows=1000000 cost={cpu=10000 memory=160000 network=0 total=325000}) colstats={col#1[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
+4:PROJECT [k] (rows=1000000 cost={cpu=10000 memory=0 network=0 total=5000}) colstats={col#3[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
+  3:PROJECT [generate_series AS k] (rows=1000000 cost={cpu=10000 memory=0 network=0 total=5000}) colstats={col#1[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
     2:GENERATE_SERIES(1, 1000000, 1) (rows=1000000 cost={cpu=20000 memory=0 network=0 total=10000}) colstats={col#1[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000}

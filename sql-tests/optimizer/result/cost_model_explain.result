@@ -4,8 +4,8 @@ TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-2:PROJECT [cost_model_explain_t.k AS k, cost_model_explain_t.v AS v] (rows=990 cost={cpu=9.9000 memory=209.7612 network=0 total=424.4724}) colstats={col#1[min=1 max=1000 ndv=990 null_frac=0], col#2[min=10 max=10000 ndv=990 null_frac=0]} stats={rows=990 conf=estimated}
-  1:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t (rows=990 cost={cpu=10488.0600 memory=0 network=0 total=5244.0300}) colstats={col#1[min=1 max=1000 ndv=990 null_frac=0], col#2[min=10 max=10000 ndv=990 null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0], col#4[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=990 conf=estimated}
+2:PROJECT [cost_model_explain_t.k AS k, cost_model_explain_t.v AS v] (rows=990 cost={cpu=9.9000 memory=0 network=0 total=4.9500}) colstats={col#1[min=1 max=1000 ndv=990 null_frac=0], col#2[min=10 max=10000 ndv=990 null_frac=0]} stats={rows=990 conf=estimated}
+  1:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t (rows=990 cost={cpu=10622 memory=0 network=0 total=5311}) colstats={col#1[min=1 max=1000 ndv=990 null_frac=0], col#2[min=10 max=10000 ndv=990 null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0], col#4[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=990 conf=estimated}
        TABLE: db_sqlt_9277b14d3609c4e0.cost_model_explain_t
        columns: k, v
        predicates: CAST(v AS Int64) > 10
@@ -16,11 +16,11 @@ TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-6:PROJECT [cost_model_explain_t.k AS k, cost_model_explain_t.v AS v, gs.generate_series AS rk] (rows=100 cost={cpu=1 memory=37.1880 network=0 total=74.8760}) colstats={col#1[min=1 max=1000 ndv=100 null_frac=0], col#2[min=10 max=10000 ndv=100 null_frac=0], col#5[min=1 max=100 ndv=100 null_frac=0]} stats={rows=100 conf=estimated}
+6:PROJECT [cost_model_explain_t.k AS k, cost_model_explain_t.v AS v, gs.generate_series AS rk] (rows=100 cost={cpu=1 memory=0 network=0 total=0.5000}) colstats={col#1[min=1 max=1000 ndv=100 null_frac=0], col#2[min=10 max=10000 ndv=100 null_frac=0], col#5[min=1 max=100 ndv=100 null_frac=0]} stats={rows=100 conf=estimated}
   5:HASH JOIN (BROADCAST, INNER, eq: [CAST(cost_model_explain_t.k AS Int64) = rk]) (rows=100 cost={cpu=4459.4000 memory=8000.0000 network=1600 total=20629.7000}) colstats={col#1[min=1 max=1000 ndv=100 null_frac=0], col#2[min=10 max=10000 ndv=100 null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0], col#4[min=-inf max=+inf ndv=? null_frac=0], col#5[min=1 max=100 ndv=100 null_frac=0]} bcast={build=800B ht=2.6KB be=3 fanout=2.3KB budget=1GB risk_mult=1.0x} stats={rows=100 conf=estimated}
     build runtime filters:
     - filter_id = 0, build_expr = (rk)
-    1:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t (rows=900 cost={cpu=9534.6000 memory=0 network=0 total=4767.3000}) colstats={col#1[min=1 max=1000 ndv=900 null_frac=0], col#2[min=10 max=10000 ndv=900 null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0], col#4[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=900 conf=estimated}
+    1:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t (rows=900 cost={cpu=10614 memory=0 network=0 total=5307}) colstats={col#1[min=1 max=1000 ndv=900 null_frac=0], col#2[min=10 max=10000 ndv=900 null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0], col#4[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=900 conf=estimated}
          TABLE: db_sqlt_9277b14d3609c4e0.cost_model_explain_t
          columns: k, v
          predicates: k IS NOT NULL
@@ -49,7 +49,7 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 4
     PARTITION: UNPARTITIONED
 3:LOCAL TOP-N (limit=10, offset=0) [cost_model_explain_t.v DESC NULLS LAST] (rows=10 cost={cpu=3321.9281 memory=105.9400 network=0 total=1872.8440}) colstats={col#1[min=1 max=1000 ndv=1000 null_frac=0], col#2[min=10 max=10000 ndv=1000 null_frac=0]} stats={rows=10 conf=estimated}
-  2:PROJECT [cost_model_explain_t.k AS k, cost_model_explain_t.v AS v] (rows=1000 cost={cpu=10 memory=211.8800 network=0 total=428.7600}) colstats={col#1[min=1 max=1000 ndv=1000 null_frac=0], col#2[min=10 max=10000 ndv=1000 null_frac=0]} stats={rows=1000 conf=estimated}
+  2:PROJECT [cost_model_explain_t.k AS k, cost_model_explain_t.v AS v] (rows=1000 cost={cpu=10 memory=0 network=0 total=5}) colstats={col#1[min=1 max=1000 ndv=1000 null_frac=0], col#2[min=10 max=10000 ndv=1000 null_frac=0]} stats={rows=1000 conf=estimated}
     1:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t (rows=1000 cost={cpu=10594 memory=0 network=0 total=5297}) colstats={col#1[min=1 max=1000 ndv=1000 null_frac=0], col#2[min=10 max=10000 ndv=1000 null_frac=0], col#3[min=-inf max=+inf ndv=? null_frac=0], col#4[min=-inf max=+inf ndv=? null_frac=0]} stats={rows=1000}
          TABLE: db_sqlt_9277b14d3609c4e0.cost_model_explain_t
          columns: k, v

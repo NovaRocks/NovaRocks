@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
 use crate::connector::starrocks::table::model::{StarRocksTableKind, StarRocksTableState};
+use crate::engine::mv::iceberg_refresh::nr_mv_public_name;
 use crate::engine::virtual_table::{INFORMATION_SCHEMA_DB, VirtualTableProvider};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 use crate::sql::catalog::ColumnDef;
@@ -155,11 +156,12 @@ fn materialized_view_rows(
     let mut rows = Vec::new();
     for mv in &definitions {
         if mv.storage_engine.eq_ignore_ascii_case("iceberg") {
-            let (Some(table_schema), Some(table_name)) =
+            let (Some(table_schema), Some(target_table)) =
                 (mv.target_namespace.clone(), mv.target_table.clone())
             else {
                 continue;
             };
+            let table_name = iceberg_mv_public_table_name(target_table);
             rows.push(MaterializedViewInfoRow {
                 table_schema,
                 table_name,
@@ -193,6 +195,10 @@ fn materialized_view_rows(
         });
     }
     Ok(rows)
+}
+
+fn iceberg_mv_public_table_name(target_table: String) -> String {
+    nr_mv_public_name(&target_table).unwrap_or(target_table)
 }
 
 fn is_information_schema_be_configs(factor: &sqlast::TableFactor) -> bool {
@@ -549,7 +555,7 @@ pub(crate) fn build_schemata_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::try_update_be_configs;
+    use super::{iceberg_mv_public_table_name, try_update_be_configs};
     use crate::engine::StatementResult;
     use crate::sql::parser::dialect::StarRocksDialect;
     use sqlparser::parser::Parser;
@@ -584,5 +590,17 @@ mod tests {
             .expect_err("unsupported be_configs assignment should fail");
 
         assert!(err.contains("only supports assigning `value`"), "err={err}");
+    }
+
+    #[test]
+    fn information_schema_iceberg_mv_uses_public_name() {
+        assert_eq!(
+            iceberg_mv_public_table_name("__nr_mv_orders_mv".to_string()),
+            "orders_mv"
+        );
+        assert_eq!(
+            iceberg_mv_public_table_name("legacy_orders_mv".to_string()),
+            "legacy_orders_mv"
+        );
     }
 }

@@ -235,10 +235,22 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
         {
             return Ok(RewriteResult::Unchanged);
         }
+        let eliminated_count_outputs: HashSet<ColumnId> = aggregate
+            .aggregates
+            .iter()
+            .map(|aggregate| aggregate.output_column_id)
+            .filter(|id| *id != ColumnId::UNSET)
+            .collect();
         let items = project
             .items
             .into_iter()
-            .map(|item| rewrite_eliminated_aggregate_project_item(item, &mut arena_rc.borrow_mut()))
+            .map(|item| {
+                rewrite_eliminated_aggregate_project_item(
+                    item,
+                    &eliminated_count_outputs,
+                    &mut arena_rc.borrow_mut(),
+                )
+            })
             .collect::<Option<Vec<_>>>();
         let Some(items) = items else {
             return Ok(RewriteResult::Unchanged);
@@ -715,9 +727,11 @@ fn is_eliminable_count(aggregate: &ScalarAggregateSpec, arena: &ScalarArena) -> 
 
 fn rewrite_eliminated_aggregate_project_item(
     item: ScalarProjectItem,
+    eliminated_count_outputs: &HashSet<ColumnId>,
     arena: &mut ScalarArena,
 ) -> Option<ScalarProjectItem> {
-    let new_expr_id = rewrite_eliminated_aggregate_expr(arena, item.expr)?;
+    let new_expr_id =
+        rewrite_eliminated_aggregate_expr(arena, item.expr, eliminated_count_outputs)?;
     Some(ScalarProjectItem {
         expr: new_expr_id,
         output_name: item.output_name,
@@ -726,8 +740,15 @@ fn rewrite_eliminated_aggregate_project_item(
     })
 }
 
-fn rewrite_eliminated_aggregate_expr(arena: &mut ScalarArena, expr: ScalarId) -> Option<ScalarId> {
+fn rewrite_eliminated_aggregate_expr(
+    arena: &mut ScalarArena,
+    expr: ScalarId,
+    eliminated_count_outputs: &HashSet<ColumnId>,
+) -> Option<ScalarId> {
     match arena.node(expr).clone() {
+        ScalarNode::ColumnRef(column_id) if eliminated_count_outputs.contains(&column_id) => {
+            Some(scalar_expr::int_literal(arena, 1))
+        }
         ScalarNode::AggregateCall {
             name,
             distinct,
@@ -961,5 +982,28 @@ mod tests {
 
         assert!(is_eliminable_count(&count_one, &arena));
         assert!(is_eliminable_count(&count_null, &arena));
+    }
+
+    #[test]
+    fn eliminated_unique_aggregate_rewrites_count_output_ref_to_literal() {
+        let mut arena = ScalarArena::new();
+        let count_output = ColumnId::new_for_test(9001);
+        let count_ref = arena.intern(ScalarNode::ColumnRef(count_output), DataType::Int64, false);
+        let item = ScalarProjectItem {
+            expr: count_ref,
+            output_name: "cnt".to_string(),
+            output_column_id: ColumnId::new_for_test(9002),
+            expr_display: None,
+        };
+        let eliminated_outputs = HashSet::from([count_output]);
+
+        let rewritten =
+            rewrite_eliminated_aggregate_project_item(item, &eliminated_outputs, &mut arena)
+                .expect("count output reference should be rewritten");
+
+        assert!(matches!(
+            arena.node(rewritten.expr),
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1)))
+        ));
     }
 }

@@ -19,7 +19,7 @@ PLAN FRAGMENT 2
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 6
-    PARTITION: HASH_PARTITIONED (l.k)
+    PARTITION: HASH_PARTITIONED (k)
 5:HASH AGGREGATE (LOCAL, group by: [l.k]) stats={rows=3}
   aggregations: sum(r.v)
   4:HASH JOIN (BROADCAST, INNER, eq: [l.k = r.k]) bcast_verdict=feasible stats={rows=3}

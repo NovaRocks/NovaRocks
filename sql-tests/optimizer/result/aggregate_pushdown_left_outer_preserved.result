@@ -25,7 +25,7 @@ PLAN FRAGMENT 2
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 5
-    PARTITION: HASH_PARTITIONED (a.k)
+    PARTITION: HASH_PARTITIONED (k)
 4:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=100}
   aggregations: sum(a.v)
   3:SCAN db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a (alias=a) stats={rows=20000}

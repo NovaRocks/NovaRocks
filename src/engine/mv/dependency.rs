@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::connector::starrocks::table::mv_ddl::ResolvedTableRef;
 use crate::engine::StandaloneState;
-use crate::engine::mv::iceberg_refresh::nr_mv_storage_lookup_name;
+use crate::engine::mv::iceberg_refresh::{nr_mv_public_name, nr_mv_storage_lookup_name};
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
     MvDependencyStorageEngine, StoredMvDefinition,
@@ -70,6 +70,17 @@ pub(crate) fn starrocks_table_object_ref(database: &str, table: &str) -> MvDepen
         object_type: MvDependencyObjectType::Table,
         storage_engine: MvDependencyStorageEngine::StarRocks,
     }
+}
+
+pub(crate) fn dependency_display_name(object: &MvDependencyObjectRef) -> String {
+    let mut object = object.clone();
+    if object.storage_engine == MvDependencyStorageEngine::Iceberg
+        && object.object_type == MvDependencyObjectType::MaterializedView
+        && let Some(public_name) = nr_mv_public_name(&object.name)
+    {
+        object.name = public_name;
+    }
+    object.display_name()
 }
 
 pub(crate) fn ensure_no_downstream_dependencies(
@@ -551,6 +562,19 @@ mod tests {
 
         assert_eq!(table.display_name(), "ice.sales.orders");
         assert_eq!(mv.display_name(), "mv:ice.sales.orders_mv");
+    }
+
+    #[test]
+    fn dependency_display_name_strips_iceberg_mv_storage_prefix() {
+        let mv = iceberg_mv_dependency_ref("ice", "sales", "__nr_mv_orders_mv");
+        let table = iceberg_table_dependency_ref(&IcebergTableRef {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "__nr_mv_orders".to_string(),
+        });
+
+        assert_eq!(dependency_display_name(&mv), "mv:ice.sales.orders_mv");
+        assert_eq!(dependency_display_name(&table), "ice.sales.__nr_mv_orders");
     }
 
     #[test]

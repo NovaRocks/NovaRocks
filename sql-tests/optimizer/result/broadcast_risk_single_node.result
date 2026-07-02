@@ -2,7 +2,7 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-14:PROJECT [count(*) AS cnt] (rows=1 cost={cpu=0.0100 memory=0.1600 network=0 total=0.3250}) stats={rows=1 conf=estimated}
+14:PROJECT [count(*) AS cnt] (rows=1 cost={cpu=0.0100 memory=0 network=0 total=0.0050}) stats={rows=1 conf=estimated}
   13:HASH AGGREGATE (GLOBAL) (rows=1 cost={cpu=2.4000 memory=8 network=0 total=17.2000}) stats={rows=1 conf=estimated}
     aggregations: count()
     12:GATHER (rows=1 cost={cpu=16777216 memory=0.4000 network=8 total=8388620.8000}) stats={rows=1 conf=estimated}
@@ -17,10 +17,10 @@ PLAN FRAGMENT 1
   10:HASH JOIN (BROADCAST, INNER, eq: [p.k = b.k]) (rows=10000 cost={cpu=1170000 memory=266666.6667 network=0 total=1118333.3333}) colstats={col#3[min=1 max=1000000 ndv=10000 null_frac=0], col#4[min=1 max=10000 ndv=10000 null_frac=0]} bcast={build=78.1KB ht=260.4KB be=1 fanout=156.2KB budget=1GB risk_mult=2.0x} stats={rows=10000 conf=estimated}
     build runtime filters:
     - filter_id = 0, build_expr = (b.k)
-    4:PROJECT [k] (rows=1000000 cost={cpu=10000 memory=160000 network=0 total=325000}) colstats={col#3[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
+    4:PROJECT [k] (rows=1000000 cost={cpu=10000 memory=0 network=0 total=5000}) colstats={col#3[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
         probe runtime filters:
         - filter_id = 0, probe_expr = (p.k)
-      3:PROJECT [generate_series AS k] (rows=1000000 cost={cpu=10000 memory=160000 network=0 total=325000}) colstats={col#1[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
+      3:PROJECT [generate_series AS k] (rows=1000000 cost={cpu=10000 memory=0 network=0 total=5000}) colstats={col#1[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000 conf=estimated}
         2:GENERATE_SERIES(1, 1000000, 1) (rows=1000000 cost={cpu=20000 memory=0 network=0 total=10000}) colstats={col#1[min=1 max=1000000 ndv=1000000 null_frac=0]} stats={rows=1000000}
     9:GATHER (rows=10000 cost={cpu=16777216 memory=4000 network=80000 total=8516608}) colstats={col#4[min=1 max=10000 ndv=10000 null_frac=0]} stats={rows=10000 conf=estimated}
 PLAN FRAGMENT 2
@@ -29,6 +29,6 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 9
     PARTITION: UNPARTITIONED
-8:PROJECT [k] (rows=10000 cost={cpu=100 memory=1600 network=0 total=3250}) colstats={col#4[min=1 max=10000 ndv=10000 null_frac=0]} stats={rows=10000 conf=estimated}
-  7:PROJECT [generate_series AS k] (rows=10000 cost={cpu=100 memory=1600 network=0 total=3250}) colstats={col#2[min=1 max=10000 ndv=10000 null_frac=0]} stats={rows=10000 conf=estimated}
+8:PROJECT [k] (rows=10000 cost={cpu=100 memory=0 network=0 total=50}) colstats={col#4[min=1 max=10000 ndv=10000 null_frac=0]} stats={rows=10000 conf=estimated}
+  7:PROJECT [generate_series AS k] (rows=10000 cost={cpu=100 memory=0 network=0 total=50}) colstats={col#2[min=1 max=10000 ndv=10000 null_frac=0]} stats={rows=10000 conf=estimated}
     6:GENERATE_SERIES(1, 10000, 1) (rows=10000 cost={cpu=200 memory=0 network=0 total=100}) colstats={col#2[min=1 max=10000 ndv=10000 null_frac=0]} stats={rows=10000}

@@ -91,14 +91,14 @@ struct JoinRfSides {
 /// probe child to be early-filtered by keys from the true build child.
 fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
     match kind {
-        JoinKind::Inner | JoinKind::RightOuter | JoinKind::LeftSemi | JoinKind::RightSemi => {
-            Some(JoinRfSides {
-                probe_child: 0,
-                build_child: 1,
-            })
-        }
+        JoinKind::Inner | JoinKind::RightOuter => Some(JoinRfSides {
+            probe_child: 0,
+            build_child: 1,
+        }),
         JoinKind::LeftOuter
         | JoinKind::FullOuter
+        | JoinKind::LeftSemi
+        | JoinKind::RightSemi
         | JoinKind::LeftAnti
         | JoinKind::RightAnti
         | JoinKind::NullAwareLeftAnti
@@ -1968,12 +1968,7 @@ mod tests {
     fn rf_join_eligibility_matches_probe_output_semantics() {
         use crate::sql::analysis::JoinKind;
 
-        for kind in [
-            JoinKind::Inner,
-            JoinKind::RightOuter,
-            JoinKind::LeftSemi,
-            JoinKind::RightSemi,
-        ] {
+        for kind in [JoinKind::Inner, JoinKind::RightOuter] {
             let mut join = super::test_support::hash_join_two_scans(kind);
             annotate_test(&mut join, &OptimizerOptions::default_settings());
             assert_eq!(
@@ -1986,6 +1981,8 @@ mod tests {
         for kind in [
             JoinKind::LeftOuter,
             JoinKind::FullOuter,
+            JoinKind::LeftSemi,
+            JoinKind::RightSemi,
             JoinKind::LeftAnti,
             JoinKind::RightAnti,
             JoinKind::NullAwareLeftAnti,
@@ -2008,13 +2005,9 @@ mod tests {
             rf_sides_for_join(JoinKind::Cross).is_none(),
             "Cross should not be marked RF-producing"
         );
-        assert_eq!(
-            rf_sides_for_join(JoinKind::LeftSemi),
-            Some(JoinRfSides {
-                probe_child: 0,
-                build_child: 1
-            }),
-            "Left semi joins should probe the left child using the right child build filter"
+        assert!(
+            rf_sides_for_join(JoinKind::LeftSemi).is_none(),
+            "Semi joins stay RF-free until completion-safe semantics are reviewed"
         );
         assert!(
             rf_sides_for_join(JoinKind::LeftAnti).is_none(),
@@ -2023,28 +2016,18 @@ mod tests {
     }
 
     #[test]
-    fn right_semi_runtime_filter_uses_left_child_as_execution_probe() {
+    fn right_semi_join_does_not_build_runtime_filter() {
         let mut join = super::test_support::hash_join_two_scans(JoinKind::RightSemi);
         annotate_test(&mut join, &OptimizerOptions::default_settings());
 
-        assert_eq!(join.build_runtime_filters.len(), 1);
-        assert_eq!(
-            join.children[0].probe_runtime_filters.len(),
-            1,
-            "right semi RF filters the execution probe side"
+        assert!(join.build_runtime_filters.is_empty());
+        assert!(
+            join.children[0].probe_runtime_filters.is_empty(),
+            "right semi joins must not place probe RFs"
         );
         assert!(
             join.children[1].probe_runtime_filters.is_empty(),
-            "right child remains the hash-build side for right semi RF"
-        );
-        let scalars = join.execution_props.scalar_arena.as_deref().unwrap();
-        assert_eq!(
-            column_id_vec(scalars, join.build_runtime_filters[0].build_expr),
-            vec![crate::sql::column_id::ColumnId::new_for_test(2)]
-        );
-        assert_eq!(
-            column_id_vec(scalars, join.build_runtime_filters[0].probe_expr),
-            vec![crate::sql::column_id::ColumnId::new_for_test(1)]
+            "right semi joins must not place build-side probe RFs"
         );
     }
 

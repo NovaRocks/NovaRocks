@@ -61,14 +61,15 @@ INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (3, 'A
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 6
--- Spark: externally drop `amount` from the target MV table.
--- The MV target lives at ice_rest.<ns>.<mv_name> (same REST catalog, different alias).
+-- Spark: externally drop `amount` from the target MV storage table.
+-- The NovaRocks-visible MV name stays public, while the Iceberg storage table
+-- is prefixed to keep it separate from the public projection surface.
 -- @result_contains=SPARK_SQL_OK
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-a11-tgt-fid-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-ALTER TABLE ice_rest.ns_${uuid0}.mv_${uuid0} DROP COLUMN amount;
+ALTER TABLE ice_rest.ns_${uuid0}.__nr_mv_mv_${uuid0} DROP COLUMN amount;
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf 'SPARK_SQL_OK\n'

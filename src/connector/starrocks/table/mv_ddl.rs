@@ -1187,7 +1187,7 @@ fn dependency_display_for_mv(
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
     Ok(dependencies
         .iter()
-        .map(|dep| dep.upstream.display_name())
+        .map(|dep| crate::engine::mv::dependency::dependency_display_name(&dep.upstream))
         .collect::<Vec<_>>()
         .join(", "))
 }
