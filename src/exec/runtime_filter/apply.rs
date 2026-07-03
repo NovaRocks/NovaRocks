@@ -40,14 +40,12 @@ use crate::exec::expr::{ExprArena, ExprId};
 use super::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
 enum DictionaryFoldKind {
     In,
     Membership,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
 struct DictionaryFoldKey {
     kind: DictionaryFoldKind,
     filter_id: i32,
@@ -57,7 +55,6 @@ struct DictionaryFoldKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
 enum DictionaryValuesTypeTag {
     Utf8,
     LargeUtf8,
@@ -72,15 +69,14 @@ struct DictionaryFold {
 }
 
 #[derive(Default, Debug)]
-#[allow(dead_code)]
 pub(crate) struct RuntimeFilterDictionaryFoldCache {
     folds: HashMap<DictionaryFoldKey, DictionaryFold>,
     #[cfg(test)]
     build_count: usize,
 }
 
-#[allow(dead_code)]
 impl RuntimeFilterDictionaryFoldCache {
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.folds.clear();
         #[cfg(test)]
@@ -90,12 +86,12 @@ impl RuntimeFilterDictionaryFoldCache {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn build_count_for_test(&self) -> usize {
         self.build_count
     }
 }
 
-#[allow(dead_code)]
 fn dictionary_int32_string(
     array: &ArrayRef,
 ) -> Result<Option<&DictionaryArray<Int32Type>>, String> {
@@ -118,7 +114,6 @@ fn dictionary_int32_string(
     }
 }
 
-#[allow(dead_code)]
 fn dictionary_values_tag(values: &ArrayRef) -> Result<DictionaryValuesTypeTag, String> {
     match values.data_type() {
         DataType::Utf8 => Ok(DictionaryValuesTypeTag::Utf8),
@@ -130,7 +125,6 @@ fn dictionary_values_tag(values: &ArrayRef) -> Result<DictionaryValuesTypeTag, S
     }
 }
 
-#[allow(dead_code)]
 fn dictionary_values_as_rf_utf8(values: &ArrayRef) -> Result<ArrayRef, String> {
     match values.data_type() {
         DataType::Utf8 => Ok(Arc::clone(values)),
@@ -142,7 +136,6 @@ fn dictionary_values_as_rf_utf8(values: &ArrayRef) -> Result<ArrayRef, String> {
     }
 }
 
-#[allow(dead_code)]
 fn dictionary_fold_key(
     kind: DictionaryFoldKind,
     filter_id: i32,
@@ -157,7 +150,6 @@ fn dictionary_fold_key(
     })
 }
 
-#[allow(dead_code)]
 fn fold_in_filter_for_dictionary(
     filter: &RuntimeInFilter,
     dict: &DictionaryArray<Int32Type>,
@@ -187,7 +179,6 @@ fn fold_in_filter_for_dictionary(
     Ok(fold)
 }
 
-#[allow(dead_code)]
 fn fold_membership_filter_for_dictionary(
     filter: &RuntimeMembershipFilter,
     dict: &DictionaryArray<Int32Type>,
@@ -215,7 +206,6 @@ fn fold_membership_filter_for_dictionary(
     Ok(fold)
 }
 
-#[allow(dead_code)]
 fn apply_dictionary_fold(
     dict: &DictionaryArray<Int32Type>,
     fold: &DictionaryFold,
@@ -251,10 +241,31 @@ fn apply_dictionary_fold(
     Ok(())
 }
 
+fn filter_chunk_by_keep(chunk: Chunk, keep: Vec<bool>) -> Result<Option<Chunk>, String> {
+    if keep.iter().all(|v| *v) {
+        return Ok(Some(chunk));
+    }
+    if keep.iter().all(|v| !*v) {
+        return Ok(None);
+    }
+    let mask = BooleanArray::from(keep);
+    let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
+    Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
+}
+
 /// Apply IN filters to a chunk and return the filtered chunk.
 pub(crate) fn filter_chunk_by_in_filters(
     filters: &[Arc<RuntimeInFilter>],
     chunk: Chunk,
+) -> Result<Option<Chunk>, String> {
+    let mut cache = RuntimeFilterDictionaryFoldCache::default();
+    filter_chunk_by_in_filters_with_dict_cache(filters, chunk, &mut cache)
+}
+
+fn filter_chunk_by_in_filters_with_dict_cache(
+    filters: &[Arc<RuntimeInFilter>],
+    chunk: Chunk,
+    cache: &mut RuntimeFilterDictionaryFoldCache,
 ) -> Result<Option<Chunk>, String> {
     if filters.is_empty() {
         return Ok(Some(chunk));
@@ -273,6 +284,14 @@ pub(crate) fn filter_chunk_by_in_filters(
             continue;
         }
         let array = chunk.column_by_slot_id(filter.slot_id())?;
+        if let Some(dict) = dictionary_int32_string(&array)? {
+            let fold = fold_in_filter_for_dictionary(filter, dict, cache)?;
+            apply_dictionary_fold(dict, &fold, &mut keep)?;
+            if keep.iter().all(|v| !*v) {
+                return Ok(None);
+            }
+            continue;
+        }
         for (row, keep_row) in keep.iter_mut().enumerate().take(len) {
             if !*keep_row {
                 continue;
@@ -289,12 +308,7 @@ pub(crate) fn filter_chunk_by_in_filters(
             return Ok(None);
         }
     }
-    if keep.iter().all(|v| *v) {
-        return Ok(Some(chunk));
-    }
-    let mask = BooleanArray::from(keep);
-    let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
-    Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
+    filter_chunk_by_keep(chunk, keep)
 }
 
 /// Apply IN filters using expression mappings and return the filtered chunk.
@@ -303,6 +317,17 @@ pub(crate) fn filter_chunk_by_in_filters_with_exprs(
     exprs: &HashMap<i32, ExprId>,
     filters: &[Arc<RuntimeInFilter>],
     chunk: Chunk,
+) -> Result<Option<Chunk>, String> {
+    let mut cache = RuntimeFilterDictionaryFoldCache::default();
+    filter_chunk_by_in_filters_with_exprs_and_dict_cache(arena, exprs, filters, chunk, &mut cache)
+}
+
+pub(crate) fn filter_chunk_by_in_filters_with_exprs_and_dict_cache(
+    arena: &ExprArena,
+    exprs: &HashMap<i32, ExprId>,
+    filters: &[Arc<RuntimeInFilter>],
+    chunk: Chunk,
+    cache: &mut RuntimeFilterDictionaryFoldCache,
 ) -> Result<Option<Chunk>, String> {
     if filters.is_empty() {
         return Ok(Some(chunk));
@@ -314,7 +339,11 @@ pub(crate) fn filter_chunk_by_in_filters_with_exprs(
             return Ok(None);
         };
         let Some(expr_id) = exprs.get(&filter_ref.filter_id()) else {
-            current = filter_chunk_by_in_filters(std::slice::from_ref(filter), chunk)?;
+            current = filter_chunk_by_in_filters_with_dict_cache(
+                std::slice::from_ref(filter),
+                chunk,
+                cache,
+            )?;
             continue;
         };
         let array = match arena.eval(*expr_id, &chunk) {
@@ -328,20 +357,33 @@ pub(crate) fn filter_chunk_by_in_filters_with_exprs(
                 return Err(msg);
             }
         };
-        current = filter_ref.filter_chunk_with_array(&array, chunk)?;
+        current = filter_in_chunk_with_array_and_cache(filter_ref, &array, chunk, cache)?;
     }
     Ok(current)
 }
 
-#[allow(dead_code)]
-pub(crate) fn filter_chunk_by_in_filters_with_exprs_and_dict_cache(
-    arena: &ExprArena,
-    exprs: &HashMap<i32, ExprId>,
-    filters: &[Arc<RuntimeInFilter>],
+fn filter_in_chunk_with_array_and_cache(
+    filter: &RuntimeInFilter,
+    array: &ArrayRef,
     chunk: Chunk,
-    _dict_cache: &mut RuntimeFilterDictionaryFoldCache,
+    cache: &mut RuntimeFilterDictionaryFoldCache,
 ) -> Result<Option<Chunk>, String> {
-    filter_chunk_by_in_filters_with_exprs(arena, exprs, filters, chunk)
+    if filter.is_empty() {
+        return Ok(Some(chunk));
+    }
+    if chunk.is_empty() {
+        return Ok(Some(chunk));
+    }
+    if array.len() != chunk.len() {
+        return Err("runtime in-filter array length mismatch".to_string());
+    }
+    if let Some(dict) = dictionary_int32_string(array)? {
+        let mut keep = vec![true; chunk.len()];
+        let fold = fold_in_filter_for_dictionary(filter, dict, cache)?;
+        apply_dictionary_fold(dict, &fold, &mut keep)?;
+        return filter_chunk_by_keep(chunk, keep);
+    }
+    filter.filter_chunk_with_array(array, chunk)
 }
 
 /// Apply membership filters with expression mappings and return the filtered chunk.
@@ -350,6 +392,19 @@ pub(crate) fn filter_chunk_by_membership_filters_with_exprs(
     exprs: &HashMap<i32, ExprId>,
     filters: &[Arc<RuntimeMembershipFilter>],
     chunk: Chunk,
+) -> Result<Option<Chunk>, String> {
+    let mut cache = RuntimeFilterDictionaryFoldCache::default();
+    filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
+        arena, exprs, filters, chunk, &mut cache,
+    )
+}
+
+pub(crate) fn filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
+    arena: &ExprArena,
+    exprs: &HashMap<i32, ExprId>,
+    filters: &[Arc<RuntimeMembershipFilter>],
+    chunk: Chunk,
+    cache: &mut RuntimeFilterDictionaryFoldCache,
 ) -> Result<Option<Chunk>, String> {
     if filters.is_empty() {
         return Ok(Some(chunk));
@@ -372,23 +427,54 @@ pub(crate) fn filter_chunk_by_membership_filters_with_exprs(
                     return Err(msg);
                 }
             };
-            current = filter.filter_chunk_with_array(&array, chunk)?;
+            current = filter_membership_chunk_with_array_and_cache(filter, &array, chunk, cache)?;
         } else {
-            current = filter.filter_chunk(chunk)?;
+            current = filter_membership_chunk_with_direct_slot_and_cache(filter, chunk, cache)?;
         }
     }
     Ok(current)
 }
 
-#[allow(dead_code)]
-pub(crate) fn filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
-    arena: &ExprArena,
-    exprs: &HashMap<i32, ExprId>,
-    filters: &[Arc<RuntimeMembershipFilter>],
+fn filter_membership_chunk_with_direct_slot_and_cache(
+    filter: &RuntimeMembershipFilter,
     chunk: Chunk,
-    _dict_cache: &mut RuntimeFilterDictionaryFoldCache,
+    cache: &mut RuntimeFilterDictionaryFoldCache,
 ) -> Result<Option<Chunk>, String> {
-    filter_chunk_by_membership_filters_with_exprs(arena, exprs, filters, chunk)
+    if chunk.is_empty() {
+        return Ok(Some(chunk));
+    }
+    if !chunk.slot_id_to_index().contains_key(&filter.slot_id()) {
+        return Ok(Some(chunk));
+    }
+    let array = chunk.column_by_slot_id(filter.slot_id())?;
+    if let Some(dict) = dictionary_int32_string(&array)? {
+        let mut keep = vec![true; chunk.len()];
+        let fold = fold_membership_filter_for_dictionary(filter, dict, cache)?;
+        apply_dictionary_fold(dict, &fold, &mut keep)?;
+        return filter_chunk_by_keep(chunk, keep);
+    }
+    filter.filter_chunk(chunk)
+}
+
+fn filter_membership_chunk_with_array_and_cache(
+    filter: &RuntimeMembershipFilter,
+    array: &ArrayRef,
+    chunk: Chunk,
+    cache: &mut RuntimeFilterDictionaryFoldCache,
+) -> Result<Option<Chunk>, String> {
+    if chunk.is_empty() {
+        return Ok(Some(chunk));
+    }
+    if array.len() != chunk.len() {
+        return Err("runtime membership filter array length mismatch".to_string());
+    }
+    if let Some(dict) = dictionary_int32_string(array)? {
+        let mut keep = vec![true; chunk.len()];
+        let fold = fold_membership_filter_for_dictionary(filter, dict, cache)?;
+        apply_dictionary_fold(dict, &fold, &mut keep)?;
+        return filter_chunk_by_keep(chunk, keep);
+    }
+    filter.filter_chunk_with_array(array, chunk)
 }
 
 /// Apply min-max filters using expression mappings and return the filtered chunk.
@@ -402,6 +488,19 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
     exprs: &HashMap<i32, ExprId>,
     filters: &[(i32, Arc<RuntimeMinMaxFilter>)],
     chunk: Chunk,
+) -> Result<Option<Chunk>, String> {
+    let mut cache = RuntimeFilterDictionaryFoldCache::default();
+    filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
+        arena, exprs, filters, chunk, &mut cache,
+    )
+}
+
+pub(crate) fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
+    arena: &ExprArena,
+    exprs: &HashMap<i32, ExprId>,
+    filters: &[(i32, Arc<RuntimeMinMaxFilter>)],
+    chunk: Chunk,
+    _dict_cache: &mut RuntimeFilterDictionaryFoldCache,
 ) -> Result<Option<Chunk>, String> {
     if filters.is_empty() {
         return Ok(Some(chunk));
@@ -447,17 +546,6 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
         current = Some(Chunk::new_like(filtered_batch, &chunk));
     }
     Ok(current)
-}
-
-#[allow(dead_code)]
-pub(crate) fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
-    arena: &ExprArena,
-    exprs: &HashMap<i32, ExprId>,
-    filters: &[(i32, Arc<RuntimeMinMaxFilter>)],
-    chunk: Chunk,
-    _dict_cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<Option<Chunk>, String> {
-    filter_chunk_by_min_max_filters_with_exprs(arena, exprs, filters, chunk)
 }
 
 #[cfg(test)]
