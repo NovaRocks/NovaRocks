@@ -1144,7 +1144,9 @@ pub(crate) fn execute_drop_table_statement(
 
 fn is_missing_table_guard_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
-    lower.contains("unknown table:") || lower.contains("table not found")
+    lower.contains("unknown table:")
+        || lower.contains("table not found")
+        || lower.contains("no metadata files")
 }
 
 fn cleanup_iceberg_drop_table_registration_if_exists(
@@ -2758,6 +2760,9 @@ mod drop_table_if_exists_tests {
         ));
         assert!(super::is_missing_table_guard_error(
             "load iceberg table db.missing: table not found: warehouse/db/missing"
+        ));
+        assert!(super::is_missing_table_guard_error(
+            "no metadata files for db.missing"
         ));
         assert!(!super::is_missing_table_guard_error(
             "table ice.db.mv_orders is a materialized view; use DROP MATERIALIZED VIEW"
