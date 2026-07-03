@@ -1,0 +1,7 @@
+-- query 12
+mode	row_count	payload_sum
+rf_off	800	2402400
+
+-- query 14
+mode	row_count	payload_sum
+rf_on	800	2402400

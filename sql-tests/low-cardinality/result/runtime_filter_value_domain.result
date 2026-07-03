@@ -1,0 +1,7 @@
+-- query 10
+mode	c	payload_sum
+rf_off	3	90
+
+-- query 12
+mode	c	payload_sum
+rf_on	3	90
