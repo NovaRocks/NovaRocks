@@ -5569,12 +5569,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
         | RefreshDecision::Incremental => {}
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, &base_refs,
-    )
-    .map_err(RefreshError::user)?;
-    let current_snapshot_id = pin.get(base_ref);
-    let loaded = load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+    let current_snapshot_id = current_snapshot_id_before_pin;
+    let loaded = pre_pin_loaded;
     match crate::engine::mv::schema_contract::validate_schema_contract(
         schema_contract,
         &loaded.table,
@@ -14401,15 +14397,16 @@ fn execute_join_delta_branches(
 fn build_imv_refresh_catalog(
     state: &Arc<StandaloneState>,
     base_refs: &[&IcebergTableRef],
+    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
 ) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
     let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
     for base_ref in base_refs {
-        let table_def = crate::engine::query_prep::build_iceberg_table_def_for_delta_scan(
-            state,
-            &base_ref.catalog,
-            &base_ref.namespace,
-            &base_ref.table,
-        )?;
+        let snapshot_id = pin
+            .get(base_ref)
+            .ok_or_else(|| format!("IMV refresh catalog missing pin for {}", base_ref.fqn()))?;
+        let mut table_def =
+            build_iceberg_table_def_for_snapshot_scan(state, base_ref, snapshot_id)?;
+        table_def.name = base_ref.table.clone();
         catalog.create_database(&base_ref.namespace)?;
         catalog
             .register(&base_ref.namespace, table_def.clone())
@@ -15577,7 +15574,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         .iter()
         .map(|change| change.base_ref)
         .collect::<Vec<_>>();
-    let catalog = match build_imv_refresh_catalog(state, &refresh_base_refs) {
+    let catalog = match build_imv_refresh_catalog(state, &refresh_base_refs, &ctx.rewrite.pin) {
         Ok(c) => c,
         Err(err) => {
             return Err(handle_iceberg_mv_commit_error(

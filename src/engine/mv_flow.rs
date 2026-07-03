@@ -7,6 +7,7 @@ use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvStorageEngine, MvTarget, RefreshCtx,
     RefreshError, RefreshRequest,
 };
+use crate::engine::statement::{AlterIcebergPropertiesStmt, PropertiesOp};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
@@ -483,9 +484,12 @@ pub(crate) fn alter_mv(
     db: &str,
     stmt: &AlterMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    if matches!(stmt.action, AlterMaterializedViewAction::Repartition(_)) {
+    if matches!(
+        stmt.action,
+        AlterMaterializedViewAction::Repartition(_) | AlterMaterializedViewAction::SetProperties(_)
+    ) {
         let current_catalog = current_catalog.ok_or_else(|| {
-            "ALTER MATERIALIZED VIEW ... REPARTITION requires current Iceberg catalog".to_string()
+            "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
         })?;
         let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
             Some(current_catalog),
@@ -500,9 +504,23 @@ pub(crate) fn alter_mv(
         })?;
         if engine != MvStorageEngine::Iceberg {
             return Err(
-                "ALTER MATERIALIZED VIEW ... REPARTITION is only supported for Iceberg-backed materialized views"
+                "ALTER MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
                     .to_string(),
             );
+        }
+        if let AlterMaterializedViewAction::SetProperties(entries) = &stmt.action {
+            crate::connector::iceberg::catalog::alter_table_properties(
+                state,
+                &AlterIcebergPropertiesStmt {
+                    table: stmt.name.clone(),
+                    op: PropertiesOp::Set {
+                        entries: entries.clone(),
+                    },
+                },
+                Some(current_catalog),
+                db,
+            )?;
+            return Ok(StatementResult::Ok);
         }
         return crate::engine::mv::iceberg_refresh::repartition_iceberg_mv(
             state,
@@ -544,6 +562,9 @@ pub(crate) fn alter_mv(
         },
         AlterMaterializedViewAction::Repartition(_) => {
             unreachable!("repartition is handled before refresh metadata update")
+        }
+        AlterMaterializedViewAction::SetProperties(_) => {
+            unreachable!("properties are handled before refresh metadata update")
         }
     };
     state
@@ -723,9 +744,18 @@ pub(crate) fn execute_query_for_mv_refresh_with_catalog(
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("sql parser error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
+    let sqlparser::ast::Statement::Query(mut query) = statement else {
         return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
     };
+
+    if crate::engine::query_prep::has_time_travel_refs(&query) {
+        crate::engine::query_prep::rewrite_time_travel_refs(
+            state,
+            current_catalog,
+            current_database,
+            &mut query,
+        )?;
+    }
 
     crate::engine::execute_query_with_catalog_mgr(
         state,

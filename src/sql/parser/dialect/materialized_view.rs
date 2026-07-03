@@ -404,7 +404,7 @@ pub(crate) fn looks_like_alter_materialized_view(parser: &Parser<'_>) -> bool {
 
 /// Parse `ALTER MATERIALIZED VIEW <name> SET REFRESH ...`.
 ///
-/// This phase accepts only refresh policy metadata operations. Other
+/// This phase accepts refresh policy and target table property operations. Other
 /// StarRocks-style MV ALTER forms remain unsupported so they fail fast instead
 /// of being silently ignored.
 pub(crate) fn parse_alter_materialized_view(parser: &mut Parser<'_>) -> Result<Statement, String> {
@@ -420,10 +420,19 @@ pub(crate) fn parse_alter_materialized_view(parser: &mut Parser<'_>) -> Result<S
     let name = convert_object_name(parser.parse_object_name(false).map_err(|e| e.to_string())?)?;
 
     let action = if parser.parse_keyword(Keyword::SET) {
-        parser
-            .expect_keyword(Keyword::REFRESH)
-            .map_err(|e| format!("expected REFRESH after ALTER MATERIALIZED VIEW ... SET: {e}"))?;
-        AlterMaterializedViewAction::SetRefresh(parse_refresh_clause(parser)?)
+        if parser.parse_keyword(Keyword::REFRESH) {
+            AlterMaterializedViewAction::SetRefresh(parse_refresh_clause(parser)?)
+        } else if peek_word_eq(parser, 0, "TBLPROPERTIES") {
+            parser.next_token();
+            let properties = parse_properties(parser)?;
+            validate_alter_mv_properties(&properties)?;
+            AlterMaterializedViewAction::SetProperties(properties)
+        } else {
+            return Err(
+                "expected REFRESH or TBLPROPERTIES after ALTER MATERIALIZED VIEW ... SET"
+                    .to_string(),
+            );
+        }
     } else if peek_word_eq(parser, 0, "PAUSE") {
         parser.next_token();
         parser
@@ -445,7 +454,7 @@ pub(crate) fn parse_alter_materialized_view(parser: &mut Parser<'_>) -> Result<S
         AlterMaterializedViewAction::Repartition(fields)
     } else {
         return Err(
-            "expected SET REFRESH, PAUSE REFRESH, RESUME REFRESH, or REPARTITION BY after ALTER MATERIALIZED VIEW"
+            "expected SET REFRESH, SET TBLPROPERTIES, PAUSE REFRESH, RESUME REFRESH, or REPARTITION BY after ALTER MATERIALIZED VIEW"
                 .to_string(),
         );
     };
@@ -453,6 +462,24 @@ pub(crate) fn parse_alter_materialized_view(parser: &mut Parser<'_>) -> Result<S
     Ok(Statement::AlterMaterializedView(
         AlterMaterializedViewStmt { name, action },
     ))
+}
+
+fn validate_alter_mv_properties(properties: &[(String, String)]) -> Result<(), String> {
+    if properties.is_empty() {
+        return Err(
+            "ALTER MATERIALIZED VIEW SET TBLPROPERTIES requires at least one key=value pair"
+                .to_string(),
+        );
+    }
+    let mut seen = std::collections::HashSet::<String>::new();
+    for (key, _) in properties {
+        if !seen.insert(key.clone()) {
+            return Err(format!(
+                "duplicate key '{key}' in ALTER MATERIALIZED VIEW SET TBLPROPERTIES"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check if the current position looks like `REFRESH MATERIALIZED VIEW ...`.
@@ -848,6 +875,24 @@ mod tests {
             AlterMaterializedViewAction::SetRefresh(MaterializedViewRefreshPolicy::AsyncInterval {
                 interval_ms: 7_200_000
             })
+        );
+    }
+
+    #[test]
+    fn parse_alter_mv_set_tblproperties() {
+        let stmt = parse_one(
+            "ALTER MATERIALIZED VIEW analytics.mv1 SET TBLPROPERTIES ('history.expire.max-snapshot-age-ms' = '1')",
+        );
+        let Statement::AlterMaterializedView(alter) = stmt else {
+            panic!("expected ALTER MATERIALIZED VIEW");
+        };
+        assert_eq!(alter.name.parts, vec!["analytics", "mv1"]);
+        assert_eq!(
+            alter.action,
+            AlterMaterializedViewAction::SetProperties(vec![(
+                "history.expire.max-snapshot-age-ms".to_string(),
+                "1".to_string()
+            )])
         );
     }
 

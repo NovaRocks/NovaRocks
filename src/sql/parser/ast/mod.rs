@@ -144,6 +144,7 @@ pub(crate) struct DropMaterializedViewStmt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AlterMaterializedViewAction {
     SetRefresh(MaterializedViewRefreshPolicy),
+    SetProperties(Vec<(String, String)>),
     PauseRefresh,
     ResumeRefresh,
     Repartition(Vec<IcebergPartitionFieldExpr>),

@@ -2185,7 +2185,7 @@ mod tests {
             .expect("create iceberg namespace");
         session
             .execute_in_database(
-                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3")"#,
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
                 "default",
             )
             .expect("create iceberg orders table");
@@ -2197,14 +2197,14 @@ mod tests {
             .expect("seed iceberg base rows");
 
         session
-            .execute_in_database("create database analytics", "default")
+            .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = session.execute_in_database(
+        if let Err(err) = execute_iceberg_mv_sql(
+            &session,
             "create materialized view agg_mv \
              distributed by hash(customer) buckets 2 \
              as select customer, count(*) as c, sum(amount) as s \
              from ice.ns.orders group by customer",
-            "analytics",
         ) {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
@@ -2215,9 +2215,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view agg_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view agg_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping aggregate MV incremental DELETE test: object store unavailable on full refresh: {err}"
@@ -2258,9 +2256,7 @@ mod tests {
             .execute_in_database("delete from ice.ns.orders where id = 1", "default")
             .expect("delete base row id=1");
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view agg_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view agg_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping aggregate MV incremental DELETE test: object store unavailable on incremental refresh: {err}"
@@ -2338,7 +2334,7 @@ mod tests {
             .expect("create iceberg namespace");
         session
             .execute_in_database(
-                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3")"#,
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
                 "default",
             )
             .expect("create iceberg orders table");
@@ -2347,14 +2343,14 @@ mod tests {
             .expect("seed iceberg base row");
 
         session
-            .execute_in_database("create database analytics", "default")
+            .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = session.execute_in_database(
+        if let Err(err) = execute_iceberg_mv_sql(
+            &session,
             "create materialized view orders_mv \
              distributed by hash(id) buckets 2 \
              primary key (id) \
              as select id, customer, amount from ice.ns.orders",
-            "analytics",
         ) {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
@@ -2365,9 +2361,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view orders_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin bookkeeping test: object store unavailable on full refresh: {err}"
@@ -2377,12 +2371,10 @@ mod tests {
             panic!("first (full) refresh materialized view: {err}");
         }
 
-        let mv_info = engine
-            .starrocks_table_info("analytics", "orders_mv")
-            .expect("StarRocks table info for MV");
         let base_key = "ice.ns.orders".to_string();
         let s0 = current_orders_main_snapshot(&session).expect("snapshot after full refresh");
-        let mv_after_full = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let mv_after_full =
+            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
         assert_eq!(
             mv_after_full.last_refresh_snapshots.get(&base_key).copied(),
             Some(s0),
@@ -2406,9 +2398,7 @@ mod tests {
             *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(s2);
         }));
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view orders_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin bookkeeping test: object store unavailable on incremental refresh: {err}"
@@ -2430,7 +2420,7 @@ mod tests {
         );
 
         let mv_after_incremental =
-            load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
         let recorded = mv_after_incremental
             .last_refresh_snapshots
             .get(&base_key)
@@ -2487,7 +2477,7 @@ mod tests {
             .expect("create iceberg namespace");
         session
             .execute_in_database(
-                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
                 "default",
             )
             .expect("create iceberg orders table");
@@ -2499,14 +2489,14 @@ mod tests {
             .expect("seed iceberg base rows");
 
         session
-            .execute_in_database("create database analytics", "default")
+            .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = session.execute_in_database(
+        if let Err(err) = execute_iceberg_mv_sql(
+            &session,
             "create materialized view orders_mv \
              distributed by hash(id) buckets 2 \
              primary key (id) \
              as select id, amount + 1 as amount_plus_one from ice.ns.orders",
-            "analytics",
         ) {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
@@ -2517,9 +2507,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view orders_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin freeze acceptance test: object store unavailable on full refresh: {err}"
@@ -2529,12 +2517,10 @@ mod tests {
             panic!("first (full) refresh materialized view: {err}");
         }
 
-        let mv_info = engine
-            .starrocks_table_info("analytics", "orders_mv")
-            .expect("StarRocks table info for MV");
         let base_key = "ice.ns.orders".to_string();
         let s0 = current_orders_main_snapshot(&session).expect("snapshot after full refresh");
-        let mv_after_full = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let mv_after_full =
+            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
         assert_eq!(
             mv_after_full.last_refresh_snapshots.get(&base_key).copied(),
             Some(s0),
@@ -2558,9 +2544,7 @@ mod tests {
             *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(s2);
         }));
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view orders_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin freeze acceptance test: object store unavailable on pinned incremental refresh: {err}"
@@ -2584,7 +2568,7 @@ mod tests {
         );
 
         let mv_after_pinned_refresh =
-            load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
         let recorded_after_pinned_refresh = mv_after_pinned_refresh
             .last_refresh_snapshots
             .get(&base_key)
@@ -2601,9 +2585,7 @@ mod tests {
         );
         drop(hook_guard);
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view orders_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin freeze acceptance test: object store unavailable on follow-up refresh: {err}"
@@ -2626,7 +2608,8 @@ mod tests {
             current_snapshot, s2,
             "no additional base commit should happen after the hook insert"
         );
-        let mv_after_follow_up = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let mv_after_follow_up =
+            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
         assert_eq!(
             mv_after_follow_up
                 .last_refresh_snapshots
@@ -2676,7 +2659,7 @@ mod tests {
             .expect("create iceberg namespace");
         session
             .execute_in_database(
-                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
                 "default",
             )
             .expect("create iceberg orders table");
@@ -2688,14 +2671,14 @@ mod tests {
             .expect("seed iceberg base rows");
 
         session
-            .execute_in_database("create database analytics", "default")
+            .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = session.execute_in_database(
+        if let Err(err) = execute_iceberg_mv_sql(
+            &session,
             "create materialized view orders_mv \
              distributed by hash(id) buckets 2 \
              primary key (id) \
              as select id, amount + 1 as amount_plus_one from ice.ns.orders",
-            "analytics",
         ) {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
@@ -2706,9 +2689,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view orders_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping equality-delete pin test: object store unavailable on full refresh: {err}"
@@ -2718,9 +2699,6 @@ mod tests {
             panic!("first (full) refresh materialized view: {err}");
         }
 
-        let mv_info = engine
-            .starrocks_table_info("analytics", "orders_mv")
-            .expect("StarRocks table info for MV");
         let base_key = "ice.ns.orders".to_string();
 
         session
@@ -2750,9 +2728,7 @@ mod tests {
             *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(post_pin_snapshot);
         }));
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view orders_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping equality-delete pin test: object store unavailable on incremental refresh: {err}"
@@ -2779,7 +2755,8 @@ mod tests {
             "refresh pinned at s1 must retract id=1 and must not include post-pin id=4"
         );
 
-        let mv_after_refresh = load_mv_definition_from_metadata(&metadata_path, mv_info.table_id);
+        let mv_after_refresh =
+            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
         let recorded = mv_after_refresh
             .last_refresh_snapshots
             .get(&base_key)
@@ -2834,20 +2811,20 @@ mod tests {
             .expect("create iceberg namespace");
         session
             .execute_in_database(
-                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3")"#,
+                r#"create table ice.ns.orders (id bigint not null, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
                 "default",
             )
             .expect("create empty iceberg orders table");
 
         session
-            .execute_in_database("create database analytics", "default")
+            .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = session.execute_in_database(
+        if let Err(err) = execute_iceberg_mv_sql(
+            &session,
             "create materialized view orders_mv \
              distributed by hash(id) buckets 2 \
              primary key (id) \
              as select id, amount + 1 as amount_plus_one from ice.ns.orders",
-            "analytics",
         ) {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
@@ -2858,9 +2835,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view orders_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping empty-base MV refresh test: object store unavailable on refresh: {err}"
@@ -3104,7 +3079,7 @@ mod tests {
         // falling back to a full rebuild.
         session
             .execute_in_database(
-                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3")"#,
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
                 "default",
             )
             .expect("create iceberg orders table");
@@ -3116,14 +3091,14 @@ mod tests {
             .expect("seed iceberg base rows");
 
         session
-            .execute_in_database("create database analytics", "default")
+            .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = session.execute_in_database(
+        if let Err(err) = execute_iceberg_mv_sql(
+            &session,
             "create materialized view agg_mv \
              distributed by hash(customer) buckets 2 \
              as select customer, count(*) as c, sum(amount) as s \
              from ice.ns.orders group by customer",
-            "analytics",
         ) {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
@@ -3134,9 +3109,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view agg_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view agg_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping aggregate MV equality-delete test: object store unavailable on full refresh: {err}"
@@ -3174,9 +3147,7 @@ mod tests {
             )
             .expect("add equality delete for base row id=1");
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view agg_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view agg_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping aggregate MV equality-delete test: object store unavailable on incremental refresh: {err}"
@@ -3283,14 +3254,14 @@ mod tests {
             .expect("seed iceberg base rows");
 
         session
-            .execute_in_database("create database analytics", "default")
+            .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = session.execute_in_database(
+        if let Err(err) = execute_iceberg_mv_sql(
+            &session,
             "create materialized view agg_mv \
              distributed by hash(customer) buckets 2 \
              as select customer, count(*) as c, sum(amount) as s \
              from ice.ns.orders group by customer",
-            "analytics",
         ) {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
@@ -3301,9 +3272,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view agg_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view agg_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping v3 row-lineage MV incremental DELETE test: object store unavailable on full refresh: {err}"
@@ -3339,9 +3308,7 @@ mod tests {
             .execute_in_database("delete from ice.ns.orders where id = 1", "default")
             .expect("delete base row id=1 (writes puffin dv)");
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view agg_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view agg_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping v3 row-lineage MV incremental DELETE test: object store unavailable on incremental refresh: {err}"
@@ -3428,14 +3395,14 @@ mod tests {
             .expect("seed s3 iceberg base rows");
 
         session
-            .execute_in_database("create database analytics", "default")
+            .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = session.execute_in_database(
+        if let Err(err) = execute_iceberg_mv_sql(
+            &session,
             "create materialized view agg_mv \
              distributed by hash(customer) buckets 2 \
              as select customer, count(*) as c, sum(amount) as s \
              from ice.ns.orders group by customer",
-            "analytics",
         ) {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
@@ -3446,9 +3413,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view agg_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view agg_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on full refresh: {err}"
@@ -3483,9 +3448,7 @@ mod tests {
             .execute_in_database("delete from ice.ns.orders where id = 1", "default")
             .expect("delete s3 base row id=1 (writes puffin dv)");
 
-        if let Err(err) =
-            session.execute_in_database("refresh materialized view agg_mv", "analytics")
-        {
+        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view agg_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping s3 v3 row-lineage MV incremental DELETE test: object store unavailable on incremental refresh: {err}"
@@ -3528,7 +3491,7 @@ mod tests {
     ) -> Result<Vec<(String, i64, i64)>, String> {
         let result = session.execute_in_context(
             "select customer, c, s from agg_mv order by customer",
-            None,
+            Some("ice"),
             "analytics",
             None,
         )?;
@@ -3571,7 +3534,7 @@ mod tests {
     ) -> Result<Vec<(i64, i64)>, String> {
         let result = session.execute_in_context(
             "select id, amount_plus_one from orders_mv order by id",
-            None,
+            Some("ice"),
             "analytics",
             None,
         )?;
@@ -3605,7 +3568,7 @@ mod tests {
     ) -> Result<Option<i64>, String> {
         let result = session.execute_in_context(
             "show materialized views from analytics",
-            None,
+            Some("ice"),
             "analytics",
             None,
         )?;
@@ -3701,13 +3664,15 @@ mod tests {
 
     fn load_mv_definition_from_metadata(
         metadata_path: &std::path::Path,
-        mv_id: i64,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
     ) -> StoredMvDefinition {
         let provider = crate::meta::SqliteMetaStoreProvider::open(metadata_path)
             .expect("open sqlite metadata provider");
         let read = provider.begin_read().expect("begin metadata read");
         crate::meta::repository::mv::MvMetaRepository::default()
-            .load_by_id(read.as_ref(), mv_id)
+            .find_by_target(read.as_ref(), catalog, namespace, table)
             .expect("load mv definition")
             .expect("mv definition exists")
     }
@@ -3806,6 +3771,13 @@ enable_path_style_access = true
         format!(
             r#"create external catalog {catalog_name} properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{warehouse_uri}","aws.s3.endpoint"="{endpoint}","aws.s3.access_key"="{access_key_id}","aws.s3.secret_key"="{access_key_secret}","aws.s3.enable_path_style_access"="true","aws.s3.region"="us-east-1")"#
         )
+    }
+
+    fn execute_iceberg_mv_sql(
+        session: &crate::engine::StandaloneSession,
+        sql: &str,
+    ) -> Result<crate::engine::StatementResult, String> {
+        session.execute_in_context(sql, Some("ice"), "analytics", None)
     }
 
     #[test]

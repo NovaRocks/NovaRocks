@@ -503,7 +503,7 @@ fn scenario_2_auto_expire_keeps_min_snapshots() {
         &env.state,
         Some("ice"),
         &env.current_db,
-        "ALTER TABLE ice.analytics.mv_exp SET TBLPROPERTIES \
+        "ALTER MATERIALIZED VIEW mv_exp SET TBLPROPERTIES \
          ('history.expire.max-snapshot-age-ms' = '1', \
           'history.expire.min-snapshots-to-keep' = '1')",
     );
@@ -620,7 +620,7 @@ fn scenario_3_auto_expire_respects_downstream_consumer() {
         &env.state,
         Some("ice"),
         &env.current_db,
-        "ALTER TABLE ice.analytics.mv_a SET TBLPROPERTIES ('history.expire.max-snapshot-age-ms' = '1')",
+        "ALTER MATERIALIZED VIEW mv_a SET TBLPROPERTIES ('history.expire.max-snapshot-age-ms' = '1')",
     );
 
     let mut coordinator = coordinator_with(|_cfg| {});
@@ -680,7 +680,7 @@ fn scenario_4_escape_hatch_disables_table() {
         &env.state,
         Some("ice"),
         &env.current_db,
-        "ALTER TABLE ice.analytics.mv_off SET TBLPROPERTIES \
+        "ALTER MATERIALIZED VIEW mv_off SET TBLPROPERTIES \
          ('history.expire.max-snapshot-age-ms' = '1', 'novarocks.maintenance.enabled' = 'false')",
     );
 

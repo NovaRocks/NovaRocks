@@ -1017,14 +1017,14 @@ pub(crate) fn list_mv_rows(
 
     let mut rows = Vec::new();
     for mv in &definitions {
-        let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
-        let (refresh_state, retry_after_time) =
-            refresh_status_for_mv(state, read.as_ref(), mv, now_ms)?;
         if let Some(filter) = storage_filter
-            && engine != filter
+            && !mv.storage_engine.eq_ignore_ascii_case(filter.as_sql_str())
         {
             continue;
         }
+        let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
+        let (refresh_state, retry_after_time) =
+            refresh_status_for_mv(state, read.as_ref(), mv, now_ms)?;
         if engine == MvStorageEngine::Iceberg {
             let Some(target_catalog) = mv.target_catalog.as_deref() else {
                 continue;
@@ -2683,18 +2683,17 @@ mod tests {
         );
 
         let stmt = ShowMaterializedViewsStmt { database: None };
-        let starrocks = list_mv_rows(&state, Some("ice"), &stmt, Some(MvStorageEngine::StarRocks))
-            .expect("StarRocks rows");
+        let starrocks_err =
+            list_mv_rows(&state, Some("ice"), &stmt, Some(MvStorageEngine::StarRocks))
+                .expect_err("legacy StarRocks rows should be rejected");
         let iceberg = list_mv_rows(&state, Some("ice"), &stmt, Some(MvStorageEngine::Iceberg))
             .expect("iceberg rows");
 
-        assert!(!starrocks.is_empty(), "expected StarRocks MV rows");
-        assert!(!iceberg.is_empty(), "expected iceberg MV rows");
         assert!(
-            starrocks
-                .iter()
-                .all(|row| row.storage_engine == "starrocks")
+            starrocks_err.contains("storage_engine='starrocks'"),
+            "err={starrocks_err}"
         );
+        assert!(!iceberg.is_empty(), "expected iceberg MV rows");
         assert!(iceberg.iter().all(|row| row.storage_engine == "iceberg"));
     }
 
