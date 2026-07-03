@@ -213,3 +213,165 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
     }
     Ok(current)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::runtime_filter::{
+        RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter, RuntimeFilterType, RuntimeInFilter,
+        RuntimeInFilterValues, RuntimeMembershipFilter, RuntimeMinMaxFilter,
+    };
+    use arrow::array::{
+        Array, ArrayRef, DictionaryArray, Int32Array, LargeStringArray, StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn dict_chunk(keys: Vec<Option<i32>>, values: ArrayRef, logical_type: DataType) -> Chunk {
+        let keys = Int32Array::from(keys);
+        let dict =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef;
+        let schema = Schema::new(vec![Field::new("status", logical_type, true)]);
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[SlotId::new(1)]).unwrap();
+        Chunk::try_new_with_columns(chunk_schema, vec![dict]).unwrap()
+    }
+
+    fn output_strings(chunk: &Chunk) -> Vec<Option<String>> {
+        let array = chunk.columns()[0].clone();
+        let flat = arrow::compute::cast(array.as_ref(), &DataType::Utf8).unwrap();
+        let strings = flat.as_any().downcast_ref::<StringArray>().unwrap();
+        (0..strings.len())
+            .map(|idx| {
+                if strings.is_null(idx) {
+                    None
+                } else {
+                    Some(strings.value(idx).to_string())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn in_filter_folds_utf8_dictionary_values_and_rejects_null_keys() {
+        let values = Arc::new(StringArray::from(vec!["PAID", "NEW", "CLOSED"])) as ArrayRef;
+        let chunk = dict_chunk(
+            vec![Some(0), Some(1), None, Some(2), Some(0)],
+            values,
+            DataType::Utf8,
+        );
+        let filter = Arc::new(RuntimeInFilter::new(
+            7,
+            SlotId::new(1),
+            RuntimeInFilterValues::Utf8(
+                ["PAID".to_string(), "CLOSED".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+        ));
+
+        let out = filter_chunk_by_in_filters(std::slice::from_ref(&filter), chunk)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            output_strings(&out),
+            vec![
+                Some("PAID".to_string()),
+                Some("CLOSED".to_string()),
+                Some("PAID".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn in_filter_folds_large_utf8_dictionary_values() {
+        let values = Arc::new(LargeStringArray::from(vec!["PAID", "NEW", "CLOSED"])) as ArrayRef;
+        let chunk = dict_chunk(vec![Some(0), Some(1), Some(2)], values, DataType::LargeUtf8);
+        let filter = Arc::new(RuntimeInFilter::new(
+            8,
+            SlotId::new(1),
+            RuntimeInFilterValues::Utf8(["NEW".to_string()].into_iter().collect()),
+        ));
+
+        let out = filter_chunk_by_in_filters(std::slice::from_ref(&filter), chunk)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(output_strings(&out), vec![Some("NEW".to_string())]);
+    }
+
+    #[test]
+    fn membership_filter_folds_dictionary_values_and_preserves_has_null() {
+        let build = Arc::new(StringArray::from(vec![Some("A"), Some("Z"), None])) as ArrayRef;
+        let filter = Arc::new(RuntimeMembershipFilter::Bloom(
+            RuntimeBloomFilter::build_from_array(
+                9,
+                SlotId::new(1),
+                RuntimeFilterType::Utf8,
+                &build,
+                RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            )
+            .unwrap(),
+        ));
+        assert!(filter.has_null());
+
+        let values = Arc::new(StringArray::from(vec!["A", "M", "Z"])) as ArrayRef;
+        let chunk = dict_chunk(
+            vec![Some(0), Some(1), None, Some(2)],
+            values,
+            DataType::Utf8,
+        );
+
+        let out = filter_chunk_by_membership_filters_with_exprs(
+            &ExprArena::default(),
+            &HashMap::new(),
+            std::slice::from_ref(&filter),
+            chunk,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            output_strings(&out),
+            vec![Some("A".to_string()), None, Some("Z".to_string())]
+        );
+    }
+
+    #[test]
+    fn min_max_filter_hydrates_dictionary_probe_values_as_correctness_fallback() {
+        let build = Arc::new(StringArray::from(vec!["M", "T"])) as ArrayRef;
+        let filter =
+            Arc::new(RuntimeMinMaxFilter::from_array(RuntimeFilterType::Utf8, &build).unwrap());
+        let values = Arc::new(StringArray::from(vec!["A", "M", "P", "Z", "T"])) as ArrayRef;
+        let chunk = dict_chunk(
+            vec![Some(0), Some(1), Some(2), Some(3), Some(4), None],
+            values,
+            DataType::Utf8,
+        );
+
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let out = filter_chunk_by_min_max_filters_with_exprs(
+            &arena,
+            &HashMap::from([(11, expr)]),
+            &[(11, filter)],
+            chunk,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            output_strings(&out),
+            vec![
+                Some("M".to_string()),
+                Some("P".to_string()),
+                Some("T".to_string())
+            ]
+        );
+    }
+}
