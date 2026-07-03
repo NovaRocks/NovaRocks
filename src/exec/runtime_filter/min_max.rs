@@ -167,6 +167,18 @@ impl RuntimeMinMaxFilter {
                 (t, MinMaxValue::Utf8(v)) if is_utf8_type(&t) => {
                     Ok(MinMaxPredicateValue::ByteArray(v.as_bytes().to_vec()))
                 }
+                (
+                    RuntimeFilterType::Decimal {
+                        precision: Some(precision),
+                        scale: Some(scale),
+                        ..
+                    },
+                    MinMaxValue::Decimal128(value),
+                ) => Ok(MinMaxPredicateValue::Decimal128 {
+                    value: *value,
+                    precision,
+                    scale,
+                }),
                 (t, MinMaxValue::Decimal128(_)) if is_decimal_type(&t) => Err(format!(
                     "runtime min/max conversion for decimal type {:?} is unsupported because precision/scale metadata is missing",
                     t
@@ -468,79 +480,45 @@ impl RuntimeMinMaxFilter {
             }
             t if t == RuntimeFilterType::Int8 => {
                 let (min, max) = self.i8_range()?;
-                let arr = as_array::<Int8Array>(array, "Int8")?;
-                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
-                    if !*keep {
-                        continue;
-                    }
-                    if arr.is_null(i) {
-                        if check_null {
-                            *keep = has_null;
-                        }
-                        continue;
-                    }
-                    let v = arr.value(i);
-                    if v < min || v > max {
-                        *keep = false;
-                    }
-                }
+                apply_i64_range_to_integer_array(
+                    array,
+                    i64::from(min),
+                    i64::from(max),
+                    has_null,
+                    check_null,
+                    keep,
+                    "Int8",
+                )?;
             }
             t if t == RuntimeFilterType::Int16 => {
                 let (min, max) = self.i16_range()?;
-                let arr = as_array::<Int16Array>(array, "Int16")?;
-                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
-                    if !*keep {
-                        continue;
-                    }
-                    if arr.is_null(i) {
-                        if check_null {
-                            *keep = has_null;
-                        }
-                        continue;
-                    }
-                    let v = arr.value(i);
-                    if v < min || v > max {
-                        *keep = false;
-                    }
-                }
+                apply_i64_range_to_integer_array(
+                    array,
+                    i64::from(min),
+                    i64::from(max),
+                    has_null,
+                    check_null,
+                    keep,
+                    "Int16",
+                )?;
             }
             t if t == RuntimeFilterType::Int32 => {
                 let (min, max) = self.i32_range()?;
-                let arr = as_array::<Int32Array>(array, "Int32")?;
-                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
-                    if !*keep {
-                        continue;
-                    }
-                    if arr.is_null(i) {
-                        if check_null {
-                            *keep = has_null;
-                        }
-                        continue;
-                    }
-                    let v = arr.value(i);
-                    if v < min || v > max {
-                        *keep = false;
-                    }
-                }
+                apply_i64_range_to_integer_array(
+                    array,
+                    i64::from(min),
+                    i64::from(max),
+                    has_null,
+                    check_null,
+                    keep,
+                    "Int32",
+                )?;
             }
             t if t == RuntimeFilterType::Int64 => {
                 let (min, max) = self.i64_range()?;
-                let arr = as_array::<Int64Array>(array, "Int64")?;
-                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
-                    if !*keep {
-                        continue;
-                    }
-                    if arr.is_null(i) {
-                        if check_null {
-                            *keep = has_null;
-                        }
-                        continue;
-                    }
-                    let v = arr.value(i);
-                    if v < min || v > max {
-                        *keep = false;
-                    }
-                }
+                apply_i64_range_to_integer_array(
+                    array, min, max, has_null, check_null, keep, "Int64",
+                )?;
             }
             t if t == RuntimeFilterType::LargeInt => {
                 let (min, max) = self.i128_range()?;
@@ -822,6 +800,91 @@ fn update_min_max(
         None => *max = Some(value),
     }
     Ok(())
+}
+
+fn apply_i64_range_to_integer_array(
+    array: &ArrayRef,
+    min: i64,
+    max: i64,
+    has_null: bool,
+    check_null: bool,
+    keep: &mut [bool],
+    expected: &str,
+) -> Result<(), String> {
+    match array.data_type() {
+        DataType::Int8 => {
+            let arr = as_array::<Int8Array>(array, "Int8")?;
+            apply_integer_range(arr.len(), min, max, has_null, check_null, keep, |idx| {
+                if arr.is_null(idx) {
+                    None
+                } else {
+                    Some(i64::from(arr.value(idx)))
+                }
+            });
+            Ok(())
+        }
+        DataType::Int16 => {
+            let arr = as_array::<Int16Array>(array, "Int16")?;
+            apply_integer_range(arr.len(), min, max, has_null, check_null, keep, |idx| {
+                if arr.is_null(idx) {
+                    None
+                } else {
+                    Some(i64::from(arr.value(idx)))
+                }
+            });
+            Ok(())
+        }
+        DataType::Int32 => {
+            let arr = as_array::<Int32Array>(array, "Int32")?;
+            apply_integer_range(arr.len(), min, max, has_null, check_null, keep, |idx| {
+                if arr.is_null(idx) {
+                    None
+                } else {
+                    Some(i64::from(arr.value(idx)))
+                }
+            });
+            Ok(())
+        }
+        DataType::Int64 => {
+            let arr = as_array::<Int64Array>(array, "Int64")?;
+            apply_integer_range(arr.len(), min, max, has_null, check_null, keep, |idx| {
+                if arr.is_null(idx) {
+                    None
+                } else {
+                    Some(arr.value(idx))
+                }
+            });
+            Ok(())
+        }
+        _ => Err(format!("runtime min/max type mismatch for {expected}")),
+    }
+}
+
+fn apply_integer_range<F>(
+    len: usize,
+    min: i64,
+    max: i64,
+    has_null: bool,
+    check_null: bool,
+    keep: &mut [bool],
+    mut value_at: F,
+) where
+    F: FnMut(usize) -> Option<i64>,
+{
+    for (i, keep) in keep.iter_mut().enumerate().take(len) {
+        if !*keep {
+            continue;
+        }
+        let Some(value) = value_at(i) else {
+            if check_null {
+                *keep = has_null;
+            }
+            continue;
+        };
+        if value < min || value > max {
+            *keep = false;
+        }
+    }
 }
 
 fn full_range_values(ltype: &RuntimeFilterType) -> Result<(MinMaxValue, MinMaxValue), String> {
@@ -1156,12 +1219,12 @@ fn is_decimal_type(ltype: &RuntimeFilterType) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::Int32Array;
+    use arrow::array::{Decimal128Array, Int32Array, Int64Array};
 
     use super::{MinMaxValue, RuntimeMinMaxFilter};
     use crate::common::largeint;
     use crate::common::min_max_predicate::MinMaxPredicateValue;
-    use crate::exec::runtime_filter::RuntimeFilterType;
+    use crate::exec::runtime_filter::{RuntimeDecimalWidth, RuntimeFilterType};
 
     #[test]
     fn test_largeint_min_max_from_arrays() {
@@ -1209,6 +1272,62 @@ mod tests {
     }
 
     #[test]
+    fn test_decimal_min_max_predicate_values_preserve_type_metadata() {
+        let array: arrow::array::ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(1234_i128), Some(-500_i128), None])
+                .with_precision_and_scale(18, 2)
+                .unwrap(),
+        );
+        let filter = RuntimeMinMaxFilter::from_arrays(
+            RuntimeFilterType::Decimal {
+                width: RuntimeDecimalWidth::Decimal64,
+                precision: Some(18),
+                scale: Some(2),
+            },
+            &[array],
+        )
+        .unwrap();
+
+        match filter.min_max_predicate_values().unwrap() {
+            Some((
+                MinMaxPredicateValue::Decimal128 {
+                    value: min,
+                    precision: min_precision,
+                    scale: min_scale,
+                },
+                MinMaxPredicateValue::Decimal128 {
+                    value: max,
+                    precision: max_precision,
+                    scale: max_scale,
+                },
+            )) => {
+                assert_eq!(min, -500);
+                assert_eq!(max, 1234);
+                assert_eq!((min_precision, min_scale), (18, 2));
+                assert_eq!((max_precision, max_scale), (18, 2));
+            }
+            other => panic!("unexpected decimal literal bounds: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decimal_min_max_predicate_values_reject_missing_type_metadata() {
+        let filter = RuntimeMinMaxFilter::new(
+            RuntimeFilterType::Decimal {
+                width: RuntimeDecimalWidth::Decimal64,
+                precision: None,
+                scale: Some(2),
+            },
+            true,
+            MinMaxValue::Decimal128(1),
+            MinMaxValue::Decimal128(2),
+        );
+
+        let err = filter.min_max_predicate_values().unwrap_err();
+        assert!(err.contains("precision/scale metadata is missing"));
+    }
+
+    #[test]
     fn test_largeint_apply_to_array() {
         let filter = RuntimeMinMaxFilter::new(
             RuntimeFilterType::LargeInt,
@@ -1239,6 +1358,25 @@ mod tests {
             .apply_to_array(&array, true, true, &mut keep)
             .unwrap();
         assert_eq!(keep, vec![true, true]);
+    }
+
+    #[test]
+    fn test_integer_min_max_applies_to_widened_probe_array() {
+        let filter = RuntimeMinMaxFilter::new(
+            RuntimeFilterType::Int32,
+            true,
+            MinMaxValue::Int32(2),
+            MinMaxValue::Int32(5),
+        );
+        let array: arrow::array::ArrayRef =
+            Arc::new(Int64Array::from(vec![Some(1_i64), Some(3), Some(6), None]));
+        let mut keep = vec![true; 4];
+
+        filter
+            .apply_to_array(&array, false, true, &mut keep)
+            .unwrap();
+
+        assert_eq!(keep, vec![false, true, false, false]);
     }
 
     #[test]
