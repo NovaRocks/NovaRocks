@@ -42,8 +42,10 @@ use crate::exec::row_position::IcebergVirtualSpec;
 use crate::exec::row_position::LakeRowPositionSpec;
 use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{
-    RuntimeInFilter, RuntimeMembershipFilter, filter_chunk_by_in_filters_with_exprs,
-    filter_chunk_by_membership_filters_with_exprs, filter_chunk_by_min_max_filters_with_exprs,
+    RuntimeFilterDictionaryFoldCache, RuntimeInFilter, RuntimeMembershipFilter,
+    filter_chunk_by_in_filters_with_exprs_and_dict_cache,
+    filter_chunk_by_membership_filters_with_exprs_and_dict_cache,
+    filter_chunk_by_min_max_filters_with_exprs_and_dict_cache,
 };
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
@@ -157,6 +159,7 @@ pub(super) struct ScanAsyncRunner {
     finished: bool,
     runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
     runtime_filter_exprs: HashMap<i32, ExprId>,
+    runtime_filter_dict_fold_cache: RuntimeFilterDictionaryFoldCache,
     runtime_filters_expected: usize,
     runtime_filter_lifecycle_handles: HashMap<i32, RfLifecycleHandle>,
     acquired: Option<AcquiredRuntimeFilters>,
@@ -348,6 +351,7 @@ impl ScanAsyncRunner {
             finished: false,
             runtime_filter_probe,
             runtime_filter_exprs,
+            runtime_filter_dict_fold_cache: RuntimeFilterDictionaryFoldCache::default(),
             runtime_filters_expected,
             runtime_filter_lifecycle_handles: HashMap::new(),
             acquired: None,
@@ -387,7 +391,7 @@ impl ScanAsyncRunner {
     }
 
     fn apply_complete_runtime_filters(
-        &self,
+        &mut self,
         snapshot: &RuntimeFilterSnapshot,
         chunk: Chunk,
     ) -> Result<Option<Chunk>, String> {
@@ -398,11 +402,12 @@ impl ScanAsyncRunner {
             };
             let input_rows = chunk.len();
             let filter_id = filter.filter_id();
-            current = filter_chunk_by_membership_filters_with_exprs(
+            current = filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
                 &self.arena,
                 &self.runtime_filter_exprs,
                 std::slice::from_ref(filter),
                 chunk,
+                &mut self.runtime_filter_dict_fold_cache,
             )?;
             let output_rows = current.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
             self.record_runtime_filter_applied(filter_id, input_rows, output_rows);
@@ -413,11 +418,12 @@ impl ScanAsyncRunner {
             };
             let input_rows = chunk.len();
             let filter_id = filter.filter_id();
-            current = filter_chunk_by_in_filters_with_exprs(
+            current = filter_chunk_by_in_filters_with_exprs_and_dict_cache(
                 &self.arena,
                 &self.runtime_filter_exprs,
                 std::slice::from_ref(filter),
                 chunk,
+                &mut self.runtime_filter_dict_fold_cache,
             )?;
             let output_rows = current.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
             self.record_runtime_filter_applied(filter_id, input_rows, output_rows);
@@ -428,11 +434,12 @@ impl ScanAsyncRunner {
             };
             let input_rows = chunk.len();
             let filter_slice = [(*filter_id, Arc::clone(filter))];
-            current = filter_chunk_by_min_max_filters_with_exprs(
+            current = filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
                 &self.arena,
                 &self.runtime_filter_exprs,
                 &filter_slice,
                 chunk,
+                &mut self.runtime_filter_dict_fold_cache,
             )?;
             let output_rows = current.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
             self.record_runtime_filter_applied(*filter_id, input_rows, output_rows);
@@ -490,6 +497,7 @@ impl ScanAsyncRunner {
                 .add_counter(RUNTIME_IN_FILTER_NUM, metrics::TUnit::UNIT);
         }
         if let AcquiredRuntimeFilters::Complete(snapshot) = &acquired {
+            self.runtime_filter_dict_fold_cache.clear();
             self.runtime_filter_ctx = Some(Arc::new(RuntimeFilterContext::from_snapshot(
                 snapshot.clone(),
             )));
@@ -1473,7 +1481,7 @@ impl ScanAsyncRunner {
                 }
                 return Ok(Some(chunk));
             }
-            Some(AcquiredRuntimeFilters::Complete(snapshot)) => snapshot,
+            Some(AcquiredRuntimeFilters::Complete(snapshot)) => snapshot.clone(),
         };
         if snapshot.is_empty() {
             if let Some(profile) = self.profiles.as_ref() {
@@ -1495,9 +1503,9 @@ impl ScanAsyncRunner {
             + snapshot.min_max_filters().len()) as i64;
         let result = if let Some(profile) = self.profiles.as_ref() {
             let _timer = profile.common.scoped_timer(JOIN_RUNTIME_FILTER_TIME);
-            self.apply_complete_runtime_filters(snapshot, chunk)
+            self.apply_complete_runtime_filters(&snapshot, chunk)
         } else {
-            self.apply_complete_runtime_filters(snapshot, chunk)
+            self.apply_complete_runtime_filters(&snapshot, chunk)
         }?;
         if let Some(profile) = self.profiles.as_ref() {
             let output_rows = result.as_ref().map(|c| c.len()).unwrap_or(0) as i64;
@@ -1682,7 +1690,7 @@ pub(super) fn run_scan_worker(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::scan::{
@@ -1700,8 +1708,8 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
-    use arrow::array::{Int8Array, Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Array, DictionaryArray, Int8Array, Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
     use std::thread;
@@ -2043,6 +2051,41 @@ mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
+    fn dictionary_status_chunk(keys: Vec<Option<i32>>, values: Arc<StringArray>) -> Chunk {
+        let dict = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(keys), values)
+                .expect("build dictionary array"),
+        ) as ArrayRef;
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("status", DataType::Utf8, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        Chunk::try_new_with_columns(chunk_schema, vec![dict]).expect("dictionary status chunk")
+    }
+
+    fn output_strings(chunk: &Chunk) -> Vec<Option<String>> {
+        let flat = arrow::compute::cast(chunk.columns()[0].as_ref(), &DataType::Utf8)
+            .expect("cast dictionary output to utf8");
+        let strings = flat
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string output");
+        (0..strings.len())
+            .map(|idx| {
+                if strings.is_null(idx) {
+                    None
+                } else {
+                    Some(strings.value(idx).to_string())
+                }
+            })
+            .collect()
+    }
+
     fn in_filter(filter_id: i32, values: Vec<i32>) -> Vec<RuntimeInFilter> {
         let spec = crate::exec::node::join::JoinRuntimeFilterSpec {
             filter_id,
@@ -2061,6 +2104,24 @@ mod tests {
         set.into_filters()
     }
 
+    fn string_in_filter(filter_id: i32, values: Vec<&str>) -> Vec<RuntimeInFilter> {
+        let spec = crate::exec::node::join::JoinRuntimeFilterSpec {
+            filter_id,
+            expr_order: 0,
+            probe_slot_id: SlotId::new(1),
+            build_data_type: DataType::Utf8,
+            merge_nodes: Vec::new(),
+            has_remote_targets: false,
+        };
+        let array = Arc::new(StringArray::from(values)) as arrow::array::ArrayRef;
+        let mut set =
+            LocalRuntimeInFilterSet::new(std::slice::from_ref(&spec), std::slice::from_ref(&array))
+                .expect("string in filter set");
+        set.add_build_arrays(std::slice::from_ref(&array))
+            .expect("add string build values");
+        set.into_filters()
+    }
+
     fn pruning_membership_filter(filter_id: i32, values: Vec<i32>) -> RuntimeMembershipFilter {
         let build_values = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
         RuntimeMembershipFilter::Bloom(
@@ -2072,6 +2133,23 @@ mod tests {
                 RUNTIME_FILTER_JOIN_MODE_BROADCAST,
             )
             .expect("build bloom filter"),
+        )
+    }
+
+    fn pruning_string_membership_filter(
+        filter_id: i32,
+        values: Vec<&str>,
+    ) -> RuntimeMembershipFilter {
+        let build_values = Arc::new(StringArray::from(values)) as arrow::array::ArrayRef;
+        RuntimeMembershipFilter::Bloom(
+            RuntimeBloomFilter::build_from_array(
+                filter_id,
+                SlotId::new(1),
+                RuntimeFilterType::Utf8,
+                &build_values,
+                RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            )
+            .expect("build string bloom filter"),
         )
     }
 
@@ -2137,6 +2215,142 @@ mod tests {
             recorder.filter(filter_id),
         )]));
         (runner, expr)
+    }
+
+    fn scan_runtime_filter_string_runner(
+        filter_id: i32,
+        query_key: QueryKey,
+        hub: &RuntimeFilterHub,
+    ) -> (ScanAsyncRunner, crate::exec::expr::ExprId) {
+        let mut arena = ExprArena::default();
+        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let arena = Arc::new(arena);
+        hub.register_probe_specs(
+            42,
+            &[crate::exec::node::RuntimeFilterProbeSpec {
+                filter_id,
+                expr_id: expr,
+                slot_id: SlotId::new(1),
+                data_type: DataType::Utf8,
+            }],
+        );
+        let scan_schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Utf8,
+            true,
+        )]));
+        let scan = ScanNode::new(Arc::new(EmptyScanOp))
+            .with_node_id(42)
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            Vec::new(),
+            false,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
+            HashMap::from([(filter_id, expr)]),
+            1,
+            arena,
+            None,
+            0,
+        );
+        let recorder = RuntimeFilterLifecycleRegistry::global().recorder(query_key);
+        runner.set_runtime_filter_lifecycle_handles(HashMap::from([(
+            filter_id,
+            recorder.filter(filter_id),
+        )]));
+        (runner, expr)
+    }
+
+    #[test]
+    fn scan_runtime_filter_in_reuses_dictionary_fold_for_shared_values() {
+        let query_key = QueryKey::from_hi_lo(20_050, 7);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+        let (mut runner, _) = scan_runtime_filter_string_runner(7, query_key, &hub);
+
+        let in_filters = string_in_filter(7, vec!["PAID"]);
+        runner.acquired = Some(AcquiredRuntimeFilters::Complete(
+            RuntimeFilterSnapshot::from_filters(in_filters, Vec::new()),
+        ));
+
+        let values = Arc::new(StringArray::from(vec!["PAID", "NEW"]));
+        let base = dictionary_status_chunk(
+            vec![Some(0), Some(1), Some(1), Some(0)],
+            Arc::clone(&values),
+        );
+        let out1 = runner
+            .apply_runtime_filters(base.slice(0, 2))
+            .expect("apply runtime filters")
+            .expect("in filter should keep rows");
+        let out2 = runner
+            .apply_runtime_filters(base.slice(2, 2))
+            .expect("apply runtime filters")
+            .expect("in filter should keep rows");
+
+        assert_eq!(output_strings(&out1), vec![Some("PAID".to_string())]);
+        assert_eq!(output_strings(&out2), vec![Some("PAID".to_string())]);
+        assert_eq!(
+            runner.runtime_filter_dict_fold_cache.build_count_for_test(),
+            1
+        );
+        registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn scan_runtime_filter_membership_reuses_dictionary_fold_for_shared_values() {
+        let query_key = QueryKey::from_hi_lo(20_051, 7);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+        let (mut runner, _) = scan_runtime_filter_string_runner(7, query_key, &hub);
+
+        runner.acquired = Some(AcquiredRuntimeFilters::Complete(
+            RuntimeFilterSnapshot::from_filters(
+                Vec::new(),
+                vec![pruning_string_membership_filter(7, vec!["PAID"])],
+            ),
+        ));
+
+        let values = Arc::new(StringArray::from(vec!["PAID", "NEW"]));
+        let base = dictionary_status_chunk(
+            vec![Some(0), Some(1), Some(1), Some(0)],
+            Arc::clone(&values),
+        );
+        let out1 = runner
+            .apply_runtime_filters(base.slice(0, 2))
+            .expect("apply runtime filters")
+            .expect("membership filter should keep rows");
+        let out2 = runner
+            .apply_runtime_filters(base.slice(2, 2))
+            .expect("apply runtime filters")
+            .expect("membership filter should keep rows");
+
+        assert_eq!(output_strings(&out1), vec![Some("PAID".to_string())]);
+        assert_eq!(output_strings(&out2), vec![Some("PAID".to_string())]);
+        assert_eq!(
+            runner.runtime_filter_dict_fold_cache.build_count_for_test(),
+            1
+        );
+        registry.remove_query(query_key);
     }
 
     #[test]
