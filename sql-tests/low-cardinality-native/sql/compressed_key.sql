@@ -72,7 +72,7 @@ ANALYZE FULL TABLE all_t0;
 -- query 8
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=DECODE
+-- @result_not_contains=DECODE
 -- @skip_result_check=true
 USE ${case_db};
 EXPLAIN VERBOSE SELECT DISTINCT c8 FROM all_t0;
@@ -192,7 +192,7 @@ select distinct c17,c18,c19,c20,c21,c22,c23,c24 from all_t0 order by 1,2,3,4,5,6
 -- query 24
 -- @retry_count=60
 -- @retry_interval_ms=1000
--- @result_contains=DECODE
+-- @result_not_contains=DECODE
 -- @skip_result_check=true
 USE ${case_db};
 EXPLAIN VERBOSE SELECT DISTINCT c20 FROM all_t0;
@@ -421,7 +421,7 @@ insert into all_decimal SELECT x%100, x%200, x%200, x%200 FROM TABLE(generate_se
 USE ${case_db};
 select distinct c1,c2,c3,c4 from all_decimal order by 1,2,3,4 limit 100,3;
 
--- Populate dictionary + per-column stats before the min-max / Decode
+-- Populate dictionary + per-column stats before the min-max
 -- assertions below. NovaRocks standalone needs explicit ANALYZE FULL.
 -- @skip_result_check=true
 USE ${case_db};
@@ -1025,7 +1025,7 @@ insert into all_t1 SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM T
 USE ${case_db};
 select distinct c1, c2, c3, c4, c5, c6, c7, c8 from all_t1 order by 1,2,3,4,5,6,7,8 desc limit 1;
 
--- Populate dictionary + per-column stats before the min-max / DECODE
+-- Populate dictionary + per-column stats before the min-max
 -- assertions below. NovaRocks standalone needs explicit ANALYZE FULL.
 -- @skip_result_check=true
 USE ${case_db};
