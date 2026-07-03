@@ -136,6 +136,13 @@ fn dictionary_values_as_rf_utf8(values: &ArrayRef) -> Result<ArrayRef, String> {
     }
 }
 
+fn min_max_probe_array(array: &ArrayRef) -> Result<ArrayRef, String> {
+    if dictionary_int32_string(array)?.is_some() {
+        return cast(array.as_ref(), &DataType::Utf8).map_err(|e| e.to_string());
+    }
+    Ok(Arc::clone(array))
+}
+
 fn dictionary_fold_key(
     kind: DictionaryFoldKind,
     filter_id: i32,
@@ -532,7 +539,8 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
         let len = chunk.len();
         let mut keep = vec![true; len];
         // has_null=false, check_null=true  → null rows are excluded
-        filter.apply_to_array(&array, false, true, &mut keep)?;
+        let probe_array = min_max_probe_array(&array)?;
+        filter.apply_to_array(&probe_array, false, true, &mut keep)?;
         if keep.iter().all(|v| *v) {
             current = Some(chunk);
             continue;
@@ -707,5 +715,9 @@ mod tests {
                 Some("T".to_string())
             ]
         );
+        assert!(matches!(
+            out.columns()[0].data_type(),
+            DataType::Dictionary(_, _)
+        ));
     }
 }
