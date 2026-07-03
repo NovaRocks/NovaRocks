@@ -1000,6 +1000,22 @@ fn join_distribution_label(
     }
 }
 
+fn dict_actual_suffix(actual: &ActualMetrics) -> String {
+    if actual.dict_input_rows == 0 && actual.dict_input_columns == 0 {
+        return String::new();
+    }
+    format!(
+        " dict={{in_rows={}, kept_rows={}, hydrated_rows={}, in_cols={}, kept_cols={}, hydrated_cols={}, unsupported_cols={}}}",
+        actual.dict_input_rows,
+        actual.dict_kept_rows,
+        actual.dict_hydrated_rows,
+        actual.dict_input_columns,
+        actual.dict_kept_columns,
+        actual.dict_hydrated_columns,
+        actual.dict_unsupported_columns
+    )
+}
+
 fn actual_suffix(node: &DistributedNode, actuals: Option<&HashMap<i32, ActualMetrics>>) -> String {
     match actuals.and_then(|actuals| actuals.get(&node.node_id)) {
         Some(metrics) => {
@@ -1031,6 +1047,7 @@ fn actual_suffix(node: &DistributedNode, actuals: Option<&HashMap<i32, ActualMet
                 s.push_str(&format!(" out_probe={}", fmt_time_ns(metrics.out_probe_ns)));
             }
             s.push_str(&format!(" peak={}}}", fmt_bytes(metrics.peak_mem_bytes)));
+            s.push_str(&dict_actual_suffix(metrics));
             s
         }
         None => String::new(),
@@ -2045,6 +2062,10 @@ mod tests {
             !text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback} act="),
             "nodes absent from the actuals map must not print act=:\n{text}"
         );
+        assert!(
+            !text.contains("dict={"),
+            "zero dictionary counters must not render dictionary actuals:\n{text}"
+        );
     }
 
     #[test]
@@ -2118,6 +2139,39 @@ mod tests {
         assert!(
             !text.contains("build_ht="),
             "zero build hash-table timer must not render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn actual_suffix_renders_dictionary_metrics_when_present() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+        let mut actuals = HashMap::new();
+        actuals.insert(
+            1,
+            ActualMetrics {
+                output_rows: 8,
+                total_time_ns: 900_000,
+                peak_mem_bytes: 128,
+                dict_input_rows: 8,
+                dict_input_columns: 2,
+                dict_kept_rows: 4,
+                dict_kept_columns: 1,
+                dict_hydrated_rows: 4,
+                dict_hydrated_columns: 1,
+                dict_unsupported_columns: 1,
+                ..ActualMetrics::default()
+            },
+        );
+
+        let text =
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
+
+        assert!(
+            text.contains(
+                "dict={in_rows=8, kept_rows=4, hydrated_rows=4, in_cols=2, kept_cols=1, hydrated_cols=1, unsupported_cols=1}"
+            ),
+            "expected dictionary carrier actuals in analyzed output:\n{text}"
         );
     }
 
