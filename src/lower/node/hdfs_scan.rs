@@ -421,7 +421,7 @@ fn iceberg_file_pruning_from_hdfs_range(
     if !is_iceberg_table {
         return None;
     }
-    crate::connector::iceberg::file_pruning::iceberg_file_pruning_metadata_from_thrift(
+    crate::connector::iceberg::file_pruning_wire::iceberg_file_pruning_metadata_from_thrift(
         hdfs_range,
         hive_column_names?,
     )

@@ -185,7 +185,7 @@ fn build_hdfs_scan_range_params_for_file(
     validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
     let splits = plan_hdfs_file_splits(file);
     let iceberg_file_pruning =
-        crate::connector::iceberg::file_pruning::iceberg_file_pruning_metadata_to_thrift(
+        crate::connector::iceberg::file_pruning_wire::iceberg_file_pruning_metadata_to_thrift(
             file, columns,
         );
     splits

@@ -37,7 +37,6 @@ use crate::formats::{FileFormatConfig, build_format_iter};
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::runtime_filter_hub::AcquiredRuntimeFilters;
-use crate::thrift::metrics;
 
 fn delete_files_have_position_deletes(delete_files: &[IcebergDeleteFileSpec]) -> bool {
     delete_files
@@ -330,34 +329,28 @@ impl HdfsScanOp {
             return;
         }
         let snapshot = self.iceberg_runtime_pruning_counters.snapshot();
-        profile.counter_set(
+        profile.counter_set_unit(
             "IcebergRuntimeFilePruning/FilesTotal",
-            metrics::TUnit::UNIT,
             u64_to_i64_saturating(snapshot.files_total),
         );
-        profile.counter_set(
+        profile.counter_set_unit(
             "IcebergRuntimeFilePruning/FilesSelected",
-            metrics::TUnit::UNIT,
             u64_to_i64_saturating(snapshot.files_selected),
         );
-        profile.counter_set(
+        profile.counter_set_unit(
             "IcebergRuntimeFilePruning/FilesPruned",
-            metrics::TUnit::UNIT,
             u64_to_i64_saturating(snapshot.files_pruned),
         );
-        profile.counter_set(
+        profile.counter_set_unit(
             "IcebergRuntimeFilePruning/Predicates",
-            metrics::TUnit::UNIT,
             u64_to_i64_saturating(snapshot.predicates),
         );
-        profile.counter_set(
+        profile.counter_set_unit(
             "IcebergRuntimeFilePruning/Unsupported",
-            metrics::TUnit::UNIT,
             u64_to_i64_saturating(snapshot.unsupported),
         );
-        profile.counter_set(
+        profile.counter_set_unit(
             "IcebergRuntimeFilePruning/Unavailable",
-            metrics::TUnit::UNIT,
             u64_to_i64_saturating(snapshot.unavailable),
         );
     }

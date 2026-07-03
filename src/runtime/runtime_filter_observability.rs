@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::runtime::profile::RuntimeProfile;
-use crate::thrift::metrics;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct QueryKey {
@@ -117,11 +116,9 @@ impl RuntimeFilterLifecycleRegistry {
             filter_profile.counter_set_unit("Delivered", i64::from(record.delivered));
             if let Some(acquired) = record.acquired.as_ref() {
                 filter_profile.add_info_string("AcquireOutcome", acquired.outcome.clone());
-                filter_profile.counter_set(
-                    "AcquireLatency",
-                    metrics::TUnit::TIME_NS,
-                    acquired.latency_ns,
-                );
+                filter_profile
+                    .add_timer("AcquireLatency")
+                    .set(acquired.latency_ns);
             }
             filter_profile.counter_set_unit("AppliedInputRows", record.applied_input_rows());
             filter_profile.counter_set_unit("AppliedOutputRows", record.applied_output_rows());

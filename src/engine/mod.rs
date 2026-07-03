@@ -2969,7 +2969,11 @@ fn explain_analyze_query(
     ));
     lines.push(format_distributed_profile_summary(&profile_summary));
     if let Some(counters) =
-        format_iceberg_runtime_file_pruning_profile_counters(&outcome.fragment_profiles)
+        crate::runtime::profile_correlate::format_counter_sums_from_profile_trees(
+            &outcome.fragment_profiles,
+            ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
+            "ProfileCounters",
+        )
     {
         lines.push(counters);
     }
@@ -2990,23 +2994,6 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
     "IcebergRuntimeFilePruning/Unsupported",
     "IcebergRuntimeFilePruning/Unavailable",
 ];
-
-fn format_iceberg_runtime_file_pruning_profile_counters(
-    trees: &[crate::thrift::runtime_profile::TRuntimeProfileTree],
-) -> Option<String> {
-    let sums = crate::runtime::profile_correlate::sum_profile_counters_by_name_from_profile_trees(
-        trees,
-        ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
-    );
-    if !sums.values().any(|value| *value != 0) {
-        return None;
-    }
-    let parts = ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES
-        .iter()
-        .map(|name| format!("{name}={}", sums.get(name).copied().unwrap_or(0)))
-        .collect::<Vec<_>>();
-    Some(format!("ProfileCounters: {}", parts.join(" ")))
-}
 
 fn format_distributed_profile_summary(
     summary: &crate::runtime::profile_correlate::DistributedProfileSummary,

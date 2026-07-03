@@ -111,6 +111,22 @@ pub(crate) fn sum_profile_counters_by_name_from_profile_trees<'a>(
     sums
 }
 
+pub(crate) fn format_counter_sums_from_profile_trees(
+    trees: &[runtime_profile::TRuntimeProfileTree],
+    names: &[&str],
+    label: &str,
+) -> Option<String> {
+    let sums = sum_profile_counters_by_name_from_profile_trees(trees, names);
+    if !sums.values().any(|value| *value != 0) {
+        return None;
+    }
+    let parts = names
+        .iter()
+        .map(|name| format!("{name}={}", sums.get(name).copied().unwrap_or(0)))
+        .collect::<Vec<_>>();
+    Some(format!("{label}: {}", parts.join(" ")))
+}
+
 /// Per-fragment attribution (W0'b): group each fragment-instance profile tree by the fragment's
 /// root (output) plan-node id (see `fragment_root_plan_node_id`), merging instances of the same
 /// fragment. The renderer maps each `PLAN FRAGMENT` to the same id via `fragment.root.node_id` and

@@ -368,7 +368,8 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(feature = "compat")))]
+#[cfg(test)]
+#[cfg(not(feature = "compat"))]
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
