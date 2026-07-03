@@ -30,13 +30,226 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::BooleanArray;
-use arrow::compute::filter_record_batch;
+use arrow::array::{Array, ArrayRef, BooleanArray, DictionaryArray};
+use arrow::compute::{cast, filter_record_batch};
+use arrow::datatypes::{DataType, Int32Type};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
 use super::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+enum DictionaryFoldKind {
+    In,
+    Membership,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+struct DictionaryFoldKey {
+    kind: DictionaryFoldKind,
+    filter_id: i32,
+    values_ptr: usize,
+    values_len: usize,
+    values_type_tag: DictionaryValuesTypeTag,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+enum DictionaryValuesTypeTag {
+    Utf8,
+    LargeUtf8,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct DictionaryFold {
+    accepts: Arc<Vec<bool>>,
+    null_accepts: bool,
+    values: ArrayRef,
+}
+
+#[derive(Default, Debug)]
+#[allow(dead_code)]
+pub(crate) struct RuntimeFilterDictionaryFoldCache {
+    folds: HashMap<DictionaryFoldKey, DictionaryFold>,
+    #[cfg(test)]
+    build_count: usize,
+}
+
+#[allow(dead_code)]
+impl RuntimeFilterDictionaryFoldCache {
+    pub(crate) fn clear(&mut self) {
+        self.folds.clear();
+        #[cfg(test)]
+        {
+            self.build_count = 0;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_count_for_test(&self) -> usize {
+        self.build_count
+    }
+}
+
+#[allow(dead_code)]
+fn dictionary_int32_string(
+    array: &ArrayRef,
+) -> Result<Option<&DictionaryArray<Int32Type>>, String> {
+    match array.data_type() {
+        DataType::Dictionary(key_type, value_type)
+            if key_type.as_ref() == &DataType::Int32
+                && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            array
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .map(Some)
+                .ok_or_else(|| "failed to downcast runtime filter dictionary probe".to_string())
+        }
+        DataType::Dictionary(_, _) => Err(format!(
+            "unsupported runtime filter dictionary probe type: {:?}",
+            array.data_type()
+        )),
+        _ => Ok(None),
+    }
+}
+
+#[allow(dead_code)]
+fn dictionary_values_tag(values: &ArrayRef) -> Result<DictionaryValuesTypeTag, String> {
+    match values.data_type() {
+        DataType::Utf8 => Ok(DictionaryValuesTypeTag::Utf8),
+        DataType::LargeUtf8 => Ok(DictionaryValuesTypeTag::LargeUtf8),
+        other => Err(format!(
+            "unsupported runtime filter dictionary values type: {:?}",
+            other
+        )),
+    }
+}
+
+#[allow(dead_code)]
+fn dictionary_values_as_rf_utf8(values: &ArrayRef) -> Result<ArrayRef, String> {
+    match values.data_type() {
+        DataType::Utf8 => Ok(Arc::clone(values)),
+        DataType::LargeUtf8 => cast(values.as_ref(), &DataType::Utf8).map_err(|e| e.to_string()),
+        other => Err(format!(
+            "unsupported runtime filter dictionary values type: {:?}",
+            other
+        )),
+    }
+}
+
+#[allow(dead_code)]
+fn dictionary_fold_key(
+    kind: DictionaryFoldKind,
+    filter_id: i32,
+    values: &ArrayRef,
+) -> Result<DictionaryFoldKey, String> {
+    Ok(DictionaryFoldKey {
+        kind,
+        filter_id,
+        values_ptr: Arc::as_ptr(values) as *const () as usize,
+        values_len: values.len(),
+        values_type_tag: dictionary_values_tag(values)?,
+    })
+}
+
+#[allow(dead_code)]
+fn fold_in_filter_for_dictionary(
+    filter: &RuntimeInFilter,
+    dict: &DictionaryArray<Int32Type>,
+    cache: &mut RuntimeFilterDictionaryFoldCache,
+) -> Result<DictionaryFold, String> {
+    let values = dict.values();
+    let key = dictionary_fold_key(DictionaryFoldKind::In, filter.filter_id(), values)?;
+    if let Some(fold) = cache.folds.get(&key) {
+        return Ok(fold.clone());
+    }
+
+    let probe_values = dictionary_values_as_rf_utf8(values)?;
+    let mut accepts = Vec::with_capacity(probe_values.len());
+    for idx in 0..probe_values.len() {
+        accepts.push(filter.contains_non_null_value(&probe_values, idx)?);
+    }
+    let fold = DictionaryFold {
+        accepts: Arc::new(accepts),
+        null_accepts: false,
+        values: Arc::clone(values),
+    };
+    cache.folds.insert(key, fold.clone());
+    #[cfg(test)]
+    {
+        cache.build_count += 1;
+    }
+    Ok(fold)
+}
+
+#[allow(dead_code)]
+fn fold_membership_filter_for_dictionary(
+    filter: &RuntimeMembershipFilter,
+    dict: &DictionaryArray<Int32Type>,
+    cache: &mut RuntimeFilterDictionaryFoldCache,
+) -> Result<DictionaryFold, String> {
+    let values = dict.values();
+    let key = dictionary_fold_key(DictionaryFoldKind::Membership, filter.filter_id(), values)?;
+    if let Some(fold) = cache.folds.get(&key) {
+        return Ok(fold.clone());
+    }
+
+    let probe_values = dictionary_values_as_rf_utf8(values)?;
+    let mut accepts = vec![true; probe_values.len()];
+    filter.apply_to_value_selection(&probe_values, &mut accepts)?;
+    let fold = DictionaryFold {
+        accepts: Arc::new(accepts),
+        null_accepts: filter.has_null(),
+        values: Arc::clone(values),
+    };
+    cache.folds.insert(key, fold.clone());
+    #[cfg(test)]
+    {
+        cache.build_count += 1;
+    }
+    Ok(fold)
+}
+
+#[allow(dead_code)]
+fn apply_dictionary_fold(
+    dict: &DictionaryArray<Int32Type>,
+    fold: &DictionaryFold,
+    keep: &mut [bool],
+) -> Result<(), String> {
+    if keep.len() != dict.len() {
+        return Err("runtime filter dictionary selection size mismatch".to_string());
+    }
+    let keys = dict.keys();
+    for row in 0..dict.len() {
+        if !keep[row] {
+            continue;
+        }
+        if dict.is_null(row) {
+            keep[row] = fold.null_accepts;
+            continue;
+        }
+        let code = keys.value(row);
+        let code = usize::try_from(code).map_err(|_| {
+            format!(
+                "runtime filter dictionary code must be non-negative, got {} at row {}",
+                code, row
+            )
+        })?;
+        keep[row] = fold.accepts.get(code).copied().ok_or_else(|| {
+            format!(
+                "runtime filter dictionary code out of bounds: code={} values_len={}",
+                code,
+                fold.accepts.len()
+            )
+        })?;
+    }
+    Ok(())
+}
 
 /// Apply IN filters to a chunk and return the filtered chunk.
 pub(crate) fn filter_chunk_by_in_filters(
@@ -120,6 +333,17 @@ pub(crate) fn filter_chunk_by_in_filters_with_exprs(
     Ok(current)
 }
 
+#[allow(dead_code)]
+pub(crate) fn filter_chunk_by_in_filters_with_exprs_and_dict_cache(
+    arena: &ExprArena,
+    exprs: &HashMap<i32, ExprId>,
+    filters: &[Arc<RuntimeInFilter>],
+    chunk: Chunk,
+    _dict_cache: &mut RuntimeFilterDictionaryFoldCache,
+) -> Result<Option<Chunk>, String> {
+    filter_chunk_by_in_filters_with_exprs(arena, exprs, filters, chunk)
+}
+
 /// Apply membership filters with expression mappings and return the filtered chunk.
 pub(crate) fn filter_chunk_by_membership_filters_with_exprs(
     arena: &ExprArena,
@@ -154,6 +378,17 @@ pub(crate) fn filter_chunk_by_membership_filters_with_exprs(
         }
     }
     Ok(current)
+}
+
+#[allow(dead_code)]
+pub(crate) fn filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
+    arena: &ExprArena,
+    exprs: &HashMap<i32, ExprId>,
+    filters: &[Arc<RuntimeMembershipFilter>],
+    chunk: Chunk,
+    _dict_cache: &mut RuntimeFilterDictionaryFoldCache,
+) -> Result<Option<Chunk>, String> {
+    filter_chunk_by_membership_filters_with_exprs(arena, exprs, filters, chunk)
 }
 
 /// Apply min-max filters using expression mappings and return the filtered chunk.
@@ -212,6 +447,17 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
         current = Some(Chunk::new_like(filtered_batch, &chunk));
     }
     Ok(current)
+}
+
+#[allow(dead_code)]
+pub(crate) fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
+    arena: &ExprArena,
+    exprs: &HashMap<i32, ExprId>,
+    filters: &[(i32, Arc<RuntimeMinMaxFilter>)],
+    chunk: Chunk,
+    _dict_cache: &mut RuntimeFilterDictionaryFoldCache,
+) -> Result<Option<Chunk>, String> {
+    filter_chunk_by_min_max_filters_with_exprs(arena, exprs, filters, chunk)
 }
 
 #[cfg(test)]
