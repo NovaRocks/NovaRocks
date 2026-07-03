@@ -2102,6 +2102,7 @@ mod tests {
                 search_ns: 20_000_000_000,
                 out_build_ns: 6_000_000_000,
                 out_probe_ns: 12_000_000_000,
+                ..ActualMetrics::default()
             },
         );
 

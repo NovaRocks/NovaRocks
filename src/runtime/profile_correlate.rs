@@ -31,7 +31,24 @@ pub(crate) struct ActualMetrics {
     pub(crate) search_ns: i64,
     pub(crate) out_build_ns: i64,
     pub(crate) out_probe_ns: i64,
+    pub(crate) dict_input_rows: i64,
+    pub(crate) dict_input_columns: i64,
+    pub(crate) dict_kept_rows: i64,
+    pub(crate) dict_kept_columns: i64,
+    pub(crate) dict_hydrated_rows: i64,
+    pub(crate) dict_hydrated_columns: i64,
+    pub(crate) dict_unsupported_columns: i64,
 }
+
+const COMMON_METRICS: &str = "CommonMetrics";
+const UNIQUE_METRICS: &str = "UniqueMetrics";
+const DICT_INPUT_ROWS: &str = "DictInputRows";
+const DICT_INPUT_COLUMNS: &str = "DictInputColumns";
+const DICT_KEPT_ROWS: &str = "DictKeptRows";
+const DICT_KEPT_COLUMNS: &str = "DictKeptColumns";
+const DICT_HYDRATED_ROWS: &str = "DictHydratedRows";
+const DICT_HYDRATED_COLUMNS: &str = "DictHydratedColumns";
+const DICT_UNSUPPORTED_COLUMNS: &str = "DictUnsupportedColumns";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DistributedProfileSummary {
@@ -228,7 +245,8 @@ fn merge_summary(into: &mut DistributedProfileSummary, other: &DistributedProfil
 
 fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
     if let Some(node_id) = parse_plan_node_id(&node.name()) {
-        if let Some(common) = node.get_child("CommonMetrics") {
+        if let Some(common) = node.get_child(COMMON_METRICS) {
+            let unique = node.get_child(UNIQUE_METRICS);
             let (total_time_ns, total_time_min_ns, total_time_max_ns) = common
                 .counter_value_min_max("OperatorTotalTime")
                 .unwrap_or((0, 0, 0));
@@ -245,6 +263,16 @@ fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
                     search_ns: counter(&common, "SearchHashTableTime"),
                     out_build_ns: counter(&common, "OutputBuildColumnTime"),
                     out_probe_ns: counter(&common, "OutputProbeColumnTime"),
+                    dict_input_rows: optional_counter(unique.as_ref(), DICT_INPUT_ROWS),
+                    dict_input_columns: optional_counter(unique.as_ref(), DICT_INPUT_COLUMNS),
+                    dict_kept_rows: optional_counter(unique.as_ref(), DICT_KEPT_ROWS),
+                    dict_kept_columns: optional_counter(unique.as_ref(), DICT_KEPT_COLUMNS),
+                    dict_hydrated_rows: optional_counter(unique.as_ref(), DICT_HYDRATED_ROWS),
+                    dict_hydrated_columns: optional_counter(unique.as_ref(), DICT_HYDRATED_COLUMNS),
+                    dict_unsupported_columns: optional_counter(
+                        unique.as_ref(),
+                        DICT_UNSUPPORTED_COLUMNS,
+                    ),
                 },
             );
         }
@@ -272,27 +300,52 @@ fn collect_thrift_rec(
     }
 
     if let Some(node_id) = parse_plan_node_id(&node.name) {
+        let mut common_range = None;
+        let mut unique_range = None;
         for range in child_ranges {
             if nodes
                 .get(range.start)
-                .is_some_and(|child| child.name == "CommonMetrics")
+                .is_some_and(|child| child.name == COMMON_METRICS)
             {
-                let (total_time_max_ns, total_time_min_ns) =
-                    thrift_counter_min_max(nodes, range.clone(), "OperatorTotalTime");
-                let metrics = ActualMetrics {
-                    output_rows: thrift_counter(nodes, range.clone(), "PullRowNum"),
-                    total_time_ns: thrift_counter(nodes, range.clone(), "OperatorTotalTime"),
-                    peak_mem_bytes: thrift_counter(nodes, range.clone(), "OperatorPeakMemoryUsage"),
-                    total_time_max_ns,
-                    total_time_min_ns,
-                    build_ht_ns: thrift_counter(nodes, range.clone(), "BuildHashTableTime"),
-                    search_ns: thrift_counter(nodes, range.clone(), "SearchHashTableTime"),
-                    out_build_ns: thrift_counter(nodes, range.clone(), "OutputBuildColumnTime"),
-                    out_probe_ns: thrift_counter(nodes, range, "OutputProbeColumnTime"),
-                };
-                merge_actual_metrics(actuals, node_id, metrics);
-                break;
+                common_range = Some(range);
+            } else if nodes
+                .get(range.start)
+                .is_some_and(|child| child.name == UNIQUE_METRICS)
+            {
+                unique_range = Some(range);
             }
+        }
+        if let Some(common_range) = common_range {
+            let (total_time_max_ns, total_time_min_ns) =
+                thrift_counter_min_max(nodes, common_range.clone(), "OperatorTotalTime");
+            let unique_counter = |name| {
+                unique_range
+                    .as_ref()
+                    .map_or(0, |range| thrift_counter(nodes, range.clone(), name))
+            };
+            let metrics = ActualMetrics {
+                output_rows: thrift_counter(nodes, common_range.clone(), "PullRowNum"),
+                total_time_ns: thrift_counter(nodes, common_range.clone(), "OperatorTotalTime"),
+                peak_mem_bytes: thrift_counter(
+                    nodes,
+                    common_range.clone(),
+                    "OperatorPeakMemoryUsage",
+                ),
+                total_time_max_ns,
+                total_time_min_ns,
+                build_ht_ns: thrift_counter(nodes, common_range.clone(), "BuildHashTableTime"),
+                search_ns: thrift_counter(nodes, common_range.clone(), "SearchHashTableTime"),
+                out_build_ns: thrift_counter(nodes, common_range.clone(), "OutputBuildColumnTime"),
+                out_probe_ns: thrift_counter(nodes, common_range, "OutputProbeColumnTime"),
+                dict_input_rows: unique_counter(DICT_INPUT_ROWS),
+                dict_input_columns: unique_counter(DICT_INPUT_COLUMNS),
+                dict_kept_rows: unique_counter(DICT_KEPT_ROWS),
+                dict_kept_columns: unique_counter(DICT_KEPT_COLUMNS),
+                dict_hydrated_rows: unique_counter(DICT_HYDRATED_ROWS),
+                dict_hydrated_columns: unique_counter(DICT_HYDRATED_COLUMNS),
+                dict_unsupported_columns: unique_counter(DICT_UNSUPPORTED_COLUMNS),
+            };
+            merge_actual_metrics(actuals, node_id, metrics);
         }
     }
 
@@ -308,6 +361,25 @@ fn merge_actual_metrics(
     let entry = actuals.entry(node_id).or_default();
     entry.output_rows = entry.output_rows.saturating_add(metrics.output_rows);
     entry.peak_mem_bytes = entry.peak_mem_bytes.saturating_add(metrics.peak_mem_bytes);
+    entry.dict_input_rows = entry
+        .dict_input_rows
+        .saturating_add(metrics.dict_input_rows);
+    entry.dict_input_columns = entry
+        .dict_input_columns
+        .saturating_add(metrics.dict_input_columns);
+    entry.dict_kept_rows = entry.dict_kept_rows.saturating_add(metrics.dict_kept_rows);
+    entry.dict_kept_columns = entry
+        .dict_kept_columns
+        .saturating_add(metrics.dict_kept_columns);
+    entry.dict_hydrated_rows = entry
+        .dict_hydrated_rows
+        .saturating_add(metrics.dict_hydrated_rows);
+    entry.dict_hydrated_columns = entry
+        .dict_hydrated_columns
+        .saturating_add(metrics.dict_hydrated_columns);
+    entry.dict_unsupported_columns = entry
+        .dict_unsupported_columns
+        .saturating_add(metrics.dict_unsupported_columns);
     match metrics.total_time_ns.cmp(&entry.total_time_ns) {
         std::cmp::Ordering::Greater => {
             entry.total_time_ns = metrics.total_time_ns;
@@ -338,6 +410,10 @@ fn sanitize_operator_total_time(mut metrics: ActualMetrics) -> ActualMetrics {
 
 fn counter(common: &Profiler, name: &str) -> i64 {
     common.counter_value(name).unwrap_or(0)
+}
+
+fn optional_counter(profile: Option<&Profiler>, name: &str) -> i64 {
+    profile.and_then(|p| p.counter_value(name)).unwrap_or(0)
 }
 
 fn thrift_counter(
@@ -401,7 +477,9 @@ fn parse_plan_node_id(name: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActualMetrics, collect_actuals_by_plan_node_id,
+        ActualMetrics, COMMON_METRICS, DICT_HYDRATED_COLUMNS, DICT_HYDRATED_ROWS,
+        DICT_INPUT_COLUMNS, DICT_INPUT_ROWS, DICT_KEPT_COLUMNS, DICT_KEPT_ROWS,
+        DICT_UNSUPPORTED_COLUMNS, UNIQUE_METRICS, collect_actuals_by_plan_node_id,
         collect_actuals_by_plan_node_id_from_profile_trees, collect_actuals_by_plan_node_id_multi,
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics,
@@ -416,7 +494,7 @@ mod tests {
         total_time_ns: i64,
         peak_mem_bytes: i64,
     ) {
-        let common = parent.child(name).child("CommonMetrics");
+        let common = parent.child(name).child(COMMON_METRICS);
         common.counter_set("PullRowNum", metrics::TUnit::UNIT, output_rows);
         common.counter_set("OperatorTotalTime", metrics::TUnit::TIME_NS, total_time_ns);
         common.counter_set(
@@ -424,6 +502,123 @@ mod tests {
             metrics::TUnit::BYTES,
             peak_mem_bytes,
         );
+    }
+
+    fn add_dictionary_metrics(
+        parent: &Profiler,
+        name: &str,
+        input_rows: i64,
+        input_columns: i64,
+        kept_rows: i64,
+        kept_columns: i64,
+        hydrated_rows: i64,
+        hydrated_columns: i64,
+        unsupported_columns: i64,
+    ) {
+        let unique = parent.child(name).child(UNIQUE_METRICS);
+        unique.counter_set(DICT_INPUT_ROWS, metrics::TUnit::UNIT, input_rows);
+        unique.counter_set(DICT_INPUT_COLUMNS, metrics::TUnit::UNIT, input_columns);
+        unique.counter_set(DICT_KEPT_ROWS, metrics::TUnit::UNIT, kept_rows);
+        unique.counter_set(DICT_KEPT_COLUMNS, metrics::TUnit::UNIT, kept_columns);
+        unique.counter_set(DICT_HYDRATED_ROWS, metrics::TUnit::UNIT, hydrated_rows);
+        unique.counter_set(
+            DICT_HYDRATED_COLUMNS,
+            metrics::TUnit::UNIT,
+            hydrated_columns,
+        );
+        unique.counter_set(
+            DICT_UNSUPPORTED_COLUMNS,
+            metrics::TUnit::UNIT,
+            unsupported_columns,
+        );
+    }
+
+    #[test]
+    fn collect_actuals_reads_dictionary_unique_metrics() {
+        let profiler = Profiler::new("query");
+        let driver = profiler
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 10, 5, 64);
+        add_dictionary_metrics(&driver, "SCAN (plan_node_id=2)", 100, 3, 80, 2, 20, 1, 4);
+
+        let actuals = collect_actuals_by_plan_node_id(&profiler);
+        let metrics = actuals.get(&2).expect("node 2 metrics");
+
+        assert_eq!(metrics.output_rows, 10);
+        assert_eq!(metrics.dict_input_rows, 100);
+        assert_eq!(metrics.dict_input_columns, 3);
+        assert_eq!(metrics.dict_kept_rows, 80);
+        assert_eq!(metrics.dict_kept_columns, 2);
+        assert_eq!(metrics.dict_hydrated_rows, 20);
+        assert_eq!(metrics.dict_hydrated_columns, 1);
+        assert_eq!(metrics.dict_unsupported_columns, 4);
+    }
+
+    #[test]
+    fn collect_actuals_reads_dictionary_unique_metrics_from_thrift_tree() {
+        let profiler = Profiler::new("query");
+        let driver = profiler
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 10, 5, 64);
+        add_dictionary_metrics(&driver, "SCAN (plan_node_id=2)", 101, 4, 81, 3, 21, 2, 5);
+        let tree =
+            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_thrift_tree();
+
+        let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
+        let metrics = actuals.get(&2).expect("node 2 metrics");
+
+        assert_eq!(metrics.output_rows, 10);
+        assert_eq!(metrics.dict_input_rows, 101);
+        assert_eq!(metrics.dict_input_columns, 4);
+        assert_eq!(metrics.dict_kept_rows, 81);
+        assert_eq!(metrics.dict_kept_columns, 3);
+        assert_eq!(metrics.dict_hydrated_rows, 21);
+        assert_eq!(metrics.dict_hydrated_columns, 2);
+        assert_eq!(metrics.dict_unsupported_columns, 5);
+    }
+
+    #[test]
+    fn merge_actual_metrics_sums_dictionary_counters() {
+        let mut actuals = std::collections::HashMap::new();
+        merge_actual_metrics(
+            &mut actuals,
+            7,
+            ActualMetrics {
+                dict_input_rows: 100,
+                dict_input_columns: 3,
+                dict_kept_rows: 90,
+                dict_kept_columns: 2,
+                dict_hydrated_rows: 10,
+                dict_hydrated_columns: 1,
+                dict_unsupported_columns: 4,
+                ..ActualMetrics::default()
+            },
+        );
+        merge_actual_metrics(
+            &mut actuals,
+            7,
+            ActualMetrics {
+                dict_input_rows: 200,
+                dict_input_columns: 5,
+                dict_kept_rows: 180,
+                dict_kept_columns: 4,
+                dict_hydrated_rows: 20,
+                dict_hydrated_columns: 2,
+                dict_unsupported_columns: 6,
+                ..ActualMetrics::default()
+            },
+        );
+
+        let metrics = actuals.get(&7).expect("node 7 metrics");
+        assert_eq!(metrics.dict_input_rows, 300);
+        assert_eq!(metrics.dict_input_columns, 8);
+        assert_eq!(metrics.dict_kept_rows, 270);
+        assert_eq!(metrics.dict_kept_columns, 6);
+        assert_eq!(metrics.dict_hydrated_rows, 30);
+        assert_eq!(metrics.dict_hydrated_columns, 3);
+        assert_eq!(metrics.dict_unsupported_columns, 10);
     }
 
     #[test]
@@ -511,6 +706,7 @@ mod tests {
                 search_ns: 6,
                 out_build_ns: 4,
                 out_probe_ns: 6,
+                ..ActualMetrics::default()
             })
         );
     }
@@ -791,6 +987,7 @@ mod tests {
                 search_ns: 30,
                 out_build_ns: 35,
                 out_probe_ns: 40,
+                ..ActualMetrics::default()
             },
         );
         merge_actual_metrics(
@@ -806,6 +1003,7 @@ mod tests {
                 search_ns: 10,
                 out_build_ns: 45,
                 out_probe_ns: 15,
+                ..ActualMetrics::default()
             },
         );
 
@@ -821,6 +1019,7 @@ mod tests {
                 search_ns: 30,
                 out_build_ns: 45,
                 out_probe_ns: 40,
+                ..ActualMetrics::default()
             })
         );
     }
