@@ -576,7 +576,7 @@ impl ParquetScanIter {
         &self,
         arrow_schema: &Schema,
     ) -> HashMap<String, DataType> {
-        if self.cfg.query_global_dicts.is_empty() && !self.has_iceberg_schema_evolution() {
+        if self.cfg.query_global_dicts.is_empty() {
             let mut candidates = HashMap::new();
             if self.cfg.columns.is_empty() {
                 if self.materialized_chunk_schema.slots().len() != arrow_schema.fields().len() {
@@ -2069,6 +2069,12 @@ fn align_iceberg_array_to_field(
             Ok(Arc::new(array))
         }
         _ => {
+            if is_dictionary_string_carrier_for_slot(
+                source_array.data_type(),
+                target_field.data_type(),
+            ) {
+                return Ok(source_array);
+            }
             if source_array.data_type() == target_field.data_type() {
                 return Ok(source_array);
             }
@@ -2203,6 +2209,21 @@ fn arrow_type_to_iceberg_type(
     })
 }
 
+fn iceberg_output_field_for_array(target_field: &Field, array: &ArrayRef) -> Field {
+    let mut field =
+        if is_dictionary_string_carrier_for_slot(array.data_type(), target_field.data_type()) {
+            target_field
+                .clone()
+                .with_data_type(array.data_type().clone())
+        } else {
+            target_field.clone()
+        };
+    if array.null_count() > 0 && !field.is_nullable() {
+        field = field.with_nullable(true);
+    }
+    field
+}
+
 fn align_batch_to_iceberg_schema(
     output_schema: &SchemaRef,
     batch: RecordBatch,
@@ -2210,6 +2231,7 @@ fn align_batch_to_iceberg_schema(
 ) -> Result<RecordBatch, String> {
     let row_count = batch.num_rows();
     let batch_schema = batch.schema();
+    let mut fields = Vec::with_capacity(output_schema.fields().len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
     for target in output_schema.fields() {
         if target.name() == "___count___" {
@@ -2221,6 +2243,7 @@ fn align_batch_to_iceberg_schema(
             }
             let count_array: ArrayRef =
                 Arc::new(arrow::array::BooleanArray::from(vec![true; row_count]));
+            fields.push(target.as_ref().clone());
             columns.push(count_array);
             continue;
         }
@@ -2235,12 +2258,14 @@ fn align_batch_to_iceberg_schema(
                 row_count,
                 case_sensitive,
             )?;
+            fields.push(iceberg_output_field_for_array(target.as_ref(), &array));
             columns.push(array);
         } else {
+            fields.push(target.as_ref().clone());
             columns.push(build_iceberg_default_array(target.as_ref(), row_count)?);
         }
     }
-    RecordBatch::try_new(Arc::clone(output_schema), columns).map_err(|e| e.to_string())
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| e.to_string())
 }
 
 fn reorder_batch(cfg: &ParquetScanConfig, batch: RecordBatch) -> Result<RecordBatch, String> {
@@ -3448,6 +3473,33 @@ mod tests {
         assert_eq!(values.value(0), "NEW");
         assert_eq!(values.value(1), "PAID");
         assert!(values.is_null(3));
+    }
+
+    #[test]
+    fn scan_preserves_dictionary_string_carrier_with_iceberg_output_schema() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("dict_status.parquet");
+        write_status_parquet(&file_path, true);
+
+        let batch = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["status".to_string()],
+                vec![types::TPrimitiveType::VARCHAR],
+                Some(Schema::new(vec![field_with_id(
+                    "status",
+                    DataType::Utf8,
+                    true,
+                    1,
+                )])),
+            ),
+            &file_path,
+        );
+
+        assert!(matches!(
+            batch.column(0).data_type(),
+            DataType::Dictionary(key, value)
+                if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8
+        ));
     }
 
     #[test]

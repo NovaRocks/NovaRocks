@@ -9,7 +9,9 @@ compatibility after R0. Cases here exercise:
 - write paths (INSERT / UPDATE / MERGE / TRUNCATE / DELETE) advance table
   snapshots so stale dictionary metadata does not affect query correctness;
 - DROP TABLE / DROP DATABASE remove dictionary metadata;
-- runtime filters stay value-domain correct over low-cardinality string data.
+- runtime filters stay value-domain correct over low-cardinality string data;
+- runtime observability reports dictionary carrier input, kept, and hydrated
+  counters without restoring legacy native rewrite plan shapes.
 
 R0 retired the standalone native low-cardinality rewrite path. Standalone SQL
 plans should not contain FE-compatible `DECODE` nodes or scan dictionary hints;
