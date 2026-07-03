@@ -231,6 +231,17 @@ impl RuntimeBitsetFilter {
         let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
+
+    pub(in crate::exec::runtime_filter) fn apply_to_selection(
+        &self,
+        array: &ArrayRef,
+        keep: &mut [bool],
+    ) -> Result<(), String> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        apply_bitset_filter(self, &self.ltype, self.has_null, array.clone(), keep)
+    }
 }
 
 pub(crate) fn maybe_build_runtime_bitset_filter(

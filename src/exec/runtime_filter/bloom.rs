@@ -340,6 +340,17 @@ impl RuntimeBloomFilter {
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 
+    pub(in crate::exec::runtime_filter) fn apply_to_selection(
+        &self,
+        array: &ArrayRef,
+        keep: &mut [bool],
+    ) -> Result<(), String> {
+        let Some(bf) = self.bf.as_ref() else {
+            return Ok(());
+        };
+        apply_bloom_filter(bf, &self.ltype, self.has_null, array.clone(), keep)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn build_from_array(
         filter_id: i32,

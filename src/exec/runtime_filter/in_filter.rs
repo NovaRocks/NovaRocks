@@ -1161,6 +1161,17 @@ impl RuntimeInFilter {
         }
     }
 
+    pub(in crate::exec::runtime_filter) fn contains_non_null_value(
+        &self,
+        array: &ArrayRef,
+        row: usize,
+    ) -> Result<bool, String> {
+        if array.is_null(row) {
+            return Ok(false);
+        }
+        self.values.contains(array, row)
+    }
+
     pub(crate) fn filter_chunk_with_array(
         &self,
         array: &ArrayRef,

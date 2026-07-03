@@ -272,6 +272,27 @@ impl RuntimeMembershipFilter {
         }
     }
 
+    pub(in crate::exec::runtime_filter) fn apply_to_value_selection(
+        &self,
+        array: &ArrayRef,
+        keep: &mut [bool],
+    ) -> Result<(), String> {
+        if keep.len() != array.len() {
+            return Err("runtime membership filter value selection size mismatch".to_string());
+        }
+        let check_null = matches!(self, RuntimeMembershipFilter::Empty(_));
+        self.min_max()
+            .apply_to_array(array, self.has_null(), check_null, keep)?;
+        if keep.iter().all(|v| !*v) {
+            return Ok(());
+        }
+        match self {
+            RuntimeMembershipFilter::Bloom(filter) => filter.apply_to_selection(array, keep),
+            RuntimeMembershipFilter::Bitset(filter) => filter.apply_to_selection(array, keep),
+            RuntimeMembershipFilter::Empty(_) => Ok(()),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn filter_chunk_with_expr(
         &self,
