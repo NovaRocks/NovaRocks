@@ -83,3 +83,26 @@ if [ "$(ci_suite_cluster_size optimizer)" != "1" ]; then
   echo "ordinary suites should keep the global cluster size" >&2
   exit 1
 fi
+
+iceberg_ivm_env="$(ci_suite_extra_env iceberg-ivm)"
+if [ "$iceberg_ivm_env" != "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1" ]; then
+  echo "iceberg-ivm must enable the test-only stateless rebuild procedure" >&2
+  exit 1
+fi
+
+if [ -n "$(ci_suite_extra_env optimizer)" ]; then
+  echo "ordinary suites must not enable the stateless rebuild procedure" >&2
+  exit 1
+fi
+
+REQUESTED_SUITES=(iceberg-ivm)
+RUN_MODE="explicit"
+resolve_suites
+if ! ci_suites_include iceberg-ivm; then
+  echo "resolved suite set should include iceberg-ivm" >&2
+  exit 1
+fi
+if ci_suites_include optimizer; then
+  echo "resolved suite set should not include optimizer" >&2
+  exit 1
+fi
