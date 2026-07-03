@@ -35,6 +35,7 @@ use super::types::{
 use crate::common::failpoint;
 use crate::connector::iceberg::equality_delete::{EqualityDeleteSet, equality_delete_keep_mask};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+use crate::exec::expr::dict_peel::referenced_slots;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
@@ -674,9 +675,10 @@ impl ScanAsyncRunner {
             return Ok(Some(chunk));
         }
 
+        let predicate_chunk = chunk_for_conjunct_predicate(&self.arena, predicate, &chunk)?;
         let predicate_array = self
             .arena
-            .eval(predicate, &chunk)
+            .eval(predicate, &predicate_chunk)
             .map_err(|e| e.to_string())?;
         let filter_mask = predicate_array
             .as_any()
@@ -1500,6 +1502,20 @@ impl ScanAsyncRunner {
     }
 }
 
+fn chunk_for_conjunct_predicate(
+    arena: &ExprArena,
+    predicate: ExprId,
+    chunk: &Chunk,
+) -> Result<Chunk, String> {
+    let referenced = referenced_slots(arena, predicate).unwrap_or_default();
+    if referenced.is_empty() {
+        return Ok(chunk.clone());
+    }
+    crate::exec::chunk::hydrate_dictionary_columns_except(chunk, |slot, _| {
+        !referenced.contains(&slot)
+    })
+}
+
 fn apply_iceberg_include_position_filter(
     chunk: Chunk,
     included: &RoaringTreemap,
@@ -1660,6 +1676,7 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::scan::{
@@ -2942,6 +2959,73 @@ mod tests {
         assert!(
             runner.next_chunk().expect("scan eof").is_none(),
             "runner should reach EOF after single morsel"
+        );
+    }
+
+    #[test]
+    fn scan_conjunct_hydrates_referenced_dictionary_string_slots() {
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let upper = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Upper,
+                args: vec![slot],
+            },
+            DataType::Utf8,
+        );
+        let paid = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("PAID".to_string())),
+            DataType::Utf8,
+        );
+        let predicate = arena.push_typed(ExprNode::Eq(upper, paid), DataType::Boolean);
+        let arena = Arc::new(arena);
+
+        let scan = ScanNode::new(Arc::new(ValuesScanOp {
+            values: vec![1],
+            ivm_change_op: None,
+        }))
+        .with_node_id(1)
+        .with_conjunct_predicate(Some(predicate));
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            Vec::new(),
+            false,
+        )));
+        let runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            None,
+            HashMap::new(),
+            0,
+            arena,
+            None,
+            0,
+        );
+        let chunk = dictionary_status_chunk(
+            vec![Some(0), Some(1), None, Some(2), Some(0)],
+            Arc::new(StringArray::from(vec!["paid", "open", "PAID"])),
+        );
+
+        let filtered = runner
+            .apply_conjunct_predicate(chunk)
+            .expect("scan conjunct should evaluate")
+            .expect("matching rows");
+
+        assert_eq!(filtered.len(), 3);
+        assert!(matches!(
+            filtered.columns()[0].data_type(),
+            DataType::Dictionary(key_type, value_type)
+                if key_type.as_ref() == &DataType::Int32
+                    && value_type.as_ref() == &DataType::Utf8
+        ));
+        assert_eq!(
+            output_strings(&filtered),
+            vec![
+                Some("paid".to_string()),
+                Some("PAID".to_string()),
+                Some("paid".to_string()),
+            ]
         );
     }
 
