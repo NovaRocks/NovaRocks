@@ -13,9 +13,8 @@
 
 -- query 1: baseline table creation must succeed
 -- @skip_result_check=true
-SET CATALOG default_catalog;
 CREATE DATABASE IF NOT EXISTS ${case_db};
-CREATE TABLE default_catalog.${case_db}.t_bm_hll (
+CREATE TABLE ${case_db}.t_bm_hll (
   k INT,
   bm BITMAP,
   hv HLL
@@ -24,52 +23,52 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 2: ORDER BY on a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in ORDER BY
-SELECT k FROM default_catalog.${case_db}.t_bm_hll ORDER BY bm;
+SELECT k FROM ${case_db}.t_bm_hll ORDER BY bm;
 
 -- query 3: ORDER BY on an HLL column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in ORDER BY
-SELECT k FROM default_catalog.${case_db}.t_bm_hll ORDER BY hv;
+SELECT k FROM ${case_db}.t_bm_hll ORDER BY hv;
 
 -- query 4: GROUP BY on a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in GROUP BY
-SELECT bm FROM default_catalog.${case_db}.t_bm_hll GROUP BY bm;
+SELECT bm FROM ${case_db}.t_bm_hll GROUP BY bm;
 
 -- query 5: GROUP BY on an HLL column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in GROUP BY
-SELECT hv FROM default_catalog.${case_db}.t_bm_hll GROUP BY hv;
+SELECT hv FROM ${case_db}.t_bm_hll GROUP BY hv;
 
 -- query 6: equality comparison against a BITMAP column must be rejected
 -- @expect_error=comparison operator
-SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE bm = bm;
+SELECT k FROM ${case_db}.t_bm_hll WHERE bm = bm;
 
 -- query 7: equality comparison against an HLL column must be rejected
 -- @expect_error=comparison operator
-SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE hv = hv;
+SELECT k FROM ${case_db}.t_bm_hll WHERE hv = hv;
 
 -- query 8: DISTRIBUTED BY HASH over a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot be used as distribution key
-CREATE TABLE default_catalog.${case_db}.t_dist_bm (k INT, bm BITMAP)
+CREATE TABLE ${case_db}.t_dist_bm (k INT, bm BITMAP)
 DISTRIBUTED BY HASH(bm) BUCKETS 1
 TBLPROPERTIES ("format-version" = "3");
 
 -- query 9: DISTRIBUTED BY HASH over an HLL column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot be used as distribution key
-CREATE TABLE default_catalog.${case_db}.t_dist_hll (k INT, hv HLL)
+CREATE TABLE ${case_db}.t_dist_hll (k INT, hv HLL)
 DISTRIBUTED BY HASH(hv) BUCKETS 1
 TBLPROPERTIES ("format-version" = "3");
 
 -- query 10: IN list against a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in IN
-SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE bm IN (bm);
+SELECT k FROM ${case_db}.t_bm_hll WHERE bm IN (bm);
 
 -- query 11: BETWEEN against a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in BETWEEN
-SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE bm BETWEEN bm AND bm;
+SELECT k FROM ${case_db}.t_bm_hll WHERE bm BETWEEN bm AND bm;
 
 -- query 12: NOT IN against a BITMAP column must be rejected
 -- @expect_error=BITMAP/HLL columns cannot appear in NOT IN
-SELECT k FROM default_catalog.${case_db}.t_bm_hll WHERE bm NOT IN (bm);
+SELECT k FROM ${case_db}.t_bm_hll WHERE bm NOT IN (bm);
 
--- query 13: cleanup default-catalog probe table
+-- query 13: cleanup probe table
 -- @skip_result_check=true
-DROP TABLE default_catalog.${case_db}.t_bm_hll;
+DROP TABLE ${case_db}.t_bm_hll;

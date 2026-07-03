@@ -2896,6 +2896,8 @@ pub(crate) fn logical_type_property_value(data_type: &SqlType) -> Option<String>
         SqlType::TinyInt => Some("tinyint".to_string()),
         SqlType::SmallInt => Some("smallint".to_string()),
         SqlType::Date => Some("date".to_string()),
+        SqlType::Bitmap => Some("bitmap".to_string()),
+        SqlType::Hll => Some("hll".to_string()),
         SqlType::Decimal { precision, scale } => Some(format!("decimal({precision},{scale})")),
         _ => None,
     }
@@ -2906,6 +2908,8 @@ fn parse_logical_type_property_value(value: &str) -> Option<SqlType> {
         "tinyint" => Some(SqlType::TinyInt),
         "smallint" => Some(SqlType::SmallInt),
         "date" => Some(SqlType::Date),
+        "bitmap" => Some(SqlType::Bitmap),
+        "hll" => Some(SqlType::Hll),
         _ => parse_decimal_logical_type(value),
     }
 }
@@ -3086,6 +3090,21 @@ fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
         .signed_duration_since(epoch)
         .num_microseconds()
         .ok_or_else(|| format!("DATETIME literal `{value}` is out of range"))
+}
+
+#[cfg(test)]
+mod logical_type_property_tests {
+    use super::{logical_type_property_value, parse_logical_type_property_value};
+    use crate::sql::parser::ast::SqlType;
+
+    #[test]
+    fn bitmap_and_hll_logical_types_round_trip_through_properties() {
+        for sql_type in [SqlType::Bitmap, SqlType::Hll] {
+            let stored = logical_type_property_value(&sql_type)
+                .expect("BITMAP/HLL should be stored as Iceberg logical type properties");
+            assert_eq!(parse_logical_type_property_value(&stored), Some(sql_type));
+        }
+    }
 }
 
 #[cfg(test)]
