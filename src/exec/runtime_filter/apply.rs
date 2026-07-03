@@ -685,6 +685,60 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_fold_preserves_dictionary_value_null_semantics() {
+        let values = Arc::new(StringArray::from(vec![Some("A"), None, Some("Z")])) as ArrayRef;
+        let chunk = dict_chunk(
+            vec![Some(0), Some(1), Some(2), None],
+            Arc::clone(&values),
+            DataType::Utf8,
+        );
+        let in_filter = Arc::new(RuntimeInFilter::new(
+            10,
+            SlotId::new(1),
+            RuntimeInFilterValues::Utf8(["A".to_string(), "Z".to_string()].into_iter().collect()),
+        ));
+
+        let out = filter_chunk_by_in_filters(std::slice::from_ref(&in_filter), chunk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output_strings(&out),
+            vec![Some("A".to_string()), Some("Z".to_string())]
+        );
+
+        let build = Arc::new(StringArray::from(vec![Some("A"), None])) as ArrayRef;
+        let membership_filter = Arc::new(RuntimeMembershipFilter::Bloom(
+            RuntimeBloomFilter::build_from_array(
+                10,
+                SlotId::new(1),
+                RuntimeFilterType::Utf8,
+                &build,
+                RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            )
+            .unwrap(),
+        ));
+        assert!(membership_filter.has_null());
+
+        let chunk = dict_chunk(
+            vec![Some(0), Some(1), Some(2), None],
+            values,
+            DataType::Utf8,
+        );
+        let out = filter_chunk_by_membership_filters_with_exprs(
+            &ExprArena::default(),
+            &HashMap::new(),
+            std::slice::from_ref(&membership_filter),
+            chunk,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output_strings(&out),
+            vec![Some("A".to_string()), None, None]
+        );
+    }
+
+    #[test]
     fn min_max_filter_hydrates_dictionary_probe_values_as_correctness_fallback() {
         let build = Arc::new(StringArray::from(vec!["M", "T"])) as ArrayRef;
         let filter =
