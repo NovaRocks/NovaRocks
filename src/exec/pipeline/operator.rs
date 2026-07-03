@@ -148,11 +148,59 @@ pub(crate) fn hydrate_for_downstream(
     })
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct DictionaryCarrierStats {
+    pub input_rows: i64,
+    pub input_columns: i64,
+    pub kept_rows: i64,
+    pub kept_columns: i64,
+    pub hydrated_rows: i64,
+    pub hydrated_columns: i64,
+    pub unsupported_columns: i64,
+}
+
+impl DictionaryCarrierStats {
+    pub fn has_input(self) -> bool {
+        self.input_columns > 0
+    }
+}
+
+pub(crate) fn dictionary_carrier_stats(
+    chunk: &Chunk,
+    downstream: &dyn ProcessorOperator,
+) -> DictionaryCarrierStats {
+    let rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
+    let mut stats = DictionaryCarrierStats::default();
+
+    for slot in chunk.chunk_schema().slots() {
+        let data_type = slot.data_type();
+        if !matches!(data_type, arrow::datatypes::DataType::Dictionary(_, _)) {
+            continue;
+        }
+
+        stats.input_columns = stats.input_columns.saturating_add(1);
+        stats.input_rows = stats.input_rows.saturating_add(rows);
+
+        if downstream.accepts_encoded_column(slot.slot_id(), data_type) {
+            stats.kept_columns = stats.kept_columns.saturating_add(1);
+            stats.kept_rows = stats.kept_rows.saturating_add(rows);
+        } else {
+            stats.hydrated_columns = stats.hydrated_columns.saturating_add(1);
+            stats.hydrated_rows = stats.hydrated_rows.saturating_add(rows);
+            stats.unsupported_columns = stats.unsupported_columns.saturating_add(1);
+        }
+    }
+
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{Chunk, Operator, ProcessorOperator, hydrate_for_downstream};
+    use super::{
+        dictionary_carrier_stats, hydrate_for_downstream, Chunk, Operator, ProcessorOperator,
+    };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::runtime::runtime_state::RuntimeState;
@@ -347,5 +395,37 @@ mod tests {
             &DataType::Utf8
         );
         assert_utf8_values(&hydrated.columns()[1]);
+    }
+
+    #[test]
+    fn dictionary_carrier_stats_hydrates_all_dictionary_columns_by_default() {
+        let chunk = two_dictionary_column_chunk();
+        let op = StubOp;
+
+        let stats = dictionary_carrier_stats(&chunk, &op);
+
+        assert_eq!(stats.input_rows, 8);
+        assert_eq!(stats.input_columns, 2);
+        assert_eq!(stats.kept_rows, 0);
+        assert_eq!(stats.kept_columns, 0);
+        assert_eq!(stats.hydrated_rows, 8);
+        assert_eq!(stats.hydrated_columns, 2);
+        assert_eq!(stats.unsupported_columns, 2);
+    }
+
+    #[test]
+    fn dictionary_carrier_stats_keeps_declared_encoded_slot() {
+        let chunk = two_dictionary_column_chunk();
+        let op = KeepSlot1Op;
+
+        let stats = dictionary_carrier_stats(&chunk, &op);
+
+        assert_eq!(stats.input_rows, 8);
+        assert_eq!(stats.input_columns, 2);
+        assert_eq!(stats.kept_rows, 4);
+        assert_eq!(stats.kept_columns, 1);
+        assert_eq!(stats.hydrated_rows, 4);
+        assert_eq!(stats.hydrated_columns, 1);
+        assert_eq!(stats.unsupported_columns, 1);
     }
 }
