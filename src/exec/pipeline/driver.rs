@@ -31,7 +31,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-use super::operator::{BlockedReason, Operator};
+use super::operator::{
+    BlockedReason, DictionaryCarrierStats, Operator, dictionary_carrier_stats,
+    hydrate_for_downstream,
+};
 use crate::common::types::{UniqueId, format_uuid};
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
@@ -225,10 +228,32 @@ struct OperatorCounters {
     pull_row_num: CounterRef,
     mem_peak: CounterRef,
     mem_allocated: CounterRef,
+    dict_input_rows: CounterRef,
+    dict_input_columns: CounterRef,
+    dict_kept_rows: CounterRef,
+    dict_kept_columns: CounterRef,
+    dict_hydrated_rows: CounterRef,
+    dict_hydrated_columns: CounterRef,
+    dict_unsupported_columns: CounterRef,
     io_task_exec_time: Option<CounterRef>,
     wait_time: Option<CounterRef>,
     receiver_process_total_time: Option<CounterRef>,
     network_time: Option<CounterRef>,
+}
+
+fn record_dictionary_carrier_stats(counters: &OperatorCounters, stats: DictionaryCarrierStats) {
+    if !stats.has_input() {
+        return;
+    }
+    counters.dict_input_rows.add(stats.input_rows);
+    counters.dict_input_columns.add(stats.input_columns);
+    counters.dict_kept_rows.add(stats.kept_rows);
+    counters.dict_kept_columns.add(stats.kept_columns);
+    counters.dict_hydrated_rows.add(stats.hydrated_rows);
+    counters.dict_hydrated_columns.add(stats.hydrated_columns);
+    counters
+        .dict_unsupported_columns
+        .add(stats.unsupported_columns);
 }
 
 impl PipelineDriver {
@@ -301,6 +326,25 @@ impl PipelineDriver {
                         mem_allocated: p
                             .common
                             .add_counter("OperatorAllocatedMemoryUsage", metrics::TUnit::BYTES),
+                        dict_input_rows: p
+                            .unique
+                            .add_counter("DictInputRows", metrics::TUnit::UNIT),
+                        dict_input_columns: p
+                            .unique
+                            .add_counter("DictInputColumns", metrics::TUnit::UNIT),
+                        dict_kept_rows: p.unique.add_counter("DictKeptRows", metrics::TUnit::UNIT),
+                        dict_kept_columns: p
+                            .unique
+                            .add_counter("DictKeptColumns", metrics::TUnit::UNIT),
+                        dict_hydrated_rows: p
+                            .unique
+                            .add_counter("DictHydratedRows", metrics::TUnit::UNIT),
+                        dict_hydrated_columns: p
+                            .unique
+                            .add_counter("DictHydratedColumns", metrics::TUnit::UNIT),
+                        dict_unsupported_columns: p
+                            .unique
+                            .add_counter("DictUnsupportedColumns", metrics::TUnit::UNIT),
                         io_task_exec_time,
                         wait_time,
                         receiver_process_total_time,
@@ -907,8 +951,8 @@ impl PipelineDriver {
             if !need_input {
                 continue;
             }
-            let mut chunk = self.edge_chunks[e].take().expect("checked is_some");
-            chunk = {
+            let chunk = self.edge_chunks[e].take().expect("checked is_some");
+            let (mut chunk, dict_stats) = {
                 let downstream_ref = self
                     .operators
                     .get(downstream_idx)
@@ -919,7 +963,13 @@ impl PipelineDriver {
                             downstream_name
                         )
                     })?;
-                crate::exec::pipeline::operator::hydrate_for_downstream(&chunk, downstream_ref)?
+                let stats = if self.profiler.is_some() {
+                    Some(dictionary_carrier_stats(&chunk, downstream_ref))
+                } else {
+                    None
+                };
+                let chunk = hydrate_for_downstream(&chunk, downstream_ref)?;
+                (chunk, stats)
             };
             if let Some(tracker) = self
                 .operator_mem_trackers
@@ -967,6 +1017,11 @@ impl PipelineDriver {
                 let counters = &self.operator_counters[downstream_idx];
                 counters.push_total_time.add(elapsed_ns);
                 counters.operator_total_time.add(active_ns);
+                if result.is_ok()
+                    && let Some(stats) = dict_stats
+                {
+                    record_dictionary_carrier_stats(counters, stats);
+                }
                 let pushed_rows = match &result {
                     Ok(()) => push_rows as i64,
                     _ => 0,

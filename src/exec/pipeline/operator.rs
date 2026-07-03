@@ -199,7 +199,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        dictionary_carrier_stats, hydrate_for_downstream, Chunk, Operator, ProcessorOperator,
+        Chunk, Operator, ProcessorOperator, dictionary_carrier_stats, hydrate_for_downstream,
     };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
