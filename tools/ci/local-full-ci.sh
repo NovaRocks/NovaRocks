@@ -341,6 +341,15 @@ run_fail_fast_stage() {
   ci_render_summary "RUNNING"
 }
 
+ci_suite_extra_env() {
+  local suite="$1"
+  case "$suite" in
+    iceberg-ivm)
+      printf "%s\n" "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1"
+      ;;
+  esac
+}
+
 run_cargo_gates() {
   run_fail_fast_stage "thrift boundary audit" "thrift-boundary-audit.log" \
     python3 tools/dev/audit_thrift_boundaries.py --strict
@@ -365,6 +374,9 @@ start_server_stage() {
   local duration
 
   start="$(ci_epoch)"
+  if ci_suites_include "iceberg-ivm"; then
+    export NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1
+  fi
   ci_start_standalone_server "$NOVAROCKS_STANDALONE_CONFIG" "$log_path" 60 "$NOVA_CI_CARGO_PROFILE"
   code=$?
   duration=$(($(ci_epoch) - start))
@@ -417,6 +429,17 @@ resolve_suites() {
     fi
     SUITES+=("$suite")
   done <<<"$suites_output"
+}
+
+ci_suites_include() {
+  local want="$1"
+  local suite
+  for suite in "${SUITES[@]}"; do
+    if [ "$suite" = "$want" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 validate_explicit_suites_early() {
@@ -684,6 +707,7 @@ run_sql_suites() {
   local code
   local duration
   local -a suite_extra_args
+  local -a suite_extra_env
   local query_timeout
   local novarocks_bin
   local suite_cluster_mode
@@ -701,6 +725,7 @@ run_sql_suites() {
     log_path="$CI_RUN_DIR/sql/${suite}.log"
     start="$(ci_epoch)"
     suite_extra_args=()
+    mapfile -t suite_extra_env < <(ci_suite_extra_env "$suite")
     query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
     suite_cluster_mode="$(ci_suite_cluster_mode "$suite")"
     suite_cluster_size="$(ci_suite_cluster_size "$suite")"
@@ -737,6 +762,7 @@ run_sql_suites() {
     fi
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
+      "${suite_extra_env[@]}" \
       NOVAROCKS_BIN="$novarocks_bin" \
       cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
@@ -855,6 +881,7 @@ main() {
   prepare_runtime
   run_cargo_gates
   reset_managed_lake_metadata_stage
+  resolve_suites
   if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
     start_server_stage
   else
