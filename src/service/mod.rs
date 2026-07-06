@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#[cfg(feature = "compat")]
 pub mod backend_service;
 #[cfg(feature = "compat")]
 pub mod compat;
@@ -24,17 +25,25 @@ pub mod exchange_sender;
 pub(crate) mod exec_state_reporter;
 pub(crate) mod exec_status_report;
 pub mod fe_report;
+pub mod fragment_control;
 pub mod frontend_rpc;
 pub mod grpc_client;
 pub mod grpc_server;
+#[cfg(feature = "compat")]
 pub mod heartbeat_service;
 pub(crate) mod internal_rpc;
 #[cfg(feature = "compat")]
 pub(crate) mod internal_rpc_client;
+#[cfg(feature = "compat")]
 pub mod internal_service;
 pub mod load_tracking_http;
 pub(crate) mod metrics_http;
+pub(crate) mod native_fragment_service;
 pub mod report_worker;
+pub(crate) mod result_batch_wire;
 pub(crate) mod standalone_exec_state_reporter;
+#[cfg(feature = "compat")]
 pub mod stream_load;
+#[cfg(feature = "compat")]
 pub mod stream_load_http;
+pub(crate) mod stream_load_registry;

@@ -774,6 +774,7 @@ fn main() {
             };
 
             let server = &cfg.server;
+            #[cfg(feature = "compat")]
             let advertise_endpoint =
                 network::advertise_endpoint_for_config(&cfg).expect("resolve advertise endpoint");
 
@@ -784,29 +785,32 @@ fn main() {
             novarocks::start_grpc_server(server.host.as_str()).expect("start grpc server");
 
             // Start Rust heartbeat service
-            let heartbeat_cfg = novarocks::service::heartbeat_service::HeartbeatConfig {
-                host: server.host.clone(),
-                advertise_host: advertise_endpoint.host.clone(),
-                heartbeat_port: server.heartbeat_port,
-                be_port: server.be_port,
-                brpc_port: server.brpc_port,
-                http_port: server.http_port,
-                starlet_port: advertise_endpoint.port,
-                mem_limit_bytes: cfg
-                    .runtime
-                    .effective_be_mem_limit_bytes()
-                    .expect("resolve BE memory limit"),
-            };
-            novarocks::service::heartbeat_service::start_heartbeat_server(heartbeat_cfg)
-                .expect("start heartbeat server");
+            #[cfg(feature = "compat")]
+            {
+                let heartbeat_cfg = novarocks::service::heartbeat_service::HeartbeatConfig {
+                    host: server.host.clone(),
+                    advertise_host: advertise_endpoint.host.clone(),
+                    heartbeat_port: server.heartbeat_port,
+                    be_port: server.be_port,
+                    brpc_port: server.brpc_port,
+                    http_port: server.http_port,
+                    starlet_port: advertise_endpoint.port,
+                    mem_limit_bytes: cfg
+                        .runtime
+                        .effective_be_mem_limit_bytes()
+                        .expect("resolve BE memory limit"),
+                };
+                novarocks::service::heartbeat_service::start_heartbeat_server(heartbeat_cfg)
+                    .expect("start heartbeat server");
 
-            // Start Rust BackendService (StarRocks BE be_port)
-            let backend_cfg = novarocks::service::backend_service::BackendServiceConfig {
-                host: server.host.clone(),
-                be_port: server.be_port,
-            };
-            novarocks::service::backend_service::start_backend_service(backend_cfg)
-                .expect("start backend service");
+                // Start Rust BackendService (StarRocks BE be_port)
+                let backend_cfg = novarocks::service::backend_service::BackendServiceConfig {
+                    host: server.host.clone(),
+                    be_port: server.be_port,
+                };
+                novarocks::service::backend_service::start_backend_service(backend_cfg)
+                    .expect("start backend service");
+            }
 
             // Start C++ brpc service (for query execution) — only with compat feature.
             #[cfg(feature = "compat")]
@@ -824,6 +828,7 @@ fn main() {
                 novarocks::service::compat::start(&compat_cfg).expect("start compat");
             }
 
+            #[cfg(feature = "compat")]
             println!(
                 "novarocksd started (bind_host={}, advertise_host={}, advertise_port={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, starlet_port={})",
                 server.host,
@@ -835,6 +840,11 @@ fn main() {
                 server.http_port,
                 server.starlet_port
             );
+            #[cfg(not(feature = "compat"))]
+            println!(
+                "novarocksd started (bind_host={}, http_port={})",
+                server.host, server.http_port
+            );
             println!("Press Ctrl-C to stop...");
 
             // Keep process alive until Ctrl-C or signal
@@ -844,7 +854,9 @@ fn main() {
 
             #[cfg(feature = "compat")]
             novarocks::service::compat::stop();
+            #[cfg(feature = "compat")]
             novarocks::service::backend_service::stop_backend_service();
+            #[cfg(feature = "compat")]
             novarocks::service::heartbeat_service::stop_heartbeat_server();
             novarocks::service::grpc_server::stop_grpc_server();
             novarocks::service::report_worker::stop();

@@ -36,7 +36,7 @@ use crate::lower::layout::{
 };
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::lower::type_lowering::arrow_type_from_desc;
-use crate::service::stream_load;
+use crate::service::stream_load_registry;
 use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
 #[derive(Clone, Debug)]
@@ -426,7 +426,7 @@ pub(crate) fn lower_file_scan_node(
                             node.node_id
                         )
                     })?;
-                    stream_load::resolve_stream_load_file_path(load_id).ok_or_else(|| {
+                    stream_load_registry::resolve_stream_load_file_path(load_id).ok_or_else(|| {
                         format!(
                             "FILE_SCAN_NODE node_id={} has no registered local file for load_id={}",
                             node.node_id,

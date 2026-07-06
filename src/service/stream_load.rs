@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +28,9 @@ use crate::runtime::{backend_id, sink_commit};
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::internal_service;
+use crate::service::stream_load_registry::{
+    register_stream_load_file, unregister_stream_load_file,
+};
 use crate::thrift::frontend_service::{
     TFrontendServiceSyncClient, TLoadTxnBeginRequest, TLoadTxnBeginResult, TLoadTxnCommitRequest,
     TLoadTxnCommitResult, TLoadTxnRollbackRequest, TLoadTxnRollbackResult, TStreamLoadPutRequest,
@@ -155,35 +158,6 @@ impl TxnContext {
 fn txn_contexts() -> &'static Mutex<HashMap<String, Arc<Mutex<TxnContext>>>> {
     static CONTEXTS: OnceLock<Mutex<HashMap<String, Arc<Mutex<TxnContext>>>>> = OnceLock::new();
     CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn stream_load_file_paths() -> &'static Mutex<HashMap<(i64, i64), String>> {
-    static FILE_PATHS: OnceLock<Mutex<HashMap<(i64, i64), String>>> = OnceLock::new();
-    FILE_PATHS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub(crate) fn register_stream_load_file(load_id: &TUniqueId, path: &Path) {
-    let mut guard = stream_load_file_paths()
-        .lock()
-        .expect("stream load file path lock");
-    guard.insert(
-        (load_id.hi, load_id.lo),
-        path.as_os_str().to_string_lossy().to_string(),
-    );
-}
-
-pub(crate) fn resolve_stream_load_file_path(load_id: &TUniqueId) -> Option<String> {
-    let guard = stream_load_file_paths()
-        .lock()
-        .expect("stream load file path lock");
-    guard.get(&(load_id.hi, load_id.lo)).cloned()
-}
-
-pub(crate) fn unregister_stream_load_file(load_id: &TUniqueId) {
-    let mut guard = stream_load_file_paths()
-        .lock()
-        .expect("stream load file path lock");
-    guard.remove(&(load_id.hi, load_id.lo));
 }
 
 fn get_header<'a>(headers: &'a HttpHeaders, key: &str) -> Option<&'a str> {

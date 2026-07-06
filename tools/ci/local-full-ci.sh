@@ -359,13 +359,17 @@ run_cargo_gates() {
     scripts/audit_fs_access_boundary.sh
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   run_fail_fast_stage "cargo clippy" "cargo-clippy.log" cargo clippy --all-targets
+  run_fail_fast_stage "cargo clippy compat" "cargo-clippy-compat.log" cargo clippy --all-targets --features compat
   run_fail_fast_stage "cargo build" "cargo-build.log" cargo build --profile "$NOVA_CI_CARGO_PROFILE"
+  run_fail_fast_stage "cargo build compat" "cargo-build-compat.log" cargo build --profile "$NOVA_CI_CARGO_PROFILE" --features compat
 
   if [ "$SKIP_CARGO_TEST" = "true" ]; then
     ci_record_stage "cargo test" "SKIP" "0" ""
+    ci_record_stage "cargo test compat" "SKIP" "0" ""
     ci_render_summary "RUNNING"
   else
     run_fail_fast_stage "cargo test" "cargo-test.log" cargo test --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+    run_fail_fast_stage "cargo test compat" "cargo-test-compat.log" cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat -- --test-threads=1
   fi
 }
 

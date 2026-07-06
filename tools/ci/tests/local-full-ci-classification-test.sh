@@ -135,3 +135,29 @@ if ! grep -q -- "--plan-wire-format proto" <<<"$proto_args"; then
   echo "proto runner args must include --plan-wire-format proto" >&2
   exit 1
 fi
+
+local_full_ci_text="$(cat "$REPO_ROOT/tools/ci/local-full-ci.sh")"
+if ! grep -q 'run_fail_fast_stage "cargo clippy compat"' <<<"$local_full_ci_text"; then
+  echo "local-full-ci must run a compat clippy stage" >&2
+  exit 1
+fi
+if ! grep -q -- 'cargo clippy --all-targets --features compat' <<<"$local_full_ci_text"; then
+  echo "compat clippy stage must pass --features compat" >&2
+  exit 1
+fi
+if ! grep -q 'run_fail_fast_stage "cargo build compat"' <<<"$local_full_ci_text"; then
+  echo "local-full-ci must run a compat build stage" >&2
+  exit 1
+fi
+if ! grep -q -- 'cargo build --profile "$NOVA_CI_CARGO_PROFILE" --features compat' <<<"$local_full_ci_text"; then
+  echo "compat build stage must pass --features compat" >&2
+  exit 1
+fi
+if ! grep -q 'run_fail_fast_stage "cargo test compat"' <<<"$local_full_ci_text"; then
+  echo "local-full-ci must run a compat test stage" >&2
+  exit 1
+fi
+if ! grep -q -- 'cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat' <<<"$local_full_ci_text"; then
+  echo "compat test stage must pass --features compat" >&2
+  exit 1
+fi

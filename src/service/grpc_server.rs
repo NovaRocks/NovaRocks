@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#[cfg(feature = "compat")]
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,7 +25,9 @@ use std::thread::JoinHandle;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post, put};
+use axum::routing::get;
+#[cfg(feature = "compat")]
+use axum::routing::{post, put};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -34,14 +37,22 @@ use tonic::server::NamedService;
 use tonic::service::Routes;
 use tonic::transport::Server;
 
-use crate::common::config::{http_port, starlet_port};
+use crate::common::config::http_port;
+#[cfg(feature = "compat")]
+use crate::common::config::starlet_port;
 use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
+#[cfg(feature = "compat")]
 use crate::connector::starrocks::starmgr;
-use crate::novarocks_logging::{error, info, warn};
+#[cfg(feature = "compat")]
+use crate::novarocks_logging::warn;
+use crate::novarocks_logging::{error, info};
+#[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
 use crate::service::internal_rpc;
-use crate::service::{load_tracking_http, metrics_http, stream_load_http};
+#[cfg(feature = "compat")]
+use crate::service::stream_load_http;
+use crate::service::{load_tracking_http, metrics_http};
 
 pub(crate) use crate::common::engine_error::{
     REPORT_EXEC_STATUS_OK, REPORT_EXEC_STATUS_QUERY_GONE,
@@ -298,7 +309,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         } = request.into_inner();
         let result = match (plan, instance_params) {
             (Some(plan), Some(instance_params)) => tokio::task::spawn_blocking(move || {
-                crate::service::internal_service::submit_exec_plan_fragment_native(
+                crate::service::native_fragment_service::submit_exec_plan_fragment_native(
                     plan,
                     instance_params,
                 )
@@ -312,16 +323,24 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     .to_string(),
             ),
             (None, None) => {
-                // submit_exec_plan_fragment does thrift deserialization and pipeline setup,
-                // which is CPU-bound. Offload to the blocking thread pool so tonic worker
-                // threads remain free for I/O.
-                tokio::task::spawn_blocking(move || {
-                    crate::submit_exec_plan_fragment(&exec_plan_fragment_params_thrift)
-                })
-                .await
-                .map_err(|e| {
-                    tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
-                })?
+                #[cfg(feature = "compat")]
+                {
+                    // submit_exec_plan_fragment does thrift deserialization and pipeline setup,
+                    // which is CPU-bound. Offload to the blocking thread pool so tonic worker
+                    // threads remain free for I/O.
+                    tokio::task::spawn_blocking(move || {
+                        crate::submit_exec_plan_fragment(&exec_plan_fragment_params_thrift)
+                    })
+                    .await
+                    .map_err(|e| {
+                        tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
+                    })?
+                }
+                #[cfg(not(feature = "compat"))]
+                {
+                    let _ = exec_plan_fragment_params_thrift;
+                    Err("thrift SubmitFragment requires the compat feature".to_string())
+                }
             }
         };
         match result {
@@ -672,16 +691,18 @@ fn failed_query_from_native_report(
 }
 
 fn mark_failed_query_report(report: FailedQueryReport) {
-    crate::service::internal_service::mark_query_failed_from_report(
+    crate::service::fragment_control::mark_query_failed_from_report(
         report.query_id,
         report.finst_id,
         report.error,
     );
 }
 
+#[cfg(feature = "compat")]
 #[derive(Default)]
 pub struct StarletGrpcService;
 
+#[cfg(feature = "compat")]
 fn staros_ok_status() -> proto::staros::StarStatus {
     proto::staros::StarStatus {
         status_code: proto::staros::StatusCode::Ok as i32,
@@ -690,12 +711,14 @@ fn staros_ok_status() -> proto::staros::StarStatus {
     }
 }
 
+#[cfg(feature = "compat")]
 fn parse_add_shard_s3_config(
     path_info: &proto::staros::FilePathInfo,
 ) -> Result<Option<starlet_shard_registry::S3StoreConfig>, String> {
     starmgr::parse_s3_config_from_file_path_info(path_info)
 }
 
+#[cfg(feature = "compat")]
 fn summarize_top_counts(counts: &HashMap<String, usize>, top_n: usize) -> String {
     if counts.is_empty() {
         return "-".to_string();
@@ -758,6 +781,7 @@ where
     }
 }
 
+#[cfg(feature = "compat")]
 fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
     grpc_routes
         .into_axum_router()
@@ -781,6 +805,18 @@ fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
         .route("/metrics", get(metrics_http::handle_metrics))
 }
 
+#[cfg(not(feature = "compat"))]
+fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
+    grpc_routes
+        .into_axum_router()
+        .route(
+            "/api/_load_tracking/:hi/:lo",
+            get(load_tracking_http::handle_load_tracking_log),
+        )
+        .route("/metrics", get(metrics_http::handle_metrics))
+}
+
+#[cfg(feature = "compat")]
 #[tonic::async_trait]
 impl proto::staros::starlet_server::Starlet for StarletGrpcService {
     async fn add_shard(
@@ -949,19 +985,30 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
 
     let host = host.to_string();
     let grpc_http_port = http_port();
+    #[cfg(feature = "compat")]
     let grpc_starlet_port = starlet_port();
+    #[cfg(feature = "compat")]
     validate_grpc_ports(grpc_http_port, grpc_starlet_port)?;
     ensure_bindable(&host, grpc_http_port, "novarocks grpc/http")?;
+    #[cfg(feature = "compat")]
     ensure_bindable(&host, grpc_starlet_port, "starlet grpc")?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let join_handle = std::thread::spawn(move || {
+        #[cfg(feature = "compat")]
         info!(
             target: "novarocks::grpc",
             host = %host,
             http_port = grpc_http_port,
             starlet_port = grpc_starlet_port,
             "starting grpc servers"
+        );
+        #[cfg(not(feature = "compat"))]
+        info!(
+            target: "novarocks::grpc",
+            host = %host,
+            http_port = grpc_http_port,
+            "starting grpc server"
         );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -971,10 +1018,15 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             .expect("build grpc server runtime");
 
         rt.block_on(async move {
+            #[cfg(feature = "compat")]
             let (http_addr, starlet_addr) =
                 grpc_server_bind_addrs(&host, grpc_http_port, grpc_starlet_port)
                     .expect("parse grpc server bind addrs");
+            #[cfg(not(feature = "compat"))]
+            let http_addr =
+                parse_grpc_bind_addr(&host, grpc_http_port).expect("parse grpc/http bind addr");
             let mut http_shutdown = shutdown_rx.clone();
+            #[cfg(feature = "compat")]
             let mut starlet_shutdown = shutdown_rx.clone();
 
             let svc = GrpcService::full_execution();
@@ -993,29 +1045,43 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
                     }
                 });
 
-            let starlet = StarletGrpcService;
-            let starlet = proto::staros::starlet_server::StarletServer::new(starlet)
-                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-            let starlet_server = Server::builder().add_service(starlet).serve_with_shutdown(
-                starlet_addr,
-                async move {
-                    while !*starlet_shutdown.borrow() {
-                        if starlet_shutdown.changed().await.is_err() {
-                            break;
+            #[cfg(feature = "compat")]
+            {
+                let starlet = StarletGrpcService;
+                let starlet = proto::staros::starlet_server::StarletServer::new(starlet)
+                    .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                let starlet_server = Server::builder().add_service(starlet).serve_with_shutdown(
+                    starlet_addr,
+                    async move {
+                        while !*starlet_shutdown.borrow() {
+                            if starlet_shutdown.changed().await.is_err() {
+                                break;
+                            }
                         }
-                    }
-                },
-            );
-
-            if let Err(e) = tokio::try_join!(novarocks_server, starlet_server) {
-                error!(
-                    target: "novarocks::grpc",
-                    error = %e,
-                    http_port = grpc_http_port,
-                    starlet_port = grpc_starlet_port,
-                    "grpc server stopped"
+                    },
                 );
+
+                if let Err(e) = tokio::try_join!(novarocks_server, starlet_server) {
+                    error!(
+                        target: "novarocks::grpc",
+                        error = %e,
+                        http_port = grpc_http_port,
+                        starlet_port = grpc_starlet_port,
+                        "grpc server stopped"
+                    );
+                }
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                if let Err(e) = novarocks_server.await {
+                    error!(
+                        target: "novarocks::grpc",
+                        error = %e,
+                        http_port = grpc_http_port,
+                        "grpc server stopped"
+                    );
+                }
             }
         });
     });
@@ -1433,6 +1499,7 @@ mod pr3_tests {
         report
     }
 
+    #[cfg(feature = "compat")]
     #[tokio::test]
     async fn submit_fragment_thrift_decode_error_returns_business_error() {
         let svc = GrpcService::default();
@@ -1448,6 +1515,26 @@ mod pr3_tests {
             "should return business error for bad thrift"
         );
         assert!(!body.message.is_empty());
+    }
+
+    #[cfg(not(feature = "compat"))]
+    #[tokio::test]
+    async fn submit_fragment_thrift_request_requires_compat_feature() {
+        let svc = GrpcService::default();
+        let req = Request::new(SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
+            plan: None,
+            instance_params: None,
+        });
+        let resp = svc.submit_fragment(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+        assert_ne!(body.status_code, 0);
+        assert!(
+            body.message
+                .contains("thrift SubmitFragment requires the compat feature"),
+            "{}",
+            body.message
+        );
     }
 
     #[tokio::test]

@@ -24,7 +24,7 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::result_buffer;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::service::internal_service::{
+use crate::service::result_batch_wire::{
     build_empty_fetch_result_batch_template, build_fetch_result_batch_for_chunk,
 };
 use crate::thrift::{data_sinks, exprs};

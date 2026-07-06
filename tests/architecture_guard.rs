@@ -284,6 +284,41 @@ fn distributed_plan_node_has_no_optimizer_payloads() {
 }
 
 #[test]
+fn nidl_d1_pure_mode_gates_starrocks_compat_behavior() {
+    let repo = Path::new(manifest_dir());
+    let service_mod = fs::read_to_string(repo.join("src/service/mod.rs")).unwrap();
+    for module in [
+        "backend_service",
+        "heartbeat_service",
+        "internal_service",
+        "stream_load",
+        "stream_load_http",
+    ] {
+        let expected = format!("#[cfg(feature = \"compat\")]\npub mod {module};");
+        assert!(
+            service_mod.contains(&expected),
+            "service module `{module}` must be compat-gated"
+        );
+    }
+
+    let grpc = fs::read_to_string(repo.join("src/service/grpc_server.rs")).unwrap();
+    assert!(
+        grpc.contains("#[cfg(feature = \"compat\")]\nfn build_novarocks_http_app"),
+        "stream-load HTTP routes must only exist in compat grpc app"
+    );
+    assert!(
+        grpc.contains(
+            "#[cfg(feature = \"compat\")]\n#[derive(Default)]\npub struct StarletGrpcService"
+        ),
+        "Starlet gRPC service must be compat-gated"
+    );
+    assert!(
+        grpc.contains("thrift SubmitFragment requires the compat feature"),
+        "pure SubmitFragment must reject thrift fallback explicitly"
+    );
+}
+
+#[test]
 fn distributed_build_does_not_call_optimizer_cost_model() {
     let file = src_dir().join("sql/planner/distributed_plan_build.rs");
     let mut violations = Vec::new();
