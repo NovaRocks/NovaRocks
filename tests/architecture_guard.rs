@@ -4927,6 +4927,93 @@ fn nidl_d3b_proto_schema_comparator_returns_stable_sorted_deduped_violations() {
 // as clusters are cleaned, and E10 empties the ledger and adds the build.rs /
 // lib.rs gate assertions.
 
+#[test]
+fn nidl_e7_result_path_uses_native_result_batch_and_primitive_types() {
+    let repo = Path::new(manifest_dir());
+    let guarded = [
+        "src/common/types.rs",
+        "src/common/util.rs",
+        "src/runtime/result_buffer.rs",
+        "src/service/result_batch_wire.rs",
+        "src/exec/operators/result_buffer_sink.rs",
+    ];
+    let mut violations = Vec::new();
+
+    for source in guarded {
+        let text = fs::read_to_string(repo.join(source)).unwrap();
+        let production = rust_production_text_without_cfg_test(&text);
+        push_forbidden_terms(
+            &mut violations,
+            source,
+            &production,
+            &[
+                "crate::thrift",
+                "TResultBatch",
+                "TPrimitiveType",
+                "TResultSinkType",
+                "TResultSinkFormatType",
+                "exprs::TExpr",
+                "data_sinks::",
+                "types::T",
+                "crate::types::arrow_thrift",
+            ],
+            "E7 result execution path must use native result batch, primitive tags, and sink config",
+        );
+    }
+
+    let native_fragment_wire =
+        fs::read_to_string(repo.join("src/runtime/native_fragment_wire.rs")).unwrap();
+    let native_fragment_wire = rust_production_text_without_cfg_test(&native_fragment_wire);
+    push_forbidden_terms(
+        &mut violations,
+        "src/runtime/native_fragment_wire.rs",
+        &native_fragment_wire,
+        &[
+            "pub(crate) type ResultSinkType =",
+            "TResultSinkType",
+            "TResultSinkFormatType",
+        ],
+        "E7 native fragment wire must not expose thrift result-sink aliases",
+    );
+
+    let arrow_thrift = fs::read_to_string(repo.join("src/types/arrow_thrift.rs")).unwrap();
+    let arrow_thrift = rust_production_text_without_cfg_test(&arrow_thrift);
+    push_forbidden_terms(
+        &mut violations,
+        "src/types/arrow_thrift.rs",
+        &arrow_thrift,
+        &[
+            "fn logical_type_to_primitive",
+            "fn field_logical_primitive",
+            "fn arrow_field_to_primitive",
+            "fn arrow_type_to_primitive",
+            "fn thrift_node_to_primitive",
+            "fn thrift_desc_to_primitive",
+        ],
+        "Arrow/native primitive helpers must live outside thrift type descriptors",
+    );
+
+    let common_thrift = fs::read_to_string(repo.join("src/common/thrift.rs")).unwrap();
+    let common_thrift = rust_production_text_without_cfg_test(&common_thrift);
+    push_forbidden_terms(
+        &mut violations,
+        "src/common/thrift.rs",
+        &common_thrift,
+        &[
+            "crate::thrift::data",
+            "TResultBatch",
+            "thrift_serialize_result_batch",
+        ],
+        "generic thrift helpers must not know the result-batch runtime model",
+    );
+
+    assert!(
+        violations.is_empty(),
+        "NIDL-E7 native result-batch/primitive guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
 const NIDL_E0_LEDGER_PATH: &str = "tests/nidl_noncompat_idl_ledger.txt";
 
 /// Files/prefixes already gated to `#[cfg(feature = "compat")]` (or expected to
