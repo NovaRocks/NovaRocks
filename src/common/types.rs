@@ -16,6 +16,8 @@
 // under the License.
 use std::fmt;
 
+use crate::common::result_batch::ResultBatch;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct UniqueId {
     pub hi: i64,
@@ -63,7 +65,7 @@ impl fmt::Display for UniqueId {
 pub struct FetchResult {
     pub packet_seq: i64,
     pub eos: bool,
-    pub result_batch: crate::thrift::data::TResultBatch,
+    pub result_batch: ResultBatch,
 }
 
 #[cfg(test)]

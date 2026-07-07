@@ -16,6 +16,7 @@
 // under the License.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::common::result_batch::ResultBatch;
 use crate::common::thrift::thrift_serialize_result_batch;
 use crate::connector::starrocks::lake::compaction::{
     abort_compaction as lake_abort_compaction, compact as lake_compact,
@@ -62,8 +63,20 @@ fn unique_id(hi: i64, lo: i64) -> UniqueId {
     UniqueId { hi, lo }
 }
 
+fn wire_result_batch_from_native(
+    batch: ResultBatch,
+    packet_seq: i64,
+) -> crate::thrift::data::TResultBatch {
+    crate::thrift::data::TResultBatch::new(
+        batch.rows,
+        batch.is_compressed,
+        packet_seq,
+        batch.statistic_version,
+    )
+}
+
 fn write_fetch_result(
-    mut result: FetchResult,
+    result: FetchResult,
     out_packet_seq: *mut i64,
     out_eos: *mut bool,
     out_batch: *mut NovaRocksRustBuf,
@@ -83,8 +96,8 @@ fn write_fetch_result(
             // Align with StarRocks BE: EOS closes the stream with packet_seq/eos only
             // and does not send an empty TResultBatch attachment.
             if !(result.eos && result.result_batch.rows.is_empty()) {
-                result.result_batch.packet_seq = result.packet_seq;
-                let bytes = thrift_serialize_result_batch(&result.result_batch);
+                let batch = wire_result_batch_from_native(result.result_batch, result.packet_seq);
+                let bytes = thrift_serialize_result_batch(&batch);
                 let boxed = bytes.into_boxed_slice();
                 let len = boxed.len();
                 let ptr = Box::into_raw(boxed) as *mut u8;
@@ -1049,12 +1062,7 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::thrift::data::TResultBatch::new(
-                    vec![b"row".to_vec()],
-                    false,
-                    0,
-                    None,
-                ),
+                result_batch: ResultBatch::new(vec![b"row".to_vec()], false, 0, None),
             },
         );
 

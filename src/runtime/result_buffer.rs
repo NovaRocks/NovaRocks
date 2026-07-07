@@ -18,6 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::common::result_batch::ResultBatch;
 use crate::common::types::{FetchResult, UniqueId};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 
@@ -52,7 +53,7 @@ struct BufferControlBlock {
     cancel_message: Option<String>,
     next_packet_seq: i64,
     mem_tracker: Option<Arc<MemTracker>>,
-    eos_template: Option<crate::thrift::data::TResultBatch>,
+    eos_template: Option<ResultBatch>,
 }
 
 impl BufferControlBlock {
@@ -78,10 +79,7 @@ impl BufferControlBlock {
         FetchResult {
             packet_seq: seq,
             eos: true,
-            result_batch: self
-                .eos_template
-                .clone()
-                .unwrap_or_else(|| crate::thrift::data::TResultBatch::new(vec![], false, 0, None)),
+            result_batch: self.eos_template.clone().unwrap_or_else(ResultBatch::empty),
         }
     }
 
@@ -167,16 +165,7 @@ impl TrackedFetchResult {
 }
 
 fn fetch_result_bytes(result: &FetchResult) -> usize {
-    let mut total = 0usize;
-    let rows = &result.result_batch.rows;
-    total = total.saturating_add(
-        rows.capacity()
-            .saturating_mul(std::mem::size_of::<Vec<u8>>()),
-    );
-    for row in rows {
-        total = total.saturating_add(row.capacity().max(row.len()));
-    }
-    total
+    result.result_batch.heap_size_bytes()
 }
 
 #[derive(Debug, Clone)]
@@ -370,7 +359,7 @@ pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {
     }
 }
 
-pub(crate) fn set_eos_template(finst_id: UniqueId, template: crate::thrift::data::TResultBatch) {
+pub(crate) fn set_eos_template(finst_id: UniqueId, template: ResultBatch) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
     let block = guard
@@ -433,7 +422,7 @@ fn try_fetch_inner(
     if block.mode == Some(ResultBufferMode::Typed) {
         return TryFetchResult::Error(FetchError {
             kind: FetchErrorKind::Failed,
-            message: "typed result buffer cannot be fetched as legacy TResultBatch".to_string(),
+            message: "typed result buffer cannot be fetched as legacy result batch".to_string(),
         });
     }
     if let Some(result) = block.pop_next() {
@@ -651,12 +640,7 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::thrift::data::TResultBatch::new(
-                    vec![b"a".to_vec()],
-                    false,
-                    0,
-                    None,
-                ),
+                result_batch: ResultBatch::new(vec![b"a".to_vec()], false, 0, None),
             },
         );
         insert(
@@ -664,12 +648,7 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::thrift::data::TResultBatch::new(
-                    vec![b"b".to_vec()],
-                    false,
-                    0,
-                    None,
-                ),
+                result_batch: ResultBatch::new(vec![b"b".to_vec()], false, 0, None),
             },
         );
         close_ok(finst_id);
@@ -712,12 +691,7 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::thrift::data::TResultBatch::new(
-                    vec![b"row".to_vec()],
-                    false,
-                    0,
-                    None,
-                ),
+                result_batch: ResultBatch::new(vec![b"row".to_vec()], false, 0, None),
             },
         );
 
@@ -769,12 +743,7 @@ mod tests {
                 FetchResult {
                     packet_seq: 0,
                     eos: false,
-                    result_batch: crate::thrift::data::TResultBatch::new(
-                        vec![b"wait_data".to_vec()],
-                        false,
-                        0,
-                        None,
-                    ),
+                    result_batch: ResultBatch::new(vec![b"wait_data".to_vec()], false, 0, None),
                 },
             );
         });
@@ -839,12 +808,7 @@ mod tests {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: crate::thrift::data::TResultBatch::new(
-                    vec![b"row".to_vec()],
-                    false,
-                    0,
-                    None,
-                ),
+                result_batch: ResultBatch::new(vec![b"row".to_vec()], false, 0, None),
             },
         );
 

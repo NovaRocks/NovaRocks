@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use crate::common::result_batch::ResultBatch;
 use crate::common::types::{FetchResult, UniqueId};
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -115,6 +116,15 @@ struct ResultBufferSinkOperator {
     finished: bool,
 }
 
+fn native_result_batch_from_wire(batch: crate::thrift::data::TResultBatch) -> ResultBatch {
+    ResultBatch::new(
+        batch.rows,
+        batch.is_compressed,
+        batch.packet_seq,
+        batch.statistic_version,
+    )
+}
+
 impl ResultBufferSinkOperator {
     fn finst_id(&self, state: &RuntimeState) -> Result<UniqueId, String> {
         state
@@ -131,7 +141,7 @@ impl ResultBufferSinkOperator {
             self.result_sink_type,
             self.result_sink_format,
         )?;
-        result_buffer::set_eos_template(finst_id, template);
+        result_buffer::set_eos_template(finst_id, native_result_batch_from_wire(template));
         Ok(finst_id)
     }
 
@@ -196,7 +206,7 @@ impl ProcessorOperator for ResultBufferSinkOperator {
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: batch,
+                result_batch: native_result_batch_from_wire(batch),
             },
         );
         Ok(())
