@@ -935,24 +935,30 @@ fn merge_counter_values(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_native_counter_strategy, native_profile_tree_to_thrift, CounterAggregateType,
-        ProfileUnit, RuntimeProfile, ROOT_COUNTER,
+        default_counter_strategy, default_native_counter_strategy, native_profile_tree_to_thrift,
+        CounterAggregateType, ProfileUnit, RuntimeProfile, ROOT_COUNTER,
     };
     use crate::proto::novarocks;
-    use crate::thrift::metrics;
+    use crate::thrift::{metrics, runtime_profile};
 
     #[test]
     fn native_profile_unit_roundtrips_proto_values() {
-        assert_eq!(
-            ProfileUnit::from_proto(novarocks::ProfileUnit::Unit as i32).expect("UNIT converts"),
-            ProfileUnit::Unit
-        );
-        assert_eq!(
-            ProfileUnit::from_proto(novarocks::ProfileUnit::TimeNs as i32)
-                .expect("TIME_NS converts"),
-            ProfileUnit::TimeNs
-        );
-        assert_eq!(ProfileUnit::None.to_proto(), novarocks::ProfileUnit::None);
+        let cases = [
+            (ProfileUnit::Unit, novarocks::ProfileUnit::Unit),
+            (ProfileUnit::CpuTicks, novarocks::ProfileUnit::CpuTicks),
+            (ProfileUnit::Bytes, novarocks::ProfileUnit::Bytes),
+            (ProfileUnit::TimeNs, novarocks::ProfileUnit::TimeNs),
+            (ProfileUnit::TimeMs, novarocks::ProfileUnit::TimeMs),
+            (ProfileUnit::TimeS, novarocks::ProfileUnit::TimeS),
+            (ProfileUnit::None, novarocks::ProfileUnit::None),
+        ];
+        for (unit, proto) in cases {
+            assert_eq!(
+                ProfileUnit::from_proto(proto as i32).expect("valid unit converts"),
+                unit
+            );
+            assert_eq!(unit.to_proto(), proto);
+        }
         assert!(
             ProfileUnit::from_proto(novarocks::ProfileUnit::Unspecified as i32).is_err(),
             "unspecified proto unit must not silently become a runtime unit"
@@ -961,22 +967,44 @@ mod tests {
 
     #[test]
     fn native_counter_strategy_defaults_match_existing_merge_behavior() {
-        assert_eq!(
-            default_native_counter_strategy(ProfileUnit::TimeNs).aggregate_type(),
-            CounterAggregateType::Avg
-        );
-        assert_eq!(
-            default_native_counter_strategy(ProfileUnit::TimeMs).aggregate_type(),
-            CounterAggregateType::Avg
-        );
-        assert_eq!(
-            default_native_counter_strategy(ProfileUnit::Bytes).aggregate_type(),
-            CounterAggregateType::Sum
-        );
-        assert_eq!(
-            default_native_counter_strategy(ProfileUnit::Unit).aggregate_type(),
-            CounterAggregateType::Sum
-        );
+        let cases = [
+            (ProfileUnit::Unit, metrics::TUnit::UNIT),
+            (ProfileUnit::CpuTicks, metrics::TUnit::CPU_TICKS),
+            (ProfileUnit::Bytes, metrics::TUnit::BYTES),
+            (ProfileUnit::TimeNs, metrics::TUnit::TIME_NS),
+            (ProfileUnit::TimeMs, metrics::TUnit::TIME_MS),
+            (ProfileUnit::TimeS, metrics::TUnit::TIME_S),
+            (ProfileUnit::None, metrics::TUnit::NONE),
+        ];
+        for (native_unit, thrift_unit) in cases {
+            let native_aggregate = default_native_counter_strategy(native_unit).aggregate_type();
+            let thrift_aggregate =
+                native_aggregate_from_thrift(default_counter_strategy(thrift_unit));
+            assert_eq!(
+                native_aggregate, thrift_aggregate,
+                "native strategy for {native_unit:?} must match thrift default strategy"
+            );
+        }
+    }
+
+    fn native_aggregate_from_thrift(
+        strategy: runtime_profile::TCounterStrategy,
+    ) -> CounterAggregateType {
+        match strategy.aggregate_type.0 {
+            value if value == runtime_profile::TCounterAggregateType::SUM.0 => {
+                CounterAggregateType::Sum
+            }
+            value if value == runtime_profile::TCounterAggregateType::AVG.0 => {
+                CounterAggregateType::Avg
+            }
+            value if value == runtime_profile::TCounterAggregateType::SUM_AVG.0 => {
+                CounterAggregateType::SumAvg
+            }
+            value if value == runtime_profile::TCounterAggregateType::AVG_SUM.0 => {
+                CounterAggregateType::AvgSum
+            }
+            value => panic!("unexpected thrift aggregate type {value}"),
+        }
     }
 
     #[test]
