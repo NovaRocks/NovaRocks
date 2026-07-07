@@ -18,7 +18,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::common::result_batch::ResultBatch;
 use crate::common::types::{FetchResult, UniqueId};
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -26,9 +25,9 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::result_buffer;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::result_batch_wire::{
-    build_empty_fetch_result_batch_template, build_fetch_result_batch_for_chunk,
+    ResultProjection, ResultSinkConfig, ResultSinkType, build_empty_fetch_result_batch_template,
+    build_fetch_result_batch_for_chunk,
 };
-use crate::thrift::{data_sinks, exprs};
 
 #[derive(Debug)]
 struct ResultBufferSinkShared {
@@ -53,18 +52,16 @@ impl ResultBufferSinkShared {
 /// Factory for result sinks that stream encoded batches directly into the fetch result buffer.
 pub struct ResultBufferSinkFactory {
     name: String,
-    output_exprs: Option<Vec<exprs::TExpr>>,
-    result_sink_type: Option<data_sinks::TResultSinkType>,
-    result_sink_format: Option<data_sinks::TResultSinkFormatType>,
+    output_projections: Option<Vec<ResultProjection>>,
+    result_sink_config: ResultSinkConfig,
     typed_result_sink: bool,
     shared: Arc<ResultBufferSinkShared>,
 }
 
 impl ResultBufferSinkFactory {
     pub fn new(
-        output_exprs: Option<Vec<exprs::TExpr>>,
-        result_sink_type: Option<data_sinks::TResultSinkType>,
-        result_sink_format: Option<data_sinks::TResultSinkFormatType>,
+        output_projections: Option<Vec<ResultProjection>>,
+        result_sink_config: ResultSinkConfig,
         plan_node_id: Option<i32>,
         typed_result_sink: bool,
     ) -> Self {
@@ -74,9 +71,8 @@ impl ResultBufferSinkFactory {
         };
         Self {
             name: format!("RESULT_BUFFER_SINK (plan_node_id={plan_node_id})"),
-            output_exprs,
-            result_sink_type,
-            result_sink_format,
+            output_projections,
+            result_sink_config,
             typed_result_sink,
             shared: Arc::new(ResultBufferSinkShared::new()),
         }
@@ -92,9 +88,8 @@ impl OperatorFactory for ResultBufferSinkFactory {
         self.shared.init_driver_count(dop);
         Box::new(ResultBufferSinkOperator {
             name: self.name.clone(),
-            output_exprs: self.output_exprs.clone(),
-            result_sink_type: self.result_sink_type,
-            result_sink_format: self.result_sink_format,
+            output_projections: self.output_projections.clone(),
+            result_sink_config: self.result_sink_config,
             typed_result_sink: self.typed_result_sink,
             shared: Arc::clone(&self.shared),
             finished: false,
@@ -108,21 +103,11 @@ impl OperatorFactory for ResultBufferSinkFactory {
 
 struct ResultBufferSinkOperator {
     name: String,
-    output_exprs: Option<Vec<exprs::TExpr>>,
-    result_sink_type: Option<data_sinks::TResultSinkType>,
-    result_sink_format: Option<data_sinks::TResultSinkFormatType>,
+    output_projections: Option<Vec<ResultProjection>>,
+    result_sink_config: ResultSinkConfig,
     typed_result_sink: bool,
     shared: Arc<ResultBufferSinkShared>,
     finished: bool,
-}
-
-fn native_result_batch_from_wire(batch: crate::thrift::data::TResultBatch) -> ResultBatch {
-    ResultBatch::new(
-        batch.rows,
-        batch.is_compressed,
-        batch.packet_seq,
-        batch.statistic_version,
-    )
 }
 
 impl ResultBufferSinkOperator {
@@ -137,19 +122,15 @@ impl ResultBufferSinkOperator {
         if self.typed_result_sink {
             return Ok(finst_id);
         }
-        let template = build_empty_fetch_result_batch_template(
-            self.result_sink_type,
-            self.result_sink_format,
-        )?;
-        result_buffer::set_eos_template(finst_id, native_result_batch_from_wire(template));
+        let template = build_empty_fetch_result_batch_template(self.result_sink_config)?;
+        result_buffer::set_eos_template(finst_id, template);
         Ok(finst_id)
     }
 
     fn validate_typed_result_sink(&self) -> Result<(), String> {
-        match self.result_sink_type {
-            None => Ok(()),
-            Some(t) if t == data_sinks::TResultSinkType::MYSQL_PROTOCAL => Ok(()),
-            Some(other) => Err(format!(
+        match self.result_sink_config.sink_type {
+            ResultSinkType::MySqlProtocol => Ok(()),
+            other => Err(format!(
                 "typed RESULT_SINK only supports MYSQL_PROTOCAL result sink, got {:?}",
                 other
             )),
@@ -197,16 +178,15 @@ impl ProcessorOperator for ResultBufferSinkOperator {
         }
         let batch = build_fetch_result_batch_for_chunk(
             &chunk,
-            self.output_exprs.as_deref(),
-            self.result_sink_type,
-            self.result_sink_format,
+            self.output_projections.as_deref(),
+            self.result_sink_config,
         )?;
         result_buffer::insert(
             finst_id,
             FetchResult {
                 packet_seq: 0,
                 eos: false,
-                result_batch: native_result_batch_from_wire(batch),
+                result_batch: batch,
             },
         );
         Ok(())

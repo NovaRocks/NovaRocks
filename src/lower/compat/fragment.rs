@@ -24,6 +24,7 @@ use crate::exec::row_position::RowPositionDescriptor;
 use crate::novarocks_connectors::ConnectorRegistry;
 
 use crate::common::config::debug_exec_node_output;
+use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::operators::{
     DataStreamSinkFactory, IcebergChangeStreamRouterSinkFactory, IcebergTableSinkFactory,
@@ -40,12 +41,19 @@ use crate::lower::compat::layout::{
     build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots,
 };
 use crate::lower::compat::node::{Lowered, PlanOrigin, lower_plan};
+use crate::lower::compat::type_lowering::{
+    native_primitive_type_from_desc, render_schema_from_type_desc,
+};
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+use crate::service::result_batch_wire::{
+    ResultProjection, ResultSinkConfig, thrift_statistic_row_encoder,
+};
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
+use crate::types::PrimitiveType;
 
 fn merge_row_pos_descs(
     target: &mut HashMap<i32, RowPositionDescriptor>,
@@ -148,6 +156,72 @@ fn iceberg_sink_type_name(t: data_sinks::TDataSinkType) -> &'static str {
         data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK => "ICEBERG_EQUALITY_DELETE_SINK",
         _ => "ICEBERG_TABLE_SINK",
     }
+}
+
+fn result_sink_config_from_thrift(
+    result_sink: &data_sinks::TResultSink,
+) -> Result<ResultSinkConfig, String> {
+    let sink_type = result_sink
+        .type_
+        .unwrap_or(data_sinks::TResultSinkType::MYSQL_PROTOCAL);
+    match sink_type {
+        t if t == data_sinks::TResultSinkType::MYSQL_PROTOCAL => Ok(ResultSinkConfig::mysql()),
+        t if t == data_sinks::TResultSinkType::HTTP_PROTOCAL => {
+            let format = result_sink
+                .format
+                .unwrap_or(data_sinks::TResultSinkFormatType::JSON);
+            if format != data_sinks::TResultSinkFormatType::JSON {
+                return Err(format!(
+                    "HTTP_PROTOCAL result sink only supports JSON format, got {:?}",
+                    format
+                ));
+            }
+            Ok(ResultSinkConfig::http_json())
+        }
+        t if t == data_sinks::TResultSinkType::STATISTIC => {
+            Ok(ResultSinkConfig::statistic(thrift_statistic_row_encoder))
+        }
+        other => Err(format!("unsupported RESULT_SINK type {:?}", other)),
+    }
+}
+
+fn result_projection_from_thrift_expr(
+    expr: &crate::thrift::exprs::TExpr,
+    idx: usize,
+) -> Result<ResultProjection, String> {
+    let root = expr
+        .nodes
+        .first()
+        .ok_or_else(|| format!("RESULT_SINK output_exprs[{idx}] is empty"))?;
+    if root.node_type != crate::thrift::exprs::TExprNodeType::SLOT_REF {
+        return Err(format!(
+            "RESULT_SINK output_exprs[{idx}] unsupported node_type {:?} (expected SLOT_REF)",
+            root.node_type
+        ));
+    }
+    let slot = root
+        .slot_ref
+        .as_ref()
+        .ok_or_else(|| format!("RESULT_SINK output_exprs[{idx}] missing slot_ref payload"))?;
+    Ok(ResultProjection {
+        slot_id: SlotId::try_from(slot.slot_id)?,
+        primitive: native_primitive_type_from_desc(&root.type_).unwrap_or(PrimitiveType::Invalid),
+        field_schema: render_schema_from_type_desc(&root.type_)?,
+    })
+}
+
+fn result_projections_from_thrift_exprs(
+    output_exprs: Option<&Vec<crate::thrift::exprs::TExpr>>,
+) -> Result<Option<Vec<ResultProjection>>, String> {
+    let Some(output_exprs) = output_exprs.filter(|exprs| !exprs.is_empty()) else {
+        return Ok(None);
+    };
+    output_exprs
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| result_projection_from_thrift_expr(expr, idx))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 pub(crate) fn execute_fragment(
@@ -464,10 +538,12 @@ pub(crate) fn execute_fragment(
                     .result_sink
                     .as_ref()
                     .ok_or_else(|| "RESULT_SINK missing result_sink payload".to_string())?;
+                let result_sink_config = result_sink_config_from_thrift(result_sink)?;
+                let output_projections =
+                    result_projections_from_thrift_exprs(fragment.output_exprs.as_ref())?;
                 let sink_factory = ResultBufferSinkFactory::new(
-                    fragment.output_exprs.clone(),
-                    result_sink.type_,
-                    result_sink.format,
+                    output_projections,
+                    result_sink_config,
                     None,
                     typed_result_sink,
                 );

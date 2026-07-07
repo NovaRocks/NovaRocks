@@ -34,7 +34,6 @@ pub(crate) type IcebergChangeStreamRouterBranchKind =
 pub(crate) type IcebergChangeStreamRouterSink = data_sinks::TIcebergChangeStreamRouterSink;
 pub(crate) type MultiCastDataStreamSink = data_sinks::TMultiCastDataStreamSink;
 pub(crate) type DataPartition = partitions::TDataPartition;
-pub(crate) type ResultSinkType = data_sinks::TResultSinkType;
 
 #[cfg(test)]
 pub(crate) type SpillMode = internal_service::TSpillMode;

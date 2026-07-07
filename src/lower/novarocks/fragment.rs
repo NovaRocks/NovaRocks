@@ -41,6 +41,7 @@ use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::result_buffer;
+use crate::service::result_batch_wire::ResultSinkConfig;
 use crate::{connector, proto};
 
 pub(crate) fn execute_fragment_native(
@@ -249,8 +250,7 @@ fn sink_factory_from_native(
             }
             Ok(Box::new(ResultBufferSinkFactory::new(
                 None,
-                Some(native_wire::ResultSinkType::MYSQL_PROTOCAL),
-                None,
+                ResultSinkConfig::mysql(),
                 None,
                 typed_result_sink,
             )))
