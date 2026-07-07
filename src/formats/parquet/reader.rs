@@ -116,8 +116,7 @@ mod tests {
 
     use crate::cache::{DataCacheManager, DataCachePageCacheOptions};
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
-    use crate::runtime::profile::RuntimeProfile;
-    use crate::thrift::metrics;
+    use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 
     use super::{ParquetCachedReader, ParquetReadCachePolicy};
 
@@ -146,7 +145,7 @@ mod tests {
         );
 
         let first = reader.get_bytes(0, 1024).expect("first page-cache read");
-        let read_requests = profile.add_counter("ReadRequests", metrics::TUnit::UNIT);
+        let read_requests = profile.add_counter("ReadRequests", ProfileUnit::Unit);
         assert_eq!(first.len(), 1024);
         assert_eq!(read_requests.value(), 1);
 

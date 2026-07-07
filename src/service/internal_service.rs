@@ -29,7 +29,7 @@ use crate::lower::compat::fragment::execute_fragment;
 use crate::lower::compat::node::hdfs_scan::cache_iceberg_table_locations;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
+use crate::runtime::profile::{ProfileUnit, Profiler};
 use crate::runtime::query_context::{
     QueryContextManager, QueryId, desc_tbl_is_cached, is_desc_tbl_effectively_empty,
     observe_total_fragments, query_context_manager, query_expire_durations,
@@ -423,11 +423,7 @@ fn spawn_exec_fragment(
         if let Some(p) = profiler_for_wall.as_ref() {
             let elapsed_ns =
                 crate::runtime::profile::clamp_u128_to_i64(wall_start.elapsed().as_nanos());
-            p.counter_set(
-                "QueryExecutionWallTime",
-                crate::thrift::metrics::TUnit::TIME_NS,
-                elapsed_ns,
-            );
+            p.counter_set("QueryExecutionWallTime", ProfileUnit::TimeNs, elapsed_ns);
         }
         let mut report_error: Option<String> = None;
         if uses_fetch_result_buffer {

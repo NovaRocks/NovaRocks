@@ -17,8 +17,7 @@
 use crate::common::file_identity::FileIdentity;
 use crate::novarocks_logging::debug;
 use crate::runtime::global_async_runtime::data_runtime;
-use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
-use crate::thrift::metrics;
+use crate::runtime::profile::{CounterRef, ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use opendal::Operator;
@@ -191,16 +190,16 @@ impl OpendalRemoteIoCounters {
     fn new(profile: &RuntimeProfile) -> Self {
         let _ = profile.add_child_counter(
             INPUT_STREAM_PROFILE_GROUP,
-            metrics::TUnit::NONE,
+            ProfileUnit::None,
             IO_TASK_EXEC_TIME_COUNTER,
         );
         Self {
-            read_requests: profile.add_counter("ReadRequests", metrics::TUnit::UNIT),
-            bytes_read: profile.add_counter("BytesRead", metrics::TUnit::BYTES),
+            read_requests: profile.add_counter("ReadRequests", ProfileUnit::Unit),
+            bytes_read: profile.add_counter("BytesRead", ProfileUnit::Bytes),
             app_io_time: profile.add_child_timer("AppIOTime", INPUT_STREAM_PROFILE_GROUP),
             fs_io_time: profile.add_child_timer("FSIOTime", INPUT_STREAM_PROFILE_GROUP),
             remote_read_in_flight_peak: profile
-                .add_counter("RemoteReadInFlightPeak", metrics::TUnit::UNIT),
+                .add_counter("RemoteReadInFlightPeak", ProfileUnit::Unit),
             observed_remote_read_peak: Arc::new(AtomicI64::new(0)),
         }
     }

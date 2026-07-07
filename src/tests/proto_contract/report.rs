@@ -1,8 +1,7 @@
 use prost::Message;
 
 use crate::proto::{common, novarocks};
-use crate::runtime::profile::RuntimeProfile;
-use crate::thrift::metrics;
+use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 
 fn roundtrip_message<M>(value: &M) -> M
 where
@@ -19,7 +18,7 @@ fn runtime_profile_tree_survives_proto_roundtrip() {
 
     let z_root = root.add_unit_counter("ZRoot");
     z_root.set(300);
-    let none_counter = root.add_child_counter("NoUnitCounter", metrics::TUnit::NONE, "ZRoot");
+    let none_counter = root.add_child_counter("NoUnitCounter", ProfileUnit::None, "ZRoot");
     none_counter.set(0);
 
     let total_time = root.add_timer("TotalTime");
@@ -37,7 +36,7 @@ fn runtime_profile_tree_survives_proto_roundtrip() {
     scan.add_info_string("table", "lineitem");
     scan.counter_set_bytes("DataCacheReadBytes", 4096);
 
-    let rows_read = scan.add_child_counter("RowsRead", metrics::TUnit::UNIT, "DataCacheReadBytes");
+    let rows_read = scan.add_child_counter("RowsRead", ProfileUnit::Unit, "DataCacheReadBytes");
     rows_read.set(8);
     rows_read.set_min(4);
     rows_read.set_max(12);
@@ -45,7 +44,7 @@ fn runtime_profile_tree_survives_proto_roundtrip() {
     let exchange = root.child("EXCHANGE (plan_node_id=2)");
     exchange.set_metadata(2);
     exchange.add_info_string("partition", "HASH");
-    exchange.counter_set("NetworkTime", metrics::TUnit::TIME_MS, 9);
+    exchange.counter_set("NetworkTime", ProfileUnit::TimeMs, 9);
 
     let decoded: novarocks::RuntimeProfileTree = roundtrip_message(&root.to_proto());
     let decoded_root = decoded.root.expect("profile root");

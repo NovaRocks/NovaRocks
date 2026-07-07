@@ -32,7 +32,7 @@ use crate::proto::novarocks;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
+use crate::runtime::profile::{ProfileUnit, Profiler};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime::sink_commit;
@@ -41,9 +41,7 @@ use crate::service::exec_status_report::{self, ExecStatusReportInput};
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::report_worker;
 use crate::service::standalone_exec_state_reporter::{self, StandaloneExecStateReportTask};
-use crate::thrift::{
-    data_cache, frontend_service, metrics, runtime_profile, status, status_code, types,
-};
+use crate::thrift::{data_cache, frontend_service, runtime_profile, status, status_code, types};
 
 #[derive(Clone, Debug)]
 enum ReportDestination {
@@ -648,26 +646,22 @@ fn build_merged_profile_for_report(
     if let Some(tracker) = mem_tracker {
         merged.counter_set(
             "InstancePeakMemoryUsage",
-            metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             tracker.peak(),
         );
         merged.counter_set(
             "InstanceAllocatedMemoryUsage",
-            metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             tracker.allocated(),
         );
         merged.counter_set(
             "InstanceDeallocatedMemoryUsage",
-            metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             tracker.deallocated(),
         );
     }
     if let Some(tracker) = query_mem_tracker {
-        merged.counter_set(
-            "QueryPeakMemoryUsage",
-            metrics::TUnit::BYTES,
-            tracker.peak(),
-        );
+        merged.counter_set("QueryPeakMemoryUsage", ProfileUnit::Bytes, tracker.peak());
     }
     Some(merged)
 }

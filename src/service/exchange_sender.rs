@@ -25,7 +25,7 @@ use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::{debug, error};
 use crate::runtime::io::io_executor;
 use crate::runtime::mem_tracker::TrackedBytes;
-use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
+use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::service::internal_rpc_transport::{
     InternalRpcTransport, internal_rpc_transport_for_current_process,
@@ -407,20 +407,20 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
     if let Some(profile) = task.profiles.as_ref() {
         profile
             .common
-            .counter_add("RequestSent", crate::thrift::metrics::TUnit::UNIT, 1);
+            .counter_add("RequestSent", ProfileUnit::Unit, 1);
         profile.common.counter_add(
             "BytesSent",
-            crate::thrift::metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             clamp_u128_to_i64(task.payload_bytes as u128),
         );
         profile.unique.counter_add(
             "NetworkTime",
-            crate::thrift::metrics::TUnit::TIME_NS,
+            ProfileUnit::TimeNs,
             clamp_u128_to_i64(send_ns),
         );
         profile.common.counter_add(
             "OverallTime",
-            crate::thrift::metrics::TUnit::TIME_NS,
+            ProfileUnit::TimeNs,
             clamp_u128_to_i64(task.encode_ns.saturating_add(send_ns)),
         );
     }

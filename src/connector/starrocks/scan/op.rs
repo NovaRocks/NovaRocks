@@ -28,9 +28,8 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_logging::{info, warn};
-use crate::runtime::profile::RuntimeProfile;
+use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 use crate::runtime::starlet_shard_registry;
-use crate::thrift::metrics;
 use crate::thrift::types;
 
 use super::reader::StarRocksNativeReader;
@@ -237,7 +236,7 @@ impl StarRocksScanIter {
         if let Some(profile) = self.profile.as_ref() {
             profile.counter_add(
                 "ScannerOpenTime",
-                metrics::TUnit::TIME_NS,
+                ProfileUnit::TimeNs,
                 open_start.elapsed().as_nanos() as i64,
             );
         }
@@ -292,15 +291,11 @@ impl Iterator for StarRocksScanIter {
                 }
                 Ok(ScanBatch::Chunk(chunk, rows, bytes)) => {
                     if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add("ExternalRowsRead", metrics::TUnit::UNIT, rows as i64);
-                        profile.counter_add(
-                            "ExternalBytesRead",
-                            metrics::TUnit::BYTES,
-                            bytes as i64,
-                        );
+                        profile.counter_add("ExternalRowsRead", ProfileUnit::Unit, rows as i64);
+                        profile.counter_add("ExternalBytesRead", ProfileUnit::Bytes, bytes as i64);
                         profile.counter_add(
                             "ScannerGetNextTime",
-                            metrics::TUnit::TIME_NS,
+                            ProfileUnit::TimeNs,
                             batch_start.elapsed().as_nanos() as i64,
                         );
                     }

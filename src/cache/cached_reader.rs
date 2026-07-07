@@ -29,8 +29,7 @@ use crate::common::file_identity::FileIdentity;
 use crate::fs::coalesced_reader::{CoalescedRangeReader, CoalescedReadOptions};
 use crate::fs::opendal::OpendalRangeReader;
 use crate::fs::range_plan::PlannedIoRanges;
-use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
-use crate::thrift::metrics;
+use crate::runtime::profile::{CounterRef, ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
 
 #[derive(Clone, Debug)]
 pub(crate) struct CacheIoCounters {
@@ -47,19 +46,15 @@ pub(crate) struct CacheIoCounters {
 impl CacheIoCounters {
     fn new(profile: &RuntimeProfile) -> Self {
         Self {
-            cache_read_requests: profile.add_counter("CacheReadRequests", metrics::TUnit::UNIT),
-            bytes_read_from_cache: profile.add_counter("BytesReadFromCache", metrics::TUnit::BYTES),
-            datacache_read_counter: profile
-                .add_counter("DataCacheReadCounter", metrics::TUnit::UNIT),
-            datacache_read_bytes: profile.add_counter("DataCacheReadBytes", metrics::TUnit::BYTES),
-            datacache_read_timer: profile
-                .add_counter("DataCacheReadTimer", metrics::TUnit::TIME_NS),
+            cache_read_requests: profile.add_counter("CacheReadRequests", ProfileUnit::Unit),
+            bytes_read_from_cache: profile.add_counter("BytesReadFromCache", ProfileUnit::Bytes),
+            datacache_read_counter: profile.add_counter("DataCacheReadCounter", ProfileUnit::Unit),
+            datacache_read_bytes: profile.add_counter("DataCacheReadBytes", ProfileUnit::Bytes),
+            datacache_read_timer: profile.add_counter("DataCacheReadTimer", ProfileUnit::TimeNs),
             datacache_write_counter: profile
-                .add_counter("DataCacheWriteCounter", metrics::TUnit::UNIT),
-            datacache_write_bytes: profile
-                .add_counter("DataCacheWriteBytes", metrics::TUnit::BYTES),
-            datacache_write_timer: profile
-                .add_counter("DataCacheWriteTimer", metrics::TUnit::TIME_NS),
+                .add_counter("DataCacheWriteCounter", ProfileUnit::Unit),
+            datacache_write_bytes: profile.add_counter("DataCacheWriteBytes", ProfileUnit::Bytes),
+            datacache_write_timer: profile.add_counter("DataCacheWriteTimer", ProfileUnit::TimeNs),
         }
     }
 }
@@ -365,8 +360,7 @@ mod tests {
     use crate::cache::{CacheOptions, DataCacheManager};
     use crate::fs::opendal::OpendalRangeReaderFactory;
     use crate::fs::opendal::build_fs_operator;
-    use crate::runtime::profile::RuntimeProfile;
-    use crate::thrift::metrics;
+    use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 
     use super::CachedRangeReader;
 
@@ -438,7 +432,7 @@ mod tests {
         let cached = CachedRangeReader::new(reader, Some(ctx));
 
         let first = cached.read_bytes(0, 4).expect("first read");
-        let read_requests = profile.add_counter("ReadRequests", metrics::TUnit::UNIT);
+        let read_requests = profile.add_counter("ReadRequests", ProfileUnit::Unit);
         assert_eq!(first.as_ref(), b"abcd");
         assert_eq!(read_requests.value(), 1);
 

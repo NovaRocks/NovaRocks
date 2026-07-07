@@ -50,10 +50,9 @@ use crate::exec::runtime_filter::{
     filter_chunk_by_min_max_filters_with_exprs_and_dict_cache,
 };
 use crate::novarocks_logging::debug;
-use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
+use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_filter_hub::{AcquiredRuntimeFilters, RuntimeFilterSnapshot};
 use crate::runtime::runtime_filter_observability::RfLifecycleHandle;
-use crate::thrift::metrics;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
 use roaring::RoaringTreemap;
@@ -92,7 +91,7 @@ impl IoExecScope {
         {
             p.unique.counter_add(
                 "IOTaskWaitTime",
-                metrics::TUnit::TIME_NS,
+                ProfileUnit::TimeNs,
                 clamp_u128_to_i64(idle_ns),
             );
         }
@@ -112,10 +111,10 @@ impl Drop for IoExecScope {
         let elapsed_ns = clamp_u128_to_i64(elapsed_ns);
         profiles
             .unique
-            .counter_add(IO_TASK_EXEC_TIME, metrics::TUnit::TIME_NS, elapsed_ns);
+            .counter_add(IO_TASK_EXEC_TIME, ProfileUnit::TimeNs, elapsed_ns);
         profiles
             .unique
-            .counter_add(SCAN_TIME, metrics::TUnit::TIME_NS, elapsed_ns);
+            .counter_add(SCAN_TIME, ProfileUnit::TimeNs, elapsed_ns);
     }
 }
 
@@ -455,19 +454,19 @@ impl ScanAsyncRunner {
             profile.common.add_timer(JOIN_RUNTIME_FILTER_HASH_TIME);
             profile
                 .common
-                .add_counter(JOIN_RUNTIME_FILTER_INPUT_ROWS, metrics::TUnit::UNIT);
+                .add_counter(JOIN_RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit);
             profile
                 .common
-                .add_counter(JOIN_RUNTIME_FILTER_OUTPUT_ROWS, metrics::TUnit::UNIT);
+                .add_counter(JOIN_RUNTIME_FILTER_OUTPUT_ROWS, ProfileUnit::Unit);
             profile
                 .common
-                .add_counter(JOIN_RUNTIME_FILTER_EVALUATE, metrics::TUnit::UNIT);
+                .add_counter(JOIN_RUNTIME_FILTER_EVALUATE, ProfileUnit::Unit);
             profile
                 .common
-                .add_counter(RUNTIME_FILTER_NUM, metrics::TUnit::UNIT);
+                .add_counter(RUNTIME_FILTER_NUM, ProfileUnit::Unit);
             profile
                 .common
-                .add_counter(RUNTIME_IN_FILTER_NUM, metrics::TUnit::UNIT);
+                .add_counter(RUNTIME_IN_FILTER_NUM, ProfileUnit::Unit);
         }
         if let AcquiredRuntimeFilters::Complete(snapshot) = &acquired {
             self.runtime_filter_dict_fold_cache.clear();
@@ -487,25 +486,25 @@ impl ScanAsyncRunner {
                     let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
                     profile
                         .common
-                        .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+                        .counter_set(&name, ProfileUnit::TimeNs, latency_ns);
                 }
                 for filter in snapshot.membership_filters() {
                     let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
                     profile
                         .common
-                        .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+                        .counter_set(&name, ProfileUnit::TimeNs, latency_ns);
                 }
             }
             self.log_runtime_filters_loaded(snapshot.in_filters(), snapshot.membership_filters());
             if let Some(profile) = self.profiles.as_ref() {
                 profile.common.counter_set(
                     RUNTIME_FILTER_NUM,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     snapshot.membership_filters().len() as i64,
                 );
                 profile.common.counter_set(
                     RUNTIME_IN_FILTER_NUM,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     snapshot.in_filters().len() as i64,
                 );
             }
@@ -646,7 +645,7 @@ impl ScanAsyncRunner {
                             let rows = i64::try_from(filtered.len()).unwrap_or(i64::MAX);
                             profile
                                 .unique
-                                .counter_add("RowsRead", metrics::TUnit::UNIT, rows);
+                                .counter_add("RowsRead", ProfileUnit::Unit, rows);
                         }
                         return Ok(Some(filtered));
                     }
@@ -1453,12 +1452,12 @@ impl ScanAsyncRunner {
                 if let Some(profile) = self.profiles.as_ref() {
                     profile.common.counter_add(
                         JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                        metrics::TUnit::UNIT,
+                        ProfileUnit::Unit,
                         input_rows as i64,
                     );
                     profile.common.counter_add(
                         JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                        metrics::TUnit::UNIT,
+                        ProfileUnit::Unit,
                         input_rows as i64,
                     );
                 }
@@ -1470,12 +1469,12 @@ impl ScanAsyncRunner {
             if let Some(profile) = self.profiles.as_ref() {
                 profile.common.counter_add(
                     JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     input_rows as i64,
                 );
                 profile.common.counter_add(
                     JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     input_rows as i64,
                 );
             }
@@ -1494,18 +1493,18 @@ impl ScanAsyncRunner {
             let output_rows = result.as_ref().map(|c| c.len()).unwrap_or(0) as i64;
             profile.common.counter_add(
                 JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 input_rows as i64,
             );
             profile.common.counter_add(
                 JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 output_rows,
             );
             if filters_len > 0 {
                 profile.common.counter_add(
                     JOIN_RUNTIME_FILTER_EVALUATE,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     filters_len,
                 );
             }

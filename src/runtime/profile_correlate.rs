@@ -484,8 +484,7 @@ mod tests {
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
-    use crate::runtime::profile::Profiler;
-    use crate::thrift::metrics;
+    use crate::runtime::profile::{ProfileUnit, Profiler};
 
     fn add_operator_metrics(
         parent: &Profiler,
@@ -495,11 +494,11 @@ mod tests {
         peak_mem_bytes: i64,
     ) {
         let common = parent.child(name).child(COMMON_METRICS);
-        common.counter_set("PullRowNum", metrics::TUnit::UNIT, output_rows);
-        common.counter_set("OperatorTotalTime", metrics::TUnit::TIME_NS, total_time_ns);
+        common.counter_set("PullRowNum", ProfileUnit::Unit, output_rows);
+        common.counter_set("OperatorTotalTime", ProfileUnit::TimeNs, total_time_ns);
         common.counter_set(
             "OperatorPeakMemoryUsage",
-            metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             peak_mem_bytes,
         );
     }
@@ -516,19 +515,15 @@ mod tests {
         unsupported_columns: i64,
     ) {
         let unique = parent.child(name).child(UNIQUE_METRICS);
-        unique.counter_set(DICT_INPUT_ROWS, metrics::TUnit::UNIT, input_rows);
-        unique.counter_set(DICT_INPUT_COLUMNS, metrics::TUnit::UNIT, input_columns);
-        unique.counter_set(DICT_KEPT_ROWS, metrics::TUnit::UNIT, kept_rows);
-        unique.counter_set(DICT_KEPT_COLUMNS, metrics::TUnit::UNIT, kept_columns);
-        unique.counter_set(DICT_HYDRATED_ROWS, metrics::TUnit::UNIT, hydrated_rows);
-        unique.counter_set(
-            DICT_HYDRATED_COLUMNS,
-            metrics::TUnit::UNIT,
-            hydrated_columns,
-        );
+        unique.counter_set(DICT_INPUT_ROWS, ProfileUnit::Unit, input_rows);
+        unique.counter_set(DICT_INPUT_COLUMNS, ProfileUnit::Unit, input_columns);
+        unique.counter_set(DICT_KEPT_ROWS, ProfileUnit::Unit, kept_rows);
+        unique.counter_set(DICT_KEPT_COLUMNS, ProfileUnit::Unit, kept_columns);
+        unique.counter_set(DICT_HYDRATED_ROWS, ProfileUnit::Unit, hydrated_rows);
+        unique.counter_set(DICT_HYDRATED_COLUMNS, ProfileUnit::Unit, hydrated_columns);
         unique.counter_set(
             DICT_UNSUPPORTED_COLUMNS,
-            metrics::TUnit::UNIT,
+            ProfileUnit::Unit,
             unsupported_columns,
         );
     }
@@ -802,28 +797,28 @@ mod tests {
     #[test]
     fn summarizes_distributed_profile_attribution_from_thrift_trees() {
         let profiler = Profiler::new("fragment");
-        profiler.counter_set("FragmentWallTime", metrics::TUnit::TIME_NS, 20_000);
+        profiler.counter_set("FragmentWallTime", ProfileUnit::TimeNs, 20_000);
         let driver = profiler
             .child("Pipeline (id=0)")
             .child("PipelineDriver (id=0)");
-        driver.counter_set("DriverTotalTime", metrics::TUnit::TIME_NS, 10_000);
-        driver.counter_set("DriverBlockedTime", metrics::TUnit::TIME_NS, 4_500);
-        driver.counter_set("DriverInputEmptyTime", metrics::TUnit::TIME_NS, 2_000);
-        driver.counter_set("DriverOutputFullTime", metrics::TUnit::TIME_NS, 1_500);
-        driver.counter_set("DriverDependencyWaitTime", metrics::TUnit::TIME_NS, 1_000);
+        driver.counter_set("DriverTotalTime", ProfileUnit::TimeNs, 10_000);
+        driver.counter_set("DriverBlockedTime", ProfileUnit::TimeNs, 4_500);
+        driver.counter_set("DriverInputEmptyTime", ProfileUnit::TimeNs, 2_000);
+        driver.counter_set("DriverOutputFullTime", ProfileUnit::TimeNs, 1_500);
+        driver.counter_set("DriverDependencyWaitTime", ProfileUnit::TimeNs, 1_000);
         add_operator_metrics(&driver, "EXCHANGE_SOURCE (plan_node_id=2)", 8, 3_000, 512);
         let exchange_unique = driver
             .child("EXCHANGE_SOURCE (plan_node_id=2)")
             .child("UniqueMetrics");
-        exchange_unique.counter_set("WaitTime", metrics::TUnit::TIME_NS, 700);
-        exchange_unique.counter_set("ReceiverProcessTotalTime", metrics::TUnit::TIME_NS, 300);
+        exchange_unique.counter_set("WaitTime", ProfileUnit::TimeNs, 700);
+        exchange_unique.counter_set("ReceiverProcessTotalTime", ProfileUnit::TimeNs, 300);
         add_operator_metrics(&driver, "DATA_STREAM_SINK (plan_node_id=3)", 8, 2_000, 256);
         let sink_unique = driver
             .child("DATA_STREAM_SINK (plan_node_id=3)")
             .child("UniqueMetrics");
-        sink_unique.counter_set("NetworkTime", metrics::TUnit::TIME_NS, 900);
+        sink_unique.counter_set("NetworkTime", ProfileUnit::TimeNs, 900);
         let scan_unique = driver.child("SCAN (plan_node_id=4)").child("UniqueMetrics");
-        scan_unique.counter_set("IOTaskExecTime", metrics::TUnit::TIME_NS, 1_100);
+        scan_unique.counter_set("IOTaskExecTime", ProfileUnit::TimeNs, 1_100);
 
         let summary =
             collect_distributed_profile_summary_from_profile_trees(&[profiler.to_thrift_tree()]);
@@ -854,12 +849,12 @@ mod tests {
                 .child("CommonMetrics");
             common.counter_set(
                 "IcebergRuntimeFilePruning/FilesPruned",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 files_pruned,
             );
             common.counter_set(
                 "IcebergRuntimeFilePruning/Unsupported",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 unsupported,
             );
             profiler.to_thrift_tree()
@@ -883,15 +878,13 @@ mod tests {
         let profiler = Profiler::new("Fragment");
         let op = profiler.child("HASH JOIN (plan_node_id=9)");
         let common = op.child("CommonMetrics");
-        common
-            .add_counter("PullRowNum", metrics::TUnit::UNIT)
-            .set(100);
+        common.add_counter("PullRowNum", ProfileUnit::Unit).set(100);
         let total = common.add_timer("OperatorTotalTime");
         total.set(44_000);
         total.set_min(43_000);
         total.set_max(46_000);
         common
-            .add_counter("OperatorPeakMemoryUsage", metrics::TUnit::BYTES)
+            .add_counter("OperatorPeakMemoryUsage", ProfileUnit::Bytes)
             .set(640);
         common.add_timer("BuildHashTableTime").set(0);
         common.add_timer("SearchHashTableTime").set(20_000);
@@ -921,9 +914,9 @@ mod tests {
         let make_a = |active: i64, blocked: i64| {
             let p = Profiler::new("execute_fragment (plan_node_id=9)");
             let pipeline = p.child("Pipeline (id=0)");
-            pipeline.counter_set("DriverTotalTime", metrics::TUnit::TIME_NS, 1);
+            pipeline.counter_set("DriverTotalTime", ProfileUnit::TimeNs, 1);
             let driver = pipeline.child("PipelineDriver (id=0)");
-            driver.counter_set("DriverBlockedTime", metrics::TUnit::TIME_NS, blocked);
+            driver.counter_set("DriverBlockedTime", ProfileUnit::TimeNs, blocked);
             add_operator_metrics(&driver, "HASH JOIN (plan_node_id=9)", 1, active, 0);
             add_operator_metrics(&driver, "SCAN (plan_node_id=4)", 1, 0, 0);
             p.to_thrift_tree()
@@ -932,9 +925,9 @@ mod tests {
         let make_b = || {
             let p = Profiler::new("execute_fragment (plan_node_id=2)");
             let pipeline = p.child("Pipeline (id=0)");
-            pipeline.counter_set("DriverTotalTime", metrics::TUnit::TIME_NS, 1);
+            pipeline.counter_set("DriverTotalTime", ProfileUnit::TimeNs, 1);
             let driver = pipeline.child("PipelineDriver (id=0)");
-            driver.counter_set("DriverBlockedTime", metrics::TUnit::TIME_NS, 300);
+            driver.counter_set("DriverBlockedTime", ProfileUnit::TimeNs, 300);
             add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 1, 5_000, 0);
             p.to_thrift_tree()
         };

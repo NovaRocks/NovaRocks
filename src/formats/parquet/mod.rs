@@ -69,8 +69,7 @@ use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::range_plan::PlannedIoRanges;
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
-use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
-use crate::thrift::metrics;
+use crate::runtime::profile::{ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
 use page_selection::{
     PageSelectionResult, build_row_selection_for_row_groups,
     build_row_selection_for_scan_predicates,
@@ -104,52 +103,52 @@ fn read_app_io_time_ns(profile: &RuntimeProfile) -> i64 {
 fn record_page_selection(profile: &RuntimeProfile, selection: &PageSelectionResult) {
     profile.counter_add(
         "ParquetPageRowsTotal",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.rows_total as u128),
     );
     profile.counter_add(
         "ParquetPageRowsSelected",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.rows_selected as u128),
     );
     profile.counter_add(
         "ParquetPageRowsPruned",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.rows_total.saturating_sub(selection.rows_selected) as u128),
     );
     profile.counter_add(
         "ParquetPagePagesTotal",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.pages_total),
     );
     profile.counter_add(
         "ParquetPagePagesSelected",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.pages_selected),
     );
     profile.counter_add(
         "ParquetPagePagesPruned",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.pages_pruned),
     );
     profile.counter_add(
         "ParquetPagePredicatesRange",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.physical_range_predicates),
     );
     profile.counter_add(
         "ParquetPagePredicatesDiscreteSet",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.physical_discrete_set_predicates),
     );
     profile.counter_add(
         "ParquetPagePredicatesEnvelopeFallback",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.physical_envelope_fallback_predicates),
     );
     profile.counter_add(
         "ParquetPagePredicatesUnsupported",
-        metrics::TUnit::UNIT,
+        ProfileUnit::Unit,
         clamp_u128_to_i64(selection.predicates_unsupported),
     );
 }
@@ -828,7 +827,7 @@ impl ParquetScanIter {
 
     fn record_delayed_decision(&self, counter: &str) {
         if let Some(profile) = self.profile.as_ref() {
-            profile.counter_add(counter, metrics::TUnit::UNIT, 1);
+            profile.counter_add(counter, ProfileUnit::Unit, 1);
         }
     }
 
@@ -836,17 +835,17 @@ impl ParquetScanIter {
         if let Some(profile) = self.profile.as_ref() {
             profile.counter_add(
                 "ParquetBloomFilterProbe",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 clamp_u128_to_i64(counters.probes()),
             );
             profile.counter_add(
                 "ParquetBloomFilterDefiniteMiss",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 clamp_u128_to_i64(counters.definite_misses()),
             );
             profile.counter_add(
                 "ParquetBloomFilterUnsupported",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 clamp_u128_to_i64(counters.unsupported_values()),
             );
         }
@@ -1153,20 +1152,20 @@ impl ParquetScanIter {
         self.record_delayed_decision("ParquetDelayedDecisionUse");
         if let Some(profile) = self.profile.as_ref() {
             record_page_selection(profile, &selection);
-            profile.counter_add("ParquetDelayedRange", metrics::TUnit::UNIT, 1);
+            profile.counter_add("ParquetDelayedRange", ProfileUnit::Unit, 1);
             profile.counter_add(
                 "ParquetDelayedRowsTotal",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 clamp_u128_to_i64(selection.rows_total as u128),
             );
             profile.counter_add(
                 "ParquetDelayedRowsSelected",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 clamp_u128_to_i64(selection.rows_selected as u128),
             );
             profile.counter_add(
                 "ParquetDelayedRowsPruned",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 clamp_u128_to_i64(
                     selection.rows_total.saturating_sub(selection.rows_selected) as u128
                 ),
@@ -1200,15 +1199,15 @@ impl ParquetScanIter {
                 .and_then(|opts| opts.modification_time);
 
             if let Some(profile) = self.profile.as_ref() {
-                profile.counter_add("ParquetRanges", metrics::TUnit::UNIT, 1);
+                profile.counter_add("ParquetRanges", ProfileUnit::Unit, 1);
                 let _ = profile.add_child_counter(
                     PARQUET_PROFILE_GROUP,
-                    metrics::TUnit::NONE,
+                    ProfileUnit::None,
                     IO_TASK_EXEC_TIME_COUNTER,
                 );
                 let _ = profile.add_child_counter(
                     SHARED_BUFFERED_PROFILE_GROUP,
-                    metrics::TUnit::NONE,
+                    ProfileUnit::None,
                     IO_TASK_EXEC_TIME_COUNTER,
                 );
             }
@@ -1229,7 +1228,7 @@ impl ParquetScanIter {
                     .unwrap_or(0);
                 profile.counter_add_with_parent(
                     "ReaderInit",
-                    metrics::TUnit::TIME_NS,
+                    ProfileUnit::TimeNs,
                     std::cmp::max(reader_init_ns, reader_init_io_ns),
                     IO_TASK_EXEC_TIME_COUNTER,
                 );
@@ -1274,19 +1273,19 @@ impl ParquetScanIter {
                 let footer_ns = std::cmp::max(footer_read_ns, footer_io_ns);
                 profile.counter_add_with_parent(
                     "ReaderInitFooterRead",
-                    metrics::TUnit::TIME_NS,
+                    ProfileUnit::TimeNs,
                     footer_ns,
                     PARQUET_PROFILE_GROUP,
                 );
                 profile.counter_add_with_parent(
                     "OpenFile",
-                    metrics::TUnit::TIME_NS,
+                    ProfileUnit::TimeNs,
                     std::cmp::max(clamp_u128_to_i64(open_file_ns), footer_ns),
                     IO_TASK_EXEC_TIME_COUNTER,
                 );
                 profile.counter_add_with_parent(
                     "DirectIOTime",
-                    metrics::TUnit::TIME_NS,
+                    ProfileUnit::TimeNs,
                     footer_ns,
                     SHARED_BUFFERED_PROFILE_GROUP,
                 );
@@ -1338,22 +1337,22 @@ impl ParquetScanIter {
             if let Some(profile) = self.profile.as_ref() {
                 profile.counter_add(
                     "ParquetScanPredicatesRange",
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     clamp_u128_to_i64(predicates.counters.range),
                 );
                 profile.counter_add(
                     "ParquetScanPredicatesDiscreteSet",
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     clamp_u128_to_i64(predicates.counters.discrete_set),
                 );
                 profile.counter_add(
                     "ParquetScanPredicatesEnvelopeFallback",
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     clamp_u128_to_i64(predicates.counters.envelope_fallback),
                 );
                 profile.counter_add(
                     "ParquetScanPredicatesUnsupported",
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     clamp_u128_to_i64(predicates.counters.unsupported),
                 );
             }
@@ -1396,32 +1395,32 @@ impl ParquetScanIter {
                 if let Some(profile) = self.profile.as_ref() {
                     profile.counter_add(
                         "ParquetRowGroupsTotal",
-                        metrics::TUnit::UNIT,
+                        ProfileUnit::Unit,
                         clamp_u128_to_i64(rg_total),
                     );
                     profile.counter_add(
                         "ParquetRowGroupsSelected",
-                        metrics::TUnit::UNIT,
+                        ProfileUnit::Unit,
                         clamp_u128_to_i64(rg_selected),
                     );
                     profile.counter_add(
                         "ParquetRowGroupsPruned",
-                        metrics::TUnit::UNIT,
+                        ProfileUnit::Unit,
                         clamp_u128_to_i64(rg_pruned),
                     );
                     profile.counter_add(
                         "ParquetRowGroupBytesTotal",
-                        metrics::TUnit::BYTES,
+                        ProfileUnit::Bytes,
                         clamp_u128_to_i64(bytes_total),
                     );
                     profile.counter_add(
                         "ParquetRowGroupBytesSelected",
-                        metrics::TUnit::BYTES,
+                        ProfileUnit::Bytes,
                         clamp_u128_to_i64(bytes_selected),
                     );
                     profile.counter_add(
                         "ParquetRowGroupBytesPruned",
-                        metrics::TUnit::BYTES,
+                        ProfileUnit::Bytes,
                         clamp_u128_to_i64(bytes_pruned),
                     );
                 }
@@ -1501,7 +1500,7 @@ impl ParquetScanIter {
                     if let Some(profile) = self.profile.as_ref() {
                         profile.counter_add(
                             "PrepareChunkSourceTime",
-                            metrics::TUnit::TIME_NS,
+                            ProfileUnit::TimeNs,
                             clamp_u128_to_i64(prep_ns),
                         );
                     }
@@ -1534,7 +1533,7 @@ impl ParquetScanIter {
                 if let Some(profile) = self.profile.as_ref() {
                     profile.counter_add(
                         "PrepareChunkSourceTime",
-                        metrics::TUnit::TIME_NS,
+                        ProfileUnit::TimeNs,
                         clamp_u128_to_i64(prep_ns),
                     );
                 }
@@ -1578,25 +1577,25 @@ impl Iterator for ParquetScanIter {
                     .unwrap_or(0);
                 profile.counter_add_with_parent(
                     "ColumnReadTime",
-                    metrics::TUnit::TIME_NS,
+                    ProfileUnit::TimeNs,
                     column_read_ns,
                     IO_TASK_EXEC_TIME_COUNTER,
                 );
                 profile.counter_add_with_parent(
                     "GroupChunkRead",
-                    metrics::TUnit::TIME_NS,
+                    ProfileUnit::TimeNs,
                     column_read_ns,
                     PARQUET_PROFILE_GROUP,
                 );
                 profile.counter_add_with_parent(
                     "PageReadTime",
-                    metrics::TUnit::TIME_NS,
+                    ProfileUnit::TimeNs,
                     column_read_ns,
                     PARQUET_PROFILE_GROUP,
                 );
                 profile.counter_add_with_parent(
                     "SharedIOTime",
-                    metrics::TUnit::TIME_NS,
+                    ProfileUnit::TimeNs,
                     shared_io_ns,
                     SHARED_BUFFERED_PROFILE_GROUP,
                 );
@@ -1642,15 +1641,15 @@ impl Iterator for ParquetScanIter {
                     };
                     self.remaining -= to_take;
                     if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add("ParquetBatchesOut", metrics::TUnit::UNIT, 1);
+                        profile.counter_add("ParquetBatchesOut", ProfileUnit::Unit, 1);
                         profile.counter_add(
                             "ParquetRowsOut",
-                            metrics::TUnit::UNIT,
+                            ProfileUnit::Unit,
                             clamp_u128_to_i64(to_take as u128),
                         );
                         profile.counter_add(
                             "RawRowsRead",
-                            metrics::TUnit::UNIT,
+                            ProfileUnit::Unit,
                             clamp_u128_to_i64(to_take as u128),
                         );
                     }

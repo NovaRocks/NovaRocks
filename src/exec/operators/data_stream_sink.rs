@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::profile::clamp_u128_to_i64;
+use crate::runtime::profile::{ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
 const NEED_INPUT_LOG_EVERY: u64 = 1;
@@ -1551,7 +1551,7 @@ impl DataStreamSinkOperator {
             profile.common.add_info_string("PartType", part_type);
             profile.common.counter_add(
                 "ChannelNum",
-                crate::thrift::metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 clamp_u128_to_i64(channel_num),
             );
         }
@@ -1815,12 +1815,12 @@ impl DataStreamSinkOperator {
         if let Some(profile) = self.profiles.as_ref() {
             profile.common.counter_add(
                 "SerializeChunkTime",
-                crate::thrift::metrics::TUnit::TIME_NS,
+                ProfileUnit::TimeNs,
                 clamp_u128_to_i64(encode_ns),
             );
             profile.common.counter_add(
                 "SerializedBytes",
-                crate::thrift::metrics::TUnit::BYTES,
+                ProfileUnit::Bytes,
                 clamp_u128_to_i64(payload_bytes as u128),
             );
         }

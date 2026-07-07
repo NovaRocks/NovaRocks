@@ -2575,6 +2575,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
+    use crate::runtime::profile::ProfileUnit;
     use crate::runtime::write_coordinator::{
         FragmentExecStatusReport, WriteCoordinator, WriterKey, write_registry_test_guard,
     };
@@ -3775,17 +3776,9 @@ mod tests {
         let common = profiler
             .child(format!("SCAN (plan_node_id={node_id})"))
             .child("CommonMetrics");
-        common.counter_set("PullRowNum", crate::thrift::metrics::TUnit::UNIT, 3);
-        common.counter_set(
-            "OperatorTotalTime",
-            crate::thrift::metrics::TUnit::TIME_NS,
-            1_000,
-        );
-        common.counter_set(
-            "OperatorPeakMemoryUsage",
-            crate::thrift::metrics::TUnit::BYTES,
-            64,
-        );
+        common.counter_set("PullRowNum", ProfileUnit::Unit, 3);
+        common.counter_set("OperatorTotalTime", ProfileUnit::TimeNs, 1_000);
+        common.counter_set("OperatorPeakMemoryUsage", ProfileUnit::Bytes, 64);
         profiler.to_thrift_tree()
     }
 

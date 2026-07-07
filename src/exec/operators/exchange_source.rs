@@ -44,6 +44,7 @@ use crate::exec::runtime_filter::{
 };
 use crate::novarocks_logging::debug;
 use crate::runtime::exchange;
+use crate::runtime::profile::ProfileUnit;
 use crate::runtime::runtime_filter_hub::{
     AcquireProgress, AcquiredRuntimeFilters, RuntimeFilterHub, RuntimeFilterProbe,
     RuntimeFilterSnapshot,
@@ -52,7 +53,6 @@ use crate::runtime::runtime_filter_observability::{
     QueryKey, RfLifecycleHandle, RuntimeFilterLifecycleRegistry,
 };
 use crate::runtime::runtime_state::RuntimeState;
-use crate::thrift::metrics;
 
 static EXCHANGE_SOURCE_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -558,19 +558,19 @@ impl ExchangeSourceOperator {
             profile.common.add_timer(JOIN_RUNTIME_FILTER_HASH_TIME);
             profile
                 .common
-                .add_counter(JOIN_RUNTIME_FILTER_INPUT_ROWS, metrics::TUnit::UNIT);
+                .add_counter(JOIN_RUNTIME_FILTER_INPUT_ROWS, ProfileUnit::Unit);
             profile
                 .common
-                .add_counter(JOIN_RUNTIME_FILTER_OUTPUT_ROWS, metrics::TUnit::UNIT);
+                .add_counter(JOIN_RUNTIME_FILTER_OUTPUT_ROWS, ProfileUnit::Unit);
             profile
                 .common
-                .add_counter(JOIN_RUNTIME_FILTER_EVALUATE, metrics::TUnit::UNIT);
+                .add_counter(JOIN_RUNTIME_FILTER_EVALUATE, ProfileUnit::Unit);
             profile
                 .common
-                .add_counter(RUNTIME_FILTER_NUM, metrics::TUnit::UNIT);
+                .add_counter(RUNTIME_FILTER_NUM, ProfileUnit::Unit);
             profile
                 .common
-                .add_counter(RUNTIME_IN_FILTER_NUM, metrics::TUnit::UNIT);
+                .add_counter(RUNTIME_IN_FILTER_NUM, ProfileUnit::Unit);
         }
         let (filter_num, in_filter_num) = match &acquired {
             AcquiredRuntimeFilters::Complete(snapshot) => {
@@ -585,13 +585,13 @@ impl ExchangeSourceOperator {
                         let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
                         profile
                             .common
-                            .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+                            .counter_set(&name, ProfileUnit::TimeNs, latency_ns);
                     }
                     for filter in snapshot.membership_filters() {
                         let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
                         profile
                             .common
-                            .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+                            .counter_set(&name, ProfileUnit::TimeNs, latency_ns);
                     }
                 }
                 self.log_runtime_filters_loaded(
@@ -616,10 +616,10 @@ impl ExchangeSourceOperator {
         if let Some(profile) = self.profiles.as_ref() {
             profile
                 .common
-                .counter_set(RUNTIME_FILTER_NUM, metrics::TUnit::UNIT, filter_num as i64);
+                .counter_set(RUNTIME_FILTER_NUM, ProfileUnit::Unit, filter_num as i64);
             profile.common.counter_set(
                 RUNTIME_IN_FILTER_NUM,
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 in_filter_num as i64,
             );
             profile
@@ -702,12 +702,12 @@ impl ExchangeSourceOperator {
             if let Some(profile) = self.profiles.as_ref() {
                 profile.common.counter_add(
                     JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     input_rows as i64,
                 );
                 profile.common.counter_add(
                     JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     input_rows as i64,
                 );
             }
@@ -717,12 +717,12 @@ impl ExchangeSourceOperator {
             if let Some(profile) = self.profiles.as_ref() {
                 profile.common.counter_add(
                     JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     input_rows as i64,
                 );
                 profile.common.counter_add(
                     JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     input_rows as i64,
                 );
             }
@@ -740,18 +740,18 @@ impl ExchangeSourceOperator {
             let output_rows = result.as_ref().map(|c| c.len()).unwrap_or(0) as i64;
             profile.common.counter_add(
                 JOIN_RUNTIME_FILTER_INPUT_ROWS,
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 input_rows as i64,
             );
             profile.common.counter_add(
                 JOIN_RUNTIME_FILTER_OUTPUT_ROWS,
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 output_rows,
             );
             if filters_len > 0 {
                 profile.common.counter_add(
                     JOIN_RUNTIME_FILTER_EVALUATE,
-                    metrics::TUnit::UNIT,
+                    ProfileUnit::Unit,
                     filters_len,
                 );
             }

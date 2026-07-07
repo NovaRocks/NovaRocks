@@ -22,7 +22,7 @@ use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_logging::debug;
 
 use crate::runtime::exchange;
-use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
+use crate::runtime::profile::{ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
 
 pub struct ExchangeScanOp {
     key: exchange::ExchangeKey,
@@ -186,26 +186,22 @@ impl ExchangeScanIter {
         profile.add_info_string("DestID", format!("{}", self.key.node_id));
         profile.counter_add(
             "RequestReceived",
-            crate::thrift::metrics::TUnit::UNIT,
+            ProfileUnit::Unit,
             clamp_u128_to_i64(stats.request_received),
         );
         profile.counter_add(
             "BytesReceived",
-            crate::thrift::metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             clamp_u128_to_i64(stats.bytes_received),
         );
         profile.counter_add(
             "DeserializeChunkTime",
-            crate::thrift::metrics::TUnit::TIME_NS,
+            ProfileUnit::TimeNs,
             clamp_u128_to_i64(stats.deserialize_ns),
         );
         let elapsed_ns = clamp_u128_to_i64(elapsed.as_nanos());
-        profile.counter_add(
-            "ReceiverProcessTotalTime",
-            crate::thrift::metrics::TUnit::TIME_NS,
-            elapsed_ns,
-        );
+        profile.counter_add("ReceiverProcessTotalTime", ProfileUnit::TimeNs, elapsed_ns);
         let wait_ns = clamp_u128_to_i64(elapsed.as_nanos().saturating_sub(stats.deserialize_ns));
-        profile.counter_add("WaitTime", crate::thrift::metrics::TUnit::TIME_NS, wait_ns);
+        profile.counter_add("WaitTime", ProfileUnit::TimeNs, wait_ns);
     }
 }

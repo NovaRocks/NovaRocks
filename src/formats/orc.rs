@@ -33,8 +33,7 @@ use crate::fs::coalesce_policy::AdaptiveCoalesceController;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::range_plan::PlannedIoRanges;
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
-use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
-use crate::thrift::metrics;
+use crate::runtime::profile::{ProfileUnit, RuntimeProfile, clamp_u128_to_i64};
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
 static ORC_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
@@ -110,7 +109,7 @@ impl OrcScanIter {
         self.range_idx += 1;
 
         if let Some(profile) = self.profile.as_ref() {
-            profile.counter_add("OrcRanges", metrics::TUnit::UNIT, 1);
+            profile.counter_add("OrcRanges", ProfileUnit::Unit, 1);
         }
 
         let path = range.path.clone();
@@ -218,15 +217,15 @@ impl Iterator for OrcScanIter {
                     };
                     self.remaining -= to_take;
                     if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add("OrcBatchesOut", metrics::TUnit::UNIT, 1);
+                        profile.counter_add("OrcBatchesOut", ProfileUnit::Unit, 1);
                         profile.counter_add(
                             "OrcRowsOut",
-                            metrics::TUnit::UNIT,
+                            ProfileUnit::Unit,
                             clamp_u128_to_i64(to_take as u128),
                         );
                         profile.counter_add(
                             "RawRowsRead",
-                            metrics::TUnit::UNIT,
+                            ProfileUnit::Unit,
                             clamp_u128_to_i64(to_take as u128),
                         );
                     }

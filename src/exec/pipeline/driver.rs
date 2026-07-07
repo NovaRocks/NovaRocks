@@ -42,10 +42,9 @@ use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::{debug, error};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
-use crate::runtime::profile::{CounterRef, OperatorProfiles, clamp_u128_to_i64};
+use crate::runtime::profile::{CounterRef, OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::fe_report;
-use crate::thrift::metrics;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Runtime state for a single pipeline driver.
@@ -318,33 +317,31 @@ impl PipelineDriver {
                         pull_total_time: p.common.add_timer("PullTotalTime"),
                         set_finishing_time: p.common.add_timer("SetFinishingTime"),
                         close_time: p.common.add_timer("CloseTime"),
-                        push_row_num: p.common.add_counter("PushRowNum", metrics::TUnit::UNIT),
-                        pull_row_num: p.common.add_counter("PullRowNum", metrics::TUnit::UNIT),
+                        push_row_num: p.common.add_counter("PushRowNum", ProfileUnit::Unit),
+                        pull_row_num: p.common.add_counter("PullRowNum", ProfileUnit::Unit),
                         mem_peak: p
                             .common
-                            .add_counter("OperatorPeakMemoryUsage", metrics::TUnit::BYTES),
+                            .add_counter("OperatorPeakMemoryUsage", ProfileUnit::Bytes),
                         mem_allocated: p
                             .common
-                            .add_counter("OperatorAllocatedMemoryUsage", metrics::TUnit::BYTES),
-                        dict_input_rows: p
-                            .unique
-                            .add_counter("DictInputRows", metrics::TUnit::UNIT),
+                            .add_counter("OperatorAllocatedMemoryUsage", ProfileUnit::Bytes),
+                        dict_input_rows: p.unique.add_counter("DictInputRows", ProfileUnit::Unit),
                         dict_input_columns: p
                             .unique
-                            .add_counter("DictInputColumns", metrics::TUnit::UNIT),
-                        dict_kept_rows: p.unique.add_counter("DictKeptRows", metrics::TUnit::UNIT),
+                            .add_counter("DictInputColumns", ProfileUnit::Unit),
+                        dict_kept_rows: p.unique.add_counter("DictKeptRows", ProfileUnit::Unit),
                         dict_kept_columns: p
                             .unique
-                            .add_counter("DictKeptColumns", metrics::TUnit::UNIT),
+                            .add_counter("DictKeptColumns", ProfileUnit::Unit),
                         dict_hydrated_rows: p
                             .unique
-                            .add_counter("DictHydratedRows", metrics::TUnit::UNIT),
+                            .add_counter("DictHydratedRows", ProfileUnit::Unit),
                         dict_hydrated_columns: p
                             .unique
-                            .add_counter("DictHydratedColumns", metrics::TUnit::UNIT),
+                            .add_counter("DictHydratedColumns", ProfileUnit::Unit),
                         dict_unsupported_columns: p
                             .unique
-                            .add_counter("DictUnsupportedColumns", metrics::TUnit::UNIT),
+                            .add_counter("DictUnsupportedColumns", ProfileUnit::Unit),
                         io_task_exec_time,
                         wait_time,
                         receiver_process_total_time,
