@@ -52,8 +52,8 @@ fn test_exchange_module() {
 #[test]
 fn test_profile_module() {
     let profiler = Profiler::new("runtime_profile_smoke");
-    let tree = profiler.to_thrift_tree();
-    assert_eq!(tree.nodes[0].name, "runtime_profile_smoke");
+    let tree = profiler.to_native_tree();
+    assert_eq!(tree.root.name, "runtime_profile_smoke");
 }
 
 #[test]

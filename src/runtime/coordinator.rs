@@ -32,6 +32,7 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
+use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
@@ -66,7 +67,7 @@ pub(crate) struct CoordinatedQueryResult {
     pub(crate) query_result: QueryResult,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
-    pub(crate) fragment_profiles: Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>,
+    pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
 }
 
 pub(crate) struct NativePlanSidecars {
@@ -2076,10 +2077,7 @@ impl Drop for StandaloneQueryFailureGuard {
 #[derive(Default)]
 struct StandaloneQueryProfileRegistry {
     active: BTreeSet<(i64, i64)>,
-    profiles: BTreeMap<
-        (i64, i64),
-        BTreeMap<(i64, i64), crate::thrift::runtime_profile::TRuntimeProfileTree>,
-    >,
+    profiles: BTreeMap<(i64, i64), BTreeMap<(i64, i64), RuntimeProfileTree>>,
 }
 
 fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry> {
@@ -2114,11 +2112,12 @@ pub(crate) fn record_standalone_query_profile_report(
             .fragment_instance_id
             .as_ref()
             .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?;
+        let native = crate::service::fe_report::runtime_profile_tree_from_thrift_for_fe(profile)?;
         guard
             .profiles
             .entry(key)
             .or_default()
-            .insert(query_failure_key(finst_id), profile.clone());
+            .insert(query_failure_key(finst_id), native);
     }
     Ok(true)
 }
@@ -2147,12 +2146,12 @@ pub(crate) fn record_native_standalone_query_profile_report(
         let Some(finst_id) = report.fragment_instance_id.as_ref() else {
             return Err("ExecStatusReport missing fragment_instance_id".to_string());
         };
-        let thrift = crate::runtime::profile::native_profile_tree_to_thrift(profile)?;
+        let native = RuntimeProfileTree::from_proto(profile)?;
         guard
             .profiles
             .entry(key)
             .or_default()
-            .insert((finst_id.hi, finst_id.lo), thrift);
+            .insert((finst_id.hi, finst_id.lo), native);
     }
     Ok(true)
 }
@@ -2167,9 +2166,7 @@ fn standalone_query_profile_count(query_id: &types::TUniqueId) -> usize {
         .unwrap_or(0)
 }
 
-fn take_standalone_query_profiles(
-    query_id: &types::TUniqueId,
-) -> Vec<crate::thrift::runtime_profile::TRuntimeProfileTree> {
+fn take_standalone_query_profiles(query_id: &types::TUniqueId) -> Vec<RuntimeProfileTree> {
     standalone_query_profiles()
         .lock()
         .expect("standalone query profile registry lock")
@@ -2210,7 +2207,7 @@ pub(crate) struct SubmitAndFetchResult {
     pub(crate) chunks: Vec<crate::exec::chunk::Chunk>,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
-    pub(crate) fragment_profiles: Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>,
+    pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
 }
 
 struct QueryStateRegistrationGuard {
@@ -2411,7 +2408,7 @@ fn wait_for_profile_reports(
     deadline: std::time::Instant,
     timeout_ms: i64,
     runtime_query_id: crate::runtime::query_context::QueryId,
-) -> Result<Vec<crate::thrift::runtime_profile::TRuntimeProfileTree>, String> {
+) -> Result<Vec<RuntimeProfileTree>, String> {
     const PROFILE_REPORT_POLL_INTERVAL_MS: i64 = 10;
 
     if expected_reports == 0 {
@@ -3779,7 +3776,8 @@ mod tests {
         common.counter_set("PullRowNum", ProfileUnit::Unit, 3);
         common.counter_set("OperatorTotalTime", ProfileUnit::TimeNs, 1_000);
         common.counter_set("OperatorPeakMemoryUsage", ProfileUnit::Bytes, 64);
-        profiler.to_thrift_tree()
+        crate::service::fe_report::runtime_profile_tree_to_thrift_for_fe(&profiler.to_native_tree())
+            .expect("profile tree converts to thrift")
     }
 
     // -----------------------------------------------------------------------
