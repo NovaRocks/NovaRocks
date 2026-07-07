@@ -5,7 +5,6 @@
 # cluster's references, regenerate with:
 #   NOVA_WRITE_IDL_LEDGER=1 cargo test --test architecture_guard nidl_e0_noncompat
 # The end state (E10) is an empty list plus the build.rs/lib.rs gate.
-src/cache/cached_reader.rs
 src/common/engine_error.rs
 src/connector/iceberg/file_pruning_wire.rs
 src/connector/schema/context.rs
@@ -32,20 +31,14 @@ src/engine/query_options_wire.rs
 src/exec/chunk/schema_thrift.rs
 src/exec/node/fetch.rs
 src/exec/operators/data_stream_sink.rs
-src/exec/operators/exchange_source.rs
 src/exec/operators/fetch_processor.rs
 src/exec/operators/iceberg_change_stream_router_sink.rs
 src/exec/operators/multi_cast_data_stream_sink.rs
-src/exec/operators/scan/runner.rs
 src/exec/operators/split_data_stream_sink.rs
-src/exec/pipeline/driver.rs
 src/exec/pipeline/executor.rs
 src/exec/pipeline/fragment_context.rs
 src/exec/runtime_filter/codec.rs
 src/exec/runtime_filter/proto_type.rs
-src/formats/orc.rs
-src/formats/parquet/mod.rs
-src/fs/opendal.rs
 src/lower/compat/expr/arithmetic.rs
 src/lower/compat/expr/binary_pred.rs
 src/lower/compat/expr/case.rs
@@ -102,12 +95,9 @@ src/runtime/coordinator.rs
 src/runtime/descriptor_snapshot_thrift.rs
 src/runtime/dispatcher.rs
 src/runtime/endpoint.rs
-src/runtime/exchange_scan.rs
 src/runtime/exec_params.rs
 src/runtime/fragment_exec_params.rs
 src/runtime/native_fragment_wire.rs
-src/runtime/profile.rs
-src/runtime/profile_correlate.rs
 src/runtime/query_context.rs
 src/runtime/query_options.rs
 src/runtime/runtime_filter_params.rs
@@ -120,12 +110,10 @@ src/runtime/write_coordinator.rs
 src/runtime/write_coordinator_compat.rs
 src/runtime/write_operation_lifecycle.rs
 src/service/disk_report.rs
-src/service/exchange_sender.rs
 src/service/exec_state_reporter.rs
 src/service/exec_status_report.rs
 src/service/fe_report.rs
 src/service/frontend_rpc.rs
-src/service/native_fragment_service.rs
 src/service/stream_load_registry.rs
 src/sql/codegen/connector_scan_wire.rs
 src/sql/codegen/descriptors.rs
@@ -143,5 +131,4 @@ src/sql/codegen/resolve.rs
 src/sql/codegen/runtime_filter_lowering.rs
 src/sql/codegen/type_infer.rs
 src/sql/common/change_stream.rs
-src/tests/proto_contract/report.rs
 src/types/arrow_thrift.rs
