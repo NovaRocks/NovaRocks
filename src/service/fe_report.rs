@@ -680,10 +680,16 @@ fn native_profile_node_from_thrift_for_fe(
     let Some(node) = nodes.get(idx) else {
         return Ok(None);
     };
+    if node.num_children < 0 {
+        return Err(format!(
+            "TRuntimeProfileTree node {} has negative num_children {}",
+            node.name, node.num_children
+        ));
+    }
 
     let mut next = idx + 1;
     let mut children = Vec::new();
-    for _ in 0..node.num_children.max(0) {
+    for _ in 0..node.num_children {
         let Some((child, consumed)) = native_profile_node_from_thrift_for_fe(nodes, next)? else {
             return Err(format!(
                 "TRuntimeProfileTree node {} declares more children than available nodes",
@@ -1339,6 +1345,66 @@ mod tests {
                 Some((task.coord.clone(), task.report.clone()));
         })));
         ReportHookGuard
+    }
+
+    fn empty_thrift_profile_node(
+        name: &str,
+        num_children: i32,
+    ) -> runtime_profile::TRuntimeProfileNode {
+        runtime_profile::TRuntimeProfileNode::new(
+            name.to_string(),
+            num_children,
+            vec![],
+            0,
+            false,
+            BTreeMap::new(),
+            vec![],
+            BTreeMap::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn runtime_profile_tree_from_thrift_for_fe_rejects_negative_num_children() {
+        let tree =
+            runtime_profile::TRuntimeProfileTree::new(vec![empty_thrift_profile_node("Root", -1)]);
+
+        let err = super::runtime_profile_tree_from_thrift_for_fe(&tree)
+            .expect_err("negative child count should be rejected");
+
+        assert!(
+            err.contains("negative num_children"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn runtime_profile_tree_from_thrift_for_fe_rejects_missing_declared_children() {
+        let tree = runtime_profile::TRuntimeProfileTree::new(vec![
+            empty_thrift_profile_node("Root", 2),
+            empty_thrift_profile_node("OnlyChild", 0),
+        ]);
+
+        let err = super::runtime_profile_tree_from_thrift_for_fe(&tree)
+            .expect_err("missing declared child should be rejected");
+
+        assert!(
+            err.contains("declares more children than available nodes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn runtime_profile_tree_from_thrift_for_fe_rejects_trailing_nodes() {
+        let tree = runtime_profile::TRuntimeProfileTree::new(vec![
+            empty_thrift_profile_node("Root", 0),
+            empty_thrift_profile_node("Trailing", 0),
+        ]);
+
+        let err = super::runtime_profile_tree_from_thrift_for_fe(&tree)
+            .expect_err("trailing nodes should be rejected");
+
+        assert!(err.contains("trailing nodes"), "unexpected error: {err}");
     }
 
     #[test]
