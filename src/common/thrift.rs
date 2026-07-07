@@ -21,8 +21,6 @@ use thrift::protocol::{
 };
 use thrift::transport::{TBufferChannel, TIoChannel};
 
-use crate::thrift::data;
-
 fn maybe_unique_id_uuid(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     if map.len() != 2 || !map.contains_key("hi") || !map.contains_key("lo") {
         return None;
@@ -80,19 +78,6 @@ pub(crate) fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Result<Vec
     }
 }
 
-// Used by engine_ffi.rs when feature = "compat" is enabled.
-#[allow(dead_code)]
-pub(crate) fn thrift_serialize_result_batch(batch: &data::TResultBatch) -> Vec<u8> {
-    let capacity = estimate_result_batch_bytes(batch);
-    let channel = TBufferChannel::with_capacity(0, capacity);
-    let (_, w) = channel.split().expect("split TBufferChannel");
-    let mut protocol = TBinaryOutputProtocol::new(w, true);
-    batch
-        .write_to_out_protocol(&mut protocol)
-        .expect("write TResultBatch");
-    protocol.transport.write_bytes()
-}
-
 pub(crate) fn thrift_compact_serialize<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
     // Compact thrift encoding size for statistic rows can vary significantly
     // (for example large HLL hex payloads in statistics v9). Retry with a
@@ -117,23 +102,6 @@ pub(crate) fn thrift_compact_serialize<T: TSerializable>(value: &T) -> Result<Ve
             }
         }
     }
-}
-
-#[allow(dead_code)] // helper for thrift_serialize_result_batch
-fn estimate_result_batch_bytes(batch: &data::TResultBatch) -> usize {
-    let mut rows_bytes = 0usize;
-    for row in &batch.rows {
-        rows_bytes = rows_bytes.saturating_add(4);
-        rows_bytes = rows_bytes.saturating_add(row.len());
-    }
-
-    let mut total = 24usize.saturating_add(rows_bytes);
-    if batch.statistic_version.is_some() {
-        total = total.saturating_add(7);
-    }
-
-    // Extra slack for protocol overhead and safety margin.
-    total.saturating_add(64)
 }
 
 #[derive(Default)]

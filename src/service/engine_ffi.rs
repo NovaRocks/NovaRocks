@@ -17,7 +17,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::common::result_batch::ResultBatch;
-use crate::common::thrift::thrift_serialize_result_batch;
 use crate::connector::starrocks::lake::compaction::{
     abort_compaction as lake_abort_compaction, compact as lake_compact,
 };
@@ -63,16 +62,46 @@ fn unique_id(hi: i64, lo: i64) -> UniqueId {
     UniqueId { hi, lo }
 }
 
-fn wire_result_batch_from_native(
-    batch: ResultBatch,
+fn result_batch_to_thrift(
+    batch: &ResultBatch,
     packet_seq: i64,
 ) -> crate::thrift::data::TResultBatch {
     crate::thrift::data::TResultBatch::new(
-        batch.rows,
+        batch.rows.clone(),
         batch.is_compressed,
         packet_seq,
         batch.statistic_version,
     )
+}
+
+fn estimate_result_batch_bytes(batch: &ResultBatch) -> usize {
+    let mut rows_bytes = 0usize;
+    for row in &batch.rows {
+        rows_bytes = rows_bytes.saturating_add(4);
+        rows_bytes = rows_bytes.saturating_add(row.len());
+    }
+
+    let mut total = 24usize.saturating_add(rows_bytes);
+    if batch.statistic_version.is_some() {
+        total = total.saturating_add(7);
+    }
+
+    total.saturating_add(64)
+}
+
+fn thrift_serialize_result_batch(batch: &ResultBatch, packet_seq: i64) -> Vec<u8> {
+    use thrift::protocol::{TBinaryOutputProtocol, TSerializable};
+    use thrift::transport::{TBufferChannel, TIoChannel};
+
+    let wire_batch = result_batch_to_thrift(batch, packet_seq);
+    let capacity = estimate_result_batch_bytes(batch);
+    let channel = TBufferChannel::with_capacity(0, capacity);
+    let (_, w) = channel.split().expect("split TBufferChannel");
+    let mut protocol = TBinaryOutputProtocol::new(w, true);
+    wire_batch
+        .write_to_out_protocol(&mut protocol)
+        .expect("write TResultBatch");
+    protocol.transport.write_bytes()
 }
 
 fn write_fetch_result(
@@ -96,8 +125,7 @@ fn write_fetch_result(
             // Align with StarRocks BE: EOS closes the stream with packet_seq/eos only
             // and does not send an empty TResultBatch attachment.
             if !(result.eos && result.result_batch.rows.is_empty()) {
-                let batch = wire_result_batch_from_native(result.result_batch, result.packet_seq);
-                let bytes = thrift_serialize_result_batch(&batch);
+                let bytes = thrift_serialize_result_batch(&result.result_batch, result.packet_seq);
                 let boxed = bytes.into_boxed_slice();
                 let len = boxed.len();
                 let ptr = Box::into_raw(boxed) as *mut u8;
@@ -1060,9 +1088,9 @@ mod tests {
         crate::runtime::result_buffer::insert(
             finst,
             FetchResult {
-                packet_seq: 0,
+                packet_seq: 7,
                 eos: false,
-                result_batch: ResultBatch::new(vec![b"row".to_vec()], false, 0, None),
+                result_batch: ResultBatch::new(vec![b"row".to_vec()], true, 99, Some(42)),
             },
         );
 
@@ -1079,7 +1107,14 @@ mod tests {
         assert!(!eos);
         assert!(!batch.ptr.is_null());
         assert!(err.ptr.is_null());
-        novarocks_rs_free_buf(batch.ptr, batch.len);
+        let batch_bytes = take_ffi_buf(&mut batch);
+        let wire_batch: crate::thrift::data::TResultBatch =
+            crate::common::thrift::thrift_binary_deserialize(&batch_bytes)
+                .expect("decode TResultBatch attachment");
+        assert_eq!(wire_batch.packet_seq, 0);
+        assert_eq!(wire_batch.rows, vec![b"row".to_vec()]);
+        assert!(wire_batch.is_compressed);
+        assert_eq!(wire_batch.statistic_version, Some(42));
     }
 
     #[test]
