@@ -93,17 +93,65 @@ pub enum CounterAggregateType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterMergeType {
+    MergeAll,
+    SkipAll,
+    SkipFirstMerge,
+    SkipSecondMerge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterMinMaxType {
+    MinMaxAll,
+    SkipAll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CounterStrategy {
     aggregate_type: CounterAggregateType,
+    merge_type: CounterMergeType,
+    display_threshold: i64,
+    min_max_type: Option<CounterMinMaxType>,
 }
 
 impl CounterStrategy {
     pub fn new(aggregate_type: CounterAggregateType) -> Self {
-        Self { aggregate_type }
+        Self {
+            aggregate_type,
+            merge_type: CounterMergeType::MergeAll,
+            display_threshold: 0,
+            min_max_type: Some(CounterMinMaxType::MinMaxAll),
+        }
+    }
+
+    pub fn custom(
+        aggregate_type: CounterAggregateType,
+        merge_type: CounterMergeType,
+        display_threshold: i64,
+        min_max_type: Option<CounterMinMaxType>,
+    ) -> Self {
+        Self {
+            aggregate_type,
+            merge_type,
+            display_threshold,
+            min_max_type,
+        }
     }
 
     pub fn aggregate_type(self) -> CounterAggregateType {
         self.aggregate_type
+    }
+
+    pub fn merge_type(self) -> CounterMergeType {
+        self.merge_type
+    }
+
+    pub fn display_threshold(self) -> i64 {
+        self.display_threshold
+    }
+
+    pub fn min_max_type(self) -> Option<CounterMinMaxType> {
+        self.min_max_type
     }
 }
 
@@ -886,11 +934,23 @@ fn counter_strategy_to_thrift(strategy: CounterStrategy) -> runtime_profile::TCo
         CounterAggregateType::SumAvg => runtime_profile::TCounterAggregateType::SUM_AVG,
         CounterAggregateType::AvgSum => runtime_profile::TCounterAggregateType::AVG_SUM,
     };
+    let merge_type = match strategy.merge_type() {
+        CounterMergeType::MergeAll => runtime_profile::TCounterMergeType::MERGE_ALL,
+        CounterMergeType::SkipAll => runtime_profile::TCounterMergeType::SKIP_ALL,
+        CounterMergeType::SkipFirstMerge => runtime_profile::TCounterMergeType::SKIP_FIRST_MERGE,
+        CounterMergeType::SkipSecondMerge => runtime_profile::TCounterMergeType::SKIP_SECOND_MERGE,
+    };
+    let min_max_type = strategy
+        .min_max_type()
+        .map(|min_max_type| match min_max_type {
+            CounterMinMaxType::MinMaxAll => runtime_profile::TCounterMinMaxType::MIN_MAX_ALL,
+            CounterMinMaxType::SkipAll => runtime_profile::TCounterMinMaxType::SKIP_ALL,
+        });
     runtime_profile::TCounterStrategy::new(
         aggregate_type,
-        runtime_profile::TCounterMergeType::MERGE_ALL,
-        0,
-        runtime_profile::TCounterMinMaxType::MIN_MAX_ALL,
+        merge_type,
+        strategy.display_threshold(),
+        min_max_type,
     )
 }
 
@@ -923,7 +983,8 @@ fn merge_counter_values(strategy: &CounterStrategy, values: &[i64]) -> (i64, i64
 #[cfg(test)]
 mod tests {
     use super::{
-        CounterAggregateType, ProfileUnit, ROOT_COUNTER, RuntimeProfile, default_counter_strategy,
+        CounterAggregateType, CounterMergeType, CounterMinMaxType, CounterStrategy, ProfileUnit,
+        ROOT_COUNTER, RuntimeProfile, counter_strategy_to_thrift, default_counter_strategy,
         default_thrift_counter_strategy, native_profile_tree_to_thrift,
     };
     use crate::proto::novarocks;
@@ -965,12 +1026,23 @@ mod tests {
             (ProfileUnit::None, metrics::TUnit::NONE),
         ];
         for (native_unit, thrift_unit) in cases {
-            let native_aggregate = default_counter_strategy(native_unit).aggregate_type();
-            let thrift_aggregate =
-                native_aggregate_from_thrift(default_thrift_counter_strategy(thrift_unit));
+            let native_strategy = counter_strategy_to_thrift(default_counter_strategy(native_unit));
+            let thrift_strategy = default_thrift_counter_strategy(thrift_unit);
             assert_eq!(
-                native_aggregate, thrift_aggregate,
-                "native strategy for {native_unit:?} must match thrift default strategy"
+                native_strategy.aggregate_type, thrift_strategy.aggregate_type,
+                "native aggregate strategy for {native_unit:?} must match thrift default strategy"
+            );
+            assert_eq!(
+                native_strategy.merge_type, thrift_strategy.merge_type,
+                "native merge strategy for {native_unit:?} must match thrift default strategy"
+            );
+            assert_eq!(
+                native_strategy.display_threshold, thrift_strategy.display_threshold,
+                "native display threshold for {native_unit:?} must match thrift default strategy"
+            );
+            assert_eq!(
+                native_strategy.min_max_type, thrift_strategy.min_max_type,
+                "native min/max strategy for {native_unit:?} must match thrift default strategy"
             );
         }
     }
@@ -994,24 +1066,48 @@ mod tests {
         assert_eq!(scan.strategy.aggregate_type(), CounterAggregateType::Avg);
     }
 
-    fn native_aggregate_from_thrift(
-        strategy: runtime_profile::TCounterStrategy,
-    ) -> CounterAggregateType {
-        match strategy.aggregate_type.0 {
-            value if value == runtime_profile::TCounterAggregateType::SUM.0 => {
-                CounterAggregateType::Sum
-            }
-            value if value == runtime_profile::TCounterAggregateType::AVG.0 => {
-                CounterAggregateType::Avg
-            }
-            value if value == runtime_profile::TCounterAggregateType::SUM_AVG.0 => {
-                CounterAggregateType::SumAvg
-            }
-            value if value == runtime_profile::TCounterAggregateType::AVG_SUM.0 => {
-                CounterAggregateType::AvgSum
-            }
-            value => panic!("unexpected thrift aggregate type {value}"),
-        }
+    #[test]
+    fn thrift_tree_preserves_native_counter_strategy_fields() {
+        let profile = RuntimeProfile::new("strategy-profile");
+        let counter = profile.add_counter_with_strategy(
+            "CustomCounter",
+            ProfileUnit::TimeMs,
+            CounterStrategy::custom(
+                CounterAggregateType::SumAvg,
+                CounterMergeType::SkipFirstMerge,
+                42,
+                Some(CounterMinMaxType::SkipAll),
+            ),
+        );
+        counter.set(99);
+        counter.set_min(7);
+        counter.set_max(123);
+
+        let tree = profile.to_thrift_tree();
+        let thrift_counter = tree.nodes[0]
+            .counters
+            .iter()
+            .find(|counter| counter.name == "CustomCounter")
+            .expect("custom counter");
+        let strategy = thrift_counter.strategy.as_ref().expect("counter strategy");
+
+        assert_eq!(thrift_counter.type_, metrics::TUnit::TIME_MS);
+        assert_eq!(thrift_counter.value, 99);
+        assert_eq!(thrift_counter.min_value, Some(7));
+        assert_eq!(thrift_counter.max_value, Some(123));
+        assert_eq!(
+            strategy.aggregate_type,
+            runtime_profile::TCounterAggregateType::SUM_AVG
+        );
+        assert_eq!(
+            strategy.merge_type,
+            runtime_profile::TCounterMergeType::SKIP_FIRST_MERGE
+        );
+        assert_eq!(strategy.display_threshold, 42);
+        assert_eq!(
+            strategy.min_max_type,
+            Some(runtime_profile::TCounterMinMaxType::SKIP_ALL)
+        );
     }
 
     #[test]
