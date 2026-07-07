@@ -41,6 +41,82 @@ pub struct RuntimeProfile {
 
 pub type Profiler = RuntimeProfile;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProfileUnit {
+    Unit,
+    CpuTicks,
+    Bytes,
+    TimeNs,
+    TimeMs,
+    TimeS,
+    None,
+}
+
+impl ProfileUnit {
+    pub(crate) fn to_proto(self) -> novarocks::ProfileUnit {
+        match self {
+            Self::Unit => novarocks::ProfileUnit::Unit,
+            Self::CpuTicks => novarocks::ProfileUnit::CpuTicks,
+            Self::Bytes => novarocks::ProfileUnit::Bytes,
+            Self::TimeNs => novarocks::ProfileUnit::TimeNs,
+            Self::TimeMs => novarocks::ProfileUnit::TimeMs,
+            Self::TimeS => novarocks::ProfileUnit::TimeS,
+            Self::None => novarocks::ProfileUnit::None,
+        }
+    }
+
+    pub(crate) fn from_proto(unit: i32) -> Result<Self, String> {
+        match novarocks::ProfileUnit::try_from(unit) {
+            Ok(novarocks::ProfileUnit::Unit) => Ok(Self::Unit),
+            Ok(novarocks::ProfileUnit::CpuTicks) => Ok(Self::CpuTicks),
+            Ok(novarocks::ProfileUnit::Bytes) => Ok(Self::Bytes),
+            Ok(novarocks::ProfileUnit::TimeNs) => Ok(Self::TimeNs),
+            Ok(novarocks::ProfileUnit::TimeMs) => Ok(Self::TimeMs),
+            Ok(novarocks::ProfileUnit::TimeS) => Ok(Self::TimeS),
+            Ok(novarocks::ProfileUnit::None) => Ok(Self::None),
+            Ok(novarocks::ProfileUnit::Unspecified) => {
+                Err("ProfileUnit is unspecified in native runtime profile".to_string())
+            }
+            Err(_) => Err(format!(
+                "unknown ProfileUnit value {unit} in native runtime profile"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterAggregateType {
+    Sum,
+    Avg,
+    SumAvg,
+    AvgSum,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CounterStrategy {
+    aggregate_type: CounterAggregateType,
+}
+
+impl CounterStrategy {
+    pub fn new(aggregate_type: CounterAggregateType) -> Self {
+        Self { aggregate_type }
+    }
+
+    pub fn aggregate_type(self) -> CounterAggregateType {
+        self.aggregate_type
+    }
+}
+
+pub fn default_native_counter_strategy(unit: ProfileUnit) -> CounterStrategy {
+    let aggregate_type = match unit {
+        ProfileUnit::CpuTicks | ProfileUnit::TimeNs | ProfileUnit::TimeMs | ProfileUnit::TimeS => {
+            CounterAggregateType::Avg
+        }
+        ProfileUnit::Unit | ProfileUnit::Bytes | ProfileUnit::None => CounterAggregateType::Sum,
+    };
+    CounterStrategy::new(aggregate_type)
+}
+
 #[derive(Debug)]
 struct RuntimeProfileInner {
     name: RwLock<String>,
@@ -858,9 +934,50 @@ fn merge_counter_values(
 
 #[cfg(test)]
 mod tests {
-    use super::{ROOT_COUNTER, RuntimeProfile, native_profile_tree_to_thrift};
+    use super::{
+        default_native_counter_strategy, native_profile_tree_to_thrift, CounterAggregateType,
+        ProfileUnit, RuntimeProfile, ROOT_COUNTER,
+    };
     use crate::proto::novarocks;
     use crate::thrift::metrics;
+
+    #[test]
+    fn native_profile_unit_roundtrips_proto_values() {
+        assert_eq!(
+            ProfileUnit::from_proto(novarocks::ProfileUnit::Unit as i32).expect("UNIT converts"),
+            ProfileUnit::Unit
+        );
+        assert_eq!(
+            ProfileUnit::from_proto(novarocks::ProfileUnit::TimeNs as i32)
+                .expect("TIME_NS converts"),
+            ProfileUnit::TimeNs
+        );
+        assert_eq!(ProfileUnit::None.to_proto(), novarocks::ProfileUnit::None);
+        assert!(
+            ProfileUnit::from_proto(novarocks::ProfileUnit::Unspecified as i32).is_err(),
+            "unspecified proto unit must not silently become a runtime unit"
+        );
+    }
+
+    #[test]
+    fn native_counter_strategy_defaults_match_existing_merge_behavior() {
+        assert_eq!(
+            default_native_counter_strategy(ProfileUnit::TimeNs).aggregate_type(),
+            CounterAggregateType::Avg
+        );
+        assert_eq!(
+            default_native_counter_strategy(ProfileUnit::TimeMs).aggregate_type(),
+            CounterAggregateType::Avg
+        );
+        assert_eq!(
+            default_native_counter_strategy(ProfileUnit::Bytes).aggregate_type(),
+            CounterAggregateType::Sum
+        );
+        assert_eq!(
+            default_native_counter_strategy(ProfileUnit::Unit).aggregate_type(),
+            CounterAggregateType::Sum
+        );
+    }
 
     #[test]
     fn thrift_tree_keeps_child_counter_hierarchy() {
