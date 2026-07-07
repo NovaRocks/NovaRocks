@@ -26,8 +26,12 @@ use crate::common::util::{
     mysql_text_row_from_arrays_with_primitives,
 };
 use crate::exec::chunk::Chunk;
-use crate::thrift::{data, data_sinks, exprs, types};
-use crate::types::arrow_thrift::{arrow_field_to_primitive, thrift_desc_to_primitive};
+use crate::lower::compat::type_lowering::{
+    native_primitive_type_from_desc, render_schema_from_type_desc,
+};
+use crate::thrift::{data, data_sinks, exprs};
+use crate::types::PrimitiveType;
+use crate::types::arrow_primitive::arrow_field_to_primitive;
 
 const STATISTIC_DATA_VERSION_V1: i32 = 1;
 const STATISTIC_HISTOGRAM_VERSION: i32 = 2;
@@ -75,7 +79,7 @@ fn columns_for_output_exprs(
 
 fn primitives_for_output_exprs(
     output_exprs: &[exprs::TExpr],
-) -> Result<Vec<types::TPrimitiveType>, String> {
+) -> Result<Vec<PrimitiveType>, String> {
     let mut out = Vec::with_capacity(output_exprs.len());
     for (col_idx, e) in output_exprs.iter().enumerate() {
         let root = e
@@ -83,20 +87,18 @@ fn primitives_for_output_exprs(
             .first()
             .ok_or_else(|| format!("output_exprs[{}] is empty", col_idx))?;
         let primitive =
-            thrift_desc_to_primitive(&root.type_).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
+            native_primitive_type_from_desc(&root.type_).unwrap_or(PrimitiveType::Invalid);
         out.push(primitive);
     }
     Ok(out)
 }
 
-fn primitives_for_chunk_fields(chunk: &Chunk) -> Vec<types::TPrimitiveType> {
+fn primitives_for_chunk_fields(chunk: &Chunk) -> Vec<PrimitiveType> {
     chunk
         .chunk_schema()
         .slots()
         .iter()
-        .map(|slot| {
-            arrow_field_to_primitive(slot.field()).unwrap_or(types::TPrimitiveType::INVALID_TYPE)
-        })
+        .map(|slot| arrow_field_to_primitive(slot.field()).unwrap_or(PrimitiveType::Invalid))
         .collect()
 }
 
@@ -109,7 +111,7 @@ fn field_schemas_for_output_exprs(
             .nodes
             .first()
             .ok_or_else(|| format!("output_exprs[{}] is empty", col_idx))?;
-        out.push(FieldRenderSchema::try_from_type_desc(&root.type_)?);
+        out.push(render_schema_from_type_desc(&root.type_)?);
     }
     Ok(out)
 }

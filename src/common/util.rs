@@ -30,18 +30,34 @@ use std::cmp::Ordering;
 
 use crate::common::largeint;
 use crate::exec::variant::VariantValue;
-use crate::thrift::types;
-use crate::types::arrow_thrift::arrow_field_to_primitive;
+use crate::types::PrimitiveType;
+use crate::types::arrow_primitive::arrow_field_to_primitive;
 use crate::types::logical::{LogicalType, logical_type_of_field};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FieldRenderSchema {
-    primitive: Option<types::TPrimitiveType>,
+    primitive: Option<PrimitiveType>,
     json_value: bool,
     children: Vec<FieldRenderSchema>,
 }
 
 impl FieldRenderSchema {
+    pub(crate) fn scalar(primitive: Option<PrimitiveType>) -> Self {
+        Self {
+            primitive,
+            json_value: primitive.is_some_and(PrimitiveType::is_json),
+            children: Vec::new(),
+        }
+    }
+
+    pub(crate) fn complex(children: Vec<FieldRenderSchema>) -> Self {
+        Self {
+            primitive: None,
+            json_value: false,
+            children,
+        }
+    }
+
     pub(crate) fn from_field(field: &Field) -> Self {
         let children = match field.data_type() {
             DataType::Struct(fields) => fields
@@ -68,87 +84,6 @@ impl FieldRenderSchema {
             primitive: arrow_field_to_primitive(field),
             json_value: matches!(logical_type_of_field(field), Some(LogicalType::Json)),
             children,
-        }
-    }
-
-    pub(crate) fn try_from_type_desc(desc: &types::TTypeDesc) -> Result<Self, String> {
-        let nodes = desc
-            .types
-            .as_ref()
-            .ok_or_else(|| "render field type desc missing nodes".to_string())?;
-        let (schema, next) = Self::from_desc_nodes(nodes, 0)?;
-        if next != nodes.len() {
-            return Err(format!(
-                "render field type desc has trailing nodes: consumed={} total={}",
-                next,
-                nodes.len()
-            ));
-        }
-        Ok(schema)
-    }
-
-    fn from_desc_nodes(nodes: &[types::TTypeNode], start: usize) -> Result<(Self, usize), String> {
-        let node = nodes
-            .get(start)
-            .ok_or_else(|| format!("render field type desc ended unexpectedly at node {start}"))?;
-
-        match node.type_ {
-            t if t == types::TTypeNodeType::SCALAR => {
-                let primitive = node.scalar_type.as_ref().map(|scalar| scalar.type_);
-                Ok((
-                    Self {
-                        primitive,
-                        json_value: primitive == Some(types::TPrimitiveType::JSON),
-                        children: Vec::new(),
-                    },
-                    start + 1,
-                ))
-            }
-            t if t == types::TTypeNodeType::STRUCT => {
-                let struct_fields = node
-                    .struct_fields
-                    .as_ref()
-                    .ok_or_else(|| "render struct type desc missing struct_fields".to_string())?;
-                let mut cursor = start + 1;
-                let mut children = Vec::with_capacity(struct_fields.len());
-                for _ in struct_fields {
-                    let (child, next) = Self::from_desc_nodes(nodes, cursor)?;
-                    cursor = next;
-                    children.push(child);
-                }
-                Ok((
-                    Self {
-                        primitive: None,
-                        json_value: false,
-                        children,
-                    },
-                    cursor,
-                ))
-            }
-            t if t == types::TTypeNodeType::ARRAY => {
-                let (item, next) = Self::from_desc_nodes(nodes, start + 1)?;
-                Ok((
-                    Self {
-                        primitive: None,
-                        json_value: false,
-                        children: vec![item],
-                    },
-                    next,
-                ))
-            }
-            t if t == types::TTypeNodeType::MAP => {
-                let (key, next) = Self::from_desc_nodes(nodes, start + 1)?;
-                let (value, next) = Self::from_desc_nodes(nodes, next)?;
-                Ok((
-                    Self {
-                        primitive: None,
-                        json_value: false,
-                        children: vec![key, value],
-                    },
-                    next,
-                ))
-            }
-            other => Err(format!("unsupported render type desc node {:?}", other)),
         }
     }
 
@@ -189,22 +124,20 @@ fn format_date32_for_mysql(days: i32) -> String {
     }
 }
 
-fn is_opaque_binary_primitive(primitive: types::TPrimitiveType) -> bool {
-    primitive == types::TPrimitiveType::HLL
-        || primitive == types::TPrimitiveType::OBJECT
-        || primitive == types::TPrimitiveType::PERCENTILE
+fn is_opaque_binary_primitive(primitive: PrimitiveType) -> bool {
+    primitive.is_opaque_binary()
 }
 
 fn effective_primitive_type(
-    primitive: types::TPrimitiveType,
+    primitive: PrimitiveType,
     field_schema: Option<&FieldRenderSchema>,
-) -> types::TPrimitiveType {
-    if primitive != types::TPrimitiveType::INVALID_TYPE {
+) -> PrimitiveType {
+    if !matches!(primitive, PrimitiveType::Invalid) {
         primitive
     } else {
         field_schema
             .and_then(|schema| schema.primitive)
-            .unwrap_or(types::TPrimitiveType::INVALID_TYPE)
+            .unwrap_or(PrimitiveType::Invalid)
     }
 }
 
@@ -237,7 +170,7 @@ fn map_entry_fields(entries: &Field) -> Result<(&Field, &Field), String> {
 pub(crate) fn mysql_text_row_from_arrays_with_primitives(
     columns: &[ArrayRef],
     row: usize,
-    primitive_types: Option<&[types::TPrimitiveType]>,
+    primitive_types: Option<&[PrimitiveType]>,
     field_schemas: Option<&[FieldRenderSchema]>,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -251,7 +184,7 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
             primitive_types
                 .and_then(|prims| prims.get(idx))
                 .copied()
-                .unwrap_or(types::TPrimitiveType::INVALID_TYPE),
+                .unwrap_or(PrimitiveType::Invalid),
             field_schema,
         );
         match col.data_type() {
@@ -414,9 +347,7 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
                     .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-                if primitive == types::TPrimitiveType::LARGEINT
-                    || *width == largeint::LARGEINT_BYTE_WIDTH
-                {
+                if primitive.is_largeint() || *width == largeint::LARGEINT_BYTE_WIDTH {
                     let value = largeint::i128_from_be_bytes(arr.value(row))?;
                     append_lenenc_string(&mut out, value.to_string().as_bytes());
                 } else if is_opaque_binary_primitive(primitive) {
@@ -458,7 +389,7 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
 pub(crate) fn http_json_row_from_arrays_with_primitives(
     columns: &[ArrayRef],
     row: usize,
-    primitive_types: Option<&[types::TPrimitiveType]>,
+    primitive_types: Option<&[PrimitiveType]>,
     field_schemas: Option<&[FieldRenderSchema]>,
 ) -> Result<Vec<u8>, String> {
     let mut out = String::from("{\"data\":[");
@@ -471,7 +402,7 @@ pub(crate) fn http_json_row_from_arrays_with_primitives(
             primitive_types
                 .and_then(|prims| prims.get(idx))
                 .copied()
-                .unwrap_or(types::TPrimitiveType::INVALID_TYPE),
+                .unwrap_or(PrimitiveType::Invalid),
             field_schema,
         );
         append_http_json_value_with_schema(&mut out, col, row, primitive, field_schema)?;
@@ -491,7 +422,7 @@ fn append_http_json_value_with_schema(
     out: &mut String,
     col: &ArrayRef,
     row: usize,
-    primitive: types::TPrimitiveType,
+    primitive: PrimitiveType,
     field_schema: Option<&FieldRenderSchema>,
 ) -> Result<(), String> {
     if col.is_null(row) {
@@ -569,7 +500,7 @@ fn append_http_json_value_with_schema(
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
             let value = arr.value(row);
-            if json_semantic || primitive == types::TPrimitiveType::JSON {
+            if json_semantic || primitive.is_json() {
                 serde_json::from_str::<serde_json::Value>(value).map_err(|e| {
                     format!("invalid JSON UTF8 value for HTTP result row: value={value}, error={e}")
                 })?;
@@ -673,9 +604,7 @@ fn append_http_json_value_with_schema(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-            if primitive == types::TPrimitiveType::LARGEINT
-                || *width == largeint::LARGEINT_BYTE_WIDTH
-            {
+            if primitive.is_largeint() || *width == largeint::LARGEINT_BYTE_WIDTH {
                 let value = largeint::i128_from_be_bytes(arr.value(row))?;
                 append_http_json_quoted(out, &value.to_string())?;
             } else if is_opaque_binary_primitive(primitive) {
@@ -721,7 +650,7 @@ fn append_http_json_value_with_schema(
                     out,
                     values,
                     idx,
-                    types::TPrimitiveType::INVALID_TYPE,
+                    PrimitiveType::Invalid,
                     Some(item_schema.as_ref()),
                 )?;
             }
@@ -749,7 +678,7 @@ fn append_http_json_value_with_schema(
                     out,
                     values,
                     idx,
-                    types::TPrimitiveType::INVALID_TYPE,
+                    PrimitiveType::Invalid,
                     Some(item_schema.as_ref()),
                 )?;
             }
@@ -790,7 +719,7 @@ fn append_http_json_value_with_schema(
                     out,
                     values,
                     entry_idx,
-                    types::TPrimitiveType::INVALID_TYPE,
+                    PrimitiveType::Invalid,
                     Some(value_schema.as_ref()),
                 )?;
             }
@@ -817,7 +746,7 @@ fn append_http_json_value_with_schema(
                     out,
                     arr.column(idx),
                     row,
-                    types::TPrimitiveType::INVALID_TYPE,
+                    PrimitiveType::Invalid,
                     Some(child_schema.as_ref()),
                 )?;
             }
@@ -990,7 +919,7 @@ fn http_json_object_key_with_schema(
                 &mut rendered,
                 keys,
                 row,
-                types::TPrimitiveType::INVALID_TYPE,
+                PrimitiveType::Invalid,
                 field_schema,
             )?;
             Ok(rendered.trim_matches('"').to_string())
@@ -1012,7 +941,7 @@ pub(crate) fn format_mysql_container_value_with_schema(
     }
     let primitive = field_schema
         .and_then(|schema| schema.primitive)
-        .unwrap_or(types::TPrimitiveType::INVALID_TYPE);
+        .unwrap_or(PrimitiveType::Invalid);
     match col.data_type() {
         DataType::Null => Ok("null".to_string()),
         DataType::Boolean => {
@@ -1158,9 +1087,7 @@ pub(crate) fn format_mysql_container_value_with_schema(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-            if primitive == types::TPrimitiveType::LARGEINT
-                || *width == largeint::LARGEINT_BYTE_WIDTH
-            {
+            if primitive.is_largeint() || *width == largeint::LARGEINT_BYTE_WIDTH {
                 let value = largeint::i128_from_be_bytes(arr.value(row))?;
                 Ok(value.to_string())
             } else if is_opaque_binary_primitive(primitive) {
@@ -1665,9 +1592,9 @@ fn format_timestamp_with_primitive(
     unit: TimeUnit,
     value: i64,
     tz: Option<&str>,
-    primitive: types::TPrimitiveType,
+    primitive: PrimitiveType,
 ) -> String {
-    if primitive == types::TPrimitiveType::TIME {
+    if primitive.is_time() {
         return format_time_duration(unit, value);
     }
     format_timestamp(unit, value, tz)
@@ -1775,7 +1702,7 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, StringArray, StructArray, Time64MicrosecondArray};
     use arrow::datatypes::{DataType, Field, TimeUnit};
 
-    use crate::thrift::types;
+    use crate::types::PrimitiveType;
     use crate::types::logical::{LogicalType, field_with_logical_type};
 
     #[test]
@@ -1800,7 +1727,7 @@ mod tests {
         let row = mysql_text_row_from_arrays_with_primitives(
             &columns,
             0,
-            Some(&[types::TPrimitiveType::TIME]),
+            Some(&[PrimitiveType::Time]),
             None,
         )
         .expect("mysql row");
@@ -1815,7 +1742,7 @@ mod tests {
         let row = http_json_row_from_arrays_with_primitives(
             &columns,
             0,
-            Some(&[types::TPrimitiveType::INT]),
+            Some(&[PrimitiveType::Int]),
             None,
         )
         .expect("http json row");
@@ -1828,7 +1755,7 @@ mod tests {
         let row = http_json_row_from_arrays_with_primitives(
             &columns,
             0,
-            Some(&[types::TPrimitiveType::JSON]),
+            Some(&[PrimitiveType::Json]),
             None,
         )
         .expect("http json row");

@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use crate::common::util::FieldRenderSchema;
 use crate::thrift::types;
+use crate::types::PrimitiveType;
 pub(crate) use crate::types::arrow_thrift::{THRIFT_TIME_UNIT_NANOS, thrift_time_unit_for_arrow};
 use crate::types::arrow_thrift::{
-    thrift_desc_to_arrow_field, thrift_desc_to_arrow_type, thrift_desc_to_primitive,
-    thrift_node_to_primitive, thrift_type_desc_from_primitive,
+    thrift_desc_to_arrow_field, thrift_desc_to_arrow_type, thrift_type_desc_from_primitive,
 };
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
@@ -27,11 +28,156 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 pub(crate) fn primitive_type_from_node(
     node: &crate::thrift::exprs::TExprNode,
 ) -> Option<types::TPrimitiveType> {
-    thrift_node_to_primitive(node)
+    primitive_type_from_desc(&node.type_)
 }
 
 pub(crate) fn primitive_type_from_desc(desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
-    thrift_desc_to_primitive(desc)
+    let nodes = desc.types.as_ref()?;
+    let first = nodes.first()?;
+    if first.type_ != types::TTypeNodeType::SCALAR {
+        return None;
+    }
+    let scalar = first.scalar_type.as_ref()?;
+    Some(scalar.type_)
+}
+
+pub(crate) fn native_primitive_from_thrift(
+    primitive: types::TPrimitiveType,
+) -> Option<PrimitiveType> {
+    let native = match primitive {
+        t if t == types::TPrimitiveType::INVALID_TYPE => PrimitiveType::Invalid,
+        t if t == types::TPrimitiveType::NULL_TYPE => PrimitiveType::Null,
+        t if t == types::TPrimitiveType::BOOLEAN => PrimitiveType::Boolean,
+        t if t == types::TPrimitiveType::TINYINT => PrimitiveType::TinyInt,
+        t if t == types::TPrimitiveType::SMALLINT => PrimitiveType::SmallInt,
+        t if t == types::TPrimitiveType::INT => PrimitiveType::Int,
+        t if t == types::TPrimitiveType::BIGINT => PrimitiveType::BigInt,
+        t if t == types::TPrimitiveType::LARGEINT => PrimitiveType::LargeInt,
+        t if t == types::TPrimitiveType::INT256 => PrimitiveType::Int256,
+        t if t == types::TPrimitiveType::FLOAT => PrimitiveType::Float,
+        t if t == types::TPrimitiveType::DOUBLE => PrimitiveType::Double,
+        t if t == types::TPrimitiveType::DATE => PrimitiveType::Date,
+        t if t == types::TPrimitiveType::DATETIME => PrimitiveType::DateTime,
+        t if t == types::TPrimitiveType::TIME => PrimitiveType::Time,
+        t if t == types::TPrimitiveType::DECIMAL => PrimitiveType::Decimal,
+        t if t == types::TPrimitiveType::DECIMALV2 => PrimitiveType::DecimalV2,
+        t if t == types::TPrimitiveType::DECIMAL32 => PrimitiveType::Decimal32,
+        t if t == types::TPrimitiveType::DECIMAL64 => PrimitiveType::Decimal64,
+        t if t == types::TPrimitiveType::DECIMAL128 => PrimitiveType::Decimal128,
+        t if t == types::TPrimitiveType::DECIMAL256 => PrimitiveType::Decimal256,
+        t if t == types::TPrimitiveType::CHAR => PrimitiveType::Char,
+        t if t == types::TPrimitiveType::VARCHAR => PrimitiveType::Varchar,
+        t if t == types::TPrimitiveType::BINARY => PrimitiveType::Binary,
+        t if t == types::TPrimitiveType::VARBINARY => PrimitiveType::Varbinary,
+        t if t == types::TPrimitiveType::JSON => PrimitiveType::Json,
+        t if t == types::TPrimitiveType::HLL => PrimitiveType::Hll,
+        t if t == types::TPrimitiveType::OBJECT => PrimitiveType::Object,
+        t if t == types::TPrimitiveType::PERCENTILE => PrimitiveType::Percentile,
+        t if t == types::TPrimitiveType::FUNCTION => PrimitiveType::Function,
+        t if t == types::TPrimitiveType::VARIANT => PrimitiveType::Variant,
+        _ => return None,
+    };
+    Some(native)
+}
+
+pub(crate) fn thrift_primitive_from_native(primitive: PrimitiveType) -> types::TPrimitiveType {
+    match primitive {
+        PrimitiveType::Invalid => types::TPrimitiveType::INVALID_TYPE,
+        PrimitiveType::Null => types::TPrimitiveType::NULL_TYPE,
+        PrimitiveType::Boolean => types::TPrimitiveType::BOOLEAN,
+        PrimitiveType::TinyInt => types::TPrimitiveType::TINYINT,
+        PrimitiveType::SmallInt => types::TPrimitiveType::SMALLINT,
+        PrimitiveType::Int => types::TPrimitiveType::INT,
+        PrimitiveType::BigInt => types::TPrimitiveType::BIGINT,
+        PrimitiveType::LargeInt => types::TPrimitiveType::LARGEINT,
+        PrimitiveType::Int256 => types::TPrimitiveType::INT256,
+        PrimitiveType::Float => types::TPrimitiveType::FLOAT,
+        PrimitiveType::Double => types::TPrimitiveType::DOUBLE,
+        PrimitiveType::Date => types::TPrimitiveType::DATE,
+        PrimitiveType::DateTime => types::TPrimitiveType::DATETIME,
+        PrimitiveType::Time => types::TPrimitiveType::TIME,
+        PrimitiveType::Decimal => types::TPrimitiveType::DECIMAL,
+        PrimitiveType::DecimalV2 => types::TPrimitiveType::DECIMALV2,
+        PrimitiveType::Decimal32 => types::TPrimitiveType::DECIMAL32,
+        PrimitiveType::Decimal64 => types::TPrimitiveType::DECIMAL64,
+        PrimitiveType::Decimal128 => types::TPrimitiveType::DECIMAL128,
+        PrimitiveType::Decimal256 => types::TPrimitiveType::DECIMAL256,
+        PrimitiveType::Char => types::TPrimitiveType::CHAR,
+        PrimitiveType::Varchar => types::TPrimitiveType::VARCHAR,
+        PrimitiveType::Binary => types::TPrimitiveType::BINARY,
+        PrimitiveType::Varbinary => types::TPrimitiveType::VARBINARY,
+        PrimitiveType::Json => types::TPrimitiveType::JSON,
+        PrimitiveType::Hll => types::TPrimitiveType::HLL,
+        PrimitiveType::Object => types::TPrimitiveType::OBJECT,
+        PrimitiveType::Percentile => types::TPrimitiveType::PERCENTILE,
+        PrimitiveType::Function => types::TPrimitiveType::FUNCTION,
+        PrimitiveType::Variant => types::TPrimitiveType::VARIANT,
+    }
+}
+
+pub(crate) fn native_primitive_type_from_desc(desc: &types::TTypeDesc) -> Option<PrimitiveType> {
+    primitive_type_from_desc(desc).and_then(native_primitive_from_thrift)
+}
+
+pub(crate) fn render_schema_from_type_desc(
+    desc: &types::TTypeDesc,
+) -> Result<FieldRenderSchema, String> {
+    let nodes = desc
+        .types
+        .as_ref()
+        .ok_or_else(|| "render field type desc missing nodes".to_string())?;
+    let (schema, next) = render_schema_from_desc_nodes(nodes, 0)?;
+    if next != nodes.len() {
+        return Err(format!(
+            "render field type desc has trailing nodes: consumed={} total={}",
+            next,
+            nodes.len()
+        ));
+    }
+    Ok(schema)
+}
+
+fn render_schema_from_desc_nodes(
+    nodes: &[types::TTypeNode],
+    start: usize,
+) -> Result<(FieldRenderSchema, usize), String> {
+    let node = nodes
+        .get(start)
+        .ok_or_else(|| format!("render field type desc ended unexpectedly at node {start}"))?;
+
+    match node.type_ {
+        t if t == types::TTypeNodeType::SCALAR => {
+            let primitive = node
+                .scalar_type
+                .as_ref()
+                .and_then(|scalar| native_primitive_from_thrift(scalar.type_));
+            Ok((FieldRenderSchema::scalar(primitive), start + 1))
+        }
+        t if t == types::TTypeNodeType::STRUCT => {
+            let struct_fields = node
+                .struct_fields
+                .as_ref()
+                .ok_or_else(|| "render struct type desc missing struct_fields".to_string())?;
+            let mut cursor = start + 1;
+            let mut children = Vec::with_capacity(struct_fields.len());
+            for _ in struct_fields {
+                let (child, next) = render_schema_from_desc_nodes(nodes, cursor)?;
+                cursor = next;
+                children.push(child);
+            }
+            Ok((FieldRenderSchema::complex(children), cursor))
+        }
+        t if t == types::TTypeNodeType::ARRAY => {
+            let (item, next) = render_schema_from_desc_nodes(nodes, start + 1)?;
+            Ok((FieldRenderSchema::complex(vec![item]), next))
+        }
+        t if t == types::TTypeNodeType::MAP => {
+            let (key, next) = render_schema_from_desc_nodes(nodes, start + 1)?;
+            let (value, next) = render_schema_from_desc_nodes(nodes, next)?;
+            Ok((FieldRenderSchema::complex(vec![key, value]), next))
+        }
+        other => Err(format!("unsupported render type desc node {:?}", other)),
+    }
 }
 
 pub(crate) fn scalar_type_desc(primitive: types::TPrimitiveType) -> types::TTypeDesc {

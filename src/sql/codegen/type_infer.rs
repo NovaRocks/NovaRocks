@@ -1,8 +1,8 @@
 use arrow::datatypes::{DataType, Field};
 
-use crate::lower::compat::type_lowering::scalar_type_desc;
+use crate::lower::compat::type_lowering::{scalar_type_desc, thrift_primitive_from_native};
 use crate::thrift::types;
-use crate::types::arrow_thrift::{arrow_type_to_primitive, field_logical_primitive};
+use crate::types::arrow_primitive::{arrow_type_to_primitive, field_logical_primitive};
 
 /// Convert Arrow DataType to Thrift TTypeDesc.
 pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTypeDesc, String> {
@@ -27,7 +27,11 @@ fn append_arrow_type_nodes(
     // If the enclosing `Field` carries a logical-type tag, override the
     // inferred primitive so the child reports e.g. JSON instead of VARCHAR.
     if let Some(primitive) = parent_field.and_then(field_logical_primitive) {
-        nodes.extend(scalar_type_desc(primitive).types.unwrap_or_default());
+        nodes.extend(
+            scalar_type_desc(thrift_primitive_from_native(primitive))
+                .types
+                .unwrap_or_default(),
+        );
         return Ok(());
     }
     match data_type {
@@ -141,7 +145,7 @@ fn append_arrow_type_nodes(
             Ok(())
         }
         _ => {
-            let primitive = arrow_type_to_primitive(data_type)?;
+            let primitive = thrift_primitive_from_native(arrow_type_to_primitive(data_type)?);
             nodes.extend(scalar_type_desc(primitive).types.unwrap_or_default());
             Ok(())
         }
@@ -153,7 +157,8 @@ pub(crate) use crate::types::{arithmetic_result_type_with_op, wider_type};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::arrow_thrift::arrow_field_to_primitive;
+    use crate::types::PrimitiveType;
+    use crate::types::arrow_primitive::arrow_field_to_primitive;
     use crate::types::logical::LogicalType;
 
     fn primitive_from_desc(desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
@@ -177,10 +182,7 @@ mod tests {
             primitive_from_desc(&desc),
             Some(types::TPrimitiveType::JSON)
         );
-        assert_eq!(
-            arrow_field_to_primitive(&field),
-            Some(types::TPrimitiveType::JSON)
-        );
+        assert_eq!(arrow_field_to_primitive(&field), Some(PrimitiveType::Json));
     }
 
     #[test]
@@ -189,26 +191,30 @@ mod tests {
             (
                 logical_field("hll", DataType::Binary, LogicalType::Hll),
                 types::TPrimitiveType::HLL,
+                PrimitiveType::Hll,
             ),
             (
                 logical_field("bitmap", DataType::Binary, LogicalType::Bitmap),
                 types::TPrimitiveType::OBJECT,
+                PrimitiveType::Object,
             ),
             (
                 logical_field("object", DataType::LargeBinary, LogicalType::Object),
                 types::TPrimitiveType::OBJECT,
+                PrimitiveType::Object,
             ),
             (
                 logical_field("percentile", DataType::Binary, LogicalType::Percentile),
                 types::TPrimitiveType::PERCENTILE,
+                PrimitiveType::Percentile,
             ),
         ];
 
-        for (field, expected) in cases {
+        for (field, thrift_expected, native_expected) in cases {
             let desc = arrow_field_to_type_desc(&field).unwrap();
 
-            assert_eq!(primitive_from_desc(&desc), Some(expected));
-            assert_eq!(arrow_field_to_primitive(&field), Some(expected));
+            assert_eq!(primitive_from_desc(&desc), Some(thrift_expected));
+            assert_eq!(arrow_field_to_primitive(&field), Some(native_expected));
         }
     }
 
@@ -218,7 +224,7 @@ mod tests {
 
         assert_eq!(
             arrow_field_to_primitive(&field),
-            Some(types::TPrimitiveType::VARCHAR)
+            Some(PrimitiveType::Varchar)
         );
     }
 
