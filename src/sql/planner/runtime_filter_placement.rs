@@ -10,7 +10,9 @@
 //! `optimizer::runtime_filter_pass` -- do not "improve" placement here; changes
 //! belong in the RF baseline / producer arcs.
 
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
+use crate::sql::planner::physical_vocab::JoinDistribution;
 use crate::sql::planner::plan::PhysicalPlanNode;
 
 /// Rule name recognized by `SET disable_optimizer_rules='RuntimeFilterPushDown'`.
@@ -45,6 +47,84 @@ impl RuntimeFilterPlacementConfig {
             allow_cross_exchange: s.allow_cross_exchange_rf.unwrap_or(true),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JoinRfSides {
+    probe_child: usize,
+    build_child: usize,
+}
+
+fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
+    match kind {
+        JoinKind::Inner | JoinKind::RightOuter | JoinKind::LeftSemi => Some(JoinRfSides {
+            probe_child: 0,
+            build_child: 1,
+        }),
+        JoinKind::LeftOuter
+        | JoinKind::FullOuter
+        | JoinKind::RightSemi
+        | JoinKind::LeftAnti
+        | JoinKind::RightAnti
+        | JoinKind::NullAwareLeftAnti
+        | JoinKind::Cross => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossExchangeMode {
+    Disabled,
+    Unconditional,
+    KeyAligned,
+}
+
+impl From<&JoinDistribution> for CrossExchangeMode {
+    fn from(d: &JoinDistribution) -> Self {
+        match d {
+            JoinDistribution::Broadcast => CrossExchangeMode::Unconditional,
+            JoinDistribution::Shuffle | JoinDistribution::Colocate => CrossExchangeMode::KeyAligned,
+            JoinDistribution::Unknown => CrossExchangeMode::Disabled,
+        }
+    }
+}
+
+fn join_is_outer_or_anti_boundary(kind: JoinKind) -> bool {
+    matches!(
+        kind,
+        JoinKind::LeftOuter
+            | JoinKind::RightOuter
+            | JoinKind::FullOuter
+            | JoinKind::LeftAnti
+            | JoinKind::RightAnti
+            | JoinKind::NullAwareLeftAnti
+    )
+}
+
+fn build_gate_passes(distribution: &JoinDistribution, build_size: f64, build_max: f64) -> bool {
+    match distribution {
+        JoinDistribution::Shuffle => !(build_size <= 0.0 || build_size > build_max),
+        _ => true,
+    }
+}
+
+fn probe_gate_passes(
+    local: bool,
+    build_size: f64,
+    probe_size: f64,
+    build_min: f64,
+    probe_min: f64,
+    min_sel: f64,
+) -> bool {
+    if local {
+        return true;
+    }
+    if build_size <= build_min {
+        return true;
+    }
+    if probe_size < probe_min {
+        return false;
+    }
+    (build_size / probe_size.max(1.0)) <= 1.0 - min_sel
 }
 
 /// Entry point. No-op until Task 7 fills the traversal.
@@ -85,12 +165,74 @@ fn walk_plan_mut(node: &mut PhysicalPlanNode, f: &mut impl FnMut(&mut PhysicalPl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::common::JoinKind;
     use crate::sql::optimizer::options::{
         SessionOptimizerSettings, with_session_optimizer_settings,
     };
+    use crate::sql::planner::physical_vocab::JoinDistribution;
     use crate::sql::planner::plan::{PhysicalPlanKind, PlanValuesNode};
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
     use std::collections::HashMap;
+
+    #[test]
+    fn rf_sides_match_join_semantics() {
+        assert_eq!(
+            rf_sides_for_join(JoinKind::Inner),
+            Some(JoinRfSides {
+                probe_child: 0,
+                build_child: 1
+            })
+        );
+        assert_eq!(
+            rf_sides_for_join(JoinKind::RightOuter),
+            Some(JoinRfSides {
+                probe_child: 0,
+                build_child: 1
+            })
+        );
+        assert_eq!(rf_sides_for_join(JoinKind::RightSemi), None);
+        assert_eq!(rf_sides_for_join(JoinKind::LeftOuter), None);
+        assert_eq!(rf_sides_for_join(JoinKind::FullOuter), None);
+    }
+
+    #[test]
+    fn cross_exchange_mode_maps_distribution() {
+        assert_eq!(
+            CrossExchangeMode::from(&JoinDistribution::Broadcast),
+            CrossExchangeMode::Unconditional
+        );
+        assert_eq!(
+            CrossExchangeMode::from(&JoinDistribution::Shuffle),
+            CrossExchangeMode::KeyAligned
+        );
+        assert_eq!(
+            CrossExchangeMode::from(&JoinDistribution::Colocate),
+            CrossExchangeMode::KeyAligned
+        );
+        assert_eq!(
+            CrossExchangeMode::from(&JoinDistribution::Unknown),
+            CrossExchangeMode::Disabled
+        );
+    }
+
+    #[test]
+    fn build_gate_rejects_oversized_shuffle_build() {
+        assert!(!build_gate_passes(&JoinDistribution::Shuffle, 200.0, 100.0));
+        assert!(build_gate_passes(&JoinDistribution::Shuffle, 50.0, 100.0));
+        assert!(build_gate_passes(
+            &JoinDistribution::Broadcast,
+            200.0,
+            100.0
+        ));
+    }
+
+    #[test]
+    fn probe_gate_matches_local_and_selectivity_thresholds() {
+        assert!(probe_gate_passes(true, 1_000.0, 1.0, 10.0, 10.0, 0.5));
+        assert!(probe_gate_passes(false, 5.0, 1.0, 10.0, 10.0, 0.5));
+        assert!(!probe_gate_passes(false, 20.0, 5.0, 10.0, 10.0, 0.5));
+        assert!(probe_gate_passes(false, 20.0, 100.0, 10.0, 10.0, 0.5));
+    }
 
     #[test]
     fn walk_plan_mut_visits_descendants_before_parent() {
