@@ -631,6 +631,7 @@ mod tests {
                 },
             ],
             total_data_files: Some(200),
+            max_compactable_data_files: Some(200),
             total_files_size_bytes: Some(200 * 1024 * 1024),
             total_delete_files: Some(0),
             properties: std::collections::HashMap::new(),

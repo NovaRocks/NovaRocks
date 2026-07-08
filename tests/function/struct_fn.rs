@@ -18,7 +18,7 @@
 
 use crate::common;
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Int64Array, ListArray, StringArray, StructArray,
+    Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields};
 use arrow::record_batch::RecordBatch;
@@ -142,7 +142,7 @@ fn test_row_rejects_decimal_precision_drift() {
 }
 
 #[test]
-fn test_struct_expr_nested_list_mismatch_reports_path() {
+fn test_struct_expr_nested_list_casts_declared_item_type() {
     let mut arena = ExprArena::default();
     let slot_id = SlotId::new(12);
     let list = Arc::new(ListArray::from_iter_primitive::<
@@ -168,16 +168,15 @@ fn test_struct_expr_nested_list_mismatch_reports_path() {
         struct_type,
     );
 
-    let err = arena
+    let out = arena
         .eval(expr, &chunk)
-        .expect_err("struct expr must reject nested list item drift");
+        .expect("struct expr must cast nested list item drift");
 
-    assert!(
-        err.contains("struct_expr field type mismatch at field[0].list.item"),
-        "err={err}"
-    );
-    assert!(err.contains("Int32"), "err={err}");
-    assert!(err.contains("Int64"), "err={err}");
+    let out = out.as_any().downcast_ref::<StructArray>().unwrap();
+    let list = out.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(list.values().data_type(), &DataType::Int32);
+    let values = list.values().as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(values.value(0), 7);
 }
 
 #[test]

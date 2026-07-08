@@ -302,6 +302,11 @@ fn physical_node_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColum
         Operator::PhysicalDistribution(_) => physical_distribution_output_columns(node),
         Operator::PhysicalHashJoin(join) => physical_join_output_columns(join.join_type, node),
         Operator::PhysicalNestLoopJoin(join) => physical_join_output_columns(join.join_type, node),
+        Operator::PhysicalFilter(_)
+        | Operator::PhysicalSort(_)
+        | Operator::PhysicalLimit(_)
+        | Operator::PhysicalTopN(_)
+        | Operator::PhysicalAssertOneRow(_) => physical_passthrough_output_columns(node),
         _ => node.output_columns.clone(),
     }
 }
@@ -314,6 +319,13 @@ fn physical_node_materialized_output_columns(node: &OptimizerPhysicalNode) -> Ve
 }
 
 fn physical_distribution_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
+    node.children
+        .first()
+        .map(physical_node_materialized_output_columns)
+        .unwrap_or_else(|| node.output_columns.clone())
+}
+
+fn physical_passthrough_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
     node.children
         .first()
         .map(physical_node_materialized_output_columns)

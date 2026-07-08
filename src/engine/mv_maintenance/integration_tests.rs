@@ -20,8 +20,9 @@
 //! background thread, injected `now_ms`) against a real `StandaloneState`
 //! backed by a local hadoop iceberg catalog, and verify the four acceptance
 //! behaviors:
-//!   1. auto OPTIMIZE compacts small files
-//!      (`scenario_1_auto_optimize_compacts_small_files`);
+//!   1. auto OPTIMIZE skips row-lineage small files when no same-sequence
+//!      compaction group can reduce file count
+//!      (`scenario_1_auto_optimize_skips_sequence_isolated_row_lineage_files`);
 //!   2. auto EXPIRE honors `history.expire.*` and keeps min snapshots;
 //!   3. auto EXPIRE does not break a downstream incremental consumer;
 //!   4. the per-table escape hatch (`novarocks.maintenance.enabled=false`)
@@ -352,21 +353,29 @@ fn run_pass(env: &MaintenanceTestEnv, coordinator: &mut MaintenanceCoordinator) 
         .expect("maintenance pass");
 }
 
-// --- Scenario ①: auto OPTIMIZE compacts small files ---
+// --- Scenario ①: auto OPTIMIZE skips sequence-isolated row-lineage files ---
 //
-// Previously ignored because OPTIMIZE of an MV storage table failed with
+// Previously this asserted that every set of small MV files must compact, but
+// row-lineage preserve rewrites can only merge files in the same partition and
+// with the same `_last_updated_sequence_number`: the REPLACE data manifest has
+// one sequence number per replacement file. The incremental refreshes below
+// deliberately create one MV file per Iceberg sequence, so maintenance must
+// skip OPTIMIZE instead of submitting a job that can only rewrite 4 files into
+// 4 files.
+//
+// Older versions of this scenario were ignored because OPTIMIZE of an MV
+// storage table failed with
 // `annotate_batch column count mismatch: batch=5 schema=6`: the rewrite read
 // the table with `SELECT *, _row_id, _last_updated_sequence_number`, and
 // `SELECT *` omitted the MV's hidden internal apply-key column
 // (`__nova_base_row_id`) while the writer schema (built from the full physical
 // `current_schema()`) included it. The fix in `compact.rs` rewrites tables that
 // carry hidden internal columns through a direct physical read that preserves
-// every physical column (including the apply key) verbatim. This scenario now
-// exercises the small-file compaction path on a projection MV storage table;
-// `optimize_preserves_mv_apply_key_for_incremental_delete` is the companion
-// correctness gate that proves the apply key survives compaction.
+// every physical column (including the apply key) verbatim. The
+// `optimize_preserves_mv_apply_key_for_incremental_delete` correctness gate
+// proves the apply key survives compaction.
 #[test]
-fn scenario_1_auto_optimize_compacts_small_files() {
+fn scenario_1_auto_optimize_skips_sequence_isolated_row_lineage_files() {
     let env = open_env("ice", "analytics");
     create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
     insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
@@ -411,17 +420,12 @@ fn scenario_1_auto_optimize_compacts_small_files() {
         "expected >= 2 data files before optimize to exercise compaction, got {data_files_before}"
     );
 
-    // One pass with the compaction file-count threshold lowered to 2 submits an
-    // optimize job (avg file size is tiny, well below the small-file ratio).
+    // One pass with the compaction file-count threshold lowered to 2 must still
+    // skip OPTIMIZE because no same-sequence file group reaches the threshold.
     let mut coordinator = coordinator_with(|cfg| {
         cfg.policy.compaction_min_data_files = 2;
     });
     run_pass(&env, &mut coordinator);
-
-    // The optimize worker thread is not spawned under cfg(test); drive it once
-    // synchronously to execute the submitted job.
-    crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)
-        .expect("run optimize job");
 
     let provider = env.state.metadata_provider.as_ref().expect("provider");
     let read = provider.begin_read().expect("read txn");
@@ -430,17 +434,13 @@ fn scenario_1_auto_optimize_compacts_small_files() {
         .job_repo
         .show_iceberg_optimize_jobs(read.as_ref())
         .expect("list jobs");
-    assert!(!jobs.is_empty(), "expected an auto-submitted optimize job");
     assert!(
-        jobs.iter().all(|j| matches!(
-            j.state,
-            crate::meta::repository::job::IcebergOptimizeJobState::Finished
-        )),
-        "jobs: {jobs:?}"
+        jobs.is_empty(),
+        "sequence-isolated row-lineage files are not compactable; jobs: {jobs:?}"
     );
 
-    // Capture data-file count AFTER optimize and assert it shrank (convergence
-    // criterion: compaction reduces data files when there are multiple small ones).
+    // Capture data-file count AFTER maintenance and assert no no-op rewrite was
+    // committed.
     let definitions_after = {
         let provider2 = env.state.metadata_provider.as_ref().expect("provider");
         let read2 = provider2.begin_read().expect("read txn");
@@ -455,16 +455,12 @@ fn scenario_1_auto_optimize_compacts_small_files() {
     let data_files_after = stats_after
         .total_data_files
         .expect("total_data_files must be present after optimize");
-    assert!(
-        data_files_after < data_files_before,
-        "optimize must reduce data-file count (convergence): before={data_files_before} after={data_files_after}"
-    );
-    assert!(
-        data_files_after >= 1,
-        "optimize must leave at least one data file, got {data_files_after}"
+    assert_eq!(
+        data_files_after, data_files_before,
+        "maintenance must not commit a no-op optimize rewrite"
     );
 
-    // The MV still answers SELECT after compaction.
+    // The MV still answers SELECT after the skipped maintenance pass.
     let rows = select_row_count(
         &env.state,
         Some("ice"),
@@ -818,10 +814,11 @@ fn optimize_preserves_mv_apply_key_for_incremental_delete() {
         "MV must hold all four rows before optimize"
     );
 
-    // Lower the file-count threshold so the small files trigger a compaction
-    // job over the MV storage table.
+    // This test is the OPTIMIZE apply-key preservation gate, not the
+    // sequence-aware auto-admission gate. Force admission even when each
+    // row-lineage file belongs to its own sequence.
     let mut coordinator = coordinator_with(|cfg| {
-        cfg.policy.compaction_min_data_files = 2;
+        cfg.policy.compaction_min_data_files = 1;
     });
     run_pass(&env, &mut coordinator);
 
@@ -985,7 +982,9 @@ fn optimize_preserves_aggregate_mv_apply_key_and_state() {
     );
 
     let mut coordinator = coordinator_with(|cfg| {
-        cfg.policy.compaction_min_data_files = 2;
+        // This test is the OPTIMIZE aggregate-state preservation gate, not the
+        // sequence-aware auto-admission gate.
+        cfg.policy.compaction_min_data_files = 1;
     });
     run_pass(&env, &mut coordinator);
     crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)

@@ -81,7 +81,9 @@ pub use retry::{commit_with_retry, is_retryable_commit_conflict};
 pub use rewrite_data_files::RewriteDataFilesCommit;
 #[allow(unused_imports)]
 pub(crate) use rewrite_data_files::count_current_live_files;
-pub(crate) use rewrite_data_files::{LiveFileMetrics, current_live_file_metrics};
+pub(crate) use rewrite_data_files::{
+    LiveFileMetrics, current_live_data_file_compaction_stats, current_live_file_metrics,
+};
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
 pub use row_delta_dv_from_files::RowDeltaDvFromFilesCommit;

@@ -673,15 +673,111 @@ fn split_row_lineage_batches_into_manifest_runs(
             let row_id = row_lineage_row_id_at(&batch.lineage.row_ids, row)?;
             let seq = row_lineage_sequence_at(&batch.lineage.last_updated_sequence_numbers, row);
             if row_id != prev_row_id + 1 || seq != prev_seq {
-                out.push(slice_row_lineage_write_batch(batch, start, row - start));
+                push_row_lineage_manifest_run(
+                    &mut out,
+                    slice_row_lineage_write_batch(batch, start, row - start),
+                )?;
                 start = row;
             }
             prev_row_id = row_id;
             prev_seq = seq;
         }
-        out.push(slice_row_lineage_write_batch(batch, start, rows - start));
+        push_row_lineage_manifest_run(
+            &mut out,
+            slice_row_lineage_write_batch(batch, start, rows - start),
+        )?;
     }
     Ok(out)
+}
+
+fn push_row_lineage_manifest_run(
+    out: &mut Vec<RowLineageWriteBatch>,
+    run: RowLineageWriteBatch,
+) -> Result<(), String> {
+    let Some(last) = out.last_mut() else {
+        out.push(run);
+        return Ok(());
+    };
+    if !can_merge_row_lineage_manifest_runs(last, &run)? {
+        out.push(run);
+        return Ok(());
+    }
+
+    *last = merge_row_lineage_manifest_runs(last, &run)?;
+    Ok(())
+}
+
+fn can_merge_row_lineage_manifest_runs(
+    left: &RowLineageWriteBatch,
+    right: &RowLineageWriteBatch,
+) -> Result<bool, String> {
+    let left_rows = left.user_batch.num_rows();
+    let right_rows = right.user_batch.num_rows();
+    if left_rows == 0 || right_rows == 0 {
+        return Ok(left_rows == 0 || right_rows == 0);
+    }
+    if left.user_batch.schema().as_ref() != right.user_batch.schema().as_ref() {
+        return Ok(false);
+    }
+
+    let left_last_row_id = row_lineage_row_id_at(&left.lineage.row_ids, left_rows - 1)?;
+    let right_first_row_id = row_lineage_row_id_at(&right.lineage.row_ids, 0)?;
+    let contiguous = left_last_row_id
+        .checked_add(1)
+        .is_some_and(|expected| expected == right_first_row_id);
+    if !contiguous {
+        return Ok(false);
+    }
+
+    let left_seq =
+        row_lineage_sequence_at(&left.lineage.last_updated_sequence_numbers, left_rows - 1);
+    let right_seq = row_lineage_sequence_at(&right.lineage.last_updated_sequence_numbers, 0);
+    Ok(left_seq == right_seq)
+}
+
+fn merge_row_lineage_manifest_runs(
+    left: &RowLineageWriteBatch,
+    right: &RowLineageWriteBatch,
+) -> Result<RowLineageWriteBatch, String> {
+    use arrow::array::{Array, Int64Array};
+    use arrow::compute::{concat, concat_batches};
+
+    if left.user_batch.num_rows() == 0 {
+        return Ok(right.clone());
+    }
+    if right.user_batch.num_rows() == 0 {
+        return Ok(left.clone());
+    }
+
+    let schema = left.user_batch.schema();
+    let user_batch = concat_batches(&schema, [&left.user_batch, &right.user_batch])
+        .map_err(|e| format!("merge row-lineage user batches failed: {e}"))?;
+    let row_ids = concat(&[
+        &left.lineage.row_ids as &dyn Array,
+        &right.lineage.row_ids as &dyn Array,
+    ])
+    .map_err(|e| format!("merge row-lineage row-id columns failed: {e}"))?
+    .as_any()
+    .downcast_ref::<Int64Array>()
+    .ok_or_else(|| "merged row-lineage row-id column must be Int64".to_string())?
+    .clone();
+    let last_updated_sequence_numbers = concat(&[
+        &left.lineage.last_updated_sequence_numbers as &dyn Array,
+        &right.lineage.last_updated_sequence_numbers as &dyn Array,
+    ])
+    .map_err(|e| format!("merge row-lineage sequence columns failed: {e}"))?
+    .as_any()
+    .downcast_ref::<Int64Array>()
+    .ok_or_else(|| "merged row-lineage sequence column must be Int64".to_string())?
+    .clone();
+
+    Ok(RowLineageWriteBatch {
+        user_batch,
+        lineage: RowLineageColumns {
+            row_ids,
+            last_updated_sequence_numbers,
+        },
+    })
 }
 
 fn row_lineage_row_id_at(row_ids: &arrow::array::Int64Array, row: usize) -> Result<i64, String> {
@@ -1607,7 +1703,11 @@ mod tests {
                 user_batch: test_batch(&[0, 0, 1]),
                 lineage: RowLineageColumns {
                     row_ids: Int64Array::from(vec![10, 11, 12]),
-                    last_updated_sequence_numbers: Int64Array::from(vec![None, Some(3), Some(4)]),
+                    last_updated_sequence_numbers: Int64Array::from(vec![
+                        Some(3),
+                        Some(3),
+                        Some(3),
+                    ]),
                 },
             }],
         )
@@ -1628,6 +1728,41 @@ mod tests {
                 "row-lineage files must retain the evolved default partition spec id"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn row_lineage_writer_merges_contiguous_runs_across_batches() {
+        use arrow::array::Int64Array;
+
+        let table = build_unpartitioned_test_table("row_lineage_cross_batch_merge").await;
+        let data_files = write_row_lineage_batches_as_data_files(
+            &table,
+            &[
+                RowLineageWriteBatch {
+                    user_batch: test_batch(&[1, 2]),
+                    lineage: RowLineageColumns {
+                        row_ids: Int64Array::from(vec![10, 11]),
+                        last_updated_sequence_numbers: Int64Array::from(vec![Some(3), Some(3)]),
+                    },
+                },
+                RowLineageWriteBatch {
+                    user_batch: test_batch(&[3]),
+                    lineage: RowLineageColumns {
+                        row_ids: Int64Array::from(vec![12]),
+                        last_updated_sequence_numbers: Int64Array::from(vec![Some(3)]),
+                    },
+                },
+            ],
+        )
+        .await
+        .expect("row-lineage write");
+
+        assert_eq!(
+            data_files.len(),
+            1,
+            "contiguous rows with the same last-updated sequence should compact into one file"
+        );
+        assert_eq!(data_files[0].record_count(), 3);
     }
 
     #[tokio::test]

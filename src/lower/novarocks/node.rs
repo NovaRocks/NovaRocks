@@ -1014,7 +1014,10 @@ fn project_output_plan(
             nullable: item.nullable,
             is_internal: false,
         });
-        if is_duplicate_compute || computed_idx != output_indices.len() {
+        if is_duplicate_compute
+            || computed_idx != output_indices.len()
+            || compute_column_id != output_column_id
+        {
             needs_output_indices = true;
         }
         output_indices.push(computed_idx);
@@ -4456,6 +4459,42 @@ mod tests {
         assert_eq!(project.expr_slot_ids, vec![SlotId::new(7)]);
         assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(9)]);
         assert_eq!(lowered.layout.order(), &[SlotId::new(9)]);
+    }
+
+    #[test]
+    fn lowers_project_reused_input_slots_with_output_indices_when_output_ids_change() {
+        let project = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![
+                    plan::ProjectItem {
+                        expr: Some(column_ref(1, DataType::Int64)),
+                        output_name: "left_out".to_string(),
+                        output_column_id: 7,
+                    },
+                    plan::ProjectItem {
+                        expr: Some(column_ref(2, DataType::Int64)),
+                        output_name: "right_out".to_string(),
+                        output_column_id: 8,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![two_col_values_node(10)],
+        );
+
+        let lowered = lower(&project);
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected Project");
+        };
+        assert_eq!(project.expr_slot_ids, vec![SlotId::new(1), SlotId::new(2)]);
+        assert_eq!(project.output_indices, Some(vec![0, 1]));
+        assert_eq!(
+            project.output_chunk_schema.slot_ids(),
+            &[SlotId::new(7), SlotId::new(8)]
+        );
+        assert_eq!(lowered.layout.order(), &[SlotId::new(7), SlotId::new(8)]);
     }
 
     #[test]

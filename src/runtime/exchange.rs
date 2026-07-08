@@ -319,8 +319,12 @@ fn retag_queued_chunks_for_expected_schema(
                 .map(|slot| slot.slot_id())
                 .collect(),
         };
-        let (batch, chunk_schema) =
-            materialize_chunk_for_wire_meta(Some(expected_chunk_schema), &chunk.batch, &wire_meta)?;
+        let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
+            Some(expected_chunk_schema),
+            &chunk.batch,
+            &wire_meta,
+            true,
+        )?;
         let mut retagged = chunk_from_exchange_batch(batch, chunk_schema).map_err(|e| {
             format!(
                 "retag queued exchange chunk for late expected schema failed: {}",
@@ -1147,6 +1151,7 @@ fn materialize_chunk_for_wire_meta(
     expected_chunk_schema: Option<&ChunkSchemaRef>,
     batch: &RecordBatch,
     wire_meta: &ExchangeWireMeta,
+    prefer_wire_slot_ids: bool,
 ) -> Result<(RecordBatch, ChunkSchemaRef), String> {
     if wire_meta.slot_ids_by_index.len() != batch.num_columns() {
         return Err(format!(
@@ -1171,13 +1176,14 @@ fn materialize_chunk_for_wire_meta(
     }
     let batch_schema = batch.schema();
 
-    // Check whether wire slot IDs match the expected schema. If not (e.g. CTE
-    // produce/consume have independent slot namespaces), fall back to
-    // position-based mapping using the expected schema's own slot ordering.
-    let wire_ids_match = wire_meta
-        .slot_ids_by_index
-        .iter()
-        .all(|id| expected_chunk_schema.slot(*id).is_some());
+    // Check whether wire slot IDs match the expected schema. Some callers
+    // deliberately use an independent expected-slot namespace, so they force
+    // position-based mapping even when numeric slot IDs overlap.
+    let wire_ids_match = prefer_wire_slot_ids
+        && wire_meta
+            .slot_ids_by_index
+            .iter()
+            .all(|id| expected_chunk_schema.slot(*id).is_some());
     let expected_slots_by_index = if wire_ids_match {
         &[] as &[_]
     } else {
@@ -1217,23 +1223,31 @@ fn materialize_chunk_for_wire_meta(
             check_exchange_data_type(expected_arrow_type, field.data_type(), &root)?;
             if !is_exchange_dictionary_carrier_for_expected(expected_arrow_type, field.data_type())
             {
-                out_column = crate::exec::chunk::type_compatibility::retag_column(
+                match crate::exec::chunk::type_compatibility::retag_column(
                     batch.column(idx),
                     expected_arrow_type,
-                )
-                .map_err(|m| {
-                    format!(
-                        "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?} ({:?})",
-                        idx, slot_id, field.data_type(), expected_arrow_type, m.kind
-                    )
-                })?;
-                out_field = arrow::datatypes::Field::new(
-                    field.name(),
-                    expected_arrow_type.clone(),
-                    field.is_nullable(),
-                )
-                .with_metadata(field.metadata().clone());
-                any_materialized = true;
+                ) {
+                    Ok(retagged) => {
+                        out_column = retagged;
+                        out_field = arrow::datatypes::Field::new(
+                            field.name(),
+                            expected_arrow_type.clone(),
+                            field.is_nullable(),
+                        )
+                        .with_metadata(field.metadata().clone());
+                        any_materialized = true;
+                    }
+                    Err(m) => {
+                        debug!(
+                            "exchange decoded arrow metadata retag skipped at index {} for slot {}: batch={:?} expected={:?} ({:?})",
+                            idx,
+                            slot_id,
+                            field.data_type(),
+                            expected_arrow_type,
+                            m.kind
+                        );
+                    }
+                }
             }
         }
 
@@ -1291,7 +1305,7 @@ pub fn decode_root_result_chunks(
     for batch in batches {
         let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
         let (batch, chunk_schema) =
-            materialize_chunk_for_wire_meta(expected_chunk_schema, &batch, &wire_meta)?;
+            materialize_chunk_for_wire_meta(expected_chunk_schema, &batch, &wire_meta, false)?;
         chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
     }
     Ok(chunks)
@@ -1379,8 +1393,12 @@ pub fn decode_chunks_for_sender(
     let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
         let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
-        let (batch, chunk_schema) =
-            materialize_chunk_for_wire_meta(expected_chunk_schema.as_ref(), &batch, &wire_meta)?;
+        let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
+            expected_chunk_schema.as_ref(),
+            &batch,
+            &wire_meta,
+            true,
+        )?;
         chunks.push(chunk_from_exchange_batch(batch, chunk_schema)?);
     }
     Ok(chunks)
@@ -1389,12 +1407,14 @@ pub fn decode_chunks_for_sender(
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        Array, ArrayRef, Decimal128Array, DictionaryArray, Int32Array, Int64Array, StringArray,
-        make_array,
+        Array, ArrayRef, Decimal128Array, DictionaryArray, Int32Array, Int64Array, MapArray,
+        StringArray, StructArray, make_array,
     };
-    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow::record_batch::RecordBatchOptions;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::{
@@ -1913,6 +1933,144 @@ mod tests {
             decoded[0].chunk_schema().slots()[0].slot_id(),
             SlotId::new(55)
         );
+    }
+
+    #[test]
+    fn decode_root_result_chunks_uses_expected_schema_positionally() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("file", DataType::Utf8, false),
+                Field::new("row_id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a.parquet"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![42])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("x")])) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let wire_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(3), SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("wire chunk schema");
+        let payload = encode_chunks(&[Chunk::new_with_chunk_schema(batch, wire_schema)], true)
+            .expect("encode root result");
+        let expected_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    Field::new("file", DataType::Utf8, false),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(2),
+                    Field::new("row_id", DataType::Int64, false),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(3),
+                    Field::new("value", DataType::Utf8, true),
+                    None,
+                    None,
+                ),
+            ])
+            .expect("expected root schema"),
+        );
+
+        let decoded =
+            decode_root_result_chunks(&payload, Some(&expected_schema)).expect("decode root");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].chunk_schema().slot_ids(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
+        );
+        assert_eq!(decoded[0].batch.schema().field(0).name(), "file");
+        assert_eq!(decoded[0].batch.schema().field(1).name(), "row_id");
+        assert_eq!(decoded[0].batch.schema().field(2).name(), "value");
+    }
+
+    #[test]
+    fn decode_root_result_chunks_accepts_nested_map_field_metadata_drift() {
+        let source_entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("key", DataType::Int32, true),
+                Field::new("value", DataType::Int32, true),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])) as ArrayRef,
+            ],
+            None,
+        );
+        let source_entries_field = Arc::new(Field::new(
+            "entries",
+            source_entries.data_type().clone(),
+            false,
+        ));
+        let map = Arc::new(MapArray::new(
+            source_entries_field.clone(),
+            OffsetBuffer::new(vec![0, 2].into()),
+            source_entries,
+            None,
+            false,
+        )) as ArrayRef;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "m",
+                DataType::Map(source_entries_field, false),
+                true,
+            )])),
+            vec![map],
+        )
+        .expect("record batch");
+        let wire_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(5)],
+        )
+        .expect("wire chunk schema");
+        let payload = encode_chunks(&[Chunk::new_with_chunk_schema(batch, wire_schema)], true)
+            .expect("encode");
+
+        let key_field = Field::new("key", DataType::Int32, false).with_metadata(HashMap::from([(
+            "PARQUET:field_id".to_string(),
+            "12".to_string(),
+        )]));
+        let value_field = Field::new("value", DataType::Int32, true).with_metadata(HashMap::from(
+            [("PARQUET:field_id".to_string(), "13".to_string())],
+        ));
+        let target_entries = Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(Fields::from(vec![key_field, value_field])),
+            false,
+        ));
+        let expected_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(5),
+                Field::new("m", DataType::Map(target_entries, false), true),
+                None,
+                None,
+            )])
+            .expect("expected chunk schema"),
+        );
+
+        let decoded = decode_root_result_chunks(&payload, Some(&expected_schema))
+            .expect("decode map field metadata drift");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].chunk_schema().slots()[0].slot_id(),
+            SlotId::new(5)
+        );
+        assert!(matches!(
+            decoded[0].batch.schema().field(0).data_type(),
+            DataType::Map(_, false)
+        ));
+        assert_eq!(decoded[0].batch.column(0).len(), 1);
     }
 
     #[test]

@@ -60,7 +60,7 @@ use crate::connector::starrocks::table::schema_adapter::{
 };
 use crate::connector::starrocks::table::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
-    write_chunks_into_starrocks_partition,
+    read_active_starrocks_physical_chunks, write_chunks_into_starrocks_partition,
     write_chunks_into_starrocks_partition_for_aggregate_mv_upsert,
     write_chunks_into_starrocks_partition_for_mv_refresh_with_row_delta,
 };
@@ -2337,7 +2337,6 @@ mod tests {
         let Some((config_dir, config_path)) = maybe_starrocks_table_config_path() else {
             return;
         };
-        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
         let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
         let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
 
@@ -2380,11 +2379,12 @@ mod tests {
         session
             .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = execute_iceberg_mv_sql(
-            &session,
+        if let Err(err) = create_starrocks_mv_sql(
+            &engine,
             "create materialized view orders_mv \
              distributed by hash(id) buckets 2 \
              primary key (id) \
+             properties('storage_engine' = 'starrocks') \
              as select id, customer, amount from ice.ns.orders",
         ) {
             if is_unavailable_object_store_error(&err) {
@@ -2396,7 +2396,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
+        if let Err(err) = refresh_starrocks_mv(&engine, "orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin bookkeeping test: object store unavailable on full refresh: {err}"
@@ -2408,8 +2408,7 @@ mod tests {
 
         let base_key = "ice.ns.orders".to_string();
         let s0 = current_orders_main_snapshot(&session).expect("snapshot after full refresh");
-        let mv_after_full =
-            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
+        let mv_after_full = load_starrocks_mv_definition(&engine, "analytics", "orders_mv");
         assert_eq!(
             mv_after_full.last_refresh_snapshots.get(&base_key).copied(),
             Some(s0),
@@ -2433,7 +2432,7 @@ mod tests {
             *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(s2);
         }));
 
-        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
+        if let Err(err) = refresh_starrocks_mv(&engine, "orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin bookkeeping test: object store unavailable on incremental refresh: {err}"
@@ -2454,8 +2453,7 @@ mod tests {
             "base table current snapshot should now be the hook-created snapshot"
         );
 
-        let mv_after_incremental =
-            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
+        let mv_after_incremental = load_starrocks_mv_definition(&engine, "analytics", "orders_mv");
         let recorded = mv_after_incremental
             .last_refresh_snapshots
             .get(&base_key)
@@ -2480,7 +2478,6 @@ mod tests {
         let Some((config_dir, config_path)) = maybe_starrocks_table_config_path() else {
             return;
         };
-        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
         let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
         let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
 
@@ -2526,11 +2523,12 @@ mod tests {
         session
             .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = execute_iceberg_mv_sql(
-            &session,
+        if let Err(err) = create_starrocks_mv_sql(
+            &engine,
             "create materialized view orders_mv \
              distributed by hash(id) buckets 2 \
              primary key (id) \
+             properties('storage_engine' = 'starrocks') \
              as select id, amount + 1 as amount_plus_one from ice.ns.orders",
         ) {
             if is_unavailable_object_store_error(&err) {
@@ -2542,7 +2540,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
+        if let Err(err) = refresh_starrocks_mv(&engine, "orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin freeze acceptance test: object store unavailable on full refresh: {err}"
@@ -2554,8 +2552,7 @@ mod tests {
 
         let base_key = "ice.ns.orders".to_string();
         let s0 = current_orders_main_snapshot(&session).expect("snapshot after full refresh");
-        let mv_after_full =
-            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
+        let mv_after_full = load_starrocks_mv_definition(&engine, "analytics", "orders_mv");
         assert_eq!(
             mv_after_full.last_refresh_snapshots.get(&base_key).copied(),
             Some(s0),
@@ -2579,7 +2576,7 @@ mod tests {
             *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(s2);
         }));
 
-        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
+        if let Err(err) = refresh_starrocks_mv(&engine, "orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin freeze acceptance test: object store unavailable on pinned incremental refresh: {err}"
@@ -2595,7 +2592,7 @@ mod tests {
             .expect("after-capture hook should run during refresh pin capture");
         assert_ne!(s1, s2, "hook INSERT should advance the base snapshot");
         let rows_after_pinned_refresh =
-            collect_projection_mv_rows(&session).expect("select pinned refresh MV rows");
+            collect_projection_mv_rows(&engine).expect("select pinned refresh MV rows");
         assert_eq!(
             rows_after_pinned_refresh,
             vec![(1, 11), (2, 21), (3, 31)],
@@ -2603,7 +2600,7 @@ mod tests {
         );
 
         let mv_after_pinned_refresh =
-            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
+            load_starrocks_mv_definition(&engine, "analytics", "orders_mv");
         let recorded_after_pinned_refresh = mv_after_pinned_refresh
             .last_refresh_snapshots
             .get(&base_key)
@@ -2620,7 +2617,7 @@ mod tests {
         );
         drop(hook_guard);
 
-        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
+        if let Err(err) = refresh_starrocks_mv(&engine, "orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping MV refresh pin freeze acceptance test: object store unavailable on follow-up refresh: {err}"
@@ -2631,7 +2628,7 @@ mod tests {
         }
 
         let rows_after_follow_up =
-            collect_projection_mv_rows(&session).expect("select follow-up refresh MV rows");
+            collect_projection_mv_rows(&engine).expect("select follow-up refresh MV rows");
         assert_eq!(
             rows_after_follow_up,
             vec![(1, 11), (2, 21), (3, 31), (4, 41)],
@@ -2643,8 +2640,7 @@ mod tests {
             current_snapshot, s2,
             "no additional base commit should happen after the hook insert"
         );
-        let mv_after_follow_up =
-            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
+        let mv_after_follow_up = load_starrocks_mv_definition(&engine, "analytics", "orders_mv");
         assert_eq!(
             mv_after_follow_up
                 .last_refresh_snapshots
@@ -2663,7 +2659,6 @@ mod tests {
         let Some((config_dir, config_path)) = maybe_starrocks_table_config_path() else {
             return;
         };
-        let metadata_path = config_dir.path().join("meta").join("standalone.sqlite");
         let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
         let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
 
@@ -2708,11 +2703,12 @@ mod tests {
         session
             .execute_in_database("create database ice.analytics", "default")
             .expect("create analytics database");
-        if let Err(err) = execute_iceberg_mv_sql(
-            &session,
+        if let Err(err) = create_starrocks_mv_sql(
+            &engine,
             "create materialized view orders_mv \
              distributed by hash(id) buckets 2 \
              primary key (id) \
+             properties('storage_engine' = 'starrocks') \
              as select id, amount + 1 as amount_plus_one from ice.ns.orders",
         ) {
             if is_unavailable_object_store_error(&err) {
@@ -2724,7 +2720,7 @@ mod tests {
             panic!("create materialized view: {err}");
         }
 
-        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
+        if let Err(err) = refresh_starrocks_mv(&engine, "orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping equality-delete pin test: object store unavailable on full refresh: {err}"
@@ -2763,7 +2759,7 @@ mod tests {
             *hook_snapshot_for_hook.lock().expect("hook snapshot lock") = Some(post_pin_snapshot);
         }));
 
-        if let Err(err) = execute_iceberg_mv_sql(&session, "refresh materialized view orders_mv") {
+        if let Err(err) = refresh_starrocks_mv(&engine, "orders_mv") {
             if is_unavailable_object_store_error(&err) {
                 eprintln!(
                     "skipping equality-delete pin test: object store unavailable on incremental refresh: {err}"
@@ -2783,15 +2779,14 @@ mod tests {
         );
 
         let rows_after_refresh =
-            collect_projection_mv_rows(&session).expect("select equality-delete pinned MV rows");
+            collect_projection_mv_rows(&engine).expect("select equality-delete pinned MV rows");
         assert_eq!(
             rows_after_refresh,
             vec![(2, 21), (3, 31)],
             "refresh pinned at s1 must retract id=1 and must not include post-pin id=4"
         );
 
-        let mv_after_refresh =
-            load_mv_definition_from_metadata(&metadata_path, "ice", "analytics", "orders_mv");
+        let mv_after_refresh = load_starrocks_mv_definition(&engine, "analytics", "orders_mv");
         let recorded = mv_after_refresh
             .last_refresh_snapshots
             .get(&base_key)
@@ -3565,28 +3560,39 @@ mod tests {
     }
 
     fn collect_projection_mv_rows(
-        session: &crate::engine::StandaloneSession,
+        engine: &crate::engine::StandaloneNovaRocks,
     ) -> Result<Vec<(i64, i64)>, String> {
-        let result = session.execute_in_context(
-            "select id, amount_plus_one from orders_mv order by id",
-            Some("ice"),
-            "analytics",
-            None,
+        let state = engine.state_for_test();
+        let plan = load_physical_insert_plan(
+            &state,
+            &crate::engine::ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
+            },
+            PartitionTarget::Active,
         )?;
-        let crate::engine::StatementResult::Query(query_result) = result else {
-            return Err("select from orders_mv must return rows".to_string());
-        };
+        let id_idx = plan
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case("id"))
+            .ok_or_else(|| "orders_mv physical plan missing id column".to_string())?;
+        let amount_idx = plan
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case("amount_plus_one"))
+            .ok_or_else(|| "orders_mv physical plan missing amount_plus_one column".to_string())?;
+        let chunks = read_active_starrocks_physical_chunks(&state, &plan)?;
         let mut out = Vec::new();
-        for chunk in &query_result.chunks {
+        for chunk in &chunks {
             let ids = chunk
                 .batch
-                .column(0)
+                .column(id_idx)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| "orders_mv id column not Int64".to_string())?;
             let amount_plus_one = chunk
                 .batch
-                .column(1)
+                .column(amount_idx)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| "orders_mv amount_plus_one column not Int64".to_string())?;
@@ -3594,6 +3600,7 @@ mod tests {
                 out.push((ids.value(row), amount_plus_one.value(row)));
             }
         }
+        out.sort_by_key(|(id, _)| *id);
         Ok(out)
     }
 
@@ -3697,21 +3704,6 @@ mod tests {
         Err("iceberg main ref not found".to_string())
     }
 
-    fn load_mv_definition_from_metadata(
-        metadata_path: &std::path::Path,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> StoredMvDefinition {
-        let provider = crate::meta::SqliteMetaStoreProvider::open(metadata_path)
-            .expect("open sqlite metadata provider");
-        let read = provider.begin_read().expect("begin metadata read");
-        crate::meta::repository::mv::MvMetaRepository::default()
-            .find_by_target(read.as_ref(), catalog, namespace, table)
-            .expect("load mv definition")
-            .expect("mv definition exists")
-    }
-
     /// Build a TOML config file that points the standalone server at
     /// the minio endpoint identified by `maybe_object_store_config_for_mv_refresh`,
     /// plus a per-test sqlite metadata-db path. Returns `None` when minio
@@ -3813,6 +3805,82 @@ enable_path_style_access = true
         sql: &str,
     ) -> Result<crate::engine::StatementResult, String> {
         session.execute_in_context(sql, Some("ice"), "analytics", None)
+    }
+
+    fn create_starrocks_mv_sql(
+        engine: &crate::engine::StandaloneNovaRocks,
+        sql: &str,
+    ) -> Result<crate::engine::StatementResult, String> {
+        let state = engine.state_for_test();
+        {
+            let mut catalog = state.catalog.write().expect("catalog write lock");
+            if !catalog.database_exists("analytics")? {
+                catalog.create_database("analytics")?;
+            }
+        }
+        let stmt = parse_create_mv_stmt(sql)?;
+        super::super::mv_ddl::create_mv(&state, Some("ice"), "analytics", &stmt)
+    }
+
+    fn refresh_starrocks_mv(
+        engine: &crate::engine::StandaloneNovaRocks,
+        mv_name: &str,
+    ) -> Result<crate::engine::StatementResult, String> {
+        let state = engine.state_for_test();
+        refresh_mv(
+            &state,
+            Some("ice"),
+            "analytics",
+            &RefreshMaterializedViewStmt {
+                name: ObjectName {
+                    parts: vec![mv_name.to_string()],
+                },
+                full: false,
+            },
+        )
+    }
+
+    fn parse_create_mv_stmt(
+        sql: &str,
+    ) -> Result<crate::sql::parser::ast::CreateMaterializedViewStmt, String> {
+        let mut statements = crate::sql::parser::parse_sql(sql)?;
+        if statements.len() != 1 {
+            return Err(format!(
+                "expected exactly one CREATE MATERIALIZED VIEW statement, got {}",
+                statements.len()
+            ));
+        }
+        let statement = statements.remove(0);
+        let crate::sql::parser::ast::Statement::CreateMaterializedView(stmt) = statement else {
+            return Err("expected CREATE MATERIALIZED VIEW statement".to_string());
+        };
+        Ok(stmt)
+    }
+
+    fn load_starrocks_mv_definition(
+        engine: &crate::engine::StandaloneNovaRocks,
+        database: &str,
+        mv_name: &str,
+    ) -> StoredMvDefinition {
+        let state = engine.state_for_test();
+        let mv_id = {
+            let starrocks = state
+                .starrocks_table
+                .read()
+                .expect("standalone StarRocks table read lock");
+            starrocks
+                .table(database, mv_name)
+                .expect("StarRocks MV runtime")
+                .table
+                .table_id
+        };
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("begin metadata read");
+        state
+            .mv_repo
+            .load_by_id(read.as_ref(), mv_id)
+            .expect("load mv definition")
+            .expect("mv definition exists")
     }
 
     #[test]

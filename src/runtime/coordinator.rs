@@ -102,6 +102,11 @@ struct CompatCteConsumer {
 
 type FragmentEdgeKey = (FragmentId, FragmentId, i32);
 
+struct CompatEdgeSidecar {
+    partition: partitions::TDataPartition,
+    output_slot_ids: Vec<i32>,
+}
+
 pub(crate) fn prepare_native_plan_sidecars(
     native_plan: &crate::sql::planner::DistributedPlan,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -269,7 +274,7 @@ impl ExecutionCoordinator {
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
         let execution_root_fragment_id = plan.root_fragment_id;
-        let compat_partition_by_edge = build_compat_partition_by_edge(&edges, lowered_edges)?;
+        let compat_edge_sidecars = build_compat_edge_sidecars(&edges, lowered_edges)?;
 
         // ---------------------------------------------------------------
         // 2. Build per-edge / CTE consumer indices used for sink wiring.
@@ -329,8 +334,12 @@ impl ExecutionCoordinator {
                         .push(CompatCteConsumer {
                             fragment_id: e.target_fragment_id,
                             exchange_node_id: e.target_exchange_node_id,
-                            partition: compat_partition_for_edge(&compat_partition_by_edge, e)?,
-                            output_slot_ids: e.output_slot_ids.clone(),
+                            partition: compat_partition_for_edge(&compat_edge_sidecars, e)?,
+                            output_slot_ids: compat_output_slot_ids_for_edge(
+                                &compat_edge_sidecars,
+                                e,
+                            )?
+                            .to_vec(),
                         });
                 }
                 FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {}
@@ -492,9 +501,12 @@ impl ExecutionCoordinator {
                 let (output_sink, fragment_partition, exec_destinations) = if is_root {
                     (fr.output_sink.clone(), unpartitioned_partition(), None)
                 } else if let Some(edge) = stream_edge {
-                    let compat_partition =
-                        compat_partition_for_edge(&compat_partition_by_edge, edge)?;
-                    let stream_sink = build_stream_sink_for_edge(edge, compat_partition.clone());
+                    let compat_partition = compat_partition_for_edge(&compat_edge_sidecars, edge)?;
+                    let stream_sink = build_stream_sink_for_edge(
+                        edge,
+                        compat_partition.clone(),
+                        compat_output_slot_ids_for_edge(&compat_edge_sidecars, edge)?,
+                    );
                     let output_sink = wrap_data_stream_sink(stream_sink);
                     let exec_destinations = placement
                         .destinations
@@ -516,7 +528,7 @@ impl ExecutionCoordinator {
                     let output_sink = wrap_iceberg_change_stream_router_sink(
                         template,
                         branch_edges,
-                        &compat_partition_by_edge,
+                        &compat_edge_sidecars,
                         &plan.by_fragment,
                     )?;
                     // Router branches carry their own destinations in the sink payload.
@@ -979,14 +991,18 @@ fn fragment_edge_key(edge: &FragmentEdge) -> FragmentEdgeKey {
     )
 }
 
-fn build_compat_partition_by_edge(
+fn build_compat_edge_sidecars(
     edges: &[FragmentEdge],
     lowered_edges: Vec<LoweredFragmentEdge>,
-) -> Result<BTreeMap<FragmentEdgeKey, partitions::TDataPartition>, String> {
+) -> Result<BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>, String> {
     let mut by_key = BTreeMap::new();
     for lowered in lowered_edges {
         let key = fragment_edge_key(&lowered.edge);
-        if by_key.insert(key, lowered.compat_partition).is_some() {
+        let sidecar = CompatEdgeSidecar {
+            partition: lowered.compat_partition,
+            output_slot_ids: lowered.edge.output_slot_ids,
+        };
+        if by_key.insert(key, sidecar).is_some() {
             return Err(format!(
                 "lowered edge sidecars contain duplicate edge source={} target={} exchange={}",
                 key.0, key.1, key.2
@@ -1006,16 +1022,35 @@ fn build_compat_partition_by_edge(
 }
 
 fn compat_partition_for_edge(
-    compat_partition_by_edge: &BTreeMap<FragmentEdgeKey, partitions::TDataPartition>,
+    compat_edge_sidecars: &BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>,
     edge: &FragmentEdge,
 ) -> Result<partitions::TDataPartition, String> {
     let key = fragment_edge_key(edge);
-    compat_partition_by_edge.get(&key).cloned().ok_or_else(|| {
-        format!(
-            "fragment edge source={} target={} exchange={} is missing lowered compat partition",
-            key.0, key.1, key.2
-        )
-    })
+    compat_edge_sidecars
+        .get(&key)
+        .map(|sidecar| sidecar.partition.clone())
+        .ok_or_else(|| {
+            format!(
+                "fragment edge source={} target={} exchange={} is missing lowered compat partition",
+                key.0, key.1, key.2
+            )
+        })
+}
+
+fn compat_output_slot_ids_for_edge<'a>(
+    compat_edge_sidecars: &'a BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>,
+    edge: &FragmentEdge,
+) -> Result<&'a [i32], String> {
+    let key = fragment_edge_key(edge);
+    compat_edge_sidecars
+        .get(&key)
+        .map(|sidecar| sidecar.output_slot_ids.as_slice())
+        .ok_or_else(|| {
+            format!(
+                "fragment edge source={} target={} exchange={} is missing lowered output slots",
+                key.0, key.1, key.2
+            )
+        })
 }
 
 /// Wrap a `TDataStreamSink` in a DATA_STREAM_SINK `TDataSink`.
@@ -1044,6 +1079,7 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
 fn build_stream_sink_for_edge(
     edge: &FragmentEdge,
     compat_partition: partitions::TDataPartition,
+    output_slot_ids: &[i32],
 ) -> data_sinks::TDataStreamSink {
     data_sinks::TDataStreamSink::new(
         edge.target_exchange_node_id,
@@ -1051,7 +1087,7 @@ fn build_stream_sink_for_edge(
         None::<bool>,
         None::<bool>,
         None::<i32>,
-        stream_sink_output_columns(&edge.output_slot_ids),
+        stream_sink_output_columns(output_slot_ids),
         None::<i64>,
     )
 }
@@ -1200,7 +1236,7 @@ fn group_router_edges_by_source<'a>(
 fn wrap_iceberg_change_stream_router_sink(
     template: &data_sinks::TIcebergChangeStreamRouterSink,
     branch_edges: &[&FragmentEdge],
-    compat_partition_by_edge: &BTreeMap<FragmentEdgeKey, partitions::TDataPartition>,
+    compat_edge_sidecars: &BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>,
     placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
 ) -> Result<data_sinks::TDataSink, String> {
     if branch_edges.is_empty() {
@@ -1238,7 +1274,11 @@ fn wrap_iceberg_change_stream_router_sink(
 
         let mut stream_sink = template_branch.stream_sink.clone();
         stream_sink.dest_node_id = edge.target_exchange_node_id;
-        stream_sink.output_partition = compat_partition_for_edge(compat_partition_by_edge, edge)?;
+        stream_sink.output_partition = compat_partition_for_edge(compat_edge_sidecars, edge)?;
+        stream_sink.output_columns = stream_sink_output_columns(compat_output_slot_ids_for_edge(
+            compat_edge_sidecars,
+            edge,
+        )?);
         let destinations = placements
             .get(&edge.target_fragment_id)
             .ok_or_else(|| {
@@ -3478,11 +3518,18 @@ mod tests {
         )
     }
 
-    fn compat_partition_map_for_test(
+    fn compat_edge_sidecar_map_for_test(
         edge: &FragmentEdge,
         partition: partitions::TDataPartition,
-    ) -> BTreeMap<FragmentEdgeKey, partitions::TDataPartition> {
-        BTreeMap::from([(fragment_edge_key(edge), partition)])
+        output_slot_ids: Vec<i32>,
+    ) -> BTreeMap<FragmentEdgeKey, CompatEdgeSidecar> {
+        BTreeMap::from([(
+            fragment_edge_key(edge),
+            CompatEdgeSidecar {
+                partition,
+                output_slot_ids,
+            },
+        )])
     }
 
     fn empty_router_sink_for_test() -> data_sinks::TIcebergChangeStreamRouterSink {
@@ -4040,12 +4087,41 @@ mod tests {
     }
 
     #[test]
+    fn compat_edge_sidecar_preserves_lowered_output_slots() {
+        let mut original = fake_stream_edge(1, 2, 77);
+        original.output_slot_ids = vec![31, 12, 9];
+        let mut lowered = original.clone();
+        lowered.output_slot_ids = vec![3, 4, 2, 1];
+
+        let sidecars = build_compat_edge_sidecars(
+            &[original.clone()],
+            vec![LoweredFragmentEdge {
+                edge: lowered,
+                compat_partition: unpartitioned_partition(),
+            }],
+        )
+        .expect("compat edge sidecars");
+
+        assert_eq!(
+            compat_output_slot_ids_for_edge(&sidecars, &original).expect("lowered output slots"),
+            &[3, 4, 2, 1]
+        );
+        let sink = build_stream_sink_for_edge(
+            &original,
+            compat_partition_for_edge(&sidecars, &original).expect("partition"),
+            compat_output_slot_ids_for_edge(&sidecars, &original).expect("lowered output slots"),
+        );
+        assert_eq!(sink.output_columns, Some(vec![3, 4, 2, 1]));
+    }
+
+    #[test]
     fn plain_stream_sink_carries_edge_output_columns() {
         let mut edge = fake_stream_edge(1, 2, 77);
         edge.output_slot_ids = vec![31, 12, 9];
         edge.output_partition = DataPartition::hash(vec![hash_key_expr_for_test(1, "bucket")]);
 
-        let sink = build_stream_sink_for_edge(&edge, compiled_hash_partition_for_test(31));
+        let sink =
+            build_stream_sink_for_edge(&edge, compiled_hash_partition_for_test(31), &[31, 12, 9]);
 
         assert_eq!(sink.dest_node_id, 77);
         assert_eq!(sink.output_columns, Some(vec![31, 12, 9]));
@@ -4056,7 +4132,7 @@ mod tests {
     fn plain_stream_sink_omits_empty_output_columns() {
         let edge = fake_stream_edge(1, 2, 77);
 
-        let sink = build_stream_sink_for_edge(&edge, unpartitioned_partition());
+        let sink = build_stream_sink_for_edge(&edge, unpartitioned_partition(), &[]);
 
         assert_eq!(sink.output_columns, None);
     }
@@ -4104,13 +4180,16 @@ mod tests {
                 fake_placement(2, 1, 201, "10.0.0.21"),
             ],
         )]);
-        let compat_partitions =
-            compat_partition_map_for_test(&edge, compiled_hash_partition_for_test(10));
+        let compat_sidecars = compat_edge_sidecar_map_for_test(
+            &edge,
+            compiled_hash_partition_for_test(10),
+            vec![12, 9],
+        );
 
         let wrapped = wrap_iceberg_change_stream_router_sink(
             &template,
             &[&edge],
-            &compat_partitions,
+            &compat_sidecars,
             &placements,
         )
         .expect("wrap");
@@ -4126,7 +4205,7 @@ mod tests {
             branch.stream_sink.dest_node_id, 77,
             "branch stream sink must route to the edge exchange node"
         );
-        assert_eq!(branch.stream_sink.output_columns, Some(vec![10, 11]));
+        assert_eq!(branch.stream_sink.output_columns, Some(vec![12, 9]));
         assert_eq!(
             branch.stream_sink.output_partition.type_,
             partitions::TPartitionType::HASH_PARTITIONED
@@ -4423,7 +4502,27 @@ mod tests {
                 limit: -1,
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
-                children: Vec::new(),
+                children: vec![native_plan::DistributedNode {
+                    node_id: 4,
+                    fragment_id: 1,
+                    tuple_ids: Vec::new(),
+                    nullable_tuple_ids: Vec::new(),
+                    limit: -1,
+                    build_runtime_filters: Vec::new(),
+                    probe_runtime_filters: Vec::new(),
+                    children: Vec::new(),
+                    payload: Some(native_plan::distributed_node::Payload::Physical(
+                        native_plan::PlanNode {
+                            output_columns: vec![root_a.clone(), root_b.clone(), root_c.clone()],
+                            kind: Some(native_plan::plan_node::Kind::Values(
+                                native_plan::ValuesNode {
+                                    rows: Vec::new(),
+                                    columns: vec![root_a.clone(), root_b.clone(), root_c.clone()],
+                                },
+                            )),
+                        },
+                    )),
+                }],
                 payload: Some(native_plan::distributed_node::Payload::Physical(
                     native_plan::PlanNode {
                         output_columns: vec![root_a, root_b, root_c],

@@ -93,6 +93,21 @@ pub(crate) fn collect_table_stats(
         format!("load iceberg table {catalog}.{namespace}.{table} for maintenance failed: {e}")
     })?;
     let metadata = loaded.metadata();
+    let preserve_row_lineage = crate::connector::iceberg::catalog::row_lineage_enabled(metadata);
+    let compaction_stats = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        crate::connector::iceberg::commit::current_live_data_file_compaction_stats(
+            &loaded,
+            loaded.file_io(),
+            preserve_row_lineage,
+        ),
+    )?
+    .map_err(|e| {
+        format!("collect iceberg table {catalog}.{namespace}.{table} compaction groups failed: {e}")
+    })?;
+    let max_compactable_data_files = u64::try_from(compaction_stats.max_compactable_data_files)
+        .map_err(|_| {
+            format!("iceberg table {catalog}.{namespace}.{table} compactable file count overflow")
+        })?;
 
     let snapshots: Vec<SnapshotInfo> = metadata
         .snapshots()
@@ -124,6 +139,7 @@ pub(crate) fn collect_table_stats(
         current_snapshot_id: metadata.current_snapshot_id(),
         snapshots,
         total_data_files: summary_u64(&summary, TOTAL_DATA_FILES_KEY),
+        max_compactable_data_files: Some(max_compactable_data_files),
         total_files_size_bytes: summary_u64(&summary, TOTAL_FILES_SIZE_KEY),
         total_delete_files: summary_u64(&summary, TOTAL_DELETE_FILES_KEY),
         properties: metadata.properties().clone(),

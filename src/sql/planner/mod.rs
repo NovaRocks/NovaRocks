@@ -230,9 +230,11 @@ fn apply_query_modifiers(
 
     // Wrap with Sort if ORDER BY is present.
     if !order_by.is_empty() {
-        let mut extra_items = collect_extra_sort_items(&order_by, &output_columns, factory);
+        let body_output_columns =
+            plan_output_columns(&body_plan).unwrap_or_else(|_| output_columns.clone());
+        let mut extra_items = collect_extra_sort_items(&order_by, &body_output_columns, factory);
         let sort_items =
-            rewrite_sort_items_to_projection_refs(&order_by, &extra_items, &output_columns);
+            rewrite_sort_items_to_projection_refs(&order_by, &extra_items, &body_output_columns);
         if !extra_items.is_empty() {
             // We're about to add extra sort-only columns to the inner Project
             // and then strip them with an outer Project after the sort. To
@@ -264,13 +266,23 @@ fn apply_query_modifiers(
                     ..
                 } = &mut body_plan
                 {
+                    let select_items_for_extra = proj.items.clone();
+                    for extra in &mut extra_items {
+                        extra.expr = rewrite_project_output_refs_to_item_expr(
+                            &extra.expr,
+                            &select_items_for_extra,
+                        );
+                    }
+
                     if let Some(child) = children.get_mut(0)
-                        && let LogicalPlanKind::Aggregate(agg) = &mut child.kind
+                        && matches!(child.kind, LogicalPlanKind::Aggregate(_))
                     {
-                        for extra in &extra_items {
-                            collect_aggregates(&extra.expr, &mut agg.aggregates, factory);
+                        if let LogicalPlanKind::Aggregate(agg) = &mut child.kind {
+                            for extra in &extra_items {
+                                collect_aggregates(&extra.expr, &mut agg.aggregates, factory);
+                            }
+                            ensure_aggregate_output_columns(agg);
                         }
-                        ensure_aggregate_output_columns(agg);
                         // ORDER BY-only aggregates (e.g. `count(v2)` that does
                         // not appear in SELECT) were just folded into the
                         // aggregate node above. Their extra Project items still
@@ -293,10 +305,15 @@ fn apply_query_modifiers(
                         // Without this the post-aggregate Project re-derives the group
                         // key from a pre-aggregate column that the id-binding verifier
                         // rejects as "not produced by child scope".
-                        let gb_targets = planner_aggregate_group_by_targets(agg);
-                        for extra in &mut extra_items {
-                            extra.expr = rewrite_agg_calls_to_refs(&extra.expr, &agg.aggregates);
-                            extra.expr = rewrite_group_by_expr_refs(&extra.expr, &gb_targets);
+                        let repeat_gb_targets = planner_repeat_original_group_by_targets(child);
+                        if let LogicalPlanKind::Aggregate(agg) = &mut child.kind {
+                            let mut gb_targets = planner_aggregate_group_by_targets(agg);
+                            gb_targets.extend(repeat_gb_targets);
+                            for extra in &mut extra_items {
+                                extra.expr =
+                                    rewrite_agg_calls_to_refs(&extra.expr, &agg.aggregates);
+                                extra.expr = rewrite_group_by_expr_refs(&extra.expr, &gb_targets);
+                            }
                         }
                     }
                     let user: Vec<(String, arrow::datatypes::DataType, bool, ColumnId)> = proj
@@ -333,9 +350,16 @@ fn apply_query_modifiers(
                     .enumerate()
                     .map(|(idx, (name, _, _, output_id))| (name.to_lowercase(), (idx, *output_id)))
                     .collect();
+                let id_to_output: std::collections::HashMap<ColumnId, (usize, ColumnId)> = user
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, (_, _, _, output_id))| {
+                        (*output_id != ColumnId::UNSET).then_some((*output_id, (idx, *output_id)))
+                    })
+                    .collect();
                 sort_items
                     .into_iter()
-                    .map(|item| remap_sort_to_synthetic(item, &name_to_output))
+                    .map(|item| remap_sort_to_synthetic(item, &id_to_output, &name_to_output))
                     .collect()
             } else {
                 sort_items
@@ -495,6 +519,7 @@ fn collect_extra_sort_items(
 /// references still resolve.
 fn remap_sort_to_synthetic(
     item: SortItem,
+    id_to_output: &std::collections::HashMap<ColumnId, (usize, ColumnId)>,
     name_to_output: &std::collections::HashMap<String, (usize, ColumnId)>,
 ) -> SortItem {
     let SortItem {
@@ -503,7 +528,7 @@ fn remap_sort_to_synthetic(
         nulls_first,
     } = item;
     SortItem {
-        expr: remap_select_alias_refs(expr, name_to_output),
+        expr: remap_select_alias_refs(expr, id_to_output, name_to_output),
         asc,
         nulls_first,
     }
@@ -511,15 +536,22 @@ fn remap_sort_to_synthetic(
 
 fn remap_select_alias_refs(
     expr: TypedExpr,
+    id_to_output: &std::collections::HashMap<ColumnId, (usize, ColumnId)>,
     name_to_output: &std::collections::HashMap<String, (usize, ColumnId)>,
 ) -> TypedExpr {
     match expr.kind {
         ExprKind::ColumnRef {
+            column_id,
             qualifier: None,
             ref column,
-            ..
         } => {
-            if let Some((idx, output_id)) = name_to_output.get(&column.to_lowercase()) {
+            let target = if column_id != ColumnId::UNSET {
+                id_to_output.get(&column_id)
+            } else {
+                None
+            }
+            .or_else(|| name_to_output.get(&column.to_lowercase()));
+            if let Some((idx, output_id)) = target {
                 TypedExpr {
                     data_type: expr.data_type,
                     nullable: expr.nullable,
@@ -535,6 +567,36 @@ fn remap_select_alias_refs(
         }
         _ => expr,
     }
+}
+
+fn rewrite_project_output_refs_to_item_expr(
+    expr: &TypedExpr,
+    project_items: &[ProjectItem],
+) -> TypedExpr {
+    if let ExprKind::ColumnRef {
+        column_id,
+        qualifier: None,
+        column,
+    } = &expr.kind
+    {
+        if *column_id != ColumnId::UNSET
+            && let Some(item) = project_items
+                .iter()
+                .find(|item| item.output_column_id == *column_id)
+        {
+            return item.expr.clone();
+        }
+        if let Some(item) = project_items
+            .iter()
+            .find(|item| item.output_name.eq_ignore_ascii_case(column))
+        {
+            return item.expr.clone();
+        }
+    }
+
+    rewrite_expr_children(expr, |child| {
+        rewrite_project_output_refs_to_item_expr(child, project_items)
+    })
 }
 
 fn rewrite_sort_items_to_projection_refs(
@@ -562,13 +624,27 @@ fn rewrite_sort_items_to_projection_refs(
         .filter(|c| c.column_id != ColumnId::UNSET)
         .map(|c| (c.name.to_lowercase(), c))
         .collect();
+    let output_by_id: std::collections::HashMap<ColumnId, &OutputColumn> = output
+        .iter()
+        .filter(|c| c.column_id != ColumnId::UNSET)
+        .map(|c| (c.column_id, c))
+        .collect();
 
     order_by
         .iter()
         .map(|item| {
             let display =
                 crate::sql::codegen::helpers::typed_expr_display_name(&item.expr).to_lowercase();
-            if let Some(extra) = extra_names.get(&display) {
+            if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind
+                && *column_id != ColumnId::UNSET
+                && output_by_id.contains_key(column_id)
+            {
+                // Positional ORDER BY is already resolved to the exact SELECT
+                // output ColumnId. Keep that id instead of re-resolving by
+                // display name; duplicate output names such as `s.a, t.a`
+                // would otherwise collapse both sort keys onto the same slot.
+                item.clone()
+            } else if let Some(extra) = extra_names.get(&display) {
                 // Preserve the extra item's output_column_id so that the
                 // Phase-1 tagging pass (tag_sort → collect_column_id_refs)
                 // can see this sort key's ColumnId and include it in the
@@ -583,6 +659,26 @@ fn rewrite_sort_items_to_projection_refs(
                             column_id: extra.output_column_id,
                             qualifier: None,
                             column: extra.output_name.clone(),
+                        },
+                        data_type: item.expr.data_type.clone(),
+                        nullable: item.expr.nullable,
+                    },
+                    asc: item.asc,
+                    nulls_first: item.nulls_first,
+                }
+            } else if let ExprKind::ColumnRef {
+                qualifier: None,
+                column,
+                ..
+            } = &item.expr.kind
+                && let Some(col) = output_by_name.get(&column.to_lowercase())
+            {
+                SortItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: col.column_id,
+                            qualifier: None,
+                            column: col.name.clone(),
                         },
                         data_type: item.expr.data_type.clone(),
                         nullable: item.expr.nullable,
@@ -1221,7 +1317,7 @@ fn prepare_repeat_input(
     // Build a substitution table keyed by the original expression's
     // display name so a later pass can rewrite projection / having
     // occurrences of the same expression to a ColumnRef on the alias.
-    let mut substitutions: Vec<(String, TypedExpr)> = Vec::new();
+    let mut substitutions: Vec<RepeatSubstitution> = Vec::new();
     let mut repeat_key_ids_by_name: std::collections::HashMap<String, ColumnId> =
         std::collections::HashMap::new();
     let mut all_rollup_column_ids = Vec::with_capacity(grouping_key_aliases.len());
@@ -1253,7 +1349,11 @@ fn prepare_repeat_input(
             data_type,
             nullable,
         };
-        substitutions.push((original_display, replacement));
+        substitutions.push(RepeatSubstitution {
+            display_name: original_display,
+            source_column_id: direct_column_ref_id(&source_expr),
+            replacement,
+        });
 
         project_items.push(ProjectItem {
             expr: source_expr,
@@ -1309,6 +1409,9 @@ fn prepare_repeat_input(
     }
     for item in &mut select.projection {
         substitute_expr_in_place(&mut item.expr, &substitutions);
+        if let Some(column_id) = direct_column_ref_id(&item.expr) {
+            item.output_column_id = column_id;
+        }
     }
     if let Some(having_expr) = select.having.as_mut() {
         substitute_expr_in_place(having_expr, &substitutions);
@@ -1352,16 +1455,44 @@ fn prepare_repeat_input(
 /// on the materialised alias slot — so the REPEAT operator's per-level
 /// nullification of that slot drives the grouping key, instead of being
 /// recomputed from the pre-REPEAT input.
-fn substitute_expr_in_place(expr: &mut TypedExpr, substitutions: &[(String, TypedExpr)]) {
+#[derive(Clone)]
+struct RepeatSubstitution {
+    display_name: String,
+    source_column_id: Option<ColumnId>,
+    replacement: TypedExpr,
+}
+
+fn substitute_expr_in_place(expr: &mut TypedExpr, substitutions: &[RepeatSubstitution]) {
     let name = typed_expr_display_name(expr);
-    if let Some((_, replacement)) = substitutions.iter().find(|(n, _)| n == &name) {
-        *expr = replacement.clone();
+    if let Some(substitution) = substitutions.iter().find(|substitution| {
+        substitution.display_name == name
+            || direct_column_ref_id(expr)
+                .zip(substitution.source_column_id)
+                .is_some_and(|(expr_id, source_id)| expr_id == source_id)
+    }) {
+        *expr = substitution.replacement.clone();
         return;
     }
     match &mut expr.kind {
         ExprKind::AggregateCall { args, order_by, .. } => {
             for a in args {
                 substitute_expr_in_place(a, substitutions);
+            }
+            for s in order_by {
+                substitute_expr_in_place(&mut s.expr, substitutions);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                substitute_expr_in_place(a, substitutions);
+            }
+            for p in partition_by {
+                substitute_expr_in_place(p, substitutions);
             }
             for s in order_by {
                 substitute_expr_in_place(&mut s.expr, substitutions);
@@ -2304,10 +2435,11 @@ fn split_projection_for_aggregate(
         .map(|item| {
             let expr = rewrite_agg_calls_to_refs(&item.expr, &agg_calls);
             let expr = rewrite_group_by_expr_refs(&expr, &group_by_rewrite_targets);
+            let output_column_id = direct_column_ref_id(&expr).unwrap_or(item.output_column_id);
             ProjectItem {
                 expr,
                 output_name: item.output_name.clone(),
-                output_column_id: item.output_column_id,
+                output_column_id,
             }
         })
         .collect();
@@ -2317,6 +2449,14 @@ fn split_projection_for_aggregate(
     });
 
     (project_items, agg_calls, output_columns, rewritten_having)
+}
+
+fn direct_column_ref_id(expr: &TypedExpr) -> Option<ColumnId> {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => Some(*column_id),
+        ExprKind::Nested(inner) => direct_column_ref_id(inner),
+        _ => None,
+    }
 }
 
 fn dedup_group_by_exprs(group_by: &[TypedExpr]) -> Vec<TypedExpr> {
@@ -2374,6 +2514,56 @@ fn planner_aggregate_group_by_targets(agg: &LogicalAggregateNode) -> Vec<GroupBy
             expr: gb.clone(),
             column_id: output_column.column_id,
             display_name: typed_expr_display_name(gb),
+        })
+        .collect()
+}
+
+fn planner_repeat_original_group_by_targets(
+    aggregate_plan: &LogicalPlanNode,
+) -> Vec<GroupByRewriteTarget> {
+    let LogicalPlanKind::Aggregate(agg) = &aggregate_plan.kind else {
+        return Vec::new();
+    };
+    let Some(repeat) = aggregate_plan
+        .children
+        .first()
+        .and_then(|child| match &child.kind {
+            LogicalPlanKind::Repeat(repeat) => Some(repeat),
+            _ => None,
+        })
+    else {
+        return Vec::new();
+    };
+
+    let aggregate_targets = planner_aggregate_group_by_targets(agg);
+    repeat
+        .grouping_key_aliases
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (original_name, alias_name))| {
+            let alias_id = repeat.all_rollup_column_ids.get(idx).copied();
+            let target = aggregate_targets.iter().find(|target| {
+                target.display_name.eq_ignore_ascii_case(alias_name)
+                    || matches!(
+                        &target.expr.kind,
+                        ExprKind::ColumnRef { column_id, column, .. }
+                            if alias_id.is_some_and(|id| id == *column_id)
+                                || column.eq_ignore_ascii_case(alias_name)
+                    )
+            })?;
+            Some(GroupByRewriteTarget {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::UNSET,
+                        qualifier: None,
+                        column: original_name.clone(),
+                    },
+                    data_type: target.expr.data_type.clone(),
+                    nullable: target.expr.nullable,
+                },
+                column_id: target.column_id,
+                display_name: target.display_name.clone(),
+            })
         })
         .collect()
 }
@@ -4873,6 +5063,106 @@ mod tests {
     }
 
     #[test]
+    fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
+        let sql = "SELECT array_agg(DISTINCT b ORDER BY b) \
+                   FROM t GROUP BY ROLLUP(a) ORDER BY a";
+        let (resolved, cte_registry, mut factory) =
+            parse_analyze_query(sql).expect("analyzer should succeed");
+        let logical =
+            plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )
+        .expect("logical to opt expr");
+        let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+            opt_expr,
+            scalar_arena,
+            &std::collections::HashMap::new(),
+            factory,
+            None,
+            Vec::new(),
+        )
+        .expect("optimizer should produce a physical plan");
+
+        crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(&physical)
+            .expect("ROLLUP ORDER BY-only key must bind to aggregate repeat-key output");
+    }
+
+    #[test]
+    fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
+        let sql = "SELECT sum(b) AS total_sum, \
+                          a, \
+                          b, \
+                          grouping(a) + grouping(b) AS lochierarchy, \
+                          rank() OVER ( \
+                            PARTITION BY grouping(a) + grouping(b), \
+                                         CASE WHEN grouping(b) = 0 THEN a END \
+                            ORDER BY sum(b) DESC \
+                          ) AS rank_within_parent \
+                   FROM t \
+                   GROUP BY ROLLUP(a, b) \
+                   ORDER BY lochierarchy DESC, \
+                            CASE WHEN lochierarchy = 0 THEN a END, \
+                            rank_within_parent \
+                   LIMIT 10";
+        let (resolved, cte_registry, mut factory) =
+            parse_analyze_query(sql).expect("analyzer should succeed");
+        let logical =
+            plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )
+        .expect("logical to opt expr");
+        let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+            opt_expr,
+            scalar_arena,
+            &std::collections::HashMap::new(),
+            factory,
+            None,
+            Vec::new(),
+        )
+        .expect("optimizer should produce a physical plan");
+
+        crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(&physical)
+            .expect("ROLLUP window ORDER BY alias extras must bind to child/window outputs");
+    }
+
+    #[test]
+    fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
+        let sql = "SELECT a, count(*) AS total_cnt \
+                   FROM t \
+                   GROUP BY a \
+                   ORDER BY total_cnt DESC, a \
+                   LIMIT 10";
+        let (resolved, cte_registry, mut factory) =
+            parse_analyze_query(sql).expect("analyzer should succeed");
+        let logical =
+            plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )
+        .expect("logical to opt expr");
+        let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+            opt_expr,
+            scalar_arena,
+            &std::collections::HashMap::new(),
+            factory,
+            None,
+            Vec::new(),
+        )
+        .expect("optimizer should produce a physical plan");
+
+        crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(&physical)
+            .expect("aggregate ORDER BY alias TopN must bind to aggregate project output");
+    }
+
+    #[test]
     fn p1_window_expr_gets_output_column_id() {
         let plan =
             plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");
@@ -5610,6 +5900,43 @@ mod tests {
             *column_id, inner_output_id,
             "ORDER BY alias remap must preserve the inner Project output ColumnId"
         );
+    }
+
+    #[test]
+    fn order_by_positions_preserve_duplicate_output_column_ids() {
+        let plan = parse_analyze_and_plan(
+            "SELECT l.a, r.a FROM t l FULL JOIN t r ON l.a != r.a ORDER BY 1, 2",
+        )
+        .expect("planner should succeed");
+
+        let sort = match &plan.kind {
+            LogicalPlanKind::Sort(sort) => sort,
+            other => panic!("expected Sort root, got {other:?}"),
+        };
+        let project = match &plan.unary_input().kind {
+            LogicalPlanKind::Project(project) => project,
+            other => panic!("expected Project under Sort, got {other:?}"),
+        };
+        assert_eq!(project.items.len(), 2);
+        assert_eq!(project.items[0].output_name, "a");
+        assert_eq!(project.items[1].output_name, "a");
+
+        let first_output_id = project.items[0].output_column_id;
+        let second_output_id = project.items[1].output_column_id;
+        assert_ne!(first_output_id, ColumnId::UNSET);
+        assert_ne!(second_output_id, ColumnId::UNSET);
+        assert_ne!(first_output_id, second_output_id);
+
+        let sort_ids = sort
+            .items
+            .iter()
+            .map(|item| match &item.expr.kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                other => panic!("expected sort key ColumnRef, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sort_ids, vec![first_output_id, second_output_id]);
     }
 
     #[test]

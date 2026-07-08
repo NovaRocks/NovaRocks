@@ -1274,6 +1274,10 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         };
 
+        if let Some(date_shift) = date_day_arithmetic_expr(&left_typed, op, &right_typed) {
+            return Ok(date_shift);
+        }
+
         let (bin_op, result_type) = match op {
             // Comparison operators -> Boolean
             sqlast::BinaryOperator::Eq => (BinOp::Eq, DataType::Boolean),
@@ -3400,6 +3404,62 @@ fn cast_null_preserving_target_type(expr: TypedExpr, target: &DataType) -> Typed
     }
 }
 
+fn date_day_arithmetic_expr(
+    left: &TypedExpr,
+    op: &sqlast::BinaryOperator,
+    right: &TypedExpr,
+) -> Option<TypedExpr> {
+    match op {
+        sqlast::BinaryOperator::Plus if is_temporal_day_base(&left.data_type) => {
+            date_day_shift_expr("days_add", left.clone(), right.clone())
+        }
+        sqlast::BinaryOperator::Plus if is_temporal_day_base(&right.data_type) => {
+            date_day_shift_expr("days_add", right.clone(), left.clone())
+        }
+        sqlast::BinaryOperator::Minus if is_temporal_day_base(&left.data_type) => {
+            date_day_shift_expr("days_sub", left.clone(), right.clone())
+        }
+        _ => None,
+    }
+}
+
+fn date_day_shift_expr(
+    function_name: &str,
+    date_expr: TypedExpr,
+    offset_expr: TypedExpr,
+) -> Option<TypedExpr> {
+    if !is_integer_day_offset(&offset_expr.data_type) {
+        return None;
+    }
+    let nullable = date_expr.nullable || offset_expr.nullable;
+    let data_type = match &date_expr.data_type {
+        DataType::Date32 => DataType::Date32,
+        DataType::Timestamp(unit, tz) => DataType::Timestamp(*unit, tz.clone()),
+        _ => return None,
+    };
+    let offset_expr = cast_null_preserving_target_type(offset_expr, &DataType::Int64);
+    Some(TypedExpr {
+        kind: ExprKind::FunctionCall {
+            name: function_name.to_string(),
+            args: vec![date_expr, offset_expr],
+            distinct: false,
+        },
+        data_type,
+        nullable,
+    })
+}
+
+fn is_temporal_day_base(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Date32 | DataType::Timestamp(_, _))
+}
+
+fn is_integer_day_offset(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
 fn cast_to_utf8_if_needed(expr: &mut TypedExpr) -> bool {
     if matches!(expr.data_type, DataType::Utf8 | DataType::LargeUtf8) {
         return false;
@@ -5126,6 +5186,40 @@ mod tests {
                     DataType::Int64,
                     "right operand coerced to common type"
                 );
+            }
+            other => panic!("expected BinaryOp comparison, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn date_plus_integer_rewrites_to_days_add() {
+        let expr = analyze_projection_expr("select cast('1999-01-01' as date) + cast(5 as int)")
+            .expect("date + integer should analyze");
+
+        assert_eq!(expr.data_type, DataType::Date32);
+        match expr.kind {
+            crate::sql::analysis::ExprKind::FunctionCall { name, args, .. } => {
+                assert_eq!(name, "days_add");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].data_type, DataType::Date32);
+                assert_eq!(args[1].data_type, DataType::Int64);
+            }
+            other => panic!("expected days_add FunctionCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn date_plus_integer_comparison_keeps_date_operands() {
+        let expr = analyze_projection_expr(
+            "select cast('1999-01-06' as date) > cast('1999-01-01' as date) + 5",
+        )
+        .expect("date comparison should analyze");
+
+        assert_eq!(expr.data_type, DataType::Boolean);
+        match expr.kind {
+            crate::sql::analysis::ExprKind::BinaryOp { left, right, .. } => {
+                assert_eq!(left.data_type, DataType::Date32);
+                assert_eq!(right.data_type, DataType::Date32);
             }
             other => panic!("expected BinaryOp comparison, got {:?}", other),
         }

@@ -527,14 +527,6 @@ mod tests {
                 data_type: DataType::Int64,
                 nullable: false,
             },
-            TypedExpr {
-                kind: ExprKind::Lambda {
-                    params: vec!["x".to_string()],
-                    body: Box::new(lambda_body),
-                },
-                data_type: DataType::Int64,
-                nullable: true,
-            },
         ];
 
         let names = variants
@@ -564,8 +556,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(names.len(), 18);
-        assert_eq!(names.iter().filter(|&&name| name == "lambda").count(), 2);
+        assert_eq!(names.len(), 17);
+        assert!(names.contains(&"lambda_param_ref"));
         assert!(names.contains(&"window_call"));
         assert!(names.contains(&"aggregate_call"));
         assert!(names.contains(&"case"));

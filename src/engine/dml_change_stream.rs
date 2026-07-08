@@ -1876,7 +1876,7 @@ mod tests {
             .expect_err("assert-bearing plan must be processed before the observer short-circuit");
 
         assert!(
-            err.contains("requires exactly one ChangeEventExpand node, found 0"),
+            err.contains("requires exactly one native ChangeEventExpand node, found 0"),
             "unexpected error: {err}"
         );
     }

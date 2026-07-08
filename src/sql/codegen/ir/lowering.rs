@@ -1075,7 +1075,27 @@ fn lower_stream_edge_output_slot_ids(
     source_output_columns: &[AnalysisOutputColumn],
 ) -> Result<Vec<i32>, String> {
     if edge.output_slot_ids.is_empty() {
-        return Ok(Vec::new());
+        return source_output_columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                if let Some(binding) = source_scope.resolve_by_id(column.column_id) {
+                    return Ok(binding.slot_id);
+                }
+                source_scope
+                    .iter_columns()
+                    .nth(index)
+                    .map(|(_, binding)| binding.slot_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "stream edge source fragment {} output column id {} has no materialized slot at ordinal {}",
+                            edge.source_fragment_id,
+                            column.column_id.0,
+                            index
+                        )
+                    })
+            })
+            .collect();
     }
     let ordered_bindings = if edge.output_slot_ids.len() <= source_scope.iter_columns().count() {
         Some(
@@ -8006,6 +8026,46 @@ mod tests {
             super::lower_stream_edge_output_slot_ids(&edge, &scope, &[]).expect("lower slots");
 
         assert_eq!(lowered, vec![42]);
+    }
+
+    #[test]
+    fn stream_edge_empty_output_slot_ids_lower_to_full_source_outputs() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId::new_for_test(3),
+            None,
+            "l_suppkey".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 31,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        scope.add_column_with_id(
+            ColumnId::new_for_test(1),
+            None,
+            "l_orderkey".to_string(),
+            ColumnBinding {
+                tuple_id: 7,
+                slot_id: 11,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let source_output_columns = vec![
+            output_col(3, "l_suppkey", DataType::Int64, false),
+            output_col(1, "l_orderkey", DataType::Int64, false),
+        ];
+        let edge = fragment_edge(1, 2, 77);
+
+        let lowered =
+            super::lower_stream_edge_output_slot_ids(&edge, &scope, &source_output_columns)
+                .expect("lower slots");
+
+        assert_eq!(lowered, vec![31, 11]);
     }
 
     fn distributed_values_node(

@@ -875,7 +875,7 @@ fn test_register_map_functions() {
 
     let mut m = StdHashMap::new();
     register(&mut m);
-    assert_eq!(m.get("map"), Some(&FunctionKind::Map("map_from_arrays")));
+    assert_eq!(m.get("map"), Some(&FunctionKind::Map("map")));
     assert_eq!(m.get("map_size"), Some(&FunctionKind::Map("map_size")));
     assert_eq!(
         m.get("transform_keys"),

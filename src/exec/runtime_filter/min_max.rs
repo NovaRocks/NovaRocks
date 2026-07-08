@@ -167,6 +167,18 @@ impl RuntimeMinMaxFilter {
                 (t, MinMaxValue::Utf8(v)) if is_utf8_type(&t) => {
                     Ok(MinMaxPredicateValue::ByteArray(v.as_bytes().to_vec()))
                 }
+                (
+                    RuntimeFilterType::Decimal {
+                        precision: Some(precision),
+                        scale: Some(scale),
+                        ..
+                    },
+                    MinMaxValue::Decimal128(value),
+                ) => Ok(MinMaxPredicateValue::Decimal128 {
+                    value: *value,
+                    precision,
+                    scale,
+                }),
                 (t, MinMaxValue::Decimal128(_)) if is_decimal_type(&t) => Err(format!(
                     "runtime min/max conversion for decimal type {:?} is unsupported because precision/scale metadata is missing",
                     t
@@ -1205,6 +1217,36 @@ mod tests {
                 assert_eq!(max, i128::MAX - 456);
             }
             other => panic!("unexpected literal bounds: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decimal_min_max_predicate_values_use_runtime_type_precision_scale() {
+        let filter = RuntimeMinMaxFilter::new(
+            RuntimeFilterType::Decimal {
+                width: crate::exec::runtime_filter::RuntimeDecimalWidth::Decimal64,
+                precision: Some(18),
+                scale: Some(2),
+            },
+            true,
+            MinMaxValue::Decimal128(123),
+            MinMaxValue::Decimal128(456),
+        );
+        match filter.min_max_predicate_values().unwrap() {
+            Some((
+                MinMaxPredicateValue::Decimal128 {
+                    value: min,
+                    precision,
+                    scale,
+                },
+                MinMaxPredicateValue::Decimal128 { value: max, .. },
+            )) => {
+                assert_eq!(min, 123);
+                assert_eq!(max, 456);
+                assert_eq!(precision, 18);
+                assert_eq!(scale, 2);
+            }
+            other => panic!("unexpected decimal min/max predicate values: {other:?}"),
         }
     }
 

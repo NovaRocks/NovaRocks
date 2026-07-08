@@ -322,7 +322,8 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
-    use arrow::array::StringArray;
+    use arrow::array::{Int32Builder, ListBuilder, StringArray};
+    use arrow::compute::lexsort_to_indices;
 
     fn decimal_chunk(precision: u8, scale: i8, value: i128) -> Chunk {
         let data_type = DataType::Decimal128(precision, scale);
@@ -385,6 +386,50 @@ mod tests {
         assert!(err.contains("sort payload type mismatch"), "err={err}");
         assert!(err.contains("Utf8"), "err={err}");
         assert!(err.contains("Binary"), "err={err}");
+    }
+
+    fn append_inner_list(
+        builder: &mut ListBuilder<ListBuilder<Int32Builder>>,
+        values: &[Option<i32>],
+    ) {
+        for value in values {
+            builder.values().values().append_option(*value);
+        }
+        builder.values().append(true);
+    }
+
+    #[test]
+    fn complex_sort_keeps_parent_nulls_first_and_inner_nulls_first() {
+        let mut builder = ListBuilder::new(ListBuilder::new(Int32Builder::new()));
+
+        builder.append(false);
+
+        append_inner_list(&mut builder, &[Some(1)]);
+        builder.values().append(false);
+        append_inner_list(&mut builder, &[Some(2)]);
+        builder.append(true);
+
+        append_inner_list(&mut builder, &[Some(1)]);
+        append_inner_list(&mut builder, &[Some(2)]);
+        builder.append(true);
+
+        let values = Arc::new(builder.finish()) as ArrayRef;
+        let values = normalize_sort_key_array(&values).expect("normalize sort key");
+        let mut sort_columns = vec![SortColumn {
+            values,
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: true,
+            }),
+        }];
+        append_stable_row_index_sort_column(&mut sort_columns, 3);
+
+        let indices = lexsort_to_indices(&sort_columns, None).expect("sort indices");
+        let actual = (0..indices.len())
+            .map(|idx| indices.value(idx))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, vec![0, 1, 2]);
     }
 }
 

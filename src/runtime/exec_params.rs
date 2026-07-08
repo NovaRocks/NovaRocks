@@ -24,20 +24,19 @@
 use std::collections::BTreeMap;
 
 use crate::runtime::fragment_exec_params::FragmentExecParams;
-use crate::thrift::data_sinks;
-use crate::thrift::descriptors;
-use crate::thrift::internal_service;
-use crate::thrift::planner;
-use crate::thrift::types;
+use crate::thrift::{
+    data, data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner, types,
+    work_group,
+};
 
 pub(crate) struct CompatFragmentPlanPayload {
-    pub(crate) plan: crate::thrift::plan_nodes::TPlan,
+    pub(crate) plan: plan_nodes::TPlan,
     pub(crate) desc_tbl: descriptors::TDescriptorTable,
     pub(crate) output_sink: data_sinks::TDataSink,
-    pub(crate) output_exprs: Option<Vec<crate::thrift::exprs::TExpr>>,
-    pub(crate) fragment_partition: crate::thrift::partitions::TDataPartition,
-    pub(crate) query_global_dicts: Option<Vec<crate::thrift::data::TGlobalDict>>,
-    pub(crate) query_global_dict_exprs: Option<BTreeMap<i32, crate::thrift::exprs::TExpr>>,
+    pub(crate) output_exprs: Option<Vec<exprs::TExpr>>,
+    pub(crate) fragment_partition: partitions::TDataPartition,
+    pub(crate) query_global_dicts: Option<Vec<data::TGlobalDict>>,
+    pub(crate) query_global_dict_exprs: Option<BTreeMap<i32, exprs::TExpr>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -72,7 +71,7 @@ pub(crate) fn build_exec_plan_fragment_params(
         None::<i64>,
         None::<i64>,
         payload.query_global_dicts,
-        None::<Vec<crate::thrift::data::TGlobalDict>>,
+        None::<Vec<data::TGlobalDict>>,
         None::<planner::TCacheParam>,
         payload.query_global_dict_exprs,
         None::<planner::TGroupExecutionParam>,
@@ -96,7 +95,7 @@ pub(crate) fn build_exec_plan_fragment_params(
         Some(true),                                  // is_pipeline
         Some(pipeline_dop),
         None::<BTreeMap<types::TPlanNodeId, i32>>, // per_scan_node_dop
-        None::<crate::thrift::work_group::TWorkGroup>, // workgroup
+        None::<work_group::TWorkGroup>,            // workgroup
         None::<bool>,                              // enable_resource_group
         None::<i32>,                               // func_version
         None::<bool>,                              // enable_shared_scan

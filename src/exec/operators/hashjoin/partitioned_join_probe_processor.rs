@@ -631,6 +631,22 @@ mod tests {
         }
     }
 
+    fn append_pair_slots(
+        chunk: Chunk,
+        first_slot: SlotId,
+        second_slot: SlotId,
+        out: &mut Vec<(i32, i32)>,
+    ) {
+        let first = int32_options_by_slot(&chunk, first_slot);
+        let second = int32_options_by_slot(&chunk, second_slot);
+        for row in 0..chunk.len() {
+            out.push((
+                first[row].expect("first slot must be non-null"),
+                second[row].expect("second slot must be non-null"),
+            ));
+        }
+    }
+
     fn int32_options_by_slot(chunk: &Chunk, slot_id: SlotId) -> Vec<Option<i32>> {
         let array = chunk.column_by_slot_id(slot_id).expect("slot column");
         let values = array
@@ -1256,13 +1272,13 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_columns(out, 2, 3, &mut rows);
+                    append_pairs(out, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_columns(out, 2, 3, &mut rows);
+                    append_pairs(out, &mut rows);
                 }
             }
         }
@@ -1371,13 +1387,13 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_columns(out, 2, 3, &mut rows);
+                    append_pairs(out, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pair_columns(out, 2, 3, &mut rows);
+                    append_pairs(out, &mut rows);
                 }
             }
         }
@@ -1824,13 +1840,13 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
                 }
             }
         }
@@ -1943,13 +1959,13 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_slots(out, LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, &mut rows);
                 }
             }
         }
@@ -2052,13 +2068,13 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_slots(out, RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_slots(out, RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID, &mut rows);
                 }
             }
         }

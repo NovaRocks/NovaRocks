@@ -159,7 +159,7 @@ mod tests {
             .expect_err("aggregate signature must reject decimal precision drift");
 
         assert!(
-            err.contains("aggregate output type signature mismatch"),
+            err.contains("aggregate intermediate type signature mismatch"),
             "{err}"
         );
         assert!(err.contains("Decimal128(38, 2)"), "{err}");

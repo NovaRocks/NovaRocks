@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 #[cfg(feature = "compat")]
-use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, types};
+use crate::thrift::{data_cache, descriptors, exprs, internal_service, plan_nodes, types};
 #[cfg(feature = "compat")]
 use thrift::OrderedFloat;
 
@@ -310,10 +310,8 @@ fn thrift_deletion_vector_from_native(
 }
 
 #[cfg(feature = "compat")]
-fn thrift_datacache_options_from_native(
-    src: &DatacacheOptions,
-) -> crate::thrift::data_cache::TDataCacheOptions {
-    crate::thrift::data_cache::TDataCacheOptions::new(src.enable_populate_datacache, src.priority)
+fn thrift_datacache_options_from_native(src: &DatacacheOptions) -> data_cache::TDataCacheOptions {
+    data_cache::TDataCacheOptions::new(src.enable_populate_datacache, src.priority)
 }
 
 #[cfg(feature = "compat")]

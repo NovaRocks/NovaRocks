@@ -406,7 +406,8 @@ fn validate_spill_mode(mode: SpillMode) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
+#[cfg(feature = "compat")]
 mod compat_tests {
     use super::*;
     use crate::thrift::internal_service::{TQueryOptions, TSpillMode, TSpillOptions};

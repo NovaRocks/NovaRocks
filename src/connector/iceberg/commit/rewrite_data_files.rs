@@ -443,6 +443,11 @@ pub(crate) struct LiveFileMetrics {
     pub(crate) delete_bytes: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LiveDataFileCompactionStats {
+    pub(crate) max_compactable_data_files: i64,
+}
+
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) async fn count_current_live_files(
     table: &Table,
@@ -464,6 +469,35 @@ pub(crate) async fn current_live_file_metrics(
             .map_err(|_| "live delete file count overflow".to_string())?,
         data_bytes: live_file_bytes(&live.data_files, "data")?,
         delete_bytes: live_file_bytes(&live.delete_files, "delete")?,
+    })
+}
+
+pub(crate) async fn current_live_data_file_compaction_stats(
+    table: &Table,
+    file_io: &FileIO,
+    preserve_row_lineage: bool,
+) -> Result<LiveDataFileCompactionStats, String> {
+    let live = enumerate_live_files(table, file_io).await?;
+    let mut groups: HashMap<String, i64> = HashMap::new();
+    for entry in &live.data_files {
+        let sequence = if preserve_row_lineage {
+            Some(entry.sequence_number)
+        } else {
+            None
+        };
+        let key = format!(
+            "spec={};partition={:?};sequence={:?}",
+            entry.partition_spec_id,
+            entry.data_file.partition(),
+            sequence
+        );
+        let count = groups.entry(key).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| "live data file compaction group count overflow".to_string())?;
+    }
+    Ok(LiveDataFileCompactionStats {
+        max_compactable_data_files: groups.into_values().max().unwrap_or(0),
     })
 }
 

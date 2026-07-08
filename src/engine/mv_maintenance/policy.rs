@@ -74,6 +74,7 @@ pub(crate) struct TableMaintenanceStats {
     pub(crate) current_snapshot_id: Option<i64>,
     pub(crate) snapshots: Vec<SnapshotInfo>,
     pub(crate) total_data_files: Option<u64>,
+    pub(crate) max_compactable_data_files: Option<u64>,
     pub(crate) total_files_size_bytes: Option<u64>,
     pub(crate) total_delete_files: Option<u64>,
     pub(crate) properties: HashMap<String, String>,
@@ -283,7 +284,8 @@ fn plan_optimize(
     let (Some(files), Some(size)) = (stats.total_data_files, stats.total_files_size_bytes) else {
         return Err(SkipReason::MissingSummaryStats);
     };
-    if files == 0 || files < policy.compaction_min_data_files {
+    let compactable_files = stats.max_compactable_data_files.unwrap_or(files).min(files);
+    if files == 0 || compactable_files < policy.compaction_min_data_files {
         return Err(SkipReason::BelowThreshold);
     }
     let avg = size / files;
@@ -396,6 +398,7 @@ mod tests {
                 },
             ],
             total_data_files: Some(200),
+            max_compactable_data_files: Some(200),
             total_files_size_bytes: Some(200 * 1024 * 1024), // avg 1 MiB << 384 MiB
             total_delete_files: Some(0),
             properties: HashMap::new(),
@@ -611,6 +614,25 @@ mod tests {
     fn optimize_skips_below_file_count_threshold() {
         let mut stats = base_stats();
         stats.total_data_files = Some(99);
+        stats.max_compactable_data_files = Some(99);
+        let out = evaluate_table(
+            &stats,
+            &enabled_policy(),
+            &TableRuntimeState::default(),
+            &MaintenancePolicyConfig::default(),
+            NOW,
+        );
+        assert!(
+            out.skips
+                .contains(&(ActionKind::Optimize, SkipReason::BelowThreshold))
+        );
+    }
+
+    #[test]
+    fn optimize_skips_when_no_compactable_group_reaches_threshold() {
+        let mut stats = base_stats();
+        stats.total_data_files = Some(200);
+        stats.max_compactable_data_files = Some(1);
         let out = evaluate_table(
             &stats,
             &enabled_policy(),

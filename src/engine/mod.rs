@@ -578,6 +578,13 @@ impl StandaloneNovaRocks {
             .as_ref()
             .map(open_metadata_provider)
             .transpose()?;
+        let starrocks_table_config = match cfg.standalone_server.as_ref() {
+            Some(standalone) => standalone
+                .starrocks_table_config()?
+                .map(StarRocksTableConfig::from_app_config)
+                .transpose()?,
+            None => None,
+        };
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
         let catalog = Arc::new(RwLock::new(InMemoryCatalog::default()));
         let mut catalog_mgr = catalog_mgr::CatalogMgr::new();
@@ -588,8 +595,10 @@ impl StandaloneNovaRocks {
         let inner = Arc::new(StandaloneState {
             catalog,
             catalog_mgr: RwLock::new(catalog_mgr),
-            starrocks_table: RwLock::new(StarRocksTableCatalog::empty(None)),
-            starrocks_table_config: None,
+            starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
+                starrocks_table_config.clone(),
+            )),
+            starrocks_table_config,
             mv_refresh_pruning_limits,
             metadata_provider,
             backend_repo: BackendMetaRepository,
@@ -625,6 +634,11 @@ impl StandaloneNovaRocks {
     #[cfg(test)]
     pub(crate) fn run_pending_optimize_jobs_for_test(&self) -> Result<(), String> {
         crate::connector::iceberg::compact::run_optimize_jobs_once(&self.inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_for_test(&self) -> Arc<StandaloneState> {
+        Arc::clone(&self.inner)
     }
 
     #[cfg(feature = "compat")]
@@ -2742,9 +2756,10 @@ fn explain_analyze_query(
     let execution_start = std::time::Instant::now();
     let query_opts =
         crate::engine::query_options_wire::standalone_query_options_to_runtime(&query_opts);
+    let native_dp = refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, None)?;
     let native_sidecars =
         crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
-            &dp, None,
+            &native_dp, None,
         )?;
     let outcome =
         crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
@@ -3134,9 +3149,10 @@ pub(crate) fn execute_query_as_iceberg_write(
         ),
     )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let native_dp = refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, None)?;
     let native_sidecars =
         crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
-            &dp, None,
+            &native_dp, None,
         )?;
     crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
         build_result,
@@ -3333,6 +3349,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
             &distributed_plan,
             mv_refresh_ctx,
         )?;
+    native_distributed_plan.edges = build_result.edges.clone();
     if let Some(mutate_native_plan) = native_plan_mutation {
         mutate_native_plan(&mut native_distributed_plan)?;
     }
@@ -3750,7 +3767,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         ),
     )?;
     let native_dp =
-        crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(&dp, mv_refresh_ctx)?;
+        refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, mv_refresh_ctx)?;
     let native_sidecars =
         crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
             &native_dp,
@@ -3820,7 +3837,7 @@ pub(crate) fn execute_logical_plan_with_options(
         ),
     )?;
     let native_dp =
-        crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(&dp, mv_refresh_ctx)?;
+        refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, mv_refresh_ctx)?;
     let native_sidecars =
         crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
             &native_dp,
@@ -3869,6 +3886,17 @@ fn coordinated_execution_services() -> Result<
         }
     };
     Ok((dispatcher, scheduler))
+}
+
+fn refresh_native_sidecar_plan_with_lowered_edges(
+    dp: &crate::sql::planner::DistributedPlan,
+    lowered_edges: &[crate::sql::codegen::FragmentEdge],
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<crate::sql::planner::DistributedPlan, String> {
+    let mut native_dp =
+        crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(dp, mv_refresh_ctx)?;
+    native_dp.edges = lowered_edges.to_vec();
+    Ok(native_dp)
 }
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
@@ -5067,7 +5095,6 @@ mysql_port = 19030
 
     #[test]
     fn standalone_state_retains_metadata_provider_from_metadata_config() {
-        let _runtime_guard = lock_runtime_test_state();
         let dir = TempDir::new().expect("create config dir");
         let config_path = dir.path().join("novarocks.toml");
         std::fs::write(
@@ -5101,7 +5128,6 @@ path = "meta/catalog.db"
     // load but before open_with_config, the call must still succeed.
     #[test]
     fn open_with_config_does_not_reread_config_file() {
-        let _runtime_guard = lock_runtime_test_state();
         let dir = TempDir::new().expect("create config dir");
         let config_path = dir.path().join("novarocks.toml");
 

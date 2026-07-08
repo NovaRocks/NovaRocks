@@ -32,7 +32,8 @@ pub(crate) struct RuntimeFilterParams {
     runtime_filter_max_size: Option<i64>,
 }
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
+#[cfg(feature = "compat")]
 mod compat_tests {
     use std::collections::BTreeMap;
 
