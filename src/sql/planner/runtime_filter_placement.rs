@@ -14,6 +14,7 @@ use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
+use crate::sql::planner::PhysicalPlanStats;
 use crate::sql::planner::physical_vocab::JoinDistribution;
 use crate::sql::planner::plan::{PhysicalHashJoinEqCondition, PhysicalPlanNode};
 use std::collections::HashSet;
@@ -50,6 +51,97 @@ impl RuntimeFilterPlacementConfig {
             allow_cross_exchange: s.allow_cross_exchange_rf.unwrap_or(true),
         }
     }
+}
+
+const MAX_FINITE_SIZE: f64 = 1.0e300;
+
+fn avg_row_size(stats: &PhysicalPlanStats) -> f64 {
+    if stats.column_statistics.is_empty() {
+        8.0
+    } else {
+        stats
+            .column_statistics
+            .values()
+            .map(|c| c.average_row_size)
+            .sum()
+    }
+}
+
+fn stats_compute_size(stats: &PhysicalPlanStats) -> f64 {
+    stats.output_row_count * avg_row_size(stats)
+}
+
+fn safe_output_row_count(stats: &PhysicalPlanStats) -> f64 {
+    if stats.output_row_count.is_finite() && stats.output_row_count > 0.0 {
+        stats.output_row_count
+    } else if stats.output_row_count.is_infinite() && stats.output_row_count.is_sign_positive() {
+        MAX_FINITE_SIZE
+    } else {
+        1.0
+    }
+}
+
+fn add_safe_width(total: f64, width: Option<f64>) -> f64 {
+    let contribution = match width {
+        Some(width) if width.is_finite() && width > 0.0 => width,
+        Some(width) if width.is_infinite() && width.is_sign_positive() => return MAX_FINITE_SIZE,
+        _ => 8.0,
+    };
+    let total = total + contribution;
+    if total.is_finite() && total >= 0.0 {
+        total.min(MAX_FINITE_SIZE)
+    } else {
+        MAX_FINITE_SIZE
+    }
+}
+
+fn safe_width_for_all_columns(stats: &PhysicalPlanStats) -> f64 {
+    if stats.column_statistics.is_empty() {
+        return 8.0;
+    }
+    let mut row_width = 0.0;
+    for column in stats.column_statistics.values() {
+        row_width = add_safe_width(row_width, Some(column.average_row_size));
+        if row_width >= MAX_FINITE_SIZE {
+            return MAX_FINITE_SIZE;
+        }
+    }
+    row_width
+}
+
+fn safe_size(stats: &PhysicalPlanStats, row_width: f64) -> f64 {
+    if row_width >= MAX_FINITE_SIZE {
+        return MAX_FINITE_SIZE;
+    }
+    let row_count = safe_output_row_count(stats);
+    if row_count >= MAX_FINITE_SIZE {
+        return MAX_FINITE_SIZE;
+    }
+    let size = row_count * row_width;
+    if size.is_finite() && size >= 0.0 {
+        size.min(MAX_FINITE_SIZE)
+    } else {
+        MAX_FINITE_SIZE
+    }
+}
+
+fn stats_compute_size_for_columns(stats: &PhysicalPlanStats, columns: &[ColumnId]) -> f64 {
+    let row_width = if columns.is_empty() {
+        safe_width_for_all_columns(stats)
+    } else {
+        let mut row_width = 0.0;
+        for id in columns {
+            row_width = add_safe_width(
+                row_width,
+                stats.column_statistics.get(id).map(|c| c.average_row_size),
+            );
+            if row_width >= MAX_FINITE_SIZE {
+                return MAX_FINITE_SIZE;
+            }
+        }
+        row_width
+    };
+    safe_size(stats, row_width)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,7 +417,7 @@ mod tests {
     use crate::sql::planner::plan::{
         PhysicalHashJoinEqCondition, PhysicalPlanKind, PlanValuesNode,
     };
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::{PhysicalPlanStats, PlannerColumnStatistic, PlannerConfidence};
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 
@@ -457,6 +549,73 @@ mod tests {
     }
 
     #[test]
+    fn stats_size_uses_row_count_times_avg_width() {
+        let stats = stats_with_columns(10.0, &[(1, 4.0)]);
+
+        assert_eq!(stats_compute_size(&stats), 40.0);
+        assert_eq!(
+            stats_compute_size_for_columns(&stats, &[ColumnId::new_for_test(1)]),
+            40.0
+        );
+
+        let empty = stats_with_columns(2.0, &[]);
+
+        assert_eq!(stats_compute_size(&empty), 16.0);
+        assert_eq!(stats_compute_size_for_columns(&empty, &[]), 16.0);
+    }
+
+    #[test]
+    fn stats_size_for_columns_matches_optimizer_safe_size_edges() {
+        let invalid_stats = stats_with_columns(f64::NAN, &[(1, f64::NAN)]);
+
+        assert_eq!(
+            stats_compute_size_for_columns(&invalid_stats, &[ColumnId::new_for_test(1)]),
+            8.0
+        );
+        assert_eq!(stats_compute_size_for_columns(&invalid_stats, &[]), 8.0);
+
+        let infinite_row_stats = stats_with_columns(f64::INFINITY, &[(1, 4.0)]);
+
+        assert_eq!(
+            stats_compute_size_for_columns(&infinite_row_stats, &[ColumnId::new_for_test(1)]),
+            MAX_FINITE_SIZE
+        );
+        assert_eq!(
+            stats_compute_size_for_columns(&infinite_row_stats, &[]),
+            MAX_FINITE_SIZE
+        );
+
+        let infinite_width_stats = stats_with_columns(10.0, &[(1, f64::INFINITY)]);
+
+        assert_eq!(
+            stats_compute_size_for_columns(&infinite_width_stats, &[ColumnId::new_for_test(1)]),
+            MAX_FINITE_SIZE
+        );
+        assert_eq!(
+            stats_compute_size_for_columns(&infinite_width_stats, &[]),
+            MAX_FINITE_SIZE
+        );
+
+        let overflow_stats = stats_with_columns(1.0e299, &[(1, 1.0e10)]);
+
+        assert_eq!(
+            stats_compute_size_for_columns(&overflow_stats, &[ColumnId::new_for_test(1)]),
+            MAX_FINITE_SIZE
+        );
+        assert_eq!(
+            stats_compute_size_for_columns(&overflow_stats, &[]),
+            MAX_FINITE_SIZE
+        );
+
+        let missing_column_stats = stats_with_columns(2.0, &[(1, 4.0)]);
+
+        assert_eq!(
+            stats_compute_size_for_columns(&missing_column_stats, &[ColumnId::new_for_test(99)]),
+            16.0
+        );
+    }
+
+    #[test]
     fn could_bound_requires_all_columns_present() {
         let node = leaf(vec![out_col(1, "a"), out_col(2, "b")]);
 
@@ -582,6 +741,34 @@ mod tests {
             column_id_vec(&expr),
             (1..=10).map(ColumnId::new_for_test).collect::<Vec<_>>()
         );
+    }
+
+    fn planner_column_statistic(average_row_size: f64) -> PlannerColumnStatistic {
+        PlannerColumnStatistic {
+            min_value: 0.0,
+            max_value: 0.0,
+            nulls_fraction: 0.0,
+            average_row_size,
+            ndv: None,
+            confidence: PlannerConfidence::Estimated,
+        }
+    }
+
+    fn stats_with_columns(output_row_count: f64, columns: &[(u32, f64)]) -> PhysicalPlanStats {
+        let mut column_statistics = HashMap::new();
+        for (id, average_row_size) in columns {
+            column_statistics.insert(
+                ColumnId::new_for_test(*id),
+                planner_column_statistic(*average_row_size),
+            );
+        }
+        PhysicalPlanStats {
+            output_row_count,
+            row_count_confidence: PlannerConfidence::Estimated,
+            column_statistics,
+            cost_estimate: None,
+            broadcast_decision: None,
+        }
     }
 
     fn out_col(id: u32, name: &str) -> OutputColumn {
