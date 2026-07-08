@@ -571,12 +571,28 @@ fn push_probe_down(
 
 /// Entry point for the planner-side RF placement pass once the bridge wires it.
 pub(crate) fn place_runtime_filters(root: &mut PhysicalPlanNode) {
+    debug_assert!(
+        tree_has_no_runtime_filters(root),
+        "optimizer output must not carry runtime filters; RF placement is a planner-only pass (RFP-1)"
+    );
     let config = RuntimeFilterPlacementConfig::from_current_session();
     if !config.enabled {
         return;
     }
     let mut next_filter_id: i32 = 0;
     place_node(root, &config, &mut next_filter_id);
+}
+
+fn tree_has_no_runtime_filters(node: &PhysicalPlanNode) -> bool {
+    if !node.probe_runtime_filters.is_empty() {
+        return false;
+    }
+    if let PhysicalPlanKind::HashJoin(join) = &node.kind {
+        if !join.build_runtime_filters.is_empty() {
+            return false;
+        }
+    }
+    node.children.iter().all(tree_has_no_runtime_filters)
 }
 
 fn place_node(
@@ -798,6 +814,72 @@ mod tests {
         });
 
         assert_eq!(visited, vec![3, 2, 4, 1]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "optimizer output must not carry runtime filters")]
+    fn guard_rejects_preexisting_runtime_filter_intents() {
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(col_ref(1, "a"), col_ref(2, "b"), false)],
+            vec![leaf(vec![out_col(1, "a")]), leaf(vec![out_col(2, "b")])],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        let PhysicalPlanKind::HashJoin(join_kind) = &mut join.kind else {
+            panic!("expected hash join");
+        };
+        join_kind
+            .build_runtime_filters
+            .push(RuntimeFilterBuildIntent {
+                filter_id: 99,
+                build_expr: col_ref(2, "b"),
+                probe_expr: col_ref(1, "a"),
+                expr_order: 0,
+                execution_mode: JoinExecutionMode::Broadcast,
+            });
+        join.children[0]
+            .probe_runtime_filters
+            .push(RuntimeFilterProbeIntent {
+                filter_id: 100,
+                probe_expr: col_ref(1, "a"),
+            });
+
+        place_runtime_filters(&mut join);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "optimizer output must not carry runtime filters")]
+    fn guard_rejects_preexisting_runtime_filter_intents_when_rule_disabled() {
+        let mut settings = SessionOptimizerSettings::default();
+        settings.disabled_rules = vec![RUNTIME_FILTER_RULE.to_string()];
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(col_ref(1, "a"), col_ref(2, "b"), false)],
+            vec![leaf(vec![out_col(1, "a")]), leaf(vec![out_col(2, "b")])],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        let PhysicalPlanKind::HashJoin(join_kind) = &mut join.kind else {
+            panic!("expected hash join");
+        };
+        join_kind
+            .build_runtime_filters
+            .push(RuntimeFilterBuildIntent {
+                filter_id: 99,
+                build_expr: col_ref(2, "b"),
+                probe_expr: col_ref(1, "a"),
+                expr_order: 0,
+                execution_mode: JoinExecutionMode::Broadcast,
+            });
+
+        with_session_optimizer_settings(settings, || {
+            place_runtime_filters(&mut join);
+        });
     }
 
     #[test]

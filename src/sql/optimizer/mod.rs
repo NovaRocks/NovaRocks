@@ -298,6 +298,13 @@ fn optimize_with_root_property(
     // 11. Extract best plan.
     let mut physical = extract::extract_best(&mut memo, root_group, &root_required, &ctx.winners)?;
 
+    // Optimizer output contract: the physical tree produced here carries no
+    // runtime-filter annotations. CSE and pure physical/scalar rewrites may
+    // remain optimizer-side, but runtime-filter placement depends on the
+    // distributed topology and therefore lives in
+    // planner::runtime_filter_placement after the optimizer->planner bridge.
+    // Do not add downstream execution annotations to optimizer output here.
+
     // 12. Common-subexpression elimination (materializes repeats as Project columns).
     cse_pass::rewrite(
         &mut physical,
