@@ -10,10 +10,13 @@
 //! `optimizer::runtime_filter_pass` -- do not "improve" placement here; changes
 //! belong in the RF baseline / producer arcs.
 
+use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
 use crate::sql::planner::physical_vocab::JoinDistribution;
-use crate::sql::planner::plan::PhysicalPlanNode;
+use crate::sql::planner::plan::{PhysicalHashJoinEqCondition, PhysicalPlanNode};
+use std::collections::HashSet;
 
 /// Rule name recognized by `SET disable_optimizer_rules='RuntimeFilterPushDown'`.
 /// Kept identical to the retired optimizer constant so the session knob is
@@ -69,6 +72,153 @@ fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
         | JoinKind::NullAwareLeftAnti
         | JoinKind::Cross => None,
     }
+}
+
+fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            if *column_id != ColumnId::UNSET {
+                out.push(*column_id);
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_typed_expr_column_ids(left, out);
+            collect_typed_expr_column_ids(right, out);
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr) => collect_typed_expr_column_ids(expr, out),
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_typed_expr_column_ids(arg, out);
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } => collect_typed_expr_column_ids(body, out),
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                collect_typed_expr_column_ids(arg, out);
+            }
+            for item in order_by {
+                collect_typed_expr_column_ids(&item.expr, out);
+            }
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_typed_expr_column_ids(expr, out);
+            for item in list {
+                collect_typed_expr_column_ids(item, out);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_typed_expr_column_ids(expr, out);
+            collect_typed_expr_column_ids(low, out);
+            collect_typed_expr_column_ids(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_typed_expr_column_ids(expr, out);
+            collect_typed_expr_column_ids(pattern, out);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_typed_expr_column_ids(op, out);
+            }
+            for (when, then) in when_then {
+                collect_typed_expr_column_ids(when, out);
+                collect_typed_expr_column_ids(then, out);
+            }
+            if let Some(el) = else_expr {
+                collect_typed_expr_column_ids(el, out);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_typed_expr_column_ids(arg, out);
+            }
+            for item in partition_by {
+                collect_typed_expr_column_ids(item, out);
+            }
+            for item in order_by {
+                collect_typed_expr_column_ids(&item.expr, out);
+            }
+        }
+        ExprKind::Lambda { body, .. } => collect_typed_expr_column_ids(body, out),
+        ExprKind::Literal(_)
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+fn column_id_vec(expr: &TypedExpr) -> Vec<ColumnId> {
+    let mut ids = Vec::new();
+    collect_typed_expr_column_ids(expr, &mut ids);
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn child_column_set(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
+    node.output_columns.iter().map(|c| c.column_id).collect()
+}
+
+fn could_bound(node: &PhysicalPlanNode, probe_expr: &TypedExpr) -> bool {
+    let needed = column_id_vec(probe_expr);
+    if needed.is_empty() {
+        return false;
+    }
+    let have = child_column_set(node);
+    needed.iter().all(|id| have.contains(id))
+}
+
+fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> {
+    let ids = column_id_vec(expr);
+    if ids.is_empty() {
+        return None;
+    }
+
+    let mut bound = None;
+    for (idx, child) in node.children.iter().enumerate() {
+        let cols = child_column_set(child);
+        if ids.iter().all(|id| cols.contains(id)) {
+            if bound.is_some() {
+                return None;
+            }
+            bound = Some(idx);
+        }
+    }
+    bound
+}
+
+fn rf_key_types_match(eq: &PhysicalHashJoinEqCondition) -> bool {
+    eq.left.data_type == eq.right.data_type
+}
+
+/// Callers pass bindable members with non-empty column ids; choose a stable
+/// representative for deterministic placement and EXPLAIN output.
+fn best_member(members: &[TypedExpr]) -> Option<TypedExpr> {
+    members
+        .iter()
+        .cloned()
+        .min_by(|a, b| column_id_vec(a).cmp(&column_id_vec(b)))
+}
+
+fn bindable_members(node: &PhysicalPlanNode, members: &[TypedExpr]) -> Vec<TypedExpr> {
+    members
+        .iter()
+        .filter(|m| could_bound(node, m))
+        .cloned()
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,13 +315,18 @@ fn walk_plan_mut(node: &mut PhysicalPlanNode, f: &mut impl FnMut(&mut PhysicalPl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::common::JoinKind;
+    use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::common::{BinOp, JoinKind, OutputColumn};
     use crate::sql::optimizer::options::{
         SessionOptimizerSettings, with_session_optimizer_settings,
     };
     use crate::sql::planner::physical_vocab::JoinDistribution;
-    use crate::sql::planner::plan::{PhysicalPlanKind, PlanValuesNode};
+    use crate::sql::planner::plan::{
+        PhysicalHashJoinEqCondition, PhysicalPlanKind, PlanValuesNode,
+    };
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use arrow::datatypes::DataType;
     use std::collections::HashMap;
 
     #[test]
@@ -299,6 +454,210 @@ mod tests {
         assert_eq!(cfg.probe_min_selectivity, 0.25);
         assert_eq!(cfg.max_count, 1024);
         assert!(!cfg.allow_cross_exchange);
+    }
+
+    #[test]
+    fn could_bound_requires_all_columns_present() {
+        let node = leaf(vec![out_col(1, "a"), out_col(2, "b")]);
+
+        assert!(could_bound(&node, &col_ref(1, "a")));
+        assert!(!could_bound(&node, &col_ref(9, "z")));
+        assert!(could_bound(
+            &node,
+            &binary_expr(col_ref(1, "a"), col_ref(2, "b"))
+        ));
+        assert!(!could_bound(
+            &node,
+            &binary_expr(col_ref(1, "a"), col_ref(9, "z"))
+        ));
+    }
+
+    #[test]
+    fn expr_bound_child_requires_unique_binding_child() {
+        let mut parent = values_node(
+            1.0,
+            vec![leaf(vec![out_col(1, "a")]), leaf(vec![out_col(2, "b")])],
+        );
+
+        assert_eq!(expr_bound_child(&parent, &col_ref(1, "a")), Some(0));
+        assert_eq!(expr_bound_child(&parent, &col_ref(2, "b")), Some(1));
+        assert_eq!(
+            expr_bound_child(&parent, &binary_expr(col_ref(1, "a"), col_ref(2, "b"))),
+            None
+        );
+
+        parent.children = vec![leaf(vec![out_col(1, "a")]), leaf(vec![out_col(1, "a")])];
+        assert_eq!(expr_bound_child(&parent, &col_ref(1, "a")), None);
+    }
+
+    #[test]
+    fn best_member_picks_lexicographically_smallest() {
+        let best =
+            best_member(&[col_ref(5, "e"), col_ref(2, "b")]).expect("member should be selected");
+        assert_eq!(column_id_vec(&best), vec![ColumnId::new_for_test(2)]);
+
+        let best = best_member(&[
+            binary_expr(col_ref(3, "c"), col_ref(4, "d")),
+            binary_expr(col_ref(1, "a"), col_ref(9, "z")),
+        ])
+        .expect("member should be selected");
+        assert_eq!(
+            column_id_vec(&best),
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(9)]
+        );
+    }
+
+    #[test]
+    fn rf_key_types_match_compares_data_types() {
+        assert!(rf_key_types_match(&PhysicalHashJoinEqCondition {
+            left: col_ref(1, "a"),
+            right: col_ref(2, "b"),
+            null_safe: false,
+        }));
+        assert!(!rf_key_types_match(&PhysicalHashJoinEqCondition {
+            left: col_ref(1, "a"),
+            right: col_ref_with_type(2, "b", DataType::Utf8),
+            null_safe: false,
+        }));
+    }
+
+    #[test]
+    fn bindable_members_filters_to_node_output() {
+        let node = leaf(vec![out_col(1, "a")]);
+        let members = vec![col_ref(1, "a"), col_ref(2, "b")];
+        let bindable = bindable_members(&node, &members);
+
+        assert_eq!(bindable.len(), 1);
+        assert_eq!(column_id_vec(&bindable[0]), vec![ColumnId::new_for_test(1)]);
+    }
+
+    #[test]
+    fn column_id_vec_recurses_and_skips_unset() {
+        let expr = typed_expr(ExprKind::FunctionCall {
+            name: "outer_fn".to_string(),
+            args: vec![
+                unset_col_ref("unset"),
+                typed_expr(ExprKind::AggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![col_ref(7, "agg_arg")],
+                    distinct: false,
+                    order_by: vec![sort_item(col_ref(3, "agg_order"))],
+                }),
+                typed_expr(ExprKind::Case {
+                    operand: Some(Box::new(col_ref(6, "case_operand"))),
+                    when_then: vec![(
+                        col_ref(5, "case_when"),
+                        typed_expr(ExprKind::FunctionCall {
+                            name: "then_fn".to_string(),
+                            args: vec![col_ref(4, "case_then")],
+                            distinct: false,
+                        }),
+                    )],
+                    else_expr: Some(Box::new(col_ref(2, "case_else"))),
+                }),
+                typed_expr(ExprKind::WindowCall {
+                    name: "row_number".to_string(),
+                    args: vec![col_ref(9, "window_arg")],
+                    distinct: false,
+                    partition_by: vec![col_ref(8, "window_partition")],
+                    order_by: vec![sort_item(col_ref(1, "window_order"))],
+                    window_frame: None,
+                    ignore_nulls: false,
+                }),
+                typed_expr(ExprKind::Lambda {
+                    params: vec!["x".to_string()],
+                    body: Box::new(col_ref(10, "lambda_body")),
+                }),
+            ],
+            distinct: false,
+        });
+
+        let mut raw = Vec::new();
+        collect_typed_expr_column_ids(&expr, &mut raw);
+        assert!(!raw.contains(&ColumnId::UNSET));
+        for id in 1..=10 {
+            assert!(raw.contains(&ColumnId::new_for_test(id)));
+        }
+        assert_eq!(
+            column_id_vec(&expr),
+            (1..=10).map(ColumnId::new_for_test).collect::<Vec<_>>()
+        );
+    }
+
+    fn out_col(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn col_ref(id: u32, name: &str) -> TypedExpr {
+        col_ref_with_type(id, name, DataType::Int64)
+    }
+
+    fn col_ref_with_type(id: u32, name: &str, data_type: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: None,
+                column: name.to_string(),
+            },
+            data_type,
+            nullable: false,
+        }
+    }
+
+    fn unset_col_ref(name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: None,
+                column: name.to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn typed_expr(kind: ExprKind) -> TypedExpr {
+        TypedExpr {
+            kind,
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn sort_item(expr: TypedExpr) -> SortItem {
+        SortItem {
+            expr,
+            asc: true,
+            nulls_first: false,
+        }
+    }
+
+    fn binary_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Add,
+                right: Box::new(right),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn leaf(cols: Vec<OutputColumn>) -> PhysicalPlanNode {
+        let mut node = values_node(1.0, vec![]);
+        node.kind = PhysicalPlanKind::Values(PlanValuesNode {
+            rows: vec![],
+            columns: cols.clone(),
+        });
+        node.output_columns = cols;
+        node
     }
 
     fn values_node(marker: f64, children: Vec<PhysicalPlanNode>) -> PhysicalPlanNode {
