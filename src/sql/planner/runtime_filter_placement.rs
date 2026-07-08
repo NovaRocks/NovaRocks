@@ -4,9 +4,8 @@
 //!
 //! Runs on the single `PhysicalPlanNode` tree produced by the optimizer->planner
 //! bridge, BEFORE `build_distributed_plan` fragments it. Annotates hash joins
-//! with build-side `RuntimeFilterBuildIntent`s and pushes matching
-//! `RuntimeFilterProbeIntent`s down to the deepest bindable probe descendant.
-//! Behavior is a byte-for-byte port of the retired
+//! with build-side `RuntimeFilterBuildIntent`s. Probe-side pushdown lands in
+//! Task 6. Behavior is a byte-for-byte port of the retired
 //! `optimizer::runtime_filter_pass` -- do not "improve" placement here; changes
 //! belong in the RF baseline / producer arcs.
 
@@ -14,9 +13,11 @@ use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
-use crate::sql::planner::PhysicalPlanStats;
 use crate::sql::planner::physical_vocab::JoinDistribution;
-use crate::sql::planner::plan::{PhysicalHashJoinEqCondition, PhysicalPlanNode};
+use crate::sql::planner::plan::{
+    PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, PhysicalPlanNode,
+};
+use crate::sql::planner::{JoinExecutionMode, PhysicalPlanStats, RuntimeFilterBuildIntent};
 use std::collections::HashSet;
 
 /// Rule name recognized by `SET disable_optimizer_rules='RuntimeFilterPushDown'`.
@@ -296,6 +297,57 @@ fn rf_key_types_match(eq: &PhysicalHashJoinEqCondition) -> bool {
     eq.left.data_type == eq.right.data_type
 }
 
+#[derive(Clone, Debug)]
+struct OrientedRfKey {
+    build_expr: TypedExpr,
+    probe_expr: TypedExpr,
+    expr_order: usize,
+}
+
+fn resolve_join_distribution(join: &PhysicalHashJoinNode) -> JoinDistribution {
+    match join.execution_mode {
+        Some(JoinExecutionMode::Broadcast) => JoinDistribution::Broadcast,
+        Some(JoinExecutionMode::Partitioned) => JoinDistribution::Shuffle,
+        Some(JoinExecutionMode::Colocate) => JoinDistribution::Colocate,
+        None => join.distribution.clone(),
+    }
+}
+
+fn execution_mode_for(distribution: &JoinDistribution) -> JoinExecutionMode {
+    match distribution {
+        JoinDistribution::Broadcast => JoinExecutionMode::Broadcast,
+        JoinDistribution::Shuffle => JoinExecutionMode::Partitioned,
+        JoinDistribution::Colocate => JoinExecutionMode::Colocate,
+        JoinDistribution::Unknown => unreachable!("Unknown distribution returns early"),
+    }
+}
+
+fn orient_rf_key(
+    node: &PhysicalPlanNode,
+    sides: JoinRfSides,
+    expr_order: usize,
+    eq: &PhysicalHashJoinEqCondition,
+) -> Option<OrientedRfKey> {
+    let left_child = expr_bound_child(node, &eq.left)?;
+    let right_child = expr_bound_child(node, &eq.right)?;
+
+    if left_child == sides.probe_child && right_child == sides.build_child {
+        Some(OrientedRfKey {
+            build_expr: eq.right.clone(),
+            probe_expr: eq.left.clone(),
+            expr_order,
+        })
+    } else if left_child == sides.build_child && right_child == sides.probe_child {
+        Some(OrientedRfKey {
+            build_expr: eq.left.clone(),
+            probe_expr: eq.right.clone(),
+            expr_order,
+        })
+    } else {
+        None
+    }
+}
+
 /// Callers pass bindable members with non-empty column ids; choose a stable
 /// representative for deterministic placement and EXPLAIN output.
 fn best_member(members: &[TypedExpr]) -> Option<TypedExpr> {
@@ -369,7 +421,22 @@ fn probe_gate_passes(
     (build_size / probe_size.max(1.0)) <= 1.0 - min_sel
 }
 
-/// Entry point. No-op until Task 7 fills the traversal.
+#[derive(Clone, Copy, Debug)]
+struct ProbePushPolicy {
+    allow_cross_exchange: bool,
+    cross_exchange: CrossExchangeMode,
+}
+
+fn push_probe_down(
+    _node: &mut PhysicalPlanNode,
+    _filter_id: i32,
+    _members: &[TypedExpr],
+    _policy: ProbePushPolicy,
+) -> bool {
+    false
+}
+
+/// Entry point for the planner-side RF placement pass once the bridge wires it.
 pub(crate) fn place_runtime_filters(root: &mut PhysicalPlanNode) {
     let config = RuntimeFilterPlacementConfig::from_current_session();
     if !config.enabled {
@@ -390,11 +457,104 @@ fn place_node(
 }
 
 fn place_current_node(
-    _node: &mut PhysicalPlanNode,
-    _config: &RuntimeFilterPlacementConfig,
-    _next_filter_id: &mut i32,
+    node: &mut PhysicalPlanNode,
+    config: &RuntimeFilterPlacementConfig,
+    next_filter_id: &mut i32,
 ) {
-    // Filled incrementally in Tasks 5-6.
+    if !config.enabled {
+        return;
+    }
+
+    let (sides, eq_conditions, distribution) = {
+        let PhysicalPlanKind::HashJoin(join) = &node.kind else {
+            return;
+        };
+        let Some(sides) = rf_sides_for_join(join.join_type) else {
+            return;
+        };
+        let max_child = sides.probe_child.max(sides.build_child);
+        if node.children.len() <= max_child {
+            return;
+        }
+        let distribution = resolve_join_distribution(join);
+        if matches!(distribution, JoinDistribution::Unknown) {
+            return;
+        }
+        (sides, join.eq_conditions.clone(), distribution)
+    };
+
+    let build_size = stats_compute_size(&node.children[sides.build_child].stats);
+    let probe_size = stats_compute_size(&node.children[sides.probe_child].stats);
+
+    let mut build_key_columns = HashSet::new();
+    for (expr_order, eq) in eq_conditions.iter().enumerate() {
+        if let Some(oriented) = orient_rf_key(node, sides, expr_order, eq) {
+            build_key_columns.extend(column_id_vec(&oriented.build_expr));
+        }
+    }
+    let mut build_key_column_ids: Vec<ColumnId> = build_key_columns.into_iter().collect();
+    build_key_column_ids.sort();
+    let build_key_size = stats_compute_size_for_columns(
+        &node.children[sides.build_child].stats,
+        &build_key_column_ids,
+    );
+
+    let build_max = config.build_max_bytes as f64;
+    let build_min = config.build_min_bytes as f64;
+    let probe_min = config.probe_min_bytes as f64;
+    let min_sel = config.probe_min_selectivity;
+
+    if !build_gate_passes(&distribution, build_key_size, build_max) {
+        return;
+    }
+
+    let local = !matches!(distribution, JoinDistribution::Shuffle);
+    let execution_mode = execution_mode_for(&distribution);
+    let mut descs = Vec::new();
+
+    for (expr_order, eq) in eq_conditions.iter().enumerate() {
+        if eq.null_safe {
+            continue;
+        }
+        if !rf_key_types_match(eq) {
+            continue;
+        }
+        if !probe_gate_passes(local, build_size, probe_size, build_min, probe_min, min_sel) {
+            continue;
+        }
+        let Some(oriented) = orient_rf_key(node, sides, expr_order, eq) else {
+            continue;
+        };
+        if (*next_filter_id as usize) >= config.max_count {
+            continue;
+        }
+        let filter_id = *next_filter_id;
+        *next_filter_id += 1;
+        descs.push(RuntimeFilterBuildIntent {
+            filter_id,
+            build_expr: oriented.build_expr,
+            probe_expr: oriented.probe_expr,
+            expr_order: oriented.expr_order,
+            execution_mode,
+        });
+    }
+
+    let policy = ProbePushPolicy {
+        allow_cross_exchange: config.allow_cross_exchange,
+        cross_exchange: CrossExchangeMode::from(&distribution),
+    };
+    for desc in &descs {
+        let _ = push_probe_down(
+            &mut node.children[sides.probe_child],
+            desc.filter_id,
+            std::slice::from_ref(&desc.probe_expr),
+            policy,
+        );
+    }
+
+    if let PhysicalPlanKind::HashJoin(join) = &mut node.kind {
+        join.build_runtime_filters = descs;
+    }
 }
 
 fn walk_plan_mut(node: &mut PhysicalPlanNode, f: &mut impl FnMut(&mut PhysicalPlanNode)) {
@@ -413,9 +573,10 @@ mod tests {
     use crate::sql::optimizer::options::{
         SessionOptimizerSettings, with_session_optimizer_settings,
     };
+    use crate::sql::planner::JoinExecutionMode;
     use crate::sql::planner::physical_vocab::JoinDistribution;
     use crate::sql::planner::plan::{
-        PhysicalHashJoinEqCondition, PhysicalPlanKind, PlanValuesNode,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, PlanValuesNode,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerColumnStatistic, PlannerConfidence};
     use arrow::datatypes::DataType;
@@ -691,6 +852,221 @@ mod tests {
     }
 
     #[test]
+    fn inner_broadcast_join_emits_one_build_intent() {
+        let probe = leaf(vec![out_col(1, "probe_key")]);
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "probe_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![probe, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let join_kind = expect_hash_join(&join);
+        assert_eq!(join_kind.build_runtime_filters.len(), 1);
+        let rf = &join_kind.build_runtime_filters[0];
+        assert_eq!(rf.filter_id, 0);
+        assert_eq!(rf.expr_order, 0);
+        assert_eq!(rf.execution_mode, JoinExecutionMode::Broadcast);
+        assert_column_ref(&rf.build_expr, 2);
+        assert_column_ref(&rf.probe_expr, 1);
+        assert_eq!(nid, 1);
+        assert!(join.children[0].probe_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn place_node_assigns_nested_filter_ids_post_order() {
+        let nested_probe = leaf(vec![out_col(1, "nested_probe")]);
+        let nested_build = leaf(vec![out_col(2, "nested_build")]);
+        let nested = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "nested_probe"),
+                col_ref(2, "nested_build"),
+                false,
+            )],
+            vec![nested_probe, nested_build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        let outer_build = leaf(vec![out_col(4, "outer_build")]);
+        let mut outer = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "nested_probe"),
+                col_ref(4, "outer_build"),
+                false,
+            )],
+            vec![nested, outer_build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (4, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut outer, &cfg, &mut nid);
+
+        let nested_join = expect_hash_join(&outer.children[0]);
+        let outer_join = expect_hash_join(&outer);
+        assert_eq!(nested_join.build_runtime_filters[0].filter_id, 0);
+        assert_eq!(outer_join.build_runtime_filters[0].filter_id, 1);
+        assert_eq!(nid, 2);
+    }
+
+    #[test]
+    fn build_intent_skips_null_safe_type_mismatch_and_max_count() {
+        let probe = leaf(vec![out_col(1, "probe_key")]);
+        let build = leaf(vec![
+            out_col(2, "null_safe_build"),
+            out_col(3, "mismatch_build"),
+            out_col(4, "valid_build"),
+            out_col(5, "second_valid_build"),
+        ]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![
+                eq_cond(col_ref(1, "probe_key"), col_ref(2, "null_safe_build"), true),
+                eq_cond(
+                    col_ref(1, "probe_key"),
+                    col_ref_with_type(3, "mismatch_build", DataType::Utf8),
+                    false,
+                ),
+                eq_cond(col_ref(1, "probe_key"), col_ref(4, "valid_build"), false),
+                eq_cond(
+                    col_ref(1, "probe_key"),
+                    col_ref(5, "second_valid_build"),
+                    false,
+                ),
+            ],
+            vec![probe, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (3, 8.0), (4, 8.0), (5, 8.0)]),
+        );
+        let cfg = permissive_config(1);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let join_kind = expect_hash_join(&join);
+        assert_eq!(join_kind.build_runtime_filters.len(), 1);
+        let rf = &join_kind.build_runtime_filters[0];
+        assert_eq!(rf.filter_id, 0);
+        assert_eq!(rf.expr_order, 2);
+        assert_column_ref(&rf.build_expr, 4);
+        assert_column_ref(&rf.probe_expr, 1);
+        assert_eq!(nid, 1);
+    }
+
+    #[test]
+    fn shuffle_build_gate_uses_key_width_not_full_row_width() {
+        let mut probe = leaf(vec![out_col(1, "probe_key")]);
+        probe.stats = stats_with_columns(100.0, &[(1, 8.0)]);
+        let mut build = leaf(vec![out_col(2, "build_key"), out_col(3, "payload")]);
+        build.stats = stats_with_columns(100.0, &[(2, 1.0), (3, 10_000.0)]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Shuffle,
+            Some(JoinExecutionMode::Partitioned),
+            vec![eq_cond(
+                col_ref(1, "probe_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![probe, build],
+            stats_with_columns(100.0, &[(1, 8.0), (2, 1.0), (3, 10_000.0)]),
+        );
+        let cfg = RuntimeFilterPlacementConfig {
+            enabled: true,
+            build_max_bytes: 200,
+            build_min_bytes: 2_000_000,
+            probe_min_bytes: 0,
+            probe_min_selectivity: 0.5,
+            max_count: 1024,
+            allow_cross_exchange: true,
+        };
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let join_kind = expect_hash_join(&join);
+        assert_eq!(join_kind.build_runtime_filters.len(), 1);
+        let rf = &join_kind.build_runtime_filters[0];
+        assert_eq!(rf.filter_id, 0);
+        assert_eq!(rf.execution_mode, JoinExecutionMode::Partitioned);
+        assert_column_ref(&rf.build_expr, 2);
+        assert_column_ref(&rf.probe_expr, 1);
+        assert_eq!(nid, 1);
+    }
+
+    #[test]
+    fn unknown_distribution_emits_no_build_intents() {
+        let probe = leaf(vec![out_col(1, "probe_key")]);
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Unknown,
+            None,
+            vec![eq_cond(
+                col_ref(1, "probe_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![probe, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        assert!(expect_hash_join(&join).build_runtime_filters.is_empty());
+        assert_eq!(nid, 0);
+    }
+
+    #[test]
+    fn execution_mode_overrides_unknown_distribution_for_build_intents() {
+        let probe = leaf(vec![out_col(1, "probe_key")]);
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Unknown,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "probe_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![probe, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let join_kind = expect_hash_join(&join);
+        assert_eq!(join_kind.build_runtime_filters.len(), 1);
+        assert_eq!(
+            join_kind.build_runtime_filters[0].execution_mode,
+            JoinExecutionMode::Broadcast
+        );
+        assert_eq!(nid, 1);
+    }
+
+    #[test]
     fn column_id_vec_recurses_and_skips_unset() {
         let expr = typed_expr(ExprKind::FunctionCall {
             name: "outer_fn".to_string(),
@@ -834,6 +1210,69 @@ mod tests {
             },
             data_type: DataType::Int64,
             nullable: false,
+        }
+    }
+
+    fn eq_cond(left: TypedExpr, right: TypedExpr, null_safe: bool) -> PhysicalHashJoinEqCondition {
+        PhysicalHashJoinEqCondition {
+            left,
+            right,
+            null_safe,
+        }
+    }
+
+    fn hash_join_node(
+        join_type: JoinKind,
+        distribution: JoinDistribution,
+        execution_mode: Option<JoinExecutionMode>,
+        eq_conditions: Vec<PhysicalHashJoinEqCondition>,
+        children: Vec<PhysicalPlanNode>,
+        stats: PhysicalPlanStats,
+    ) -> PhysicalPlanNode {
+        let output_columns = children
+            .iter()
+            .flat_map(|child| child.output_columns.iter().cloned())
+            .collect::<Vec<_>>();
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type,
+                eq_conditions,
+                other_condition: None,
+                distribution,
+                execution_mode,
+                build_runtime_filters: vec![],
+                output_columns: output_columns.clone(),
+            })),
+            children,
+            output_columns,
+            stats,
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    fn expect_hash_join(node: &PhysicalPlanNode) -> &PhysicalHashJoinNode {
+        let PhysicalPlanKind::HashJoin(join) = &node.kind else {
+            panic!("expected hash join");
+        };
+        join
+    }
+
+    fn assert_column_ref(expr: &TypedExpr, id: u32) {
+        let ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
+            panic!("expected column ref");
+        };
+        assert_eq!(*column_id, ColumnId::new_for_test(id));
+    }
+
+    fn permissive_config(max_count: usize) -> RuntimeFilterPlacementConfig {
+        RuntimeFilterPlacementConfig {
+            enabled: true,
+            build_max_bytes: u64::MAX,
+            build_min_bytes: 0,
+            probe_min_bytes: 0,
+            probe_min_selectivity: 0.5,
+            max_count,
+            allow_cross_exchange: true,
         }
     }
 
