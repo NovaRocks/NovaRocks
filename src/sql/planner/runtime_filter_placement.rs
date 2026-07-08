@@ -4,8 +4,8 @@
 //!
 //! Runs on the single `PhysicalPlanNode` tree produced by the optimizer->planner
 //! bridge, BEFORE `build_distributed_plan` fragments it. Annotates hash joins
-//! with build-side `RuntimeFilterBuildIntent`s. Probe-side pushdown lands in
-//! Task 6. Behavior is a byte-for-byte port of the retired
+//! with build-side `RuntimeFilterBuildIntent`s and pushes matching
+//! probe-side `RuntimeFilterProbeIntent`s. Behavior is a byte-for-byte port of the retired
 //! `optimizer::runtime_filter_pass` -- do not "improve" placement here; changes
 //! belong in the RF baseline / producer arcs.
 
@@ -16,8 +16,11 @@ use crate::sql::optimizer::options::current_session_optimizer_settings;
 use crate::sql::planner::physical_vocab::JoinDistribution;
 use crate::sql::planner::plan::{
     PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, PhysicalPlanNode,
+    RedistributeMode,
 };
-use crate::sql::planner::{JoinExecutionMode, PhysicalPlanStats, RuntimeFilterBuildIntent};
+use crate::sql::planner::{
+    JoinExecutionMode, PhysicalPlanStats, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+};
 use std::collections::HashSet;
 
 /// Rule name recognized by `SET disable_optimizer_rules='RuntimeFilterPushDown'`.
@@ -394,6 +397,87 @@ fn join_is_outer_or_anti_boundary(kind: JoinKind) -> bool {
     )
 }
 
+fn is_exchange(node: &PhysicalPlanNode) -> bool {
+    matches!(node.kind, PhysicalPlanKind::Redistribute(_))
+}
+
+fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
+    matches!(
+        &node.kind,
+        PhysicalPlanKind::Redistribute(redistribute)
+            if matches!(redistribute.mode, RedistributeMode::Hash { .. })
+    )
+}
+
+fn hash_partition_carries_probe_key(node: &PhysicalPlanNode, probe_expr: &TypedExpr) -> bool {
+    let PhysicalPlanKind::Redistribute(redistribute) = &node.kind else {
+        return false;
+    };
+    let RedistributeMode::Hash { cols, .. } = &redistribute.mode else {
+        return false;
+    };
+    let needed = column_id_vec(probe_expr);
+    if needed.is_empty() {
+        return false;
+    }
+    needed.iter().all(|id| cols.contains(id))
+}
+
+fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
+    matches!(
+        &node.kind,
+        PhysicalPlanKind::HashJoin(join) if join_is_outer_or_anti_boundary(join.join_type)
+    )
+}
+
+fn place_probe(node: &mut PhysicalPlanNode, filter_id: i32, members: &[TypedExpr]) -> bool {
+    let Some(expr) = best_member(members) else {
+        return false;
+    };
+    node.probe_runtime_filters.push(RuntimeFilterProbeIntent {
+        filter_id,
+        probe_expr: expr,
+    });
+    true
+}
+
+fn expand_probe_set_across_join(
+    join: &PhysicalPlanNode,
+    eq_conditions: &[PhysicalHashJoinEqCondition],
+    members: &[TypedExpr],
+) -> Vec<TypedExpr> {
+    let mut expanded = members.to_vec();
+    let mut seen: HashSet<Vec<ColumnId>> = members.iter().map(column_id_vec).collect();
+    let output_cols = child_column_set(join);
+
+    let survives = |expr: &TypedExpr| -> bool {
+        let cols = column_id_vec(expr);
+        !cols.is_empty() && cols.iter().all(|c| output_cols.contains(c))
+    };
+
+    for eq in eq_conditions {
+        if eq.null_safe {
+            continue;
+        }
+        let left_cols = column_id_vec(&eq.left);
+        let right_cols = column_id_vec(&eq.right);
+        if left_cols.is_empty() || right_cols.is_empty() {
+            continue;
+        }
+        for member in members {
+            let member_cols = column_id_vec(member);
+            if member_cols == left_cols && survives(&eq.right) && seen.insert(right_cols.clone()) {
+                expanded.push(eq.right.clone());
+            }
+            if member_cols == right_cols && survives(&eq.left) && seen.insert(left_cols.clone()) {
+                expanded.push(eq.left.clone());
+            }
+        }
+    }
+
+    expanded
+}
+
 fn build_gate_passes(distribution: &JoinDistribution, build_size: f64, build_max: f64) -> bool {
     match distribution {
         JoinDistribution::Shuffle => !(build_size <= 0.0 || build_size > build_max),
@@ -428,12 +512,60 @@ struct ProbePushPolicy {
 }
 
 fn push_probe_down(
-    _node: &mut PhysicalPlanNode,
-    _filter_id: i32,
-    _members: &[TypedExpr],
-    _policy: ProbePushPolicy,
+    node: &mut PhysicalPlanNode,
+    filter_id: i32,
+    members: &[TypedExpr],
+    policy: ProbePushPolicy,
 ) -> bool {
-    false
+    if policy.allow_cross_exchange && distribution_is_crossable(node) {
+        let crossable: Vec<TypedExpr> = match policy.cross_exchange {
+            CrossExchangeMode::Unconditional => members.to_vec(),
+            CrossExchangeMode::KeyAligned => members
+                .iter()
+                .filter(|m| hash_partition_carries_probe_key(node, m))
+                .cloned()
+                .collect(),
+            CrossExchangeMode::Disabled => Vec::new(),
+        };
+        if !crossable.is_empty() {
+            if let Some(child) = node.children.first_mut() {
+                return push_probe_down(child, filter_id, &crossable, policy);
+            }
+            return false;
+        }
+    }
+    if is_exchange(node) {
+        return false;
+    }
+
+    let bindable = bindable_members(node, members);
+    if bindable.is_empty() {
+        return false;
+    }
+
+    if is_probe_semantic_boundary(node) {
+        return place_probe(node, filter_id, &bindable);
+    }
+
+    let descend_set = match &node.kind {
+        PhysicalPlanKind::HashJoin(join) => {
+            let eq_conditions = join.eq_conditions.clone();
+            expand_probe_set_across_join(node, &eq_conditions, &bindable)
+        }
+        _ => bindable.clone(),
+    };
+
+    let mut placed_in_child = false;
+    for child in &mut node.children {
+        if push_probe_down(child, filter_id, &descend_set, policy) {
+            placed_in_child = true;
+        }
+    }
+    if placed_in_child {
+        return true;
+    }
+
+    place_probe(node, filter_id, &bindable)
 }
 
 /// Entry point for the planner-side RF placement pass once the bridge wires it.
@@ -567,16 +699,17 @@ fn walk_plan_mut(node: &mut PhysicalPlanNode, f: &mut impl FnMut(&mut PhysicalPl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
+    use crate::sql::analysis::{ExprKind, ProjectItem, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{BinOp, JoinKind, OutputColumn};
     use crate::sql::optimizer::options::{
         SessionOptimizerSettings, with_session_optimizer_settings,
     };
     use crate::sql::planner::JoinExecutionMode;
-    use crate::sql::planner::physical_vocab::JoinDistribution;
+    use crate::sql::planner::physical_vocab::{HashSource, JoinDistribution};
     use crate::sql::planner::plan::{
-        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, PlanValuesNode,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, PlanProjectNode,
+        PlanValuesNode, RedistributeMode, RedistributeNode,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerColumnStatistic, PlannerConfidence};
     use arrow::datatypes::DataType;
@@ -881,7 +1014,231 @@ mod tests {
         assert_column_ref(&rf.build_expr, 2);
         assert_column_ref(&rf.probe_expr, 1);
         assert_eq!(nid, 1);
+        assert_probe_filter(&join.children[0], 0, 1);
+        assert!(join.children[1].probe_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn probe_pushes_through_project_to_scan() {
+        let probe_scan = leaf(vec![out_col(1, "probe_key")]);
+        let probe_project = project_node(
+            vec![ProjectItem {
+                expr: col_ref(1, "probe_key"),
+                output_name: "probe_key".to_string(),
+                output_column_id: ColumnId::new_for_test(1),
+            }],
+            vec![out_col(1, "probe_key")],
+            probe_scan,
+        );
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "probe_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![probe_project, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
         assert!(join.children[0].probe_runtime_filters.is_empty());
+        assert_probe_filter(&join.children[0].children[0], 0, 1);
+    }
+
+    #[test]
+    fn key_aligned_probe_crosses_redistribute_when_flag_enabled() {
+        let probe_scan = leaf(vec![out_col(1, "probe_key")]);
+        let probe_exchange = hash_redistribute_node(vec![1], probe_scan);
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Shuffle,
+            Some(JoinExecutionMode::Partitioned),
+            vec![eq_cond(
+                col_ref(1, "probe_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![probe_exchange, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        assert!(join.children[0].probe_runtime_filters.is_empty());
+        assert_probe_filter(&join.children[0].children[0], 0, 1);
+    }
+
+    #[test]
+    fn misaligned_probe_stops_at_redistribute() {
+        let probe_scan = leaf(vec![out_col(1, "probe_key"), out_col(99, "partition_key")]);
+        let probe_exchange = hash_redistribute_node(vec![99], probe_scan);
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Shuffle,
+            Some(JoinExecutionMode::Partitioned),
+            vec![eq_cond(
+                col_ref(1, "probe_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![probe_exchange, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (99, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        assert_eq!(expect_hash_join(&join).build_runtime_filters.len(), 1);
+        assert!(join.children[0].probe_runtime_filters.is_empty());
+        assert!(
+            join.children[0].children[0]
+                .probe_runtime_filters
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn outer_boundary_stops_probe_on_outer_join() {
+        let boundary_probe = leaf(vec![out_col(1, "outer_probe")]);
+        let boundary_build = leaf(vec![out_col(3, "outer_build")]);
+        let boundary = hash_join_node(
+            JoinKind::LeftOuter,
+            JoinDistribution::Unknown,
+            None,
+            vec![eq_cond(
+                col_ref(1, "outer_probe"),
+                col_ref(3, "outer_build"),
+                false,
+            )],
+            vec![boundary_probe, boundary_build],
+            stats_with_columns(10.0, &[(1, 8.0), (3, 8.0)]),
+        );
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "outer_probe"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![boundary, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (3, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        assert_probe_filter(&join.children[0], 0, 1);
+        assert!(
+            join.children[0].children[0]
+                .probe_runtime_filters
+                .is_empty()
+        );
+        assert!(
+            join.children[0].children[1]
+                .probe_runtime_filters
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn equivalent_column_expands_to_both_inner_join_sides() {
+        let left = leaf(vec![out_col(1, "left_key")]);
+        let right = leaf(vec![out_col(3, "right_key")]);
+        let lower = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Unknown,
+            None,
+            vec![eq_cond(
+                col_ref(1, "left_key"),
+                col_ref(3, "right_key"),
+                false,
+            )],
+            vec![left, right],
+            stats_with_columns(10.0, &[(1, 8.0), (3, 8.0)]),
+        );
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "left_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![lower, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (3, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let lower_join = &join.children[0];
+        assert!(lower_join.probe_runtime_filters.is_empty());
+        assert!(
+            expect_hash_join(lower_join)
+                .build_runtime_filters
+                .is_empty()
+        );
+        assert_probe_filter(&lower_join.children[0], 0, 1);
+        assert_probe_filter(&lower_join.children[1], 0, 3);
+    }
+
+    #[test]
+    fn semi_join_survival_gate_blocks_existence_only_side() {
+        let left = leaf(vec![out_col(1, "surviving_key")]);
+        let right = leaf(vec![out_col(3, "existence_key")]);
+        let mut lower = hash_join_node(
+            JoinKind::LeftSemi,
+            JoinDistribution::Unknown,
+            None,
+            vec![eq_cond(
+                col_ref(1, "surviving_key"),
+                col_ref(3, "existence_key"),
+                false,
+            )],
+            vec![left, right],
+            stats_with_columns(10.0, &[(1, 8.0), (3, 8.0)]),
+        );
+        set_hash_join_output(&mut lower, vec![out_col(1, "surviving_key")]);
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "surviving_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![lower, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (3, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let lower_join = &join.children[0];
+        assert_probe_filter(&lower_join.children[0], 0, 1);
+        assert!(lower_join.children[1].probe_runtime_filters.is_empty());
     }
 
     #[test]
@@ -1257,11 +1614,26 @@ mod tests {
         join
     }
 
+    fn set_hash_join_output(node: &mut PhysicalPlanNode, cols: Vec<OutputColumn>) {
+        let PhysicalPlanKind::HashJoin(join) = &mut node.kind else {
+            panic!("expected hash join");
+        };
+        join.output_columns = cols.clone();
+        node.output_columns = cols;
+    }
+
     fn assert_column_ref(expr: &TypedExpr, id: u32) {
         let ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
             panic!("expected column ref");
         };
         assert_eq!(*column_id, ColumnId::new_for_test(id));
+    }
+
+    fn assert_probe_filter(node: &PhysicalPlanNode, filter_id: i32, column_id: u32) {
+        assert_eq!(node.probe_runtime_filters.len(), 1);
+        let probe = &node.probe_runtime_filters[0];
+        assert_eq!(probe.filter_id, filter_id);
+        assert_column_ref(&probe.probe_expr, column_id);
     }
 
     fn permissive_config(max_count: usize) -> RuntimeFilterPlacementConfig {
@@ -1284,6 +1656,41 @@ mod tests {
         });
         node.output_columns = cols;
         node
+    }
+
+    fn project_node(
+        items: Vec<ProjectItem>,
+        output_columns: Vec<OutputColumn>,
+        child: PhysicalPlanNode,
+    ) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items,
+                output_qualifier: None,
+            }),
+            children: vec![child],
+            output_columns,
+            stats: stats_with_columns(10.0, &[(1, 8.0)]),
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    fn hash_redistribute_node(cols: Vec<u32>, child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Hash {
+                    cols: cols.into_iter().map(ColumnId::new_for_test).collect(),
+                    source: HashSource::ShuffleJoin,
+                },
+                partition_exprs: vec![],
+                output_columns: output_columns.clone(),
+            }),
+            children: vec![child],
+            output_columns,
+            stats: stats_with_columns(10.0, &[(1, 8.0), (99, 8.0)]),
+            probe_runtime_filters: vec![],
+        }
     }
 
     fn values_node(marker: f64, children: Vec<PhysicalPlanNode>) -> PhysicalPlanNode {
