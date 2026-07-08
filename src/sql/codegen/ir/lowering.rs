@@ -6588,8 +6588,8 @@ mod tests {
             tuple_ids: vec![3],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
             children: vec![child],
             stats: distributed_stats(),
             payload: DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(Box::new(
@@ -8167,8 +8167,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan

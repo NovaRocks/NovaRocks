@@ -150,8 +150,6 @@ pub(crate) fn extract_best(
             join_distribution,
             scalar_arena: None,
         },
-        build_runtime_filters: Vec::new(),
-        probe_runtime_filters: Vec::new(),
     };
 
     // If the winner has an enforcer, wrap the inner node.
@@ -190,8 +188,6 @@ pub(crate) fn extract_best(
                 join_distribution: None,
                 scalar_arena: None,
             },
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         });
     }
 
@@ -704,8 +700,6 @@ mod tests {
             explain_stats: OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         }
     }
 

@@ -690,8 +690,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         }
     }
 
@@ -721,8 +719,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(output_id, "p")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan
@@ -764,8 +760,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(declared_visible_id, "sum(a) + 1")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan
@@ -793,8 +787,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(rollup_id, "a")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         }
     }
 
@@ -898,8 +890,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(aggregate_output_id, "sum(a)")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut aggregate, Arc::new(scalars));
         let plan = project_over(
@@ -947,8 +937,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(input_id, "a")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut scalars = ScalarArena::new();
         let aggregate_output_columns = vec![
@@ -978,8 +966,6 @@ mod tests {
                 int_col(grouping_output_id, "__grouping_fn_0"),
             ],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut aggregate, Arc::new(scalars));
 
@@ -1005,8 +991,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
 

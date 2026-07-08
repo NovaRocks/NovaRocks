@@ -17,7 +17,7 @@
 
 -- M2: partitioned (Shuffle) hash-join probe runtime filters now cross a
 -- key-aligned shuffle exchange into the producing fragment
--- (`hash_partition_carries_probe_key` in runtime_filter_pass.rs). With real
+-- (`hash_partition_carries_probe_key` in planner/runtime_filter_placement.rs). With real
 -- ANALYZE stats small joins default to BROADCAST, so force a partitioned join
 -- deterministically via cbo_broadcast_node_mem_budget_bytes = 0 (see
 -- runtime_filter_cross_exchange.sql for the BROADCAST-only companion case).

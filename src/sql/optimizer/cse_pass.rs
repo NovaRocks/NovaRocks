@@ -914,8 +914,6 @@ fn wrap_project_around_child(
         output_columns,
         execution_props,
         children: vec![original],
-        build_runtime_filters: vec![],
-        probe_runtime_filters: vec![],
     };
 }
 
@@ -1083,8 +1081,6 @@ fn rewrite_project(
         output_columns: child_project_output_columns,
         execution_props,
         children: vec![child],
-        build_runtime_filters: vec![],
-        probe_runtime_filters: vec![],
     };
     node.children.push(cse_project);
     node.explain_stats = rewritten_node_explain_stats(node, scalars, cost_options);
@@ -1520,8 +1516,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         }
     }
 
@@ -1825,8 +1819,6 @@ mod tests {
                 },
             ],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
@@ -1844,8 +1836,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(110, "x"), output_column(111, "y")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -1921,8 +1911,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(10, "stale")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite(
@@ -1961,8 +1949,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(1, "a"), output_column(2, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         super::rewrite(
             &mut node,
@@ -2004,8 +1990,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(1, "a"), output_column(2, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
@@ -2020,8 +2004,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(3, "x"), output_column(4, "y")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         seed_factory_above_plan(&mut factory, &node);
@@ -2091,8 +2073,6 @@ mod tests {
                 output_column(103, "c"),
             ],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
@@ -2112,8 +2092,6 @@ mod tests {
                 output_column(112, "lambda_capture"),
             ],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -2154,8 +2132,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut parent = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp {
@@ -2166,8 +2142,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::insert_or_reuse_project_below(
@@ -2221,8 +2195,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut stale_filter = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp {
@@ -2237,8 +2209,6 @@ mod tests {
                 output_column(999, "stale_not_in_child_scope"),
             ],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::insert_or_reuse_project_below(
@@ -2298,8 +2268,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::insert_or_reuse_project_below(
@@ -2367,8 +2335,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut child_project = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
@@ -2380,8 +2346,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "x"), output_column(202, "y")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::insert_or_reuse_project_below(
@@ -2441,8 +2405,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut child_project = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
@@ -2454,8 +2416,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::insert_or_reuse_project_below(
@@ -2541,8 +2501,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp { predicate }),
@@ -2557,8 +2515,6 @@ mod tests {
             },
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -2650,8 +2606,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp { predicate }),
@@ -2663,8 +2617,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite(
@@ -2712,8 +2664,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let project = OptimizerPhysicalNode {
             op: Operator::PhysicalProject(ProjectOp {
@@ -2725,8 +2675,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "x"), output_column(202, "y")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalFilter(FilterOp { predicate }),
@@ -2735,8 +2683,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "x"), output_column(202, "y")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -2847,8 +2793,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -2908,8 +2852,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let distribution = OptimizerPhysicalNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
@@ -2920,8 +2862,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         let mut node = OptimizerPhysicalNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -2958,8 +2898,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3033,8 +2971,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3102,8 +3038,6 @@ mod tests {
                 output_column(202, "ordered_b"),
             ],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3155,8 +3089,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3209,8 +3141,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "a"), output_column(102, "b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3271,8 +3201,6 @@ mod tests {
                 output_column(201, "win_sum"),
             ],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3334,8 +3262,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3414,8 +3340,6 @@ mod tests {
                 output_column(202, "right_k"),
             ],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3479,8 +3403,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3522,8 +3444,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "shared")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(
@@ -3590,8 +3510,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
 
         super::rewrite_node(

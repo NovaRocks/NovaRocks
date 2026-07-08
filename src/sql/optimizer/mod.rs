@@ -36,7 +36,6 @@ pub(crate) mod physical_tree;
 pub(crate) mod property;
 pub(crate) mod rewrite;
 pub(crate) mod rule;
-pub(crate) mod runtime_filter_pass;
 pub(crate) mod scalar;
 pub(crate) mod scalar_expr;
 pub(crate) mod search;
@@ -299,9 +298,7 @@ fn optimize_with_root_property(
     // 11. Extract best plan.
     let mut physical = extract::extract_best(&mut memo, root_group, &root_required, &ctx.winners)?;
 
-    // 12. Annotate physical plan with runtime filter descriptors.
-    runtime_filter_pass::annotate(&mut physical, &memo.scalars, &options);
-    // 13. Common-subexpression elimination (materializes repeats as Project columns).
+    // 12. Common-subexpression elimination (materializes repeats as Project columns).
     cse_pass::rewrite(
         &mut physical,
         &mut memo.scalars,
@@ -400,7 +397,7 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
             .iter()
             .any(|r| r.name() == name)
         || rewrite::registry::is_known_rewrite_rule_name(name)
-        || name == runtime_filter_pass::RUNTIME_FILTER_RULE
+        || name == crate::sql::planner::runtime_filter_placement::RUNTIME_FILTER_RULE
         || name == cse_pass::CSE_RULE
         || name == cascades_rules::mv_rewrite::RULE_NAME
 }

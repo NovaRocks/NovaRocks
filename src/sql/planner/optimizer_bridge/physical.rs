@@ -32,7 +32,7 @@ use crate::sql::planner::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
     PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlannerBroadcastDecision,
     PlannerColumnStatistic, PlannerConfidence, PlannerCostEstimate, RedistributeMode,
-    RedistributeNode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
+    RedistributeNode, TopNPhase,
 };
 
 struct BridgeCtx<'a> {
@@ -63,7 +63,7 @@ impl BridgeCtx<'_> {
             children,
             output_columns,
             stats: planner_stats(node),
-            probe_runtime_filters: convert_probe_runtime_filters(self.scalars, node),
+            probe_runtime_filters: vec![],
         })
     }
 
@@ -127,11 +127,6 @@ impl BridgeCtx<'_> {
             }
             Operator::PhysicalHashJoin(op) => {
                 let execution_mode = join_execution_mode(node.execution_props.join_distribution);
-                let rf_execution_mode = if node.build_runtime_filters.is_empty() {
-                    None
-                } else {
-                    Some(runtime_filter_execution_mode(node)?)
-                };
                 Ok(PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                     join_type: op.join_type,
                     eq_conditions: op
@@ -148,19 +143,7 @@ impl BridgeCtx<'_> {
                         .map(|expr| materialize(self.scalars, expr)),
                     distribution: map_join_distribution(op.distribution.clone()),
                     execution_mode,
-                    build_runtime_filters: node
-                        .build_runtime_filters
-                        .iter()
-                        .map(|rf| RuntimeFilterBuildIntent {
-                            filter_id: rf.filter_id,
-                            build_expr: materialize(self.scalars, rf.build_expr),
-                            probe_expr: materialize(self.scalars, rf.probe_expr),
-                            expr_order: rf.expr_order,
-                            execution_mode: rf_execution_mode.expect(
-                                "runtime filter execution mode is resolved for non-empty RF list",
-                            ),
-                        })
-                        .collect(),
+                    build_runtime_filters: vec![],
                     output_columns: physical_join_output_columns(op.join_type, node),
                 })))
             }
@@ -605,28 +588,6 @@ fn map_aggregate_output_layout(
     )
 }
 
-fn runtime_filter_execution_mode(
-    node: &OptimizerPhysicalNode,
-) -> Result<JoinExecutionMode, String> {
-    join_execution_mode(node.execution_props.join_distribution).ok_or_else(|| {
-        "Bridge 2a cannot convert hash join runtime filters without resolved join execution distribution"
-            .to_string()
-    })
-}
-
-fn convert_probe_runtime_filters(
-    scalars: &ScalarArena,
-    node: &OptimizerPhysicalNode,
-) -> Vec<RuntimeFilterProbeIntent> {
-    node.probe_runtime_filters
-        .iter()
-        .map(|rf| RuntimeFilterProbeIntent {
-            filter_id: rf.filter_id,
-            probe_expr: materialize(scalars, rf.probe_expr),
-        })
-        .collect()
-}
-
 fn redistribute_mode(op: &PhysicalDistributionOp) -> Result<RedistributeMode, String> {
     match &op.spec {
         DistributionSpec::Gather => Ok(RedistributeMode::Gather),
@@ -765,14 +726,12 @@ mod tests {
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, ChangeEventExpandOp, ChangeEventOutputExpr,
         ChangeEventSpec, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ScanOp, UnionOp,
-        ValuesOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinOp, ScanOp, UnionOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::{
         DistributionSpec, HashSource as OptimizerHashSource, PhysicalPropertySet,
     };
-    use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{Confidence, CostEstimate, Statistics};
     use crate::sql::planner::PhysicalPlanKind;
@@ -855,8 +814,6 @@ mod tests {
                 join_distribution: None,
                 scalar_arena: None,
             },
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         }
     }
 
@@ -1405,100 +1362,6 @@ mod tests {
                 .children
                 .iter()
                 .all(|child| matches!(child.kind, PhysicalPlanKind::Values(_)))
-        );
-    }
-
-    fn hash_join_with_runtime_filter(
-        join_distribution: Option<JoinExecutionDistribution>,
-    ) -> OptimizerPhysicalNode {
-        let mut arena = ScalarArena::new();
-        let left = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
-            &mut arena,
-            &col_expr(1, "l"),
-        );
-        let right = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
-            &mut arena,
-            &col_expr(2, "r"),
-        );
-        let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-            join_type: JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left,
-                right,
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Shuffle,
-        }));
-        node.children.push(raw_values_node());
-        node.children.push(raw_values_node());
-        node.execution_props.join_distribution = join_distribution;
-        node.build_runtime_filters.push(RuntimeFilterDesc {
-            filter_id: 11,
-            build_expr: right,
-            probe_expr: left,
-            expr_order: 0,
-            distribution: JoinDistribution::Shuffle,
-        });
-        attach_arena(node, Arc::new(arena))
-    }
-
-    #[test]
-    fn hash_join_build_runtime_filter_requires_resolved_execution_distribution() {
-        let node = hash_join_with_runtime_filter(None);
-
-        let err = optimizer_physical_to_plan(&node).expect_err("RF needs resolved execution mode");
-        assert!(err.contains(
-            "Bridge 2a cannot convert hash join runtime filters without resolved join execution distribution"
-        ));
-    }
-
-    #[test]
-    fn hash_join_build_runtime_filter_uses_resolved_partitioned_execution_mode() {
-        let node = hash_join_with_runtime_filter(Some(JoinExecutionDistribution::Partitioned));
-
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
-        let PhysicalPlanKind::HashJoin(join) = physical.kind else {
-            panic!("expected HashJoin");
-        };
-        assert_eq!(join.build_runtime_filters.len(), 1);
-        assert_eq!(
-            join.build_runtime_filters[0].execution_mode,
-            JoinExecutionMode::Partitioned
-        );
-        assert_eq!(join.execution_mode, Some(JoinExecutionMode::Partitioned));
-        assert_eq!(join.build_runtime_filters[0].filter_id, 11);
-        assert_eq!(join.build_runtime_filters[0].expr_order, 0);
-        assert_column_ref(&join.build_runtime_filters[0].build_expr, 2, "r");
-        assert_column_ref(&join.build_runtime_filters[0].probe_expr, 1, "l");
-    }
-
-    #[test]
-    fn probe_runtime_filter_intent_stays_on_target_node() {
-        let mut arena = ScalarArena::new();
-        let probe_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
-            &mut arena,
-            &col_expr(9, "probe_key"),
-        );
-        let mut node = base_node(Operator::PhysicalValues(ValuesOp {
-            rows: vec![],
-            columns: vec![output_column(9, "probe_key")],
-        }));
-        node.probe_runtime_filters.push(RuntimeFilterProbe {
-            filter_id: 21,
-            probe_expr,
-        });
-        let node = attach_arena(node, Arc::new(arena));
-
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
-        assert!(matches!(physical.kind, PhysicalPlanKind::Values(_)));
-        assert!(physical.children.is_empty());
-        assert_eq!(physical.probe_runtime_filters.len(), 1);
-        assert_eq!(physical.probe_runtime_filters[0].filter_id, 21);
-        assert_column_ref(
-            &physical.probe_runtime_filters[0].probe_expr,
-            9,
-            "probe_key",
         );
     }
 

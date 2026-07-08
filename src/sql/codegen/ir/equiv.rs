@@ -62,7 +62,6 @@ mod tests {
         JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::{
@@ -1949,23 +1948,7 @@ mod tests {
     }
 
     fn inner_hash_join_two_scans_plan() -> OptimizerPhysicalNode {
-        let (mut join, _, _) = hash_join_plan(JoinKind::Inner);
-        let Operator::PhysicalHashJoin(hash_join) = &join.op else {
-            panic!("expected hash join");
-        };
-        let left_key = hash_join.eq_conditions[0].left;
-        let right_key = hash_join.eq_conditions[0].right;
-        join.children[0].probe_runtime_filters = vec![RuntimeFilterProbe {
-            filter_id: 7,
-            probe_expr: left_key,
-        }];
-        join.build_runtime_filters = vec![RuntimeFilterDesc {
-            filter_id: 7,
-            build_expr: right_key,
-            probe_expr: left_key,
-            expr_order: 0,
-            distribution: JoinDistribution::Broadcast,
-        }];
+        let (join, _, _) = hash_join_plan(JoinKind::Inner);
         join
     }
 
@@ -2467,8 +2450,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan

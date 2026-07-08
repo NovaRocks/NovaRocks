@@ -841,8 +841,8 @@ fn inject_native_keyed_assert_before_expand_node(
         tuple_ids: original_child.tuple_ids.clone(),
         nullable_tuple_ids: original_child.nullable_tuple_ids.clone(),
         limit: -1,
-        build_runtime_filters: Vec::new(),
-        probe_runtime_filters: Vec::new(),
+        build_runtime_filters: vec![],
+        probe_runtime_filters: vec![],
         children: vec![original_child],
         stats: node.stats.clone(),
         payload: crate::sql::planner::DistributedPayload::Physical(
@@ -1386,8 +1386,6 @@ mod tests {
             explain_stats: OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut physical_plan, Arc::new(ScalarArena::new()));
         physical_plan
@@ -1898,8 +1896,8 @@ mod tests {
             tuple_ids: vec![1],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
             children: Vec::new(),
             stats: PhysicalPlanStats {
                 output_row_count: 1.0,
@@ -1925,8 +1923,8 @@ mod tests {
             tuple_ids: vec![1],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
             children: vec![child],
             stats: PhysicalPlanStats {
                 output_row_count: 1.0,
@@ -1975,8 +1973,8 @@ mod tests {
             tuple_ids: vec![30],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
             children: Vec::new(),
             stats: crate::sql::planner::PhysicalPlanStats {
                 output_row_count: 1.0,

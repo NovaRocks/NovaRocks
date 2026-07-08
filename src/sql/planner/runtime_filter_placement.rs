@@ -1,12 +1,10 @@
-#![allow(dead_code)] // removed in Task 7 once wired into the bridge.
-
 //! Planner-side runtime-filter placement pass (RFP-1).
 //!
 //! Runs on the single `PhysicalPlanNode` tree produced by the optimizer->planner
 //! bridge, BEFORE `build_distributed_plan` fragments it. Annotates hash joins
 //! with build-side `RuntimeFilterBuildIntent`s and pushes matching
-//! probe-side `RuntimeFilterProbeIntent`s. Behavior is a byte-for-byte port of the retired
-//! `optimizer::runtime_filter_pass` -- do not "improve" placement here; changes
+//! probe-side `RuntimeFilterProbeIntent`s. Behavior is a byte-for-byte port of
+//! the retired optimizer-side pass -- do not "improve" placement here; changes
 //! belong in the RF baseline / producer arcs.
 
 use crate::sql::analysis::{ExprKind, TypedExpr};
@@ -160,9 +158,12 @@ fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
             probe_child: 0,
             build_child: 1,
         }),
+        JoinKind::RightSemi => Some(JoinRfSides {
+            probe_child: 1,
+            build_child: 0,
+        }),
         JoinKind::LeftOuter
         | JoinKind::FullOuter
-        | JoinKind::RightSemi
         | JoinKind::LeftAnti
         | JoinKind::RightAnti
         | JoinKind::NullAwareLeftAnti
@@ -731,7 +732,13 @@ mod tests {
                 build_child: 1
             })
         );
-        assert_eq!(rf_sides_for_join(JoinKind::RightSemi), None);
+        assert_eq!(
+            rf_sides_for_join(JoinKind::RightSemi),
+            Some(JoinRfSides {
+                probe_child: 1,
+                build_child: 0
+            })
+        );
         assert_eq!(rf_sides_for_join(JoinKind::LeftOuter), None);
         assert_eq!(rf_sides_for_join(JoinKind::FullOuter), None);
     }
@@ -1019,6 +1026,37 @@ mod tests {
     }
 
     #[test]
+    fn right_semi_join_builds_runtime_filter_on_preserved_right_side() {
+        let left = leaf(vec![out_col(1, "existence_key")]);
+        let right = leaf(vec![out_col(2, "preserved_key")]);
+        let mut join = hash_join_node(
+            JoinKind::RightSemi,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "existence_key"),
+                col_ref(2, "preserved_key"),
+                false,
+            )],
+            vec![left, right],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        set_hash_join_output(&mut join, vec![out_col(2, "preserved_key")]);
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let join_kind = expect_hash_join(&join);
+        assert_eq!(join_kind.build_runtime_filters.len(), 1);
+        let rf = &join_kind.build_runtime_filters[0];
+        assert_column_ref(&rf.build_expr, 1);
+        assert_column_ref(&rf.probe_expr, 2);
+        assert!(join.children[0].probe_runtime_filters.is_empty());
+        assert_probe_filter(&join.children[1], 0, 2);
+    }
+
+    #[test]
     fn probe_pushes_through_project_to_scan() {
         let probe_scan = leaf(vec![out_col(1, "probe_key")]);
         let probe_project = project_node(
@@ -1239,6 +1277,47 @@ mod tests {
         let lower_join = &join.children[0];
         assert_probe_filter(&lower_join.children[0], 0, 1);
         assert!(lower_join.children[1].probe_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn right_semi_join_interior_survival_gate_blocks_existence_only_side() {
+        let left = leaf(vec![out_col(1, "existence_key")]);
+        let right = leaf(vec![out_col(2, "surviving_key")]);
+        let mut lower = hash_join_node(
+            JoinKind::RightSemi,
+            JoinDistribution::Unknown,
+            None,
+            vec![eq_cond(
+                col_ref(1, "existence_key"),
+                col_ref(2, "surviving_key"),
+                false,
+            )],
+            vec![left, right],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+        );
+        set_hash_join_output(&mut lower, vec![out_col(2, "surviving_key")]);
+        let build = leaf(vec![out_col(3, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(2, "surviving_key"),
+                col_ref(3, "build_key"),
+                false,
+            )],
+            vec![lower, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (3, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let lower_join = &join.children[0];
+        assert!(lower_join.probe_runtime_filters.is_empty());
+        assert!(lower_join.children[0].probe_runtime_filters.is_empty());
+        assert_probe_filter(&lower_join.children[1], 0, 2);
     }
 
     #[test]

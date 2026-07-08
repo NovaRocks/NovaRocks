@@ -20,7 +20,7 @@
 -- Test Objective:
 -- 1. M2: partitioned (Shuffle) hash-join probe runtime filters now cross a
 --    key-aligned HASH_PARTITIONED exchange into the producing fragment
---    (`hash_partition_carries_probe_key` in runtime_filter_pass.rs). Under a
+--    (`hash_partition_carries_probe_key` in planner/runtime_filter_placement.rs). Under a
 --    real 1FE+3BE cross-process cluster this places the probe RF on the BE
 --    fragment that scans the probe table, upstream of its own shuffle send.
 -- 2. Force a PARTITIONED join (not BROADCAST) via

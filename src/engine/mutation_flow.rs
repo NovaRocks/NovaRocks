@@ -434,8 +434,6 @@ fn build_update_mor_change_event_expand_plan(
         explain_stats: OptimizerExplainStats::default(),
         output_columns: child_outputs.clone(),
         execution_props: PlanExecutionProps::default(),
-        build_runtime_filters: Vec::new(),
-        probe_runtime_filters: Vec::new(),
     };
 
     let mut next_column_id = max_physical_column_id(&distributed) + 1;
@@ -614,8 +612,6 @@ fn build_update_mor_change_event_expand_plan(
         explain_stats: OptimizerExplainStats::default(),
         output_columns,
         execution_props: PlanExecutionProps::default(),
-        build_runtime_filters: Vec::new(),
-        probe_runtime_filters: Vec::new(),
     };
     crate::sql::optimizer::physical_tree::attach_scalar_arena(&mut root, Arc::new(scalar_arena));
     Ok(root)
@@ -661,8 +657,6 @@ fn build_merge_mor_change_event_expand_plan(
         explain_stats: OptimizerExplainStats::default(),
         output_columns: child_outputs.clone(),
         execution_props: PlanExecutionProps::default(),
-        build_runtime_filters: Vec::new(),
-        probe_runtime_filters: Vec::new(),
     };
 
     let mut next_column_id = max_physical_column_id(&distributed) + 1;
@@ -905,8 +899,6 @@ fn build_merge_mor_change_event_expand_plan(
         explain_stats: OptimizerExplainStats::default(),
         output_columns,
         execution_props: PlanExecutionProps::default(),
-        build_runtime_filters: Vec::new(),
-        probe_runtime_filters: Vec::new(),
     };
     crate::sql::optimizer::physical_tree::attach_scalar_arena(&mut root, Arc::new(scalar_arena));
     Ok(root)
@@ -3682,8 +3674,6 @@ mod tests {
             explain_stats: OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         crate::sql::optimizer::physical_tree::attach_scalar_arena(
             &mut node,
@@ -3736,8 +3726,6 @@ mod tests {
             explain_stats: OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         crate::sql::optimizer::physical_tree::attach_scalar_arena(
             &mut node,

@@ -32,7 +32,7 @@ mod ordering;
 mod physical_vocab;
 pub(crate) mod plan;
 pub(crate) mod runtime_filter;
-mod runtime_filter_placement;
+pub(crate) mod runtime_filter_placement;
 pub(crate) mod stats;
 pub(crate) mod write_plan;
 pub(crate) mod write_sink;

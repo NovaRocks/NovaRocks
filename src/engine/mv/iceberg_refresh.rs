@@ -14895,8 +14895,6 @@ fn add_imv_data_route_project(
             join_distribution: None,
             scalar_arena: Some(Arc::clone(&arena)),
         },
-        build_runtime_filters: Vec::new(),
-        probe_runtime_filters: Vec::new(),
     };
     attach_scalar_arena(&mut plan, arena);
     Ok(plan)

@@ -148,7 +148,7 @@ pub(crate) struct OptimizerOptions {
     pub rf_max_count: usize,
     /// Whether probe runtime filters may be placed across shuffle exchanges at
     /// all. When true, crossing is further gated per-join-distribution by
-    /// `CrossExchangeMode` (see `runtime_filter_pass.rs`): Broadcast RFs cross
+    /// `CrossExchangeMode` (see planner `runtime_filter_placement.rs`): Broadcast RFs cross
     /// unconditionally; Shuffle/Colocate RFs cross only exchanges that
     /// re-partition on the probe key (shuffle-key alignment). Probe pushdown
     /// always stops at outer/anti/null-preserving semantic boundaries

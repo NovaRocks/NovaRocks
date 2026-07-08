@@ -25,7 +25,8 @@ pub(crate) fn optimizer_physical_to_distributed_plan(
     plan: &OptimizerPhysicalNode,
 ) -> Result<DistributedPlan, String> {
     verify_optimizer_id_binding(plan)?;
-    let physical = optimizer_physical_to_plan(plan)?;
+    let mut physical = optimizer_physical_to_plan(plan)?;
+    crate::sql::planner::runtime_filter_placement::place_runtime_filters(&mut physical);
     crate::sql::planner::build_distributed_plan(&physical)
 }
 
@@ -34,14 +35,18 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::OutputColumn;
-    use crate::sql::optimizer::operator::{Operator, ProjectOp, ValuesOp};
+    use crate::sql::common::{JoinKind, OutputColumn};
+    use crate::sql::optimizer::operator::{
+        JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ProjectOp,
+        ValuesOp,
+    };
     use crate::sql::optimizer::physical_tree::{
-        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+        JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
-    use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
+    use crate::sql::planner::DistributedNode;
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_project_items, intern_typed};
     use arrow::datatypes::DataType;
     use std::sync::Arc;
 
@@ -78,9 +83,50 @@ mod tests {
             stats: Statistics::default(),
             explain_stats: Default::default(),
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         }
+    }
+
+    fn has_build_rf(node: &DistributedNode) -> bool {
+        !node.build_runtime_filters.is_empty() || node.children.iter().any(has_build_rf)
+    }
+
+    fn has_probe_rf(node: &DistributedNode) -> bool {
+        !node.probe_runtime_filters.is_empty() || node.children.iter().any(has_probe_rf)
+    }
+
+    fn broadcast_hash_join_without_optimizer_rf_annotations() -> OptimizerPhysicalNode {
+        let probe_id = ColumnId::new_for_test(1);
+        let build_id = ColumnId::new_for_test(2);
+        let probe_col = int_col(probe_id, "probe_key");
+        let build_col = int_col(build_id, "build_key");
+        let mut scalars = ScalarArena::new();
+        let left = intern_typed(&mut scalars, &column_ref(probe_id, "probe_key"));
+        let right = intern_typed(&mut scalars, &column_ref(build_id, "build_key"));
+        let mut plan = OptimizerPhysicalNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left,
+                    right,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![
+                values_node(vec![probe_col.clone()]),
+                values_node(vec![build_col.clone()]),
+            ],
+            output_columns: vec![probe_col, build_col],
+            stats: Statistics::default(),
+            explain_stats: Default::default(),
+            execution_props: PlanExecutionProps {
+                join_distribution: Some(JoinExecutionDistribution::Broadcast),
+                ..PlanExecutionProps::default()
+            },
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     #[test]
@@ -117,8 +163,6 @@ mod tests {
             stats: Statistics::default(),
             explain_stats: Default::default(),
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
@@ -127,6 +171,23 @@ mod tests {
         assert!(
             err.contains("not produced by child scope"),
             "unexpected err={err}"
+        );
+    }
+
+    #[test]
+    fn bridge_runs_planner_runtime_filter_placement_before_distributed_build() {
+        let plan = broadcast_hash_join_without_optimizer_rf_annotations();
+
+        let dp = optimizer_physical_to_distributed_plan(&plan).expect("build DistributedPlan");
+        let root = &dp.fragments[dp.root_fragment_id as usize].root;
+
+        assert!(
+            has_build_rf(root),
+            "distributed plan should contain build RF"
+        );
+        assert!(
+            has_probe_rf(root),
+            "distributed plan should contain probe RF"
         );
     }
 }

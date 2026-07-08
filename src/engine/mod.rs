@@ -6343,10 +6343,10 @@ mysql_port = 47892
     }
 
     /// OQ-5 Task 6: codegen must lower the runtime-filter annotations the
-    /// physical-tree pass attaches to a hash join into thrift
+    /// planner-side placement pass attaches to a hash join into thrift
     /// `TRuntimeFilterDescription`s on the join node, AND assemble a
     /// `RuntimeFilterPlanResult`. Exercises the full standalone pipeline
-    /// (analyze -> plan -> optimize[annotate] -> codegen) over the test
+    /// (analyze -> plan -> optimize -> planner RF placement -> codegen) over the test
     /// catalog's fact-like `tbl(id int, name varchar)` joined to the small
     /// `date_dim` fixture on `id`.
     #[test]
@@ -9105,8 +9105,6 @@ path = "meta/operations.sqlite"
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut physical_plan, Arc::new(ScalarArena::new()));
         let state = Arc::new(StandaloneState::default());

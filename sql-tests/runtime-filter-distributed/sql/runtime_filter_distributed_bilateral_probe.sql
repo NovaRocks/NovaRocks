@@ -22,7 +22,7 @@
 --    MULTIPLE equivalent-column scans in the probe subtree, discovered via
 --    transitive equivalence across an INNER join's eq-conditions
 --    (`expand_probe_set_across_join` / `push_probe_down` in
---    runtime_filter_pass.rs). Shape: TopJoin(J_ab, build) where
+--    planner/runtime_filter_placement.rs). Shape: TopJoin(J_ab, build) where
 --    J_ab = t1 JOIN t2 ON t1.k = t2.k, and TopJoin joins J_ab with the build
 --    side on t2.k = t3.k. The build key t3.k is transitively equal to both
 --    the direct probe key t2.k and, via J_ab's own eq-condition, t1.k. An M3

@@ -24,9 +24,9 @@ use crate::thrift::exprs;
 // Scan/join ownership metadata (used by RF planning)
 // ---------------------------------------------------------------------------
 
-/// Probe-side target recorded while visiting a node that carries a
-/// `RuntimeFilterProbe` annotation. The build-side hash join (visited AFTER
-/// its probe descendants) looks this up by `filter_id` to wire the RF's
+/// Probe-side target recorded while visiting a node that carries a planner-side
+/// runtime-filter probe annotation. The build-side hash join (visited AFTER its
+/// probe descendants) looks this up by `filter_id` to wire the RF's
 /// `plan_node_id_to_target_expr` and the probe-side prober params.
 #[derive(Clone, Debug)]
 pub(in crate::sql::codegen) struct RfProbeTarget {

@@ -1550,21 +1550,22 @@ mod tests {
     };
     use crate::exec::node::sort::SortTopNType;
     use crate::runtime::profile_correlate::{ActualMetrics, DistributedProfileSummary};
-    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
+    use crate::sql::analysis::{
+        ExprKind, JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr,
+    };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::codegen::ir::explain_distributed_plan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage};
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalHashAggregateOp, ProjectOp, ScanOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ProjectOp,
+        ScanOp, ValuesOp,
     };
-    use crate::sql::optimizer::options::OptimizerOptions;
     use crate::sql::optimizer::physical_tree::{
         JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::runtime_filter_pass::{self, test_support};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{
         ColumnStatistic, Confidence, CostEstimate, Statistics,
@@ -1581,8 +1582,9 @@ mod tests {
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
         let mut plan = plan.clone();
         prepare_bridge2_test_props(&mut plan);
-        let physical =
+        let mut physical =
             crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(&plan)?;
+        crate::sql::planner::runtime_filter_placement::place_runtime_filters(&mut physical);
         crate::sql::planner::build_distributed_plan(&physical)
     }
 
@@ -1947,8 +1949,7 @@ mod tests {
 
     #[test]
     fn hash_join_line_places_broadcast_tokens_at_the_expected_levels() {
-        let dp = build_distributed_plan(&test_support::inner_join_two_scans())
-            .expect("build DistributedPlan");
+        let dp = build_distributed_plan(&inner_join_two_values()).expect("build DistributedPlan");
 
         let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
         assert!(!normal.contains("bcast_"));
@@ -1985,18 +1986,7 @@ mod tests {
 
     #[test]
     fn detailed_ir_explain_shows_build_and_probe_rf_but_normal_hides_them() {
-        let mut join = test_support::inner_join_two_scans();
-        let scalars = join
-            .execution_props
-            .scalar_arena
-            .as_ref()
-            .expect("runtime-filter test plan must carry scalar arena")
-            .clone();
-        runtime_filter_pass::annotate(
-            &mut join,
-            scalars.as_ref(),
-            &OptimizerOptions::default_settings(),
-        );
+        let join = inner_join_two_values();
         let dp = build_distributed_plan(&join).expect("build DistributedPlan");
 
         for level in [
@@ -2435,6 +2425,51 @@ mod tests {
         )
     }
 
+    fn inner_join_two_values() -> OptimizerPhysicalNode {
+        let left_col = output_col(1, "left_key", DataType::Int64, false);
+        let right_col = output_col(2, "right_key", DataType::Int64, false);
+        let left = physical_node(
+            Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![left_col.clone()],
+            }),
+            vec![],
+            vec![left_col.clone()],
+        );
+        let right = physical_node(
+            Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![right_col.clone()],
+            }),
+            vec![],
+            vec![right_col.clone()],
+        );
+        let mut scalars = scalars_from_children(&[left.clone(), right.clone()]);
+        let left_key = intern_exprs(
+            &mut scalars,
+            &[column_ref_expr(1, "left_key", DataType::Int64, false)],
+        )[0];
+        let right_key = intern_exprs(
+            &mut scalars,
+            &[column_ref_expr(2, "right_key", DataType::Int64, false)],
+        )[0];
+        physical_node_with_scalars(
+            Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key,
+                    right: right_key,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            vec![left, right],
+            vec![left_col, right_col],
+            scalars,
+        )
+    }
+
     fn physical_node(
         op: Operator,
         children: Vec<OptimizerPhysicalNode>,
@@ -2460,8 +2495,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan

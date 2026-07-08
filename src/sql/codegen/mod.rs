@@ -164,9 +164,8 @@ impl MultiFragmentBuildResult {
 /// Result of lowering runtime-filter annotations to execution wiring.
 ///
 /// Assembled by [`fragment_builder::PlanFragmentBuilder`] directly from the
-/// `RuntimeFilterDesc` / `RuntimeFilterProbe` annotations attached to the
-/// physical plan by `runtime_filter_pass`. Consumed by the execution
-/// coordinator (`setup_runtime_filter_params`).
+/// planner-side runtime-filter annotations on the distributed plan. Consumed by
+/// the execution coordinator (`setup_runtime_filter_params`).
 pub(crate) struct RuntimeFilterPlanResult {
     /// filter_id -> native RF descriptor for coordinator-side wiring.
     pub all_filters: std::collections::HashMap<i32, crate::sql::planner::PlannedRuntimeFilter>,

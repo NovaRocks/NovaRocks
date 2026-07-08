@@ -279,7 +279,6 @@ mod tests {
         JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
@@ -615,8 +614,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         })
     }
 
@@ -725,8 +722,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_column],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan
@@ -749,8 +744,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![source.clone()],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         let child_item = ProjectItem {
             expr: column_ref_expr_for_test(source.column_id, &source.name, DataType::Int8, false),
@@ -774,8 +767,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![stale_child_output],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         let parent_item = ProjectItem {
             expr: column_ref_expr_for_test(action_id, "__change_op", DataType::Int8, false),
@@ -799,8 +790,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![parent_output],
             execution_props: PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
@@ -1504,8 +1493,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         });
 
         let build = build_fragments_from_optimizer_for_database_for_test(
@@ -1641,8 +1628,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         })
     }
 
@@ -1679,8 +1664,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         })
     }
 
@@ -1718,8 +1701,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         })
     }
 
@@ -1761,8 +1742,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan
@@ -1806,8 +1785,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan
@@ -1849,8 +1826,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         })
     }
 
@@ -1892,8 +1867,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         })
     }
 
@@ -2050,11 +2023,12 @@ mod tests {
 
     #[cfg(feature = "compat")]
     fn mixed_starrocks_iceberg_join_plan() -> OptimizerPhysicalNode {
-        let id_col = crate::sql::column_id::ColumnId::new_for_test(1);
+        let left_id_col = crate::sql::column_id::ColumnId::new_for_test(1);
+        let right_id_col = crate::sql::column_id::ColumnId::new_for_test(2);
         let mut scalars = ScalarArena::new();
         let left_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: id_col,
+                column_id: left_id_col,
                 qualifier: Some("ice_t".to_string()),
                 column: "id".to_string(),
             },
@@ -2063,13 +2037,20 @@ mod tests {
         };
         let right_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: id_col,
+                column_id: right_id_col,
                 qualifier: Some("starrocks_t".to_string()),
                 column: "id".to_string(),
             },
             data_type: DataType::Int32,
             nullable: false,
         };
+        let iceberg = iceberg_scan_plan();
+        let mut starrocks = starrocks_scan_plan();
+        let right_output = output_col_for_test(2, "id", DataType::Int32, false);
+        if let Operator::PhysicalScan(scan) = &mut starrocks.op {
+            scan.columns = vec![right_output.clone()];
+        }
+        starrocks.output_columns = vec![right_output.clone()];
         let mut plan = OptimizerPhysicalNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
@@ -2081,13 +2062,14 @@ mod tests {
                 other_condition: None,
                 distribution: JoinDistribution::Colocate,
             }),
-            children: vec![iceberg_scan_plan(), starrocks_scan_plan()],
+            children: vec![iceberg, starrocks],
             stats: stats(),
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
-            output_columns: output_columns(),
+            output_columns: vec![
+                output_col_for_test(1, "id", DataType::Int32, false),
+                right_output,
+            ],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan
@@ -2122,15 +2104,11 @@ mod tests {
                 output_columns: output_columns(),
                 execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
@@ -2420,18 +2398,7 @@ mod tests {
     #[cfg(feature = "compat")]
     fn runtime_filter_uses_execution_distribution_metadata() {
         let mut plan = mixed_starrocks_iceberg_join_plan();
-        let Operator::PhysicalHashJoin(op) = &plan.op else {
-            panic!("expected hash join");
-        };
-        let eq = op.eq_conditions[0].clone();
         plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Partitioned);
-        plan.build_runtime_filters = vec![RuntimeFilterDesc {
-            filter_id: 7,
-            build_expr: eq.right,
-            probe_expr: eq.left,
-            expr_order: 0,
-            distribution: JoinDistribution::Broadcast,
-        }];
 
         let starrocks_layout = PhysicalTableLayout {
             db_id: 11,
@@ -2480,90 +2447,9 @@ mod tests {
 
     #[test]
     #[cfg(feature = "compat")]
-    fn runtime_filter_invalid_build_binding_is_skipped() {
-        let mut plan = mixed_starrocks_iceberg_join_plan();
-        let Operator::PhysicalHashJoin(op) = &plan.op else {
-            panic!("expected hash join");
-        };
-        let eq = op.eq_conditions[0].clone();
-        let mut scalars = plan
-            .execution_props
-            .scalar_arena
-            .as_deref()
-            .unwrap()
-            .clone();
-        let build_expr = column_ref_expr_for_test(
-            ColumnId::new_for_test(9999),
-            "wrong_build_id",
-            DataType::Int32,
-            false,
-        );
-        let build_expr = intern_exprs(&mut scalars, &[build_expr])[0];
-        attach_scalar_arena(&mut plan, Arc::new(scalars));
-        plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
-        plan.build_runtime_filters = vec![RuntimeFilterDesc {
-            filter_id: 99,
-            build_expr,
-            probe_expr: eq.left,
-            expr_order: 0,
-            distribution: JoinDistribution::Broadcast,
-        }];
-
-        let starrocks_layout = PhysicalTableLayout {
-            db_id: 11,
-            table_id: 22,
-            schema_id: 33,
-            tablets: vec![StarRocksTabletRef {
-                tablet_id: 101,
-                partition_id: 201,
-                version: 7,
-            }],
-        };
-        let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
-        let catalog = MixedCatalog { starrocks_layout };
-
-        let build = build_fragments_from_optimizer_for_database_for_test(
-            &plan, &catalog, &registry, "default",
-        )
-        .expect("build");
-        let root = build
-            .fragment_results
-            .iter()
-            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
-            .expect("root fragment");
-        let hash_join_node = root
-            .plan
-            .nodes
-            .iter()
-            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HASH_JOIN_NODE)
-            .expect("hash join node");
-        let build_filters = hash_join_node
-            .hash_join_node
-            .as_ref()
-            .and_then(|join| join.build_runtime_filters.as_ref());
-
-        assert!(
-            build_filters.is_none_or(Vec::is_empty),
-            "invalid runtime filter descriptor should be skipped"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "compat")]
     fn runtime_filter_unknown_uses_execution_metadata_broadcast() {
         let mut plan = mixed_starrocks_iceberg_join_plan();
-        let Operator::PhysicalHashJoin(op) = &plan.op else {
-            panic!("expected hash join");
-        };
-        let eq = op.eq_conditions[0].clone();
         plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
-        plan.build_runtime_filters = vec![RuntimeFilterDesc {
-            filter_id: 7,
-            build_expr: eq.right,
-            probe_expr: eq.left,
-            expr_order: 0,
-            distribution: JoinDistribution::Unknown,
-        }];
 
         let starrocks_layout = PhysicalTableLayout {
             db_id: 11,
@@ -2671,15 +2557,11 @@ mod tests {
                 output_columns: output_columns(),
                 execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
@@ -2795,8 +2677,6 @@ mod tests {
                     output_columns: output_columns(),
                     execution_props:
                         crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-                    build_runtime_filters: Vec::new(),
-                    probe_runtime_filters: Vec::new(),
                 }],
                 stats: stats(),
                 explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(
@@ -2804,15 +2684,11 @@ mod tests {
                 output_columns: output_columns(),
                 execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(
                 ),
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: output_columns(),
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         attach_scalar_arena(&mut plan, Arc::new(scalars));
 
@@ -2964,8 +2840,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![source_column.clone()],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         };
         let plan = project_passthrough_plan_for_test(
             generate_series,
@@ -3048,8 +2922,6 @@ mod tests {
                 is_internal: false,
             }],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         });
 
         let build = build_fragments_from_optimizer_for_database_for_test(
@@ -3922,8 +3794,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![output_col_for_test(8402, "id", DataType::Int32, false)],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         });
 
         let build = build_fragments_from_optimizer_for_database_for_test(
@@ -4209,8 +4079,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns: vec![synthetic_column.clone()],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         });
         let registry = mock_iceberg_registry();
 
@@ -4428,8 +4296,6 @@ mod tests {
                 is_internal: false,
             }],
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         });
         let output_columns = child.output_columns.clone();
         let plan = attach_test_scalar_arena(OptimizerPhysicalNode {
@@ -4441,8 +4307,6 @@ mod tests {
             explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: crate::sql::optimizer::physical_tree::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
         });
 
         let build = build_fragments_from_optimizer_for_database_for_test(
