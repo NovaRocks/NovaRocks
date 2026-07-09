@@ -33,8 +33,8 @@ use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::plan::{
-    ExchangeFlavor, PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanScanNode,
-    PlanSetOpKind, RedistributeMode, RedistributeNode,
+    ExchangeFlavor, PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanProjectNode,
+    PlanScanNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
 use crate::sql::planner::{
     OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
@@ -696,12 +696,19 @@ impl DistributedPlanBuilder {
             .get(&consume.cte_id)
             .copied()
             .ok_or_else(|| format!("CTE consume references unknown cte_id={}", consume.cte_id))?;
-        let cte_fragment_id = self.completed_fragments[cte_frag_idx].fragment_id;
+        let cte_fragment = &self.completed_fragments[cte_frag_idx];
+        let cte_fragment_id = cte_fragment.fragment_id;
+        let producer_output_columns = cte_fragment.output_columns.clone();
         validate_cte_consume_mapping(consume)?;
         let receive_producer_column_ids = consume.producer_column_ids.clone();
+        let exchange_output_columns =
+            cte_consume_exchange_output_columns(consume, &producer_output_columns)?;
+        let project_items = cte_consume_remap_project_items(consume, &exchange_output_columns)?;
 
         let exchange_node_id = self.alloc_node();
         let exchange_tuple_id = self.alloc_tuple();
+        let project_node_id = self.alloc_node();
+        let project_tuple_id = self.alloc_tuple();
         let target_fragment_id = self.current_fragment_id()?;
 
         self.edges.push(FragmentEdge {
@@ -717,7 +724,7 @@ impl DistributedPlanBuilder {
             output_slot_ids: Vec::new(),
         });
 
-        Ok(DistributedNode {
+        let exchange = DistributedNode {
             node_id: exchange_node_id,
             fragment_id: target_fragment_id,
             tuple_ids: vec![exchange_tuple_id],
@@ -730,15 +737,85 @@ impl DistributedPlanBuilder {
             payload: DistributedPayload::Exchange(ExchangeReceiver {
                 partition: DataPartition::unpartitioned(),
                 source_fragment_id: cte_fragment_id,
-                output_columns: consume.output_columns.clone(),
+                output_columns: exchange_output_columns,
                 output_qualifier: Some(consume.alias.clone()),
                 flavor: ExchangeFlavor::CteMulticast {
                     cte_id: consume.cte_id,
                     receive_producer_column_ids,
                 },
             }),
+        };
+
+        Ok(DistributedNode {
+            node_id: project_node_id,
+            fragment_id: target_fragment_id,
+            tuple_ids: vec![project_tuple_id],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![exchange],
+            stats: node.stats.clone(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Project(PlanProjectNode {
+                items: project_items,
+                output_qualifier: Some(consume.alias.clone()),
+            })),
         })
     }
+}
+
+fn cte_consume_exchange_output_columns(
+    consume: &crate::sql::planner::plan::LogicalCTEConsumeNode,
+    producer_output_columns: &[OutputColumn],
+) -> Result<Vec<OutputColumn>, String> {
+    let columns_by_id = producer_output_columns
+        .iter()
+        .cloned()
+        .map(|column| (column.column_id, column))
+        .collect::<HashMap<_, _>>();
+    consume
+        .producer_column_ids
+        .iter()
+        .map(|producer_id| {
+            columns_by_id.get(producer_id).cloned().ok_or_else(|| {
+                format!(
+                    "CTEConsume producer column {} not found in CTE fragment output for cte_id={}",
+                    producer_id.0, consume.cte_id
+                )
+            })
+        })
+        .collect()
+}
+
+fn cte_consume_remap_project_items(
+    consume: &crate::sql::planner::plan::LogicalCTEConsumeNode,
+    exchange_output_columns: &[OutputColumn],
+) -> Result<Vec<ProjectItem>, String> {
+    if consume.output_columns.len() != exchange_output_columns.len() {
+        return Err(format!(
+            "CTEConsume output/exchange arity mismatch for cte_id={}",
+            consume.cte_id
+        ));
+    }
+
+    Ok(consume
+        .output_columns
+        .iter()
+        .zip(exchange_output_columns.iter())
+        .map(|(consumer, producer)| ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: producer.column_id,
+                    qualifier: Some(consume.alias.clone()),
+                    column: producer.name.clone(),
+                },
+                data_type: producer.data_type.clone(),
+                nullable: producer.nullable,
+            },
+            output_name: consumer.name.clone(),
+            output_column_id: consumer.column_id,
+        })
+        .collect())
 }
 
 fn distributed_node_ordering(node: &DistributedNode) -> OrderingSpec {
@@ -3261,10 +3338,31 @@ mod tests {
         assert!(matches!(root_fragment.sink, DataSink::Result));
         assert_eq!(root_fragment.cte_id, None);
 
-        let exchange = &root_fragment.root;
+        let project = &root_fragment.root;
+        let project_payload = match &project.payload {
+            DistributedPayload::Physical(PhysicalPlanKind::Project(project)) => project,
+            other => panic!("expected CTE consume remap Project root, got {other:?}"),
+        };
+        assert_eq!(
+            project_payload.output_qualifier.as_deref(),
+            Some("cte_alias")
+        );
+        assert_eq!(project_payload.items.len(), consumer_columns.len());
+        assert_eq!(
+            project_payload.items[0].output_column_id,
+            consumer_columns[0].column_id
+        );
+        match &project_payload.items[0].expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => {
+                assert_eq!(*column_id, producer_columns[0].column_id);
+            }
+            other => panic!("expected producer ColumnRef, got {other:?}"),
+        }
+
+        let exchange = project.children.first().expect("project exchange child");
         let receiver = match &exchange.payload {
             DistributedPayload::Exchange(receiver) => receiver,
-            other => panic!("expected CTE consume Exchange root, got {other:?}"),
+            other => panic!("expected CTE consume Exchange child, got {other:?}"),
         };
         assert_eq!(exchange.fragment_id, dp.root_fragment_id);
         assert_eq!(exchange.tuple_ids.len(), 1);
@@ -3278,10 +3376,10 @@ mod tests {
             PartitionKind::Unpartitioned
         ));
         assert!(receiver.partition.exprs.is_empty());
-        assert_eq!(receiver.output_columns.len(), consumer_columns.len());
+        assert_eq!(receiver.output_columns.len(), producer_columns.len());
         assert_eq!(
             receiver.output_columns[0].column_id,
-            consumer_columns[0].column_id
+            producer_columns[0].column_id
         );
         assert_eq!(receiver.output_qualifier.as_deref(), Some("cte_alias"));
         let receive_producer_column_ids = match &receiver.flavor {
@@ -3328,6 +3426,138 @@ mod tests {
                 cte_id,
                 exchange.node_id,
                 vec![producer_columns[0].column_id]
+            )]
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_cte_consume_remaps_pruned_producer_columns_with_project() {
+        let cte_id: CteId = 8;
+        let producer_columns = vec![
+            output_col(1, "k", DataType::Int64, false),
+            output_col(2, "v", DataType::Int64, false),
+            output_col(3, "payload", DataType::Int64, false),
+        ];
+        let consumer_columns = vec![
+            output_col(11, "k", DataType::Int64, false),
+            output_col(13, "payload", DataType::Int64, false),
+        ];
+        let scan = scan_node_with_columns(producer_columns.clone());
+        let produce = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id,
+                output_columns: producer_columns.clone(),
+            }),
+            children: vec![scan],
+            output_columns: producer_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+        let consume = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id,
+                alias: "cte_alias".to_string(),
+                output_columns: consumer_columns.clone(),
+                producer_column_ids: vec![
+                    producer_columns[0].column_id,
+                    producer_columns[2].column_id,
+                ],
+            }),
+            children: vec![],
+            output_columns: consumer_columns.clone(),
+            stats: stats_with_cost(),
+            probe_runtime_filters: vec![],
+        };
+        let anchor = PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            children: vec![produce, consume],
+            output_columns: consumer_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: vec![],
+        };
+
+        let dp = build_distributed_plan(&anchor).expect("build_distributed_plan");
+        let produce_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.cte_id == Some(cte_id))
+            .expect("produce fragment");
+        let root_fragment = dp
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .expect("root fragment");
+
+        let project = &root_fragment.root;
+        let DistributedPayload::Physical(PhysicalPlanKind::Project(project_payload)) =
+            &project.payload
+        else {
+            panic!("expected CTE consume remap Project root");
+        };
+        assert_eq!(
+            project_payload.output_qualifier.as_deref(),
+            Some("cte_alias")
+        );
+        assert_eq!(
+            project_payload
+                .items
+                .iter()
+                .map(|item| item.output_column_id)
+                .collect::<Vec<_>>(),
+            consumer_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            project_payload
+                .items
+                .iter()
+                .map(|item| match &item.expr.kind {
+                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                    other => panic!("expected producer ColumnRef, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            vec![producer_columns[0].column_id, producer_columns[2].column_id]
+        );
+
+        let exchange = project.children.first().expect("project exchange child");
+        let receiver = match &exchange.payload {
+            DistributedPayload::Exchange(receiver) => receiver,
+            other => panic!("expected CTE consume Exchange child, got {other:?}"),
+        };
+        assert_eq!(receiver.source_fragment_id, produce_fragment.fragment_id);
+        assert_eq!(receiver.output_qualifier.as_deref(), Some("cte_alias"));
+        assert_eq!(
+            receiver
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![producer_columns[0].column_id, producer_columns[2].column_id]
+        );
+
+        let edge = &dp.edges[0];
+        assert_eq!(edge.target_exchange_node_id, exchange.node_id);
+        match &edge.edge_kind {
+            FragmentEdgeKind::CteMulticast {
+                cte_id: edge_cte_id,
+                receive_producer_column_ids,
+            } => {
+                assert_eq!(*edge_cte_id, cte_id);
+                assert_eq!(
+                    receive_producer_column_ids,
+                    &vec![producer_columns[0].column_id, producer_columns[2].column_id]
+                );
+            }
+            other => panic!("expected CteMulticast edge, got {other:?}"),
+        }
+        assert_eq!(
+            root_fragment.cte_exchange_nodes,
+            vec![(
+                cte_id,
+                exchange.node_id,
+                vec![producer_columns[0].column_id, producer_columns[2].column_id]
             )]
         );
     }

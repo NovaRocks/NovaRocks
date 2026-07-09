@@ -23,33 +23,35 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-12:SORT BY [l.k ASC NULLS FIRST] stats={rows=3}
-  11:GATHER stats={rows=3}
+14:SORT BY [l.k ASC NULLS FIRST] stats={rows=3}
+  13:GATHER stats={rows=3}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 11
+    EXCHANGE ID: 13
     PARTITION: UNPARTITIONED
-10:PROJECT [l.k AS k, r.payload AS payload] stats={rows=3}
-  9:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k]) bcast_verdict=feasible stats={rows=3}
+12:PROJECT [l.k AS k, r.payload AS payload] stats={rows=3}
+  11:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k]) bcast_verdict=feasible stats={rows=3}
     build runtime filters:
     - filter_id = 0, build_expr = (l.k)
-    4:FILTER stats={rows=3}
+    5:FILTER stats={rows=3}
       predicate: r.k IS NOT NULL
-      3:EXCHANGE stats={rows=3}
-    8:GATHER stats={rows=1}
+      4:PROJECT [r.k AS k, r.payload AS payload] stats={rows=3}
+        3:EXCHANGE stats={rows=3}
+    10:GATHER stats={rows=1}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 8
+    EXCHANGE ID: 10
     PARTITION: UNPARTITIONED
-7:FILTER stats={rows=1}
+9:FILTER stats={rows=1}
   predicate: l.k IS NOT NULL
-  6:FILTER stats={rows=2}
+  8:FILTER stats={rows=2}
     predicate: CAST(l.v AS Int64) >= 20
-    5:EXCHANGE stats={rows=3}
+    7:PROJECT [l.k AS k, l.v AS v] stats={rows=3}
+      6:EXCHANGE stats={rows=3}
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -57,7 +59,7 @@ PLAN FRAGMENT 3
     EXCHANGE ID: 3
     PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 5
+    EXCHANGE ID: 6
     PARTITION: UNPARTITIONED
 2:PROJECT [k, v, payload] stats={rows=3}
   1:SCAN db_sqlt_c0ebef7038b04fb9.oq1c_cte_src stats={rows=3}

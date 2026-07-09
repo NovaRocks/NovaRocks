@@ -118,7 +118,7 @@ impl OperatorFactory for MultiCastDataStreamSinkFactory {
             name: self.name.clone(),
             init_error: self.init_error.clone(),
             sinks,
-            finished: false,
+            finishing: false,
         })
     }
 
@@ -136,7 +136,7 @@ struct MultiCastDataStreamSinkOperator {
     name: String,
     init_error: Option<String>,
     sinks: Vec<InnerSinkRuntime>,
-    finished: bool,
+    finishing: bool,
 }
 
 impl Operator for MultiCastDataStreamSinkOperator {
@@ -185,13 +185,13 @@ impl Operator for MultiCastDataStreamSinkOperator {
     }
 
     fn is_finished(&self) -> bool {
-        self.finished
+        self.finishing && self.sinks.iter().all(|sink| sink.op.is_finished())
     }
 }
 
 impl ProcessorOperator for MultiCastDataStreamSinkOperator {
     fn need_input(&self) -> bool {
-        if self.finished {
+        if self.is_finished() || self.finishing {
             return false;
         }
         for sink in &self.sinks {
@@ -221,7 +221,7 @@ impl ProcessorOperator for MultiCastDataStreamSinkOperator {
         if let Some(err) = self.init_error.as_ref() {
             return Err(err.clone());
         }
-        if self.finished {
+        if self.is_finished() || self.finishing {
             return Ok(());
         }
         if chunk.is_empty() || self.sinks.is_empty() {
@@ -271,7 +271,7 @@ impl ProcessorOperator for MultiCastDataStreamSinkOperator {
         if let Some(err) = self.init_error.as_ref() {
             return Err(err.clone());
         }
-        if self.finished {
+        if self.finishing {
             return Ok(());
         }
         for sink in &mut self.sinks {
@@ -281,12 +281,12 @@ impl ProcessorOperator for MultiCastDataStreamSinkOperator {
                 .ok_or_else(|| "inner data stream op missing processor operator".to_string())?;
             inner.set_finishing(state)?;
         }
-        self.finished = true;
+        self.finishing = true;
         Ok(())
     }
 
     fn sink_observable(&self) -> Option<Arc<Observable>> {
-        if self.finished {
+        if self.is_finished() {
             return None;
         }
         // Return the first inner sink's observable unconditionally.
@@ -336,5 +336,115 @@ fn apply_limit(chunk: &Chunk, remaining: Option<&Arc<AtomicI64>>) -> Result<Opti
             }
             return Ok(Some(chunk.slice(0, send)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct PendingFinishSink {
+        name: String,
+        finishing: bool,
+        finished: Arc<AtomicBool>,
+        observable: Arc<Observable>,
+    }
+
+    impl PendingFinishSink {
+        fn new(name: &str, finished: Arc<AtomicBool>) -> Self {
+            Self {
+                name: name.to_string(),
+                finishing: false,
+                finished,
+                observable: Arc::new(Observable::new()),
+            }
+        }
+    }
+
+    impl Operator for PendingFinishSink {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished.load(Ordering::SeqCst)
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for PendingFinishSink {
+        fn need_input(&self) -> bool {
+            !self.finishing && !self.is_finished()
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finishing = true;
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            (!self.is_finished()).then(|| Arc::clone(&self.observable))
+        }
+    }
+
+    #[test]
+    fn multi_cast_sink_waits_for_inner_sinks_to_finish() {
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_done = Arc::new(AtomicBool::new(false));
+        let mut op = MultiCastDataStreamSinkOperator {
+            name: "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
+            init_error: None,
+            sinks: vec![
+                InnerSinkRuntime {
+                    limit_remaining: None,
+                    op: Box::new(PendingFinishSink::new("first", Arc::clone(&first_done))),
+                },
+                InnerSinkRuntime {
+                    limit_remaining: None,
+                    op: Box::new(PendingFinishSink::new("second", Arc::clone(&second_done))),
+                },
+            ],
+            finishing: false,
+        };
+
+        let state = RuntimeState::default();
+        assert!(!op.is_finished());
+
+        op.set_finishing(&state).expect("set finishing");
+        assert!(
+            !op.is_finished(),
+            "wrapper must wait for async inner stream sinks"
+        );
+        assert!(
+            op.sink_observable().is_some(),
+            "wrapper must keep an observable while inner sinks drain"
+        );
+
+        first_done.store(true, Ordering::SeqCst);
+        assert!(!op.is_finished(), "wrapper must wait for every inner sink");
+
+        second_done.store(true, Ordering::SeqCst);
+        assert!(op.is_finished());
+        assert!(op.sink_observable().is_none());
     }
 }

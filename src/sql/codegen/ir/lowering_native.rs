@@ -47,7 +47,8 @@ pub(crate) fn lower_distributed_plan(
     let _ = catalog;
     validate_distributed_plan(dp)?;
 
-    let refreshed = refresh_distributed_plan_for_native_sidecar(dp, mv_refresh_ctx)?;
+    let mut refreshed = refresh_distributed_plan_for_native_sidecar(dp, mv_refresh_ctx)?;
+    lower_native_cte_multicast_edge_output_slot_ids(&mut refreshed)?;
     let native_scan_ranges = build_native_scan_ranges(&refreshed, connectors, mv_refresh_ctx)?;
 
     let mut fragment_results = Vec::with_capacity(refreshed.fragments.len());
@@ -118,6 +119,42 @@ pub(crate) fn refresh_distributed_plan_for_native_sidecar(
         refresh_distributed_node_scan_tables_for_native(&mut fragment.root, mv_refresh_ctx)?;
     }
     Ok(out)
+}
+
+fn lower_native_cte_multicast_edge_output_slot_ids(dp: &mut DistributedPlan) -> Result<(), String> {
+    let fragments_by_id: BTreeMap<FragmentId, &PlanFragment> = dp
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.fragment_id, fragment))
+        .collect();
+    for edge in &mut dp.edges {
+        let FragmentEdgeKind::CteMulticast {
+            cte_id,
+            receive_producer_column_ids,
+        } = &edge.edge_kind
+        else {
+            continue;
+        };
+        let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
+        if receive_producer_column_ids.len() != exchange.output_columns.len() {
+            return Err(format!(
+                "lower_distributed_plan CTE multicast receive/output arity mismatch for cte_id={}",
+                cte_id
+            ));
+        }
+        edge.output_slot_ids = receive_producer_column_ids
+            .iter()
+            .map(|column_id| {
+                i32::try_from(column_id.0).map_err(|_| {
+                    format!(
+                        "native CTE multicast producer column {} cannot convert to output slot id",
+                        column_id.0
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    Ok(())
 }
 
 fn refresh_distributed_node_scan_tables_for_native(
@@ -1055,5 +1092,158 @@ fn fragment_stream_kind(partition: &DataPartition) -> FragmentStreamKind {
         PartitionKind::Unpartitioned => FragmentStreamKind::Gather,
         PartitionKind::Random => FragmentStreamKind::Broadcast,
         PartitionKind::Hash => FragmentStreamKind::Partitioned,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::connector::ConnectorRegistry;
+    use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
+    use crate::sql::analysis::cte::CteId;
+    use crate::sql::catalog::{CatalogProvider, TableDef};
+    use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::ExchangeReceiver;
+    use crate::sql::planner::plan::{ExchangeFlavor, PhysicalPlanKind, PlanValuesNode};
+    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+
+    struct EmptyCatalog;
+
+    impl CatalogProvider for EmptyCatalog {
+        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
+            Err(format!("unexpected table lookup {database}.{table}"))
+        }
+    }
+
+    fn stats() -> PhysicalPlanStats {
+        PhysicalPlanStats {
+            output_row_count: 0.0,
+            row_count_confidence: PlannerConfidence::Fallback,
+            column_statistics: HashMap::new(),
+            cost_estimate: None,
+            broadcast_decision: None,
+        }
+    }
+
+    fn output_col(id: u32, name: &str) -> AnalysisOutputColumn {
+        AnalysisOutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn physical_values_node(
+        fragment_id: FragmentId,
+        node_id: i32,
+        columns: Vec<AnalysisOutputColumn>,
+    ) -> DistributedNode {
+        DistributedNode {
+            node_id,
+            fragment_id,
+            tuple_ids: vec![node_id],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(PlanValuesNode {
+                rows: Vec::new(),
+                columns,
+            })),
+        }
+    }
+
+    #[test]
+    fn lower_distributed_plan_lowers_cte_multicast_edge_output_slots_to_requested_producer_columns()
+    {
+        let cte_id: CteId = 7;
+        let producer_columns = vec![
+            output_col(1, "k"),
+            output_col(2, "v"),
+            output_col(3, "payload"),
+        ];
+        let receive_columns = vec![producer_columns[0].clone(), producer_columns[2].clone()];
+        let receive_producer_column_ids =
+            vec![producer_columns[0].column_id, producer_columns[2].column_id];
+
+        let producer_fragment_id = 1;
+        let consumer_fragment_id = 0;
+        let exchange_node_id = 20;
+        let producer_fragment = PlanFragment {
+            fragment_id: producer_fragment_id,
+            root: physical_values_node(producer_fragment_id, 10, producer_columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::Noop,
+            output_exprs: None,
+            output_columns: producer_columns,
+            cte_id: Some(cte_id),
+            cte_exchange_nodes: Vec::new(),
+        };
+        let consumer_fragment = PlanFragment {
+            fragment_id: consumer_fragment_id,
+            root: DistributedNode {
+                node_id: exchange_node_id,
+                fragment_id: consumer_fragment_id,
+                tuple_ids: vec![exchange_node_id],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: stats(),
+                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                    partition: DataPartition::unpartitioned(),
+                    source_fragment_id: producer_fragment_id,
+                    output_columns: receive_columns.clone(),
+                    output_qualifier: Some("c".to_string()),
+                    flavor: ExchangeFlavor::CteMulticast {
+                        cte_id,
+                        receive_producer_column_ids: receive_producer_column_ids.clone(),
+                    },
+                }),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::Result,
+            output_exprs: None,
+            output_columns: receive_columns,
+            cte_id: None,
+            cte_exchange_nodes: vec![(
+                cte_id,
+                exchange_node_id,
+                receive_producer_column_ids.clone(),
+            )],
+        };
+        let dp = DistributedPlan {
+            fragments: vec![producer_fragment, consumer_fragment],
+            root_fragment_id: consumer_fragment_id,
+            edges: vec![FragmentEdge {
+                source_fragment_id: producer_fragment_id,
+                target_fragment_id: consumer_fragment_id,
+                target_exchange_node_id: exchange_node_id,
+                output_partition: DataPartition::unpartitioned(),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids,
+                },
+                output_slot_ids: Vec::new(),
+            }],
+        };
+
+        let result = lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            .expect("native lower plan");
+
+        assert_eq!(result.edges[0].output_slot_ids, vec![1, 3]);
     }
 }
