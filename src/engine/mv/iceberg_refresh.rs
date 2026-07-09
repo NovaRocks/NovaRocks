@@ -387,6 +387,26 @@ pub(crate) fn create_iceberg_mv(
         ));
     }
     target_properties.extend(descriptor.to_storage_properties()?);
+    // Query-side MV-rewrite staleness tolerance (E2): forward the user PROPERTIES
+    // key onto the target table so the rewrite candidate gate can read it. Validate
+    // it parses as a non-negative integer (seconds); reject a malformed value rather
+    // than silently ignoring it.
+    if let Some((_, raw)) = stmt.properties.iter().find(|(k, _)| {
+        k.eq_ignore_ascii_case(
+            crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP,
+        )
+    }) {
+        let secs: u64 = raw.trim().parse().map_err(|_| {
+            format!(
+                "invalid {} property value `{raw}`: expected a non-negative integer (seconds)",
+                crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP
+            )
+        })?;
+        target_properties.push((
+            crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP.to_string(),
+            secs.to_string(),
+        ));
+    }
     crate::connector::iceberg::catalog::registry::create_table(
         &entry,
         &target.namespace,
@@ -19556,6 +19576,301 @@ mod tests {
         assert!(
             missing_direct_target_err.contains(&legacy_alias_name),
             "{missing_direct_target_err}"
+        );
+    }
+
+    /// RAII guard restoring the previous thread-local session optimizer
+    /// settings on drop (including on panic during unwinding), for tests that
+    /// install a temporary override (e.g. `mv_rewrite_max_staleness_sec`).
+    struct StalenessSessionGuard(crate::sql::optimizer::options::SessionOptimizerSettings);
+
+    impl StalenessSessionGuard {
+        fn install(settings: crate::sql::optimizer::options::SessionOptimizerSettings) -> Self {
+            let previous = crate::sql::optimizer::options::current_session_optimizer_settings();
+            crate::sql::optimizer::options::install_session_optimizer_settings(settings);
+            StalenessSessionGuard(previous)
+        }
+    }
+
+    impl Drop for StalenessSessionGuard {
+        fn drop(&mut self) {
+            crate::sql::optimizer::options::install_session_optimizer_settings(self.0.clone());
+        }
+    }
+
+    /// Run the MV-rewrite candidate-preparation step for a plain SELECT, using
+    /// the same analyze -> plan -> opt_expr -> query_stats recipe production
+    /// query execution uses (see `explain_query` / `execute_query_with_options`
+    /// in `engine/mod.rs`). Lets tests exercise `prepare_mv_rewrite_candidates`
+    /// directly (candidate-set outcome), decoupled from whether the CBO would
+    /// go on to choose the rewrite plan.
+    fn mv_rewrite_candidates_for_select(
+        state: &Arc<StandaloneState>,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        sql: &str,
+    ) -> Vec<crate::sql::optimizer::cascades_rules::mv_rewrite::MvRewriteCandidate> {
+        use crate::sql::parser::dialect::StarRocksDialect;
+
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&StarRocksDialect, sql).expect("parse select");
+        let sqlparser::ast::Statement::Query(query) = &statements[0] else {
+            panic!("expected a SELECT query, got: {sql}");
+        };
+
+        let catalog_snapshot = state
+            .catalog
+            .read()
+            .expect("standalone catalog read lock")
+            .clone();
+        let connectors_snapshot = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock")
+            .clone();
+        let catalog_mgr_snap = crate::engine::catalog_mgr_snapshot(state);
+        let analyzer_catalog = crate::engine::build_analyzer_provider(
+            current_catalog,
+            &catalog_snapshot,
+            &catalog_mgr_snap,
+            &connectors_snapshot,
+            crate::sql::catalog::TableLookupMode::SchemaOnly,
+        );
+
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(query, &analyzer_catalog, current_database)
+                .expect("analyze select");
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+            .expect("plan select");
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let mut opt_expr =
+            crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+                &logical,
+                &mut scalar_arena,
+            )
+            .expect("build opt expr");
+        let providers =
+            crate::engine::query_stats::QueryStatsProviders::from_standalone_state(state);
+        let mut query_stats =
+            crate::engine::query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+
+        crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            state,
+            &analyzer_catalog,
+            current_database,
+            &logical,
+            &mut factory,
+            &mut query_stats,
+        )
+    }
+
+    #[test]
+    fn mv_rewrite_candidate_bounded_staleness_gate_wiring() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "INSERT INTO ice.sales.orders VALUES (1, 'a')",
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh");
+
+        // Advance the base table beyond the pinned refresh snapshot.
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "INSERT INTO ice.sales.orders VALUES (2, 'b')",
+        );
+
+        // (a) strict default: no session var, no MV property -> stale MV yields no candidate.
+        let candidates = mv_rewrite_candidates_for_select(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "SELECT id, name FROM ice.sales.orders",
+        );
+        assert!(candidates.is_empty(), "strict default must skip a stale MV");
+
+        // (c) permissive session window, base advanced moments ago -> candidate present.
+        {
+            let _guard = StalenessSessionGuard::install(
+                crate::sql::optimizer::options::SessionOptimizerSettings {
+                    mv_rewrite_max_staleness_sec: Some(86_400),
+                    ..Default::default()
+                },
+            );
+            let candidates = mv_rewrite_candidates_for_select(
+                &env.state,
+                Some("ice"),
+                &env.current_db,
+                "SELECT id, name FROM ice.sales.orders",
+            );
+            assert!(
+                !candidates.is_empty(),
+                "within-window stale MV must be a candidate"
+            );
+        }
+
+        // (b) session Some(0) forces strict even if the MV property is permissive.
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "ALTER MATERIALIZED VIEW mv_orders SET TBLPROPERTIES ('query_rewrite_max_staleness_sec' = '86400')",
+        );
+        {
+            let _guard = StalenessSessionGuard::install(
+                crate::sql::optimizer::options::SessionOptimizerSettings {
+                    mv_rewrite_max_staleness_sec: Some(0),
+                    ..Default::default()
+                },
+            );
+            let candidates = mv_rewrite_candidates_for_select(
+                &env.state,
+                Some("ice"),
+                &env.current_db,
+                "SELECT id, name FROM ice.sales.orders",
+            );
+            assert!(
+                candidates.is_empty(),
+                "session 0 forces strict over a permissive property"
+            );
+        }
+
+        // Sanity: with the session override cleared and the permissive MV
+        // property left in place, the MV property alone makes it eligible.
+        let candidates = mv_rewrite_candidates_for_select(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "SELECT id, name FROM ice.sales.orders",
+        );
+        assert!(
+            !candidates.is_empty(),
+            "permissive MV property alone (no session override) must be eligible"
+        );
+
+        // A malformed staleness value on ALTER must fail fast (not silently
+        // persist and degrade to strict) — mirrors the CREATE-MV validation and
+        // the project's fail-fast rule.
+        {
+            let session = crate::engine::StandaloneSession {
+                inner: Arc::clone(&env.state),
+            };
+            let rejected = session.execute_in_context(
+                "ALTER MATERIALIZED VIEW mv_orders SET TBLPROPERTIES ('query_rewrite_max_staleness_sec' = 'not-a-number')",
+                Some("ice"),
+                &env.current_db,
+                None,
+            );
+            assert!(
+                rejected.is_err(),
+                "malformed query_rewrite_max_staleness_sec on ALTER must be rejected, got {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_rewrite_candidate_accepts_two_table_inner_join_mv() {
+        // E1-bc: a real 2-table inner-join MV, refreshed against real
+        // Iceberg data, must survive the relaxed engine-side shape gate
+        // (`supports_current_mv_rewrite_shape`) and produce a candidate
+        // whose descriptor correctly reflects the join shape end-to-end
+        // through the REAL analyze -> plan -> from_opt_expr pipeline (not
+        // the hand-built LogicalPlanNode fixtures the optimizer-rule unit
+        // tests in rule.rs use).
+        let env = open_test_state_with_iceberg_catalog("ice", "sales");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "sales", "customers");
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "INSERT INTO ice.sales.orders VALUES (1, 'o1')",
+        );
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "INSERT INTO ice.sales.customers VALUES (1, 'c1')",
+        );
+
+        let join_sql = "SELECT o.id, c.name FROM ice.sales.orders o \
+                         JOIN ice.sales.customers c ON o.id = c.id";
+        let stmt = parse_create_mv(&format!(
+            "CREATE MATERIALIZED VIEW mv_join
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS {join_sql}"
+        ));
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg join mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_join");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("refresh iceberg join mv");
+
+        let candidates =
+            mv_rewrite_candidates_for_select(&env.state, Some("ice"), &env.current_db, join_sql);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a real 2-table inner-join MV must survive the relaxed shape gate \
+             and become exactly one candidate"
+        );
+        let joins = candidates[0]
+            .mv
+            .joins
+            .as_ref()
+            .expect("candidate descriptor must carry a JoinShape for a 2-table MV");
+        assert_eq!(
+            joins.inputs.len(),
+            1,
+            "one non-driving join input (customers)"
+        );
+        assert_eq!(joins.equi_edges.len(), 1, "one equi-join edge (id = id)");
+    }
+
+    #[test]
+    fn create_iceberg_mv_writes_query_rewrite_staleness_property() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg', 'query_rewrite_max_staleness_sec'='300')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target table");
+        assert_eq!(
+            loaded
+                .table
+                .metadata()
+                .properties()
+                .get("query_rewrite_max_staleness_sec")
+                .map(String::as_str),
+            Some("300"),
         );
     }
 

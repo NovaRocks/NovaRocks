@@ -46,7 +46,7 @@ use crate::sql::optimizer::scalar_expr;
 
 use super::aggregate_rollup::{RollupKind, plan_rollup};
 use super::column_mapping::{MvColumnMap, NormExpr, normalize};
-use super::descriptor::{MatchedShape, SpjgDescriptor, SpjgOutputExpr};
+use super::descriptor::{EquiEdge, MatchedShape, SpjgDescriptor, SpjgOutputExpr};
 use super::predicate_split::check_containment;
 use super::{MvRewriteCandidate, RULE_NAME};
 
@@ -157,12 +157,22 @@ fn try_rewrite(
     cand: &MvRewriteCandidate,
     memo: &mut Memo,
 ) -> Option<NewExpr> {
-    if query.joins.is_some() || cand.mv.joins.is_some() {
-        return None;
-    }
+    // 1. Join-subgraph match: single-table delegates to `same_iceberg_table`
+    //    unchanged; multi-table requires exact table-set + equi-edge-set
+    //    structural equality (self-justifying, no PK/FK proof needed).
+    join_graph_matches(query, &cand.mv)?;
 
-    // 1. Same physical base table (compare Iceberg identity, not names).
-    if !same_iceberg_table(&query.table, &cand.mv.table) {
+    // 1b. Fail open on a multi-table *SPJ* (no-aggregate) query. `from_memo`'s
+    //     no-aggregate arm derives `outputs` from the driving scan only, so a
+    //     matched Filter(Join)/Join query silently omits join-input columns
+    //     (e.g. `c.v` in `SELECT o.k, c.v FROM o JOIN c ... WHERE ...`); the SPJ
+    //     arm below would then emit a schema-short rewrite into a group whose
+    //     true schema includes those columns — an unsound, column-dropping
+    //     alternative. Multi-table SPJ *queries* are out of v1 scope (the
+    //     target is aggregate SPJG); run the original query instead. Aggregate
+    //     multi-table queries are unaffected: their `outputs` come from the
+    //     complete aggregate output layout, not the driving scan.
+    if query.joins.is_some() && matches!(shape, MatchedShape::Spj) {
         return None;
     }
     let q_names = query.base_name_of();
@@ -660,6 +670,70 @@ fn same_iceberg_table(
     }
 }
 
+/// Whether `query`'s and `mv`'s join subgraphs are structurally identical:
+/// the same set of base-table identities joined by the same set of
+/// equi-join edges, all inner. Structural equality is self-justifying (no
+/// PK/FK proof needed): an identical join graph produces identical row
+/// multiplicities, so scanning the MV *is* scanning the query's join result
+/// (umbrella D4).
+///
+/// - Both single-table (`joins.is_none()`): delegates to
+///   `same_iceberg_table`, the original, unchanged single-table identity
+///   check.
+/// - Exactly one side multi-table: `None` (fail open). Superset/subset join
+///   matching (query join ⊋ MV join) needs a PK/FK cardinality proof this
+///   rule does not attempt -- see the E1-bc design spec §0.
+/// - Both multi-table: `None` unless (a) neither side self-joins and every
+///   table resolves to an Iceberg identity, (b) the two sides' table-FQN
+///   sets are equal, and (c) the two sides' equi-edge sets are equal once
+///   each edge's endpoints are resolved to `(table_fqn, column_name)` pairs.
+fn join_graph_matches(query: &SpjgDescriptor, mv: &SpjgDescriptor) -> Option<()> {
+    match (&query.joins, &mv.joins) {
+        (None, None) => same_iceberg_table(&query.table, &mv.table).then_some(()),
+        (Some(_), None) | (None, Some(_)) => None,
+        (Some(query_joins), Some(mv_joins)) => {
+            if query.has_unsupported_multitable_identity()
+                || mv.has_unsupported_multitable_identity()
+            {
+                return None;
+            }
+            let query_fqns = query.join_table_fqns()?;
+            let mv_fqns = mv.join_table_fqns()?;
+            let query_fqn_set: HashSet<&String> = query_fqns.iter().collect();
+            let mv_fqn_set: HashSet<&String> = mv_fqns.iter().collect();
+            if query_fqn_set != mv_fqn_set {
+                return None;
+            }
+
+            let query_names = query.base_name_of();
+            let mv_names = mv.base_name_of();
+            let query_edges = qualified_edge_set(&query_joins.equi_edges, &query_names)?;
+            let mv_edges = qualified_edge_set(&mv_joins.equi_edges, &mv_names)?;
+            (query_edges == mv_edges).then_some(())
+        }
+    }
+}
+
+/// Equi-edges as an unordered set of unordered qualified-column pairs, so
+/// edge comparison is insensitive to which side of `=` each column sits on
+/// and to each side's own ColumnId numbering (query and MV allocate from
+/// independent factories). `None` if any edge references a column absent
+/// from `names` -- should not happen (edges are always built from columns
+/// already recorded in `scan_columns`/`joins.inputs`), treated as fail-open.
+fn qualified_edge_set(
+    edges: &[EquiEdge],
+    names: &std::collections::HashMap<ColumnId, String>,
+) -> Option<HashSet<(String, String)>> {
+    edges
+        .iter()
+        .map(|e| {
+            let l = names.get(&e.left)?.clone();
+            let r = names.get(&e.right)?.clone();
+            Some(if l <= r { (l, r) } else { (r, l) })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,6 +926,28 @@ mod tests {
         )
     }
 
+    /// `Scan` over the base table identity `cat.ns.<table_name>` exposing
+    /// `columns`. Mirrors `base_scan` but allows a distinct physical table
+    /// identity -- needed for multi-table join fixtures where each input is
+    /// a different base table.
+    fn base_scan_named(table_name: &str, columns: &[OutputColumn]) -> LogicalPlanNode {
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        LogicalPlanNode::new(
+            LogicalPlanKind::Scan(LogicalScanNode {
+                database: "ns".to_string(),
+                table: iceberg_table("cat", "ns", table_name, &names),
+                alias: None,
+                columns: columns.to_vec(),
+                predicates: vec![],
+                required_columns: None,
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            None,
+        )
+    }
+
     fn join_plan(
         kind: crate::sql::common::expr::JoinKind,
         left: LogicalPlanNode,
@@ -1012,6 +1108,191 @@ mod tests {
             Operator::LogicalScan(_) => false,
             _ => has_filter(memo, expr.children[0]),
         }
+    }
+
+    // --- join_graph_matches fixtures & tests ------------------------------
+
+    /// A single-table descriptor over `table`, with no scan columns/join
+    /// shape (sufficient for exercising `join_graph_matches`'s `(None,
+    /// None)` delegation to `same_iceberg_table`, which only looks at
+    /// `.table`).
+    fn descriptor_single(table: TableDef) -> SpjgDescriptor {
+        SpjgDescriptor {
+            table,
+            scan_columns: Vec::new(),
+            predicates: Vec::new(),
+            aggregate: None,
+            outputs: Vec::new(),
+            joins: None,
+        }
+    }
+
+    /// A multi-table descriptor: `driving` (with `driving_columns`) inner
+    /// joined to one `input_table` (with `input_columns`) via `edges`.
+    fn descriptor_with_join(
+        driving: TableDef,
+        driving_columns: Vec<OutputColumn>,
+        input_table: TableDef,
+        input_columns: Vec<OutputColumn>,
+        edges: Vec<EquiEdge>,
+    ) -> SpjgDescriptor {
+        SpjgDescriptor {
+            table: driving,
+            scan_columns: driving_columns,
+            predicates: Vec::new(),
+            aggregate: None,
+            outputs: Vec::new(),
+            joins: Some(JoinShape {
+                inputs: vec![JoinInput {
+                    table: input_table,
+                    scan_columns: input_columns,
+                }],
+                equi_edges: edges,
+            }),
+        }
+    }
+
+    #[test]
+    fn join_graph_matches_single_table_delegates_to_same_iceberg_table() {
+        let a = descriptor_single(iceberg_table("cat", "ns", "t1", &["a"]));
+        let b = descriptor_single(iceberg_table("cat", "ns", "t1", &["a"]));
+        assert!(join_graph_matches(&a, &b).is_some(), "same table -> match");
+
+        let c = descriptor_single(iceberg_table("cat", "ns", "other", &["a"]));
+        assert!(
+            join_graph_matches(&a, &c).is_none(),
+            "different table -> no match"
+        );
+    }
+
+    #[test]
+    fn join_graph_matches_one_sided_join_is_none() {
+        let joined = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a"]),
+            vec![col(1, "a")],
+            iceberg_table("cat", "ns", "t2", &["c"]),
+            vec![col(3, "c")],
+            vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(3),
+            }],
+        );
+        let single = descriptor_single(iceberg_table("cat", "ns", "t1", &["a"]));
+        assert!(
+            join_graph_matches(&joined, &single).is_none(),
+            "query multi-table, MV single-table -> fail open"
+        );
+        assert!(
+            join_graph_matches(&single, &joined).is_none(),
+            "query single-table, MV multi-table -> fail open"
+        );
+    }
+
+    #[test]
+    fn join_graph_matches_matches_identical_shape_with_different_column_ids() {
+        // Query and MV join the SAME two physical tables on the SAME equi
+        // edge, but allocate completely different ColumnId ranges (mirrors
+        // independent query-side vs MV-side ColumnRefFactory allocation).
+        let query = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a"]),
+            vec![col(1, "a")],
+            iceberg_table("cat", "ns", "t2", &["c"]),
+            vec![col(3, "c")],
+            vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(3),
+            }],
+        );
+        let mv = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a"]),
+            vec![col(101, "a")],
+            iceberg_table("cat", "ns", "t2", &["c"]),
+            vec![col(103, "c")],
+            vec![EquiEdge {
+                left: ColumnId(101),
+                right: ColumnId(103),
+            }],
+        );
+        assert!(join_graph_matches(&query, &mv).is_some());
+    }
+
+    #[test]
+    fn join_graph_matches_rejects_table_set_mismatch() {
+        let query = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a"]),
+            vec![col(1, "a")],
+            iceberg_table("cat", "ns", "t2", &["c"]),
+            vec![col(3, "c")],
+            vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(3),
+            }],
+        );
+        // MV joins t1 + t3 instead of t1 + t2.
+        let mv = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a"]),
+            vec![col(101, "a")],
+            iceberg_table("cat", "ns", "t3", &["c"]),
+            vec![col(103, "c")],
+            vec![EquiEdge {
+                left: ColumnId(101),
+                right: ColumnId(103),
+            }],
+        );
+        assert!(join_graph_matches(&query, &mv).is_none());
+    }
+
+    #[test]
+    fn join_graph_matches_rejects_equi_edge_mismatch() {
+        // Same table set {t1, t2} on both sides, but query joins t1.a=t2.c
+        // while MV joins t1.b=t2.c -- a different join key.
+        let query = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a", "b"]),
+            vec![col(1, "a"), col(2, "b")],
+            iceberg_table("cat", "ns", "t2", &["c"]),
+            vec![col(3, "c")],
+            vec![EquiEdge {
+                left: ColumnId(1), // t1.a
+                right: ColumnId(3),
+            }],
+        );
+        let mv = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a", "b"]),
+            vec![col(101, "a"), col(102, "b")],
+            iceberg_table("cat", "ns", "t2", &["c"]),
+            vec![col(103, "c")],
+            vec![EquiEdge {
+                left: ColumnId(102), // t1.b
+                right: ColumnId(103),
+            }],
+        );
+        assert!(join_graph_matches(&query, &mv).is_none());
+    }
+
+    #[test]
+    fn join_graph_matches_rejects_self_join() {
+        let query = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a"]),
+            vec![col(1, "a")],
+            iceberg_table("cat", "ns", "t2", &["c"]),
+            vec![col(3, "c")],
+            vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(3),
+            }],
+        );
+        // MV's join input resolves to the SAME FQN as its driving table.
+        let self_join_mv = descriptor_with_join(
+            iceberg_table("cat", "ns", "t1", &["a"]),
+            vec![col(101, "a")],
+            iceberg_table("cat", "ns", "t1", &["a"]),
+            vec![col(103, "a")],
+            vec![EquiEdge {
+                left: ColumnId(101),
+                right: ColumnId(103),
+            }],
+        );
+        assert!(join_graph_matches(&query, &self_join_mv).is_none());
     }
 
     // --- tests ------------------------------------------------------------
@@ -1185,8 +1466,12 @@ mod tests {
 
     #[test]
     fn rejects_multitable_mv_descriptor_candidate() {
-        // Until memo-side multi-table descriptor matching exists, a candidate
-        // that carries MV-side join shape must fail closed.
+        // Asymmetric join shape (MV carries a JoinShape, query does not) is
+        // a PERMANENT fail-open case per `join_graph_matches` (E1-bc):
+        // matching requires BOTH sides to carry the same join shape. See
+        // `matching_multitable_join_query_rewrites_against_matching_multitable_mv`
+        // for the positive (both-multi-table, matching) case this guards
+        // against ever regressing into.
         let a = col(1, "a");
         let v = col(2, "v");
         let s = col(3, "s");
@@ -1227,12 +1512,17 @@ mod tests {
         let rule = MvRewriteRule::new(vec![candidate]);
         assert!(
             rule.apply(&root_expr, &mut memo).is_empty(),
-            "multi-table MV descriptor must not rewrite before join matching exists"
+            "multi-table MV descriptor must not rewrite against a single-table query (asymmetric join shape -> fail open)"
         );
     }
 
     #[test]
     fn multi_table_query_descriptor_does_not_rewrite_against_single_table_candidate() {
+        // Asymmetric join shape (query carries a JoinShape, MV does not) is
+        // a PERMANENT fail-open case per `join_graph_matches` (E1-bc), not
+        // merely "not implemented yet". See
+        // `matching_multitable_join_query_rewrites_against_matching_multitable_mv`
+        // for the positive (both-multi-table, matching) case.
         use crate::sql::common::expr::JoinKind;
 
         // Aggregate(Filter(Join(...))) is important: MvRewriteRule::matches
@@ -1295,7 +1585,334 @@ mod tests {
         );
         assert!(
             rule.apply(&root_expr, &mut memo).is_empty(),
-            "multi-table query descriptor must not rewrite against a single-table candidate yet"
+            "multi-table query descriptor must not rewrite against a single-table candidate"
+        );
+    }
+
+    /// Query-side `Aggregate(Join(t1,t2))` plan: `SELECT a, sum(v) FROM t1
+    /// JOIN t2 ON t1.a = t2.c GROUP BY a`, parameterized over the caller's
+    /// own ColumnIds so tests can pick a range that never collides with a
+    /// candidate MV's own range.
+    fn two_table_agg_join_query_plan(
+        a: &OutputColumn,
+        v: &OutputColumn,
+        c: &OutputColumn,
+        s: &OutputColumn,
+    ) -> LogicalPlanNode {
+        let on = eq(col_ref(a), col_ref(c));
+        let join = join_plan(
+            crate::sql::common::expr::JoinKind::Inner,
+            base_scan_named("t1", &[a.clone(), v.clone()]),
+            base_scan_named("t2", std::slice::from_ref(c)),
+            Some(on),
+        );
+        LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(a)],
+                aggregates: vec![sum_call(v, s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![join],
+            None,
+        )
+    }
+
+    /// MV: `SELECT a, sum(v) s FROM t1 JOIN t2 ON t1.a = t2.c GROUP BY a`,
+    /// over a DISTINCT ColumnId range (100..=110) from any query built
+    /// against it.
+    fn mv_join_descriptor() -> (SpjgDescriptor, ScalarArena) {
+        let a = col(100, "a");
+        let v = col(102, "v");
+        let c = col(103, "c");
+        let s = col(110, "s");
+        let plan = two_table_agg_join_query_plan(&a, &v, &c, &s);
+        spjg_descriptor_for_test(&plan)
+    }
+
+    /// Candidate over MV `agg_join_mv(a, s)` materializing `mv_join_descriptor`.
+    fn agg_join_candidate() -> MvRewriteCandidate {
+        let (mv, mv_scalars) = mv_join_descriptor();
+        MvRewriteCandidate {
+            mv_name: "agg_join_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "agg_join_mv", &["a", "s"]),
+            target_stats_ref: stats_ref_for_test(710),
+        }
+    }
+
+    #[test]
+    fn matching_multitable_join_query_rewrites_against_matching_multitable_mv() {
+        // Query: SELECT a, SUM(v) FROM t1 JOIN t2 ON t1.a = t2.c GROUP BY a.
+        // MV: the identical join shape (same table set {t1,t2}, same
+        // equi-edge t1.a=t2.c) and the identical aggregate shape -> exact
+        // join-subgraph match, direct rewrite (group-by sets are equal, no
+        // rollup needed).
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let c = col(3, "c");
+        let s = col(4, "s");
+        let query_plan = two_table_agg_join_query_plan(&a, &v, &c, &s);
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let rule = MvRewriteRule::new(vec![agg_join_candidate()]);
+        let alts = rule.apply(&root_expr, &mut memo);
+        assert_eq!(
+            alts.len(),
+            1,
+            "matching multi-table join graphs must produce a rewrite"
+        );
+        let Operator::LogicalProject(project) = &alts[0].op else {
+            panic!("expected direct-match project, got {:?}", alts[0].op);
+        };
+        let ids: Vec<ColumnId> = project.items.iter().map(|i| i.output_column_id).collect();
+        assert_eq!(
+            ids,
+            vec![a.column_id, s.column_id],
+            "rewrite must bind the ORIGINAL query output ids"
+        );
+
+        let scan = find_scan(&memo, alts[0].children[0]);
+        assert_eq!(scan.table.name, "agg_join_mv");
+        assert_eq!(scan.mv_rewritten_from.as_deref(), Some("agg_join_mv"));
+    }
+
+    #[test]
+    fn multitable_table_set_mismatch_fails_open() {
+        // Query joins {t1, t2}; MV joins {t1, t3} (different second table)
+        // -> table sets differ -> join_graph_matches must fail open.
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let c = col(3, "c");
+        let s = col(4, "s");
+        let query_plan = two_table_agg_join_query_plan(&a, &v, &c, &s);
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        // MV: SELECT a, sum(v) s FROM t1 JOIN t3 ON t1.a = t3.e GROUP BY a.
+        let mv_a = col(100, "a");
+        let mv_v = col(102, "v");
+        let mv_e = col(103, "e");
+        let mv_s = col(110, "s");
+        let mv_on = eq(col_ref(&mv_a), col_ref(&mv_e));
+        let mv_join = join_plan(
+            crate::sql::common::expr::JoinKind::Inner,
+            base_scan_named("t1", &[mv_a.clone(), mv_v.clone()]),
+            base_scan_named("t3", std::slice::from_ref(&mv_e)),
+            Some(mv_on),
+        );
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&mv_a)],
+                aggregates: vec![sum_call(&mv_v, &mv_s)],
+                output_columns: vec![mv_a.clone(), mv_s.clone()],
+                already_pushed: false,
+            }),
+            vec![mv_join],
+            None,
+        );
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
+        let candidate = MvRewriteCandidate {
+            mv_name: "t1_t3_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "t1_t3_mv", &["a", "s"]),
+            target_stats_ref: stats_ref_for_test(711),
+        };
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        assert!(
+            rule.apply(&root_expr, &mut memo).is_empty(),
+            "table-set mismatch (t2 vs t3) must fail open"
+        );
+    }
+
+    #[test]
+    fn multitable_spj_query_fails_open_never_drops_join_columns() {
+        // A multi-table *SPJ* (no-aggregate) query is out of v1 scope: `from_memo`'s
+        // no-aggregate arm derives `outputs` from the driving scan only, so without
+        // the `try_rewrite` fail-open guard the (Spj, None) arm would emit a rewrite
+        // reproducing only the driving columns and silently DROP every join-input
+        // column (here t2.c) — a schema-short, unsound alternative inserted into a
+        // group whose true schema includes c. The guard must make this fail open.
+        //
+        // Load-bearing: query and MV both have the SPJ shape below, so join_graph_matches
+        // passes and (without the guard) the (Spj, None) arm produces exactly one such
+        // rewrite. The assertion therefore fails if the guard is ever removed.
+        //
+        // Query: Filter(a >= 5, t1[a,v] JOIN t2[c] ON a = c). Shape = SPJ, multi-table.
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let c = col(3, "c");
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: ge(col_ref(&a), 5),
+            }),
+            vec![join_plan(
+                crate::sql::common::expr::JoinKind::Inner,
+                base_scan_named("t1", &[a.clone(), v.clone()]),
+                base_scan_named("t2", std::slice::from_ref(&c)),
+                Some(eq(col_ref(&a), col_ref(&c))),
+            )],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        // MV: the identical SPJ join shape (aggregate = None), whose from_opt_expr
+        // outputs include the join-input column c (commit 7d0377f88).
+        let mv_a = col(100, "a");
+        let mv_v = col(102, "v");
+        let mv_c = col(103, "c");
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: ge(col_ref(&mv_a), 5),
+            }),
+            vec![join_plan(
+                crate::sql::common::expr::JoinKind::Inner,
+                base_scan_named("t1", &[mv_a.clone(), mv_v.clone()]),
+                base_scan_named("t2", std::slice::from_ref(&mv_c)),
+                Some(eq(col_ref(&mv_a), col_ref(&mv_c))),
+            )],
+            None,
+        );
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
+        assert!(
+            mv.joins.is_some() && mv.aggregate.is_none(),
+            "fixture precondition: MV must be a multi-table SPJ descriptor"
+        );
+        let candidate = MvRewriteCandidate {
+            mv_name: "spj_join_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "spj_join_mv", &["a", "v", "c"]),
+            target_stats_ref: stats_ref_for_test(712),
+        };
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        assert!(
+            rule.apply(&root_expr, &mut memo).is_empty(),
+            "multi-table SPJ query must fail open (never emit a join-column-dropping rewrite)"
+        );
+    }
+
+    #[test]
+    fn multitable_equi_edge_mismatch_fails_open() {
+        // Query and MV both join {t1, t2}, but on DIFFERENT columns: query
+        // joins t1.a = t2.c; MV joins t1.b = t2.c. Same table set, different
+        // edge set -> join_graph_matches must fail open.
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let v = col(3, "v");
+        let c = col(4, "c");
+        let s = col(5, "s");
+        let on = eq(col_ref(&a), col_ref(&c)); // t1.a = t2.c
+        let join = join_plan(
+            crate::sql::common::expr::JoinKind::Inner,
+            base_scan_named("t1", &[a.clone(), b.clone(), v.clone()]),
+            base_scan_named("t2", std::slice::from_ref(&c)),
+            Some(on),
+        );
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![join],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        // MV: SELECT a, sum(v) s FROM t1 JOIN t2 ON t1.b = t2.c GROUP BY a.
+        let mv_a = col(100, "a");
+        let mv_b = col(101, "b");
+        let mv_v = col(102, "v");
+        let mv_c = col(103, "c");
+        let mv_s = col(110, "s");
+        let mv_on = eq(col_ref(&mv_b), col_ref(&mv_c)); // t1.b = t2.c (different key!)
+        let mv_join = join_plan(
+            crate::sql::common::expr::JoinKind::Inner,
+            base_scan_named("t1", &[mv_a.clone(), mv_b.clone(), mv_v.clone()]),
+            base_scan_named("t2", std::slice::from_ref(&mv_c)),
+            Some(mv_on),
+        );
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&mv_a)],
+                aggregates: vec![sum_call(&mv_v, &mv_s)],
+                output_columns: vec![mv_a.clone(), mv_s.clone()],
+                already_pushed: false,
+            }),
+            vec![mv_join],
+            None,
+        );
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
+        let candidate = MvRewriteCandidate {
+            mv_name: "edge_mismatch_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "edge_mismatch_mv", &["a", "s"]),
+            target_stats_ref: stats_ref_for_test(712),
+        };
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        assert!(
+            rule.apply(&root_expr, &mut memo).is_empty(),
+            "equi-edge mismatch (t1.a=t2.c vs t1.b=t2.c) must fail open"
+        );
+    }
+
+    #[test]
+    fn multitable_self_join_fails_open() {
+        // MV descriptor with driving table and join input resolving to the
+        // SAME physical Iceberg identity (t1 joined to itself) ->
+        // join_graph_matches must fail open even if the query's own shape
+        // would otherwise match.
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let c = col(3, "c");
+        let s = col(4, "s");
+        let query_plan = two_table_agg_join_query_plan(&a, &v, &c, &s);
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        let mut candidate = agg_join_candidate();
+        candidate
+            .mv
+            .joins
+            .as_mut()
+            .expect("join shape present")
+            .inputs[0]
+            .table = iceberg_table("cat", "ns", "t1", &["c"]); // same FQN as the driving table "t1"
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        assert!(
+            rule.apply(&root_expr, &mut memo).is_empty(),
+            "self-join (t1 joined to itself) must fail open"
         );
     }
 

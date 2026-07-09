@@ -82,7 +82,6 @@ pub(crate) struct SpjgAggregate {
 /// `table`/`scan_columns`; every other inner-join input lands here.
 #[derive(Clone, Debug)]
 pub(crate) struct JoinInput {
-    #[allow(dead_code)]
     pub table: TableDef,
     /// Scan output columns of this input: ColumnId -> base column binding.
     pub scan_columns: Vec<OutputColumn>,
@@ -124,23 +123,114 @@ pub(crate) struct SpjgDescriptor {
     pub joins: Option<JoinShape>,
 }
 
+/// `catalog.namespace.table` identity of an Iceberg data-file table, or
+/// `None` if `table` is not backed by `ScanSource::IcebergDataFiles`. Shared
+/// by `base_name_of`'s column-key qualification and by
+/// `has_unsupported_multitable_identity`'s self-join/non-Iceberg detection
+/// (in turn consumed by `rule::join_graph_matches` and
+/// `mv_rewrite_prep::supports_current_mv_rewrite_shape`) -- all key
+/// physical-table identity the same way `rule::same_iceberg_table`'s
+/// pairwise single-table check already does.
+fn iceberg_fqn(table: &TableDef) -> Option<String> {
+    use crate::sql::catalog::ScanSource;
+    match &table.source {
+        // Separate the three identity components with `\u{1}` (a control char
+        // no SQL identifier can contain) rather than `.`, so a multi-level
+        // (dot-joined) namespace can never make two distinct tables collapse to
+        // the same key — e.g. `{ns:"a.b", tbl:"t"}` vs `{ns:"a", tbl:"b.t"}`.
+        // This matches the field-wise identity `rule::same_iceberg_table` uses
+        // and the `\u{1}` care `qualified_key` already takes for columns. The
+        // key is internal-only (matching/self-join detection), never serialized.
+        ScanSource::IcebergDataFiles { table: info, .. } => Some(format!(
+            "{}\u{1}{}\u{1}{}",
+            info.catalog, info.namespace, info.table
+        )),
+        _ => None,
+    }
+}
+
+/// Qualifier prefix for `base_name_of`'s keys: the table's Iceberg FQN when
+/// available, else the bare table name. The fallback keeps `base_name_of`
+/// total -- it must still work for the non-Iceberg `TableDef`s many unit
+/// tests in this module use. Multi-table rewrite MATCHING is Iceberg-only in
+/// practice (`has_unsupported_multitable_identity` / `rule::same_iceberg_table`
+/// reject non-Iceberg tables before any qualified key is ever compared
+/// across descriptor sides), so the fallback never needs to be
+/// cross-side-comparable; it only needs `base_name_of` to keep working.
+fn table_qualifier(table: &TableDef) -> String {
+    iceberg_fqn(table).unwrap_or_else(|| table.name.clone())
+}
+
+/// Join a table qualifier and a bare column name into `base_name_of`'s key
+/// format. `\u{1}` (a control character no SQL identifier can contain)
+/// separates the two so two different tables' same-named columns can never
+/// collide, whatever the qualifier or column name are.
+fn qualified_key(table_qualifier: &str, column_name: &str) -> String {
+    format!("{table_qualifier}\u{1}{column_name}")
+}
+
 impl SpjgDescriptor {
-    /// Map from scan ColumnId to base column name (for cross-side matching:
-    /// the two sides see the same physical table through different ids).
+    /// Map from scan ColumnId to an FQN-qualified base-column key, for
+    /// cross-side matching: the two sides (query, MV) allocate independent
+    /// ColumnIds for the same physical table(s), but a shared qualified
+    /// string lets `column_mapping::normalize` / `predicate_split::check_containment`
+    /// compare them structurally without changing either function's own
+    /// structure -- they already key purely off whatever string this map
+    /// produces (E1-bc design spec §2.1). Multi-table descriptors qualify
+    /// every join input's columns too, so `t1.id` and `t2.id` never
+    /// collide. Single-table descriptors are ALSO qualified (not left
+    /// bare): both sides scan the SAME physical table, so both compute the
+    /// SAME qualifier, and equality-based matching is unaffected (design
+    /// spec §2.1 "单表零回退").
     pub(crate) fn base_name_of(&self) -> HashMap<ColumnId, String> {
+        let driving_qualifier = table_qualifier(&self.table);
         let mut map: HashMap<ColumnId, String> = self
             .scan_columns
             .iter()
-            .map(|c| (c.column_id, c.name.clone()))
+            .map(|c| (c.column_id, qualified_key(&driving_qualifier, &c.name)))
             .collect();
         if let Some(joins) = &self.joins {
             for input in &joins.inputs {
+                let input_qualifier = table_qualifier(&input.table);
                 for c in &input.scan_columns {
-                    map.insert(c.column_id, c.name.clone());
+                    map.insert(c.column_id, qualified_key(&input_qualifier, &c.name));
                 }
             }
         }
         map
+    }
+
+    /// Every base-table FQN this descriptor's join shape touches: the
+    /// driving table first, then each `joins.inputs` entry in order. `None`
+    /// if any table is not an Iceberg data-file scan. Only meaningful when
+    /// `self.joins.is_some()` -- callers must check that first, or use
+    /// `has_unsupported_multitable_identity`, which does.
+    pub(crate) fn join_table_fqns(&self) -> Option<Vec<String>> {
+        let joins = self.joins.as_ref()?;
+        let mut out = Vec::with_capacity(1 + joins.inputs.len());
+        out.push(iceberg_fqn(&self.table)?);
+        for input in &joins.inputs {
+            out.push(iceberg_fqn(&input.table)?);
+        }
+        Some(out)
+    }
+
+    /// True (fail-open) if this descriptor carries a join shape whose
+    /// tables cannot all be verified as distinct Iceberg identities: either
+    /// some table is not an Iceberg data-file scan, or the same physical
+    /// table appears twice (self-join, unsupported in v1 -- the
+    /// FQN-qualified column scheme in `base_name_of` cannot disambiguate
+    /// two occurrences of one table). Always `false` for a single-table
+    /// descriptor (never blocks the unchanged single-table path).
+    pub(crate) fn has_unsupported_multitable_identity(&self) -> bool {
+        if self.joins.is_none() {
+            return false;
+        }
+        let Some(fqns) = self.join_table_fqns() else {
+            return true;
+        };
+        let unique: HashSet<&String> = fqns.iter().collect();
+        unique.len() != fqns.len()
     }
 
     pub(crate) fn from_opt_expr(
@@ -257,7 +347,7 @@ impl SpjgDescriptor {
                 (Some(SpjgAggregate { group_by }), outputs)
             }
             None => {
-                let scan_outputs: Vec<SpjgOutput> = scan
+                let mut scan_outputs: Vec<SpjgOutput> = scan
                     .columns
                     .iter()
                     .map(|c| SpjgOutput {
@@ -266,6 +356,25 @@ impl SpjgDescriptor {
                         expr: SpjgOutputExpr::Dimension(column_ref(arena, c)),
                     })
                     .collect();
+                // Multi-table SPJ (no aggregate, no mid_project): the top
+                // project can reference any joined table's column directly
+                // (e.g. `SELECT o.id, c.name FROM o JOIN c ...`), so the base
+                // map `apply_top_project` rebinds against must expose every
+                // join input's columns too, not just the driving scan's.
+                // Mirrors `SpjgDescriptor::base_name_of`'s driving +
+                // join-inputs union. A no-op for single-table descriptors
+                // (`joins` is `None`).
+                if let Some(j) = &joins {
+                    for input in &j.inputs {
+                        for c in &input.scan_columns {
+                            scan_outputs.push(SpjgOutput {
+                                name: c.name.clone(),
+                                column_id: c.column_id,
+                                expr: SpjgOutputExpr::Dimension(column_ref(arena, c)),
+                            });
+                        }
+                    }
+                }
                 // mid_project without aggregate is just "the" project.
                 let scan_outputs = match mid_project {
                     Some(p) => p
@@ -1055,13 +1164,13 @@ pub(crate) fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanKind, LogicalPlanNode,
-        LogicalScanNode, LogicalSortNode,
+        LogicalProjectNode, LogicalScanNode, LogicalSortNode,
     };
     use arrow::datatypes::DataType;
 
@@ -1328,6 +1437,63 @@ mod tests {
     }
 
     #[test]
+    fn from_opt_expr_top_project_over_multitable_join_binds_both_sides() {
+        // A bare `SELECT <driving col>, <join-input col> FROM t1 JOIN t2 ...`
+        // (no aggregate, no project directly under the join) is the shape a
+        // real 2-table-join MV definition produces end-to-end through the
+        // standalone analyze/plan pipeline (E1-bc Task 6). Regression guard
+        // for a `from_opt_expr` gap where the no-aggregate arm's base map
+        // only carried the driving scan's own columns, so a top-project item
+        // addressing a join INPUT's column (here, t2.d) failed with "top
+        // project references unknown column" even though the join shape
+        // itself was extracted correctly.
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let d = col(4, "d");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let join = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", &[c.clone(), d.clone()]),
+            Some(on),
+        );
+        let out_a = col(10, "out_a");
+        let out_d = col(11, "out_d");
+        let project = LogicalPlanNode::new(
+            LogicalPlanKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: col_ref(&a),
+                        output_name: "out_a".to_string(),
+                        output_column_id: out_a.column_id,
+                    },
+                    ProjectItem {
+                        expr: col_ref(&d),
+                        output_name: "out_d".to_string(),
+                        output_column_id: out_d.column_id,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![join],
+            None,
+        );
+
+        let (desc, _arena) =
+            descriptor_from_plan(&project).expect("top project over multitable join spjg");
+        assert_eq!(desc.outputs.len(), 2);
+        assert_eq!(desc.outputs[0].column_id, out_a.column_id);
+        assert_eq!(desc.outputs[0].name, "out_a");
+        assert_eq!(
+            desc.outputs[1].column_id, out_d.column_id,
+            "top project item addressing the JOIN INPUT's column (t2.d) must bind"
+        );
+        assert_eq!(desc.outputs[1].name, "out_d");
+    }
+
+    #[test]
     fn base_name_of_includes_join_input_columns() {
         use crate::sql::common::expr::JoinKind;
 
@@ -1344,12 +1510,81 @@ mod tests {
         );
         let (desc, _arena) = descriptor_from_plan(&plan).expect("inner join spjg");
         let names = desc.base_name_of();
-        // Driving scan columns:
-        assert_eq!(names.get(&ColumnId(1)).map(String::as_str), Some("a"));
-        assert_eq!(names.get(&ColumnId(2)).map(String::as_str), Some("b"));
-        // Join-input columns must also be present:
-        assert_eq!(names.get(&ColumnId(3)).map(String::as_str), Some("c"));
-        assert_eq!(names.get(&ColumnId(4)).map(String::as_str), Some("d"));
+        // Driving scan columns, qualified by table identity. `scan_named`'s
+        // fixture uses non-Iceberg `test_scan_source()`, so qualification
+        // falls back to the bare table name ("t1"/"t2") rather than an
+        // Iceberg FQN -- see `table_qualifier`.
+        assert_eq!(
+            names.get(&ColumnId(1)).map(String::as_str),
+            Some("t1\u{1}a")
+        );
+        assert_eq!(
+            names.get(&ColumnId(2)).map(String::as_str),
+            Some("t1\u{1}b")
+        );
+        // Join-input columns must also be present, qualified by "t2":
+        assert_eq!(
+            names.get(&ColumnId(3)).map(String::as_str),
+            Some("t2\u{1}c")
+        );
+        assert_eq!(
+            names.get(&ColumnId(4)).map(String::as_str),
+            Some("t2\u{1}d")
+        );
+    }
+
+    #[test]
+    fn base_name_of_qualifies_same_named_columns_across_tables() {
+        use crate::sql::common::expr::JoinKind;
+
+        // t1.a and t2.a share the bare column name "a"; base_name_of must
+        // produce DISTINCT qualified keys so downstream matching
+        // (normalize / check_containment) never confuses the two tables'
+        // columns (E1-bc design spec §2.1).
+        let a1 = col(1, "a");
+        let a2 = col(2, "a");
+        let on = cmp(col_ref(&a1), crate::sql::analysis::BinOp::Eq, col_ref(&a2));
+        let plan = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a1)),
+            scan_plan_named("t2", std::slice::from_ref(&a2)),
+            Some(on),
+        );
+        let (desc, _arena) = descriptor_from_plan(&plan).expect("inner join spjg");
+        let names = desc.base_name_of();
+        let t1_a = names.get(&ColumnId(1)).expect("t1.a key").clone();
+        let t2_a = names.get(&ColumnId(2)).expect("t2.a key").clone();
+        assert_ne!(
+            t1_a, t2_a,
+            "t1.a and t2.a must not collide despite sharing the bare name \"a\""
+        );
+    }
+
+    #[test]
+    fn base_name_of_single_table_key_matches_across_independent_column_ids() {
+        // Zero-regression check: the SAME physical table, scanned with
+        // completely different ColumnId ranges on two independent
+        // descriptors (mirroring query-side vs MV-side allocation), must
+        // produce the SAME qualified key for the same column name --
+        // qualification must not break single-table cross-side matching.
+        // (This assertion already holds trivially under the OLD bare-name
+        // scheme too -- it locks a property that must keep holding, it is
+        // not itself a red/green test for this task.)
+        let query_a = col(1, "a");
+        let (query_desc, _q_arena) =
+            descriptor_from_plan(&scan_plan(std::slice::from_ref(&query_a))).expect("query spjg");
+        let mv_a = col(101, "a");
+        let (mv_desc, _mv_arena) =
+            descriptor_from_plan(&scan_plan(std::slice::from_ref(&mv_a))).expect("mv spjg");
+
+        let query_names = query_desc.base_name_of();
+        let mv_names = mv_desc.base_name_of();
+        assert_eq!(
+            query_names.get(&ColumnId(1)),
+            mv_names.get(&ColumnId(101)),
+            "same physical table + same column name -> same qualified key \
+             regardless of ColumnId range"
+        );
     }
 
     #[test]

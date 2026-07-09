@@ -1016,7 +1016,8 @@ mod is_known_rule_name_tests {
         logical_plan_to_opt_expr, opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
     };
     use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode, LogicalScanNode,
+        AggregateCall, LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
+        LogicalScanNode,
     };
 
     fn optimize_logical(
@@ -1357,6 +1358,312 @@ mod is_known_rule_name_tests {
         assert!(
             plan_contains_mv_scan(&physical, "or_mv"),
             "optimizer should select the cheaper exact OR MV alternative, got {physical:#?}"
+        );
+    }
+
+    // --- IMV-P4-E1-d: multi-table (join) MV cost-selection tests ---
+    //
+    // Mirrors `optimizer_selects_cheaper_exact_or_mv_candidate` above, but
+    // the query and the MV are both `Aggregate(Join(t1, t2))`-shaped instead
+    // of single-table. The query MUST be aggregate-shaped: E1-bc
+    // (`join_graph_matches` in `cascades_rules::mv_rewrite::rule`) fails
+    // open on a bare multi-table SPJ query by design, so a non-aggregate
+    // join query would never rewrite and the cost test would be vacuous.
+
+    /// Like `int_col`, but non-nullable. Used for the fixture's equi-join key
+    /// columns (`t1.a`, `t2.c`): `DeriveJoinNotNullPredicate` (an unrelated
+    /// RBO rewrite, `rewrite::rules::derive_join_not_null`) infers `IS NOT
+    /// NULL` on *nullable* inner-join keys during the RBO phase that runs
+    /// before the Cascades memo exists. A derived predicate on `t2.c` cannot
+    /// be re-expressed as MV-rewrite compensation once the join collapses
+    /// into the MV scan (`c` is not one of the MV's visible SELECT-list
+    /// outputs, only a join key), which makes `try_rewrite`'s compensation
+    /// column-mapping step (`rule.rs`'s `col_map.rewrite`) fail closed --
+    /// unconditionally, regardless of cost. That is an unrelated concern this
+    /// fixture must not exercise. Real equi-join keys are overwhelmingly NOT
+    /// NULL in practice (surrogate/foreign keys), so this is a realistic
+    /// fixture choice, not a workaround for a shape this test is supposed to
+    /// cover.
+    fn not_null_int_col(id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            nullable: false,
+            ..int_col(id, name)
+        }
+    }
+
+    fn planner_col_ref(column: &OutputColumn) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: column.column_id,
+                qualifier: None,
+                column: column.name.clone(),
+            },
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        }
+    }
+
+    fn planner_join_eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: crate::sql::common::BinOp::Eq,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        }
+    }
+
+    fn planner_sum_call(arg: &OutputColumn, out: &OutputColumn) -> AggregateCall {
+        AggregateCall {
+            name: "sum".to_string(),
+            args: vec![planner_col_ref(arg)],
+            distinct: false,
+            result_type: DataType::Int64,
+            order_by: vec![],
+            output_column_id: out.column_id,
+        }
+    }
+
+    /// `Scan` over Iceberg base table identity `cat.ns.<table_name>`,
+    /// exposing `columns`. Mirrors
+    /// `cascades_rules::mv_rewrite::rule::tests::base_scan_named` -- needed
+    /// again here (private to that module) for multi-table join fixtures
+    /// where each join input is a distinct base table.
+    fn base_scan_named(table_name: &str, columns: &[OutputColumn]) -> LogicalPlanNode {
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        LogicalPlanNode::new(
+            LogicalPlanKind::Scan(LogicalScanNode {
+                database: "ns".to_string(),
+                table: iceberg_table("cat", "ns", table_name, &names),
+                alias: None,
+                columns: columns.to_vec(),
+                predicates: vec![],
+                required_columns: None,
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            None,
+        )
+    }
+
+    /// Binds `stats_ref` onto every `LogicalScan` in `expr` whose table name
+    /// matches `table_name`. The `LogicalPlanNode` -> `OptExpr` bridge
+    /// (`try_logical_plan_to_opt_expr`) always leaves `stats_ref: None` --
+    /// real callers bind it afterward from catalog-derived statistics (see
+    /// `QueryStatsCollector::walk` in `src/engine/query_stats.rs`), and
+    /// `optimize()` rejects any query with an unbound scan
+    /// (`validate_query_stats_bound`). Multi-table lib-harness fixtures must
+    /// bind each base table's `stats_ref` by hand the same way.
+    fn bind_scan_stats_ref(expr: &mut OptExpr, table_name: &str, stats_ref: StatsRef) {
+        if let Operator::LogicalScan(scan) = &mut expr.op
+            && scan.table.name == table_name
+        {
+            scan.stats_ref = Some(stats_ref);
+        }
+        for child in &mut expr.children {
+            bind_scan_stats_ref(child, table_name, stats_ref);
+        }
+    }
+
+    /// Like `narrow_base_stats`, but reports a real (`Exact`) NDV equal to
+    /// `row_count` for `unique_column` instead of leaving every column's NDV
+    /// "missing". `narrow_base_stats` alone leaves the equi-join key's NDV
+    /// unknown on both join sides; the join cardinality estimator's
+    /// missing-NDV fallback then dominates the join's estimated cost almost
+    /// independently of the actual base row counts (verified empirically:
+    /// even a 1-row-by-1-row join priced above a half-million-row MV scan).
+    /// Reporting the join key as (realistically) close to unique -- as most
+    /// real equi-join keys are -- lets the estimator compute a real,
+    /// size-proportional join selectivity instead, and also keeps
+    /// `AggregatePushdown`'s missing-NDV row-count fallback
+    /// (`rewrite::rules::aggregate_pushdown::cost::should_push`) from
+    /// firing: a unique group-by key means partial pre-aggregation buys no
+    /// row reduction, so the cost gate declines to push regardless of scale.
+    fn base_stats_with_unique_column(
+        row_count: u64,
+        columns: &[&str],
+        unique_column: &str,
+    ) -> BaseTableStatistics {
+        let mut stats = narrow_base_stats(row_count, columns);
+        if let Some(column_stats) = stats.columns.get_mut(unique_column) {
+            column_stats.ndv = StatValue::known(
+                row_count as f64,
+                crate::sql::optimizer::statistics::Confidence::Exact,
+                StatsSource::TestFixture,
+            );
+        }
+        stats
+    }
+
+    /// Shared fixture for the multi-table cost-selection tests. Builds:
+    ///   query: `SELECT a, SUM(v) FROM t1 JOIN t2 ON t1.a = t2.c GROUP BY a`
+    ///   MV:    `SELECT a, SUM(v) s FROM t1 JOIN t2 ON t1.a = t2.c GROUP BY a`
+    /// driven through the `optimize()` entrypoint (unlike
+    /// `cascades_rules::mv_rewrite::rule::tests::agg_join_candidate`, which
+    /// exercises `MvRewriteRule::apply` directly against a hand-built memo).
+    /// The MV side allocates its `OutputColumn`s from a disjoint ColumnId
+    /// range (100..) so cross-side matching only succeeds via table/column
+    /// NAME identity (`cat.ns.t1` / `cat.ns.t2`), never by accidental id
+    /// collision -- mirrors `two_table_agg_join_query_plan` / `mv_join_descriptor`
+    /// in `cascades_rules::mv_rewrite::rule`.
+    ///
+    /// `t1.a`/`t2.c` (the equi-join key on each side) get a real NDV via
+    /// `base_stats_with_unique_column` rather than `narrow_base_stats`'s
+    /// default "missing" -- see that helper for why: it keeps the join's
+    /// estimated cost proportional to `t1_rows`/`t2_rows` instead of being
+    /// dominated by the missing-NDV fallback, and as a side effect keeps
+    /// `AggregatePushdown` (an unrelated RBO rewrite) from firing and
+    /// restructuring `Aggregate(Join(t1, t2))` before the Cascades memo
+    /// (and `MvRewriteRule`) ever sees it.
+    fn multitable_agg_join_mv_fixture(
+        t1_rows: u64,
+        t2_rows: u64,
+        mv_target_rows: u64,
+    ) -> (
+        OptExpr,
+        ScalarArena,
+        QueryStatsSnapshot,
+        cascades_rules::mv_rewrite::MvRewriteCandidate,
+    ) {
+        let a = not_null_int_col(1, "a");
+        let v = int_col(2, "v");
+        let c = not_null_int_col(3, "c");
+        let s = int_col(4, "s");
+
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![planner_col_ref(&a)],
+                aggregates: vec![planner_sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanKind::Join(LogicalJoinNode {
+                    join_type: crate::sql::common::expr::JoinKind::Inner,
+                    condition: Some(planner_join_eq(planner_col_ref(&a), planner_col_ref(&c))),
+                }),
+                vec![
+                    base_scan_named("t1", &[a.clone(), v.clone()]),
+                    base_scan_named("t2", std::slice::from_ref(&c)),
+                ],
+                None,
+            )],
+            None,
+        );
+
+        let mut query_scalars = ScalarArena::new();
+        let mut query = try_logical_plan_to_opt_expr(&query_plan, &mut query_scalars)
+            .expect("multi-table query logical plan to opt expr");
+        bind_scan_stats_ref(&mut query, "t1", StatsRef::new(0));
+        bind_scan_stats_ref(&mut query, "t2", StatsRef::new(1));
+
+        let mv_a = not_null_int_col(100, "a");
+        let mv_v = int_col(101, "v");
+        let mv_c = not_null_int_col(102, "c");
+        let mv_s = int_col(103, "s");
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![planner_col_ref(&mv_a)],
+                aggregates: vec![planner_sum_call(&mv_v, &mv_s)],
+                output_columns: vec![mv_a.clone(), mv_s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanKind::Join(LogicalJoinNode {
+                    join_type: crate::sql::common::expr::JoinKind::Inner,
+                    condition: Some(planner_join_eq(
+                        planner_col_ref(&mv_a),
+                        planner_col_ref(&mv_c),
+                    )),
+                }),
+                vec![
+                    base_scan_named("t1", &[mv_a.clone(), mv_v.clone()]),
+                    base_scan_named("t2", std::slice::from_ref(&mv_c)),
+                ],
+                None,
+            )],
+            None,
+        );
+        let mut mv_scalars = ScalarArena::new();
+        let mv_expr = try_logical_plan_to_opt_expr(&mv_plan, &mut mv_scalars)
+            .expect("multi-table mv logical plan to opt expr");
+        let mv_desc = cascades_rules::mv_rewrite::descriptor::SpjgDescriptor::from_opt_expr(
+            &mv_expr,
+            &mut mv_scalars,
+        )
+        .expect("multi-table mv descriptor");
+
+        let candidate = cascades_rules::mv_rewrite::MvRewriteCandidate {
+            mv_name: "mt_join_mv".to_string(),
+            mv: mv_desc,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "mt_join_mv", &["a", "s"]),
+            target_stats_ref: StatsRef::new(2),
+        };
+
+        let mut stats = QueryStatsSnapshot::empty();
+        stats.insert(
+            StatsRef::new(0),
+            "cat.ns.t1",
+            base_stats_with_unique_column(t1_rows, &["a", "v"], "a"),
+        );
+        stats.insert(
+            StatsRef::new(1),
+            "cat.ns.t2",
+            base_stats_with_unique_column(t2_rows, &["c"], "c"),
+        );
+        stats.insert(
+            StatsRef::new(2),
+            "cat.ns.mt_join_mv",
+            narrow_base_stats(mv_target_rows, &["a", "s"]),
+        );
+
+        (query, query_scalars, stats, candidate)
+    }
+
+    #[test]
+    fn optimizer_selects_multitable_mv_when_cheaper() {
+        let (query, query_scalars, stats, candidate) =
+            multitable_agg_join_mv_fixture(50_000, 50_000, 500);
+
+        let physical = optimize(
+            query,
+            query_scalars,
+            &stats,
+            ColumnRefFactory::new(),
+            None,
+            vec![candidate],
+        )
+        .expect("optimize");
+
+        assert!(
+            plan_contains_mv_scan(&physical, "mt_join_mv"),
+            "optimizer should select the cheaper multi-table MV alternative, got {physical:#?}"
+        );
+    }
+
+    #[test]
+    fn optimizer_keeps_join_when_multitable_mv_pricier() {
+        let (query, query_scalars, stats, candidate) =
+            multitable_agg_join_mv_fixture(1_000, 1_000, 20_000_000);
+
+        let physical = optimize(
+            query,
+            query_scalars,
+            &stats,
+            ColumnRefFactory::new(),
+            None,
+            vec![candidate],
+        )
+        .expect("optimize");
+
+        assert!(
+            !plan_contains_mv_scan(&physical, "mt_join_mv"),
+            "optimizer should keep the original join plan when the multi-table MV is pricier, got {physical:#?}"
         );
     }
 

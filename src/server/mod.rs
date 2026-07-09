@@ -1166,6 +1166,11 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "mv_rewrite_max_staleness_sec") {
+        shim.optimizer_settings.mv_rewrite_max_staleness_sec = Some(v);
+        return Ok(StatementResult::Ok);
+    }
+
     // In-memo join-reorder size cutoffs (StarRocks `cbo_max_reorder_node*`).
     // Exact keyword match, so the `_use_*` variants never collide with the
     // shorter `cbo_max_reorder_node`.
@@ -2397,6 +2402,22 @@ mod tests {
                 "global_runtime_filter_build_max_size"
             ),
             Some(1048576)
+        );
+    }
+
+    /// Mirrors `parse_rf_build_max_size_var`: `execute_statement_text` requires
+    /// a fully constructed `NovaRocksMysqlShim` (real engine handle), which is
+    /// impractical to build in a lib unit test, so the established precedent in
+    /// this module for these exact-keyword `SET <var> = N` branches is to test
+    /// the underlying `parse_set_non_negative_integer` recognition directly.
+    #[test]
+    fn set_mv_rewrite_max_staleness_sec_updates_settings() {
+        assert_eq!(
+            parse_set_non_negative_integer(
+                "SET mv_rewrite_max_staleness_sec = 300",
+                "mv_rewrite_max_staleness_sec"
+            ),
+            Some(300)
         );
     }
 
