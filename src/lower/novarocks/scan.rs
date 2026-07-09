@@ -16,6 +16,7 @@
 // under the License.
 
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use crate::connector::iceberg::{
     file_pruning::IcebergFilePruningMetadata,
 };
 use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig, ScanConfig};
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::iceberg_delta_scan::{
@@ -49,6 +50,7 @@ use crate::exec::node::iceberg_delta_scan::{
     PositionDeleteSourceData,
 };
 use crate::exec::node::project::ProjectNode;
+use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::formats::FileFormatConfig;
@@ -97,7 +99,7 @@ pub(crate) fn lower_scan_node(
         }
         plan::scan_source::Kind::IcebergDeltaTable(source) => {
             reject_variant_columns_for_source(scan, "IcebergDeltaTable")?;
-            lower_iceberg_delta_table_scan(node, scan, source, arena)
+            lower_iceberg_delta_table_scan(node, scan, source, ctx, arena)
         }
         plan::scan_source::Kind::IcebergVersionTable(_) => {
             reject_variant_columns_for_source(scan, "IcebergVersionTable")?;
@@ -246,11 +248,16 @@ fn lower_iceberg_delta_table_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::IcebergDeltaTable,
+    ctx: &NodeLoweringContext,
     arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
     let output_columns = scan_output_columns(scan)?;
     let layout = layout_from_output_columns(&output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&output_columns)?;
+    let ranges = decode_metadata_scan_ranges(ctx.scan_ranges(node.node_id)?)?;
+    if ranges.is_empty() {
+        return empty_values_node(node.node_id, layout, output_schema);
+    }
     let table = source
         .table
         .as_ref()
@@ -328,6 +335,22 @@ fn lower_iceberg_delta_table_scan(
     }
     Ok(LoweredNode {
         node: exec_node,
+        layout,
+        output_schema,
+    })
+}
+
+fn empty_values_node(
+    node_id: i32,
+    layout: super::layout::Layout,
+    output_schema: ChunkSchemaRef,
+) -> Result<LoweredNode, String> {
+    let batch = RecordBatch::new_empty(output_schema.arrow_schema_ref());
+    let chunk = Chunk::try_new_with_chunk_schema(batch, output_schema.clone())?;
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode { chunk, node_id }),
+        },
         layout,
         output_schema,
     })
@@ -2074,12 +2097,6 @@ fn decode_deletion_vector_descriptor(
 fn decode_metadata_scan_ranges(
     ranges: &[novarocks::ScanRangeParams],
 ) -> Result<Vec<IcebergMetadataScanRange>, String> {
-    if ranges.is_empty() {
-        return Ok(vec![IcebergMetadataScanRange {
-            path: String::new(),
-            serialized_split: String::new(),
-        }]);
-    }
     ranges
         .iter()
         .enumerate()
@@ -2839,7 +2856,7 @@ mod tests {
     #[test]
     fn lowers_iceberg_delta_table_scan_from_native_payload() {
         let node = scan_node(iceberg_delta_table_source());
-        let ctx = NodeLoweringContext::default();
+        let ctx = NodeLoweringContext::default().with_scan_ranges(10, vec![file_range()]);
         let mut arena = ExprArena::default();
         let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
             .expect("lower native delta scan");
@@ -2863,6 +2880,22 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_delta_table_empty_instance_ranges_lower_to_empty_values() {
+        let node = scan_node(iceberg_delta_table_source());
+        let ctx = NodeLoweringContext::default().with_scan_ranges(10, Vec::new());
+        let mut arena = ExprArena::default();
+        let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower native delta empty instance");
+
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected empty Values for empty delta instance");
+        };
+        assert_eq!(values.node_id, 10);
+        assert_eq!(values.chunk.batch.num_rows(), 0);
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
     fn lowers_iceberg_delta_table_scan_predicates_to_filter() {
         let node = scan_node_with(
             vec![output_column(1, "id", DataType::Int64)],
@@ -2873,7 +2906,7 @@ mod tests {
             Vec::new(),
             iceberg_delta_table_source(),
         );
-        let ctx = NodeLoweringContext::default();
+        let ctx = NodeLoweringContext::default().with_scan_ranges(10, vec![file_range()]);
         let mut arena = ExprArena::default();
         let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
             .expect("lower native delta scan with predicate");
@@ -2914,6 +2947,25 @@ mod tests {
             panic!("expected Scan");
         };
         assert!(scan.conjunct_predicate().is_some());
+    }
+
+    #[test]
+    fn metadata_scan_empty_instance_ranges_produce_no_morsels() {
+        let ranges = decode_metadata_scan_ranges(&[]).expect("decode empty metadata ranges");
+
+        assert!(
+            ranges.is_empty(),
+            "empty per-instance metadata ranges must not synthesize work"
+        );
+    }
+
+    #[test]
+    fn metadata_scan_placeholder_range_produces_one_morsel() {
+        let ranges = decode_metadata_scan_ranges(&[file_range()])
+            .expect("decode placeholder metadata range");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].path, "s3://bucket/warehouse/db/t/data-1.parquet");
     }
 
     #[test]
