@@ -526,13 +526,32 @@ pub(crate) fn alter_mv(
             );
         }
         if let AlterMaterializedViewAction::SetProperties(entries) = &stmt.action {
+            // Validate + canonicalize the query-rewrite staleness property before
+            // persisting: fail fast on a malformed value (mirroring the CREATE-MV
+            // path, per the project's fail-fast rule) and normalize the key to the
+            // canonical lowercase form + integer value so the case-insensitive
+            // read side (mv_rewrite_prep) matches however the user spelled it.
+            let mut entries = entries.clone();
+            for (key, value) in entries.iter_mut() {
+                if key.eq_ignore_ascii_case(
+                    crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP,
+                ) {
+                    let secs: u64 = value.trim().parse().map_err(|_| {
+                        format!(
+                            "invalid {} property value `{value}`: expected a non-negative integer (seconds)",
+                            crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP
+                        )
+                    })?;
+                    *key = crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP
+                        .to_string();
+                    *value = secs.to_string();
+                }
+            }
             crate::connector::iceberg::catalog::alter_table_properties(
                 state,
                 &AlterIcebergPropertiesStmt {
                     table: stmt.name.clone(),
-                    op: PropertiesOp::Set {
-                        entries: entries.clone(),
-                    },
+                    op: PropertiesOp::Set { entries },
                 },
                 Some(current_catalog),
                 db,

@@ -538,4 +538,45 @@ mod tests {
         // MV: a >= 5 (Int)   query: a >= 'x' (String) -> cannot compare -> fail
         assert!(check_containment(&[ge_a_str("x")], &[ge_a(5)], &n, &n).is_none());
     }
+
+    #[test]
+    fn check_containment_disambiguates_same_column_name_across_tables() {
+        // t1.x and t2.x must not be confused despite sharing the bare name
+        // "x". Query: t1.x >= 5 AND t2.x >= 100. MV: t1.x >= 5 only (no
+        // t2.x constraint at all).
+        let mut names: HashMap<ColumnId, String> = HashMap::new();
+        names.insert(ColumnId(1), "cat.ns.t1\u{1}x".to_string());
+        names.insert(ColumnId(2), "cat.ns.t2\u{1}x".to_string());
+        let t1_x = col(1, "x");
+        let t2_x = col(2, "x");
+        let ge_col = |c: &OutputColumn, v: i64| bin(col_ref(c), BinOp::Ge, int_lit(v));
+
+        let query_conjuncts = [ge_col(&t1_x, 5), ge_col(&t2_x, 100)];
+        let mv_conjuncts = [ge_col(&t1_x, 5)];
+        let r =
+            check_containment(&query_conjuncts, &mv_conjuncts, &names, &names).expect("contained");
+        // t2.x >= 100 is unconstrained by the MV -> compensates as its OWN,
+        // separate range bucket (a bare-name bug would merge it onto t1.x's
+        // bucket and either wrongly imply it or wrongly drop it).
+        assert_eq!(r.compensation.len(), 1);
+    }
+
+    #[test]
+    fn check_containment_rejects_unimplied_constraint_on_disambiguated_column() {
+        // MV constrains t2.x >= 100; query only constrains t1.x >= 5 (no
+        // t2.x predicate at all). With qualified keys, the MV's t2.x bound
+        // is NOT implied by the query's t1.x bound -> containment must
+        // fail. (A bare-name bug would let t1.x's predicate "cover" the
+        // MV's t2.x-keyed bucket and wrongly succeed.)
+        let mut names: HashMap<ColumnId, String> = HashMap::new();
+        names.insert(ColumnId(1), "cat.ns.t1\u{1}x".to_string());
+        names.insert(ColumnId(2), "cat.ns.t2\u{1}x".to_string());
+        let t1_x = col(1, "x");
+        let t2_x = col(2, "x");
+        let ge_col = |c: &OutputColumn, v: i64| bin(col_ref(c), BinOp::Ge, int_lit(v));
+
+        let query_conjuncts = [ge_col(&t1_x, 5)];
+        let mv_conjuncts = [ge_col(&t2_x, 100)];
+        assert!(check_containment(&query_conjuncts, &mv_conjuncts, &names, &names).is_none());
+    }
 }

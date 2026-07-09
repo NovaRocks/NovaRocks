@@ -653,4 +653,24 @@ mod tests {
         let no_else = normalize(&mk(&a1, &b1, None), &n1).expect("no else");
         assert_ne!(lhs, no_else);
     }
+
+    #[test]
+    fn normalize_disambiguates_qualified_columns_across_tables() {
+        // t1.x (ColumnId 1) and t2.x (ColumnId 2) share the bare name "x"
+        // but must normalize to DIFFERENT NormExprs once base_names carries
+        // FQN-qualified keys (the scheme `SpjgDescriptor::base_name_of`
+        // produces, per Task 1).
+        let t1_x = col(1, "x");
+        let t2_x = col(2, "x");
+        let mut qualified = HashMap::new();
+        qualified.insert(ColumnId(1), "cat.ns.t1\u{1}x".to_string());
+        qualified.insert(ColumnId(2), "cat.ns.t2\u{1}x".to_string());
+
+        let n1 = normalize(&col_ref(&t1_x), &qualified).expect("t1.x");
+        let n2 = normalize(&col_ref(&t2_x), &qualified).expect("t2.x");
+        assert_ne!(
+            n1, n2,
+            "t1.x and t2.x must not collide despite sharing the bare name"
+        );
+    }
 }
