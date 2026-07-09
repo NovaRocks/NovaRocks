@@ -801,6 +801,7 @@ pub(crate) fn build_novarocks_command(binary: &Path, role: &str, config_path: &P
         .arg("--config")
         .arg(config_path)
         .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command

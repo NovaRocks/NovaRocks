@@ -3375,7 +3375,7 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn cross_process_command_sets_no_proxy() {
+    fn cross_process_command_sets_required_test_env() {
         let command = build_novarocks_command(
             PathBuf::from("ignored-binary").as_path(),
             "fe",
@@ -3387,6 +3387,13 @@ enable_path_style_access = true
             .and_then(|(_, value)| value)
             .and_then(|value| value.to_str());
         assert_eq!(no_proxy, Some("127.0.0.1,localhost"));
+
+        let imv_stateless_rebuild = command
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some("NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD"))
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str());
+        assert_eq!(imv_stateless_rebuild, Some("1"));
     }
 
     #[test]
