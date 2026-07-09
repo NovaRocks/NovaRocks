@@ -73,7 +73,10 @@ use crate::session::MysqlSession;
 use crate::types::{ConnectionConfig, QueryExecution, RunnerConfig};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static UNIQUE_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Inputs for one run of the L2 statelessness case. Kept separate from the
 /// SQL-test runner's `SqlCase`/`SqlStep` types because this harness drives
@@ -363,14 +366,16 @@ fn connection_config(handle: &CrossProcessServerHandle) -> Result<ConnectionConf
 
 /// Generate a process-unique, time-unique suffix for catalog/namespace names
 /// and the fresh metadata db filename, mirroring the runtime-dir naming
-/// scheme already used by `cluster::create_runtime_dir` (pid + nanos) so
-/// concurrent harness runs never collide.
+/// scheme already used by `cluster::create_runtime_dir` (pid + nanos), plus a
+/// process-local sequence for platforms where adjacent `SystemTime` reads can
+/// return the same tick.
 fn unique_suffix() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{}_{}", std::process::id(), nanos)
+    let seq = UNIQUE_SUFFIX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}_{}", std::process::id(), nanos, seq)
 }
 
 /// Path for cluster B's fresh, empty `[metadata]` SQLite file. Lives under

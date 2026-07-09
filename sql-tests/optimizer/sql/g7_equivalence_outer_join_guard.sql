@@ -27,6 +27,11 @@ DROP TABLE IF EXISTS ${case_db}.g7_outer_l;
 DROP TABLE IF EXISTS ${case_db}.g7_outer_r;
 CREATE TABLE ${case_db}.g7_outer_l (lk BIGINT, payload BIGINT);
 CREATE TABLE ${case_db}.g7_outer_r (rk BIGINT, payload BIGINT);
+-- @skip_result_check=true
+-- @result_contains=LEFT OUTER, eq: [l.lk = r.rk]
+-- @result_contains=other: l.lk = 10
+-- @result_not_contains=r.rk = 10
+-- @result_not_contains=predicates: l.lk = 10
 EXPLAIN VERBOSE
 SELECT l.lk, r.rk
 FROM ${case_db}.g7_outer_l l

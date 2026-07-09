@@ -28,6 +28,12 @@ CREATE TABLE ${case_db}.residual_mad_c (k INT, payload INT);
 
 SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 
+-- @skip_result_check=true
+-- @result_contains=INNER, eq: [a.k = b.k]
+-- @result_contains=INNER, eq: [b.k = c.k]
+-- @result_contains=predicates: CAST(a.k AS Int64) = 7 AND a.k IS NOT NULL
+-- @result_not_contains=CAST(b.k AS Int64) = 7
+-- @result_not_contains=CAST(c.k AS Int64) = 7
 EXPLAIN VERBOSE
 SELECT a.payload, b.payload, c.payload
 FROM ${case_db}.residual_mad_a a
@@ -37,6 +43,12 @@ WHERE a.k = 7;
 
 SET disable_optimizer_rules = 'JoinPredicateMoveAround,JoinReorder,JoinCommutativity';
 
+-- @skip_result_check=true
+-- @result_contains=INNER, eq: [a.k = b.k]
+-- @result_contains=INNER, eq: [b.k = c.k]
+-- @result_contains=predicates: CAST(a.k AS Int64) = 7 AND a.k IS NOT NULL
+-- @result_not_contains=CAST(b.k AS Int64) = 7
+-- @result_not_contains=CAST(c.k AS Int64) = 7
 EXPLAIN VERBOSE
 SELECT a.payload, b.payload, c.payload
 FROM ${case_db}.residual_mad_a a

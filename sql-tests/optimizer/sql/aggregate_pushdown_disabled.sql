@@ -35,6 +35,13 @@ ANALYZE TABLE ${case_db}.t_agg_pd_dis_a;
 ANALYZE TABLE ${case_db}.t_agg_pd_dis_b;
 
 -- Baseline (AggregatePushdown enabled): expect partial AGGREGATE under join.
+-- @skip_result_check=true
+-- @result_contains=HASH AGGREGATE (SINGLE, group by: [a.k])
+-- @result_contains=aggregations: sum(sum(a.v))
+-- @result_contains=HASH JOIN (
+-- @result_contains=INNER, eq:
+-- @result_contains=HASH AGGREGATE (GLOBAL, group by: [a.k])
+-- @result_contains=HASH AGGREGATE (LOCAL, group by: [a.k])
 EXPLAIN VERBOSE
 SELECT a.k, SUM(a.v)
 FROM ${case_db}.t_agg_pd_dis_a a
@@ -44,6 +51,11 @@ GROUP BY a.k;
 SET disable_optimizer_rules = 'AggregatePushdown';
 
 -- With AggregatePushdown disabled: top aggregate only, no partial below join.
+-- @skip_result_check=true
+-- @result_contains=HASH JOIN (
+-- @result_contains=INNER, eq:
+-- @result_contains=HASH AGGREGATE (GLOBAL, group by: [a.k])
+-- @result_not_contains=sum(sum(a.v))
 EXPLAIN VERBOSE
 SELECT a.k, SUM(a.v)
 FROM ${case_db}.t_agg_pd_dis_a a

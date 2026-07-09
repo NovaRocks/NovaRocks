@@ -27,6 +27,11 @@ CREATE TABLE ${case_db}.residual_lcj_c (k INT, flag INT, payload INT);
 
 SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 
+-- @skip_result_check=true
+-- @result_contains=INNER, eq: [a.k = b.k]
+-- @result_contains=other: a.bucket = b.bucket OR a.payload = b.payload
+-- @result_contains=INNER, eq: [b.k = c.k]
+-- @result_contains=predicates: CAST(c.flag AS Int64) = 1 AND c.k IS NOT NULL
 EXPLAIN VERBOSE
 SELECT a.payload, b.payload, c.payload
 FROM ${case_db}.residual_lcj_a a

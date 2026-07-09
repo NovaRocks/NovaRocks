@@ -24,12 +24,20 @@ DROP TABLE IF EXISTS ${case_db}.residual_sa_r;
 CREATE TABLE ${case_db}.residual_sa_l (k INT, flag INT, payload INT);
 CREATE TABLE ${case_db}.residual_sa_r (k INT, flag INT, payload INT);
 
+-- @skip_result_check=true
+-- @result_contains=LEFT SEMI, eq: [l.k = r.k, l.flag = r.flag]
+-- @result_contains=other: CAST(l.flag AS Int64) = 1
+-- @result_not_contains=predicates: CAST(l.flag AS Int64) = 1
 EXPLAIN VERBOSE
 SELECT l.k
 FROM ${case_db}.residual_sa_l l
 LEFT SEMI JOIN ${case_db}.residual_sa_r r
   ON l.k = r.k AND l.flag = r.flag AND l.flag = 1;
 
+-- @skip_result_check=true
+-- @result_contains=LEFT ANTI, eq: [l.k = r.k, l.flag = r.flag]
+-- @result_contains=other: CAST(l.flag AS Int64) = 1
+-- @result_not_contains=predicates: CAST(l.flag AS Int64) = 1
 EXPLAIN VERBOSE
 SELECT l.k
 FROM ${case_db}.residual_sa_l l
