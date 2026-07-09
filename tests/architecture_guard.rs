@@ -126,6 +126,13 @@ fn has_cfg_test_mod_tests(text: &str) -> bool {
         .any(|lines| lines == ["#[cfg(test)]", "mod tests;"])
 }
 
+fn is_cfg_test_attr(trimmed: &str) -> bool {
+    if trimmed.starts_with("#[cfg(test") {
+        return true;
+    }
+    compact_line(trimmed).starts_with("#[cfg(all(test,")
+}
+
 fn module_declarations(text: &str) -> BTreeSet<String> {
     non_comment_trimmed_lines(text)
         .into_iter()
@@ -172,7 +179,7 @@ where
             continue;
         }
 
-        if trimmed.starts_with("#[cfg(test") {
+        if is_cfg_test_attr(trimmed) {
             pending_cfg_test = true;
             let delta = brace_delta(line);
             if delta > 0 {
@@ -261,7 +268,7 @@ fn rust_production_text_without_cfg_test(text: &str) -> String {
             continue;
         }
 
-        if trimmed.starts_with("#[cfg(test") {
+        if is_cfg_test_attr(trimmed) {
             pending_cfg_test = true;
             continue;
         }
@@ -274,11 +281,11 @@ fn rust_production_text_without_cfg_test(text: &str) -> String {
 }
 
 fn is_cfg_test_or_compat_attr(trimmed: &str) -> bool {
-    if trimmed.starts_with("#[cfg(test") {
+    if is_cfg_test_attr(trimmed) {
         return true;
     }
     let compact = compact_line(trimmed);
-    compact.starts_with("#[cfg(all(test,") || compact == "#[cfg(feature=\"compat\")]"
+    compact == "#[cfg(feature=\"compat\")]"
 }
 
 fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
@@ -406,8 +413,7 @@ fn nidl_e9_rust_production_text_without_cfg_test(text: &str) -> String {
             continue;
         }
 
-        if trimmed.starts_with("#[cfg(test") || compact_line(trimmed).starts_with("#[cfg(all(test,")
-        {
+        if is_cfg_test_attr(trimmed) {
             pending_skip_attr = true;
             production.push('\n');
             continue;
@@ -754,7 +760,7 @@ fn rust_wire_reference_hits(path: &Path, policy: RustWirePolicy) -> Vec<(usize, 
             continue;
         }
 
-        if trimmed.starts_with("#[cfg(test") {
+        if is_cfg_test_attr(trimmed) {
             pending_cfg_test = true;
             let delta = brace_delta(line);
             if delta > 0 {
@@ -5287,7 +5293,6 @@ const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
     "src/exec/node/fetch.rs",
     "src/exec/operators/fetch_processor.rs",
     "src/lower/compat",
-    "src/lower/common/min_max.rs",
     "src/runtime/descriptor_snapshot_thrift.rs",
     "src/runtime/exec_params.rs",
     "src/runtime/exec_params_compat.rs",

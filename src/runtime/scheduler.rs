@@ -615,7 +615,13 @@ mod tests {
         FragmentStreamKind,
     };
     use crate::sql::planner::{DataPartition, PartitionKind};
-    use crate::thrift::partitions;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestPartitionType {
+        HashPartitioned,
+        BucketShuffleHashPartitioned,
+        Unpartitioned,
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -713,15 +719,13 @@ mod tests {
     fn fake_edge(
         src: FragmentId,
         tgt: FragmentId,
-        ptype: partitions::TPartitionType,
+        ptype: TestPartitionType,
         exch_node_id: i32,
     ) -> FragmentEdge {
         let stream_kind = match ptype {
-            partitions::TPartitionType::HASH_PARTITIONED
-            | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-                FragmentStreamKind::Partitioned
-            }
-            partitions::TPartitionType::UNPARTITIONED => FragmentStreamKind::Gather,
+            TestPartitionType::HashPartitioned
+            | TestPartitionType::BucketShuffleHashPartitioned => FragmentStreamKind::Partitioned,
+            TestPartitionType::Unpartitioned => FragmentStreamKind::Gather,
             _ => FragmentStreamKind::Other,
         };
         fake_stream_edge(src, tgt, ptype, exch_node_id, stream_kind)
@@ -731,7 +735,7 @@ mod tests {
         fake_stream_edge(
             src,
             tgt,
-            partitions::TPartitionType::UNPARTITIONED,
+            TestPartitionType::Unpartitioned,
             exch_node_id,
             FragmentStreamKind::Broadcast,
         )
@@ -740,7 +744,7 @@ mod tests {
     fn fake_stream_edge(
         src: FragmentId,
         tgt: FragmentId,
-        ptype: partitions::TPartitionType,
+        ptype: TestPartitionType,
         exch_node_id: i32,
         stream_kind: FragmentStreamKind,
     ) -> FragmentEdge {
@@ -755,11 +759,10 @@ mod tests {
         }
     }
 
-    fn native_partition_for_test(ptype: partitions::TPartitionType) -> DataPartition {
+    fn native_partition_for_test(ptype: TestPartitionType) -> DataPartition {
         let kind = match ptype {
-            partitions::TPartitionType::HASH_PARTITIONED
-            | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => PartitionKind::Hash,
-            partitions::TPartitionType::RANDOM => PartitionKind::Random,
+            TestPartitionType::HashPartitioned
+            | TestPartitionType::BucketShuffleHashPartitioned => PartitionKind::Hash,
             _ => PartitionKind::Unpartitioned,
         };
         DataPartition {
@@ -771,7 +774,7 @@ mod tests {
     fn fake_router_edge(
         src: FragmentId,
         tgt: FragmentId,
-        ptype: partitions::TPartitionType,
+        ptype: TestPartitionType,
         exch_node_id: i32,
         stream_kind: FragmentStreamKind,
     ) -> FragmentEdge {
@@ -806,12 +809,7 @@ mod tests {
         fn sparse_live_snapshot_preserves_original_backend_indices() {
             let scheduler = FragmentScheduler::new(three_backends());
             let fragments = vec![fake_fragment(0, Some(1), 2), fake_fragment(1, None, 0)];
-            let edges = vec![fake_edge(
-                0,
-                1,
-                partitions::TPartitionType::UNPARTITIONED,
-                10,
-            )];
+            let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
             let live = vec![(0usize, be("10.0.0.1:9010")), (2usize, be("10.0.0.3:9010"))];
 
             let mut plan = scheduler
@@ -861,12 +859,7 @@ mod tests {
         let scheduler = FragmentScheduler::new(backends);
         // F0=scan producer, F1=root consumer (UNPARTITIONED gather)
         let fragments = vec![fake_fragment(0, Some(1), 3), fake_fragment(1, None, 0)];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 1))
             .expect("assign");
@@ -890,11 +883,11 @@ mod tests {
             fake_router_edge(
                 0,
                 1,
-                partitions::TPartitionType::HASH_PARTITIONED,
+                TestPartitionType::HashPartitioned,
                 10,
                 FragmentStreamKind::Partitioned,
             ),
-            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_edge(1, 2, TestPartitionType::Unpartitioned, 20),
         ];
 
         let mut plan = scheduler
@@ -938,8 +931,8 @@ mod tests {
             fake_fragment(2, None, 0),    // root
         ];
         let edges = vec![
-            fake_edge(0, 1, partitions::TPartitionType::HASH_PARTITIONED, 10),
-            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_edge(0, 1, TestPartitionType::HashPartitioned, 10),
+            fake_edge(1, 2, TestPartitionType::Unpartitioned, 20),
         ];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 1))
@@ -962,12 +955,12 @@ mod tests {
             fake_fragment(1, None, 0),
             fake_fragment(2, None, 0),
         ];
-        let mut hash_edge = fake_edge(0, 1, partitions::TPartitionType::UNPARTITIONED, 10);
+        let mut hash_edge = fake_edge(0, 1, TestPartitionType::Unpartitioned, 10);
         hash_edge.output_partition = DataPartition::hash(Vec::new());
         hash_edge.stream_kind = FragmentStreamKind::Partitioned;
         let edges = vec![
             hash_edge,
-            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_edge(1, 2, TestPartitionType::Unpartitioned, 20),
         ];
 
         let plan = scheduler
@@ -995,13 +988,8 @@ mod tests {
             fake_fragment(2, None, 0),    // root gather
         ];
         let edges = vec![
-            fake_edge(
-                0,
-                1,
-                partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED,
-                10,
-            ),
-            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_edge(0, 1, TestPartitionType::BucketShuffleHashPartitioned, 10),
+            fake_edge(1, 2, TestPartitionType::Unpartitioned, 20),
         ];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 1))
@@ -1031,9 +1019,9 @@ mod tests {
             fake_fragment(3, None, 0),    // root gather
         ];
         let edges = vec![
-            fake_edge(0, 2, partitions::TPartitionType::HASH_PARTITIONED, 10),
+            fake_edge(0, 2, TestPartitionType::HashPartitioned, 10),
             fake_broadcast_edge(1, 2, 20),
-            fake_edge(2, 3, partitions::TPartitionType::UNPARTITIONED, 30),
+            fake_edge(2, 3, TestPartitionType::Unpartitioned, 30),
         ];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 1))
@@ -1060,12 +1048,7 @@ mod tests {
             fake_fragment(0, Some(1), 4), // scan
             fake_fragment(1, None, 0),    // root (UNPARTITIONED gather)
         ];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 7))
             .expect("assign");
@@ -1086,8 +1069,8 @@ mod tests {
             fake_fragment(2, None, 0),    // root
         ];
         let edges = vec![
-            fake_edge(0, 1, partitions::TPartitionType::UNPARTITIONED, 10),
-            fake_edge(1, 2, partitions::TPartitionType::HASH_PARTITIONED, 20),
+            fake_edge(0, 1, TestPartitionType::Unpartitioned, 10),
+            fake_edge(1, 2, TestPartitionType::HashPartitioned, 20),
         ];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 7))
@@ -1108,12 +1091,7 @@ mod tests {
             fake_fragment(0, Some(1), 2), // scan
             fake_fragment(1, None, 0),    // root
         ];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::HASH_PARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::HashPartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(5, 5))
             .expect("assign");
@@ -1133,14 +1111,14 @@ mod tests {
             fake_router_edge(
                 0,
                 10,
-                partitions::TPartitionType::HASH_PARTITIONED,
+                TestPartitionType::HashPartitioned,
                 100,
                 FragmentStreamKind::Partitioned,
             ),
             fake_router_edge(
                 0,
                 11,
-                partitions::TPartitionType::HASH_PARTITIONED,
+                TestPartitionType::HashPartitioned,
                 101,
                 FragmentStreamKind::Partitioned,
             ),
@@ -1177,7 +1155,7 @@ mod tests {
         let edges = vec![fake_router_edge(
             0,
             10,
-            partitions::TPartitionType::HASH_PARTITIONED,
+            TestPartitionType::HashPartitioned,
             100,
             FragmentStreamKind::Partitioned,
         )];
@@ -1209,12 +1187,7 @@ mod tests {
             fake_fragment(0, Some(1), 3), // scan: 3 instances
             fake_fragment(1, None, 0),    // root
         ];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
@@ -1252,12 +1225,7 @@ mod tests {
             fake_fragment(3, Some(1), 3), // scan fragment, id=3
             fake_fragment(99, None, 0),   // root
         ];
-        let edges = vec![fake_edge(
-            3,
-            99,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(3, 99, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(42, 0))
             .expect("assign");
@@ -1279,12 +1247,7 @@ mod tests {
         fr.fragment_id = 0;
         let root = fake_fragment(1, None, 0);
         let fragments = vec![fr, root];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
@@ -1304,12 +1267,7 @@ mod tests {
         let backends = two_backends();
         let scheduler = FragmentScheduler::new(backends);
         let fragments = vec![fake_fragment(0, Some(7), 0), fake_fragment(1, None, 0)];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
@@ -1333,12 +1291,7 @@ mod tests {
         let fr = fake_fragment(0, Some(5), 6); // node_id=5, 6 ranges with markers 0..5
         let root = fake_fragment(1, None, 0);
         let fragments = vec![fr, root];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
@@ -1370,12 +1323,7 @@ mod tests {
         let backends = three_backends();
         let scheduler = FragmentScheduler::new(backends.clone());
         let fragments = vec![fake_fragment(0, Some(1), 3), fake_fragment(1, None, 0)];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let mut plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
@@ -1397,12 +1345,7 @@ mod tests {
         let backends = three_backends();
         let scheduler = FragmentScheduler::new(backends.clone());
         let fragments = vec![fake_fragment(0, Some(1), 1), fake_fragment(1, None, 0)];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let mut plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
@@ -1422,12 +1365,7 @@ mod tests {
         let scheduler = FragmentScheduler::new(backends.clone());
         // F0=scan (2 inst), F1=root (1 inst); F0 is probe, F1 is build (artificial scenario).
         let fragments = vec![fake_fragment(0, Some(1), 2), fake_fragment(1, None, 0)];
-        let edges = vec![fake_edge(
-            0,
-            1,
-            partitions::TPartitionType::UNPARTITIONED,
-            10,
-        )];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let mut plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
@@ -1492,8 +1430,8 @@ mod tests {
             fake_fragment(2, None, 0), // root
         ];
         let edges = vec![
-            fake_edge(0, 2, partitions::TPartitionType::UNPARTITIONED, 10),
-            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_edge(0, 2, TestPartitionType::Unpartitioned, 10),
+            fake_edge(1, 2, TestPartitionType::Unpartitioned, 20),
         ];
         let mut plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
@@ -1530,8 +1468,8 @@ mod tests {
         let scheduler = FragmentScheduler::new(backends);
         let fragments = vec![fake_fragment(0, None, 0), fake_fragment(1, None, 0)];
         let edges = vec![
-            fake_edge(0, 1, partitions::TPartitionType::UNPARTITIONED, 10),
-            fake_edge(1, 0, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_edge(0, 1, TestPartitionType::Unpartitioned, 10),
+            fake_edge(1, 0, TestPartitionType::Unpartitioned, 20),
         ];
         let result = scheduler.assign(&fragments, &edges, make_query_id(1, 1));
         assert!(result.is_err());

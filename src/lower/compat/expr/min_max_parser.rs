@@ -25,6 +25,7 @@ use crate::types::arrow_thrift::{
     THRIFT_TIME_UNIT_NANOS, thrift_desc_to_arrow_type as arrow_type_from_desc,
 };
 
+/// Parse thrift min/max conjuncts into native pruning predicates.
 pub(crate) fn parse_min_max_conjuncts_with_column_resolver<F>(
     expr: &exprs::TExpr,
     mut resolve_column: F,

@@ -48,6 +48,7 @@ THRIFT_PATTERN = re.compile(
 )
 
 USE_ITEM_START_PATTERN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\b")
+CFG_ATTR_PATTERN = re.compile(r"#\s*\[\s*cfg\s*\((?P<predicate>[^]]*)\)\s*\]")
 
 
 @dataclass(frozen=True)
@@ -86,10 +87,10 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/engine/write_transaction.rs": BaselineEntry("domain-leak", "B2", 0, "Standalone write transaction still shares thrift sink-commit payload handling"),
     "src/engine/insert_flow.rs": BaselineEntry("domain-leak", "B7", 0, "Standalone insert flow consumes thrift-free standalone query options"),
     "src/engine/query_options_wire.rs": BaselineEntry("legal-boundary", "B7-wire", 1, "Standalone engine query options thrift adapter converts FE-compatible query options"),
-    "src/runtime/sink_commit.rs": BaselineEntry("legal-boundary", "B2-wire", 4, "Runtime sink commit is the wire boundary for sink commit reports"),
+    "src/runtime/sink_commit.rs": BaselineEntry("legal-boundary", "B2-wire", 6, "Runtime sink commit is the wire boundary for sink commit reports"),
     "src/runtime/sink_commit_wire.rs": BaselineEntry("legal-boundary", "B2-wire", 18, "Runtime sink commit wire adapter is the explicit wire boundary for Iceberg writer reports, native commit messages, and partition descriptors"),
     "src/runtime/write_coordinator.rs": BaselineEntry("legal-boundary", "B2-wire", 3, "Runtime write coordinator transports sink commit control-plane payloads"),
-    "src/runtime/write_coordinator_compat.rs": BaselineEntry("legal-boundary", "B2-wire", 1, "Runtime write coordinator thrift compatibility adapter converts FE report payloads"),
+    "src/runtime/write_coordinator_compat.rs": BaselineEntry("legal-boundary", "B2-wire", 8, "Runtime write coordinator thrift compatibility adapter converts FE report payloads"),
     "src/runtime/write_operation_lifecycle.rs": BaselineEntry("legal-boundary", "B2-wire", 1, "Runtime write lifecycle transports sink commit control-plane payloads"),
     "src/exec/runtime_filter/min_max.rs": BaselineEntry("domain-leak", "B3", 0, "Runtime min/max filter uses RuntimeFilterType internally"),
     "src/exec/runtime_filter/bitset.rs": BaselineEntry("domain-leak", "B3", 0, "Runtime bitset filter uses RuntimeFilterType internally"),
@@ -114,14 +115,14 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/connector/iceberg/scan_planner.rs": BaselineEntry("domain-leak", "B5", 0, "Iceberg scan planner exposes domain handles and splits only"),
     "src/runtime/lookup.rs": BaselineEntry("domain-leak", "B5", 0, "Runtime lookup consumes DescriptorSnapshot instead of thrift descriptors"),
     "src/exec/chunk/schema.rs": BaselineEntry("domain-leak", "B7", 0, "Execution chunk schema is thrift-free"),
-    "src/exec/chunk/schema_thrift.rs": BaselineEntry("legal-boundary", "B7-wire", 5, "Execution chunk schema thrift adapter builds chunk schemas from FE type descriptors"),
+    "src/exec/chunk/schema_thrift.rs": BaselineEntry("legal-boundary", "B7-wire", 7, "Execution chunk schema thrift adapter builds chunk schemas from FE type descriptors"),
     "src/exec/operators/fetch_processor.rs": BaselineEntry("domain-leak", "B5", 0, "Fetch processor discovers lookup output slots from DescriptorSnapshot"),
     "src/connector/scan_planning.rs": BaselineEntry("domain-leak", "B5", 0, "Shared scan planning trait is domain-only"),
     "src/connector/starrocks/table/scan_planner.rs": BaselineEntry("domain-leak", "B5", 0, "StarRocks table scan planner exposes domain handles and splits only"),
     "src/exec/node/scan.rs": BaselineEntry("domain-leak", "B5", 0, "Execution scan node consumes normalized incremental scan ranges"),
     "src/exec/operators/scan/runner.rs": BaselineEntry("legal-boundary", "control-plane-wire", 1, "Scan runner records FE-compatible runtime profile metric units"),
     "src/runtime/query_context.rs": BaselineEntry("legal-boundary", "B5-wire", 12, "Query context may retain FE-compatible descriptor and incremental scan payloads while exposing normalized runtime snapshots"),
-    "src/runtime/descriptor_snapshot_thrift.rs": BaselineEntry("legal-boundary", "B5-wire", 29, "Runtime descriptor snapshot thrift adapter converts FE descriptors into internal descriptor snapshots"),
+    "src/runtime/descriptor_snapshot_thrift.rs": BaselineEntry("legal-boundary", "B5-wire", 30, "Runtime descriptor snapshot thrift adapter converts FE descriptors into internal descriptor snapshots"),
     "src/runtime/scan_range.rs": BaselineEntry("legal-boundary", "B5-wire", 4, "Runtime scan range adapter converts normalized file scan ranges to FE-compatible thrift scan payloads"),
     "src/connector/starrocks/lake/schema.rs": BaselineEntry("legal-boundary", "B6-wire", 2, "StarRocks lake tablet creation is a storage/protocol IO boundary"),
     "src/connector/starrocks/lake/schema_adapter.rs": BaselineEntry("legal-boundary", "B6-wire", 85, "StarRocks lake schema adapter converts thrift schema requests into tablet schema protobufs"),
@@ -131,7 +132,8 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/formats/starrocks/writer/segment_meta.rs": BaselineEntry("legal-boundary", "B6-wire", 0, "StarRocks segment metadata production code uses internal storage-format wire type"),
     "src/formats/parquet/mod.rs": BaselineEntry("legal-boundary", "B6-wire", 1, "Parquet reader keeps FE-compatible runtime profile metric thrift unit only"),
     "src/connector/starrocks/table_schema_service.rs": BaselineEntry("legal-boundary", "B6-wire", 11, "StarRocks table schema service is a protocol adapter boundary"),
-    "src/connector/starrocks/lake/schema_change.rs": BaselineEntry("legal-boundary", "B6-wire", 2, "StarRocks lake schema change is a protocol adapter boundary"),
+    "src/connector/starrocks/lake/schema_change.rs": BaselineEntry("legal-boundary", "B6-wire", 3, "StarRocks lake schema change is a protocol adapter boundary"),
+    "src/connector/starrocks/lake/schema_change_compat.rs": BaselineEntry("legal-boundary", "B6-wire", 1, "StarRocks lake schema change compat adapter evaluates FE thrift rollup expressions"),
     "src/connector/starrocks/fe_v2_meta.rs": BaselineEntry("legal-boundary", "B6-wire", 8, "StarRocks FE v2 metadata bridge is a protocol adapter boundary"),
     "src/formats/parquet/variant_read.rs": BaselineEntry("domain-leak", "B6", 0, "Parquet variant reader uses ParquetSlotKind instead of thrift primitive type"),
     "src/connector/schema/frontend.rs": BaselineEntry("legal-boundary", "B6-wire", 6, "Schema frontend adapter exposes StarRocks-compatible metadata"),
@@ -147,8 +149,10 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/connector/starrocks/scan/reader.rs": BaselineEntry("legal-boundary", "B6-wire", 1, "StarRocks scan reader is a StarRocks protocol adapter boundary"),
     "src/connector/schema/context.rs": BaselineEntry("legal-boundary", "B6-wire", 1, "Schema context exposes StarRocks-compatible metadata"),
     "src/runtime/coordinator.rs": BaselineEntry("legal-boundary", "control-plane-wire", 53, "Runtime coordinator transports FE-compatible control-plane payloads"),
+    "src/runtime/change_op.rs": BaselineEntry("legal-boundary", "B5-wire", 2, "Runtime change-op adapter extracts FE-compatible HDFS extended-column payloads"),
     "src/runtime/endpoint.rs": BaselineEntry("legal-boundary", "control-plane-wire", 4, "Runtime endpoint adapter converts internal endpoint values to FE-compatible network addresses"),
     "src/runtime/exec_params.rs": BaselineEntry("legal-boundary", "control-plane-wire", 7, "Execution parameters assemble FE-compatible fragment payloads at the compat control-plane boundary"),
+    "src/runtime/exec_params_compat.rs": BaselineEntry("legal-boundary", "control-plane-wire", 3, "Execution parameters compat adapter converts native sink payloads to FE-compatible thrift"),
     "src/runtime/fragment_exec_params.rs": BaselineEntry("legal-boundary", "control-plane-wire", 2, "Fragment exec params convert native scheduling metadata into FE-compatible control-plane payloads"),
     "src/runtime/scheduler.rs": BaselineEntry("legal-boundary", "control-plane-wire", 13, "Runtime scheduler transports FE-compatible control-plane payloads"),
     "src/runtime/dispatcher.rs": BaselineEntry("legal-boundary", "control-plane-wire", 2, "Runtime dispatcher transports FE-compatible control-plane payloads"),
@@ -350,6 +354,17 @@ def skip_test_item_state(line: str) -> tuple[bool, int | None]:
     return True, None
 
 
+def is_test_only_cfg_predicate(predicate: str) -> bool:
+    predicate = predicate.strip()
+    if predicate == "test":
+        return True
+    return (
+        re.match(r"all\s*\(", predicate) is not None
+        and re.search(r"\btest\b", predicate) is not None
+        and re.search(r"\bnot\s*\(\s*test\s*\)", predicate) is None
+    )
+
+
 def iter_hits(path: Path, include_tests: bool) -> list[tuple[int, str]]:
     hits: list[tuple[int, str]] = []
     pending_test_item = False
@@ -382,9 +397,13 @@ def iter_hits(path: Path, include_tests: bool) -> list[tuple[int, str]]:
         if not include_tests and "#![cfg(test)]" in code_line:
             break
 
-        test_attr_start = code_line.find("#[cfg(test)]")
-        if not include_tests and test_attr_start != -1:
-            after_attr = code_line[test_attr_start + len("#[cfg(test)]") :]
+        cfg_attr = CFG_ATTR_PATTERN.search(code_line)
+        if (
+            not include_tests
+            and cfg_attr is not None
+            and is_test_only_cfg_predicate(cfg_attr.group("predicate"))
+        ):
+            after_attr = code_line[cfg_attr.end() :]
             pending_test_item, test_item_brace_depth = skip_test_item_state(after_attr)
             continue
 

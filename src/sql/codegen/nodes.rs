@@ -21,7 +21,7 @@ use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::common::types::UniqueId;
 #[cfg(feature = "compat")]
 use crate::connector::scan_planning::ConnectorScanPlanner;
-use crate::lower::common::min_max::parse_min_max_conjuncts_with_column_resolver;
+use crate::lower::compat::expr::parse_min_max_conjuncts_with_column_resolver;
 use crate::runtime::fragment_exec_params::FragmentExecParams;
 #[cfg(feature = "compat")]
 use crate::runtime::fragment_exec_params::compat_exec_params_from_parts;

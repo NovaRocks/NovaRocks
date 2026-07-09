@@ -1377,17 +1377,13 @@ mod pr3_tests {
     };
     use super::proto::{novarocks, plan};
     use crate::common::types::UniqueId;
-    use crate::thrift::types;
     use tonic::Request;
 
-    fn runtime_id(id: &types::TUniqueId) -> UniqueId {
-        UniqueId {
-            hi: id.hi,
-            lo: id.lo,
-        }
+    fn id(hi: i64, lo: i64) -> UniqueId {
+        UniqueId { hi, lo }
     }
 
-    fn ok_report(query: types::TUniqueId, finst: types::TUniqueId) -> ExecStatusReport {
+    fn ok_report(query: UniqueId, finst: UniqueId) -> ExecStatusReport {
         ExecStatusReport {
             query_id: Some(ProtoUniqueId {
                 hi: query.hi,
@@ -1411,7 +1407,7 @@ mod pr3_tests {
         }
     }
 
-    fn write_report(query: types::TUniqueId, finst: types::TUniqueId) -> ExecStatusReport {
+    fn write_report(query: UniqueId, finst: UniqueId) -> ExecStatusReport {
         let mut report = ok_report(query, finst);
         report.iceberg_commits = vec![IcebergCommitInfo {
             iceberg_data_file: Some(IcebergDataFile {
@@ -1429,14 +1425,10 @@ mod pr3_tests {
         report
     }
 
-    fn error_report(
-        query: types::TUniqueId,
-        finst: types::TUniqueId,
-        message: &str,
-    ) -> ExecStatusReport {
+    fn error_report(query: UniqueId, finst: UniqueId, message: &str) -> ExecStatusReport {
         let mut report = ok_report(query, finst);
         report.status = Some(ProtoStatus {
-            code: crate::thrift::status_code::TStatusCode::INTERNAL_ERROR.0,
+            code: 1,
             message: message.to_string(),
         });
         report
@@ -1701,14 +1693,14 @@ mod pr3_tests {
     #[tokio::test]
     async fn report_exec_status_updates_registered_write_coordinator() {
         let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
-        let query = types::TUniqueId::new(701, 801);
-        let finst = types::TUniqueId::new(702, 802);
+        let query = id(701, 801);
+        let finst = id(702, 802);
         guard
             .register_query(
-                runtime_id(&query),
+                query,
                 vec![crate::runtime::write_coordinator::WriterKey {
-                    query_id: runtime_id(&query),
-                    fragment_instance_id: runtime_id(&finst),
+                    query_id: query,
+                    fragment_instance_id: finst,
                     backend_num: 0,
                 }],
             )
@@ -1730,15 +1722,15 @@ mod pr3_tests {
     #[tokio::test]
     async fn report_exec_status_ignores_non_writer_ok_for_registered_write_query() {
         let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
-        let query = types::TUniqueId::new(711, 811);
-        let writer_finst = types::TUniqueId::new(712, 812);
-        let ordinary_finst = types::TUniqueId::new(713, 813);
+        let query = id(711, 811);
+        let writer_finst = id(712, 812);
+        let ordinary_finst = id(713, 813);
         let coord = guard
             .register_query(
-                runtime_id(&query),
+                query,
                 vec![crate::runtime::write_coordinator::WriterKey {
-                    query_id: runtime_id(&query),
-                    fragment_instance_id: runtime_id(&writer_finst),
+                    query_id: query,
+                    fragment_instance_id: writer_finst,
                     backend_num: 0,
                 }],
             )
@@ -1780,15 +1772,15 @@ mod pr3_tests {
     #[tokio::test]
     async fn report_exec_status_rejects_unknown_writer_with_write_metadata() {
         let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
-        let query = types::TUniqueId::new(714, 814);
-        let writer_finst = types::TUniqueId::new(715, 815);
-        let unknown_writer_finst = types::TUniqueId::new(716, 816);
+        let query = id(714, 814);
+        let writer_finst = id(715, 815);
+        let unknown_writer_finst = id(716, 816);
         let coord = guard
             .register_query(
-                runtime_id(&query),
+                query,
                 vec![crate::runtime::write_coordinator::WriterKey {
-                    query_id: runtime_id(&query),
-                    fragment_instance_id: runtime_id(&writer_finst),
+                    query_id: query,
+                    fragment_instance_id: writer_finst,
                     backend_num: 0,
                 }],
             )
@@ -1819,15 +1811,15 @@ mod pr3_tests {
     #[tokio::test]
     async fn report_exec_status_non_writer_error_fails_registered_write_query() {
         let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
-        let query = types::TUniqueId::new(721, 821);
-        let writer_finst = types::TUniqueId::new(722, 822);
-        let ordinary_finst = types::TUniqueId::new(723, 823);
+        let query = id(721, 821);
+        let writer_finst = id(722, 822);
+        let ordinary_finst = id(723, 823);
         let coord = guard
             .register_query(
-                runtime_id(&query),
+                query,
                 vec![crate::runtime::write_coordinator::WriterKey {
-                    query_id: runtime_id(&query),
-                    fragment_instance_id: runtime_id(&writer_finst),
+                    query_id: query,
+                    fragment_instance_id: writer_finst,
                     backend_num: 0,
                 }],
             )
@@ -1856,8 +1848,8 @@ mod pr3_tests {
     #[tokio::test]
     async fn report_exec_status_query_gone_returns_terminal_code() {
         let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
-        let query = types::TUniqueId::new(801, 901);
-        let finst = types::TUniqueId::new(802, 902);
+        let query = id(801, 901);
+        let finst = id(802, 902);
         let report = write_report(query, finst);
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {
@@ -1887,8 +1879,8 @@ mod pr3_tests {
         use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
 
         let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
-        let query = types::TUniqueId::new(811, 911);
-        let finst = types::TUniqueId::new(812, 912);
+        let query = id(811, 911);
+        let finst = id(812, 912);
         let query_id = QueryId {
             hi: query.hi,
             lo: query.lo,

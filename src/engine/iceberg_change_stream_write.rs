@@ -339,7 +339,6 @@ mod tests {
     use crate::proto::novarocks;
     use crate::runtime::sink_commit::writer_report_to_iceberg_commit_info;
     use crate::runtime::write_coordinator::{WriteCommitInput, WriterCommitInput, WriterKey};
-    use crate::thrift::types;
 
     fn test_unpartitioned_metadata() -> TableMetadata {
         let schema = Schema::builder()
@@ -452,8 +451,8 @@ mod tests {
 
     #[test]
     fn finst_id_decodes_writer_fragment_id() {
-        let finst = types::TUniqueId::new(7, (42_i64 << 16) | 3);
-        assert_eq!(writer_fragment_id_from_finst_lo(finst.lo), 42);
+        let finst_lo = (42_i64 << 16) | 3;
+        assert_eq!(writer_fragment_id_from_finst_lo(finst_lo), 42);
     }
 
     #[test]

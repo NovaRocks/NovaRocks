@@ -23,10 +23,12 @@ pub(crate) fn parse_min_max_conjuncts(
     expr: &exprs::TExpr,
     layout: &Layout,
 ) -> Result<Vec<MinMaxPredicate>, String> {
-    crate::lower::common::min_max::parse_min_max_conjuncts_with_column_resolver(expr, |slot_ref| {
+    parse_min_max_conjuncts_with_column_resolver(expr, |slot_ref| {
         get_column_name_from_slot(slot_ref, layout)
     })
 }
+
+pub(crate) use super::min_max_parser::parse_min_max_conjuncts_with_column_resolver;
 
 fn get_column_name_from_slot(
     slot_ref: &exprs::TSlotRef,

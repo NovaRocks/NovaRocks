@@ -16,6 +16,7 @@
 // under the License.
 mod literals;
 mod min_max;
+mod min_max_parser;
 
 // Node type handlers
 mod arithmetic;
@@ -70,7 +71,7 @@ use map_expr::lower_map_expr;
 use slot::lower_slot_ref;
 use subfield::lower_subfield_expr;
 
-pub(crate) use min_max::parse_min_max_conjuncts;
+pub(crate) use min_max::{parse_min_max_conjuncts, parse_min_max_conjuncts_with_column_resolver};
 
 struct CommonSlotLoweringCtx<'a> {
     /// StarRocks FE may factor out repeated sub-expressions into a `common_slot_map`, and then

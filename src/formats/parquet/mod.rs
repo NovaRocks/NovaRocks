@@ -2676,7 +2676,6 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use crate::fs::scan_context::{FileScanContext, FileScanRange};
-    use crate::thrift::types;
     use crate::types::PrimitiveType;
 
     use super::{
@@ -2706,7 +2705,7 @@ mod tests {
 
     fn test_parquet_scan_cfg(
         columns: Vec<String>,
-        slot_types: Vec<types::TPrimitiveType>,
+        slot_types: Vec<PrimitiveType>,
         iceberg_output_schema: Option<Schema>,
     ) -> ParquetScanConfig {
         let slot_ids = (0..columns.len())
@@ -2719,7 +2718,7 @@ mod tests {
                 .map(|(name, primitive)| {
                     let data_type =
                         crate::lower::common::type_mapping::arrow_type_from_native_primitive(
-                            test_native_primitive(primitive),
+                            primitive,
                         )
                         .expect("arrow type");
                     Field::new(name.clone(), data_type, true)
@@ -2737,7 +2736,7 @@ mod tests {
             slot_kinds: slot_types
                 .iter()
                 .map(|primitive| {
-                    if *primitive == types::TPrimitiveType::VARIANT {
+                    if *primitive == PrimitiveType::Variant {
                         ParquetSlotKind::Variant
                     } else {
                         ParquetSlotKind::Regular
@@ -2756,33 +2755,6 @@ mod tests {
             iceberg_output_schema: iceberg_output_schema.map(Arc::new),
             variant_path_columns: Vec::new(),
             query_global_dicts: Default::default(),
-        }
-    }
-
-    fn test_native_primitive(primitive: types::TPrimitiveType) -> PrimitiveType {
-        match primitive {
-            t if t == types::TPrimitiveType::BOOLEAN => PrimitiveType::Boolean,
-            t if t == types::TPrimitiveType::TINYINT => PrimitiveType::TinyInt,
-            t if t == types::TPrimitiveType::SMALLINT => PrimitiveType::SmallInt,
-            t if t == types::TPrimitiveType::INT => PrimitiveType::Int,
-            t if t == types::TPrimitiveType::BIGINT => PrimitiveType::BigInt,
-            t if t == types::TPrimitiveType::LARGEINT => PrimitiveType::LargeInt,
-            t if t == types::TPrimitiveType::FLOAT => PrimitiveType::Float,
-            t if t == types::TPrimitiveType::DOUBLE => PrimitiveType::Double,
-            t if t == types::TPrimitiveType::DATE => PrimitiveType::Date,
-            t if t == types::TPrimitiveType::DATETIME => PrimitiveType::DateTime,
-            t if t == types::TPrimitiveType::TIME => PrimitiveType::Time,
-            t if t == types::TPrimitiveType::CHAR => PrimitiveType::Char,
-            t if t == types::TPrimitiveType::VARCHAR => PrimitiveType::Varchar,
-            t if t == types::TPrimitiveType::BINARY => PrimitiveType::Binary,
-            t if t == types::TPrimitiveType::VARBINARY => PrimitiveType::Varbinary,
-            t if t == types::TPrimitiveType::JSON => PrimitiveType::Json,
-            t if t == types::TPrimitiveType::HLL => PrimitiveType::Hll,
-            t if t == types::TPrimitiveType::OBJECT => PrimitiveType::Object,
-            t if t == types::TPrimitiveType::PERCENTILE => PrimitiveType::Percentile,
-            t if t == types::TPrimitiveType::FUNCTION => PrimitiveType::Function,
-            t if t == types::TPrimitiveType::VARIANT => PrimitiveType::Variant,
-            other => panic!("unsupported parquet test primitive: {other:?}"),
         }
     }
 
@@ -3638,11 +3610,8 @@ mod tests {
         let file_path = temp_dir.path().join("dict_status_miss.parquet");
         write_status_parquet(&file_path, false);
 
-        let mut cfg = test_parquet_scan_cfg(
-            vec!["status".to_string()],
-            vec![types::TPrimitiveType::INT],
-            None,
-        );
+        let mut cfg =
+            test_parquet_scan_cfg(vec!["status".to_string()], vec![PrimitiveType::Int], None);
         let mut dict_values = HashMap::new();
         dict_values.insert(b"NEW".to_vec(), 11);
         cfg.query_global_dicts
@@ -3796,7 +3765,7 @@ mod tests {
         let batch = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["status".to_string()],
-                vec![types::TPrimitiveType::VARCHAR],
+                vec![PrimitiveType::Varchar],
                 None,
             ),
             &file_path,
@@ -3827,7 +3796,7 @@ mod tests {
         let batch = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["status".to_string()],
-                vec![types::TPrimitiveType::VARCHAR],
+                vec![PrimitiveType::Varchar],
                 Some(Schema::new(vec![field_with_id(
                     "status",
                     DataType::Utf8,
@@ -3854,7 +3823,7 @@ mod tests {
         let batch = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["status".to_string()],
-                vec![types::TPrimitiveType::VARCHAR],
+                vec![PrimitiveType::Varchar],
                 None,
             ),
             &file_path,
@@ -4054,7 +4023,7 @@ mod tests {
         let batch = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["new_id".to_string(), "payload".to_string()],
-                vec![types::TPrimitiveType::INT, types::TPrimitiveType::INT],
+                vec![PrimitiveType::Int, PrimitiveType::Int],
                 Some(target_schema),
             ),
             &file_path,
@@ -4102,11 +4071,7 @@ mod tests {
         let batch = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["value".to_string(), "id".to_string(), "extra".to_string()],
-                vec![
-                    types::TPrimitiveType::INT,
-                    types::TPrimitiveType::INT,
-                    types::TPrimitiveType::INT,
-                ],
+                vec![PrimitiveType::Int, PrimitiveType::Int, PrimitiveType::Int],
                 Some(target_schema),
             ),
             &file_path,
@@ -4162,7 +4127,7 @@ mod tests {
         let batch = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["id".to_string(), "note_text".to_string()],
-                vec![types::TPrimitiveType::INT, types::TPrimitiveType::VARCHAR],
+                vec![PrimitiveType::Int, PrimitiveType::Varchar],
                 Some(target_schema),
             ),
             &file_path,
@@ -4206,7 +4171,7 @@ mod tests {
         let batch = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["b".to_string(), "a".to_string()],
-                vec![types::TPrimitiveType::INT, types::TPrimitiveType::INT],
+                vec![PrimitiveType::Int, PrimitiveType::Int],
                 Some(target_schema),
             ),
             &file_path,
@@ -4273,7 +4238,7 @@ mod tests {
         let batch = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["payload".to_string()],
-                vec![types::TPrimitiveType::INVALID_TYPE],
+                vec![PrimitiveType::Invalid],
                 Some(target_schema),
             ),
             &file_path,
@@ -4433,7 +4398,7 @@ mod tests {
         let result = read_single_batch(
             test_parquet_scan_cfg(
                 vec!["a".to_string(), "b".to_string()],
-                vec![types::TPrimitiveType::INT, types::TPrimitiveType::INT],
+                vec![PrimitiveType::Int, PrimitiveType::Int],
                 Some(out_schema),
             ),
             &file_path,

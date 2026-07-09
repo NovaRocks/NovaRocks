@@ -797,7 +797,7 @@ fn parse_hdfs_scan_pruning_predicates(
     let mut predicates = HdfsScanPruningPredicates::default();
 
     for conjunct in min_max_conjuncts {
-        let parsed = crate::lower::common::min_max::parse_min_max_conjuncts_with_column_resolver(
+        let parsed = crate::lower::compat::expr::parse_min_max_conjuncts_with_column_resolver(
             conjunct,
             |slot_ref| {
                 let slot_id = SlotId::try_from(slot_ref.slot_id).map_err(|e| {

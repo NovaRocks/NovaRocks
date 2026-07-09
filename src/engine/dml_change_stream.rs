@@ -814,6 +814,12 @@ pub(crate) fn inject_dml_pre_expand_keyed_assert_into_native_plan(
             "DML change-stream keyed assert requires exactly one native ChangeEventExpand node, found {expand_count}"
         ));
     }
+    // Native plans are tree-structured and do not need the flat thrift TPlan
+    // preorder node-id invariant. Keep existing node ids in proto-only builds
+    // so scheduler metadata generated before this native-only mutation remains
+    // aligned with ExchangeReceiver node ids. Compat builds still renumber the
+    // native sidecar to match the separately renumbered thrift build result.
+    #[cfg(feature = "compat")]
     renumber_native_plan_node_ids_preserving_preorder(plan)?;
     Ok(())
 }
