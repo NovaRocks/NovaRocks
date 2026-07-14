@@ -660,6 +660,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(for_expr) = substring_for {
                     args.push(self.analyze_expr(for_expr, scope)?);
                 }
+                validate_substring_literal_int_args("substring", &args)?;
                 Ok(TypedExpr {
                     kind: ExprKind::FunctionCall {
                         name: "substring".to_string(),
@@ -2028,6 +2029,7 @@ impl<'a> super::AnalyzerContext<'a> {
         if is_aggregate_function(&name) {
             validate_aggregate_function_call(&name, &arg_types)?;
         } else {
+            validate_substring_literal_int_args(&name, &args_typed)?;
             validate_scalar_function_call_typed(&name, &args_typed)?;
         }
 
@@ -3519,6 +3521,31 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
         | "ltrim" | "repeat" | "reverse" | "right" | "rtrim" | "strleft" | "strright"
         | "substr" | "substring" | "trim" | "upper" => cast_utf8_args(args, &[0]),
         _ => false,
+    }
+}
+
+fn validate_substring_literal_int_args(name: &str, args: &[TypedExpr]) -> Result<(), String> {
+    if !matches!(name, "substr" | "substring") {
+        return Ok(());
+    }
+    for arg in args.iter().skip(1) {
+        if let Some(value) = constant_i64_value(arg)
+            && i32::try_from(value).is_err()
+        {
+            return Err(format!("Cast argument {value} to int type failed"));
+        }
+    }
+    Ok(())
+}
+
+fn constant_i64_value(expr: &TypedExpr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::Int(value)) => Some(*value),
+        ExprKind::UnaryOp {
+            op: UnOp::Negate,
+            expr: inner,
+        } => constant_i64_value(inner).and_then(i64::checked_neg),
+        _ => None,
     }
 }
 
