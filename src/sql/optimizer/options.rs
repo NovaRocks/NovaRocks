@@ -76,6 +76,12 @@ pub(crate) struct SessionOptimizerSettings {
     /// placing probe runtime filters across shuffle exchanges, for bisecting
     /// cross-fragment RF behavior.
     pub allow_cross_exchange_rf: Option<bool>,
+    /// Session override for the query-side MV rewrite bounded-staleness window
+    /// (seconds). `None` means "use each MV's own `query_rewrite_max_staleness_sec`
+    /// property" (which defaults to 0 = strict). `Some(0)` forces strict for the
+    /// whole session (overriding any MV property); `Some(n>0)` allows rewriting an
+    /// MV up to `n` seconds stale (measured by base snapshot commit-ts gap).
+    pub mv_rewrite_max_staleness_sec: Option<u64>,
 }
 
 impl SessionOptimizerSettings {
@@ -526,6 +532,12 @@ mod tests {
         settings.allow_cross_exchange_rf = Some(false);
         let opts = OptimizerOptions::from_session(&settings);
         assert!(!opts.allow_cross_exchange_rf);
+    }
+
+    #[test]
+    fn mv_rewrite_max_staleness_defaults_to_none() {
+        let s = SessionOptimizerSettings::default();
+        assert_eq!(s.mv_rewrite_max_staleness_sec, None);
     }
 
     #[test]
