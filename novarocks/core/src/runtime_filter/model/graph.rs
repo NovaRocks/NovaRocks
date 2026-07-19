@@ -43,12 +43,20 @@ pub(crate) struct RuntimeFilterChannelSpec {
 pub(crate) struct ProducerRequirement {
     pub contribution_kinds: BTreeSet<ContributionKind>,
     pub completion_requirement: CompletionRequirement,
+    pub join_key_ordinal: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConsumerBindingTarget {
+    DirectInput { input_ordinal: usize },
+    SourceBoundary,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConsumerRequirement {
     pub capabilities: BTreeSet<ArtifactCapability>,
     pub activation: ConsumerActivation,
+    pub target: ConsumerBindingTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,6 +324,7 @@ pub(super) mod tests {
             role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                 contribution_kinds,
                 completion_requirement,
+                join_key_ordinal: 0,
             }),
         }
     }
@@ -339,6 +348,7 @@ pub(super) mod tests {
             role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
                 capabilities,
                 activation,
+                target: ConsumerBindingTarget::SourceBoundary,
             }),
         }
     }

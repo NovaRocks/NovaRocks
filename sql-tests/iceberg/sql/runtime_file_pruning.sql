@@ -17,8 +17,9 @@
 
 -- @order_sensitive=true
 -- @tags=iceberg,runtime_filter
--- Validate that completed join runtime filters prune Iceberg data files before
--- HDFS scan morsel execution, while preserving join results.
+-- RFD-5B keeps native runtime-filter deployment deliberately dormant. Validate
+-- that the Iceberg join still preserves results and reports the dormant seam
+-- without claiming file-pruning side effects before RFD-6 installs artifacts.
 
 -- query 1
 -- @skip_result_check=true
@@ -91,13 +92,8 @@ ORDER BY p.k1;
 -- query 14
 -- @skip_result_check=true
 -- @result_contains=Profile: fragments=
--- @result_contains=ProfileCounters:
+-- @result_contains=RuntimeFilterDormancy: lookups_observed=true all_deployment_not_installed=true zero_side_effects=true same_backend_partial_completion=false
 -- @result_contains=HASH JOIN
--- @result_contains=IcebergRuntimeFilePruning/FilesTotal=2
--- @result_contains=IcebergRuntimeFilePruning/FilesSelected=1
--- @result_contains=IcebergRuntimeFilePruning/FilesPruned=1
--- @result_contains=IcebergRuntimeFilePruning/Predicates
--- @result_contains=IcebergRuntimeFilePruning/Unavailable=0
 EXPLAIN ANALYZE
 SELECT p.k1, p.payload
 FROM iceberg_cat_${suite_uuid0}.runtime_prune_db_${uuid0}.probe_${uuid0} p

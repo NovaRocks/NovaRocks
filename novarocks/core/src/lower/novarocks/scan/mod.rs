@@ -409,6 +409,9 @@ mod tests {
                             plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true),
                         ),
                     }),
+                    target: Some(plan::runtime_filter_consumer_role::Target::SourceBoundary(
+                        true,
+                    )),
                 },
             )),
         }

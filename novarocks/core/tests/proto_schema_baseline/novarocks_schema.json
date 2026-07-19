@@ -5056,6 +5056,20 @@
               "type_name": "RuntimeFilterConsumerActivation",
               "label": "singular",
               "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "direct_input_ordinal",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": "target"
+            },
+            "4": {
+              "number": 4,
+              "name": "source_boundary",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": "target"
             }
           },
           "reserved_numbers": [],
@@ -5196,6 +5210,13 @@
               "name": "completion_requirement",
               "type_name": "RuntimeFilterCompletionRequirement",
               "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "join_key_ordinal",
+              "type_name": "uint32",
+              "label": "optional",
               "oneof": null
             }
           },

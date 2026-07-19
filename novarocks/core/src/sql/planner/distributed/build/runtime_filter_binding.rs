@@ -25,8 +25,9 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
-    ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement, RuntimeFilterBindingRole,
-    RuntimeFilterBindingSpec, RuntimeFilterChannelSpec, RuntimeFilterGraph,
+    ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
+    RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+    RuntimeFilterGraph,
 };
 use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
@@ -57,12 +58,14 @@ pub(super) struct RuntimeFilterProbeBinding {
 pub(super) struct RuntimeFilterBindings {
     pub(super) builds: Vec<RuntimeFilterBuildBinding>,
     pub(super) probes: Vec<RuntimeFilterProbeBinding>,
+    pub(super) node_input_columns: BTreeMap<(FragmentId, i32), Vec<Vec<OutputColumn>>>,
 }
 
 #[derive(Clone)]
 pub(super) struct RuntimeFilterProducerCandidate {
     pub(super) location: PlanLocation,
     pub(super) expression: TypedExpr,
+    pub(super) join_key_ordinal: usize,
     pub(super) contribution_kinds: BTreeSet<ContributionKind>,
     pub(super) completion_requirement: CompletionRequirement,
 }
@@ -71,6 +74,7 @@ pub(super) struct RuntimeFilterProducerCandidate {
 pub(super) struct RuntimeFilterConsumerCandidate {
     pub(super) location: PlanLocation,
     pub(super) expression: TypedExpr,
+    pub(super) target: ConsumerBindingTarget,
     pub(super) capabilities: BTreeSet<ArtifactCapability>,
     pub(super) activation: ConsumerActivation,
 }
@@ -88,6 +92,7 @@ impl RuntimeFilterBindings {
         Self {
             builds: Vec::new(),
             probes: Vec::new(),
+            node_input_columns: BTreeMap::new(),
         }
     }
 
@@ -98,6 +103,14 @@ impl RuntimeFilterBindings {
         physical: &PhysicalPlanNode,
         distributed_payload: &DistributedNodeKind,
     ) {
+        self.node_input_columns.insert(
+            (fragment_id, node_id),
+            physical
+                .children
+                .iter()
+                .map(|child| child.output_columns.clone())
+                .collect(),
+        );
         for intent in &physical.probe_runtime_filters {
             self.probes.push(RuntimeFilterProbeBinding {
                 node_id,
@@ -178,6 +191,7 @@ pub(super) fn populate_runtime_filter_candidates(
                 role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                     contribution_kinds: candidate.producer.contribution_kinds,
                     completion_requirement: candidate.producer.completion_requirement,
+                    join_key_ordinal: candidate.producer.join_key_ordinal,
                 }),
             })
             .map_err(|error| {
@@ -210,6 +224,7 @@ pub(super) fn populate_runtime_filter_candidates(
                     role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
                         capabilities: consumer.capabilities,
                         activation: consumer.activation,
+                        target: consumer.target,
                     }),
                 })
                 .map_err(|error| {
@@ -262,7 +277,7 @@ pub(super) fn populate_runtime_filter_graph(
         let mut resolved_probes = Vec::new();
         let mut exact = true;
         for probe in probes {
-            match resolve_consumer_binding(fragments, probe) {
+            match resolve_consumer_binding(fragments, bindings, probe) {
                 Ok(mut resolved) => resolved_probes.append(&mut resolved),
                 Err(()) => {
                     exact = false;
@@ -316,6 +331,7 @@ pub(super) fn populate_runtime_filter_graph(
                     node_id: PlanNodeId::new(build.node_id),
                 },
                 expression: build.intent.build_expr.clone(),
+                join_key_ordinal: build.intent.expr_order,
                 contribution_kinds: contributions,
                 completion_requirement: CompletionRequirement::ProducerClosed,
             },
@@ -327,6 +343,7 @@ pub(super) fn populate_runtime_filter_graph(
                         node_id: PlanNodeId::new(probe.node_id),
                     },
                     expression: probe.expression,
+                    target: probe.target,
                     capabilities: capabilities.clone(),
                     activation: ConsumerActivation::BlockingSnapshot,
                 })
@@ -340,6 +357,7 @@ struct ResolvedConsumerBinding {
     node_id: i32,
     fragment_id: FragmentId,
     expression: TypedExpr,
+    target: ConsumerBindingTarget,
 }
 
 impl ResolvedConsumerBinding {
@@ -353,6 +371,7 @@ impl ResolvedConsumerBinding {
 
 fn resolve_consumer_binding(
     fragments: &[PlanFragment],
+    bindings: &RuntimeFilterBindings,
     probe: &RuntimeFilterProbeBinding,
 ) -> Result<Vec<ResolvedConsumerBinding>, ()> {
     let node = find_node(fragments, probe.fragment_id, probe.node_id).ok_or(())?;
@@ -363,11 +382,8 @@ fn resolve_consumer_binding(
                 .iter()
                 .map(|item| (item.output_column_id, item.expr.clone()))
                 .collect::<BTreeMap<_, _>>();
-            Ok(vec![ResolvedConsumerBinding {
-                node_id: node.node_id,
-                fragment_id: node.fragment_id,
-                expression: rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?,
-            }])
+            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
+            Ok(vec![resolved_consumer_binding(bindings, node, expression)?])
         }
         DistributedNodeKind::HashAggregate(aggregate) => {
             let referenced = expression_column_ids(&probe.intent.probe_expr);
@@ -388,11 +404,8 @@ fn resolve_consumer_binding(
                 .zip(&aggregate.group_by)
                 .map(|(column, expression)| (column.column_id, expression.clone()))
                 .collect::<BTreeMap<_, _>>();
-            Ok(vec![ResolvedConsumerBinding {
-                node_id: node.node_id,
-                fragment_id: node.fragment_id,
-                expression: rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?,
-            }])
+            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
+            Ok(vec![resolved_consumer_binding(bindings, node, expression)?])
         }
         DistributedNodeKind::SetOp(set_op)
             if matches!(
@@ -418,11 +431,8 @@ fn resolve_consumer_binding(
                         exact_column_mapping(output, input).map(|expr| (output.column_id, expr))
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?;
-                resolved.push(ResolvedConsumerBinding {
-                    node_id: child.node_id,
-                    fragment_id: child.fragment_id,
-                    expression: rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?,
-                });
+                let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
+                resolved.push(resolved_consumer_binding(bindings, child, expression)?);
             }
             Ok(resolved)
         }
@@ -442,18 +452,67 @@ fn resolve_consumer_binding(
                     exact_column_mapping(output, input).map(|expr| (output.column_id, expr))
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?;
-            Ok(vec![ResolvedConsumerBinding {
-                node_id: source.root.node_id,
-                fragment_id: source.fragment_id,
-                expression: rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?,
-            }])
+            let expression = rewrite_expr_by_column(&probe.intent.probe_expr, &replacements)?;
+            Ok(vec![resolved_consumer_binding(
+                bindings,
+                &source.root,
+                expression,
+            )?])
         }
-        _ => Ok(vec![ResolvedConsumerBinding {
-            node_id: probe.node_id,
-            fragment_id: probe.fragment_id,
-            expression: probe.intent.probe_expr.clone(),
-        }]),
+        _ => Ok(vec![resolved_consumer_binding(
+            bindings,
+            node,
+            probe.intent.probe_expr.clone(),
+        )?]),
     }
+}
+
+fn resolved_consumer_binding(
+    bindings: &RuntimeFilterBindings,
+    node: &DistributedNode,
+    expression: TypedExpr,
+) -> Result<ResolvedConsumerBinding, ()> {
+    let target = if node.children.is_empty() {
+        ConsumerBindingTarget::SourceBoundary
+    } else {
+        let inputs = bindings
+            .node_input_columns
+            .get(&(node.fragment_id, node.node_id))
+            .ok_or(())?;
+        if inputs.len() != node.children.len() {
+            return Err(());
+        }
+        let referenced = expression_column_ids(&expression);
+        if referenced.is_empty() {
+            return Err(());
+        }
+        let matches = inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(input_ordinal, columns)| {
+                let available = columns
+                    .iter()
+                    .map(|column| column.column_id)
+                    .collect::<BTreeSet<_>>();
+                referenced
+                    .iter()
+                    .all(|column_id| available.contains(column_id))
+                    .then_some(input_ordinal)
+            })
+            .collect::<Vec<_>>();
+        let [input_ordinal] = matches.as_slice() else {
+            return Err(());
+        };
+        ConsumerBindingTarget::DirectInput {
+            input_ordinal: *input_ordinal,
+        }
+    };
+    Ok(ResolvedConsumerBinding {
+        node_id: node.node_id,
+        fragment_id: node.fragment_id,
+        expression,
+        target,
+    })
 }
 
 fn find_node(
@@ -876,12 +935,14 @@ mod tests {
                     producer: RuntimeFilterProducerCandidate {
                         location: location(1),
                         expression: expression(),
+                        join_key_ordinal: 0,
                         contribution_kinds: topn_contributions,
                         completion_requirement: CompletionRequirement::ProducerClosed,
                     },
                     consumers: vec![RuntimeFilterConsumerCandidate {
                         location: location(2),
                         expression: expression(),
+                        target: ConsumerBindingTarget::SourceBoundary,
                         capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
                         activation: live,
                     }],
@@ -908,6 +969,7 @@ mod tests {
                     producer: RuntimeFilterProducerCandidate {
                         location: location(1),
                         expression: expression(),
+                        join_key_ordinal: 0,
                         contribution_kinds: aggregate_contributions,
                         completion_requirement: CompletionRequirement::FencedFinalDomain(
                             CompletionFenceKind::CommittedDomainFrozen,
@@ -916,6 +978,7 @@ mod tests {
                     consumers: vec![RuntimeFilterConsumerCandidate {
                         location: location(2),
                         expression: expression(),
+                        target: ConsumerBindingTarget::SourceBoundary,
                         capabilities: BTreeSet::from([
                             ArtifactCapability::Membership,
                             ArtifactCapability::EmptyDomain,
@@ -982,8 +1045,13 @@ mod tests {
             vec![values_node(2, 0)],
         );
         let fragments = vec![fragment(0, project, vec![column(9, "projected")])];
+        let mut bindings = RuntimeFilterBindings::new();
+        bindings
+            .node_input_columns
+            .insert((0, 1), vec![vec![column(1, "input")]]);
         let resolved = resolve_consumer_binding(
             &fragments,
+            &bindings,
             &RuntimeFilterProbeBinding {
                 node_id: 1,
                 fragment_id: 0,
@@ -1025,6 +1093,10 @@ mod tests {
             aggregate,
             vec![column(9, "group_key"), column(10, "aggregate_value")],
         )];
+        let mut bindings = RuntimeFilterBindings::new();
+        bindings
+            .node_input_columns
+            .insert((0, 1), vec![vec![column(1, "input_key")]]);
         let probe = |column_id, name| RuntimeFilterProbeBinding {
             node_id: 1,
             fragment_id: 0,
@@ -1033,13 +1105,15 @@ mod tests {
                 probe_expr: column_expression(column_id, name),
             },
         };
-        let group = resolve_consumer_binding(&fragments, &probe(9, "group_key"))
+        let group = resolve_consumer_binding(&fragments, &bindings, &probe(9, "group_key"))
             .expect("group key resolves");
         assert_eq!(
             expression_column_ids(&group[0].expression),
             vec![ColumnId::new_for_test(1)]
         );
-        assert!(resolve_consumer_binding(&fragments, &probe(10, "aggregate_value")).is_err());
+        assert!(
+            resolve_consumer_binding(&fragments, &bindings, &probe(10, "aggregate_value")).is_err()
+        );
     }
 
     #[test]
@@ -1058,8 +1132,10 @@ mod tests {
             vec![values_node(2, 0), values_node(3, 0)],
         );
         let fragments = vec![fragment(0, union, vec![column(9, "union_key")])];
+        let bindings = RuntimeFilterBindings::new();
         let resolved = resolve_consumer_binding(
             &fragments,
+            &bindings,
             &RuntimeFilterProbeBinding {
                 node_id: 1,
                 fragment_id: 0,
@@ -1104,8 +1180,10 @@ mod tests {
             Vec::new(),
         );
         let target = fragment(1, exchange, vec![column(9, "exchange_key")]);
+        let bindings = RuntimeFilterBindings::new();
         let resolved = resolve_consumer_binding(
             &[source, target],
+            &bindings,
             &RuntimeFilterProbeBinding {
                 node_id: 1,
                 fragment_id: 1,

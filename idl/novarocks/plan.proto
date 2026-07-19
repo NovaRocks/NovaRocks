@@ -250,11 +250,16 @@ message RuntimeFilterTopKReduction {
 message RuntimeFilterProducerRole {
   repeated RuntimeFilterContributionKind contribution_kinds = 1;
   RuntimeFilterCompletionRequirement completion_requirement = 2;
+  optional uint32 join_key_ordinal = 3;
 }
 
 message RuntimeFilterConsumerRole {
   repeated RuntimeFilterArtifactCapability capabilities = 1;
   RuntimeFilterConsumerActivation activation = 2;
+  oneof target {
+    uint32 direct_input_ordinal = 3;
+    bool source_boundary = 4;
+  }
 }
 
 enum RuntimeFilterContributionKind {

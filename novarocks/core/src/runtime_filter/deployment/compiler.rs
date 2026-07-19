@@ -434,6 +434,7 @@ mod tests {
                     ContributionKind::ProducerClosed,
                 ]),
                 completion_requirement: CompletionRequirement::ProducerClosed,
+                join_key_ordinal: 0,
             }),
         }
     }
@@ -479,6 +480,7 @@ mod tests {
                     ArtifactCapability::EmptyDomain,
                 ]),
                 activation,
+                target: crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
             }),
         }
     }

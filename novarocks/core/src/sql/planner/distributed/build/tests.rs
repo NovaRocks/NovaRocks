@@ -779,6 +779,14 @@ fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
 
     assert_eq!((producers.len(), consumers.len()), (2, 2));
     assert_eq!(join_node.runtime_filter_binding_ids.len(), 2);
+    let producer_key_ordinals = producers
+        .iter()
+        .map(|binding| match &binding.role {
+            RuntimeFilterBindingRole::Producer(requirement) => requirement.join_key_ordinal,
+            RuntimeFilterBindingRole::Consumer(_) => unreachable!("filtered above"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(producer_key_ordinals, vec![0, 1]);
     assert_column_ref(&consumers[0].expression, 1, "probe_1");
     assert_column_ref(&consumers[1].expression, 2, "probe_2");
 }
@@ -848,10 +856,15 @@ fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
     let binding = graph
         .binding(filter.runtime_filter_binding_ids[0])
         .expect("filter consumer binding");
-    assert!(matches!(
-        binding.role,
-        RuntimeFilterBindingRole::Consumer(_)
-    ));
+    let RuntimeFilterBindingRole::Consumer(requirement) = &binding.role else {
+        panic!("filter binding must be a consumer");
+    };
+    assert_eq!(
+        requirement.target,
+        crate::runtime_filter::model::graph::ConsumerBindingTarget::DirectInput {
+            input_ordinal: 0,
+        }
+    );
     assert_column_ref(&binding.expression, 1, "l_k");
     assert_eq!(binding.location.fragment_id.get(), join_node.fragment_id);
     let scan = &filter.children[0];
@@ -882,6 +895,7 @@ fn populate_runtime_filter_graph_deduplicates_and_skips_incomplete_channels() {
         &RuntimeFilterBindings {
             builds: build_bindings,
             probes: probe_bindings,
+            node_input_columns: std::collections::BTreeMap::new(),
         },
     )
     .expect("populate graph");

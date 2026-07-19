@@ -75,6 +75,7 @@ fn encode_runtime_filter_binding(
         PreparedRuntimeFilterBindingRole::Producer {
             contribution_kinds,
             completion_requirement,
+            join_key_ordinal,
         } => plan::runtime_filter_binding::Role::Producer(plan::RuntimeFilterProducerRole {
             contribution_kinds: contribution_kinds
                 .iter()
@@ -82,10 +83,17 @@ fn encode_runtime_filter_binding(
                 .map(encode_runtime_filter_contribution_kind)
                 .collect(),
             completion_requirement: encode_runtime_filter_completion(*completion_requirement),
+            join_key_ordinal: Some(u32::try_from(*join_key_ordinal).map_err(|_| {
+                format!(
+                    "runtime-filter binding_id={} join key ordinal does not fit u32",
+                    binding.binding_id().get()
+                )
+            })?),
         }),
         PreparedRuntimeFilterBindingRole::Consumer {
             capabilities,
             activation,
+            target,
         } => plan::runtime_filter_binding::Role::Consumer(plan::RuntimeFilterConsumerRole {
             capabilities: capabilities
                 .iter()
@@ -93,6 +101,21 @@ fn encode_runtime_filter_binding(
                 .map(encode_runtime_filter_capability)
                 .collect(),
             activation: Some(encode_runtime_filter_activation(*activation)),
+            target: Some(match target {
+                crate::runtime_filter::model::graph::ConsumerBindingTarget::DirectInput {
+                    input_ordinal,
+                } => plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(
+                    u32::try_from(*input_ordinal).map_err(|_| {
+                        format!(
+                            "runtime-filter binding_id={} input ordinal does not fit u32",
+                            binding.binding_id().get()
+                        )
+                    })?,
+                ),
+                crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary => {
+                    plan::runtime_filter_consumer_role::Target::SourceBoundary(true)
+                }
+            }),
         }),
     });
     Ok(plan::RuntimeFilterBinding {

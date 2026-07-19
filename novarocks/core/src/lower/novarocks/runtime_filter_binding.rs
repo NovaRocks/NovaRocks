@@ -54,11 +54,19 @@ pub(crate) enum DecodedBindingRole {
     Producer {
         contribution_kinds: BTreeSet<ContributionKind>,
         completion_requirement: CompletionRequirement,
+        join_key_ordinal: usize,
     },
     Consumer {
         capabilities: BTreeSet<ArtifactCapability>,
         activation: ConsumerActivation,
+        target: DecodedConsumerBindingTarget,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodedConsumerBindingTarget {
+    DirectInput { input_ordinal: usize },
+    SourceBoundary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -528,9 +536,20 @@ fn decode_role(
                 plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen => CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
                 plan::RuntimeFilterCompletionRequirement::Unspecified => return Err(format!("native runtime-filter binding_id={binding_id} unspecified completion requirement")),
             };
+            let join_key_ordinal = usize::try_from(producer.join_key_ordinal.ok_or_else(|| {
+                format!(
+                    "native runtime-filter producer binding_id={binding_id} missing join_key_ordinal"
+                )
+            })?)
+            .map_err(|_| {
+                format!(
+                    "native runtime-filter producer binding_id={binding_id} join_key_ordinal does not fit usize"
+                )
+            })?;
             Ok(DecodedBindingRole::Producer {
                 contribution_kinds,
                 completion_requirement,
+                join_key_ordinal,
             })
         }
         plan::runtime_filter_binding::Role::Consumer(consumer) => {
@@ -577,9 +596,33 @@ fn decode_role(
                     plan::RuntimeFilterLateApplyGranularity::Unspecified => return Err(format!("native runtime-filter binding_id={binding_id} unspecified late-apply granularity")),
                 }},
             };
+            let target = match consumer.target.as_ref().ok_or_else(|| {
+                format!(
+                    "native runtime-filter consumer binding_id={binding_id} missing target"
+                )
+            })? {
+                plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(raw) => {
+                    DecodedConsumerBindingTarget::DirectInput {
+                        input_ordinal: usize::try_from(*raw).map_err(|_| {
+                            format!(
+                                "native runtime-filter consumer binding_id={binding_id} input ordinal does not fit usize"
+                            )
+                        })?,
+                    }
+                }
+                plan::runtime_filter_consumer_role::Target::SourceBoundary(true) => {
+                    DecodedConsumerBindingTarget::SourceBoundary
+                }
+                plan::runtime_filter_consumer_role::Target::SourceBoundary(false) => {
+                    return Err(format!(
+                        "native runtime-filter consumer binding_id={binding_id} source boundary marker must be true"
+                    ));
+                }
+            };
             Ok(DecodedBindingRole::Consumer {
                 capabilities,
                 activation,
+                target,
             })
         }
     }
@@ -643,6 +686,7 @@ fn validate_role_contract(
         DecodedBindingRole::Producer {
             contribution_kinds,
             completion_requirement,
+            ..
         } => {
             let (expected, expected_completion) = match reduction {
                 DecodedRuntimeFilterReduction::SetUnion
@@ -775,9 +819,24 @@ mod tests {
                             plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true),
                         ),
                     }),
+                    target: Some(plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(0)),
                 },
             )),
         }
+    }
+
+    #[test]
+    fn binding_table_decode_requires_exact_consumer_target() {
+        let mut missing_target = membership_binding(1, 11);
+        let Some(plan::runtime_filter_binding::Role::Consumer(role)) = missing_target.role.as_mut()
+        else {
+            panic!("consumer")
+        };
+        role.target = None;
+        assert!(
+            RuntimeFilterBindingLookupLedger::decode(7, Some(&table(7, vec![missing_target])),)
+                .is_err()
+        );
     }
 
     fn table(
@@ -873,6 +932,7 @@ mod tests {
                             ),
                         ),
                     }),
+                    target: Some(plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(0)),
                 },
             )),
         }
@@ -1103,6 +1163,7 @@ mod tests {
                 completion_requirement: i32::from(
                     plan::RuntimeFilterCompletionRequirement::ProducerClosed,
                 ),
+                join_key_ordinal: Some(0),
             },
         ));
         assert!(
@@ -1157,6 +1218,7 @@ mod tests {
             plan::runtime_filter_binding::Role::Producer(plan::RuntimeFilterProducerRole {
                 contribution_kinds: kinds,
                 completion_requirement: i32::from(completion),
+                join_key_ordinal: Some(0),
             })
         };
         let mut extra_producer_kind = membership_binding(1, 11);
@@ -1241,6 +1303,7 @@ mod tests {
                 completion_requirement: i32::from(
                     plan::RuntimeFilterCompletionRequirement::ProducerClosed,
                 ),
+                join_key_ordinal: Some(0),
             },
         ));
         let mut ledger =

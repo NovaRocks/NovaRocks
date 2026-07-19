@@ -44,8 +44,8 @@ use self::common::*;
 
 use super::layout::Layout;
 use super::runtime_filter_binding::{
-    DecodedBindingRole, DecodedRuntimeFilterBinding, DecodedRuntimeFilterContract,
-    DecodedRuntimeFilterReduction, RuntimeFilterBindingLookupLedger,
+    DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
+    DecodedRuntimeFilterContract, DecodedRuntimeFilterReduction, RuntimeFilterBindingLookupLedger,
 };
 use crate::common::types::UniqueId;
 use crate::exec::chunk::ChunkSchemaRef;
@@ -255,32 +255,32 @@ fn attach_direct_input_consumers(
     children: &mut [LoweredNode],
     arena: &mut ExprArena,
 ) -> Result<(), String> {
-    let clean_checkpoint = arena.clone();
     let mut grouped = BTreeMap::<usize, Vec<NativeRuntimeFilterConsumerSpec>>::new();
     for binding in bindings {
-        let mut candidates = Vec::new();
-        for (index, child) in children.iter().enumerate() {
-            let mut scratch = clean_checkpoint.clone();
-            if lower_binding_expression(binding, &child.layout, &child.output_schema, &mut scratch)
-                .is_ok()
-            {
-                candidates.push(index);
-            }
-        }
-        if candidates.len() != 1 {
+        let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
             return Err(format!(
-                "native runtime-filter consumer binding_id={} on node_id={owner_node_id} must match exactly one direct input, matched {}",
-                binding.binding_id,
-                candidates.len()
+                "native runtime-filter binding_id={} expected consumer role",
+                binding.binding_id
             ));
-        }
-        let index = candidates[0];
-        let expr_id = lower_binding_expression(
-            binding,
-            &children[index].layout,
-            &children[index].output_schema,
-            arena,
-        )?;
+        };
+        let DecodedConsumerBindingTarget::DirectInput {
+            input_ordinal: index,
+        } = *target
+        else {
+            return Err(format!(
+                "native runtime-filter consumer binding_id={} on node_id={owner_node_id} must target a direct input",
+                binding.binding_id
+            ));
+        };
+        let child = children.get(index).ok_or_else(|| {
+            format!(
+                "native runtime-filter consumer binding_id={} on node_id={owner_node_id} targets missing direct input ordinal={index}, input_count={}",
+                binding.binding_id,
+                children.len()
+            )
+        })?;
+        let expr_id =
+            lower_binding_expression(binding, &child.layout, &child.output_schema, arena)?;
         grouped
             .entry(index)
             .or_default()
@@ -306,6 +306,20 @@ fn attach_leaf_consumers(
     lowered: &mut LoweredNode,
     arena: &mut ExprArena,
 ) -> Result<(), String> {
+    for binding in bindings {
+        let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
+            return Err(format!(
+                "native runtime-filter binding_id={} expected consumer role",
+                binding.binding_id
+            ));
+        };
+        if *target != DecodedConsumerBindingTarget::SourceBoundary {
+            return Err(format!(
+                "native runtime-filter consumer binding_id={} on leaf node_id={} must target source boundary",
+                binding.binding_id, wire_node.node_id
+            ));
+        }
+    }
     let specs = bindings
         .iter()
         .map(|binding| {
@@ -448,6 +462,7 @@ fn attach_hash_join_producers(
         let DecodedBindingRole::Producer {
             contribution_kinds,
             completion_requirement,
+            join_key_ordinal,
         } = &binding.role
         else {
             return Err(format!(
@@ -455,40 +470,38 @@ fn attach_hash_join_producers(
                 binding.binding_id
             ));
         };
-        let matches = wire_join
-            .eq_conditions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, condition)| {
-                if condition.null_safe {
-                    return None;
-                }
-                let raw_build = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
-                    condition.left.as_ref()
-                } else {
-                    condition.right.as_ref()
-                }?;
-                if raw_build != &binding.expression {
-                    return None;
-                }
-                validate_column_refs_exact(
-                    binding.binding_id,
-                    raw_build,
-                    build_layout,
-                    build_schema,
-                )
-                .ok()?;
-                Some(index)
-            })
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(format!(
-                "native runtime-filter producer binding_id={} must match exactly one non-null-safe raw build expression, matched {}",
+        let build_key_index = *join_key_ordinal;
+        let condition = wire_join.eq_conditions.get(build_key_index).ok_or_else(|| {
+            format!(
+                "native runtime-filter producer binding_id={} targets missing join key ordinal={build_key_index}, key_count={}",
                 binding.binding_id,
-                matches.len()
+                wire_join.eq_conditions.len()
+            )
+        })?;
+        if condition.null_safe {
+            return Err(format!(
+                "native runtime-filter producer binding_id={} targets null-safe join key ordinal={build_key_index}",
+                binding.binding_id
             ));
         }
-        let build_key_index = matches[0];
+        let raw_build = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
+            condition.left.as_ref()
+        } else {
+            condition.right.as_ref()
+        }
+        .ok_or_else(|| {
+            format!(
+                "native runtime-filter producer binding_id={} join key ordinal={build_key_index} missing build expression",
+                binding.binding_id
+            )
+        })?;
+        if raw_build != &binding.expression {
+            return Err(format!(
+                "native runtime-filter producer binding_id={} expression does not match join key ordinal={build_key_index}",
+                binding.binding_id
+            ));
+        }
+        validate_column_refs_exact(binding.binding_id, raw_build, build_layout, build_schema)?;
         let build_expr_id = lower_binding_expression(binding, build_layout, build_schema, arena)?;
         producers.push(NativeJoinRuntimeFilterProducerSpec {
             binding_id: binding.binding_id,
@@ -513,6 +526,7 @@ fn consumer_spec(
     let DecodedBindingRole::Consumer {
         capabilities,
         activation,
+        ..
     } = &binding.role
     else {
         return Err(format!(
@@ -1147,6 +1161,7 @@ mod tests {
                 ]),
                 activation:
                     crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
+                target: DecodedConsumerBindingTarget::DirectInput { input_ordinal: 0 },
             },
             contract: DecodedRuntimeFilterContract::Membership {
                 canonical_schema: Arc::from([]),
@@ -1156,11 +1171,34 @@ mod tests {
         }
     }
 
+    fn dormant_source_consumer(
+        binding_id: u32,
+        node_id: i32,
+        column_id: u32,
+    ) -> DecodedRuntimeFilterBinding {
+        let mut binding = dormant_consumer(binding_id, node_id, column_id);
+        let DecodedBindingRole::Consumer { target, .. } = &mut binding.role else {
+            unreachable!("dormant_consumer always returns a consumer")
+        };
+        *target = DecodedConsumerBindingTarget::SourceBoundary;
+        binding
+    }
+
     fn membership_producer_wire(
         binding_id: u32,
         node_id: i32,
         expression: expr::Expr,
         data_type: &DataType,
+    ) -> plan::RuntimeFilterBinding {
+        membership_producer_wire_at(binding_id, node_id, expression, data_type, 0)
+    }
+
+    fn membership_producer_wire_at(
+        binding_id: u32,
+        node_id: i32,
+        expression: expr::Expr,
+        data_type: &DataType,
+        join_key_ordinal: u32,
     ) -> plan::RuntimeFilterBinding {
         let schema = crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new(
             data_type,
@@ -1195,6 +1233,7 @@ mod tests {
                     completion_requirement: i32::from(
                         plan::RuntimeFilterCompletionRequirement::ProducerClosed,
                     ),
+                    join_key_ordinal: Some(join_key_ordinal),
                 },
             )),
         }
@@ -1397,6 +1436,72 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_raw_build_keys_are_disambiguated_by_join_key_ordinal() {
+        let left = one_col_values_node_with(10, 1, "lhs", 10);
+        let right = one_col_values_node_with(11, 2, "rhs", 20);
+        let condition = plan::HashJoinEqCondition {
+            left: Some(column_ref(1, DataType::Int64)),
+            right: Some(column_ref(2, DataType::Int64)),
+            null_safe: false,
+        };
+        let mut wire = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: i32::from(plan::JoinKind::Inner),
+                eq_conditions: vec![condition.clone(), condition],
+                other_condition: None,
+                distribution: i32::from(plan::JoinDistribution::Broadcast),
+                execution_mode: None,
+            }),
+            Vec::new(),
+            vec![left, right],
+        );
+        wire.runtime_filter_binding_ids = vec![1, 2];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![
+                membership_producer_wire_at(
+                    1,
+                    30,
+                    column_ref(2, DataType::Int64),
+                    &DataType::Int64,
+                    0,
+                ),
+                membership_producer_wire_at(
+                    2,
+                    30,
+                    column_ref(2, DataType::Int64),
+                    &DataType::Int64,
+                    1,
+                ),
+            ],
+        };
+        let mut ledger = RuntimeFilterBindingLookupLedger::decode(1, Some(&table))
+            .expect("decode duplicate-key producer table");
+        let lowered = lower_proto_node_with_bindings(
+            &wire,
+            &mut ExprArena::default(),
+            &NodeLoweringContext::default(),
+            &mut ledger,
+        )
+        .expect("exact ordinals disambiguate duplicate raw build keys");
+        ledger.finish().expect("both producer bindings consumed");
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
+            panic!("producer seam")
+        };
+        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
+            panic!("native producer execution")
+        };
+        assert_eq!(
+            producers
+                .iter()
+                .map(|binding| binding.build_key_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
     fn producer_rejects_nested_intermediate_nullability_mismatch() {
         let raw_build = cast_expr(
             cast_expr(column_ref(2, DataType::Int64), DataType::Int64, true),
@@ -1475,7 +1580,7 @@ mod tests {
         };
         attach_leaf_consumers(
             &wire,
-            &[dormant_consumer(1, 10, 1)],
+            &[dormant_source_consumer(1, 10, 1)],
             &mut lowered,
             &mut ExprArena::default(),
         )
@@ -1519,7 +1624,7 @@ mod tests {
         };
         attach_leaf_consumers(
             &wire,
-            &[dormant_consumer(1, 10, 1)],
+            &[dormant_source_consumer(1, 10, 1)],
             &mut lowered,
             &mut ExprArena::default(),
         )
@@ -1559,8 +1664,11 @@ mod tests {
         ));
         assert!(matches!(children[1].node.kind, ExecNodeKind::Values(_)));
 
-        let mut ambiguous = dormant_consumer(2, 20, 1);
-        ambiguous.expression = int_literal(1);
+        let mut missing_input = dormant_consumer(2, 20, 1);
+        let DecodedBindingRole::Consumer { target, .. } = &mut missing_input.role else {
+            unreachable!("consumer")
+        };
+        *target = DecodedConsumerBindingTarget::DirectInput { input_ordinal: 2 };
         let mut children = vec![
             lower(&one_col_values_node(10)),
             lower(&one_col_values_node(11)),
@@ -1568,7 +1676,7 @@ mod tests {
         assert!(
             attach_direct_input_consumers(
                 20,
-                &[ambiguous],
+                &[missing_input],
                 &mut children,
                 &mut ExprArena::default()
             )
@@ -1625,7 +1733,7 @@ mod tests {
         let mut lowered = lower(&wire);
         attach_leaf_consumers(
             &wire,
-            &[dormant_consumer(1, 10, 1)],
+            &[dormant_source_consumer(1, 10, 1)],
             &mut lowered,
             &mut ExprArena::default(),
         )
@@ -1652,7 +1760,7 @@ mod tests {
             Vec::new(),
         );
         let mut lowered = lower(&wire);
-        let mut binding = dormant_consumer(1, 10, 1);
+        let mut binding = dormant_source_consumer(1, 10, 1);
         binding.expression.nullable = false;
         attach_leaf_consumers(&wire, &[binding], &mut lowered, &mut ExprArena::default())
             .expect("generate series source boundary");
@@ -1677,7 +1785,7 @@ mod tests {
         assert!(
             attach_leaf_consumers(
                 &wire,
-                &[dormant_consumer(1, 10, 1)],
+                &[dormant_source_consumer(1, 10, 1)],
                 &mut lowered,
                 &mut ExprArena::default(),
             )

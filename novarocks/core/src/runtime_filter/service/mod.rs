@@ -1957,6 +1957,7 @@ mod tests {
                     completion_requirement: CompletionRequirement::FencedFinalDomain(
                         CompletionFenceKind::CommittedDomainFrozen,
                     ),
+                    join_key_ordinal: 0,
                 }),
             })
             .unwrap();
@@ -1979,6 +1980,8 @@ mod tests {
                     activation: ConsumerActivation::NonBlockingLive {
                         late_apply: LateApplyGranularity::Batch,
                     },
+                    target:
+                        crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
                 }),
             })
             .unwrap();
@@ -2080,6 +2083,7 @@ mod tests {
                 role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                     contribution_kinds: contributions,
                     completion_requirement: CompletionRequirement::ProducerClosed,
+                    join_key_ordinal: 0,
                 }),
             })
             .unwrap();
@@ -2097,6 +2101,8 @@ mod tests {
                 role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
                     capabilities,
                     activation: ConsumerActivation::BlockingSnapshot,
+                    target:
+                        crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
                 }),
             })
             .unwrap();

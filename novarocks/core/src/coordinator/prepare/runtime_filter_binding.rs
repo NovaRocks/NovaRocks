@@ -25,7 +25,8 @@ use crate::runtime_filter::model::contract::{
     RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::graph::{
-    ApplyPoint, RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterGraph,
+    ApplyPoint, ConsumerBindingTarget, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
+    RuntimeFilterGraph,
 };
 use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ArtifactSchemaDigest};
 use crate::runtime_filter::port::ordered_bound::{
@@ -142,10 +143,12 @@ pub(crate) enum PreparedRuntimeFilterBindingRole {
     Producer {
         contribution_kinds: BTreeSet<ContributionKind>,
         completion_requirement: CompletionRequirement,
+        join_key_ordinal: usize,
     },
     Consumer {
         capabilities: BTreeSet<ArtifactCapability>,
         activation: ConsumerActivation,
+        target: ConsumerBindingTarget,
     },
 }
 
@@ -249,12 +252,14 @@ pub(super) fn materialize_runtime_filter_binding_tables(
                     PreparedRuntimeFilterBindingRole::Producer {
                         contribution_kinds: requirement.contribution_kinds.clone(),
                         completion_requirement: requirement.completion_requirement,
+                        join_key_ordinal: requirement.join_key_ordinal,
                     }
                 }
                 RuntimeFilterBindingRole::Consumer(requirement) => {
                     PreparedRuntimeFilterBindingRole::Consumer {
                         capabilities: requirement.capabilities.clone(),
                         activation: requirement.activation,
+                        target: requirement.target,
                     }
                 }
             };
@@ -583,6 +588,7 @@ mod tests {
             role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                 contribution_kinds,
                 completion_requirement: CompletionRequirement::ProducerClosed,
+                join_key_ordinal: 0,
             }),
         }
     }
@@ -611,6 +617,7 @@ mod tests {
                 activation: ConsumerActivation::NonBlockingLive {
                     late_apply: LateApplyGranularity::Batch,
                 },
+                target: crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
             }),
         }
     }
