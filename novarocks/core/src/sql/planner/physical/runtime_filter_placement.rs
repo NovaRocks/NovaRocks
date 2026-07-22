@@ -16,7 +16,7 @@ use crate::sql::planner::physical::runtime_filter::{
 };
 use crate::sql::planner::physical::{
     JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
-    PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, RedistributeMode,
+    PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlanSetOpKind, RedistributeMode,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -374,6 +374,8 @@ fn bind_expression_to_columns(
 ) -> Option<TypedExpr> {
     // Runtime-filter bindings are applied at NodeInput, so every ColumnRef leaf
     // must carry the exact type and nullability of that direct-input schema.
+    // Keep the logical display name intact: distributed boundary rewrites own
+    // the final DirectInput expression and its execution-facing column names.
     let mut columns_by_id = HashMap::with_capacity(columns.len());
     for column in columns {
         if columns_by_id.insert(column.column_id, column).is_some() {
@@ -387,14 +389,11 @@ fn bind_expression_to_columns(
     ) -> Option<TypedExpr> {
         let mut bound = expression.clone();
         match &mut bound.kind {
-            ExprKind::ColumnRef {
-                column_id, column, ..
-            } => {
+            ExprKind::ColumnRef { column_id, .. } => {
                 let input = columns_by_id.get(column_id)?;
                 if expression.data_type != input.data_type {
                     return None;
                 }
-                *column = input.name.clone();
                 bound.nullable = input.nullable;
             }
             ExprKind::BinaryOp { left, right, .. } => {
@@ -543,6 +542,14 @@ fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
     )
 }
 
+fn distributed_builder_rewrites_probe_output(node: &PhysicalPlanNode) -> bool {
+    match &node.kind {
+        PhysicalPlanKind::Project(_) | PhysicalPlanKind::HashAggregate(_) => true,
+        PhysicalPlanKind::SetOp(set_op) => matches!(set_op.kind, PlanSetOpKind::UnionAll),
+        _ => false,
+    }
+}
+
 fn place_probe(node: &mut PhysicalPlanNode, filter_id: i32, members: &[TypedExpr]) -> bool {
     let bindable: Vec<TypedExpr> = if node.children.is_empty() {
         members
@@ -553,8 +560,15 @@ fn place_probe(node: &mut PhysicalPlanNode, filter_id: i32, members: &[TypedExpr
         members
             .iter()
             .filter_map(|member| {
-                let child = expr_bound_child(node, member)?;
-                bind_expression_to_columns(member, &node.children[child].output_columns)
+                if let Some(child) = expr_bound_child(node, member) {
+                    bind_expression_to_columns(member, &node.children[child].output_columns)
+                } else if distributed_builder_rewrites_probe_output(node)
+                    && could_bound(node, member)
+                {
+                    Some(member.clone())
+                } else {
+                    None
+                }
             })
             .collect()
     };
@@ -1471,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn non_leaf_probe_binding_requires_a_direct_input_expression() {
+    fn project_probe_binding_defers_output_rewrite_to_distributed_builder() {
         let child = leaf(vec![out_col(1, "input_key")]);
         let mut project = project_node(
             vec![ProjectItem {
@@ -1483,11 +1497,8 @@ mod tests {
             child,
         );
 
-        assert!(
-            !place_probe(&mut project, 7, &[col_ref(9, "computed_key")]),
-            "a NodeInput binding cannot reference a non-leaf output-only column"
-        );
-        assert!(project.probe_runtime_filters.is_empty());
+        assert!(place_probe(&mut project, 7, &[col_ref(9, "computed_key")]));
+        assert_probe_filter(&project, 7, 9);
 
         let mut leaf = leaf(vec![out_col(9, "source_key")]);
         assert!(place_probe(&mut leaf, 8, &[col_ref(9, "source_key")]));
@@ -1495,19 +1506,33 @@ mod tests {
     }
 
     #[test]
-    fn probe_binding_uses_direct_input_column_nullability() {
-        let mut input_column = out_col(1, "outer_key");
+    fn non_rewrite_node_requires_a_direct_input_expression() {
+        let child = leaf(vec![out_col(1, "input_key")]);
+        let mut parent = values_node(1.0, vec![child]);
+        parent.output_columns = vec![out_col(9, "computed_key")];
+
+        assert!(!place_probe(&mut parent, 8, &[col_ref(9, "computed_key")]));
+        assert!(parent.probe_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn probe_binding_preserves_logical_name_with_direct_input_nullability() {
+        let mut input_column = out_col(1, "input_key");
         input_column.nullable = true;
         let child = leaf(vec![input_column]);
         let mut parent = values_node(1.0, vec![child]);
-        parent.output_columns = vec![out_col(1, "outer_key")];
+        parent.output_columns = vec![out_col(1, "outer_alias")];
 
-        assert!(place_probe(&mut parent, 9, &[col_ref(1, "outer_key")]));
+        assert!(place_probe(&mut parent, 9, &[col_ref(1, "outer_alias")]));
         let probe = &parent.probe_runtime_filters[0];
         assert!(
             probe.probe_expr.nullable,
             "binding metadata must match the exact direct-input schema"
         );
+        let ExprKind::ColumnRef { column, .. } = &probe.probe_expr.kind else {
+            panic!("expected column ref")
+        };
+        assert_eq!(column, "outer_alias");
     }
 
     #[test]
