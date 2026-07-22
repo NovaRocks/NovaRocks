@@ -27,11 +27,11 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::Schema;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
 use mv_schema::MvSchemaContract;
+use novarocks_catalog::identifier::TableIdentity;
 
 /// Read-only metadata that drives Iceberg MV refresh rewrite.
 ///
@@ -598,7 +598,6 @@ pub(crate) mod tests_support {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::catalog::identifier::TableIdentity;
     use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
     use mv_schema::{
@@ -607,6 +606,7 @@ pub(crate) mod tests_support {
         JoinContractKind, JoinPredicateLineage, MvSchemaContract, OutputColumnLineage,
         OutputContract, QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
     };
+    use novarocks_catalog::identifier::TableIdentity;
 
     use super::*;
 
@@ -932,12 +932,12 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::catalog::identifier::TableIdentity;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
     };
+    use novarocks_catalog::identifier::TableIdentity;
 
     use super::tests_support::*;
     use super::*;

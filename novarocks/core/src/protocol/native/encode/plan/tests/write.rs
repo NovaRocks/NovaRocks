@@ -26,13 +26,13 @@ use super::super::write::{
     encode_iceberg_change_stream_router_sink, encode_iceberg_write_sink_spec,
 };
 use super::*;
-use crate::catalog::schema::{ColumnDef, ColumnDefault};
 use crate::protocol::native::encode::plan;
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::write::change_stream::{
     IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
 };
+use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
 
 fn encode_write_default_json_for_test(
     data_type: DataType,
@@ -416,14 +416,14 @@ fn iceberg_write_fragment_uses_sink_output_contract_for_duplicate_input_columns(
     let mut sink_spec =
         crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
     sink_spec.target_columns = vec![
-        crate::catalog::schema::ColumnDef {
+        novarocks_catalog::schema::ColumnDef {
             name: "c0".to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
-        crate::catalog::schema::ColumnDef {
+        novarocks_catalog::schema::ColumnDef {
             name: "c1".to_string(),
             data_type: DataType::Int64,
             nullable: false,
@@ -534,7 +534,7 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
     };
     let table = crate::sql::planner::table::TableDef {
         name: "orders".to_string(),
-        columns: vec![crate::catalog::schema::ColumnDef {
+        columns: vec![novarocks_catalog::schema::ColumnDef {
             name: "amount".to_string(),
             data_type: DataType::Decimal128(10, 2),
             nullable: true,
@@ -619,7 +619,7 @@ fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata
     ));
     let table = crate::sql::planner::table::TableDef {
         name: "orders".to_string(),
-        columns: vec![crate::catalog::schema::ColumnDef {
+        columns: vec![novarocks_catalog::schema::ColumnDef {
             name: "tags".to_string(),
             data_type: list_type.clone(),
             nullable: true,

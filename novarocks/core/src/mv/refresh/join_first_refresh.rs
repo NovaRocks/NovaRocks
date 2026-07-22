@@ -8,7 +8,6 @@
 use arrow::datatypes::DataType;
 use iceberg::TableIdent;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::commit::CommitOpKind;
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME;
@@ -21,6 +20,7 @@ use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::logical::LogicalPlanNode;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct JoinFirstRefreshLogicalInput {
     pub(crate) plan: LogicalPlanNode,
@@ -626,7 +626,6 @@ mod tests {
     };
     use iceberg::{NamespaceIdent, TableIdent};
 
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     };
@@ -635,6 +634,7 @@ mod tests {
     use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind};
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     fn output_column(
         factory: &mut ColumnRefFactory,

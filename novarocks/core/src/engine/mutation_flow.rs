@@ -276,7 +276,7 @@ fn build_update_mor_change_stream_write_plan(
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     target_ref: &str,
     new_sequence_number: i64,
 ) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
@@ -350,7 +350,7 @@ fn build_update_mor_change_stream_write_plan(
 
 fn update_assignment_projection_sql(
     assignments: &[crate::sql::parser::ast::UpdateAssignment],
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> Result<Vec<(String, String)>, String> {
     assignments
         .iter()
@@ -395,7 +395,7 @@ fn update_change_stream_target_sql(
 
 fn build_update_mor_change_event_expand_plan(
     optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     new_sequence_number: i64,
 ) -> Result<crate::sql::optimizer::OptimizedOperatorNode, String> {
     use crate::sql::optimizer::operator::{
@@ -613,7 +613,7 @@ fn build_update_mor_change_event_expand_plan(
 
 fn build_merge_mor_change_event_expand_plan(
     optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     new_sequence_number: i64,
     matched_update: bool,
     matched_delete: bool,
@@ -987,7 +987,7 @@ fn execute_mor_update(
     table: iceberg::table::Table,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
 ) -> Result<StatementResult, String> {
@@ -1400,7 +1400,7 @@ fn execute_cow_update(
     table_ident: iceberg::TableIdent,
     table: iceberg::table::Table,
     matched: MatchedUpdateBatch,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
 ) -> Result<StatementResult, String> {
@@ -1491,7 +1491,7 @@ fn build_cow_update_distributed_write(
     target: &crate::engine::backend_resolver::TargetBackend,
     table: &iceberg::table::Table,
     matched: &MatchedUpdateBatch,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
 ) -> Result<CowUpdateDistributedWrite, String> {
@@ -1636,7 +1636,7 @@ fn build_cow_rewrite_query(
     synthetic_table_name: &str,
     matched: &MatchedUpdateBatch,
     matched_indices: &[usize],
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     new_sequence_number: i64,
 ) -> Result<sqlparser::ast::Query, String> {
     if matched_indices.is_empty() {
@@ -1743,7 +1743,7 @@ fn build_cow_rewrite_query(
 
 fn literal_to_sql_for_values_target_column(
     literal: &crate::sql::parser::ast::Literal,
-    target_column: &crate::catalog::schema::ColumnDef,
+    target_column: &novarocks_catalog::schema::ColumnDef,
 ) -> Result<String, String> {
     let literal_sql = crate::engine::iceberg_writer::literal_to_sql_for_arrow_type(
         literal,
@@ -2210,7 +2210,7 @@ fn required_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRe
 
 fn iceberg_table_columns(
     table: &iceberg::table::Table,
-) -> Result<Vec<crate::catalog::schema::ColumnDef>, String> {
+) -> Result<Vec<novarocks_catalog::schema::ColumnDef>, String> {
     let arrow_schema = schema_to_arrow_schema(table.metadata().current_schema())
         .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
     let iceberg_schema = table.metadata().current_schema();
@@ -2230,7 +2230,7 @@ fn iceberg_table_columns(
                 }
                 _ => field.data_type().clone(),
             };
-            Ok(crate::catalog::schema::ColumnDef {
+            Ok(novarocks_catalog::schema::ColumnDef {
                 name: field.name().clone(),
                 data_type,
                 nullable: field.is_nullable(),
@@ -2258,7 +2258,7 @@ fn iceberg_partition_source_columns(table: &iceberg::table::Table) -> Result<Vec
 
 fn validate_update_assignments(
     assignments: &[crate::sql::parser::ast::UpdateAssignment],
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     partition_columns: &[String],
 ) -> Result<(), String> {
     let target_names = target_columns
@@ -2708,7 +2708,7 @@ impl std::ops::Deref for MergeInsertColumns {
 
 fn resolve_merge_insert_columns(
     action: &MergeNotMatchedAction,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> Result<MergeInsertColumns, String> {
     let target_names_lower: Vec<String> = target_columns
         .iter()
@@ -2799,7 +2799,7 @@ impl MergeMatchRows {
 
     fn unmatched_insert_batch(
         &self,
-        target_columns: &[crate::catalog::schema::ColumnDef],
+        target_columns: &[novarocks_catalog::schema::ColumnDef],
         insert_columns: &MergeInsertColumns,
     ) -> Result<RecordBatch, String> {
         let target_arrow_schema = arrow::datatypes::Schema::new(
@@ -2881,7 +2881,7 @@ fn materialize_merge_match(
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
 ) -> Result<MergeMatchRows, String> {
     let target_alias = stmt
@@ -3003,7 +3003,7 @@ fn build_merge_mor_change_stream_write_plan(
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
     new_sequence_number: i64,
@@ -3217,7 +3217,7 @@ fn build_merge_match_query_sql(
     on_sql: &str,
     matched_predicate_sql: Option<&str>,
     not_matched_predicate_sql: Option<&str>,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     matched_assignments_sql: &[(&str, &str)],
     insert_values_sql: &[(&str, &str)],
     matched_action: Option<i32>,
@@ -3314,7 +3314,7 @@ fn build_merge_unmatched_insert_query(
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
-    target_columns: &[crate::catalog::schema::ColumnDef],
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: &MergeInsertColumns,
 ) -> Result<sqlparser::ast::Query, String> {
     let target_alias = stmt
@@ -3591,8 +3591,8 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn col(name: &str) -> ColumnDef {
         ColumnDef {

@@ -28,8 +28,8 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use crate::catalog::schema::SqlType;
 use crate::sql::parser::ast::ObjectName;
+use novarocks_catalog::schema::SqlType;
 
 /// Custom StarRocks dialect for sqlparser.
 #[derive(Debug)]
@@ -3317,7 +3317,7 @@ mod tests {
     #[test]
     fn timestamp_ns_type_name_parses_to_datetimens() {
         use super::parse_modifier_to_sql_type;
-        use crate::catalog::schema::SqlType;
+        use novarocks_catalog::schema::SqlType;
         assert_eq!(
             parse_modifier_to_sql_type("timestamp_ns"),
             Ok(SqlType::DateTimeNs)
@@ -3330,8 +3330,8 @@ mod tests {
 
     #[test]
     fn datetimens_maps_to_nanosecond_arrow() {
-        use crate::catalog::schema::SqlType;
         use arrow::datatypes::{DataType, TimeUnit};
+        use novarocks_catalog::schema::SqlType;
         assert_eq!(
             crate::sql::literal::sql_type_to_arrow_type(&SqlType::DateTimeNs),
             Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))

@@ -233,21 +233,21 @@ fn create_aggregate_fact_table(
     let columns = vec![
         crate::sql::TableColumnDef {
             name: "id".to_string(),
-            data_type: crate::catalog::schema::SqlType::Int,
+            data_type: novarocks_catalog::schema::SqlType::Int,
             nullable: false,
             aggregation: None,
             default: None,
         },
         crate::sql::TableColumnDef {
             name: "region".to_string(),
-            data_type: crate::catalog::schema::SqlType::String,
+            data_type: novarocks_catalog::schema::SqlType::String,
             nullable: true,
             aggregation: None,
             default: None,
         },
         crate::sql::TableColumnDef {
             name: "amount".to_string(),
-            data_type: crate::catalog::schema::SqlType::BigInt,
+            data_type: novarocks_catalog::schema::SqlType::BigInt,
             nullable: true,
             aggregation: None,
             default: None,

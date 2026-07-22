@@ -968,10 +968,10 @@ mod is_known_rule_name_tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarNode};
     use crate::sql::optimizer::stats_input::{
@@ -1430,13 +1430,13 @@ mod is_known_rule_name_tests {
 
     #[test]
     fn optimize_with_root_distribution_overrides_default_gather_root() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::analysis::ExprKind;
         use crate::sql::catalog::PlannerTableProvider;
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::optimizer::property::DistributionSpec;
         use crate::sql::planner::logical::LogicalPlanKind;
         use crate::sql::planner::table::{ScanSource, TableDef};
+        use novarocks_catalog::schema::ColumnDef;
 
         struct MinimalCatalog;
         impl MinimalCatalog {
@@ -1529,12 +1529,12 @@ mod is_known_rule_name_tests {
 
     #[test]
     fn optimize_preserves_ranking_window_partition_topn_sort() {
-        use crate::catalog::schema::ColumnDef;
         use crate::exec::node::sort::SortTopNType;
         use crate::sql::catalog::PlannerTableProvider;
         use crate::sql::optimizer::operator::Operator;
         use crate::sql::optimizer::optimized_tree::OptimizedOperatorNode;
         use crate::sql::planner::table::{ScanSource, TableDef};
+        use novarocks_catalog::schema::ColumnDef;
 
         struct RankingCatalog;
         impl RankingCatalog {
@@ -1671,10 +1671,10 @@ mod is_known_rule_name_tests {
     /// and no residual Apply node or "subquery decorrelation failed" error.
     #[test]
     fn scalar_subquery_decorrelates_to_join() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::catalog::PlannerTableProvider;
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::planner::table::{ScanSource, TableDef};
+        use novarocks_catalog::schema::ColumnDef;
 
         // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same
         // shape the planner and analyzer test modules use.

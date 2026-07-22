@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::DataType;
 
 use super::prepare_scan_bindings;
-use crate::catalog::schema::ColumnDef;
 use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
@@ -46,6 +45,7 @@ use crate::sql::planner::distributed::{
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use crate::sql::planner::table::{ScanSource, TableDef};
+use novarocks_catalog::schema::ColumnDef;
 
 #[derive(Debug)]
 struct PlannedIcebergFiles {

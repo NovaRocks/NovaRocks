@@ -17,12 +17,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
 };
 #[cfg(test)]
 use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
+use novarocks_catalog::schema::ColumnDef;
 
 /// Metadata for an IMV target-state scan source. This struct carries only
 /// planner-safe metadata for the MV's own target state — catalog identity,

@@ -757,7 +757,6 @@ pub(super) fn materialize_physical_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
@@ -778,6 +777,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::physical::PhysicalPlanKind;
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
     use std::sync::Arc;
 
     fn int_expr(v: i64) -> TypedExpr {

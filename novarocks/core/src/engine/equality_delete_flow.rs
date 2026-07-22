@@ -27,7 +27,6 @@ use arrow::record_batch::RecordBatch;
 use iceberg::Catalog;
 use iceberg::spec::{FormatVersion, PrimitiveType, Type};
 
-use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
@@ -47,6 +46,7 @@ use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOp
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn execute_add_equality_delete_statement(
     state: &Arc<StandaloneState>,

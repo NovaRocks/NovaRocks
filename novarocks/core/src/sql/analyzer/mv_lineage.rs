@@ -646,10 +646,10 @@ impl ExpressionKindHint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use novarocks_catalog::schema::ColumnDef;
     use std::sync::Arc;
 
     fn base_schema() -> Schema {

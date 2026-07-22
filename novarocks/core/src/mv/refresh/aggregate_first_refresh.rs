@@ -629,12 +629,12 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::catalog::schema::SqlType;
     use crate::mv::aggregate_state::mv_agg_state::{AggregateStateColumn, AggregateVisibleColumn};
     use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
     use crate::mv::aggregate_state::state_codec::encode_count_state;
     use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
     use crate::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
+    use novarocks_catalog::schema::SqlType;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)

@@ -164,14 +164,14 @@ fn iceberg_scan_plan_with_outputs(
     let table = TableDef {
         name: "ice_t".to_string(),
         columns: vec![
-            crate::catalog::schema::ColumnDef {
+            novarocks_catalog::schema::ColumnDef {
                 name: "id".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
                 write_default: None,
                 logical_type: None,
             },
-            crate::catalog::schema::ColumnDef {
+            novarocks_catalog::schema::ColumnDef {
                 name: "category".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,

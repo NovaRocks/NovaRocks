@@ -254,10 +254,10 @@ mod tests {
     use super::*;
     use std::sync::{Arc, RwLock};
 
-    use crate::catalog::schema::SqlType;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
     use crate::sql::{Literal, TableColumnDef};
+    use novarocks_catalog::schema::SqlType;
 
     fn dummy_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {

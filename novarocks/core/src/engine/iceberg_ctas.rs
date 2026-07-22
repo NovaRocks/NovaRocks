@@ -49,7 +49,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::catalog::schema::SqlType;
 use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::{StandaloneState, StatementResult};
@@ -58,6 +57,7 @@ use crate::sql::parser::ast::{
     CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, InsertSource, OverwriteMode,
     TableColumnDef,
 };
+use novarocks_catalog::schema::SqlType;
 
 /// Execute a CTAS statement. Caller has confirmed `stmt.as_select.is_some()`.
 pub(crate) fn execute_iceberg_ctas(
@@ -419,7 +419,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     use super::{arrow_data_type_to_sql_type, arrow_schema_to_table_column_defs};
-    use crate::catalog::schema::SqlType;
+    use novarocks_catalog::schema::SqlType;
 
     // ---------- basic scalar types ----------
 

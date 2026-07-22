@@ -385,7 +385,6 @@ fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
@@ -395,6 +394,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn scan_plan() -> OptExpr {
         OptExpr::leaf(Operator::LogicalScan(ScanOp {

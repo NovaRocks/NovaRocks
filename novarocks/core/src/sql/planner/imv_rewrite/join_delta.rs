@@ -1518,7 +1518,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
@@ -1538,6 +1537,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     #[test]
     fn supported_join_delta_kinds_are_inner_and_cross_only() {

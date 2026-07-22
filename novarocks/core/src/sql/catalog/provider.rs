@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::catalog::partition::LegacyRangePartition;
-use crate::catalog::provider::CatalogProvider;
-use crate::catalog::service::CatalogService;
-use crate::catalog::table::CatalogTable;
 use crate::connector::ConnectorRegistry;
 use crate::sql::catalog::{
     CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
     ResolvedAnalyzerTable, TableLookupMode,
 };
 use crate::sql::planner::table::TableDef;
+use novarocks_catalog::partition::LegacyRangePartition;
+use novarocks_catalog::provider::CatalogProvider;
+use novarocks_catalog::service::CatalogService;
+use novarocks_catalog::table::CatalogTable;
 
 pub(crate) struct CatalogServiceProvider<'a> {
     current_catalog: Option<&'a str>,
@@ -213,12 +213,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::CatalogServiceProvider;
-    use crate::catalog::identifier::TableIdentity;
-    use crate::catalog::memory::MemoryCatalog;
-    use crate::catalog::provider::CatalogProvider;
-    use crate::catalog::registry::{Catalog, CatalogRegistry};
-    use crate::catalog::schema::ColumnDef;
-    use crate::catalog::service::CatalogService;
     use crate::connector::backend::{
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
@@ -229,6 +223,12 @@ mod tests {
     };
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_catalog::memory::MemoryCatalog;
+    use novarocks_catalog::provider::CatalogProvider;
+    use novarocks_catalog::registry::{Catalog, CatalogRegistry};
+    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_catalog::service::CatalogService;
 
     fn column(name: &str) -> ColumnDef {
         ColumnDef {

@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::catalog::identifier::TableIdentity;
-use crate::catalog::memory::{MemoryCatalog, MemoryCatalogEntry};
-use crate::catalog::table::CatalogTable;
 use crate::sql::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
 };
 use crate::sql::planner::table::TableDef;
+use novarocks_catalog::identifier::TableIdentity;
+use novarocks_catalog::memory::{MemoryCatalog, MemoryCatalogEntry};
+use novarocks_catalog::table::CatalogTable;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
@@ -78,14 +78,14 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::PlannerMemoryCatalog;
-    use crate::catalog::identifier::TableIdentity;
-    use crate::catalog::memory::DEFAULT_DATABASE;
-    use crate::catalog::provider::CatalogProvider;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_catalog::memory::DEFAULT_DATABASE;
+    use novarocks_catalog::provider::CatalogProvider;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
         ColumnDef {

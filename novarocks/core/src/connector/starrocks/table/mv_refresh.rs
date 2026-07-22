@@ -45,7 +45,6 @@ use crate::mv::analysis::resolve_mv_name;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::starrocks::table::catalog::{
     StarRocksTableCatalog, StarRocksTableRuntime, register_starrocks_tables_in_catalog,
 };
@@ -69,6 +68,7 @@ use crate::meta::repository::starrocks_table::{
     StageStarRocksMvRefreshRequest, StagedStarRocksMvRefresh,
 };
 use crate::mv::persistence::definition::StoredMvDefinition;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
@@ -377,7 +377,7 @@ pub(crate) fn refresh_mv(
             } else {
                 tagged_projection_change_chunks(delta_result)?
             };
-            let resolved_mv = crate::catalog::identifier::LocalTableIdentity {
+            let resolved_mv = novarocks_catalog::identifier::LocalTableIdentity {
                 database: db_name.clone(),
                 table: mv_name.clone(),
             };
@@ -784,7 +784,7 @@ fn refresh_aggregate_mv_incremental(
 
     let plan = load_physical_insert_plan(
         ctx.state,
-        &crate::catalog::identifier::LocalTableIdentity {
+        &novarocks_catalog::identifier::LocalTableIdentity {
             database: ctx.database.to_string(),
             table: ctx.mv_name.to_string(),
         },
@@ -933,7 +933,7 @@ where
 
     let plan = match load_physical_insert_plan(
         state,
-        &crate::catalog::identifier::LocalTableIdentity {
+        &novarocks_catalog::identifier::LocalTableIdentity {
             database: database.to_string(),
             table: mv_name.to_string(),
         },
@@ -1418,13 +1418,13 @@ fn validate_incremental_mv_base_ref(
 ) -> Result<(), String> {
     let actual = normalize_three_part_base_table(base_table)?;
     let expected = (
-        crate::catalog::identifier::normalize_identifier(&base_ref.catalog).map_err(|e| {
+        novarocks_catalog::identifier::normalize_identifier(&base_ref.catalog).map_err(|e| {
             format!("incremental MV refresh stored metadata has invalid catalog reference: {e}")
         })?,
-        crate::catalog::identifier::normalize_identifier(&base_ref.namespace).map_err(|e| {
+        novarocks_catalog::identifier::normalize_identifier(&base_ref.namespace).map_err(|e| {
             format!("incremental MV refresh stored metadata has invalid namespace reference: {e}")
         })?,
-        crate::catalog::identifier::normalize_identifier(&base_ref.table).map_err(|e| {
+        novarocks_catalog::identifier::normalize_identifier(&base_ref.table).map_err(|e| {
             format!("incremental MV refresh stored metadata has invalid table reference: {e}")
         })?,
     );
@@ -1445,7 +1445,7 @@ fn normalize_three_part_base_table(
         .iter()
         .map(|part| match part {
             sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                crate::catalog::identifier::normalize_identifier(&ident.value).map_err(|e| {
+                novarocks_catalog::identifier::normalize_identifier(&ident.value).map_err(|e| {
                     format!(
                         "incremental MV refresh stored SQL has invalid base table reference: {e}"
                     )
@@ -1777,9 +1777,9 @@ pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdent
                 ));
             };
             Ok(TableIdentity {
-                catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
-                namespace: crate::catalog::identifier::normalize_identifier(namespace)?,
-                table: crate::catalog::identifier::normalize_identifier(table)?,
+                catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
+                namespace: novarocks_catalog::identifier::normalize_identifier(namespace)?,
+                table: novarocks_catalog::identifier::normalize_identifier(table)?,
             })
         })
         .collect()

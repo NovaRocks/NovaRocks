@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::catalog::schema::ColumnDef;
 use crate::sql::planner::table::{IcebergMvTargetStateScan, ScanSource};
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn build_target_state_scan_source(
     catalog: String,

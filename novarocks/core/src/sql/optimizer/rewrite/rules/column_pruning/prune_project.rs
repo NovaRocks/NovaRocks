@@ -153,7 +153,6 @@ impl LogicalRewriteRule for PruneProjectColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem, ScanOp};
@@ -162,6 +161,7 @@ mod tests {
     use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarNode};
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;

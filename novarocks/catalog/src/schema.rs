@@ -77,7 +77,7 @@ pub enum ColumnDefault {
     Map(Vec<(ColumnDefault, ColumnDefault)>),
 }
 
-pub(crate) fn validate_column_default(value: &ColumnDefault) -> Result<(), String> {
+pub fn validate_column_default(value: &ColumnDefault) -> Result<(), String> {
     if matches!(value, ColumnDefault::Null) {
         return Err("top-level column default cannot be NULL".to_string());
     }

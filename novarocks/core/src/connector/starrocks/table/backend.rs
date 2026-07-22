@@ -23,7 +23,6 @@ use std::sync::{Arc, Weak};
 
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, MvBackend, ResolvedTable, TableSink, TableSource,
 };
@@ -41,6 +40,7 @@ use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
 use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
 use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::sql::planner::table::TableDef;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct StarRocksTableBackend {
     state: Weak<StandaloneState>,

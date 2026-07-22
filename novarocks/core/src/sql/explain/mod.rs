@@ -635,7 +635,6 @@ mod tests {
         ExplainLevel, PlanNodeExplainStage, explain_plan, format_expr, format_project_item,
         format_shared_plan_node_header,
     };
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
@@ -648,6 +647,7 @@ mod tests {
         PlanWindowNode, WindowExpr,
     };
     use crate::sql::planner::table::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     fn empty_values_for_test() -> LogicalPlanNode {
         LogicalPlanNode::new(

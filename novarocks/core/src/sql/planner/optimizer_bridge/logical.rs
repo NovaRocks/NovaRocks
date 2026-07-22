@@ -571,7 +571,6 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ScanVariantColumn;
@@ -591,6 +590,7 @@ mod tests {
     use crate::sql::planner::physical::PhysicalPlanKind;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
     use std::sync::Arc;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {

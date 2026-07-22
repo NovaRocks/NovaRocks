@@ -17,9 +17,9 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::catalog::identifier::TableIdentity;
-use crate::catalog::registry::Catalog;
 use crate::sql::catalog::{CatalogRuntimeMetadata, local::PlannerMemoryCatalog};
+use novarocks_catalog::identifier::TableIdentity;
+use novarocks_catalog::registry::Catalog;
 
 pub(super) struct InternalCatalog {
     name: String,
@@ -64,12 +64,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::InternalCatalog;
-    use crate::catalog::registry::Catalog;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::catalog::{
         CatalogRuntimeBinding, CatalogRuntimeMetadata, local::PlannerMemoryCatalog,
     };
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::registry::Catalog;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn starrocks_table_def() -> TableDef {
         TableDef {

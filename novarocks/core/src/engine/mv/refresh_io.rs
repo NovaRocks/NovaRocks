@@ -18,12 +18,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::load_table;
 use crate::engine::StandaloneState;
 use crate::engine::mv_flow::execute_query_for_mv_refresh_with_catalog;
 use crate::exec::chunk::Chunk;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn run_mv_full_select_chunks_with_catalog(
     state: &Arc<StandaloneState>,
@@ -97,9 +97,9 @@ pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdent
                 ));
             };
             Ok(TableIdentity {
-                catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
-                namespace: crate::catalog::identifier::normalize_identifier(namespace)?,
-                table: crate::catalog::identifier::normalize_identifier(table)?,
+                catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
+                namespace: novarocks_catalog::identifier::normalize_identifier(namespace)?,
+                table: novarocks_catalog::identifier::normalize_identifier(table)?,
             })
         })
         .collect()

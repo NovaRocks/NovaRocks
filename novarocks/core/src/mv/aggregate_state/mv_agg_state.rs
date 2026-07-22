@@ -31,7 +31,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::schema::SqlType;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array, build_agg_scalar_array};
 use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
@@ -55,6 +54,7 @@ use crate::mv::aggregate_state::state_codec::{
 use crate::mv::model::{AggregateFunctionKind, AggregateStateRole, VisibleAggregateOutput};
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::analysis::OutputColumn;
+use novarocks_catalog::schema::SqlType;
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
 pub(crate) const AGG_STATE_PREFIX: &str = "__agg_state_";

@@ -2443,7 +2443,6 @@ fn repeat_output_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
     };
@@ -2465,6 +2464,7 @@ mod tests {
     use crate::sql::planner::payload::*;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
         let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(

@@ -43,7 +43,6 @@ use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
-use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
@@ -62,6 +61,7 @@ use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOp
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn execute_delete_statement(
     state: &Arc<StandaloneState>,
@@ -1767,8 +1767,8 @@ mod tests {
         }
     }
 
-    fn column(name: &str, data_type: DataType) -> crate::catalog::schema::ColumnDef {
-        crate::catalog::schema::ColumnDef {
+    fn column(name: &str, data_type: DataType) -> novarocks_catalog::schema::ColumnDef {
+        novarocks_catalog::schema::ColumnDef {
             name: name.to_string(),
             data_type,
             nullable: false,

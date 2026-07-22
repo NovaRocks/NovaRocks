@@ -995,7 +995,6 @@ impl LogicalRewriteRule for TagRequiredColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::optimizer::operator::{
@@ -1007,6 +1006,7 @@ mod tests {
     use crate::sql::optimizer::scalar::{ScalarArena, SortKey};
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2583,7 +2583,7 @@ mod tests {
                 database: "db".to_string(),
                 table: crate::sql::planner::table::TableDef {
                     name: "t".to_string(),
-                    columns: vec![crate::catalog::schema::ColumnDef {
+                    columns: vec![novarocks_catalog::schema::ColumnDef {
                         name: "a".to_string(),
                         data_type: arrow::datatypes::DataType::Int32,
                         nullable: false,

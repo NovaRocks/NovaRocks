@@ -158,7 +158,6 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{FilterOp, Operator, ScanOp};
@@ -168,6 +167,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn test_col_id(name: &str) -> ColumnId {
         match name {

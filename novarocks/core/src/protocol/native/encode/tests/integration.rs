@@ -79,7 +79,7 @@ fn values_distributed_node(
 fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::planner::table::TableDef {
     let columns = names
         .iter()
-        .map(|name| crate::catalog::schema::ColumnDef {
+        .map(|name| novarocks_catalog::schema::ColumnDef {
             name: (*name).to_string(),
             data_type: DataType::Int64,
             nullable: true,

@@ -20,8 +20,8 @@ use iceberg::spec::{
     UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
 
-use crate::catalog::identifier::normalize_identifier;
 use crate::sql::parser::ast::IcebergPartitionFieldExpr;
+use novarocks_catalog::identifier::normalize_identifier;
 
 /// First partition field id by Iceberg spec convention.
 /// V2 metadata starts partition field ids at 1000; iceberg-rust matches via

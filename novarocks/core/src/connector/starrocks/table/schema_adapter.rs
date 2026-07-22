@@ -17,14 +17,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::SqlType;
 use crate::connector::starrocks::table::catalog::StarRocksTableRuntime;
 use crate::connector::starrocks::table::ddl::{
     aggregation_string_to_column_aggregation, parse_keys_type, parse_starrocks_logical_type,
     to_keys_type,
 };
 use crate::sql::parser::ast::{ColumnAggregation, TableColumnDef, TableKeyDesc, TableKeyKind};
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::schema::SqlType;
 
 pub(crate) fn request_schema_from_runtime(
     runtime: &StarRocksTableRuntime,

@@ -17,10 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::changes::{
     ChangeError, IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
 };
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct NonJoinBaseChange<'a> {
     pub base_ref: &'a TableIdentity,

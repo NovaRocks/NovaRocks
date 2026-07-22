@@ -783,12 +783,12 @@ fn rewrite_eliminated_aggregate_expr(
 mod tests {
     use super::*;
 
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{LiteralValue, OutputColumn};
     use crate::sql::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp};
     use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     fn output_col(id: u32, name: &str) -> OutputColumn {
         OutputColumn {

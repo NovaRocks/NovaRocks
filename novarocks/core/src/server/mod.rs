@@ -43,8 +43,6 @@ use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
 
 use self::encoding::write_query_result;
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::memory::DEFAULT_DATABASE;
 use crate::engine::mv_maintenance::MaintenanceCoordinatorConfig;
 use crate::engine::mv_scheduler::RefreshCoordinatorConfig;
 use crate::engine::statement::{
@@ -57,6 +55,8 @@ use crate::sql::parser::dialect::StarRocksDialect;
 use crate::sql::parser::dialect::backend::{
     looks_like_add_backend, looks_like_drop_backend, looks_like_show_backends,
 };
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const DEFAULT_CATALOG: &str = "default_catalog";

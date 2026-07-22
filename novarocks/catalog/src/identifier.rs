@@ -21,26 +21,26 @@
 //! adapters pass already-separated name parts and current context explicitly.
 
 #[derive(Clone, Debug)]
-pub(crate) struct LocalTableIdentity {
-    pub(crate) database: String,
-    pub(crate) table: String,
+pub struct LocalTableIdentity {
+    pub database: String,
+    pub table: String,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CatalogNamespaceIdentity {
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
+pub struct CatalogNamespaceIdentity {
+    pub catalog: String,
+    pub namespace: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct TableIdentity {
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) table: String,
+pub struct TableIdentity {
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
 }
 
 impl TableIdentity {
-    pub(crate) fn new(catalog: &str, namespace: &str, table: &str) -> Self {
+    pub fn new(catalog: &str, namespace: &str, table: &str) -> Self {
         Self {
             catalog: catalog.to_string(),
             namespace: namespace.to_string(),
@@ -48,12 +48,12 @@ impl TableIdentity {
         }
     }
 
-    pub(crate) fn fqn(&self) -> String {
+    pub fn fqn(&self) -> String {
         format!("{}.{}.{}", self.catalog, self.namespace, self.table)
     }
 }
 
-pub(crate) fn normalize_identifier(raw: &str) -> Result<String, String> {
+pub fn normalize_identifier(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     // Strip backtick quotes if present
     let trimmed = trimmed
@@ -76,11 +76,11 @@ pub(crate) fn normalize_identifier(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_ascii_lowercase())
 }
 
-pub(crate) fn normalize_optional_identifier(raw: Option<&str>) -> Result<Option<String>, String> {
+pub fn normalize_optional_identifier(raw: Option<&str>) -> Result<Option<String>, String> {
     raw.map(normalize_identifier).transpose()
 }
 
-pub(crate) fn resolve_local_table_name(
+pub fn resolve_local_table_name(
     parts: &[String],
     current_database: &str,
 ) -> Result<LocalTableIdentity, String> {
@@ -100,7 +100,7 @@ pub(crate) fn resolve_local_table_name(
     }
 }
 
-pub(crate) fn resolve_catalog_namespace_name(
+pub fn resolve_catalog_namespace_name(
     parts: &[String],
     current_catalog: Option<&str>,
 ) -> Result<CatalogNamespaceIdentity, String> {
@@ -120,7 +120,7 @@ pub(crate) fn resolve_catalog_namespace_name(
     }
 }
 
-pub(crate) fn resolve_catalog_table_name(
+pub fn resolve_catalog_table_name(
     parts: &[String],
     current_catalog: Option<&str>,
     current_database: &str,

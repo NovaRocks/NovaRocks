@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use arrow::datatypes::DataType;
 
-use crate::catalog::schema::ColumnDef;
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
@@ -30,6 +29,7 @@ use crate::connector::iceberg::scan_planner::{
 };
 use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
 use crate::runtime::scan_range;
+use novarocks_catalog::schema::ColumnDef;
 
 const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
 const ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE: usize = 1024;

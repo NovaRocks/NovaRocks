@@ -17,11 +17,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::mv::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget, RefreshMode};
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct RefreshPlanningInput<'a> {
     pub(crate) snapshot_policy: BaseSnapshotPolicy,
@@ -86,11 +86,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::catalog::identifier::TableIdentity;
     use crate::mv::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget, RefreshMode};
     use crate::mv::refresh::snapshot::{
         BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
     };
+    use novarocks_catalog::identifier::TableIdentity;
 
     const LABEL: &str = "iceberg MV test";
 

@@ -10,7 +10,6 @@ use super::runtime_filter_binding::{
     RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
-use crate::catalog::schema::ColumnDef;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
 use crate::sql::analysis::cte::CteId;
@@ -40,6 +39,7 @@ use crate::sql::planner::physical::{
     PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
 use crate::sql::planner::table::{ScanSource, TableDef};
+use novarocks_catalog::schema::ColumnDef;
 
 #[test]
 fn build_distributed_plan_values_shapes_root_fragment() {

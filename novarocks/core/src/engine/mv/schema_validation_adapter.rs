@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::catalog::identifier::TableIdentity;
 use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::schema_validation::{
     ContractDecision, CurrentIcebergTableView, JoinContractDecision, JoinSchemaValidationError,
     validate_join_schema_contract, validate_schema_contract,
 };
+use novarocks_catalog::identifier::TableIdentity;
 
 const ICEBERG_ROW_LINEAGE_PROP: &str = "write.row-lineage";
 

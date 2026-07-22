@@ -17,10 +17,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput;
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::sql::planner::table::TableDef;
+use novarocks_catalog::schema::ColumnDef;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {

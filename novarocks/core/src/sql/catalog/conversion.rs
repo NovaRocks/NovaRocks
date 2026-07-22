@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::catalog::identifier::TableIdentity;
-use crate::catalog::table::CatalogTable;
 use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
 use crate::sql::catalog::metadata::{CatalogRuntimeBinding, CatalogRuntimeMetadata};
 use crate::sql::planner::table::{ScanSource, TableDef};
+use novarocks_catalog::identifier::TableIdentity;
+use novarocks_catalog::table::CatalogTable;
 
 impl CatalogRuntimeMetadata {
     pub(super) fn from_table_def(

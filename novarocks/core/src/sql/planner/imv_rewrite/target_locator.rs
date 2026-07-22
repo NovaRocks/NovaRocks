@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::datatypes::DataType;
 
-use crate::catalog::schema::ColumnDef;
 use crate::mv::persistence::schema::{
     ApplyKeySource, BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
@@ -46,6 +45,7 @@ use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, o
 use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
 use crate::sql::planner::table::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) struct InjectTargetLocatorJoinRule {
     checked_root: AtomicBool,

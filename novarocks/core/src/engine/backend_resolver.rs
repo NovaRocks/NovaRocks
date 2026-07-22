@@ -23,9 +23,9 @@
 
 use std::sync::Arc;
 
-use crate::catalog::identifier::{resolve_catalog_namespace_name, resolve_catalog_table_name};
 use crate::engine::StandaloneState;
 use crate::sql::parser::ast::ObjectName;
+use novarocks_catalog::identifier::{resolve_catalog_namespace_name, resolve_catalog_table_name};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TargetBackend {

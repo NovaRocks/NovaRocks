@@ -24,7 +24,6 @@ mod refresh_property_contract_tests;
 
 use std::collections::HashSet;
 
-use crate::catalog::identifier::normalize_identifier;
 use crate::mv::aggregate_state::mv_shape::AggregateMvShape;
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
 use crate::sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
@@ -32,6 +31,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{
     IcebergPartitionFieldExpr, MaterializedViewDistribution, ObjectName, TableColumnDef,
 };
+use novarocks_catalog::identifier::normalize_identifier;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvedTableRef {

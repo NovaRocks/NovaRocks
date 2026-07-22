@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 
-use crate::catalog::identifier::TableIdentity;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::table::model::StarRocksTableKind;
 use crate::engine::StandaloneState;
@@ -38,6 +37,7 @@ use crate::mv::persistence::definition::StoredMvDefinition;
 #[cfg(test)]
 use crate::mv::persistence::definition::StoredMvRefreshPolicy;
 use crate::mv::persistence::dependency::stored_definition_dependency_ref;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) base_refs: Vec<TableIdentity>,

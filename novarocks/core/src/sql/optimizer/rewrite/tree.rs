@@ -126,7 +126,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::rewrite_with_rule;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
@@ -140,6 +139,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
     use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     struct RenameScanRule;
 

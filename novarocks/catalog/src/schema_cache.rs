@@ -18,14 +18,14 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::catalog::identifier::TableIdentity;
+use crate::identifier::TableIdentity;
 
 struct CachedEntry<M> {
     schema_id: Option<i32>,
     metadata: M,
 }
 
-pub(crate) struct SchemaCache<M> {
+pub struct SchemaCache<M> {
     entries: RwLock<HashMap<TableIdentity, CachedEntry<M>>>,
 }
 
@@ -38,11 +38,11 @@ impl<M> Default for SchemaCache<M> {
 }
 
 impl<M: Clone> SchemaCache<M> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn get_or_build_validated<F>(
+    pub fn get_or_build_validated<F>(
         &self,
         id: &TableIdentity,
         current_schema_id: Option<i32>,
@@ -74,14 +74,14 @@ impl<M: Clone> SchemaCache<M> {
         Ok(metadata)
     }
 
-    pub(crate) fn invalidate(&self, id: &TableIdentity) {
+    pub fn invalidate(&self, id: &TableIdentity) {
         self.entries
             .write()
             .expect("schema cache write lock")
             .remove(id);
     }
 
-    pub(crate) fn invalidate_all(&self) {
+    pub fn invalidate_all(&self) {
         self.entries
             .write()
             .expect("schema cache write lock")
@@ -96,7 +96,7 @@ mod tests {
     use std::time::Duration;
 
     use super::SchemaCache;
-    use crate::catalog::identifier::TableIdentity;
+    use crate::identifier::TableIdentity;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestMetadata {

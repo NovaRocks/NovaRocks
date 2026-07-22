@@ -17,15 +17,15 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::partition::LegacyRangePartition;
-use crate::catalog::provider::CatalogProvider;
-use crate::catalog::table::CatalogTable;
+use crate::identifier::normalize_identifier;
+use crate::partition::LegacyRangePartition;
+use crate::provider::CatalogProvider;
+use crate::table::CatalogTable;
 
-pub(crate) const DEFAULT_DATABASE: &str = "default";
+pub const DEFAULT_DATABASE: &str = "default";
 const DEFAULT_CATALOG: &str = "default_catalog";
 
-pub(crate) trait MemoryCatalogEntry: Clone {
+pub trait MemoryCatalogEntry: Clone {
     fn table_name(&self) -> &str;
     fn to_catalog_table(&self, catalog: &str, database: &str) -> CatalogTable;
 }
@@ -36,7 +36,7 @@ struct DatabaseDef<T> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MemoryCatalog<T: MemoryCatalogEntry> {
+pub struct MemoryCatalog<T: MemoryCatalogEntry> {
     databases: HashMap<String, DatabaseDef<T>>,
     legacy_range_partitions: HashMap<(String, String), Vec<LegacyRangePartition>>,
 }
@@ -58,7 +58,7 @@ impl<T: MemoryCatalogEntry> Default for MemoryCatalog<T> {
 }
 
 impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
-    pub(crate) fn create_database(&mut self, database_name: &str) -> Result<(), String> {
+    pub fn create_database(&mut self, database_name: &str) -> Result<(), String> {
         let key = normalize_identifier(database_name)?;
         if self.databases.contains_key(&key) {
             return Ok(());
@@ -72,16 +72,16 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
         Ok(())
     }
 
-    pub(crate) fn database_exists(&self, database_name: &str) -> Result<bool, String> {
+    pub fn database_exists(&self, database_name: &str) -> Result<bool, String> {
         let key = normalize_identifier(database_name)?;
         Ok(self.databases.contains_key(&key))
     }
 
-    pub(crate) fn database_names(&self) -> impl Iterator<Item = &str> {
+    pub fn database_names(&self) -> impl Iterator<Item = &str> {
         self.databases.keys().map(String::as_str)
     }
 
-    pub(crate) fn table_names_in_database(&self, database_name: &str) -> Vec<String> {
+    pub fn table_names_in_database(&self, database_name: &str) -> Vec<String> {
         let Ok(db_key) = normalize_identifier(database_name) else {
             return Vec::new();
         };
@@ -91,7 +91,7 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
             .unwrap_or_default()
     }
 
-    pub(crate) fn register(&mut self, database_name: &str, table: T) -> Result<(), String> {
+    pub fn register(&mut self, database_name: &str, table: T) -> Result<(), String> {
         let db_key = normalize_identifier(database_name)?;
         let database = self
             .databases
@@ -102,11 +102,7 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
         Ok(())
     }
 
-    pub(crate) fn drop_table(
-        &mut self,
-        database_name: &str,
-        table_name: &str,
-    ) -> Result<(), String> {
+    pub fn drop_table(&mut self, database_name: &str, table_name: &str) -> Result<(), String> {
         let db_key = normalize_identifier(database_name)?;
         let database = self
             .databases
@@ -121,7 +117,7 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
         Ok(())
     }
 
-    pub(crate) fn drop_database(&mut self, database_name: &str) -> Result<(), String> {
+    pub fn drop_database(&mut self, database_name: &str) -> Result<(), String> {
         let key = normalize_identifier(database_name)?;
         if key == DEFAULT_DATABASE {
             return Err("cannot drop default database".to_string());
@@ -132,7 +128,7 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
         Ok(())
     }
 
-    pub(crate) fn get(&self, database_name: &str, table_name: &str) -> Result<T, String> {
+    pub fn get(&self, database_name: &str, table_name: &str) -> Result<T, String> {
         let db_key = normalize_identifier(database_name)?;
         let table_key = normalize_identifier(table_name)?;
         self.databases
@@ -144,7 +140,7 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
             .ok_or_else(|| format!("unknown table: {table_name}"))
     }
 
-    pub(crate) fn set_legacy_range_partitions(
+    pub fn set_legacy_range_partitions(
         &mut self,
         database_name: &str,
         table_name: &str,
@@ -161,7 +157,7 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
         Ok(())
     }
 
-    pub(crate) fn add_legacy_range_partition(
+    pub fn add_legacy_range_partition(
         &mut self,
         database_name: &str,
         table_name: &str,
@@ -181,7 +177,7 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
         Ok(())
     }
 
-    pub(crate) fn get_legacy_range_partition(
+    pub fn get_legacy_range_partition(
         &self,
         database: &str,
         table: &str,
@@ -233,10 +229,10 @@ impl<T: MemoryCatalogEntry> CatalogProvider for MemoryCatalog<T> {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_DATABASE, MemoryCatalog, MemoryCatalogEntry};
-    use crate::catalog::identifier::TableIdentity;
-    use crate::catalog::partition::LegacyRangePartition;
-    use crate::catalog::provider::CatalogProvider;
-    use crate::catalog::table::CatalogTable;
+    use crate::identifier::TableIdentity;
+    use crate::partition::LegacyRangePartition;
+    use crate::provider::CatalogProvider;
+    use crate::table::CatalogTable;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestEntry {

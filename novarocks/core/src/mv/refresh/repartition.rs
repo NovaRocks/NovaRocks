@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 
 use iceberg::TableIdent;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::commit::CommitOpKind;
 use crate::exec::chunk::Chunk;
 use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
@@ -31,6 +30,7 @@ use crate::mv::refresh::projection_first_refresh::{
 };
 use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
+use novarocks_catalog::identifier::TableIdentity;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RepartitionShape {

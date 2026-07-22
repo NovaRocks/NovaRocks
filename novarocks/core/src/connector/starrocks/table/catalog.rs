@@ -36,11 +36,11 @@ use super::model::{
     StarRocksTableState, StoredStarRocksColumn, StoredStarRocksDatabase, StoredStarRocksIndex,
     StoredStarRocksPartition, StoredStarRocksTable, StoredStarRocksTablet,
 };
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::ColumnDef;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
 use crate::sql::catalog::local::PlannerMemoryCatalog;
 use crate::sql::planner::table::{ScanSource, TableDef};
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::schema::ColumnDef;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StarRocksTableCatalog {
@@ -810,7 +810,7 @@ pub(crate) fn arrow_type_from_tablet_column(
 /// Returns `None` for columns whose Arrow type is authoritative.
 fn logical_type_from_tablet_column(
     column: &StarRocksColumnSchema,
-) -> Option<crate::catalog::schema::SqlType> {
+) -> Option<novarocks_catalog::schema::SqlType> {
     let raw_type = column.r#type.trim().to_ascii_uppercase();
     let base_type = raw_type
         .split('(')
@@ -818,10 +818,10 @@ fn logical_type_from_tablet_column(
         .unwrap_or(raw_type.as_str())
         .trim();
     match base_type {
-        "JSON" => Some(crate::catalog::schema::SqlType::Json),
+        "JSON" => Some(novarocks_catalog::schema::SqlType::Json),
         // BE schema persists BITMAP as `OBJECT` (the historical wire name).
-        "OBJECT" | "BITMAP" => Some(crate::catalog::schema::SqlType::Bitmap),
-        "HLL" => Some(crate::catalog::schema::SqlType::Hll),
+        "OBJECT" | "BITMAP" => Some(novarocks_catalog::schema::SqlType::Bitmap),
+        "HLL" => Some(novarocks_catalog::schema::SqlType::Hll),
         _ => None,
     }
 }

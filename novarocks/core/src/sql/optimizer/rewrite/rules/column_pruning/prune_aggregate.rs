@@ -155,7 +155,6 @@ impl LogicalRewriteRule for PruneAggregateColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
@@ -165,6 +164,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
     use std::collections::HashSet;
 
     fn ctx() -> RewriteContext {

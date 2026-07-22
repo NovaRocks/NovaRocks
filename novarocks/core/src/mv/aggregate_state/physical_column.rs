@@ -17,9 +17,9 @@
 
 use std::collections::HashSet;
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::SqlType;
 use crate::sql::parser::ast::TableColumnDef;
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::schema::SqlType;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StarRocksPhysicalColumn {
@@ -66,7 +66,7 @@ pub(crate) fn validate_unique_aggregate_physical_column_names(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::SqlType;
+    use novarocks_catalog::schema::SqlType;
 
     fn column(name: &str) -> StarRocksPhysicalColumn {
         starrocks_physical_column(name.to_string(), SqlType::BigInt, false, true, false)

@@ -22,10 +22,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::catalog::schema::ColumnDef;
 use crate::engine::virtual_table::{INFORMATION_SCHEMA_DB, VirtualTableProvider};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks_catalog::schema::ColumnDef;
 
 #[derive(Clone, Debug)]
 struct MaterializedViewInfoRow {

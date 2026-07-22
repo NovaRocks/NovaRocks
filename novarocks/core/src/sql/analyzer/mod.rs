@@ -3928,10 +3928,10 @@ fn replace_grouping_markers_in_relation(
     }
 }
 
-fn is_bitmap_or_hll_type(sql_type: &crate::catalog::schema::SqlType) -> bool {
+fn is_bitmap_or_hll_type(sql_type: &novarocks_catalog::schema::SqlType) -> bool {
     matches!(
         sql_type,
-        crate::catalog::schema::SqlType::Bitmap | crate::catalog::schema::SqlType::Hll
+        novarocks_catalog::schema::SqlType::Bitmap | novarocks_catalog::schema::SqlType::Hll
     )
 }
 
@@ -3948,7 +3948,6 @@ fn sync_output_columns_from_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{
@@ -3957,6 +3956,7 @@ mod tests {
     };
     use crate::sql::catalog::IcebergMetadataTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     struct TestCatalog;
 

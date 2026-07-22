@@ -29,14 +29,14 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::ColumnDef;
 use crate::formats::parquet::local_io::normalize_map_entries_nullability;
 use crate::sql::literal::{
     latin1_string_to_bytes, literal_to_i128_for_integer, parse_date_string_to_days,
     parse_datetime_string_to_micros, parse_datetime_string_to_nanos,
 };
 use crate::sql::parser::ast::Literal;
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn reorder_insert_rows(
     rows: &[Vec<Literal>],
@@ -129,9 +129,9 @@ fn reorder_insert_row(
 
 fn arrow_data_type_to_sql_type(
     dt: &arrow::datatypes::DataType,
-) -> Result<crate::catalog::schema::SqlType, String> {
-    use crate::catalog::schema::SqlType;
+) -> Result<novarocks_catalog::schema::SqlType, String> {
     use arrow::datatypes::{DataType, TimeUnit};
+    use novarocks_catalog::schema::SqlType;
     Ok(match dt {
         DataType::Boolean => SqlType::Boolean,
         DataType::Int8 => SqlType::TinyInt,
@@ -661,9 +661,9 @@ fn build_local_literal_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
-    use crate::catalog::schema::ColumnDefault;
     use arrow::datatypes::{DataType, Field, Fields};
+    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_catalog::schema::ColumnDefault;
 
     fn test_column(
         name: &str,

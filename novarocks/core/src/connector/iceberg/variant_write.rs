@@ -65,7 +65,7 @@ pub(crate) fn parse_variant_shredding_properties(
 
     let mut columns_by_name = HashMap::new();
     for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
-        let key = crate::catalog::identifier::normalize_identifier(&field.name)?;
+        let key = novarocks_catalog::identifier::normalize_identifier(&field.name)?;
         columns_by_name.insert(key, (idx, field));
     }
 
@@ -74,7 +74,7 @@ pub(crate) fn parse_variant_shredding_properties(
         let Some(column_name) = key.strip_prefix(VARIANT_SHREDDING_PROPERTY_PREFIX) else {
             continue;
         };
-        let normalized_column = crate::catalog::identifier::normalize_identifier(column_name)
+        let normalized_column = novarocks_catalog::identifier::normalize_identifier(column_name)
             .map_err(|e| format!("invalid variant shredding property `{key}`: {e}"))?;
         let Some((idx, field)) = columns_by_name.get(&normalized_column).copied() else {
             return Err(format!(
@@ -249,7 +249,7 @@ fn parse_path_type_entry<'a>(
 }
 
 fn parse_shredding_sql_type(property_key: &str, raw: &str) -> Result<DataType, String> {
-    use crate::catalog::schema::SqlType;
+    use novarocks_catalog::schema::SqlType;
 
     let sql_type = crate::sql::parser::dialect::create_table::parse_sql_type_string(raw)
         .map_err(|e| format!("{property_key}: invalid shredding type `{raw}`: {e}"))?;

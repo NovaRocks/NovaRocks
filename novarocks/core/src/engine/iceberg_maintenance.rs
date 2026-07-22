@@ -24,7 +24,6 @@ use arrow::record_batch::RecordBatch;
 use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableIdent};
 
-use crate::catalog::identifier::normalize_identifier;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::expire_snapshots::{ExpireParams, run_expire_snapshots};
 use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
@@ -41,6 +40,7 @@ use crate::fs::object_store::ObjectStoreConfig;
 use crate::meta::repository::job::CreateIcebergOptimizeJobRequest;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::procedure::{CallProcedureStmt, ProcedureArgMode, ProcedureArgValue};
+use novarocks_catalog::identifier::normalize_identifier;
 
 /// Return type shared by `resolve_maintenance_catalog` and `build_action_catalog`.
 pub(crate) type MaintenanceCatalogTriple =

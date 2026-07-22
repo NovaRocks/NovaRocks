@@ -1609,7 +1609,7 @@ pub(crate) fn catalog_base_table_statistics(
     state: &Arc<StandaloneState>,
     database: &str,
     table: &str,
-    columns: &[crate::catalog::schema::ColumnDef],
+    columns: &[novarocks_catalog::schema::ColumnDef],
     source: crate::sql::optimizer::stats_input::StatsSource,
 ) -> Result<Option<crate::sql::optimizer::stats_input::BaseTableStatistics>, String> {
     use crate::sql::optimizer::statistics::Confidence;
@@ -2341,7 +2341,7 @@ fn drop_multi_column_stats(state: &Arc<StandaloneState>, key: &TableKey) {
 }
 
 fn normalize_name(name: &str) -> Result<String, String> {
-    crate::catalog::identifier::normalize_identifier(name.trim().trim_matches('`'))
+    novarocks_catalog::identifier::normalize_identifier(name.trim().trim_matches('`'))
 }
 
 fn ok_result() -> Result<QueryResult, String> {
@@ -2543,9 +2543,9 @@ mod tests {
 
     #[test]
     fn catalog_base_table_statistics_reads_analyze_rows_without_name_heuristics() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::optimizer::statistics::Confidence;
         use crate::sql::optimizer::stats_input::{StatValue, StatsSource};
+        use novarocks_catalog::schema::ColumnDef;
 
         let state = Arc::new(StandaloneState::default());
         let key = TableKey {

@@ -138,7 +138,7 @@ pub(super) fn query_result_column_to_mysql_column(
     }
     if matches!(
         column.logical_type,
-        Some(crate::catalog::schema::SqlType::Decimal { .. })
+        Some(novarocks_catalog::schema::SqlType::Decimal { .. })
     ) {
         return Ok(Column {
             table: String::new(),
@@ -231,7 +231,7 @@ pub(super) fn array_value_to_mysql_value(
         return Ok(StandaloneMysqlValue::Null);
     }
 
-    if let Some(crate::catalog::schema::SqlType::Decimal { scale, .. }) =
+    if let Some(novarocks_catalog::schema::SqlType::Decimal { scale, .. }) =
         declared.logical_type.as_ref()
     {
         return decimal_to_mysql_value(column, row_idx, *scale);

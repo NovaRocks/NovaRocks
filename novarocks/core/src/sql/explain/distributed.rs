@@ -1520,7 +1520,6 @@ mod tests {
         explain_distributed_plan_analyze, explain_fragment_order,
         format_distributed_shared_plan_node_header,
     };
-    use crate::catalog::schema::ColumnDef;
     use crate::coordinator::profile::correlate::{ActualMetrics, DistributedProfileSummary};
     use crate::exec::node::sort::SortTopNType;
     use crate::sql::analysis::{
@@ -1553,6 +1552,7 @@ mod tests {
         PhysicalPlanStats, PlannerBroadcastDecision, PlannerConfidence,
     };
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     fn prepare_bridge2_test_props(node: &mut OptimizedOperatorNode) {
         for child in &mut node.children {

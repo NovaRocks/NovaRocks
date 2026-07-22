@@ -283,7 +283,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
@@ -295,6 +294,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::stats_input::{StatValue, StatsSource};
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     #[test]
     fn collector_binds_each_scan_in_the_same_opt_expr_traversal() {

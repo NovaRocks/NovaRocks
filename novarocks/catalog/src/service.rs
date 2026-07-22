@@ -17,10 +17,10 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::catalog::memory::{MemoryCatalog, MemoryCatalogEntry};
-use crate::catalog::registry::{Catalog, CatalogRegistry};
+use crate::memory::{MemoryCatalog, MemoryCatalogEntry};
+use crate::registry::{Catalog, CatalogRegistry};
 
-pub(crate) struct CatalogService<L, M>
+pub struct CatalogService<L, M>
 where
     L: MemoryCatalogEntry,
 {
@@ -32,50 +32,50 @@ impl<L, M> CatalogService<L, M>
 where
     L: MemoryCatalogEntry,
 {
-    pub(crate) fn new(local: Arc<RwLock<MemoryCatalog<L>>>, registry: CatalogRegistry<M>) -> Self {
+    pub fn new(local: Arc<RwLock<MemoryCatalog<L>>>, registry: CatalogRegistry<M>) -> Self {
         Self {
             local,
             registry: RwLock::new(registry),
         }
     }
 
-    pub(crate) fn local(&self) -> &Arc<RwLock<MemoryCatalog<L>>> {
+    pub fn local(&self) -> &Arc<RwLock<MemoryCatalog<L>>> {
         &self.local
     }
 
-    pub(crate) fn registry(&self) -> &RwLock<CatalogRegistry<M>> {
+    pub fn registry(&self) -> &RwLock<CatalogRegistry<M>> {
         &self.registry
     }
 
-    pub(crate) fn local_snapshot(&self) -> MemoryCatalog<L> {
+    pub fn local_snapshot(&self) -> MemoryCatalog<L> {
         self.local
             .read()
             .expect("catalog service local read lock")
             .clone()
     }
 
-    pub(crate) fn registry_snapshot(&self) -> CatalogRegistry<M> {
+    pub fn registry_snapshot(&self) -> CatalogRegistry<M> {
         self.registry
             .read()
             .expect("catalog service registry read lock")
             .clone()
     }
 
-    pub(crate) fn register_catalog(&self, catalog: Arc<dyn Catalog<M>>) {
+    pub fn register_catalog(&self, catalog: Arc<dyn Catalog<M>>) {
         self.registry
             .write()
             .expect("catalog service registry write lock")
             .register(catalog);
     }
 
-    pub(crate) fn unregister_catalog(&self, name: &str) {
+    pub fn unregister_catalog(&self, name: &str) {
         self.registry
             .write()
             .expect("catalog service registry write lock")
             .unregister(name);
     }
 
-    pub(crate) fn invalidate_table(
+    pub fn invalidate_table(
         &self,
         catalog: &str,
         namespace: &str,
@@ -94,10 +94,10 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use super::CatalogService;
-    use crate::catalog::identifier::TableIdentity;
-    use crate::catalog::memory::{DEFAULT_DATABASE, MemoryCatalog, MemoryCatalogEntry};
-    use crate::catalog::registry::{Catalog, CatalogRegistry};
-    use crate::catalog::table::CatalogTable;
+    use crate::identifier::TableIdentity;
+    use crate::memory::{DEFAULT_DATABASE, MemoryCatalog, MemoryCatalogEntry};
+    use crate::registry::{Catalog, CatalogRegistry};
+    use crate::table::CatalogTable;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestEntry {

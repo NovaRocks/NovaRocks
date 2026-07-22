@@ -15,28 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::catalog::partition::LegacyRangePartition;
-use crate::catalog::table::CatalogTable;
-
-pub(crate) trait CatalogProvider {
-    fn get_table(&self, database: &str, table: &str) -> Result<CatalogTable, String>;
-
-    fn get_table_in_catalog(
-        &self,
-        catalog: Option<&str>,
-        database: &str,
-        table: &str,
-    ) -> Result<CatalogTable, String> {
-        let _ = catalog;
-        self.get_table(database, table)
-    }
-
-    fn get_legacy_range_partition(
-        &self,
-        _database: &str,
-        _table: &str,
-        _partition: &str,
-    ) -> Result<Option<LegacyRangePartition>, String> {
-        Ok(None)
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyRangePartition {
+    pub name: String,
+    pub column: String,
+    pub lower_sql: String,
+    pub upper_sql: String,
 }

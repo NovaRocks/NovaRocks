@@ -78,7 +78,6 @@ use std::fmt;
 
 use arrow::datatypes::DataType;
 
-use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::expr::JoinKind;
@@ -86,6 +85,7 @@ use crate::sql::planner::payload::{PlanGenerateSeriesNode, PlanProjectNode, Plan
 use crate::sql::planner::physical::{
     PhysicalHashAggregateNode, aggregate_intermediate_type, hash_aggregate_outputs_intermediate,
 };
+use novarocks_catalog::schema::ColumnDef;
 
 use super::boundary::{
     BoundaryCatalog, BoundaryContract, ExecutionColumnId, ExecutionColumnIdAllocator,
@@ -2079,7 +2079,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::NodeExecutionKind;
-    use crate::catalog::schema::ColumnDef;
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
@@ -2108,6 +2107,7 @@ mod tests {
         PlanSetOpKind, PlannerConfidence,
     };
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     fn stats() -> PhysicalPlanStats {
         PhysicalPlanStats {

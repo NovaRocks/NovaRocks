@@ -24,7 +24,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 #[cfg(test)]
 use crate::connector::iceberg::scan_model::IcebergSchemaDef;
@@ -40,6 +39,7 @@ use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use crate::sql::planner::table::IcebergMvTargetLocatorScan;
 use crate::sql::planner::table::{IcebergMvTargetStateScan, ScanSource};
 use mv_schema::MvSchemaContract;
+use novarocks_catalog::identifier::TableIdentity;
 
 /// Refresh-time context. Wraps `IcebergMvRewriteContext` and adds execution
 /// handles only the refresh path needs.
@@ -355,7 +355,7 @@ impl IcebergMvRefreshContext {
         &self,
         catalog: &str,
     ) -> Result<&IcebergCatalogEntry, String> {
-        let key = crate::catalog::identifier::normalize_identifier(catalog)?;
+        let key = novarocks_catalog::identifier::normalize_identifier(catalog)?;
         self.base_catalog_entries.get(&key).ok_or_else(|| {
             format!("Iceberg version scan requires base catalog {catalog} in MV refresh context")
         })
@@ -716,7 +716,7 @@ fn collect_base_catalog_entries(
 ) -> Result<BTreeMap<String, IcebergCatalogEntry>, String> {
     let mut entries = BTreeMap::new();
     for base_ref in base_refs {
-        let key = crate::catalog::identifier::normalize_identifier(&base_ref.catalog)?;
+        let key = novarocks_catalog::identifier::normalize_identifier(&base_ref.catalog)?;
         if entries.contains_key(&key) {
             continue;
         }
@@ -758,7 +758,6 @@ pub(crate) mod tests_support {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::catalog::identifier::TableIdentity;
     use crate::mv::rewrite::context::IcebergMvRewriteContext;
     use crate::mv::rewrite::context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
@@ -770,6 +769,7 @@ pub(crate) mod tests_support {
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, JOIN_APPLY_KEY_COLUMN_NAME,
     };
+    use novarocks_catalog::identifier::TableIdentity;
 
     use super::*;
 
@@ -807,14 +807,14 @@ pub(crate) mod tests_support {
             &[
                 crate::sql::TableColumnDef {
                     name: "k".to_string(),
-                    data_type: crate::catalog::schema::SqlType::BigInt,
+                    data_type: novarocks_catalog::schema::SqlType::BigInt,
                     nullable: false,
                     aggregation: None,
                     default: None,
                 },
                 crate::sql::TableColumnDef {
                     name: "v".to_string(),
-                    data_type: crate::catalog::schema::SqlType::BigInt,
+                    data_type: novarocks_catalog::schema::SqlType::BigInt,
                     nullable: true,
                     aggregation: None,
                     default: None,
@@ -1158,14 +1158,14 @@ pub(crate) mod tests_support {
                 &[
                     crate::sql::TableColumnDef {
                         name: "k".to_string(),
-                        data_type: crate::catalog::schema::SqlType::BigInt,
+                        data_type: novarocks_catalog::schema::SqlType::BigInt,
                         nullable: false,
                         aggregation: None,
                         default: None,
                     },
                     crate::sql::TableColumnDef {
                         name: "v".to_string(),
-                        data_type: crate::catalog::schema::SqlType::BigInt,
+                        data_type: novarocks_catalog::schema::SqlType::BigInt,
                         nullable: true,
                         aggregation: None,
                         default: None,
@@ -1189,21 +1189,21 @@ pub(crate) mod tests_support {
             &[
                 crate::sql::TableColumnDef {
                     name: "k".to_string(),
-                    data_type: crate::catalog::schema::SqlType::BigInt,
+                    data_type: novarocks_catalog::schema::SqlType::BigInt,
                     nullable: false,
                     aggregation: None,
                     default: None,
                 },
                 crate::sql::TableColumnDef {
                     name: "v".to_string(),
-                    data_type: crate::catalog::schema::SqlType::BigInt,
+                    data_type: novarocks_catalog::schema::SqlType::BigInt,
                     nullable: true,
                     aggregation: None,
                     default: None,
                 },
                 crate::sql::TableColumnDef {
                     name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-                    data_type: crate::catalog::schema::SqlType::String,
+                    data_type: novarocks_catalog::schema::SqlType::String,
                     nullable: false,
                     aggregation: None,
                     default: None,

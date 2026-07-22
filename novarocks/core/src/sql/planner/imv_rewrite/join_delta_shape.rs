@@ -290,7 +290,6 @@ mod tests {
     use crate::sql::planner::payload::*;
     use arrow::datatypes::DataType;
 
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
@@ -299,6 +298,7 @@ mod tests {
     use crate::sql::planner::logical::LogicalPlanKind;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
     use crate::sql::planner::table::TableDef;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn table_info(table: &str) -> IcebergTableInfo {
         IcebergTableInfo {

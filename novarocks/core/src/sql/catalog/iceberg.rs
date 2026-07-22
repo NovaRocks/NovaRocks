@@ -17,11 +17,11 @@
 
 use std::sync::Arc;
 
-use crate::catalog::identifier::TableIdentity;
-use crate::catalog::registry::Catalog;
-use crate::catalog::schema_cache::SchemaCache;
 use crate::connector::backend::{CatalogBackend, TableSource};
 use crate::sql::catalog::CatalogRuntimeMetadata;
+use novarocks_catalog::identifier::TableIdentity;
+use novarocks_catalog::registry::Catalog;
+use novarocks_catalog::schema_cache::SchemaCache;
 
 pub(super) struct IcebergCatalog {
     name: String,
@@ -87,8 +87,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::IcebergCatalog;
-    use crate::catalog::registry::{Catalog, CatalogRegistry};
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::backend::{
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
@@ -96,6 +94,8 @@ mod tests {
     use crate::sql::catalog::{CatalogRuntimeBinding, CatalogRuntimeMetadata};
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::registry::{Catalog, CatalogRegistry};
+    use novarocks_catalog::schema::ColumnDef;
 
     struct TrackingBackend {
         loads: Arc<AtomicUsize>,

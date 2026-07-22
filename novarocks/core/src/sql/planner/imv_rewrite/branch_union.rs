@@ -332,7 +332,6 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
@@ -361,6 +360,7 @@ mod tests {
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode,
     };
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     #[test]
     fn rewrites_top_union_of_aggregates_into_branch_scoped_merges() {

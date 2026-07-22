@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LegacyRangePartition {
-    pub(crate) name: String,
-    pub(crate) column: String,
-    pub(crate) lower_sql: String,
-    pub(crate) upper_sql: String,
+use crate::identifier::TableIdentity;
+use crate::schema::ColumnDef;
+
+#[derive(Clone, Debug)]
+pub struct CatalogTable {
+    pub identity: TableIdentity,
+    pub columns: Vec<ColumnDef>,
+    pub hidden_columns: Vec<ColumnDef>,
 }

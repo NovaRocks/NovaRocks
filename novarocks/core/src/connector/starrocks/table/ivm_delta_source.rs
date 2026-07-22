@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::changes::{
     DeletedDataFileRef, IcebergChangeBatch, build_factory_for_table,
     expected_object_store_bucket_for_table, normalize_delete_projection_path,
@@ -34,6 +33,7 @@ use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSER
 use crate::exec::node::iceberg_delta_scan::BaseDataFileLineage;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::catalog::local::PlannerMemoryCatalog;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct IvmDeltaSourceFiles {
     pub previous_snapshot_id: i64,

@@ -27,8 +27,8 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::schema::SqlType;
 use crate::exec::chunk::{Chunk, ChunkSchema};
+use novarocks_catalog::schema::SqlType;
 
 #[derive(Clone, Debug)]
 pub struct QueryResultColumn {

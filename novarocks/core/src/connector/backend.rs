@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::schema::ColumnDef;
 use crate::connector::stats::TableStatsProvider;
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow, RefreshCtx, RefreshError,
@@ -39,6 +38,7 @@ use crate::sql::parser::ast::{
     AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr, Literal, TableColumnDef, TableKeyDesc,
 };
 use crate::sql::planner::table::TableDef;
+use novarocks_catalog::schema::ColumnDef;
 
 /// Request to create a table. Unified shape across all catalog backends;
 /// backends ignore fields that don't apply to them (e.g. `bucket_count` is

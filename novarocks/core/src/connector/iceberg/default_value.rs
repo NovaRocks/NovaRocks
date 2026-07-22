@@ -16,7 +16,7 @@ use iceberg::spec::{
     Type,
 };
 
-use crate::catalog::schema::{ColumnDefault, validate_column_default};
+use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
 
 pub(crate) fn iceberg_literal_to_column_default(
     literal: &IcebergLiteral,
@@ -506,8 +506,8 @@ pub(crate) fn literal_to_constant_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDefault;
     use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Struct, StructType, Type};
+    use novarocks_catalog::schema::ColumnDefault;
 
     fn assert_iceberg_default_round_trip(
         literal: IcebergLiteral,

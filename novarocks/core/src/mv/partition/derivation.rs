@@ -807,7 +807,6 @@ mod tests {
 
     // --- Test fixtures for bind/evaluate tests (copied verbatim from aggregate_delta.rs) ---
 
-    use crate::catalog::schema::SqlType;
     use crate::exec::chunk::Chunk;
     use crate::mv::aggregate_state::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
@@ -816,6 +815,7 @@ mod tests {
     use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_catalog::schema::SqlType;
     use std::sync::Arc as StdArcFixture;
 
     fn count_layout_with_group_key(
@@ -1037,9 +1037,9 @@ mod tests {
 
     #[test]
     fn bind_and_evaluate_identity_partition_over_chunks() {
-        use crate::catalog::schema::SqlType;
         use arrow::array::StringArray;
         use arrow::datatypes::DataType;
+        use novarocks_catalog::schema::SqlType;
 
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
         let contract =
@@ -1068,8 +1068,8 @@ mod tests {
 
     #[test]
     fn bind_rejects_non_group_key_output_index() {
-        use crate::catalog::schema::SqlType;
         use arrow::datatypes::DataType;
+        use novarocks_catalog::schema::SqlType;
 
         let mut layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
         layout.group_key_source_indexes = vec![1]; // "region" (index 0) no longer a group key

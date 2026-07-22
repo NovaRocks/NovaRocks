@@ -126,12 +126,12 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;
 

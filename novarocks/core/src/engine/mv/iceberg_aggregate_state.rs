@@ -427,13 +427,13 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    use crate::catalog::schema::SqlType;
     use crate::mv::aggregate_state::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
     };
     use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
     use crate::mv::aggregate_state::state_codec::encode_count_state;
     use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
+    use novarocks_catalog::schema::SqlType;
 
     fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {
         record_batch_to_chunk(batch).expect("chunk")

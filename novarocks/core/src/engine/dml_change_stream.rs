@@ -366,7 +366,7 @@ fn target_partition_source_ordinals(
 
 fn output_ordinals_for_sink_columns(
     output_columns: &[OutputColumn],
-    sink_columns: &[crate::catalog::schema::ColumnDef],
+    sink_columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> Result<Vec<usize>, String> {
     sink_columns
         .iter()

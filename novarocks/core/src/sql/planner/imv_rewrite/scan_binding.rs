@@ -21,7 +21,6 @@
 //! windows from `IcebergMvRewriteContext`. It must never fall back to the
 //! current Iceberg snapshot: the refresh pin is the read upper bound.
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 pub(crate) use crate::sql::common::ImvVersionRole;
@@ -36,6 +35,7 @@ use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, o
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
+use novarocks_catalog::identifier::TableIdentity;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvSnapshotWindow {
@@ -245,7 +245,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
@@ -253,6 +252,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::table::TableDef;
+    use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;
 

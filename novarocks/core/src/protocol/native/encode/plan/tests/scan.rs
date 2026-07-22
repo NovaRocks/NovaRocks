@@ -46,7 +46,7 @@ fn prepared_runtime_filter_bindings(plan: &DistributedPlan) -> &'static Prepared
 #[test]
 fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
     let plan = iceberg_delta_distributed_plan_for_test();
-    let source_column = crate::catalog::schema::ColumnDef {
+    let source_column = novarocks_catalog::schema::ColumnDef {
         name: "physical_order_id".to_string(),
         data_type: DataType::Int64,
         nullable: false,
@@ -617,8 +617,8 @@ fn column_def_for_test(
     name: &str,
     data_type: DataType,
     nullable: bool,
-) -> crate::catalog::schema::ColumnDef {
-    crate::catalog::schema::ColumnDef {
+) -> novarocks_catalog::schema::ColumnDef {
+    novarocks_catalog::schema::ColumnDef {
         name: name.to_string(),
         data_type,
         nullable,
@@ -671,7 +671,7 @@ fn iceberg_delta_distributed_plan_for_test() -> DistributedPlan {
 fn iceberg_delta_table_for_test() -> table_model::TableDef {
     table_model::TableDef {
         name: "orders".to_string(),
-        columns: vec![crate::catalog::schema::ColumnDef {
+        columns: vec![novarocks_catalog::schema::ColumnDef {
             name: "order_id".to_string(),
             data_type: DataType::Int64,
             nullable: false,

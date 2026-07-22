@@ -18,7 +18,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::catalog::schema::SqlType;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::create_lake_tablet_from_req;
@@ -31,12 +30,12 @@ use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::parser::ast::{
     ColumnAggregation, ObjectName, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
+use novarocks_catalog::schema::SqlType;
 
 use super::catalog::{
     StarRocksTableCatalog, StarRocksTableRuntime, register_starrocks_table_in_catalog,
 };
 use super::model::{StarRocksPartitionState, StoredStarRocksColumn};
-use crate::catalog::identifier::normalize_identifier;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
 use crate::connector::starrocks::table::schema_adapter::{
     build_create_tablet_request, build_tablet_schema, request_schema_from_runtime,
@@ -47,6 +46,7 @@ use crate::meta::repository::starrocks_table::{
     StagedStarRocksTruncate, StarRocksTableKind as RepoStarRocksTableKind,
 };
 use crate::mv::aggregate_state::physical_column::StarRocksPhysicalColumn;
+use novarocks_catalog::identifier::normalize_identifier;
 
 /// Default bucket count when the user omits `DISTRIBUTED BY ... BUCKETS <n>`.
 const DEFAULT_STARROCKS_BUCKET_COUNT: u32 = 1;

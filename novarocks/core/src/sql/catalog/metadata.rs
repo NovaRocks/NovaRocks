@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::catalog::table::CatalogTable;
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
+use novarocks_catalog::table::CatalogTable;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum CatalogRuntimeBinding {
@@ -45,12 +45,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{CatalogRuntimeBinding, CatalogRuntimeMetadata};
-    use crate::catalog::identifier::TableIdentity;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
     };
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn column(name: &str) -> ColumnDef {
         ColumnDef {

@@ -21,7 +21,6 @@ use std::sync::{Arc, RwLock};
 
 use arrow::datatypes::DataType;
 
-use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
 use crate::connector::iceberg::catalog::backend::{
     data_file_with_stats_to_iceberg_data_file_info, iceberg_schema_def_for_codegen,
@@ -32,6 +31,7 @@ use crate::connector::stats::{
     ScanSourceIdentity, StatsProviderError, TableSnapshotRef, TableStatsProvider, TableStatsRequest,
 };
 use crate::sql::optimizer::stats_input::{BaseTableStatistics, StatsMissingReason};
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) struct IcebergTableStatsProvider {
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
@@ -384,7 +384,6 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, RwLock};
 
-    use crate::catalog::schema::SqlType;
     use crate::connector::iceberg::catalog::registry::{
         DataFileWithStats, IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg,
         build_iceberg_catalog,
@@ -401,6 +400,7 @@ mod tests {
         BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
     };
     use crate::sql::{Literal, TableColumnDef};
+    use novarocks_catalog::schema::SqlType;
 
     fn s3_cloud_properties(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries

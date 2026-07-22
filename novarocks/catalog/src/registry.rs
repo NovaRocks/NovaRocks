@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) trait Catalog<M>: Send + Sync {
+pub trait Catalog<M>: Send + Sync {
     fn name(&self) -> &str;
 
     fn get_table_metadata(&self, namespace: &str, table: &str) -> Result<M, String>;
@@ -26,7 +26,7 @@ pub(crate) trait Catalog<M>: Send + Sync {
     fn invalidate_table(&self, _namespace: &str, _table: &str) {}
 }
 
-pub(crate) struct CatalogRegistry<M> {
+pub struct CatalogRegistry<M> {
     catalogs: HashMap<String, Arc<dyn Catalog<M>>>,
 }
 
@@ -47,20 +47,20 @@ impl<M> Default for CatalogRegistry<M> {
 }
 
 impl<M> CatalogRegistry<M> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn register(&mut self, catalog: Arc<dyn Catalog<M>>) {
+    pub fn register(&mut self, catalog: Arc<dyn Catalog<M>>) {
         self.catalogs
             .insert(catalog.name().to_ascii_lowercase(), catalog);
     }
 
-    pub(crate) fn unregister(&mut self, name: &str) {
+    pub fn unregister(&mut self, name: &str) {
         self.catalogs.remove(&name.to_ascii_lowercase());
     }
 
-    pub(crate) fn invalidate_table(
+    pub fn invalidate_table(
         &self,
         catalog: &str,
         namespace: &str,
@@ -71,14 +71,14 @@ impl<M> CatalogRegistry<M> {
         Ok(())
     }
 
-    pub(crate) fn get_catalog(&self, name: &str) -> Result<Arc<dyn Catalog<M>>, String> {
+    pub fn get_catalog(&self, name: &str) -> Result<Arc<dyn Catalog<M>>, String> {
         self.catalogs
             .get(&name.to_ascii_lowercase())
             .cloned()
             .ok_or_else(|| format!("unknown catalog: {name}"))
     }
 
-    pub(crate) fn resolve(&self, catalog: &str, namespace: &str, table: &str) -> Result<M, String> {
+    pub fn resolve(&self, catalog: &str, namespace: &str, table: &str) -> Result<M, String> {
         self.get_catalog(catalog)?
             .get_table_metadata(namespace, table)
     }

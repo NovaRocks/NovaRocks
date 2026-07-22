@@ -24,8 +24,6 @@ use arrow::array::{Array, ArrayRef, BinaryArray, StringArray, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::ColumnDef;
 use crate::connector::backend::ResolvedTable;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::insert::reorder_insert_rows;
@@ -35,6 +33,8 @@ use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{InsertSource, ObjectName, OverwriteMode};
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn run_insert(
     state: &Arc<StandaloneState>,

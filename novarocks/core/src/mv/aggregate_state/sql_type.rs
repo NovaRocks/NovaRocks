@@ -17,7 +17,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::catalog::schema::SqlType;
+use novarocks_catalog::schema::SqlType;
 
 pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType, String> {
     match data_type {
@@ -83,7 +83,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 
     use super::arrow_data_type_to_sql_type;
-    use crate::catalog::schema::SqlType;
+    use novarocks_catalog::schema::SqlType;
 
     #[test]
     fn arrow_data_type_to_sql_type_preserves_scalar_contract() {

@@ -19,7 +19,6 @@ use std::collections::BTreeSet;
 
 use arrow::datatypes::DataType;
 
-use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
@@ -32,6 +31,7 @@ use crate::sql::planner::logical::{
 };
 use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode};
 use crate::sql::planner::table::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn build_join_apply_key_project(
     input: LogicalPlanNode,

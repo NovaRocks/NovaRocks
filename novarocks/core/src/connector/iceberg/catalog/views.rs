@@ -32,8 +32,8 @@ use super::registry::{
     IcebergCatalogEntry, IcebergCatalogKind, block_on_iceberg, build_iceberg_catalog,
     iceberg_type_for_sql_type,
 };
-use crate::catalog::identifier::normalize_identifier;
 use crate::sql::parser::ast::TableColumnDef;
+use novarocks_catalog::identifier::normalize_identifier;
 
 /// Dialect tag NovaRocks writes into view representations. NovaRocks parses
 /// StarRocks-flavoured SQL, so it shares StarRocks' dialect tag for
@@ -339,8 +339,8 @@ mod rest_view_tests {
 
     use super::super::registry::{IcebergCatalogEntry, build_catalog_entry};
     use super::{create_view, drop_view, list_views, load_view, view_exists};
-    use crate::catalog::schema::SqlType;
     use crate::sql::parser::ast::TableColumnDef;
+    use novarocks_catalog::schema::SqlType;
 
     fn rest_props(uri: &str) -> Vec<(String, String)> {
         vec![

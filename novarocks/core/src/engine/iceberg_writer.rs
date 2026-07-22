@@ -34,8 +34,6 @@ use iceberg::Catalog;
 use iceberg::spec::DataFile;
 use iceberg::{NamespaceIdent, TableIdent};
 
-use crate::catalog::schema::ColumnDef;
-use crate::catalog::schema::SqlType;
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::backend::{
     ICEBERG_ROW_IDENTITY_FILE_COLUMN, ICEBERG_ROW_IDENTITY_POS_COLUMN,
@@ -75,6 +73,8 @@ use crate::sql::planner::distributed::write::sink::{
     synthetic_iceberg_write_table_id, transform_to_sink_string,
 };
 use crate::sql::planner::table::{ScanSource, TableDef};
+use novarocks_catalog::schema::ColumnDef;
+use novarocks_catalog::schema::SqlType;
 
 pub(crate) fn execute_iceberg_insert_or_overwrite(
     state: &Arc<StandaloneState>,
@@ -698,7 +698,7 @@ fn wrap_insert_query_with_write_projection(
     let source_alias = "__nr_insert_src";
     let mut projection = Vec::with_capacity(write_columns.len());
     for (write_idx, column) in write_columns.iter().enumerate() {
-        let target_name = crate::catalog::identifier::normalize_identifier(&column.name)?;
+        let target_name = novarocks_catalog::identifier::normalize_identifier(&column.name)?;
         let expr = if let Some(source_idx) = insert_idx_by_target.get(&target_name) {
             let source_expr = format!(
                 "{}.{}",
@@ -798,7 +798,7 @@ fn values_append_source_to_query_for_write(
                         }
                     } else {
                         let target_name =
-                            crate::catalog::identifier::normalize_identifier(&column.name)?;
+                            novarocks_catalog::identifier::normalize_identifier(&column.name)?;
                         if let Some(literal) = insert_idx_by_target
                             .get(&target_name)
                             .and_then(|source_idx| row.get(*source_idx))
@@ -894,14 +894,14 @@ fn insert_column_index_by_target_name(
 ) -> Result<std::collections::HashMap<String, usize>, String> {
     let mut target_names = std::collections::HashSet::with_capacity(target_columns.len());
     for column in target_columns {
-        target_names.insert(crate::catalog::identifier::normalize_identifier(
+        target_names.insert(novarocks_catalog::identifier::normalize_identifier(
             &column.name,
         )?);
     }
 
     let mut mapping = std::collections::HashMap::with_capacity(insert_columns.len());
     for (idx, column) in insert_columns.iter().enumerate() {
-        let normalized = crate::catalog::identifier::normalize_identifier(column)?;
+        let normalized = novarocks_catalog::identifier::normalize_identifier(column)?;
         if !target_names.contains(&normalized) {
             return Err(format!("unknown INSERT column `{column}`"));
         }
@@ -1350,14 +1350,14 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
     use sqlparser::ast as sqlast;
 
-    use crate::catalog::schema::ColumnDefault;
+    use novarocks_catalog::schema::ColumnDefault;
 
     fn test_column(
         name: &str,
         data_type: DataType,
         write_default: Option<ColumnDefault>,
-    ) -> crate::catalog::schema::ColumnDef {
-        crate::catalog::schema::ColumnDef {
+    ) -> novarocks_catalog::schema::ColumnDef {
+        novarocks_catalog::schema::ColumnDef {
             name: name.to_string(),
             data_type,
             nullable: true,
@@ -1615,7 +1615,7 @@ mod tests {
     fn arrow_data_type_to_sql_type_accepts_time64_for_insert_defaults() {
         assert_eq!(
             arrow_data_type_to_sql_type(&DataType::Time64(TimeUnit::Microsecond)).expect("type"),
-            crate::catalog::schema::SqlType::Time
+            novarocks_catalog::schema::SqlType::Time
         );
     }
 

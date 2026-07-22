@@ -523,7 +523,6 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -538,6 +537,7 @@ mod tests {
     use crate::sql::planner::table::{
         IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
     };
+    use novarocks_catalog::schema::ColumnDef;
 
     fn output_column(id: u32, name: &str, data_type: DataType, is_internal: bool) -> OutputColumn {
         OutputColumn {

@@ -17,7 +17,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
 };
@@ -27,6 +26,7 @@ use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) use super::iceberg_delta::IcebergDeltaScanRuntimePlan;
 
@@ -252,7 +252,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::catalog::schema::SqlType;
+    use novarocks_catalog::schema::SqlType;
 
     #[test]
     fn resolver_trait_object_is_send_and_sync() {

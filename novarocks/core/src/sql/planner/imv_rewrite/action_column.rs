@@ -26,7 +26,6 @@ use std::sync::atomic::AtomicBool;
 
 use arrow::datatypes::DataType;
 
-use crate::catalog::schema::ColumnDef;
 use crate::mv::persistence::schema::{HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
@@ -49,6 +48,7 @@ use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) struct ImvActionColumn;
 
@@ -422,7 +422,6 @@ fn has_visible_output(plan: &LogicalPlanNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
@@ -435,6 +434,7 @@ mod tests {
     use crate::sql::planner::payload::PlanProjectNode;
     use crate::sql::planner::payload::*;
     use crate::sql::planner::table::TableDef;
+    use novarocks_catalog::schema::ColumnDef;
 
     #[test]
     fn output_column_has_expected_shape() {

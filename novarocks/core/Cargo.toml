@@ -32,6 +32,7 @@ test = false
 bench = false
 
 [dependencies]
+novarocks-catalog = { path = "../catalog" }
 novarocks-types = { path = "../types" }
 novarocks-version = { path = "../version" }
 novarocks-state-store = { path = "../state-store" }

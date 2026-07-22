@@ -253,7 +253,7 @@ fn resolved_source_column<'a>(
     scan: &'a PlanScanNode,
     name: &str,
 ) -> Option<(
-    &'a crate::catalog::schema::ColumnDef,
+    &'a novarocks_catalog::schema::ColumnDef,
     ResolvedScanColumnKind,
 )> {
     if let Some(column) = scan

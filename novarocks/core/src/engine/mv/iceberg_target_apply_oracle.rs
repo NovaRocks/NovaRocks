@@ -855,8 +855,8 @@ fn try_register_scoped_framework_locator_table(
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 struct FrameworkLocatorTableFingerprint {
-    columns: Vec<crate::catalog::schema::ColumnDef>,
-    iceberg_row_lineage_metadata_columns: Vec<crate::catalog::schema::ColumnDef>,
+    columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     source_debug: String,
 }
 
@@ -1162,7 +1162,7 @@ fn framework_locator_loaded_table(
                     field.name()
                 )
             })?;
-            Ok(crate::catalog::schema::ColumnDef {
+            Ok(novarocks_catalog::schema::ColumnDef {
                 name: field.name().clone(),
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
@@ -1566,7 +1566,7 @@ mod tests {
         let column = apply_key_table_column();
 
         assert_eq!(column.name, "__nova_base_row_id");
-        assert_eq!(column.data_type, crate::catalog::schema::SqlType::BigInt);
+        assert_eq!(column.data_type, novarocks_catalog::schema::SqlType::BigInt);
         assert!(!column.nullable);
         assert!(column.aggregation.is_none());
         assert!(column.default.is_none());
@@ -1577,7 +1577,7 @@ mod tests {
         let column = join_apply_key_table_column();
 
         assert_eq!(column.name, "__nova_join_row_key");
-        assert_eq!(column.data_type, crate::catalog::schema::SqlType::String);
+        assert_eq!(column.data_type, novarocks_catalog::schema::SqlType::String);
         assert!(!column.nullable);
         assert!(column.aggregation.is_none());
         assert!(column.default.is_none());
@@ -1591,7 +1591,7 @@ mod tests {
         assert!(!col.nullable);
         assert!(matches!(
             col.data_type,
-            crate::catalog::schema::SqlType::Int
+            novarocks_catalog::schema::SqlType::Int
         ));
     }
 
@@ -2496,14 +2496,14 @@ mod tests {
         crate::connector::iceberg::catalog::IcebergLoadedTable {
             table: target_table.clone(),
             columns: vec![
-                crate::catalog::schema::ColumnDef {
+                novarocks_catalog::schema::ColumnDef {
                     name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
                     nullable: false,
                     write_default: None,
                     logical_type: None,
                 },
-                crate::catalog::schema::ColumnDef {
+                novarocks_catalog::schema::ColumnDef {
                     name: "region".to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
                     nullable: true,
@@ -2548,7 +2548,7 @@ mod tests {
         assert_standard_mv_target_table_def_hides_physical_apply_key(&table_def);
         table_def.columns.insert(
             0,
-            crate::catalog::schema::ColumnDef {
+            novarocks_catalog::schema::ColumnDef {
                 name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                 data_type: arrow::datatypes::DataType::Utf8,
                 nullable: false,
@@ -3387,7 +3387,7 @@ mod tests {
     ) -> crate::sql::planner::table::TableDef {
         crate::sql::planner::table::TableDef {
             name: name.to_string(),
-            columns: vec![crate::catalog::schema::ColumnDef {
+            columns: vec![novarocks_catalog::schema::ColumnDef {
                 name: column_name.to_string(),
                 data_type: arrow::datatypes::DataType::Int32,
                 nullable: false,

@@ -37,8 +37,6 @@ use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
 };
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::memory::DEFAULT_DATABASE;
 use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRepository};
 use crate::connector::{
     IcebergCatalogRegistry, StarRocksTableCatalog, StarRocksTableConfig, iceberg_namespace_exists,
@@ -55,6 +53,8 @@ use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 use crate::sql::catalog::local::PlannerMemoryCatalog;
 use crate::sql::catalog::{StandaloneCatalogService, TableLookupMode};
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_ops;
@@ -110,8 +110,8 @@ pub struct StandaloneOptions {
     pub config_path: Option<PathBuf>,
 }
 
-use crate::catalog::partition::LegacyRangePartition;
 use crate::sql::parser::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
+use novarocks_catalog::partition::LegacyRangePartition;
 
 #[cfg(feature = "compat")]
 pub(crate) fn recover_starrocks_tablet_paths_from_current_engine(
@@ -4607,7 +4607,7 @@ path = "{metadata_path}"
                     catalog: catalog.to_string(),
                     namespace: namespace.to_string(),
                     table: table.to_string(),
-                    columns: vec![crate::catalog::schema::ColumnDef {
+                    columns: vec![novarocks_catalog::schema::ColumnDef {
                         name: "id".to_string(),
                         data_type: DataType::Int64,
                         nullable: false,
@@ -5169,9 +5169,9 @@ mysql_port = 47892
         crate::coordinator::prepare::PreparedFragmentSet,
         crate::protocol::native::encode::NativeFragmentBundle,
     ) {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
         use crate::sql::planner::table::{ScanSource, TableDef};
+        use novarocks_catalog::schema::ColumnDef;
 
         let mut catalog = super::PlannerMemoryCatalog::default();
         let table = TableDef {
@@ -5499,14 +5499,14 @@ mysql_port = 47892
                 crate::sql::planner::table::TableDef {
                     name: "b".to_string(),
                     columns: vec![
-                        crate::catalog::schema::ColumnDef {
+                        novarocks_catalog::schema::ColumnDef {
                             name: "k".to_string(),
                             data_type: DataType::Int64,
                             nullable: false,
                             write_default: None,
                             logical_type: None,
                         },
-                        crate::catalog::schema::ColumnDef {
+                        novarocks_catalog::schema::ColumnDef {
                             name: "v".to_string(),
                             data_type: DataType::Int64,
                             nullable: true,
@@ -5711,8 +5711,8 @@ mysql_port = 47892
 
     #[test]
     fn build_local_insert_batch_supports_array_columns() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
+        use novarocks_catalog::schema::ColumnDef;
 
         let columns = vec![
             ColumnDef {
@@ -5774,7 +5774,7 @@ mysql_port = 47892
     #[test]
     fn sql_type_to_arrow_type_maps_largeint_to_fixed_size_binary() {
         assert_eq!(
-            super::sql_type_to_arrow_type(&crate::catalog::schema::SqlType::LargeInt)
+            super::sql_type_to_arrow_type(&novarocks_catalog::schema::SqlType::LargeInt)
                 .expect("map largeint type"),
             DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
         );
@@ -5782,8 +5782,8 @@ mysql_port = 47892
 
     #[test]
     fn build_local_insert_batch_supports_largeint_columns() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
+        use novarocks_catalog::schema::ColumnDef;
         use novarocks_types::largeint;
 
         let columns = vec![ColumnDef {
@@ -5825,8 +5825,8 @@ mysql_port = 47892
 
     #[test]
     fn build_local_insert_batch_accepts_integral_float_literals_for_bigint_arrays() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
+        use novarocks_catalog::schema::ColumnDef;
 
         let columns = vec![ColumnDef {
             name: "nums".to_string(),
@@ -5858,8 +5858,8 @@ mysql_port = 47892
 
     #[test]
     fn build_local_insert_batch_drops_null_map_keys() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
+        use novarocks_catalog::schema::ColumnDef;
 
         // Arrow's Map layout requires `entries.key` to be non-nullable; map
         // literals with NULL keys must drop those kv-pairs so that the output
@@ -5916,8 +5916,8 @@ mysql_port = 47892
 
     #[test]
     fn cast_batch_to_schema_relaxes_map_key_nullability() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
+        use novarocks_catalog::schema::ColumnDef;
 
         let source_entries_field = Arc::new(Field::new(
             "entries",
@@ -5980,8 +5980,8 @@ mysql_port = 47892
 
     #[test]
     fn local_parquet_round_trip_drops_null_map_keys() {
-        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
+        use novarocks_catalog::schema::ColumnDef;
 
         // Arrow's Map layout requires non-null keys; when a literal carries a
         // NULL key, the insert path drops the kv-pair and the resulting

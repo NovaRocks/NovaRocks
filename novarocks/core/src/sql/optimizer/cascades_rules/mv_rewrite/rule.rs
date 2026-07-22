@@ -663,7 +663,6 @@ fn same_iceberg_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
@@ -681,6 +680,7 @@ mod tests {
     use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode};
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
 
     // --- fixture helpers --------------------------------------------------
 

@@ -1055,7 +1055,6 @@ pub(crate) fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -1063,6 +1062,7 @@ mod tests {
     use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode, PlanSortNode};
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
 
     fn col(id: u32, name: &str) -> OutputColumn {
         OutputColumn {

@@ -31,7 +31,6 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::ApplyTransactionAction;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::identifier::TableIdentity;
 use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::changes::plan_changes;
 use crate::connector::iceberg::commit::mv_provenance::{
@@ -151,6 +150,7 @@ use crate::sql::parser::ast::{
     DropMaterializedViewStmt, ObjectName, RefreshMaterializedViewStmt,
 };
 use mv_schema::MvPartitionContract;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
      its previous behavior (drop target + delete definition + recreate empty target) \
@@ -580,7 +580,7 @@ fn resolve_iceberg_mv_target(
     }
     let (namespace, table) = resolve_mv_name(&stmt.name, current_database)?;
     Ok(IcebergMvTarget {
-        catalog: crate::catalog::identifier::normalize_identifier(current_catalog)?,
+        catalog: novarocks_catalog::identifier::normalize_identifier(current_catalog)?,
         namespace,
         table,
     })
@@ -2593,7 +2593,7 @@ pub(crate) fn resolve_refresh_target(
     })?;
     let (namespace, table) = resolve_mv_name(name, current_database)?;
     Ok(IcebergMvTarget {
-        catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
+        catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
         namespace,
         table,
     })
@@ -12537,9 +12537,9 @@ fn join_catalog_registration_key(
 ) -> Result<String, String> {
     Ok(format!(
         "{}.{}.{}",
-        crate::catalog::identifier::normalize_identifier(catalog)?,
-        crate::catalog::identifier::normalize_identifier(namespace)?,
-        crate::catalog::identifier::normalize_identifier(table)?
+        novarocks_catalog::identifier::normalize_identifier(catalog)?,
+        novarocks_catalog::identifier::normalize_identifier(namespace)?,
+        novarocks_catalog::identifier::normalize_identifier(table)?
     ))
 }
 
@@ -13210,7 +13210,7 @@ fn build_imv_change_stream_branches(
 
 fn output_ordinals_for_sink_columns(
     output_columns: &[OutputColumn],
-    sink_columns: &[crate::catalog::schema::ColumnDef],
+    sink_columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> Result<Vec<usize>, String> {
     sink_columns
         .iter()
@@ -14054,7 +14054,7 @@ fn resolve_drop_target(
     })?;
     let (namespace, table) = resolve_mv_name(name, current_database)?;
     Ok(IcebergMvTarget {
-        catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
+        catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
         namespace,
         table,
     })
@@ -17160,14 +17160,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "name".to_string(),
-                data_type: crate::catalog::schema::SqlType::String,
+                data_type: novarocks_catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -17201,21 +17201,21 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "region".to_string(),
-                data_type: crate::catalog::schema::SqlType::String,
+                data_type: novarocks_catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "amount".to_string(),
-                data_type: crate::catalog::schema::SqlType::BigInt,
+                data_type: novarocks_catalog::schema::SqlType::BigInt,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -17249,21 +17249,21 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "region".to_string(),
-                data_type: crate::catalog::schema::SqlType::String,
+                data_type: novarocks_catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "price".to_string(),
-                data_type: crate::catalog::schema::SqlType::Double,
+                data_type: novarocks_catalog::schema::SqlType::Double,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -17297,14 +17297,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "category".to_string(),
-                data_type: crate::catalog::schema::SqlType::String,
+                data_type: novarocks_catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -17338,14 +17338,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "customer_id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
@@ -17379,14 +17379,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "region".to_string(),
-                data_type: crate::catalog::schema::SqlType::String,
+                data_type: novarocks_catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -17420,21 +17420,21 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "label".to_string(),
-                data_type: crate::catalog::schema::SqlType::String,
+                data_type: novarocks_catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-                data_type: crate::catalog::schema::SqlType::String,
+                data_type: novarocks_catalog::schema::SqlType::String,
                 nullable: false,
                 aggregation: None,
                 default: None,
@@ -17512,14 +17512,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "name".to_string(),
-                data_type: crate::catalog::schema::SqlType::String,
+                data_type: novarocks_catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -24632,13 +24632,13 @@ mod tests {
         });
     }
     mod aggregate_apply_test_helpers {
-        use crate::catalog::schema::SqlType;
         use crate::mv::aggregate_state::mv_agg_state::{
             AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
         };
         use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
         use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
         use arrow::datatypes::DataType;
+        use novarocks_catalog::schema::SqlType;
 
         pub(super) fn count_layout(group_key: &str) -> AggregateMvLayout {
             let row_id = starrocks_physical_column(

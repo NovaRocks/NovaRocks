@@ -22,7 +22,6 @@ use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::schema::ColumnDef;
 use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, CreateViewRequest, ResolvedTable, ResolvedView, TableSink,
     TableSource,
@@ -34,6 +33,7 @@ use crate::connector::iceberg::scan_model::{
 use crate::mv::persistence::schema::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY};
 use crate::sql::parser::ast::Literal;
 use crate::sql::planner::table::{ScanSource, TableDef};
+use novarocks_catalog::schema::ColumnDef;
 
 use super::registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, create_namespace as reg_create_namespace,
@@ -114,7 +114,7 @@ impl CatalogBackend for IcebergCatalogBackend {
 
     fn table_exists(&self, catalog: &str, namespace: &str, table: &str) -> Result<bool, String> {
         let entry = self.entry(catalog)?;
-        let normalized = crate::catalog::identifier::normalize_identifier(table)?;
+        let normalized = novarocks_catalog::identifier::normalize_identifier(table)?;
         let tables = reg_list_tables(&entry, namespace)?;
         Ok(tables.iter().any(|t| t.eq_ignore_ascii_case(&normalized)))
     }
@@ -937,9 +937,9 @@ mod tests {
     use iceberg::table::Table;
     use iceberg::{NamespaceIdent, TableIdent};
 
-    use crate::catalog::schema::SqlType;
     use crate::connector::iceberg::catalog::registry::DataFileWithStats;
     use crate::sql::parser::ast::TableColumnDef;
+    use novarocks_catalog::schema::SqlType;
 
     use super::*;
 

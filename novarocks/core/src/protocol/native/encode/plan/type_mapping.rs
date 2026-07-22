@@ -16,7 +16,6 @@
 // under the License.
 
 use super::super::expr::encode_expr;
-use crate::catalog::schema::SqlType;
 use crate::proto::{common, plan};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode;
@@ -25,6 +24,7 @@ use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PlanSetOpKind, RedistributeMode,
     TopNPhase,
 };
+use novarocks_catalog::schema::SqlType;
 
 pub(super) fn encode_sql_type(src: &SqlType) -> Result<common::TypeDesc, String> {
     use common::type_desc::Kind;

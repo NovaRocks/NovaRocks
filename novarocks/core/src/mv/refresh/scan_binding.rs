@@ -142,7 +142,7 @@ pub(crate) fn build_iceberg_delta_scan_runtime_plan(
     to_snapshot_id: i64,
     refresh_ctx: &IcebergMvRefreshContext,
 ) -> Result<IcebergDeltaScanRuntimePlan, String> {
-    let catalog_key = crate::catalog::identifier::normalize_identifier(&table.catalog)?;
+    let catalog_key = novarocks_catalog::identifier::normalize_identifier(&table.catalog)?;
     let entry = refresh_ctx
         .base_catalog_entries
         .get(&catalog_key)
@@ -459,7 +459,7 @@ mod tests {
             "base",
             &[crate::sql::TableColumnDef {
                 name: "k".to_string(),
-                data_type: crate::catalog::schema::SqlType::BigInt,
+                data_type: novarocks_catalog::schema::SqlType::BigInt,
                 nullable: false,
                 aggregation: None,
                 default: None,

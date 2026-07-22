@@ -25,10 +25,10 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::ColumnDef;
 use crate::sql::literal::{LiteralKey, compare_literals, literal_from_batch, literal_to_key};
 use crate::sql::parser::ast::{ColumnAggregation, Literal, TableKeyDesc, TableKeyKind};
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn merge_aggregate_table_rows_if_needed(
     columns: &[ColumnDef],

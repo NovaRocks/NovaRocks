@@ -39,8 +39,8 @@ pub(crate) const JOIN_DELTA_TARGET_LOCATOR_TABLE: &str = "__nr_join_delta_target
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JoinDeltaBranchPlan {
-    pub(crate) left_base: crate::catalog::identifier::TableIdentity,
-    pub(crate) right_base: crate::catalog::identifier::TableIdentity,
+    pub(crate) left_base: novarocks_catalog::identifier::TableIdentity,
+    pub(crate) right_base: novarocks_catalog::identifier::TableIdentity,
     pub(crate) left: BranchSide,
     pub(crate) right: BranchSide,
 }
@@ -56,8 +56,8 @@ impl JoinDeltaBranchPlan {
 }
 
 pub(crate) fn plan_join_delta_branches(
-    left_base: &crate::catalog::identifier::TableIdentity,
-    right_base: &crate::catalog::identifier::TableIdentity,
+    left_base: &novarocks_catalog::identifier::TableIdentity,
+    right_base: &novarocks_catalog::identifier::TableIdentity,
     left_window: SnapshotWindow,
     right_window: SnapshotWindow,
     left_has_changes: bool,
@@ -548,7 +548,7 @@ fn replace_branch_cte_queries(
 
 fn rewrite_branch_factor(
     factor: &mut sqlparser::ast::TableFactor,
-    base: &crate::catalog::identifier::TableIdentity,
+    base: &novarocks_catalog::identifier::TableIdentity,
     side: BranchSide,
     alias: &str,
 ) -> Result<BranchRewrite, String> {
@@ -613,7 +613,7 @@ fn table_factor_alias(
 }
 
 fn base_table_object_name(
-    base: &crate::catalog::identifier::TableIdentity,
+    base: &novarocks_catalog::identifier::TableIdentity,
 ) -> sqlparser::ast::ObjectName {
     sqlparser::ast::ObjectName(vec![
         sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.catalog)),
@@ -623,7 +623,7 @@ fn base_table_object_name(
 }
 
 fn build_nr_ivm_delta_table_factor_for_join(
-    base: &crate::catalog::identifier::TableIdentity,
+    base: &novarocks_catalog::identifier::TableIdentity,
     window: SnapshotWindow,
     alias: sqlparser::ast::Ident,
 ) -> sqlparser::ast::TableFactor {
@@ -720,8 +720,8 @@ fn qualified_alias(
 mod tests {
     use super::*;
 
-    fn base(name: &str) -> crate::catalog::identifier::TableIdentity {
-        crate::catalog::identifier::TableIdentity {
+    fn base(name: &str) -> novarocks_catalog::identifier::TableIdentity {
+        novarocks_catalog::identifier::TableIdentity {
             catalog: "ice".to_string(),
             namespace: "ns".to_string(),
             table: name.to_string(),

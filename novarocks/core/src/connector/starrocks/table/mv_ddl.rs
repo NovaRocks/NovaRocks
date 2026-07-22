@@ -23,7 +23,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::catalog::identifier::normalize_identifier;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
@@ -47,8 +46,8 @@ use crate::sql::parser::ast::{
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_catalog::identifier::normalize_identifier;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::starrocks::table::catalog::{
     StarRocksTableCatalog, register_starrocks_table_in_catalog,
 };
@@ -77,6 +76,7 @@ use crate::mv::analysis::{
 };
 use crate::mv::model::{AggregateFunctionKind, MvStorageEngine, VisibleAggregateOutput};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn resolve_mv_storage_engine(
     properties: &[(String, String)],

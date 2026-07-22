@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
@@ -28,11 +27,12 @@ use crate::mv::persistence::schema::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
         name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-        data_type: crate::catalog::schema::SqlType::BigInt,
+        data_type: novarocks_catalog::schema::SqlType::BigInt,
         nullable: false,
         aggregation: None,
         default: None,
@@ -42,7 +42,7 @@ pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDe
 pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
         name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-        data_type: crate::catalog::schema::SqlType::String,
+        data_type: novarocks_catalog::schema::SqlType::String,
         nullable: false,
         aggregation: None,
         default: None,
@@ -52,7 +52,7 @@ pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableCol
 pub(crate) fn branch_id_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
         name: BRANCH_ID_COLUMN_NAME.to_string(),
-        data_type: crate::catalog::schema::SqlType::Int,
+        data_type: novarocks_catalog::schema::SqlType::Int,
         nullable: false,
         aggregation: None,
         default: None,
@@ -203,7 +203,7 @@ pub(crate) fn expose_physical_apply_key_for_locator_registration(
 fn iceberg_column_def_for_locator(
     target_table: &iceberg::table::Table,
     column_name: &str,
-) -> Result<crate::catalog::schema::ColumnDef, String> {
+) -> Result<novarocks_catalog::schema::ColumnDef, String> {
     let iceberg_schema = target_table.metadata().current_schema();
     let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
         .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
@@ -220,7 +220,7 @@ fn iceberg_column_def_for_locator(
             field.name()
         )
     })?;
-    Ok(crate::catalog::schema::ColumnDef {
+    Ok(novarocks_catalog::schema::ColumnDef {
         name: field.name().clone(),
         data_type: field.data_type().clone(),
         nullable: field.is_nullable(),
@@ -599,7 +599,6 @@ fn iceberg_type_children(ty: &iceberg::spec::Type) -> Vec<IcebergSchemaFieldDef>
 mod tests {
     use std::sync::Arc;
 
-    use crate::catalog::identifier::TableIdentity;
     use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
     use crate::mv::persistence::schema::{
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvSchemaContract,
@@ -608,6 +607,7 @@ mod tests {
     use crate::mv::rewrite::context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
+    use novarocks_catalog::identifier::TableIdentity;
 
     use super::{
         BRANCH_ID_COLUMN_NAME, IcebergMvTargetBindings,
@@ -665,14 +665,14 @@ mod tests {
         let mut columns = vec![
             crate::sql::TableColumnDef {
                 name: "k".to_string(),
-                data_type: crate::catalog::schema::SqlType::BigInt,
+                data_type: novarocks_catalog::schema::SqlType::BigInt,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "v".to_string(),
-                data_type: crate::catalog::schema::SqlType::BigInt,
+                data_type: novarocks_catalog::schema::SqlType::BigInt,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -681,7 +681,7 @@ mod tests {
         if with_branch {
             columns.push(crate::sql::TableColumnDef {
                 name: BRANCH_ID_COLUMN_NAME.to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
@@ -1065,7 +1065,7 @@ mod tests {
         let table_def = crate::sql::planner::table::TableDef {
             name: "mv".to_string(),
             columns: Vec::new(),
-            iceberg_row_lineage_metadata_columns: vec![crate::catalog::schema::ColumnDef {
+            iceberg_row_lineage_metadata_columns: vec![novarocks_catalog::schema::ColumnDef {
                 name: "_file".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
@@ -1102,7 +1102,7 @@ mod tests {
             fixture.target_table.clone(),
         )
         .expect("target bindings");
-        let metadata_column = |name: &str, data_type| crate::catalog::schema::ColumnDef {
+        let metadata_column = |name: &str, data_type| novarocks_catalog::schema::ColumnDef {
             name: name.to_string(),
             data_type,
             nullable: false,

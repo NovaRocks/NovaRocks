@@ -18,7 +18,6 @@
 use super::aggregate::*;
 use super::output::*;
 use super::query::*;
-use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::catalog::PlannerTableProvider;
@@ -27,6 +26,7 @@ use crate::sql::planner::logical::*;
 use crate::sql::planner::payload::*;
 use crate::sql::planner::table::{ScanSource, TableDef};
 use arrow::datatypes::DataType;
+use novarocks_catalog::schema::ColumnDef;
 
 struct TestCatalog;
 

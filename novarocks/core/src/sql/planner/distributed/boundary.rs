@@ -422,7 +422,6 @@ fn find_node(node: &DistributedNode, node_id: i32) -> Option<&DistributedNode> {
 mod tests {
     use arrow::datatypes::DataType;
 
-    use crate::catalog::schema::ColumnDef;
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::analysis::cte::CteId;
@@ -445,6 +444,7 @@ mod tests {
     };
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use novarocks_catalog::schema::ColumnDef;
 
     use super::build_boundary_catalog;
     use super::{BoundaryContract, BoundaryError, BoundaryKind, ExecutionColumnIdAllocator};

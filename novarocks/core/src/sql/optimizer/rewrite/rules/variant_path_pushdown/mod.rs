@@ -30,7 +30,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::VariantPathPushdownRule;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
@@ -45,6 +44,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     fn add_column(
         factory: &Rc<RefCell<ColumnRefFactory>>,

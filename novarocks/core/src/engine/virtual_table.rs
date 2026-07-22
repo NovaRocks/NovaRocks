@@ -44,8 +44,8 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::catalog::schema::ColumnDef;
 use crate::engine::StandaloneState;
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 

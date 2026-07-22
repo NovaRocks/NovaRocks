@@ -22,7 +22,6 @@ include!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs"));
 mod tests;
 
 pub mod cache;
-pub mod catalog;
 pub(crate) mod catalog_attachment;
 pub mod common;
 pub mod connector;

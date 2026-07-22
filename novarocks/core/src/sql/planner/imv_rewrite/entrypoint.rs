@@ -365,7 +365,6 @@ pub(crate) mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
@@ -405,6 +404,7 @@ pub(crate) mod tests {
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use novarocks_catalog::schema::ColumnDef;
 
     /// Set up a fresh ScalarArena on `ctx`, convert `plan` to `OptExpr`, and
     /// return the `OptExpr`. Use this when calling `pipeline.rewrite()` directly

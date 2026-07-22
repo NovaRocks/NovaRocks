@@ -17,9 +17,9 @@
 
 use std::sync::Arc;
 
-use crate::catalog::identifier::TableIdentity;
 use crate::engine::StandaloneState;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn capture_refresh_snapshot_pin(
     state: &Arc<StandaloneState>,

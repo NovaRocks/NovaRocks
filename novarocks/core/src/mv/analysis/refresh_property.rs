@@ -51,7 +51,6 @@
 //! unrepresentable shapes (e.g. a UNION ALL of joins), are still rejected. See
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
-use crate::catalog::identifier::TableIdentity;
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::contract::{
     AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
@@ -61,6 +60,7 @@ use crate::sql::analysis::{
     SetOpKind, SortItem, TypedExpr,
 };
 use crate::sql::planner::table::ScanSource;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn derive_imv_refresh_contract(
     analysis: &crate::mv::analysis::MvAnalysis,
@@ -1674,13 +1674,13 @@ fn join_key_side(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
     use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
 
     struct TestIcebergCatalog;
 

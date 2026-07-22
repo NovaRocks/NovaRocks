@@ -17,10 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::catalog::identifier::TableIdentity;
 use crate::mv::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget};
 use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
 use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
+use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct RefreshExecutionObservation<'a> {
     pub(crate) backend: MvStorageEngine,
@@ -194,10 +194,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::catalog::identifier::TableIdentity;
     use crate::mv::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget};
     use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
     use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
+    use novarocks_catalog::identifier::TableIdentity;
 
     fn table(name: &str) -> TableIdentity {
         TableIdentity::new("ice", "db", name)

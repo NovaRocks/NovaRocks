@@ -40,9 +40,6 @@ use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::runtime::global_async_runtime::data_block_on;
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::ColumnDef;
-use crate::catalog::schema::{ColumnDefault, SqlType};
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::commit::{
     CommitCtx, CommitOpKind, FastAppendCommit, IcebergCommitAction, IcebergCommitCollector,
@@ -53,6 +50,9 @@ use crate::connector::iceberg::fs_io;
 use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
 use crate::sql::literal::{literal_to_i128_for_integer, parse_datetime_string_to_nanos};
 use crate::sql::{ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind};
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::schema::ColumnDef;
+use novarocks_catalog::schema::{ColumnDefault, SqlType};
 
 #[derive(Default)]
 pub(crate) struct IcebergCatalogRegistry {
@@ -3526,7 +3526,7 @@ mod table_property_tests {
     fn create_v2_table_with_non_null_default_rejected() {
         let columns = vec![crate::sql::parser::ast::TableColumnDef {
             name: "c".to_string(),
-            data_type: crate::catalog::schema::SqlType::Int,
+            data_type: novarocks_catalog::schema::SqlType::Int,
             nullable: true,
             aggregation: None,
             default: Some(crate::sql::parser::ast::DefaultLiteral::Int(5)),
@@ -3540,7 +3540,7 @@ mod table_property_tests {
     fn create_v3_table_with_int_default_persists_literal() {
         let columns = vec![crate::sql::parser::ast::TableColumnDef {
             name: "c".to_string(),
-            data_type: crate::catalog::schema::SqlType::Int,
+            data_type: novarocks_catalog::schema::SqlType::Int,
             nullable: true,
             aggregation: None,
             default: Some(crate::sql::parser::ast::DefaultLiteral::Int(5)),

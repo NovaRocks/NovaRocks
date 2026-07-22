@@ -17,12 +17,12 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::catalog::identifier::TableIdentity;
-use crate::catalog::registry::{Catalog, CatalogRegistry};
-use crate::catalog::service::CatalogService;
-use crate::catalog::table::CatalogTable;
 use crate::connector::backend::{CatalogBackend, TableSource};
 use crate::sql::planner::table::TableDef;
+use novarocks_catalog::identifier::TableIdentity;
+use novarocks_catalog::registry::{Catalog, CatalogRegistry};
+use novarocks_catalog::service::CatalogService;
+use novarocks_catalog::table::CatalogTable;
 
 mod conversion;
 mod iceberg;

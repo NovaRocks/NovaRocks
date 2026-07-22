@@ -3214,6 +3214,7 @@ dependencies = [
  "moka",
  "mysql",
  "mysql_common 0.32.4",
+ "novarocks-catalog",
  "novarocks-state-store",
  "novarocks-types",
  "novarocks-version",
@@ -3256,6 +3257,13 @@ dependencies = [
  "url",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "novarocks-catalog"
+version = "0.1.0"
+dependencies = [
+ "arrow",
 ]
 
 [[package]]

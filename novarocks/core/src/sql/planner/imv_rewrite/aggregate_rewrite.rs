@@ -21,7 +21,6 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 
-use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
@@ -50,6 +49,7 @@ use crate::sql::planner::plan_output_columns as planner_plan_output_columns;
 use crate::sql::planner::table::{
     IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
 };
+use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) struct RewriteAggregateStateRule;
 
@@ -231,7 +231,7 @@ pub(crate) fn build_aggregate_state_merge(
 }
 
 fn target_state_old_scan(
-    target: &crate::catalog::identifier::TableIdentity,
+    target: &novarocks_catalog::identifier::TableIdentity,
     target_columns: Vec<ColumnDef>,
     group_key_names: &[String],
     aggregate_state_names: &[String],
@@ -2218,7 +2218,6 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
@@ -2240,6 +2239,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_catalog::schema::ColumnDef;
 
     #[test]
     fn signed_state_function_maps_supported_aggregates() {

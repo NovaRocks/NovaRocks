@@ -16,8 +16,6 @@
 // under the License.
 
 mod tests {
-    use crate::catalog::identifier::TableIdentity;
-    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
@@ -33,6 +31,8 @@ mod tests {
     use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_catalog::schema::ColumnDef;
 
     struct TestIcebergCatalog;
 

@@ -53,13 +53,13 @@ use crate::service::grpc_client::proto::starrocks::{
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
 use super::catalog::register_starrocks_table_in_catalog;
-use crate::catalog::identifier::LocalTableIdentity;
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::ColumnDef;
 use crate::engine::{
     StandaloneState, StatementResult, build_local_insert_batch, execute_query, reorder_insert_rows,
 };
 use crate::exec::expr::cast_with_special_rules;
+use novarocks_catalog::identifier::LocalTableIdentity;
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::schema::ColumnDef;
 
 /// Insert rows into a standalone StarRocks table: prepare a txn in the
 /// control plane, route rows across tablets, append native-format rowsets,
@@ -1559,7 +1559,7 @@ fn resolve_starrocks_name(
     name: &ObjectName,
     current_database: &str,
 ) -> Result<LocalTableIdentity, String> {
-    use crate::catalog::identifier::normalize_identifier;
+    use novarocks_catalog::identifier::normalize_identifier;
     match name.parts.as_slice() {
         [table] => Ok(LocalTableIdentity {
             database: normalize_identifier(current_database)?,

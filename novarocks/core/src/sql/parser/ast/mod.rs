@@ -19,8 +19,8 @@
 pub mod iceberg_ref;
 pub(crate) use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 
-use crate::catalog::partition::LegacyRangePartition;
-use crate::catalog::schema::SqlType;
+use novarocks_catalog::partition::LegacyRangePartition;
+use novarocks_catalog::schema::SqlType;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CreateCatalogStmt {

@@ -24,13 +24,13 @@
 
 use std::sync::Arc;
 
-use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::identifier::resolve_local_table_name;
-use crate::catalog::partition::LegacyRangePartition;
-use crate::catalog::schema::SqlType;
 use crate::engine::{StandaloneState, StatementResult, delete_catalog_attachment_if_needed};
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, InsertSource, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_catalog::identifier::resolve_local_table_name;
+use novarocks_catalog::partition::LegacyRangePartition;
+use novarocks_catalog::schema::SqlType;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
@@ -891,8 +891,8 @@ pub(crate) fn execute_create_table_statement(
                     .find(|c| c.name.eq_ignore_ascii_case(&dist_lower))
                     && matches!(
                         column.data_type,
-                        crate::catalog::schema::SqlType::Bitmap
-                            | crate::catalog::schema::SqlType::Hll
+                        novarocks_catalog::schema::SqlType::Bitmap
+                            | novarocks_catalog::schema::SqlType::Hll
                     )
                 {
                     return Err(format!(
@@ -2885,7 +2885,7 @@ mod tests {
             super::IcebergSchemaChange::AddColumn {
                 parent: super::ColumnPath::root(),
                 name: "discount".to_string(),
-                data_type: crate::catalog::schema::SqlType::Int,
+                data_type: novarocks_catalog::schema::SqlType::Int,
                 default: Some(super::DefaultLiteral::Null),
                 position: super::AddPosition::Default,
             }
@@ -2920,7 +2920,7 @@ mod tests {
             panic!("expected ModifyColumn");
         };
         assert_eq!(path.dotted(), "id");
-        assert_eq!(new_type, crate::catalog::schema::SqlType::BigInt);
+        assert_eq!(new_type, novarocks_catalog::schema::SqlType::BigInt);
     }
 
     #[test]
@@ -3238,7 +3238,10 @@ mod tests {
             panic!();
         };
         assert_eq!(path.dotted(), "address.zip");
-        assert!(matches!(new_type, crate::catalog::schema::SqlType::BigInt));
+        assert!(matches!(
+            new_type,
+            novarocks_catalog::schema::SqlType::BigInt
+        ));
     }
 
     #[test]
@@ -3307,7 +3310,7 @@ mod tests {
             } => {
                 assert_eq!(name, "counts");
                 assert!(
-                    matches!(data_type, crate::catalog::schema::SqlType::Map(_, _)),
+                    matches!(data_type, novarocks_catalog::schema::SqlType::Map(_, _)),
                     "expected Map type, got {:?}",
                     data_type
                 );
@@ -3328,7 +3331,7 @@ mod tests {
             } => {
                 assert_eq!(name, "tags");
                 assert!(
-                    matches!(data_type, crate::catalog::schema::SqlType::Array(_)),
+                    matches!(data_type, novarocks_catalog::schema::SqlType::Array(_)),
                     "expected Array type, got {:?}",
                     data_type
                 );

@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::catalog::identifier::TableIdentity;
 use crate::mv::refresh::apply_key::ApplyKeyContract;
+use novarocks_catalog::identifier::TableIdentity;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvRefreshContract {

@@ -28,7 +28,6 @@ use super::type_mapping::{
     encode_edge_partition_type, encode_iceberg_metadata_table_type, encode_sql_type,
 };
 use super::{NativePlanEncodeContext, encode_exprs, optional_context_ref};
-use crate::catalog::schema::{ColumnDefault, validate_column_default};
 use crate::connector::iceberg::scan_model as iceberg_scan_model;
 use crate::connector::scan_model::starrocks::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksTabletSchemaDescriptor,
@@ -41,6 +40,7 @@ use crate::protocol::native::type_mapping::encode_type;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
 use crate::sql::planner::table as table_model;
+use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
 
 pub(super) fn encode_scan_node(
     src: &crate::sql::planner::payload::PlanScanNode,
@@ -256,8 +256,8 @@ fn scan_source_requires_resolved_binding(source: &table_model::ScanSource) -> bo
 fn resolved_binding_table_columns(
     binding: &ResolvedScanBinding,
 ) -> (
-    Vec<crate::catalog::schema::ColumnDef>,
-    Vec<crate::catalog::schema::ColumnDef>,
+    Vec<novarocks_catalog::schema::ColumnDef>,
+    Vec<novarocks_catalog::schema::ColumnDef>,
 ) {
     let mut columns = Vec::new();
     let mut metadata_columns = Vec::new();
@@ -288,8 +288,8 @@ fn merged_bound_table_columns(
     scan_columns: &[AnalysisOutputColumn],
     binding: &ResolvedScanBinding,
 ) -> (
-    Vec<crate::catalog::schema::ColumnDef>,
-    Vec<crate::catalog::schema::ColumnDef>,
+    Vec<novarocks_catalog::schema::ColumnDef>,
+    Vec<novarocks_catalog::schema::ColumnDef>,
 ) {
     let mut columns = src.columns.clone();
     let mut metadata_columns = src.iceberg_row_lineage_metadata_columns.clone();
@@ -321,10 +321,10 @@ fn merged_bound_table_columns(
 }
 
 fn overlay_bound_column(
-    columns: &mut Vec<crate::catalog::schema::ColumnDef>,
+    columns: &mut Vec<novarocks_catalog::schema::ColumnDef>,
     planner_name: &str,
     planner_source_name: Option<&str>,
-    source: &crate::catalog::schema::ColumnDef,
+    source: &novarocks_catalog::schema::ColumnDef,
 ) {
     if let Some(index) = columns.iter().position(|column| {
         column.name.eq_ignore_ascii_case(planner_name)
@@ -338,8 +338,8 @@ fn overlay_bound_column(
 }
 
 fn replace_column_by_name(
-    columns: &mut [crate::catalog::schema::ColumnDef],
-    source: &crate::catalog::schema::ColumnDef,
+    columns: &mut [novarocks_catalog::schema::ColumnDef],
+    source: &novarocks_catalog::schema::ColumnDef,
 ) -> bool {
     let Some(column) = columns
         .iter_mut()
@@ -352,7 +352,7 @@ fn replace_column_by_name(
 }
 
 pub(super) fn encode_column_def(
-    src: &crate::catalog::schema::ColumnDef,
+    src: &novarocks_catalog::schema::ColumnDef,
 ) -> Result<plan::ColumnDef, String> {
     Ok(plan::ColumnDef {
         name: src.name.clone(),
@@ -368,7 +368,7 @@ pub(super) fn encode_column_def(
 }
 
 fn encode_column_write_default_json(
-    column: &crate::catalog::schema::ColumnDef,
+    column: &novarocks_catalog::schema::ColumnDef,
     value: &ColumnDefault,
 ) -> Result<String, String> {
     validate_column_default(value)?;
@@ -413,7 +413,9 @@ fn encode_column_write_default_json(
     })
 }
 
-fn iceberg_type_for_column_def(column: &crate::catalog::schema::ColumnDef) -> Result<Type, String> {
+fn iceberg_type_for_column_def(
+    column: &novarocks_catalog::schema::ColumnDef,
+) -> Result<Type, String> {
     if let Some(logical_type) = column.logical_type.as_ref() {
         let mut next_field_id = 1;
         return crate::connector::iceberg::catalog::registry::iceberg_type_for_sql_type(
