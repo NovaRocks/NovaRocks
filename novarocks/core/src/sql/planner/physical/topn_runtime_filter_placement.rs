@@ -258,8 +258,20 @@ fn trace_exact_source_probes(
             let mut probes = Vec::new();
             for (child_index, child) in node.children.iter().enumerate() {
                 let branch_column = set_op.child_output_columns[child_index].get(target_index)?;
-                let branch_expr =
-                    bind_exact_column_ref(&probe_expr, std::slice::from_ref(branch_column))?;
+                if branch_column.data_type != probe_expr.data_type
+                    || branch_column.nullable != probe_expr.nullable
+                {
+                    return None;
+                }
+                let branch_expr = TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: branch_column.column_id,
+                        qualifier: None,
+                        column: branch_column.name.clone(),
+                    },
+                    data_type: branch_column.data_type.clone(),
+                    nullable: branch_column.nullable,
+                };
                 let branch_expr = bind_exact_column_ref(&branch_expr, &child.output_columns)?;
                 node_path.push(child_index);
                 let branch_probes = trace_exact_source_probes(child, &branch_expr, node_path)?;
@@ -354,7 +366,7 @@ fn node_at_path_mut<'a>(
 mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
-    use super::place_aggregate_topn_runtime_filters;
+    use super::{is_exact_column_ref, place_aggregate_topn_runtime_filters};
     use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
@@ -492,6 +504,36 @@ mod tests {
                 .iter()
                 .all(|probe| probe.filter_id == 0)
         );
+    }
+
+    #[test]
+    fn remaps_union_all_probe_to_each_distinct_branch_column() {
+        let mut plan = eligible_topn_plan(DataType::Int64, true, false);
+        let aggregate = aggregate_child_mut(&mut plan);
+        aggregate.children[0] = union_all_with_distinct_column_ids(
+            leaf(11, "left_key", DataType::Int64, false),
+            leaf(12, "right_key", DataType::Int64, false),
+            output(10, "union_key", DataType::Int64, false),
+        );
+        let PhysicalPlanKind::HashAggregate(aggregate_kind) = &mut aggregate.kind else {
+            panic!("expected aggregate")
+        };
+        aggregate_kind.group_by[0] = column(10, "union_key", DataType::Int64, false);
+        let mut next_filter_id = 0;
+
+        place_aggregate_topn_runtime_filters(&mut plan, &mut next_filter_id, 1024);
+
+        assert_eq!(aggregate_topn_builds(&plan).len(), 1);
+        let probes = source_probes(&plan);
+        assert_eq!(probes.len(), 2);
+        assert!(is_exact_column_ref(
+            &probes[0].probe_expr,
+            &output(11, "left_key", DataType::Int64, false),
+        ));
+        assert!(is_exact_column_ref(
+            &probes[1].probe_expr,
+            &output(12, "right_key", DataType::Int64, false),
+        ));
     }
 
     #[test]
@@ -1028,6 +1070,27 @@ mod tests {
 
     fn union_all_node(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
         set_op_node(PlanSetOpKind::UnionAll, left, right)
+    }
+
+    fn union_all_with_distinct_column_ids(
+        left: PhysicalPlanNode,
+        right: PhysicalPlanNode,
+        output_column: OutputColumn,
+    ) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::SetOp(PhysicalSetOpNode {
+                kind: PlanSetOpKind::UnionAll,
+                output_columns: vec![output_column.clone()],
+                child_output_columns: vec![
+                    left.output_columns.clone(),
+                    right.output_columns.clone(),
+                ],
+            }),
+            children: vec![left, right],
+            output_columns: vec![output_column],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        }
     }
     fn union_distinct_node(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
         set_op_node(PlanSetOpKind::UnionDistinct, left, right)
