@@ -49,7 +49,9 @@ use crate::exec::node::runtime_filter::{
 use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
 use crate::exec::operators::runtime_filter::tests_support::chunk;
 use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime::profile::{ProfileNode, RuntimeProfileTree};
+use crate::runtime::profile::{
+    ProfileNode, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS, RuntimeProfileTree,
+};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
@@ -103,6 +105,7 @@ use crate::service::grpc_fragment_dispatcher::{
 use crate::service::grpc_server::IndependentGrpcRuntimeFilterNode;
 use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::options::{SessionOptimizerSettings, with_session_optimizer_settings};
 use crate::sql::planner::distributed::test_support::{
     DistributedPlanDraftBuilder, draft_builder_from_plan,
 };
@@ -120,8 +123,8 @@ use crate::sql::planner::payload::{PlanLimitNode, PlanScanNode, PlanSortNode};
 use crate::sql::planner::physical::runtime_filter::JoinExecutionMode;
 use crate::sql::planner::physical::{
     AggMode, AggregateOutputLayout, JoinDistribution, PhysicalHashAggregateNode,
-    PhysicalHashJoinNode, PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlannerConfidence,
-    RedistributeMode, RedistributeNode,
+    PhysicalHashJoinNode, PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PhysicalTopNNode,
+    PlannerConfidence, RedistributeMode, RedistributeNode, TopNPhase,
 };
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
@@ -1403,10 +1406,10 @@ fn remote_producer_closed_uses_same_route_and_terminal_sequence() {
     run_live_conformance(ConformanceTopology::AllOfAggregate);
 }
 
-const TOPN_CHANNEL: ChannelId = ChannelId::new(180);
-const TOPN_PRODUCER_BINDING: BindingId = BindingId::new(181);
-const TOPN_CONSUMER_BINDING: BindingId = BindingId::new(182);
-const TOPN_WITNESS: CoverageWitnessId = CoverageWitnessId::new(183);
+const MANUAL_TOPN_CHANNEL: ChannelId = ChannelId::new(180);
+const MANUAL_TOPN_PRODUCER_BINDING: BindingId = BindingId::new(181);
+const MANUAL_TOPN_CONSUMER_BINDING: BindingId = BindingId::new(182);
+const MANUAL_TOPN_WITNESS: CoverageWitnessId = CoverageWitnessId::new(183);
 const TOPN_LIMIT: u32 = 2;
 const TOPN_ROWS_PER_PUBLISH: usize = 4096;
 
@@ -1706,6 +1709,46 @@ fn topn_physical_plan(files: &[IcebergDataFileInfo], remote: bool) -> PhysicalPl
         stats: topn_stats(files.len() as f64 * TOPN_ROWS_PER_PUBLISH as f64),
         probe_runtime_filters: Vec::new(),
     };
+    if remote {
+        return manual_remote_topn_physical_plan(scan, files.len());
+    }
+    let group_output = topn_output_column(10, "k");
+    let aggregate = PhysicalPlanNode {
+        kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+            mode: AggMode::Local,
+            group_by: vec![topn_column_expr(1, Some("source"), "k")],
+            aggregates: Vec::new(),
+            is_merge: Vec::new(),
+            output_layout: AggregateOutputLayout::new(vec![group_output.clone()], Vec::new()),
+            output_columns: vec![group_output.clone()],
+            topn_runtime_filter_builds: Vec::new(),
+        })),
+        children: vec![scan],
+        output_columns: vec![group_output.clone()],
+        stats: topn_stats(files.len() as f64),
+        probe_runtime_filters: Vec::new(),
+    };
+    let topn = PhysicalPlanNode {
+        kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+            items: vec![crate::sql::analysis::SortItem {
+                expr: topn_column_expr(10, None, "k"),
+                asc: true,
+                nulls_first: false,
+            }],
+            limit: Some(i64::from(TOPN_LIMIT)),
+            offset: Some(0),
+            phase: TopNPhase::Partial,
+            is_split: true,
+        }),
+        children: vec![aggregate],
+        output_columns: vec![group_output.clone()],
+        stats: topn_stats(TOPN_LIMIT as f64),
+        probe_runtime_filters: Vec::new(),
+    };
+    topn
+}
+
+fn manual_remote_topn_physical_plan(scan: PhysicalPlanNode, file_count: usize) -> PhysicalPlanNode {
     let group_output = topn_output_column(10, "k");
     let aggregate = PhysicalPlanNode {
         kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
@@ -1719,23 +1762,19 @@ fn topn_physical_plan(files: &[IcebergDataFileInfo], remote: bool) -> PhysicalPl
         })),
         children: vec![scan],
         output_columns: vec![group_output.clone()],
-        stats: topn_stats(files.len() as f64),
+        stats: topn_stats(file_count as f64),
         probe_runtime_filters: Vec::new(),
     };
-    let input = if remote {
-        PhysicalPlanNode {
-            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
-                mode: RedistributeMode::Gather,
-                partition_exprs: Vec::new(),
-                output_columns: vec![group_output.clone()],
-            }),
-            children: vec![aggregate],
+    let gather = PhysicalPlanNode {
+        kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+            mode: RedistributeMode::Gather,
+            partition_exprs: Vec::new(),
             output_columns: vec![group_output.clone()],
-            stats: topn_stats(files.len() as f64),
-            probe_runtime_filters: Vec::new(),
-        }
-    } else {
-        aggregate
+        }),
+        children: vec![aggregate],
+        output_columns: vec![group_output.clone()],
+        stats: topn_stats(file_count as f64),
+        probe_runtime_filters: Vec::new(),
     };
     let sort = PhysicalPlanNode {
         kind: PhysicalPlanKind::Sort(PlanSortNode {
@@ -1750,7 +1789,7 @@ fn topn_physical_plan(files: &[IcebergDataFileInfo], remote: bool) -> PhysicalPl
             partition_limit: None,
             topn_type: None,
         }),
-        children: vec![input],
+        children: vec![gather],
         output_columns: vec![group_output.clone()],
         stats: topn_stats(TOPN_LIMIT as f64),
         probe_runtime_filters: Vec::new(),
@@ -1767,7 +1806,7 @@ fn topn_physical_plan(files: &[IcebergDataFileInfo], remote: bool) -> PhysicalPl
     }
 }
 
-fn find_topn_binding_locations(fragments: &[PlanFragment]) -> ((u32, i32), (u32, i32)) {
+fn find_manual_topn_binding_locations(fragments: &[PlanFragment]) -> ((u32, i32), (u32, i32)) {
     fn walk(
         node: &DistributedNode,
         producer: &mut Option<(u32, i32)>,
@@ -1777,13 +1816,13 @@ fn find_topn_binding_locations(fragments: &[PlanFragment]) -> ((u32, i32), (u32,
             DistributedNodeKind::HashAggregate(aggregate) if !aggregate.group_by.is_empty() => {
                 assert!(
                     producer.replace((node.fragment_id, node.node_id)).is_none(),
-                    "live TopN fixture has one producer aggregate"
+                    "manual remote TopN fixture has one producer aggregate"
                 );
             }
             DistributedNodeKind::Scan(_) => {
                 assert!(
                     consumer.replace((node.fragment_id, node.node_id)).is_none(),
-                    "live TopN fixture has one source scan"
+                    "manual remote TopN fixture has one source scan"
                 );
             }
             _ => {}
@@ -1792,29 +1831,34 @@ fn find_topn_binding_locations(fragments: &[PlanFragment]) -> ((u32, i32), (u32,
             walk(child, producer, consumer);
         }
     }
+
     let mut producer = None;
     let mut consumer = None;
     for fragment in fragments {
         walk(&fragment.root, &mut producer, &mut consumer);
     }
     (
-        producer.expect("live TopN producer aggregate location"),
-        consumer.expect("live TopN consumer scan location"),
+        producer.expect("manual remote TopN producer aggregate location"),
+        consumer.expect("manual remote TopN consumer scan location"),
     )
 }
 
-fn attach_topn_binding(node: &mut DistributedNode, location: (u32, i32), binding: BindingId) {
+fn attach_manual_topn_binding(
+    node: &mut DistributedNode,
+    location: (u32, i32),
+    binding: BindingId,
+) {
     if (node.fragment_id, node.node_id) == location {
         node.runtime_filter_binding_ids.push(binding);
         node.runtime_filter_binding_ids.sort_unstable();
         node.runtime_filter_binding_ids.dedup();
     }
     for child in &mut node.children {
-        attach_topn_binding(child, location, binding);
+        attach_manual_topn_binding(child, location, binding);
     }
 }
 
-fn topn_runtime_filter_graph(
+fn manual_remote_topn_runtime_filter_graph(
     producer: (u32, i32),
     consumer: (u32, i32),
     deadline_ms: u64,
@@ -1833,11 +1877,11 @@ fn topn_runtime_filter_graph(
         ContributionKind::ProducerClosed,
     ]);
     let capabilities = BTreeSet::from([ArtifactCapability::OrderedRange]);
-    let coverage = Coverage::Leaf(TOPN_WITNESS);
+    let coverage = Coverage::Leaf(MANUAL_TOPN_WITNESS);
     let mut graph = DraftRuntimeFilterGraph::default();
     graph
         .insert_channel(RuntimeFilterChannelSpec {
-            channel_id: TOPN_CHANNEL,
+            channel_id: MANUAL_TOPN_CHANNEL,
             logical_domain: RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
                 keys,
                 inclusive: true,
@@ -1856,12 +1900,12 @@ fn topn_runtime_filter_graph(
                 max_retries: 2,
             },
         })
-        .expect("insert live TopN channel");
+        .expect("insert manual remote TopN channel");
     graph
         .insert_binding(RuntimeFilterBindingSpecData {
-            binding_id: TOPN_PRODUCER_BINDING,
-            channel_id: TOPN_CHANNEL,
-            coverage_witness_id: Some(TOPN_WITNESS),
+            binding_id: MANUAL_TOPN_PRODUCER_BINDING,
+            channel_id: MANUAL_TOPN_CHANNEL,
+            coverage_witness_id: Some(MANUAL_TOPN_WITNESS),
             location: PlanLocation {
                 fragment_id: PlanFragmentId::new(producer.0),
                 node_id: PlanNodeId::new(producer.1),
@@ -1878,11 +1922,11 @@ fn topn_runtime_filter_graph(
                     },
             }),
         })
-        .expect("insert live TopN producer");
+        .expect("insert manual remote TopN producer");
     graph
         .insert_binding(RuntimeFilterBindingSpecData {
-            binding_id: TOPN_CONSUMER_BINDING,
-            channel_id: TOPN_CHANNEL,
+            binding_id: MANUAL_TOPN_CONSUMER_BINDING,
+            channel_id: MANUAL_TOPN_CHANNEL,
             coverage_witness_id: None,
             location: PlanLocation {
                 fragment_id: PlanFragmentId::new(consumer.0),
@@ -1899,7 +1943,7 @@ fn topn_runtime_filter_graph(
                 target: ConsumerBindingTarget::SourceBoundary,
             }),
         })
-        .expect("insert live TopN consumer");
+        .expect("insert manual remote TopN consumer");
     graph
 }
 
@@ -1910,21 +1954,135 @@ fn sealed_topn_plan(
     deadline_ms: u64,
 ) -> crate::sql::planner::distributed::DistributedPlan {
     let physical = topn_physical_plan(files, remote);
-    let base = crate::sql::planner::distributed::build::build_distributed_plan(&physical)
-        .expect("build live TopN distributed plan");
-    if !runtime_filter {
-        return base;
+    if remote {
+        let base = crate::sql::planner::distributed::build::build_distributed_plan(&physical)
+            .expect("build manual remote TopN distributed plan");
+        if !runtime_filter {
+            return base;
+        }
+        let mut draft = draft_builder_from_plan(&base, Default::default());
+        let (producer, consumer) = find_manual_topn_binding_locations(draft.fragments());
+        draft.set_runtime_filter_graph(manual_remote_topn_runtime_filter_graph(
+            producer,
+            consumer,
+            deadline_ms,
+        ));
+        for fragment in draft.fragments_mut() {
+            attach_manual_topn_binding(&mut fragment.root, producer, MANUAL_TOPN_PRODUCER_BINDING);
+            attach_manual_topn_binding(&mut fragment.root, consumer, MANUAL_TOPN_CONSUMER_BINDING);
+        }
+        return draft
+            .seal()
+            .expect("manual remote TopN fixture passes the production plan seal");
     }
-    let mut draft = draft_builder_from_plan(&base, Default::default());
-    let (producer, consumer) = find_topn_binding_locations(draft.fragments());
-    draft.set_runtime_filter_graph(topn_runtime_filter_graph(producer, consumer, deadline_ms));
-    for fragment in draft.fragments_mut() {
-        attach_topn_binding(&mut fragment.root, producer, TOPN_PRODUCER_BINDING);
-        attach_topn_binding(&mut fragment.root, consumer, TOPN_CONSUMER_BINDING);
+    let plan = with_session_optimizer_settings(
+        SessionOptimizerSettings {
+            enable_global_runtime_filter: Some(runtime_filter),
+            ..Default::default()
+        },
+        || crate::sql::planner::pipeline::build_distributed_plan(physical),
+    )
+    .expect("build planner-generated live TopN distributed plan");
+    if runtime_filter {
+        let graph = plan.runtime_filter_graph();
+        assert_eq!(
+            graph.channel_count(),
+            1,
+            "eligible live TopN fixture must generate one ordered runtime-filter channel"
+        );
+        assert_eq!(
+            graph.bindings()
+                .filter(|binding| matches!(
+                    binding.role,
+                    crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData::Producer(
+                        crate::runtime_filter::model::graph::ProducerRequirement {
+                            target: crate::runtime_filter::model::graph::ProducerBindingTarget::AggregateTopNKey { .. },
+                            ..
+                        }
+                    )
+                ))
+                .count(),
+            1,
+            "eligible live TopN fixture must generate one AggregateTopN producer"
+        );
+        assert!(
+            graph.bindings().any(|binding| matches!(
+                binding.role,
+                crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData::Consumer(_)
+            )),
+            "eligible live TopN fixture must generate a source consumer"
+        );
+        planner_generated_topn_ids(&plan)
+            .expect("planner attaches discoverable live TopN channel and binding ids");
+    } else {
+        assert!(
+            plan.runtime_filter_graph().is_empty(),
+            "runtime-filter-off live TopN fixture must not generate a graph"
+        );
     }
-    draft
-        .seal()
-        .expect("explicit live TopN fixture passes the production plan seal")
+    plan
+}
+
+#[derive(Clone, Debug)]
+struct PlannerGeneratedTopNIds {
+    channel: ChannelId,
+    consumers: Vec<BindingId>,
+}
+
+fn planner_generated_topn_ids(
+    plan: &crate::sql::planner::distributed::DistributedPlan,
+) -> Result<PlannerGeneratedTopNIds, String> {
+    let graph = plan.runtime_filter_graph();
+    if graph.channel_count() != 1 {
+        return Err(format!(
+            "planner-generated live TopN graph must contain exactly one channel, found {}",
+            graph.channel_count()
+        ));
+    }
+    let channel = graph
+        .channels()
+        .find(|channel| {
+            matches!(
+                channel.logical_domain,
+                RuntimeFilterLogicalDomain::OrderedBound(_)
+            )
+        })
+        .ok_or_else(|| "planner-generated live TopN graph has no ordered channel".to_string())?;
+    let producers = graph
+        .bindings()
+        .filter(|binding| {
+            binding.channel_id == channel.channel_id
+                && matches!(
+                    &binding.role,
+                    RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
+                        target: crate::runtime_filter::model::graph::ProducerBindingTarget::AggregateTopNKey { .. },
+                        ..
+                    })
+                )
+        })
+        .map(|binding| binding.binding_id)
+        .collect::<Vec<_>>();
+    if producers.len() != 1 {
+        return Err(format!(
+            "planner-generated live TopN graph must contain exactly one AggregateTopN producer, found {}",
+            producers.len()
+        ));
+    }
+    let consumers = graph
+        .bindings()
+        .filter(|binding| {
+            binding.channel_id == channel.channel_id
+                && matches!(&binding.role, RuntimeFilterBindingRoleData::Consumer(_))
+        })
+        .map(|binding| binding.binding_id)
+        .collect::<Vec<_>>();
+    if consumers.is_empty() {
+        return Err("planner-generated live TopN graph has no source consumer".to_string());
+    }
+    Ok(PlannerGeneratedTopNIds {
+        channel: channel.channel_id,
+        consumers,
+    })
 }
 
 struct TopNNodeEvidence {
@@ -1937,6 +2095,7 @@ struct TopNNodeEvidence {
 
 struct LiveTopNRun {
     outcome: CoordinatedQueryResult,
+    planner_generated_ids: Option<PlannerGeneratedTopNIds>,
     observations: Vec<TopNInstallObservation>,
     node_evidence: Vec<TopNNodeEvidence>,
     hub_snapshot_empty: bool,
@@ -2078,6 +2237,10 @@ fn run_live_topn(
     let endpoints = nodes.iter().map(|node| node.endpoint()).collect::<Vec<_>>();
     let backends = LiveBackendSnapshot::new(endpoints.iter().copied().enumerate().collect());
     let sealed = sealed_topn_plan(&files.files, remote, runtime_filter, deadline_ms);
+    let planner_generated_ids = (!remote && runtime_filter).then(|| {
+        planner_generated_topn_ids(&sealed)
+            .expect("planner-generated live TopN graph remains discoverable before deployment")
+    });
     let mut connectors = crate::connector::ConnectorRegistry::new();
     connectors.register_scan_planner(Arc::new(
         crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
@@ -2166,18 +2329,18 @@ fn run_live_topn(
         {
             std::thread::sleep(Duration::from_millis(5));
         }
-        if runtime_filter && !fail_remote_transport {
+        if runtime_filter && !fail_remote_transport && remote {
             let remote_producer_routes = observations
                 .iter()
                 .flat_map(|observation| {
-                    observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+                    observation.install.routing_shard().channels()[&MANUAL_TOPN_CHANNEL]
                         .outbound_edges()
                         .iter()
                         .filter_map(|edge| {
                             (matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. })
                                 && matches!(
                                     edge.source().role(),
-                                    RuntimeFilterRouteRole::Producer(TOPN_PRODUCER_BINDING)
+                                    RuntimeFilterRouteRole::Producer(MANUAL_TOPN_PRODUCER_BINDING)
                                 )
                                 && edge.target().role() == RuntimeFilterRouteRole::Aggregator)
                                 .then_some(edge.route_edge_id())
@@ -2186,43 +2349,31 @@ fn run_live_topn(
                 .collect::<BTreeSet<_>>();
             let evidence_deadline = Instant::now() + MAX_WAIT;
             let evidence_ready = loop {
-                let ready = if remote {
-                    services.iter().any(|service| {
-                        let envelopes = service.admitted_transport_envelopes_for_test();
-                        let events = service.lifecycle_events_for_test();
-                        remote_producer_routes.iter().any(|route_edge_id| {
-                            envelopes.iter().any(|(route, envelope)| {
-                                route.route_edge_id() == *route_edge_id
-                                    && envelope.kind() == RuntimeFilterEnvelopeKind::Contribution
-                                    && !envelope.payload().is_empty()
-                            }) && events.iter().any(|event| matches!(
-                                event,
-                                RuntimeFilterEvent::TransportEnvelope {
-                                    identity,
-                                    kind: TransportEventKind::Sent,
-                                    bytes,
-                                } if identity.route_edge_id() == *route_edge_id && *bytes > 0
-                            )) && events.iter().any(|event| matches!(
-                                event,
-                                RuntimeFilterEvent::TransportEnvelope {
-                                    identity,
-                                    kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
-                                    bytes,
-                                } if identity.route_edge_id() == *route_edge_id && *bytes > 0
-                            ))
-                        })
+                let ready = services.iter().any(|service| {
+                    let envelopes = service.admitted_transport_envelopes_for_test();
+                    let events = service.lifecycle_events_for_test();
+                    remote_producer_routes.iter().any(|route_edge_id| {
+                        envelopes.iter().any(|(route, envelope)| {
+                            route.route_edge_id() == *route_edge_id
+                                && envelope.kind() == RuntimeFilterEnvelopeKind::Contribution
+                                && !envelope.payload().is_empty()
+                        }) && events.iter().any(|event| matches!(
+                            event,
+                            RuntimeFilterEvent::TransportEnvelope {
+                                identity,
+                                kind: TransportEventKind::Sent,
+                                bytes,
+                            } if identity.route_edge_id() == *route_edge_id && *bytes > 0
+                        )) && events.iter().any(|event| matches!(
+                            event,
+                            RuntimeFilterEvent::TransportEnvelope {
+                                identity,
+                                kind: TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
+                                bytes,
+                            } if identity.route_edge_id() == *route_edge_id && *bytes > 0
+                        ))
                     })
-                } else {
-                    services.iter().any(|service| {
-                        service.lifecycle_events_for_test().iter().any(|event| {
-                            matches!(
-                                event,
-                                RuntimeFilterEvent::LiveSubscriptionUpdated { version, .. }
-                                    if version.get() == 2
-                            )
-                        })
-                    })
-                };
+                });
                 if ready || Instant::now() >= evidence_deadline {
                     break ready;
                 }
@@ -2288,6 +2439,7 @@ fn run_live_topn(
     }
     LiveTopNRun {
         outcome,
+        planner_generated_ids,
         observations,
         node_evidence,
         hub_snapshot_empty,
@@ -2333,7 +2485,55 @@ fn topn_counter(profiles: &[RuntimeProfileTree], name: &str) -> i64 {
         .sum()
 }
 
-fn assert_live_topn_common(on: &LiveTopNRun, off: &LiveTopNRun, expected: &[i32]) {
+fn assert_planner_loopback_topn_common(on: &LiveTopNRun, off: &LiveTopNRun, expected: &[i32]) {
+    let ids = on
+        .planner_generated_ids
+        .as_ref()
+        .expect("runtime-filter-on result carries planner-generated ids");
+    assert!(
+        !ids.consumers.is_empty(),
+        "planner-generated live TopN contract retains at least one source consumer"
+    );
+    assert_eq!(topn_result_values(&on.outcome), expected);
+    assert_eq!(
+        topn_result_values(&on.outcome),
+        topn_result_values(&off.outcome),
+        "runtime filtering does not change the query fingerprint"
+    );
+    assert!(
+        topn_counter(&on.outcome.fragment_profiles, RUNTIME_FILTER_INPUT_ROWS)
+            > topn_counter(&on.outcome.fragment_profiles, RUNTIME_FILTER_OUTPUT_ROWS),
+        "the published ordered bound tightens already-read chunks for the Batch live consumer, \
+         rather than skipping unopened FileRange morsels"
+    );
+    assert!(
+        on.hub_snapshot_empty,
+        "native TopN never records legacy Hub activity"
+    );
+    assert!(
+        on.observations.iter().all(|observation| {
+            observation.install.core_view().channels()[&ids.channel]
+                .allowed_contribution_kinds()
+                .contains(&ContributionKind::OrderedBoundUpdate)
+                && !observation.install.core_view().channels()[&ids.channel]
+                    .allowed_contribution_kinds()
+                    .contains(&ContributionKind::TopKSummary)
+        }),
+        "installed channels accept OrderedBound updates and reject TopKSummary"
+    );
+    assert!(
+        on.node_evidence
+            .iter()
+            .all(|evidence| evidence.pending_transport == 0),
+        "all reliable transports drain"
+    );
+}
+
+fn assert_manual_remote_topn_common(on: &LiveTopNRun, off: &LiveTopNRun, expected: &[i32]) {
+    assert!(
+        on.planner_generated_ids.is_none(),
+        "the preserved remote fixture installs its explicit manual runtime-filter graph"
+    );
     assert_eq!(topn_result_values(&on.outcome), expected);
     assert_eq!(
         topn_result_values(&on.outcome),
@@ -2345,7 +2545,7 @@ fn assert_live_topn_common(on: &LiveTopNRun, off: &LiveTopNRun, expected: &[i32]
             &on.outcome.fragment_profiles,
             "NativeOrderedRuntimeFilterLatePrunedUnits"
         ) > 0,
-        "the live ordered consumer prunes at least one unopened scan unit"
+        "the Split live consumer prunes at least one unopened scan unit"
     );
     assert!(
         on.hub_snapshot_empty,
@@ -2353,10 +2553,10 @@ fn assert_live_topn_common(on: &LiveTopNRun, off: &LiveTopNRun, expected: &[i32]
     );
     assert!(
         on.observations.iter().all(|observation| {
-            observation.install.core_view().channels()[&TOPN_CHANNEL]
+            observation.install.core_view().channels()[&MANUAL_TOPN_CHANNEL]
                 .allowed_contribution_kinds()
                 .contains(&ContributionKind::OrderedBoundUpdate)
-                && !observation.install.core_view().channels()[&TOPN_CHANNEL]
+                && !observation.install.core_view().channels()[&MANUAL_TOPN_CHANNEL]
                     .allowed_contribution_kinds()
                     .contains(&ContributionKind::TopKSummary)
         }),
@@ -2374,7 +2574,7 @@ fn assert_live_topn_common(on: &LiveTopNRun, off: &LiveTopNRun, expected: &[i32]
 fn live_topn_loopback_executes_aggregate_service_and_live_scan_chain() {
     let on = run_live_topn(1, true, 5_000, false);
     let off = run_live_topn(1, false, 5_000, false);
-    assert_live_topn_common(&on, &off, &[5, 20]);
+    assert_planner_loopback_topn_common(&on, &off, &[5, 20]);
     let events = &on
         .node_evidence
         .first()
@@ -2386,32 +2586,24 @@ fn live_topn_loopback_executes_aggregate_service_and_live_scan_chain() {
         .expect("scan polls before the first TopN version");
     let first_publish = events
         .iter()
-        .position(|event| {
-            matches!(
-                event,
-                RuntimeFilterEvent::LogicalVersionPublished { version, .. }
-                    if version.get() == 1
-            )
-        })
-        .expect("N candidates publish v1");
+        .position(|event| matches!(event, RuntimeFilterEvent::LogicalVersionPublished { .. }))
+        .expect("TopN candidates publish an ordered bound");
     assert!(
         first_idle < first_publish,
         "the live scan makes progress without waiting for v1"
     );
-    for version in [1, 2] {
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                RuntimeFilterEvent::LiveSubscriptionUpdated {
-                    version: observed,
-                    ..
-                } if observed.get() == version
-            )),
-            "the loopback scan consumer observes v{version}"
-        );
-    }
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeFilterEvent::LiveSubscriptionUpdated { .. })),
+        "the loopback scan consumer observes a published ordered bound"
+    );
+    let ids = on
+        .planner_generated_ids
+        .as_ref()
+        .expect("loopback run retains planner-generated ids");
     assert!(on.observations.iter().any(|observation| {
-        observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+        observation.install.routing_shard().channels()[&ids.channel]
             .outbound_edges()
             .iter()
             .any(|edge| {
@@ -2427,13 +2619,13 @@ fn live_topn_loopback_executes_aggregate_service_and_live_scan_chain() {
 fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
     let on = run_live_topn(3, true, 5_000, false);
     let off = run_live_topn(3, false, 5_000, false);
-    assert_live_topn_common(&on, &off, &[1, 1]);
+    assert_manual_remote_topn_common(&on, &off, &[1, 1]);
     assert_eq!(on.node_evidence.len(), 3);
     let aggregator_install = on
         .observations
         .iter()
         .find(|observation| {
-            observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+            observation.install.routing_shard().channels()[&MANUAL_TOPN_CHANNEL]
                 .outbound_edges()
                 .iter()
                 .any(|edge| {
@@ -2451,7 +2643,7 @@ fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
         .observations
         .iter()
         .flat_map(|observation| {
-            observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+            observation.install.routing_shard().channels()[&MANUAL_TOPN_CHANNEL]
                 .outbound_edges()
                 .iter()
                 .filter_map(|edge| {
@@ -2460,7 +2652,7 @@ fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
                         && matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. })
                         && matches!(
                             edge.source().role(),
-                            RuntimeFilterRouteRole::Producer(TOPN_PRODUCER_BINDING)
+                            RuntimeFilterRouteRole::Producer(MANUAL_TOPN_PRODUCER_BINDING)
                         )
                         && edge.target().role() == RuntimeFilterRouteRole::Aggregator)
                         .then_some((observation.participant, edge.route_edge_id()))
@@ -2520,7 +2712,7 @@ fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
         "a nonterminal Contribution has a Sent/Accepted lifecycle correlated by compiled route and nonzero frame bytes"
     );
     let remote_artifact_routes = aggregator_install.install.routing_shard().channels()
-        [&TOPN_CHANNEL]
+        [&MANUAL_TOPN_CHANNEL]
         .outbound_edges()
         .iter()
         .filter_map(|edge| {
@@ -2553,8 +2745,9 @@ fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
         }),
         "an Artifact/FinalArtifact has a Sent/Accepted lifecycle correlated by compiled route and nonzero frame bytes"
     );
-    let expected_instances = aggregator_install.install.core_view().channels()[&TOPN_CHANNEL]
-        .producers()[&TOPN_PRODUCER_BINDING]
+    let expected_instances = aggregator_install.install.core_view().channels()
+        [&MANUAL_TOPN_CHANNEL]
+        .producers()[&MANUAL_TOPN_PRODUCER_BINDING]
         .expected_fragment_instances()
         .clone();
     let expected_producers = expected_instances.len();
@@ -2569,7 +2762,7 @@ fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
             matches!(
                 event,
                 RuntimeFilterEvent::OrderedAvailabilityReached { identity }
-                    if identity.channel_id() == TOPN_CHANNEL
+                    if identity.channel_id() == MANUAL_TOPN_CHANNEL
             )
         })
         .expect("one sound producer contribution reaches availability");
@@ -2581,8 +2774,8 @@ fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
             let RuntimeFilterEvent::ProducerInstanceClosed { identity } = event else {
                 return None;
             };
-            (identity.common().channel_id() == TOPN_CHANNEL
-                && identity.producer_binding_id() == TOPN_PRODUCER_BINDING)
+            (identity.common().channel_id() == MANUAL_TOPN_CHANNEL
+                && identity.producer_binding_id() == MANUAL_TOPN_PRODUCER_BINDING)
                 .then_some((position, identity.fragment_instance_id()))
         })
         .collect::<Vec<_>>();
@@ -2605,7 +2798,7 @@ fn live_topn_remote_uses_contribution_ack_and_artifact_delivery() {
             matches!(
                 event,
                 RuntimeFilterEvent::ChannelCompleted { identity, .. }
-                    if identity.channel_id() == TOPN_CHANNEL
+                    if identity.channel_id() == MANUAL_TOPN_CHANNEL
             )
         })
         .expect("aggregate owner completes");
@@ -2640,7 +2833,7 @@ fn live_topn_remote_timeout_fails_open_with_correct_results() {
         .observations
         .iter()
         .flat_map(|observation| {
-            observation.install.routing_shard().channels()[&TOPN_CHANNEL]
+            observation.install.routing_shard().channels()[&MANUAL_TOPN_CHANNEL]
                 .outbound_edges()
                 .iter()
                 .filter_map(|edge| {
