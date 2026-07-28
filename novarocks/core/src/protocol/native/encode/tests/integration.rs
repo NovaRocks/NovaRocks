@@ -373,6 +373,7 @@ fn stream_edge_patches_exchange_columns_from_aggregate_layout_when_fragment_outp
                     Vec::new(),
                 ),
                 output_columns: Vec::new(),
+                topn_runtime_filter_builds: Vec::new(),
             },
         )),
     };
@@ -486,6 +487,7 @@ fn stream_edge_patches_local_avg_exchange_schema_to_intermediate_type() {
                     vec![avg_column.clone()],
                 ),
                 output_columns: Vec::new(),
+                topn_runtime_filter_builds: Vec::new(),
             },
         )),
     };

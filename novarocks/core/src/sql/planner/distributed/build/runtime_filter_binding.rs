@@ -1470,6 +1470,7 @@ mod tests {
                     vec![column(10, "aggregate_value")],
                 ),
                 output_columns: vec![column(9, "group_key"), column(10, "aggregate_value")],
+                topn_runtime_filter_builds: Vec::new(),
             })),
             vec![values_node(2, 0)],
         );

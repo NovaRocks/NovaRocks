@@ -28,7 +28,7 @@ use crate::sql::planner::payload::{
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
 };
 use crate::sql::planner::physical::runtime_filter::{
-    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    AggregateTopNRuntimeFilterBuildIntent, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
 use crate::sql::planner::physical::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
@@ -55,6 +55,7 @@ pub(crate) struct PhysicalHashAggregateNode {
     pub is_merge: Vec<bool>,
     pub output_layout: AggregateOutputLayout,
     pub output_columns: Vec<OutputColumn>,
+    pub topn_runtime_filter_builds: Vec<AggregateTopNRuntimeFilterBuildIntent>,
 }
 
 #[allow(dead_code)]

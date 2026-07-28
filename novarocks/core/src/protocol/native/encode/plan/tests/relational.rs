@@ -77,6 +77,7 @@ fn hash_aggregate_payload_maps_group_layout_and_mode() {
                     Vec::new(),
                 ),
                 output_columns: vec![group.clone()],
+                topn_runtime_filter_builds: Vec::new(),
             },
         )),
     };

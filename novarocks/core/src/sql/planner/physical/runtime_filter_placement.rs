@@ -14,6 +14,7 @@ use crate::sql::optimizer::options::current_session_optimizer_settings;
 use crate::sql::planner::physical::runtime_filter::{
     RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
+use crate::sql::planner::physical::topn_runtime_filter_placement::place_aggregate_topn_runtime_filters;
 use crate::sql::planner::physical::{
     JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
     PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlanSetOpKind, RedistributeMode,
@@ -722,6 +723,7 @@ pub(crate) fn place_runtime_filters(root: &mut PhysicalPlanNode) {
     }
     let mut next_filter_id: i32 = 0;
     place_node(root, &config, &mut next_filter_id);
+    place_aggregate_topn_runtime_filters(root, &mut next_filter_id, config.max_count);
 }
 
 fn tree_has_no_runtime_filters(node: &PhysicalPlanNode) -> bool {
@@ -730,6 +732,11 @@ fn tree_has_no_runtime_filters(node: &PhysicalPlanNode) -> bool {
     }
     if let PhysicalPlanKind::HashJoin(join) = &node.kind {
         if !join.build_runtime_filters.is_empty() {
+            return false;
+        }
+    }
+    if let PhysicalPlanKind::HashAggregate(aggregate) = &node.kind {
+        if !aggregate.topn_runtime_filter_builds.is_empty() {
             return false;
         }
     }

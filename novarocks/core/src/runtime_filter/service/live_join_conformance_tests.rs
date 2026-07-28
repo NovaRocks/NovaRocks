@@ -806,6 +806,7 @@ fn join_plan(
             is_merge: vec![false],
             output_layout: AggregateOutputLayout::new(Vec::new(), vec![count_column.clone()]),
             output_columns: vec![count_column.clone()],
+            topn_runtime_filter_builds: Vec::new(),
         })),
         children: vec![gather],
         output_columns: vec![count_column],

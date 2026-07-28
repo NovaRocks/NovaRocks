@@ -1715,6 +1715,7 @@ fn topn_physical_plan(files: &[IcebergDataFileInfo], remote: bool) -> PhysicalPl
             is_merge: Vec::new(),
             output_layout: AggregateOutputLayout::new(vec![group_output.clone()], Vec::new()),
             output_columns: vec![group_output.clone()],
+            topn_runtime_filter_builds: Vec::new(),
         })),
         children: vec![scan],
         output_columns: vec![group_output.clone()],

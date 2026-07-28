@@ -2243,6 +2243,7 @@ mod tests {
             is_merge,
             output_layout: AggregateOutputLayout::new(group_key, aggregate),
             output_columns: visible,
+            topn_runtime_filter_builds: Vec::new(),
         }))
     }
 

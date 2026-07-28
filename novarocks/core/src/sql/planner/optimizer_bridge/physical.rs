@@ -128,6 +128,7 @@ impl BridgeCtx<'_> {
                         output_layout: map_aggregate_output_layout(&op.output_layout),
                         is_merge: op.is_merge.clone(),
                         output_columns: op.output_columns.clone(),
+                        topn_runtime_filter_builds: Vec::new(),
                     },
                 )))
             }

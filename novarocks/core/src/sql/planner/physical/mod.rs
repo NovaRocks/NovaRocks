@@ -21,6 +21,7 @@ mod node;
 pub(crate) mod runtime_filter;
 pub(crate) mod runtime_filter_placement;
 mod stats;
+pub(super) mod topn_runtime_filter_placement;
 mod vocab;
 
 pub(crate) use node::*;

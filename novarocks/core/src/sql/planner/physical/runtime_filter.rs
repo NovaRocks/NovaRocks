@@ -21,6 +21,9 @@
 //! Intent annotations are complete after placement, before fragment topology
 //! exists. They therefore carry no optional fragment-routing fields.
 
+use std::num::NonZeroU32;
+
+use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
 use crate::sql::analysis::TypedExpr;
 
 #[derive(Clone, Debug)]
@@ -36,6 +39,16 @@ pub(crate) struct RuntimeFilterBuildIntent {
 pub(crate) struct RuntimeFilterProbeIntent {
     pub filter_id: i32,
     pub probe_expr: TypedExpr,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AggregateTopNRuntimeFilterBuildIntent {
+    pub filter_id: i32,
+    pub group_key_expr: TypedExpr,
+    pub group_key_ordinal: usize,
+    pub limit: NonZeroU32,
+    pub direction: SortDirection,
+    pub null_order: NullOrder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
