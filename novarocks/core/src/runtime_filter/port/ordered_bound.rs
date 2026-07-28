@@ -306,6 +306,12 @@ impl ComparatorDigestV1 {
     }
 }
 
+pub(crate) fn comparator_digest_for_plan(
+    keys: &[OrderKeyContract],
+) -> Result<ComparatorDigest, OrderContractError> {
+    ComparatorDigestV1::for_contract(keys, COMPARATOR_ALGORITHM_VERSION)
+}
+
 impl RuntimeOrderContract {
     pub(crate) fn from_codec(
         keys: Vec<RuntimeOrderKey>,
@@ -626,6 +632,36 @@ mod tests {
             inclusive,
             comparator_digest,
         }
+    }
+
+    #[test]
+    fn plan_comparator_digest_matches_runtime_order_contract_and_rejects_unsupported_schema() {
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let digest = comparator_digest_for_plan(&keys).expect("Int64 supports ordered bounds");
+        let contract = OrderContract {
+            keys: keys.clone(),
+            inclusive: true,
+            comparator_digest: digest,
+        };
+        assert_eq!(
+            RuntimeOrderContract::try_from_plan(&contract)
+                .expect("plan digest must match runtime contract")
+                .plan_comparator_digest(),
+            digest
+        );
+
+        assert_eq!(
+            comparator_digest_for_plan(&[OrderKeyContract {
+                data_type: DataType::Float64,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }]),
+            Err(OrderContractError::UnsupportedSchema)
+        );
     }
 
     fn test_order_contract(

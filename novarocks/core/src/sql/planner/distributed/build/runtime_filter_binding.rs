@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
-    CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId, ReductionRequirement,
-    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+    CoverageWitnessId, LateApplyGranularity, NullSemantics, OrderContract, OrderKeyContract,
+    PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
+    RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
@@ -32,14 +33,16 @@ use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 
+use crate::runtime_filter::port::ordered_bound::comparator_digest_for_plan;
 use crate::sql::planner::distributed::activation_decision::{
-    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph,
+    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph, RequiredLiveReason,
 };
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, FragmentId, PlanFragment,
 };
 use crate::sql::planner::physical::runtime_filter::{
-    JoinExecutionMode, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    AggregateTopNRuntimeFilterBuildIntent, JoinExecutionMode, RuntimeFilterBuildIntent,
+    RuntimeFilterProbeIntent,
 };
 use crate::sql::planner::physical::{PhysicalPlanKind, PhysicalPlanNode};
 
@@ -57,9 +60,17 @@ pub(super) struct RuntimeFilterProbeBinding {
     pub(super) intent: RuntimeFilterProbeIntent,
 }
 
+#[derive(Clone)]
+pub(super) struct AggregateTopNRuntimeFilterBuildBinding {
+    node_id: i32,
+    fragment_id: FragmentId,
+    intent: AggregateTopNRuntimeFilterBuildIntent,
+}
+
 pub(super) struct RuntimeFilterBindings {
     pub(super) builds: Vec<RuntimeFilterBuildBinding>,
     pub(super) probes: Vec<RuntimeFilterProbeBinding>,
+    pub(super) topn_builds: Vec<AggregateTopNRuntimeFilterBuildBinding>,
     pub(super) node_input_columns: BTreeMap<(FragmentId, i32), Vec<Vec<OutputColumn>>>,
 }
 
@@ -94,6 +105,7 @@ impl RuntimeFilterBindings {
         Self {
             builds: Vec::new(),
             probes: Vec::new(),
+            topn_builds: Vec::new(),
             node_input_columns: BTreeMap::new(),
         }
     }
@@ -104,7 +116,7 @@ impl RuntimeFilterBindings {
         fragment_id: FragmentId,
         physical: &PhysicalPlanNode,
         distributed_payload: &DistributedNodeKind,
-    ) {
+    ) -> Result<(), String> {
         self.node_input_columns.insert(
             (fragment_id, node_id),
             physical
@@ -131,6 +143,25 @@ impl RuntimeFilterBindings {
                 });
             }
         }
+        if let PhysicalPlanKind::HashAggregate(aggregate) = &physical.kind
+            && !aggregate.topn_runtime_filter_builds.is_empty()
+        {
+            if !matches!(distributed_payload, DistributedNodeKind::HashAggregate(_)) {
+                return Err(format!(
+                    "aggregate TopN runtime filter {} lowered to a non-HashAggregate payload",
+                    aggregate.topn_runtime_filter_builds[0].filter_id
+                ));
+            }
+            for intent in &aggregate.topn_runtime_filter_builds {
+                self.topn_builds
+                    .push(AggregateTopNRuntimeFilterBuildBinding {
+                        node_id,
+                        fragment_id,
+                        intent: intent.clone(),
+                    });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -279,12 +310,156 @@ pub(super) fn populate_runtime_filter_graph(
     graph: &mut DraftRuntimeFilterGraph,
     bindings: &RuntimeFilterBindings,
 ) -> Result<(), String> {
-    let candidates = collect_join_runtime_filter_candidates(fragments, bindings, || {
+    let mut candidates = collect_join_runtime_filter_candidates(fragments, bindings, || {
         ActivationConstraint::BlockingOrBatchLive {
             fallback: ActivationFallback::BlockingSnapshot,
         }
     });
+    candidates.extend(collect_aggregate_topn_runtime_filter_candidates(
+        fragments, bindings,
+    )?);
     populate_runtime_filter_candidates(fragments, graph, candidates)
+}
+
+fn collect_aggregate_topn_runtime_filter_candidates(
+    fragments: &[PlanFragment],
+    bindings: &RuntimeFilterBindings,
+) -> Result<Vec<RuntimeFilterChannelCandidate<ActivationConstraint>>, String> {
+    let mut builds_by_filter = BTreeMap::<i32, AggregateTopNRuntimeFilterBuildBinding>::new();
+    for build in &bindings.topn_builds {
+        if bindings
+            .builds
+            .iter()
+            .any(|join_build| join_build.intent.filter_id == build.intent.filter_id)
+        {
+            return Err(format!(
+                "runtime filter {} has both join and aggregate TopN producers",
+                build.intent.filter_id
+            ));
+        }
+        if builds_by_filter
+            .insert(build.intent.filter_id, build.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "runtime filter {} has duplicate aggregate TopN producers",
+                build.intent.filter_id
+            ));
+        }
+    }
+
+    let mut probes_by_filter = BTreeMap::<i32, Vec<RuntimeFilterProbeBinding>>::new();
+    for probe in &bindings.probes {
+        probes_by_filter
+            .entry(probe.intent.filter_id)
+            .or_default()
+            .push(probe.clone());
+    }
+
+    let mut candidates = Vec::with_capacity(builds_by_filter.len());
+    for (legacy_filter_id, build) in builds_by_filter {
+        let probes = probes_by_filter.get(&legacy_filter_id).ok_or_else(|| {
+            format!("runtime filter {legacy_filter_id} has no aggregate TopN probe")
+        })?;
+        let mut resolved_probes = Vec::new();
+        for probe in probes {
+            let mut resolved = resolve_consumer_binding(fragments, bindings, probe).map_err(|()| {
+                format!(
+                    "runtime filter {legacy_filter_id} aggregate TopN probe could not resolve exactly"
+                )
+            })?;
+            resolved_probes.append(&mut resolved);
+        }
+        resolved_probes.sort_by_key(|probe| (probe.fragment_id, probe.node_id, probe.stable_key()));
+        resolved_probes.dedup_by(|left, right| {
+            left.fragment_id == right.fragment_id
+                && left.node_id == right.node_id
+                && left.stable_key() == right.stable_key()
+        });
+        if resolved_probes.is_empty() {
+            return Err(format!(
+                "runtime filter {legacy_filter_id} has no exactly resolved aggregate TopN probe"
+            ));
+        }
+        if resolved_probes
+            .iter()
+            .any(|probe| probe.expression.data_type != build.intent.group_key_expr.data_type)
+        {
+            return Err(format!(
+                "runtime filter {legacy_filter_id} aggregate TopN producer/probe type mismatch"
+            ));
+        }
+
+        let keys = vec![OrderKeyContract {
+            data_type: build.intent.group_key_expr.data_type.clone(),
+            direction: build.intent.direction,
+            null_order: build.intent.null_order,
+        }];
+        let comparator_digest = comparator_digest_for_plan(&keys).map_err(|error| {
+            format!(
+                "runtime filter {legacy_filter_id} aggregate TopN comparator contract is unsupported: {error:?}"
+            )
+        })?;
+        let contributions = BTreeSet::from([
+            ContributionKind::OrderedBoundUpdate,
+            ContributionKind::ProducerClosed,
+        ]);
+        let capabilities = BTreeSet::from([ArtifactCapability::OrderedRange]);
+        let witness = Coverage::Leaf(CoverageWitnessId::new(0));
+        candidates.push(RuntimeFilterChannelCandidate {
+            legacy_filter_id,
+            channel: RuntimeFilterChannelSpec {
+                channel_id: ChannelId::new(0),
+                logical_domain: RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
+                    keys,
+                    inclusive: true,
+                    comparator_digest,
+                }),
+                lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
+                availability_coverage: witness.clone(),
+                terminal_coverage: witness,
+                reduction_requirement: ReductionRequirement::TightenOrderedBound,
+                allowed_contribution_kinds: contributions.clone(),
+                required_consumer_capabilities: capabilities.clone(),
+                policy: RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 4096,
+                    deadline_ms: 30_000,
+                    max_retries: 3,
+                },
+            },
+            producer: RuntimeFilterProducerCandidate {
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(build.fragment_id),
+                    node_id: PlanNodeId::new(build.node_id),
+                },
+                expression: build.intent.group_key_expr.clone(),
+                target: ProducerBindingTarget::AggregateTopNKey {
+                    group_key_ordinal: build.intent.group_key_ordinal,
+                    limit: build.intent.limit,
+                },
+                contribution_kinds: contributions,
+                completion_requirement: CompletionRequirement::ProducerClosed,
+            },
+            consumers: resolved_probes
+                .into_iter()
+                .map(|probe| RuntimeFilterConsumerCandidate {
+                    location: PlanLocation {
+                        fragment_id: PlanFragmentId::new(probe.fragment_id),
+                        node_id: PlanNodeId::new(probe.node_id),
+                    },
+                    expression: probe.expression,
+                    target: probe.target,
+                    capabilities: capabilities.clone(),
+                    activation: ActivationConstraint::LiveOnly {
+                        late_apply: LateApplyGranularity::Batch,
+                        reason: RequiredLiveReason::OrderedBoundContract,
+                    },
+                })
+                .collect(),
+        });
+    }
+    Ok(candidates)
 }
 
 fn collect_join_runtime_filter_candidates<A>(

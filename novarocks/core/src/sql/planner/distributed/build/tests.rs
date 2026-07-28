@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroU32;
 
 use arrow::datatypes::DataType;
 
@@ -12,8 +13,9 @@ use super::runtime_filter_binding::{
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
-    ConsumerActivation, ContributionKind, CoverageWitnessId, NullSemantics, ReductionRequirement,
-    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+    ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder, NullSemantics,
+    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+    RuntimeFilterPolicyRequirement, SortDirection,
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
@@ -40,7 +42,7 @@ use crate::sql::planner::payload::{
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode, WindowExpr,
 };
 use crate::sql::planner::physical::runtime_filter::{
-    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    AggregateTopNRuntimeFilterBuildIntent, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
 use crate::sql::planner::physical::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
@@ -987,6 +989,143 @@ fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
 }
 
 #[test]
+fn aggregate_topn_runtime_filter_materializes_ordered_live_graph() {
+    let filter_id = 71;
+    let plan = aggregate_topn_runtime_filter_plan(filter_id);
+
+    let distributed = build_distributed_plan(&plan).expect("build aggregate TopN graph");
+    let graph = distributed.runtime_filter_graph();
+    let channels = graph.channels().collect::<Vec<_>>();
+    assert_eq!(channels.len(), 1);
+    let channel = channels[0];
+    assert!(matches!(
+        channel.logical_domain,
+        RuntimeFilterLogicalDomain::OrderedBound(_)
+    ));
+    assert_eq!(channel.lifecycle, RuntimeFilterLifecycle::MonotonicUpdates);
+    assert_eq!(
+        channel.reduction_requirement,
+        ReductionRequirement::TightenOrderedBound
+    );
+    assert_eq!(
+        channel.allowed_contribution_kinds,
+        BTreeSet::from([
+            ContributionKind::OrderedBoundUpdate,
+            ContributionKind::ProducerClosed,
+        ])
+    );
+    assert_eq!(
+        channel.required_consumer_capabilities,
+        BTreeSet::from([ArtifactCapability::OrderedRange])
+    );
+
+    let producer = graph
+        .bindings()
+        .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
+        .expect("aggregate TopN producer");
+    assert!(matches!(
+        producer.role,
+        RuntimeFilterBindingRole::Producer(ref requirement)
+            if matches!(
+                requirement.target,
+                ProducerBindingTarget::AggregateTopNKey {
+                    group_key_ordinal: 0,
+                    limit,
+                } if limit == NonZeroU32::new(2).unwrap()
+            )
+    ));
+    let consumer = graph
+        .bindings()
+        .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
+        .expect("source-boundary consumer");
+    let RuntimeFilterBindingRole::Consumer(requirement) = &consumer.role else {
+        unreachable!("filtered to a consumer")
+    };
+    assert_eq!(requirement.target, ConsumerBindingTarget::SourceBoundary);
+    assert_eq!(
+        requirement.activation,
+        ConsumerActivation::NonBlockingLive {
+            late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+        }
+    );
+
+    let aggregate_node = find_distributed_node(distributed.fragments(), |node| {
+        matches!(node.payload, DistributedNodeKind::HashAggregate(_))
+    })
+    .expect("aggregate node");
+    let scan_node = find_distributed_node(distributed.fragments(), |node| {
+        matches!(node.payload, DistributedNodeKind::Scan(_))
+    })
+    .expect("scan node");
+    assert_eq!(
+        aggregate_node.runtime_filter_binding_ids,
+        vec![producer.binding_id]
+    );
+    assert_eq!(
+        scan_node.runtime_filter_binding_ids,
+        vec![consumer.binding_id]
+    );
+    crate::sql::planner::distributed::validation::validate_runtime_filter_graph_against_plan(
+        graph,
+        distributed.fragments(),
+    )
+    .expect("runtime-filter graph must remain attached to the plan");
+}
+
+#[test]
+fn aggregate_topn_runtime_filter_keeps_ordered_bound_contract_live_in_draft() {
+    let draft = super::build_distributed_plan_draft(&aggregate_topn_runtime_filter_plan(75))
+        .expect("build aggregate TopN draft");
+    let consumer = draft
+        .runtime_filter_graph
+        .bindings()
+        .find(|binding| matches!(binding.role, RuntimeFilterBindingRoleData::Consumer(_)))
+        .expect("draft consumer binding");
+    let RuntimeFilterBindingRoleData::Consumer(requirement) = &consumer.role else {
+        unreachable!("filtered to a consumer")
+    };
+    assert_eq!(
+        requirement.activation,
+        ActivationConstraint::LiveOnly {
+            late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+            reason: crate::sql::planner::distributed::activation_decision::RequiredLiveReason::OrderedBoundContract,
+        }
+    );
+}
+
+#[test]
+fn aggregate_topn_runtime_filter_rejects_missing_probe_after_intent_exists() {
+    let filter_id = 72;
+    let mut plan = aggregate_topn_runtime_filter_plan(filter_id);
+    clear_runtime_filter_probes(&mut plan);
+
+    let error = build_distributed_plan(&plan).expect_err("TopN intent without a probe must fail");
+    assert!(error.contains(&filter_id.to_string()), "{error}");
+    assert!(error.contains("probe"), "{error}");
+}
+
+#[test]
+fn aggregate_topn_runtime_filter_rejects_duplicate_aggregate_owners() {
+    let filter_id = 73;
+    let plan = duplicate_aggregate_topn_runtime_filter_plan(filter_id);
+
+    let error = build_distributed_plan(&plan).expect_err("duplicate TopN owners must fail");
+    assert!(error.contains(&filter_id.to_string()), "{error}");
+    assert!(error.contains("duplicate"), "{error}");
+}
+
+#[test]
+fn aggregate_topn_runtime_filter_rejects_probe_that_cannot_exactly_resolve() {
+    let filter_id = 74;
+    let plan = aggregate_topn_runtime_filter_plan_with_unresolvable_project_probe(filter_id);
+
+    let error =
+        build_distributed_plan(&plan).expect_err("unresolvable TopN probe must fail the build");
+    assert!(error.contains(&filter_id.to_string()), "{error}");
+    assert!(error.contains("resolve"), "{error}");
+}
+
+#[test]
 fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
     let filter_id = 78;
     let probe_expr = column_ref_expr(1, "l_k", DataType::Int64, false);
@@ -1090,6 +1229,7 @@ fn populate_runtime_filter_graph_deduplicates_and_skips_incomplete_channels() {
         &RuntimeFilterBindings {
             builds: build_bindings,
             probes: probe_bindings,
+            topn_builds: Vec::new(),
             node_input_columns: std::collections::BTreeMap::new(),
         },
     )
@@ -1108,6 +1248,7 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
     let bindings = RuntimeFilterBindings {
         builds: vec![test_build_binding(1, 0, 10)],
         probes: vec![test_probe_binding(2, 1, 10)],
+        topn_builds: Vec::new(),
         node_input_columns: std::collections::BTreeMap::new(),
     };
     let fragments = vec![
@@ -3488,6 +3629,149 @@ fn scan_node(column_id: u32, column_name: &str) -> PhysicalPlanNode {
     scan_node_with_columns(scan_columns)
 }
 
+fn aggregate_topn_runtime_filter_plan(filter_id: i32) -> PhysicalPlanNode {
+    let key = output_col(1, "key", DataType::Int64, false);
+    let key_expr = column_ref_expr(1, "key", DataType::Int64, false);
+    let mut scan = scan_node(1, "key");
+    scan.probe_runtime_filters = vec![RuntimeFilterProbeIntent {
+        filter_id,
+        probe_expr: key_expr.clone(),
+    }];
+    let aggregate = PhysicalPlanNode {
+        kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+            mode: AggMode::Local,
+            group_by: vec![key_expr.clone()],
+            aggregates: Vec::new(),
+            is_merge: Vec::new(),
+            output_layout: AggregateOutputLayout::new(vec![key.clone()], Vec::new()),
+            output_columns: vec![key.clone()],
+            topn_runtime_filter_builds: vec![AggregateTopNRuntimeFilterBuildIntent {
+                filter_id,
+                group_key_expr: key_expr.clone(),
+                group_key_ordinal: 0,
+                limit: NonZeroU32::new(2).unwrap(),
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }],
+        })),
+        children: vec![scan],
+        output_columns: vec![key.clone()],
+        stats: stats(),
+        probe_runtime_filters: Vec::new(),
+    };
+    PhysicalPlanNode {
+        kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+            items: vec![SortItem {
+                expr: key_expr,
+                asc: true,
+                nulls_first: false,
+            }],
+            limit: Some(2),
+            offset: Some(0),
+            phase: TopNPhase::Partial,
+            is_split: true,
+        }),
+        children: vec![aggregate],
+        output_columns: vec![key],
+        stats: stats(),
+        probe_runtime_filters: Vec::new(),
+    }
+}
+
+fn duplicate_aggregate_topn_runtime_filter_plan(filter_id: i32) -> PhysicalPlanNode {
+    let left = aggregate_topn_runtime_filter_plan(filter_id);
+    let mut right = aggregate_topn_runtime_filter_plan(filter_id);
+    clear_runtime_filter_probes(&mut right);
+    let output_columns = left
+        .output_columns
+        .iter()
+        .chain(right.output_columns.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    PhysicalPlanNode {
+        kind: PhysicalPlanKind::NestLoopJoin(PhysicalNestLoopJoinNode {
+            join_type: JoinKind::Inner,
+            condition: None,
+            output_columns: output_columns.clone(),
+        }),
+        children: vec![left, right],
+        output_columns,
+        stats: stats(),
+        probe_runtime_filters: Vec::new(),
+    }
+}
+
+fn aggregate_topn_runtime_filter_plan_with_unresolvable_project_probe(
+    filter_id: i32,
+) -> PhysicalPlanNode {
+    let mut plan = aggregate_topn_runtime_filter_plan(filter_id);
+    let PhysicalPlanKind::TopN(topn) = &mut plan.kind else {
+        unreachable!("fixture root is TopN")
+    };
+    let projected_key = output_col(2, "projected_key", DataType::Int64, false);
+    let projected_key_expr = column_ref_expr(2, "projected_key", DataType::Int64, false);
+    topn.items[0].expr = projected_key_expr.clone();
+    plan.output_columns = vec![projected_key.clone()];
+
+    let aggregate = &mut plan.children[0];
+    let PhysicalPlanKind::HashAggregate(aggregate_node) = &mut aggregate.kind else {
+        unreachable!("TopN child is aggregate")
+    };
+    aggregate_node.group_by = vec![projected_key_expr.clone()];
+    aggregate_node.output_layout =
+        AggregateOutputLayout::new(vec![projected_key.clone()], Vec::new());
+    aggregate_node.output_columns = vec![projected_key.clone()];
+    aggregate_node.topn_runtime_filter_builds[0].group_key_expr = projected_key_expr.clone();
+    aggregate.output_columns = vec![projected_key.clone()];
+
+    let mut source = aggregate.children.remove(0);
+    source.probe_runtime_filters.clear();
+    aggregate.children = vec![PhysicalPlanNode {
+        kind: PhysicalPlanKind::Project(PlanProjectNode {
+            items: vec![ProjectItem {
+                expr: column_ref_expr(1, "key", DataType::Int64, false),
+                output_name: "projected_key".to_string(),
+                output_column_id: ColumnId::new_for_test(2),
+            }],
+            output_qualifier: None,
+        }),
+        children: vec![source],
+        output_columns: vec![projected_key],
+        stats: stats(),
+        probe_runtime_filters: vec![RuntimeFilterProbeIntent {
+            filter_id,
+            probe_expr: column_ref_expr(2, "projected_key", DataType::Int32, false),
+        }],
+    }];
+    plan
+}
+
+fn clear_runtime_filter_probes(node: &mut PhysicalPlanNode) {
+    node.probe_runtime_filters.clear();
+    for child in &mut node.children {
+        clear_runtime_filter_probes(child);
+    }
+}
+
+fn find_distributed_node(
+    fragments: &[PlanFragment],
+    predicate: impl Fn(&DistributedNode) -> bool + Copy,
+) -> Option<&DistributedNode> {
+    fn find(
+        node: &DistributedNode,
+        predicate: impl Fn(&DistributedNode) -> bool + Copy,
+    ) -> Option<&DistributedNode> {
+        predicate(node).then_some(node).or_else(|| {
+            node.children
+                .iter()
+                .find_map(|child| find(child, predicate))
+        })
+    }
+    fragments
+        .iter()
+        .find_map(|fragment| find(&fragment.root, predicate))
+}
+
 fn scan_node_with_columns(scan_columns: Vec<OutputColumn>) -> PhysicalPlanNode {
     PhysicalPlanNode {
         kind: PhysicalPlanKind::Scan(PlanScanNode {
@@ -3859,6 +4143,7 @@ fn join_progress_proof_catalog_partitions_fragment_inputs() {
         &RuntimeFilterBindings {
             builds: build_bindings,
             probes: probe_bindings,
+            topn_builds: Vec::new(),
             node_input_columns: std::collections::BTreeMap::new(),
         },
     )

@@ -223,7 +223,7 @@ impl FragmentCutBuilder {
     ) -> Result<DistributedNode, String> {
         let lowered = lower_fragment_local_node(node, fragment_id, children, &mut self.ids)?;
         self.bindings
-            .record(lowered.node_id, fragment_id, node, &lowered.payload);
+            .record(lowered.node_id, fragment_id, node, &lowered.payload)?;
         Ok(lowered)
     }
 
@@ -242,7 +242,7 @@ impl FragmentCutBuilder {
             &mut self.ids,
         )?;
         self.bindings
-            .record(lowered.node_id, fragment_id, node, &lowered.payload);
+            .record(lowered.node_id, fragment_id, node, &lowered.payload)?;
         Ok(lowered)
     }
 
