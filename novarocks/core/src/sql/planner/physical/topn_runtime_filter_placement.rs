@@ -154,6 +154,7 @@ fn prove_topn_placement(
         return None;
     };
     if aggregate.mode != AggMode::Local
+        || aggregate_node.children.len() != 1
         || aggregate.group_by.len() != 1
         || aggregate.output_layout.group_key_columns.len() != 1
     {
@@ -362,7 +363,8 @@ mod tests {
         SessionOptimizerSettings, with_session_optimizer_settings,
     };
     use crate::sql::planner::payload::{
-        PlanFilterNode, PlanProjectNode, PlanValuesNode, PlanWindowNode,
+        PlanCTEConsumeNode, PlanCTEProduceNode, PlanFilterNode, PlanProjectNode, PlanValuesNode,
+        PlanWindowNode,
     };
     use crate::sql::planner::physical::runtime_filter::AggregateTopNRuntimeFilterBuildIntent;
     use crate::sql::planner::physical::runtime_filter_placement::{
@@ -593,6 +595,23 @@ mod tests {
                 }),
             ),
             (
+                "hash join boundary",
+                Box::new(|plan| {
+                    aggregate_child_mut(plan).children[0] = unsupported_hash_join_node()
+                }),
+            ),
+            (
+                "cte producer boundary",
+                Box::new(|plan| {
+                    aggregate_child_mut(plan).children[0] =
+                        cte_producer_node(leaf(1, "key", DataType::Int64, false))
+                }),
+            ),
+            (
+                "cte consumer boundary",
+                Box::new(|plan| aggregate_child_mut(plan).children[0] = cte_consumer_node()),
+            ),
+            (
                 "union distinct",
                 Box::new(|plan| {
                     aggregate_child_mut(plan).children[0] = union_distinct_node(
@@ -621,6 +640,24 @@ mod tests {
             assert!(source_probes(&plan).is_empty(), "{name}");
             assert_eq!(next_filter_id, 7, "{name}");
         }
+    }
+
+    #[test]
+    fn rejects_local_aggregate_with_multiple_inputs_atomically() {
+        let mut plan = eligible_topn_plan(DataType::Int64, true, false);
+        aggregate_child_mut(&mut plan).children.push(leaf(
+            1,
+            "second_input",
+            DataType::Int64,
+            false,
+        ));
+        let mut next_filter_id = 0;
+
+        place_aggregate_topn_runtime_filters(&mut plan, &mut next_filter_id, 1024);
+
+        assert!(aggregate_topn_builds(&plan).is_empty());
+        assert!(source_probes(&plan).is_empty());
+        assert_eq!(next_filter_id, 0);
     }
 
     #[test]
@@ -911,6 +948,65 @@ mod tests {
         let aggregate = aggregate_child_mut(plan);
         let child = aggregate.children.remove(0);
         aggregate.children.push(cast_project_node(child));
+    }
+
+    fn unsupported_hash_join_node() -> PhysicalPlanNode {
+        let left = leaf(1, "key", DataType::Int64, false);
+        let right = leaf(2, "other", DataType::Int64, false);
+        let output_columns = left
+            .output_columns
+            .iter()
+            .chain(right.output_columns.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: column(1, "key", DataType::Int64, false),
+                    right: column(2, "other", DataType::Int64, false),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+                execution_mode: Some(JoinExecutionMode::Broadcast),
+                build_runtime_filters: Vec::new(),
+                output_columns: output_columns.clone(),
+            })),
+            children: vec![left, right],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        }
+    }
+
+    fn cte_producer_node(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
+                cte_id: 1,
+                output_columns: child.output_columns.clone(),
+            }),
+            children: vec![child.clone()],
+            output_columns: child.output_columns,
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        }
+    }
+
+    fn cte_consumer_node() -> PhysicalPlanNode {
+        let output_columns = vec![output(1, "key", DataType::Int64, false)];
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
+                cte_id: 1,
+                alias: "cte".to_string(),
+                output_columns: output_columns.clone(),
+                producer_column_ids: vec![ColumnId::new_for_test(1)],
+            }),
+            children: Vec::new(),
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        }
     }
 
     fn redistribute_node(child: PhysicalPlanNode) -> PhysicalPlanNode {
