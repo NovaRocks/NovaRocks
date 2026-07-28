@@ -20,7 +20,11 @@ use std::{collections::HashMap, fmt::Write};
 use arrow::datatypes::DataType;
 
 use crate::coordinator::profile::correlate::{ActualMetrics, DistributedProfileSummary};
-use crate::runtime_filter::model::graph::RuntimeFilterBindingRole;
+use crate::runtime_filter::model::contract::{
+    ConsumerActivation, LateApplyGranularity, NullOrder, NullSemantics, RuntimeFilterLogicalDomain,
+    SortDirection,
+};
+use crate::runtime_filter::model::graph::{ProducerBindingTarget, RuntimeFilterBindingRole};
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ScanVariantColumn;
@@ -75,9 +79,10 @@ fn explain_distributed_plan_inner(
     if detailed && !dp.runtime_filter_graph().is_empty() {
         out.push("RUNTIME FILTER GRAPH".to_string());
         for channel in dp.runtime_filter_graph().channels() {
+            out.push("  runtime filter".to_string());
             out.push(format!(
-                "  runtime filter channel {}",
-                channel.channel_id.get()
+                "    domain = {}",
+                format_runtime_filter_domain(&channel.logical_domain)
             ));
             for binding in dp
                 .runtime_filter_graph()
@@ -85,20 +90,15 @@ fn explain_distributed_plan_inner(
                 .filter(|binding| binding.channel_id == channel.channel_id)
             {
                 match &binding.role {
-                    RuntimeFilterBindingRole::Producer(_) => out.push(format!(
-                        "    producer binding {}, fragment = {}, node = {}, expr = ({})",
-                        binding.binding_id.get(),
-                        binding.location.fragment_id.get(),
-                        binding.location.node_id.get(),
-                        format_expr(&binding.expression)
+                    RuntimeFilterBindingRole::Producer(requirement) => out.push(format!(
+                        "    producer binding: target = {}, expr = ({})",
+                        format_runtime_filter_producer_target(&requirement.target),
+                        format_expr(&binding.expression),
                     )),
                     RuntimeFilterBindingRole::Consumer(requirement) => out.push(format!(
-                        "    consumer binding {}, fragment = {}, node = {}, expr = ({}), activation = {:?}",
-                        binding.binding_id.get(),
-                        binding.location.fragment_id.get(),
-                        binding.location.node_id.get(),
+                        "    consumer binding: activation = {}, expr = ({})",
+                        format_runtime_filter_activation(requirement.activation),
                         format_expr(&binding.expression),
-                        requirement.activation
                     )),
                 }
             }
@@ -161,6 +161,85 @@ fn explain_distributed_plan_inner(
     }
 
     out
+}
+
+fn format_runtime_filter_domain(domain: &RuntimeFilterLogicalDomain) -> String {
+    match domain {
+        RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } => format!(
+            "Membership(value_type={value_type}, null_semantics={})",
+            match null_semantics {
+                NullSemantics::NeverMatches => "NeverMatches",
+                NullSemantics::NullSafeEqual => "NullSafeEqual",
+            }
+        ),
+        RuntimeFilterLogicalDomain::OrderedBound(order) => {
+            let keys = order
+                .keys
+                .iter()
+                .map(|key| {
+                    format!(
+                        "{} {} NULLS {}",
+                        key.data_type,
+                        match key.direction {
+                            SortDirection::Ascending => "ASC",
+                            SortDirection::Descending => "DESC",
+                        },
+                        match key.null_order {
+                            NullOrder::First => "FIRST",
+                            NullOrder::Last => "LAST",
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            match keys.as_slice() {
+                [key] => format!("OrderedBound(key={key}, inclusive={})", order.inclusive),
+                _ => format!(
+                    "OrderedBound(keys=[{}], inclusive={})",
+                    keys.join(", "),
+                    order.inclusive
+                ),
+            }
+        }
+    }
+}
+
+fn format_runtime_filter_producer_target(target: &ProducerBindingTarget) -> String {
+    match target {
+        ProducerBindingTarget::JoinBuildKey { ordinal } => {
+            format!("JoinBuildKey(ordinal={ordinal})")
+        }
+        ProducerBindingTarget::AggregateTopNKey {
+            group_key_ordinal,
+            limit,
+        } => format!(
+            "AggregateTopNKey(group_key_ordinal={group_key_ordinal}, limit={})",
+            limit.get()
+        ),
+    }
+}
+
+fn format_runtime_filter_activation(activation: ConsumerActivation) -> &'static str {
+    match activation {
+        ConsumerActivation::BlockingSnapshot => "BlockingSnapshot",
+        ConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Row,
+        } => "NonBlockingLive(Row)",
+        ConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Batch,
+        } => "NonBlockingLive(Batch)",
+        ConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::RowGroup,
+        } => "NonBlockingLive(RowGroup)",
+        ConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Split,
+        } => "NonBlockingLive(Split)",
+        ConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::File,
+        } => "NonBlockingLive(File)",
+    }
 }
 
 fn explain_fragment_order(dp: &DistributedPlan) -> Vec<&PlanFragment> {
@@ -1531,7 +1610,7 @@ mod tests {
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, JoinDistribution, Operator, PhysicalDistributionOp,
         PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ProjectOp,
-        ScanOp, ValuesOp,
+        ScanOp, TopNOp, TopNPhase as OptimizerTopNPhase, ValuesOp,
     };
     use crate::sql::optimizer::optimized_tree::{
         JoinExecutionDistribution, OptimizedOperatorNode, PlanExecutionProps, attach_scalar_arena,
@@ -2012,11 +2091,13 @@ mod tests {
                 "missing graph header at {level:?}:\n{text}"
             );
             assert!(
-                text.contains("runtime filter channel "),
-                "missing channel at {level:?}:\n{text}"
+                text.contains("domain = Membership(")
+                    && text.contains("target = JoinBuildKey(ordinal=0)")
+                    && text.contains("activation = BlockingSnapshot"),
+                "missing stable Join runtime-filter contract at {level:?}:\n{text}"
             );
             assert!(
-                text.contains("producer binding ") && text.contains("consumer binding "),
+                text.contains("producer binding:") && text.contains("consumer binding:"),
                 "missing graph bindings at {level:?}:\n{text}"
             );
         }
@@ -2025,6 +2106,70 @@ mod tests {
         assert!(
             !normal.contains("RUNTIME FILTER GRAPH"),
             "Normal must hide RF graph lines:\n{normal}"
+        );
+    }
+
+    #[test]
+    fn detailed_ir_explain_shows_aggregate_topn_runtime_filter_contract() {
+        let mut optimized_tree = aggregate_topn_runtime_filter_plan();
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert eligible Aggregate TopN plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
+            .expect("build sealed Aggregate TopN graph");
+
+        for level in [
+            ExplainLevel::Verbose,
+            ExplainLevel::Costs,
+            ExplainLevel::Analyze,
+        ] {
+            let text = explain_distributed_plan(&distributed_plan, level).join("\n");
+            for expected in [
+                "RUNTIME FILTER GRAPH",
+                "domain = OrderedBound(key=Int32 ASC NULLS LAST, inclusive=true)",
+                "target = AggregateTopNKey(group_key_ordinal=0, limit=2)",
+                "activation = NonBlockingLive(Batch)",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "missing {expected:?} at {level:?}:\n{text}"
+                );
+            }
+            for forbidden in [
+                "ComparatorDigest",
+                "coverage_witness",
+                "route",
+                "participant",
+                "runtime filter channel 0",
+                "binding 0",
+                "fragment =",
+                "node =",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "unstable graph detail {forbidden:?} leaked at {level:?}:\n{text}"
+                );
+            }
+        }
+
+        let normal = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
+        assert!(
+            !normal.contains("RUNTIME FILTER GRAPH"),
+            "Normal must hide RF graph lines:\n{normal}"
+        );
+
+        let mut join = inner_join_two_values();
+        prepare_bridge2_test_props(&mut join);
+        let join_physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&join)
+            .expect("convert join plan");
+        let join_distributed = crate::sql::planner::pipeline::build_distributed_plan(join_physical)
+            .expect("build sealed join graph");
+        let join_text =
+            explain_distributed_plan(&join_distributed, ExplainLevel::Verbose).join("\n");
+        assert!(
+            join_text.contains("producer binding") && join_text.contains("consumer binding"),
+            "Membership/Join bindings must remain explainable:\n{join_text}"
         );
     }
 
@@ -2311,12 +2456,27 @@ mod tests {
     }
 
     fn scan_plan() -> OptimizedOperatorNode {
-        let k = output_col(1, "k", DataType::Int64, false);
+        scan_plan_with_key_type(DataType::Int64)
+    }
+
+    fn scan_plan_with_key_type(key_type: DataType) -> OptimizedOperatorNode {
+        let k = output_col(1, "k", key_type.clone(), false);
         let v = output_col(2, "v", DataType::Int64, true);
         physical_node(
             Operator::PhysicalScan(ScanOp {
                 database: "test_db".to_string(),
-                table: table_def(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![
+                        column_def("k", key_type, false),
+                        column_def("v", DataType::Int64, true),
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 1,
+                        table_id: 2,
+                    },
+                },
                 alias: Some("t".to_string()),
                 stats_ref: None,
                 columns: vec![k.clone(), v.clone()],
@@ -2426,6 +2586,46 @@ mod tests {
             vec![child],
             vec![k, count],
             scalars,
+        )
+    }
+
+    fn aggregate_topn_runtime_filter_plan() -> OptimizedOperatorNode {
+        let scan = scan_plan_with_key_type(DataType::Int32);
+        let mut aggregate_scalars = scalars_from_children(std::slice::from_ref(&scan));
+        let key = output_col(1, "k", DataType::Int32, false);
+        let key_expr = column_ref_expr(1, "k", DataType::Int32, false);
+        let aggregate = physical_node_with_scalars(
+            Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Local,
+                group_by: intern_exprs(&mut aggregate_scalars, std::slice::from_ref(&key_expr)),
+                aggregates: vec![],
+                output_layout: AggregateOutputLayout::new(vec![key.clone()], vec![]),
+                output_columns: vec![key.clone()],
+                is_merge: vec![],
+            }),
+            vec![scan],
+            vec![key.clone()],
+            aggregate_scalars,
+        );
+        let mut topn_scalars = scalars_from_children(std::slice::from_ref(&aggregate));
+        physical_node_with_scalars(
+            Operator::PhysicalTopN(TopNOp {
+                items: intern_sort_items(
+                    &mut topn_scalars,
+                    &[SortItem {
+                        expr: key_expr,
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                ),
+                limit: Some(2),
+                offset: Some(0),
+                phase: OptimizerTopNPhase::Partial,
+                is_split: true,
+            }),
+            vec![aggregate],
+            vec![key],
+            topn_scalars,
         )
     }
 
