@@ -20,7 +20,9 @@ use crate::query_execution::artifact::{
     RuntimeFilterDeploymentOptions, RuntimeFilterInstallBarrier, RuntimeFilterInstallLease,
     RuntimeFilterInstallLeaseGuard, ValidatedFragmentSchedule,
 };
-use crate::query_execution::cancellation::QueryCancellationView;
+use crate::query_execution::cancellation::{
+    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
+};
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
@@ -372,11 +374,11 @@ fn nonempty_runtime_filter_graph_is_compiled_before_the_install_barrier() {
 
 #[test]
 fn cancellation_view_observes_injected_flag() {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let view = QueryCancellationView::new(cancelled.clone());
+    let cancelled = QueryCancellationSource::new();
+    let view = cancelled.view();
 
     assert!(!view.is_cancelled());
-    cancelled.store(true, Ordering::SeqCst);
+    let _ = cancelled.request(QueryCancellationReason::ClientDisconnected);
     assert!(view.is_cancelled());
 }
 

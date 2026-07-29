@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -290,8 +291,19 @@ impl NativeFragmentIngress for NativeFragmentService {
         &self,
         request: NativeFragmentCancelRequest,
     ) -> Result<(), NativeFragmentIngressError> {
+        // Design: ADR-0010 (docs/adr/ADR-0010-explicit-query-cancellation-surface.md)
+        let mut fragment_instance_ids = request
+            .fragment_instance_ids()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        fragment_instance_ids.extend(
+            self.queries
+                .cancel_query(request.query_id(), request.reason().to_string()),
+        );
+        let fragment_instance_ids = fragment_instance_ids.into_iter().collect::<Vec<_>>();
         self.controls
-            .cancel_many(request.fragment_instance_ids(), request.reason());
+            .cancel_many(&fragment_instance_ids, request.reason());
         Ok(())
     }
 }
@@ -384,7 +396,7 @@ mod tests {
     use novarocks::runtime::fragment::{FragmentOutcome, FragmentPrepareContext, prepare_fragment};
     use novarocks::runtime::query_context::QueryId;
     use novarocks::service::native_fragment_ingress::{
-        NativeFragmentIngress, NativeFragmentRequest,
+        NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentRequest,
     };
 
     use crate::fragment::control::FragmentControlHandle;
@@ -409,6 +421,74 @@ mod tests {
                 .expect("recording control reasons")
                 .push(reason.to_string());
         }
+    }
+
+    #[test]
+    fn cancel_latches_query_context_before_cancelling_all_local_controls() {
+        let service = NativeFragmentService::with_lifecycle_observer(|_| {});
+        let query_id = QueryId::new(84_000, 84_001);
+        let requested = UniqueId {
+            hi: 84_002,
+            lo: 84_003,
+        };
+        let local_sibling = UniqueId {
+            hi: 84_004,
+            lo: 84_005,
+        };
+        let mut controls = Vec::new();
+        let mut control_tokens = Vec::new();
+        for finst in [requested, local_sibling] {
+            let registration = service
+                .queries
+                .register_fragment(
+                    query_id,
+                    finst,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+                .expect("register local fragment");
+            registration.into_running();
+            let control = Arc::new(RecordingControl::default());
+            let control_handle: Arc<dyn FragmentControlHandle> = control.clone();
+            let token = service
+                .controls
+                .reserve(finst)
+                .expect("reserve local control")
+                .publish(control_handle);
+            controls.push(control);
+            control_tokens.push(token);
+        }
+
+        service
+            .cancel(NativeFragmentCancelRequest::new(
+                query_id,
+                vec![requested],
+                "explicit query cancellation",
+            ))
+            .expect("cancel is idempotent");
+        assert!(controls.iter().all(|control| {
+            control
+                .reasons
+                .lock()
+                .expect("recording control reasons")
+                .iter()
+                .any(|reason| reason == "explicit query cancellation")
+        }));
+        assert!(
+            !service
+                .queries
+                .cancel_query(query_id, "repeat probe".to_string())
+                .is_empty(),
+            "canonical query cancellation retains the local fragment set until terminal cleanup"
+        );
+        service
+            .cancel(NativeFragmentCancelRequest::new(
+                query_id,
+                vec![requested],
+                "explicit query cancellation",
+            ))
+            .expect("repeat cancel is idempotent");
+        drop(control_tokens);
     }
 
     fn values_result_request(query_base: i64, fragment_base: i64) -> NativeFragmentRequest {

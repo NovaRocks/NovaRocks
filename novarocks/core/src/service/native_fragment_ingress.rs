@@ -136,16 +136,26 @@ impl NativeFragmentAccepted {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeFragmentCancelRequest {
+    query_id: QueryId,
     fragment_instance_ids: Vec<UniqueId>,
     reason: String,
 }
 
 impl NativeFragmentCancelRequest {
-    pub fn new(fragment_instance_ids: Vec<UniqueId>, reason: impl Into<String>) -> Self {
+    pub fn new(
+        query_id: QueryId,
+        fragment_instance_ids: Vec<UniqueId>,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
+            query_id,
             fragment_instance_ids,
             reason: reason.into(),
         }
+    }
+
+    pub const fn query_id(&self) -> QueryId {
+        self.query_id
     }
 
     pub fn fragment_instance_ids(&self) -> &[UniqueId] {

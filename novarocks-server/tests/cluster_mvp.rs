@@ -670,6 +670,35 @@ deployment_owner = "fe-1"
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    fn wait_for_every_be_output_contains(&mut self, marker: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut stdout = vec![Vec::new(); self.bes.len()];
+        let mut observed = vec![false; self.bes.len()];
+        loop {
+            for (index, be) in self.bes.iter_mut().enumerate() {
+                if let Some(status) = be.child.try_wait().expect("poll BE child") {
+                    panic!(
+                        "BE {index} exited before marker `{marker}` with status {status}; stdout={:?}; stderr={}",
+                        stdout[index],
+                        be.read_stderr()
+                    );
+                }
+                while let Ok(line) = be.stdout_rx.try_recv() {
+                    observed[index] |= line.contains(marker);
+                    stdout[index].push(line);
+                }
+            }
+            if observed.iter().all(|seen| *seen) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "every BE must emit `{marker}`; observed={observed:?}; stdout={stdout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 fn coordinated_query_sql() -> &'static str {
@@ -687,6 +716,23 @@ fn disconnect_blocking_query_sql() -> &'static str {
 fn multi_submit_query_sql() -> &'static str {
     "WITH cte AS (SELECT 1 AS v UNION ALL SELECT 2) \
      SELECT a.v FROM cte a JOIN cte b ON a.v = b.v ORDER BY a.v"
+}
+
+fn cancellation_acceptance_query_sql() -> &'static str {
+    "SELECT t.v \
+     FROM qlc_cancel_catalog.qlc_cancel.cancellation_data AS t \
+     CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x) \
+     ORDER BY t.v DESC, x DESC LIMIT 1"
+}
+
+fn assert_mysql_server_error(error: mysql::Error, expected_code: u16) {
+    match error {
+        mysql::Error::MySqlError(error) => assert_eq!(
+            error.code, expected_code,
+            "expected MySQL error {expected_code}, got {error}"
+        ),
+        other => panic!("expected MySQL server error {expected_code}, got {other}"),
+    }
 }
 
 fn read_packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
@@ -1328,6 +1374,100 @@ emit_grpc_fragment_marker = true
         "reason=coordinator cancel",
         Duration::from_secs(5),
     );
+}
+
+#[test]
+fn three_be_kill_query_cancels_distributed_execution_from_a_control_connection() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _guard = lock_cluster_mvp();
+    let mut cluster = MultiBeClusterHarness::start_n_be(
+        3,
+        r#"
+[debug]
+emit_cancel_marker = true
+emit_grpc_fragment_marker = true
+"#,
+        "",
+    );
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create cancellation warehouse");
+    let mut control = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut control, 3);
+    control
+        .query_drop(format!(
+            r#"CREATE EXTERNAL CATALOG qlc_cancel_catalog PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        ))
+        .expect("create cancellation catalog");
+    control
+        .query_drop("CREATE DATABASE qlc_cancel_catalog.qlc_cancel")
+        .expect("create cancellation database");
+    control
+        .query_drop("CREATE TABLE qlc_cancel_catalog.qlc_cancel.cancellation_data (v BIGINT)")
+        .expect("create cancellation table");
+    for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
+        control
+            .query_drop(format!(
+                "INSERT INTO qlc_cancel_catalog.qlc_cancel.cancellation_data \
+                 SELECT generate_series FROM TABLE(generate_series({range}))"
+            ))
+            .expect("write a distinct scan range for cancellation acceptance");
+    }
+    for be in &mut cluster.bes {
+        while be.stdout_rx.try_recv().is_ok() {}
+    }
+
+    let (target_ready_tx, target_ready_rx) = mpsc::sync_channel(1);
+    let (target_done_tx, target_done_rx) = mpsc::sync_channel(1);
+    let (target_release_tx, target_release_rx) = mpsc::sync_channel(0);
+    let fe_mysql = cluster.fe_mysql_port();
+    let target = std::thread::spawn(move || {
+        let mut conn = connect_mysql(fe_mysql);
+        target_ready_tx
+            .send(conn.connection_id())
+            .expect("publish target connection id");
+        let result = conn.query::<i64, _>(cancellation_acceptance_query_sql());
+        target_done_tx.send(result).expect("publish target result");
+        target_release_rx.recv().expect("release target connection");
+    });
+    let target_connection_id = target_ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("target connection id");
+
+    cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_GRPC_SUBMIT_ACCEPTED",
+        Duration::from_secs(10),
+    );
+    control
+        .query_drop(format!("KILL QUERY {target_connection_id}"))
+        .expect("KILL QUERY must acknowledge the active target statement");
+
+    let target_error = target_done_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("target query must terminate after KILL QUERY")
+        .expect_err("target query must not succeed after KILL QUERY");
+    assert_mysql_server_error(target_error, 1317);
+    cluster.wait_for_every_be_output_contains("NOVAROCKS_CANCEL", Duration::from_secs(10));
+
+    let idle_error = control
+        .query_drop(format!("KILL QUERY {target_connection_id}"))
+        .expect_err("an idle target session has no active query");
+    assert_mysql_server_error(idle_error, 1094);
+    let unknown_error = control
+        .query_drop("KILL QUERY 4000000000")
+        .expect_err("an unknown connection must be rejected");
+    assert_mysql_server_error(unknown_error, 1094);
+    target_release_tx
+        .send(())
+        .expect("release target connection after idle assertion");
+    target.join().expect("target thread must join");
+
+    let rows: Vec<i64> = control
+        .query(coordinated_query_sql())
+        .expect("a later distributed query must succeed after cancellation cleanup");
+    assert_eq!(rows, vec![1, 2]);
 }
 
 #[test]

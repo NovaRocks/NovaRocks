@@ -31,6 +31,7 @@ use crate::coordinator::{
 };
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
+use crate::query_control::FrontendQueryControl;
 use crate::statistics::FrontendStatisticsService;
 use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::topology::FrontendTopologyController;
@@ -97,6 +98,7 @@ pub struct FrontendApplicationHost {
     mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
+    query_control: novarocks::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     topology: Arc<FrontendTopologyController>,
 }
@@ -135,6 +137,7 @@ impl FrontendApplicationHost {
             mv_application_service: None,
             state_store_host: None,
             query_execution: None,
+            query_control: FrontendQueryControl::service(),
             coordinator: None,
             topology: Arc::new(FrontendTopologyController::new_unconfigured()),
         };
@@ -266,6 +269,12 @@ impl FrontendApplicationHost {
             .as_ref()
             .expect("frontend query execution service is installed before host open returns")
             .clone()
+    }
+
+    pub fn query_control_service(
+        &self,
+    ) -> novarocks::query_execution::control::QueryControlService {
+        self.query_control.clone()
     }
 
     pub fn coordinator_report_handler(&self) -> FrontendCoordinatorReportHandler {

@@ -21,14 +21,13 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use arrow::array::RecordBatchOptions;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::query_execution::cancellation::QueryCancellationView;
+use crate::query_execution::cancellation::{QueryCancellationSource, QueryCancellationView};
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
     DistributedQueryOutcome, DistributedQueryRequest, build_distributed_query_request,
@@ -48,7 +47,7 @@ pub struct ResultContractFixture {
     request: DistributedQueryRequest,
     backends: Vec<(usize, SocketAddr)>,
     result_chunk: Chunk,
-    cancellation: Arc<AtomicBool>,
+    cancellation: QueryCancellationSource,
 }
 
 impl ResultContractFixture {
@@ -60,7 +59,7 @@ impl ResultContractFixture {
         FetchedQueryBatch::new(self.result_chunk.clone())
     }
 
-    pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
+    pub fn cancellation_source(&self) -> QueryCancellationSource {
         self.cancellation.clone()
     }
 
@@ -133,7 +132,7 @@ pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
             },
         ])
         .expect("contract fixture native bundle");
-    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation = QueryCancellationSource::new();
     let request = build_distributed_query_request(
         prepared,
         native_bundle,
@@ -143,7 +142,7 @@ pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
             ..Default::default()
         }),
         DistributedQueryIntent::Result,
-        QueryCancellationView::new(cancellation.clone()),
+        cancellation.view(),
     )
     .expect("contract fixture request");
     let batch = RecordBatch::try_new_with_options(
@@ -312,7 +311,7 @@ pub fn non_empty_runtime_filter_contract_fixture() -> ResultContractFixture {
             },
         ])
         .expect("contract fixture native bundle");
-    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation = QueryCancellationSource::new();
     let request = build_distributed_query_request(
         prepared,
         native_bundle,
@@ -322,7 +321,7 @@ pub fn non_empty_runtime_filter_contract_fixture() -> ResultContractFixture {
             ..Default::default()
         }),
         DistributedQueryIntent::Result,
-        QueryCancellationView::new(cancellation.clone()),
+        cancellation.view(),
     )
     .expect("runtime-filter contract fixture request");
     let batch = RecordBatch::try_new_with_options(
@@ -364,7 +363,7 @@ pub fn assert_result_outcome_preserved(
 pub struct WriteContractFixture {
     request: DistributedQueryRequest,
     backends: Vec<(usize, SocketAddr)>,
-    cancellation: Arc<AtomicBool>,
+    cancellation: QueryCancellationSource,
 }
 
 impl WriteContractFixture {
@@ -372,8 +371,8 @@ impl WriteContractFixture {
         &self.backends
     }
 
-    pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancellation)
+    pub fn cancellation_source(&self) -> QueryCancellationSource {
+        self.cancellation.clone()
     }
 
     pub fn successful_writer_report(&self) -> NativeExecutionReport {
@@ -530,7 +529,7 @@ pub fn non_empty_write_contract_fixture_with_query_timeout_seconds(
             },
         ])
         .expect("write contract native bundle");
-    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation = QueryCancellationSource::new();
     let request = build_distributed_query_request(
         prepared,
         native_bundle,
@@ -540,7 +539,7 @@ pub fn non_empty_write_contract_fixture_with_query_timeout_seconds(
             ..Default::default()
         }),
         DistributedQueryIntent::Write,
-        QueryCancellationView::new(cancellation.clone()),
+        cancellation.view(),
     )
     .expect("write contract request");
     WriteContractFixture {

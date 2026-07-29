@@ -272,7 +272,12 @@ mod tests {
         cancellation_query_ids: Mutex<Vec<QueryId>>,
         outcomes: Mutex<VecDeque<FetchOutcome>>,
         fail_on_submit: Option<usize>,
-        cancel_on_submit: Mutex<Option<(usize, Arc<AtomicBool>)>>,
+        cancel_on_submit: Mutex<
+            Option<(
+                usize,
+                novarocks::query_execution::cancellation::QueryCancellationSource,
+            )>,
+        >,
         report_on_submit: Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>,
         events: Option<Arc<Mutex<Vec<&'static str>>>>,
     }
@@ -326,7 +331,7 @@ mod tests {
 
         fn with_result_and_cancellation(
             batch: FetchedQueryBatch,
-            cancellation: Arc<AtomicBool>,
+            cancellation: novarocks::query_execution::cancellation::QueryCancellationSource,
             submit_count: usize,
         ) -> Self {
             Self {
@@ -339,7 +344,10 @@ mod tests {
             }
         }
 
-        fn with_cancellation(cancellation: Arc<AtomicBool>, submit_count: usize) -> Self {
+        fn with_cancellation(
+            cancellation: novarocks::query_execution::cancellation::QueryCancellationSource,
+            submit_count: usize,
+        ) -> Self {
             Self {
                 cancel_on_submit: Mutex::new(Some((submit_count, cancellation))),
                 ..Self::default()
@@ -499,7 +507,9 @@ mod tests {
                 .is_some_and(|(submit_count, _)| submissions.len() == *submit_count);
             if should_cancel {
                 if let Some((_, cancellation)) = self.cancel_on_submit.lock().unwrap().take() {
-                    cancellation.store(true, Ordering::SeqCst);
+                    let _ = cancellation.request(
+                        novarocks::query_execution::cancellation::QueryCancellationReason::ClientDisconnected,
+                    );
                 }
             }
             let report_callback = {
@@ -1020,7 +1030,7 @@ mod tests {
     fn write_cancellation_after_partial_submit_returns_abort_payload() {
         let fixture = non_empty_write_contract_fixture();
         let backends = fixture.backends().to_vec();
-        let cancellation = fixture.cancellation_flag();
+        let cancellation = fixture.cancellation_source();
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::with_cancellation(cancellation, 1));
         let scheduler =
@@ -1206,7 +1216,7 @@ mod tests {
     fn frontend_contract_cancels_only_through_dispatcher() {
         let fixture = non_empty_result_contract_fixture();
         let backends = fixture.backends().to_vec();
-        let cancellation = fixture.cancellation_flag();
+        let cancellation = fixture.cancellation_source();
         let batch = fixture.result_batch();
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::with_result_and_cancellation(

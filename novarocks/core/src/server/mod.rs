@@ -24,8 +24,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -53,6 +55,11 @@ use crate::engine::statement::{
 };
 use crate::engine::{
     StandaloneNovaRocks, StandaloneOpenServices, StandaloneOptions, StatementResult,
+};
+use crate::query_execution::cancellation::QueryCancellationReason;
+use crate::query_execution::control::{
+    QueryCancelOutcome, QueryControlError, QueryControlService, QuerySessionLease, SessionIdentity,
+    SessionToken, StatementFinishOutcome,
 };
 use crate::runtime::query_result::QueryResult;
 use crate::sql::optimizer::options::SessionOptimizerSettings;
@@ -268,6 +275,7 @@ where
 {
     configure_standalone_internal_rpc_transport();
     let native_report_handler = Arc::clone(&services.native_report_handler);
+    let query_control = services.query_control.clone();
 
     let grpc_endpoint = start_standalone_grpc_endpoint(
         &resolved.grpc_bind_host,
@@ -309,13 +317,19 @@ where
         let ready_user = resolved.user.clone();
         let session_engine = engine;
         let session_user = resolved.user;
+        let session_query_control = query_control.clone();
+        let cancellation_shutdown = query_control;
         serve_until_shutdown(
             bind_addr,
-            shutdown,
+            async move {
+                shutdown.await;
+                cancellation_shutdown.cancel_all(QueryCancellationReason::ServerShutdown);
+            },
             move |stream, peer_addr| {
                 serve_mysql_connection(
                     session_engine.clone(),
                     session_user.clone(),
+                    session_query_control.clone(),
                     stream,
                     peer_addr,
                 )
@@ -678,22 +692,24 @@ async fn drain_session_tasks(sessions: &mut JoinSet<()>, drain_timeout: Duration
 async fn serve_mysql_connection(
     engine: StandaloneNovaRocks,
     user: String,
+    query_control: QueryControlService,
     stream: TcpStream,
     peer_addr: SocketAddr,
 ) {
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    let (client_disconnect_signal, disconnect_watcher) = spawn_client_disconnect_watcher(&stream);
-    let connection_disconnect_signal = Arc::clone(&client_disconnect_signal);
+    let session_token = Arc::new(OnceLock::new());
+    let disconnect_watcher =
+        spawn_client_disconnect_watcher(&stream, query_control.clone(), Arc::clone(&session_token));
     let shim = NovaRocksMysqlShim::new(
         engine,
         user,
         connection_id,
-        client_disconnect_signal,
+        query_control,
+        session_token,
         disconnect_watcher,
     );
     let (reader, writer) = stream.into_split();
     let result = AsyncMysqlIntermediary::run_on(shim, reader, writer).await;
-    connection_disconnect_signal.store(true, Ordering::SeqCst);
     if let Err(err) = result {
         warn!(
             "standalone mysql connection failed: peer={}, connection_id={}, err={}",
@@ -705,11 +721,12 @@ async fn serve_mysql_connection(
 #[cfg(unix)]
 fn spawn_client_disconnect_watcher(
     stream: &tokio::net::TcpStream,
-) -> (Arc<AtomicBool>, ClientDisconnectWatcher) {
-    let disconnected = Arc::new(AtomicBool::new(false));
+    query_control: QueryControlService,
+    session_token: Arc<OnceLock<SessionToken>>,
+) -> ClientDisconnectWatcher {
     let fd = unsafe { libc::dup(stream.as_raw_fd()) };
     if fd < 0 {
-        return (disconnected, ClientDisconnectWatcher { join_handle: None });
+        return ClientDisconnectWatcher { join_handle: None };
     }
 
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
@@ -718,26 +735,27 @@ fn spawn_client_disconnect_watcher(
             "failed to configure disconnect monitor fd as nonblocking: {}",
             err
         );
-        return (disconnected, ClientDisconnectWatcher { join_handle: None });
+        return ClientDisconnectWatcher { join_handle: None };
     }
     let watcher_stream = match tokio::net::TcpStream::from_std(std_stream) {
         Ok(stream) => stream,
         Err(err) => {
             warn!("failed to create async disconnect monitor stream: {}", err);
-            return (disconnected, ClientDisconnectWatcher { join_handle: None });
+            return ClientDisconnectWatcher { join_handle: None };
         }
     };
 
-    let watcher_disconnected = Arc::clone(&disconnected);
     let join_handle = tokio::spawn(async move {
         let mut buf = [0u8; 1];
         loop {
-            if watcher_disconnected.load(Ordering::SeqCst) {
-                break;
-            }
             match watcher_stream.peek(&mut buf).await {
                 Ok(0) => {
-                    watcher_disconnected.store(true, Ordering::SeqCst);
+                    if let Some(token) = session_token.get().copied() {
+                        let _ = query_control.cancel_session_statement(
+                            token,
+                            QueryCancellationReason::ClientDisconnected,
+                        );
+                    }
                     break;
                 }
                 Ok(_) => {
@@ -748,38 +766,48 @@ fn spawn_client_disconnect_watcher(
                     io::ErrorKind::ConnectionReset
                     | io::ErrorKind::BrokenPipe
                     | io::ErrorKind::NotConnected => {
-                        watcher_disconnected.store(true, Ordering::SeqCst);
+                        if let Some(token) = session_token.get().copied() {
+                            let _ = query_control.cancel_session_statement(
+                                token,
+                                QueryCancellationReason::ClientDisconnected,
+                            );
+                        }
                         break;
                     }
                     _ => {
-                        watcher_disconnected.store(true, Ordering::SeqCst);
+                        if let Some(token) = session_token.get().copied() {
+                            let _ = query_control.cancel_session_statement(
+                                token,
+                                QueryCancellationReason::ClientDisconnected,
+                            );
+                        }
                         break;
                     }
                 },
             }
         }
     });
-    (
-        disconnected,
-        ClientDisconnectWatcher {
-            join_handle: Some(join_handle),
-        },
-    )
+    ClientDisconnectWatcher {
+        join_handle: Some(join_handle),
+    }
 }
 
 #[cfg(not(unix))]
 fn spawn_client_disconnect_watcher(
     _stream: &tokio::net::TcpStream,
-) -> (Arc<AtomicBool>, ClientDisconnectWatcher) {
-    let disconnected = Arc::new(AtomicBool::new(false));
-    (disconnected, ClientDisconnectWatcher { join_handle: None })
+    _query_control: QueryControlService,
+    _session_token: Arc<OnceLock<SessionToken>>,
+) -> ClientDisconnectWatcher {
+    ClientDisconnectWatcher { join_handle: None }
 }
 
 struct NovaRocksMysqlShim {
     engine: StandaloneNovaRocks,
     user: String,
     connection_id: u32,
-    client_disconnect_signal: Arc<AtomicBool>,
+    query_control: QueryControlService,
+    session_token: Arc<OnceLock<SessionToken>>,
+    session_lease: Mutex<Option<QuerySessionLease>>,
     _disconnect_watcher: ClientDisconnectWatcher,
     current_catalog: Option<String>,
     current_db: String,
@@ -807,14 +835,17 @@ impl NovaRocksMysqlShim {
         engine: StandaloneNovaRocks,
         user: String,
         connection_id: u32,
-        client_disconnect_signal: Arc<AtomicBool>,
+        query_control: QueryControlService,
+        session_token: Arc<OnceLock<SessionToken>>,
         disconnect_watcher: ClientDisconnectWatcher,
     ) -> Self {
         Self {
             engine,
             user,
             connection_id,
-            client_disconnect_signal,
+            query_control,
+            session_token,
+            session_lease: Mutex::new(None),
             _disconnect_watcher: disconnect_watcher,
             current_catalog: None,
             current_db: DEFAULT_DATABASE.to_string(),
@@ -825,6 +856,16 @@ impl NovaRocksMysqlShim {
             runtime_filter_wait_timeout_ms: None,
             optimizer_settings: SessionOptimizerSettings::default(),
             user_variables: BTreeMap::new(),
+        }
+    }
+}
+
+impl Drop for NovaRocksMysqlShim {
+    fn drop(&mut self) {
+        if let Some(token) = self.session_token.get().copied() {
+            let _ = self
+                .query_control
+                .cancel_session_statement(token, QueryCancellationReason::ClientDisconnected);
         }
     }
 }
@@ -851,12 +892,41 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for NovaRocksMysqlShim {
         if auth_plugin != "mysql_native_password" || username != self.user.as_bytes() {
             return false;
         }
-        if auth_data.is_empty() {
-            return true;
+        let authenticated = if auth_data.is_empty() {
+            true
+        } else {
+            scramble_native(salt, b"")
+                .map(|expected| auth_data == expected.as_slice())
+                .unwrap_or(false)
+        };
+        if !authenticated {
+            return false;
         }
-        scramble_native(salt, b"")
-            .map(|expected| auth_data == expected.as_slice())
-            .unwrap_or(false)
+        let mut lease = self
+            .session_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lease.is_none() {
+            let Ok(session) = self
+                .query_control
+                .register_session(SessionIdentity::new(self.connection_id, self.user.clone()))
+            else {
+                warn!(
+                    "failed to register query-control session for connection_id={}",
+                    self.connection_id
+                );
+                return false;
+            };
+            if self.session_token.set(session.token()).is_err() {
+                warn!(
+                    "query-control token was already initialized for connection_id={}",
+                    self.connection_id
+                );
+                return false;
+            }
+            *lease = Some(session);
+        }
+        true
     }
 
     async fn on_prepare<'a>(
@@ -1336,6 +1406,79 @@ fn is_supported_embedded_statement(query: &str) -> bool {
         || head.eq_ignore_ascii_case("admin")
 }
 
+fn parse_kill_query(query: &str) -> Result<Option<u32>, (ErrorKind, String)> {
+    let first = query.split_whitespace().next().unwrap_or_default();
+    if !first.eq_ignore_ascii_case("kill") {
+        return Ok(None);
+    }
+    let statements = sqlparser::parser::Parser::parse_sql(&StarRocksDialect, query)
+        .map_err(|error| (ErrorKind::ER_PARSE_ERROR, error.to_string()))?;
+    let [sqlparser::ast::Statement::Kill { modifier, id }] = statements.as_slice() else {
+        return Err((
+            ErrorKind::ER_PARSE_ERROR,
+            "KILL must contain exactly one statement".to_string(),
+        ));
+    };
+    if !matches!(modifier, Some(sqlparser::ast::KillType::Query)) {
+        return Err((
+            ErrorKind::ER_NOT_SUPPORTED_YET,
+            "only KILL QUERY <connection_id> is supported".to_string(),
+        ));
+    }
+    u32::try_from(*id).map(Some).map_err(|_| {
+        (
+            ErrorKind::ER_WRONG_VALUE,
+            format!("connection id {id} is outside the supported u32 range"),
+        )
+    })
+}
+
+fn session_token(shim: &NovaRocksMysqlShim) -> Result<SessionToken, (ErrorKind, String)> {
+    shim.session_token.get().copied().ok_or_else(|| {
+        (
+            ErrorKind::ER_UNKNOWN_ERROR,
+            "authenticated query-control session is unavailable".to_string(),
+        )
+    })
+}
+
+fn map_statement_begin_error(error: QueryControlError) -> (ErrorKind, String) {
+    match error {
+        QueryControlError::StatementBusy => (
+            ErrorKind::ER_QUERY_INTERRUPTED,
+            "Previous query is still being cancelled".to_string(),
+        ),
+        QueryControlError::UnknownSession | QueryControlError::StaleSession => (
+            ErrorKind::ER_UNKNOWN_ERROR,
+            "query-control session is no longer active".to_string(),
+        ),
+        QueryControlError::ConnectionIdInUse => (
+            ErrorKind::ER_UNKNOWN_ERROR,
+            "query-control connection id is already active".to_string(),
+        ),
+    }
+}
+
+fn cancellation_error_for_mysql(reason: QueryCancellationReason) -> (ErrorKind, String) {
+    match reason {
+        QueryCancellationReason::ExplicitKill { .. } => (
+            ErrorKind::ER_QUERY_INTERRUPTED,
+            "Query execution was interrupted".to_string(),
+        ),
+        QueryCancellationReason::DeadlineExceeded { timeout_ms } => format_engine_error_for_mysql(
+            EngineError::query_timeout(format!("query timed out after {timeout_ms} ms")),
+        ),
+        QueryCancellationReason::ClientDisconnected => (
+            ErrorKind::ER_QUERY_INTERRUPTED,
+            "Query execution was interrupted because the client disconnected".to_string(),
+        ),
+        QueryCancellationReason::ServerShutdown => (
+            ErrorKind::ER_QUERY_INTERRUPTED,
+            "Query execution was interrupted because the server is shutting down".to_string(),
+        ),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionDatabaseContext {
     catalog: Option<String>,
@@ -1374,6 +1517,30 @@ async fn execute_statement_text(
     // Treat SQL line comments (-- ...) as no-ops
     if trimmed.starts_with("--") {
         return Ok(StatementResult::Ok);
+    }
+
+    if let Some(target_connection_id) = parse_kill_query(trimmed)? {
+        let requester = session_token(shim)?;
+        return match shim
+            .query_control
+            .kill_query(requester, target_connection_id)
+        {
+            QueryCancelOutcome::Requested | QueryCancelOutcome::AlreadyRequested(_) => {
+                Ok(StatementResult::Ok)
+            }
+            QueryCancelOutcome::NoActiveStatement => Err((
+                ErrorKind::ER_NO_SUCH_THREAD,
+                format!("connection {target_connection_id} has no active query"),
+            )),
+            QueryCancelOutcome::UnknownSession => Err((
+                ErrorKind::ER_NO_SUCH_THREAD,
+                format!("unknown connection {target_connection_id}"),
+            )),
+            QueryCancelOutcome::PermissionDenied => Err((
+                ErrorKind::ER_SPECIFIC_ACCESS_DENIED_ERROR,
+                "permission denied to kill query owned by another principal".to_string(),
+            )),
+        };
     }
 
     if let Some(catalog_name) = parse_set_catalog_query(trimmed) {
@@ -1565,11 +1732,17 @@ async fn execute_sql_in_worker(
         shim.runtime_filter_wait_timeout_ms,
         allow_throw_exception,
     );
-    let client_disconnect_signal = Arc::clone(&shim.client_disconnect_signal);
+    let session_token = session_token(shim)?;
+    let mut active_statement = shim
+        .query_control
+        .begin_statement(session_token)
+        .map_err(map_statement_begin_error)?;
+    let cancellation = active_statement.cancellation().clone();
+    let cancellation_for_worker = cancellation.clone();
 
     let join_handle = task::spawn_blocking(move || {
-        crate::runtime::query_cancel::with_client_disconnect_signal(
-            client_disconnect_signal,
+        let result = crate::runtime::query_cancel::with_query_cancellation_view(
+            cancellation_for_worker,
             || {
                 crate::sql::optimizer::options::with_session_optimizer_settings(
                     optimizer_settings,
@@ -1583,13 +1756,20 @@ async fn execute_sql_in_worker(
                     },
                 )
             },
-        )
+        );
+        let completion = active_statement.finish();
+        (result, completion)
     });
     let result = if let Some(secs) = query_timeout.filter(|secs| *secs > 0) {
         match tokio::time::timeout(std::time::Duration::from_secs(secs), join_handle).await {
             Ok(result) => result,
             Err(_) => {
-                shim.client_disconnect_signal.store(true, Ordering::SeqCst);
+                let _ = shim.query_control.cancel_session_statement(
+                    session_token,
+                    QueryCancellationReason::DeadlineExceeded {
+                        timeout_ms: secs.saturating_mul(1000),
+                    },
+                );
                 return Err(format_engine_error_for_mysql(EngineError::query_timeout(
                     format!("query timed out after {} ms", secs * 1000),
                 )));
@@ -1600,10 +1780,22 @@ async fn execute_sql_in_worker(
     };
 
     match result {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(err)) => {
-            let kind = classify_query_error(&err);
-            Err((kind, err))
+        Ok((result, completion)) => {
+            let cancellation_reason = match completion {
+                StatementFinishOutcome::Cancelled(reason) => Some(reason),
+                StatementFinishOutcome::Completed => None,
+                StatementFinishOutcome::Stale => cancellation.reason(),
+            };
+            if let Some(reason) = cancellation_reason {
+                return Err(cancellation_error_for_mysql(reason));
+            }
+            match result {
+                Ok(result) => Ok(result),
+                Err(err) => {
+                    let kind = classify_query_error(&err);
+                    Err((kind, err))
+                }
+            }
         }
         Err(err) => Err((
             ErrorKind::ER_UNKNOWN_ERROR,
@@ -3010,6 +3202,35 @@ mod tests {
                 "global_runtime_filter_probe_min_selectivity"
             ),
             None
+        );
+    }
+
+    #[test]
+    fn kill_query_parser_accepts_only_query_with_u32_connection_id() {
+        assert_eq!(parse_kill_query("KILL QUERY 42"), Ok(Some(42)));
+        assert_eq!(
+            parse_kill_query("KILL CONNECTION 42")
+                .expect_err("KILL CONNECTION is intentionally unsupported")
+                .0,
+            ErrorKind::ER_NOT_SUPPORTED_YET
+        );
+        assert_eq!(
+            parse_kill_query("KILL 42")
+                .expect_err("bare KILL is intentionally unsupported")
+                .0,
+            ErrorKind::ER_NOT_SUPPORTED_YET
+        );
+        assert_eq!(
+            parse_kill_query("KILL MUTATION 42")
+                .expect_err("KILL MUTATION is intentionally unsupported")
+                .0,
+            ErrorKind::ER_NOT_SUPPORTED_YET
+        );
+        assert_eq!(
+            parse_kill_query("KILL QUERY 4294967296")
+                .expect_err("connection id must fit u32")
+                .0,
+            ErrorKind::ER_WRONG_VALUE
         );
     }
 }

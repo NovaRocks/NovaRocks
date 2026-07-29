@@ -16,83 +16,62 @@
 // under the License.
 
 use std::cell::RefCell;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::query_execution::cancellation::QueryCancellationView;
 
 thread_local! {
-    static CLIENT_DISCONNECT_SIGNAL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    static QUERY_CANCELLATION_VIEW: RefCell<Option<QueryCancellationView>> = const { RefCell::new(None) };
 }
 
-struct ClientDisconnectSignalGuard {
-    previous: Option<Arc<AtomicBool>>,
+struct QueryCancellationViewGuard {
+    previous: Option<QueryCancellationView>,
 }
 
-impl Drop for ClientDisconnectSignalGuard {
+impl Drop for QueryCancellationViewGuard {
     fn drop(&mut self) {
-        CLIENT_DISCONNECT_SIGNAL.with(|cell| {
+        QUERY_CANCELLATION_VIEW.with(|cell| {
             cell.replace(self.previous.take());
         });
     }
 }
 
-pub(crate) fn with_client_disconnect_signal<T>(
-    signal: Arc<AtomicBool>,
+pub(crate) fn with_query_cancellation_view<T>(
+    cancellation: QueryCancellationView,
     f: impl FnOnce() -> T,
 ) -> T {
-    let _guard = CLIENT_DISCONNECT_SIGNAL.with(|cell| ClientDisconnectSignalGuard {
-        previous: cell.replace(Some(signal)),
+    let _guard = QUERY_CANCELLATION_VIEW.with(|cell| QueryCancellationViewGuard {
+        previous: cell.replace(Some(cancellation)),
     });
     f()
 }
 
-pub(crate) fn current_client_disconnect_signal() -> Option<Arc<AtomicBool>> {
-    CLIENT_DISCONNECT_SIGNAL.with(|cell| cell.borrow().clone())
-}
-
-pub(crate) fn client_disconnected() -> bool {
-    CLIENT_DISCONNECT_SIGNAL.with(|cell| {
-        cell.borrow()
-            .as_ref()
-            .is_some_and(|signal| signal.load(Ordering::SeqCst))
-    })
+pub(crate) fn current_query_cancellation_view() -> Option<QueryCancellationView> {
+    QUERY_CANCELLATION_VIEW.with(|cell| cell.borrow().clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
 
     #[test]
-    fn with_client_disconnect_signal_restores_state_after_panic() {
-        let signal = Arc::new(AtomicBool::new(true));
+    fn request_scoped_view_restores_state_after_panic() {
+        let source = QueryCancellationSource::new();
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_client_disconnect_signal(signal, || panic!("boom"));
+            with_query_cancellation_view(source.view(), || panic!("boom"));
         }));
-
         assert!(panic_result.is_err(), "closure should panic");
-        assert!(
-            !client_disconnected(),
-            "disconnect signal must be restored after unwind"
-        );
+        assert!(current_query_cancellation_view().is_none());
     }
 
     #[test]
-    fn current_client_disconnect_signal_is_request_scoped_and_keeps_probe_alive() {
-        let signal = Arc::new(AtomicBool::new(false));
-        let captured = with_client_disconnect_signal(signal.clone(), || {
-            let captured =
-                current_client_disconnect_signal().expect("request-scoped signal is available");
-            assert!(Arc::ptr_eq(&captured, &signal));
-            captured
+    fn captured_view_remains_live_after_scope_exit() {
+        let source = QueryCancellationSource::new();
+        let captured = with_query_cancellation_view(source.view(), || {
+            current_query_cancellation_view().expect("request-scoped view is available")
         });
-
-        assert!(
-            current_client_disconnect_signal().is_none(),
-            "request scope must restore the previous signal"
-        );
-        signal.store(true, Ordering::SeqCst);
-        assert!(
-            captured.load(Ordering::SeqCst),
-            "captured view must keep observing the request probe after scope exit"
-        );
+        assert!(current_query_cancellation_view().is_none());
+        source.request(QueryCancellationReason::ClientDisconnected);
+        assert!(captured.is_cancelled());
     }
 }

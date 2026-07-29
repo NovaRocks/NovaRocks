@@ -79,6 +79,7 @@ fn standalone_open_services(
         host.backend_topology_port(),
         host.coordinator_report_endpoint_sink(),
         host.native_report_handler(),
+        host.query_control_service(),
         0,
     )
 }

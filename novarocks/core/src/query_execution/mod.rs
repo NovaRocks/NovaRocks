@@ -24,6 +24,7 @@ pub mod cancellation;
 pub mod contract;
 #[cfg(feature = "query-execution-contract-test-support")]
 pub mod contract_test_support;
+pub mod control;
 pub mod fragment_transport;
 pub(crate) mod outcome;
 pub(crate) mod preparation;

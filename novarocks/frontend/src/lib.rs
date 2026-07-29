@@ -20,6 +20,7 @@ pub mod coordinator;
 pub mod deployment;
 pub mod dml;
 pub mod mv;
+pub mod query_control;
 mod server;
 pub mod statistics;
 pub mod system_catalog;

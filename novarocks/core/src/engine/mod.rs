@@ -550,6 +550,7 @@ pub struct StandaloneOpenServices {
         std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
     pub native_report_handler:
         std::sync::Arc<dyn crate::query_execution::report::NativeReportHandler>,
+    pub query_control: crate::query_execution::control::QueryControlService,
     /// Bound by the server composition root before engine open. Zero means no
     /// local fragment endpoint is available to this engine instance.
     pub exchange_port: u16,
@@ -576,6 +577,7 @@ impl StandaloneOpenServices {
         native_report_handler: std::sync::Arc<
             dyn crate::query_execution::report::NativeReportHandler,
         >,
+        query_control: crate::query_execution::control::QueryControlService,
         exchange_port: u16,
     ) -> Self {
         Self {
@@ -590,6 +592,7 @@ impl StandaloneOpenServices {
             backend_topology,
             coordinator_report_endpoint,
             native_report_handler,
+            query_control,
             exchange_port,
         }
     }
@@ -759,6 +762,7 @@ impl StandaloneNovaRocks {
             backend_topology,
             coordinator_report_endpoint,
             native_report_handler: _,
+            query_control: _,
             exchange_port,
         } = services;
         if cfg.cluster.role == crate::common::app_config::ClusterRole::Fe {
@@ -3554,8 +3558,8 @@ pub(crate) fn execute_logical_plan_with_options(
 
 fn current_query_cancellation_view() -> crate::query_execution::cancellation::QueryCancellationView
 {
-    match crate::runtime::query_cancel::current_client_disconnect_signal() {
-        Some(signal) => crate::query_execution::cancellation::QueryCancellationView::new(signal),
+    match crate::runtime::query_cancel::current_query_cancellation_view() {
+        Some(view) => view,
         None => crate::query_execution::cancellation::QueryCancellationView::never_cancelled(),
     }
 }
@@ -4680,6 +4684,7 @@ mod tests {
             backend_topology,
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
             Arc::new(super::TestNativeReportHandler),
+            crate::query_execution::control::QueryControlService::for_test(),
             0,
         )
     }

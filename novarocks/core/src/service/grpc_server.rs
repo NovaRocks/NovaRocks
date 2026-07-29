@@ -1049,6 +1049,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         })?;
         ingress
             .cancel(NativeFragmentCancelRequest::new(
+                crate::runtime::query_context::QueryId::new(query_id.hi, query_id.lo),
                 req.finst_ids
                     .iter()
                     .map(|id| crate::UniqueId {
@@ -3425,8 +3426,16 @@ mod pr3_tests {
                 .lock()
                 .expect("native fragment cancellations"),
             vec![
-                NativeFragmentCancelRequest::new(vec![UniqueId { hi: 1, lo: 2 }], "test",),
-                NativeFragmentCancelRequest::new(vec![UniqueId { hi: 1, lo: 2 }], "test-2",),
+                NativeFragmentCancelRequest::new(
+                    crate::runtime::query_context::QueryId::new(31, 32),
+                    vec![UniqueId { hi: 1, lo: 2 }],
+                    "test",
+                ),
+                NativeFragmentCancelRequest::new(
+                    crate::runtime::query_context::QueryId::new(31, 32),
+                    vec![UniqueId { hi: 1, lo: 2 }],
+                    "test-2",
+                ),
             ]
         );
     }

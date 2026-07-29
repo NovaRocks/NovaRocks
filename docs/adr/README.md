@@ -87,6 +87,7 @@ code-anchors:
 
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
 - ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（active）
+- ADR-0010 — 显式 query cancellation surface 为何以 MySQL KILL QUERY 和 frontend session owner 实现（active）
 
 ### table-maintenance
 
