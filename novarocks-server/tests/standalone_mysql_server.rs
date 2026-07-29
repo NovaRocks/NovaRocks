@@ -189,6 +189,7 @@ fn run_curl_stream_load(
 fn write_standalone_metadata_config(mysql_port: u16) -> (TempDir, PathBuf) {
     let config_dir = TempDir::new().expect("create standalone server config dir");
     let config_path = config_dir.path().join("novarocks.toml");
+    let state_store_path = config_dir.path().join("frontend-state.sqlite");
     std::fs::write(
         &config_path,
         format!(
@@ -196,10 +197,17 @@ fn write_standalone_metadata_config(mysql_port: u16) -> (TempDir, PathBuf) {
 provider = "sqlite"
 path = "meta/catalog.db"
 
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "standalone-mysql-server-test"
+deployment_owner = "all-in-one"
+
 [standalone_server]
 mysql_port = {mysql_port}
 user = "root"
-"#
+"#,
+            state_store_path.display(),
         ),
     )
     .expect("write standalone server config");

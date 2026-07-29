@@ -58,32 +58,52 @@ async fn run_all_in_one_until<F>(
 where
     F: Future<Output = Result<(), String>> + Send,
 {
-    let mut backend = BackendApplicationHost::open(BackendServerConfig {
+    let frontend_config = FrontendServerConfig {
         config: config.clone(),
-    })
-    .map_err(|error| anyhow::anyhow!("open all-in-one backend application failed: {error}"))?;
-
-    let (frontend_shutdown_tx, frontend_shutdown_rx) = tokio::sync::oneshot::channel();
-    let frontend = novarocks_frontend::run_frontend_server_until_shutdown(
-        FrontendServerConfig {
-            config,
-            config_path,
-            port_override,
-            grpc_endpoint: FrontendGrpcEndpointOwnership::ExternallyHosted,
+        config_path: config_path.clone(),
+        port_override,
+        grpc_endpoint: FrontendGrpcEndpointOwnership::ExternallyHosted,
+    };
+    let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
+        .await
+        .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
+    let mut backend = match BackendApplicationHost::open_with_native_report_handler(
+        BackendServerConfig {
+            config: config.clone(),
         },
+        frontend.native_report_handler(),
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            let frontend_cleanup = frontend.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "open all-in-one backend application failed: {error}; frontend cleanup: {:?}",
+                frontend_cleanup.err()
+            ));
+        }
+    };
+    let services = novarocks_frontend::standalone_open_services_for_server(&frontend, &config);
+
+    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = novarocks::server::run_standalone_server_with_config_until_shutdown(
+        config,
+        config_path,
+        port_override,
+        novarocks::server::StandaloneGrpcEndpointOwnership::ExternallyHosted,
+        services,
         async move {
-            let _ = frontend_shutdown_rx.await;
+            let _ = server_shutdown_rx.await;
         },
     );
-    tokio::pin!(frontend);
+    tokio::pin!(server);
     tokio::pin!(shutdown);
 
-    let mut frontend_completed = false;
+    let mut server_completed = false;
     let primary = loop {
         tokio::select! {
-            frontend_result = &mut frontend => {
-                frontend_completed = true;
-                break frontend_result.map_err(|error| error.to_string());
+            server_result = &mut server => {
+                server_completed = true;
+                break server_result;
             }
             shutdown_result = &mut shutdown => break shutdown_result,
             _ = tokio::time::sleep(BACKEND_SUPERVISION_POLL_INTERVAL) => {
@@ -95,26 +115,32 @@ where
         }
     };
 
-    let frontend_cleanup = if frontend_completed {
+    let server_cleanup = if server_completed {
         Ok(())
     } else {
-        let _ = frontend_shutdown_tx.send(());
-        frontend.await.map_err(|error| error.to_string())
+        let _ = server_shutdown_tx.send(());
+        server.await
     };
     let backend_cleanup = backend.shutdown().map_err(|error| error.to_string());
-    combine_primary_and_cleanup(primary, frontend_cleanup, backend_cleanup)
+    let frontend_cleanup = frontend.shutdown().await.map_err(|error| error.to_string());
+    combine_primary_and_cleanup(primary, server_cleanup, backend_cleanup, frontend_cleanup)
         .map_err(anyhow::Error::msg)
 }
 
 fn combine_primary_and_cleanup(
     primary: Result<(), String>,
-    frontend_cleanup: Result<(), String>,
+    server_cleanup: Result<(), String>,
     backend_cleanup: Result<(), String>,
+    frontend_cleanup: Result<(), String>,
 ) -> Result<(), String> {
-    let cleanup_errors = [frontend_cleanup.err(), backend_cleanup.err()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let cleanup_errors = [
+        server_cleanup.err(),
+        backend_cleanup.err(),
+        frontend_cleanup.err(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
 
     match (primary, cleanup_errors.is_empty()) {
         (Ok(()), true) => Ok(()),
@@ -132,15 +158,17 @@ mod tests {
     use super::combine_primary_and_cleanup;
 
     #[test]
-    fn backend_failure_remains_primary_when_frontend_and_backend_cleanup_fail() {
+    fn primary_failure_remains_primary_when_all_cleanup_steps_fail() {
         let error = combine_primary_and_cleanup(
             Err("backend failed".to_string()),
-            Err("frontend cleanup failed".to_string()),
+            Err("server cleanup failed".to_string()),
             Err("backend cleanup failed".to_string()),
+            Err("frontend cleanup failed".to_string()),
         )
         .expect_err("backend failure must be returned");
 
         assert!(error.contains("backend failed"), "{error}");
+        assert!(error.contains("server cleanup failed"), "{error}");
         assert!(error.contains("frontend cleanup failed"), "{error}");
         assert!(error.contains("backend cleanup failed"), "{error}");
     }

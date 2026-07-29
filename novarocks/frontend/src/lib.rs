@@ -34,8 +34,8 @@ pub use application::{
 };
 pub use mv::FrontendMvService;
 pub use server::{
-    FrontendGrpcEndpointOwnership, FrontendServerConfig, run_frontend_server,
-    run_frontend_server_until_shutdown,
+    FrontendGrpcEndpointOwnership, FrontendServerConfig, open_frontend_application_for_server,
+    run_frontend_server, run_frontend_server_until_shutdown, standalone_open_services_for_server,
 };
 pub use statistics::FrontendStatisticsService;
 pub use system_catalog::SystemCatalogService;

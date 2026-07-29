@@ -1388,6 +1388,16 @@ fn three_be_kill_query_cancels_distributed_execution_from_a_control_connection()
         return;
     }
     let _guard = lock_cluster_mvp();
+    let metadata_dir =
+        tempfile::tempdir_in(runtime_dir()).expect("create cancellation metadata directory");
+    let metadata_config = format!(
+        r#"
+[metadata]
+provider = "sqlite"
+path = "{}"
+"#,
+        metadata_dir.path().join("catalog.db").display()
+    );
     let mut cluster = MultiBeClusterHarness::start_n_be(
         3,
         r#"
@@ -1395,7 +1405,7 @@ fn three_be_kill_query_cancels_distributed_execution_from_a_control_connection()
 emit_cancel_marker = true
 emit_grpc_fragment_marker = true
 "#,
-        "",
+        &metadata_config,
     );
     let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create cancellation warehouse");
     let mut control = connect_mysql(cluster.fe_mysql_port());

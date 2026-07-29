@@ -94,6 +94,19 @@ impl BackendApplicationHost {
         Self::open_with_readiness_timeout(config, READINESS_TIMEOUT)
     }
 
+    /// Starts a native backend whose report ingress is owned by the supplied
+    /// coordinator. This is used only by the all-in-one composition root.
+    pub fn open_with_native_report_handler(
+        config: BackendServerConfig,
+        native_report_handler: Arc<dyn NativeReportHandler>,
+    ) -> Result<Self, BackendApplicationError> {
+        Self::open_with_readiness_timeout_and_report_handler(
+            config,
+            READINESS_TIMEOUT,
+            native_report_handler,
+        )
+    }
+
     pub fn ready_marker(&self) -> &str {
         &self.ready_marker
     }
@@ -122,6 +135,18 @@ impl BackendApplicationHost {
         config: BackendServerConfig,
         readiness_timeout: Duration,
     ) -> Result<Self, BackendApplicationError> {
+        Self::open_with_readiness_timeout_and_report_handler(
+            config,
+            readiness_timeout,
+            backend_native_report_handler(),
+        )
+    }
+
+    fn open_with_readiness_timeout_and_report_handler(
+        config: BackendServerConfig,
+        readiness_timeout: Duration,
+        native_report_handler: Arc<dyn NativeReportHandler>,
+    ) -> Result<Self, BackendApplicationError> {
         let config = config.config;
         app_config::install_preloaded_config(config.clone());
 
@@ -148,7 +173,7 @@ impl BackendApplicationHost {
             &bind_host,
             grpc_port,
             native_fragment_service.clone(),
-            backend_native_report_handler(),
+            native_report_handler,
         )
         .map_err(|error| {
             BackendApplicationError::new(

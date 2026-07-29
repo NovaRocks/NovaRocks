@@ -84,6 +84,28 @@ fn standalone_open_services(
     )
 }
 
+/// Opens the frontend services once for an externally composed server. The
+/// all-in-one composition root uses the returned host both to run MySQL and
+/// to provide the report handler installed on the native backend endpoint.
+pub async fn open_frontend_application_for_server(
+    config: &FrontendServerConfig,
+) -> Result<FrontendApplicationHost, FrontendApplicationError> {
+    let execution = resolve_frontend_execution_config(config)?;
+    FrontendApplicationHost::open(state_store_host_config(&config.config), execution).await
+}
+
+/// Builds standalone services from a previously opened frontend host.
+pub fn standalone_open_services_for_server(
+    host: &FrontendApplicationHost,
+    config: &NovaRocksConfig,
+) -> novarocks::engine::StandaloneOpenServices {
+    standalone_open_services(
+        Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+        host,
+        config,
+    )
+}
+
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
