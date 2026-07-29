@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-07-29
 provenance:
-  - "PR: pending"
+  - "PR: #759"
   - "discussion: 2026-07-29 explicit query cancellation control plane"
 code-anchors:
   - "novarocks/core/src/query_execution/control.rs (QueryControlPort)"
