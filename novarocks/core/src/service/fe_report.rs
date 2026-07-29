@@ -421,7 +421,7 @@ pub fn report_exec_state(finst_id: UniqueId) {
 }
 
 #[cfg(feature = "compat")]
-pub(crate) fn fetch_query_profile(
+pub fn fetch_query_profile(
     coord: &types::TNetworkAddress,
     query_id: &str,
 ) -> Result<String, String> {

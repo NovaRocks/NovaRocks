@@ -85,7 +85,7 @@ pub enum StarRocksExternalDependency {
 }
 
 impl StarRocksExternalDependency {
-    pub(crate) fn id(&self) -> u64 {
+    pub fn id(&self) -> u64 {
         match self {
             Self::QueryProfile { id, .. } => *id,
             Self::LakeMetaStorage { id, .. } => *id,
@@ -134,7 +134,7 @@ pub struct LakeMetaStorageRequest {
 
 impl LakeMetaStorageRequest {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         query_id: QueryId,
         catalog: String,
         db_name: String,
@@ -162,7 +162,7 @@ impl LakeMetaStorageRequest {
         }
     }
 
-    pub(crate) fn id(&self) -> u64 {
+    pub fn id(&self) -> u64 {
         self.id
     }
 }
@@ -171,6 +171,19 @@ impl LakeMetaStorageRequest {
 pub struct LakeMetaStorageFacts {
     pub(crate) total_rows: i64,
     pub(crate) column_arrays: BTreeMap<String, Vec<ArrayRef>>,
+}
+
+impl LakeMetaStorageFacts {
+    pub fn new(total_rows: i64, column_arrays: BTreeMap<String, Vec<ArrayRef>>) -> Self {
+        Self {
+            total_rows,
+            column_arrays,
+        }
+    }
+
+    pub fn total_rows(&self) -> i64 {
+        self.total_rows
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -196,7 +209,7 @@ impl StarRocksResolvedDependencies {
         Self(values)
     }
 
-    pub(crate) fn insert(
+    pub fn insert(
         &mut self,
         id: u64,
         value: StarRocksResolvedDependencyValue,
@@ -208,7 +221,7 @@ impl StarRocksResolvedDependencies {
         self.0.iter()
     }
 
-    pub(crate) fn get(&self, id: u64) -> Option<&StarRocksResolvedDependencyValue> {
+    pub fn get(&self, id: u64) -> Option<&StarRocksResolvedDependencyValue> {
         self.0.get(&id)
     }
 }

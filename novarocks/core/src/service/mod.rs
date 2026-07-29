@@ -51,12 +51,6 @@ pub(crate) mod result_batch_wire;
 pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;
 #[cfg(feature = "compat")]
-pub mod starrocks_fragment_dependency_resolver;
-#[cfg(feature = "compat")]
-pub mod starrocks_fragment_sync_ingress;
-#[cfg(feature = "compat")]
-pub mod starrocks_fragment_transport;
-#[cfg(feature = "compat")]
 pub(crate) mod starrocks_sink_commit_wire;
 #[cfg(feature = "compat")]
 pub mod stream_load;

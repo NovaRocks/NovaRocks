@@ -24,11 +24,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde_json::{Map, Value, json};
 
+use crate::protocol::starrocks::thrift_codec::thrift_binary_serialize;
+use crate::runtime::fragment::io::SyncFragmentExecutor;
 use crate::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
 use crate::runtime::{backend_id, sink_commit};
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress;
 use crate::service::starrocks_sink_commit_wire;
 use crate::service::stream_load_registry::{
     register_stream_load_file, unregister_stream_load_file,
@@ -989,7 +990,7 @@ pub(crate) fn handle_stream_load(
     table: String,
     headers: HttpHeaders,
     body: Vec<u8>,
-    fragment_sync_ingress: &dyn StarRocksFragmentSyncIngress,
+    fragment_sync_executor: &dyn SyncFragmentExecutor,
 ) -> Value {
     let started = Instant::now();
     let auth = match parse_basic_auth(&headers) {
@@ -1090,14 +1091,21 @@ pub(crate) fn handle_stream_load(
         })?;
 
         let execute_started = Instant::now();
-        let execute_result = fragment_sync_ingress.execute(plan_params).map_err(|e| {
+        let encoded_plan_params = thrift_binary_serialize(&plan_params).map_err(|e| {
             ApiError::new(
                 TStatusCode::RUNTIME_ERROR,
                 format!("execute plan fragment failed: {e}"),
             )
         })?;
+        let fragment_instance_id = fragment_sync_executor
+            .execute_encoded(&encoded_plan_params)
+            .map_err(|e| {
+                ApiError::new(
+                    TStatusCode::RUNTIME_ERROR,
+                    format!("execute plan fragment failed: {e}"),
+                )
+            })?;
         stats.write_data_time_ms = execute_started.elapsed().as_millis() as i64;
-        let fragment_instance_id = execute_result.fragment_instance_id();
         finst_id = Some(fragment_instance_id);
         commit_infos = sink_commit::list_tablet_commit_infos(fragment_instance_id);
         fail_infos = sink_commit::list_tablet_fail_infos(fragment_instance_id);
@@ -1176,7 +1184,7 @@ pub(crate) fn handle_stream_load(
 pub(crate) fn handle_transaction_load(
     headers: HttpHeaders,
     body: Vec<u8>,
-    fragment_sync_ingress: &dyn StarRocksFragmentSyncIngress,
+    fragment_sync_executor: &dyn SyncFragmentExecutor,
 ) -> Value {
     let options = match parse_load_headers(&headers).and_then(|opts| {
         ensure_txn_extensions_supported(&opts)?;
@@ -1271,14 +1279,21 @@ pub(crate) fn handle_transaction_load(
                 )
             })?;
             let execute_started = Instant::now();
-            let execute_result = fragment_sync_ingress.execute(plan_params).map_err(|e| {
+            let encoded_plan_params = thrift_binary_serialize(&plan_params).map_err(|e| {
                 ApiError::new(
                     TStatusCode::RUNTIME_ERROR,
                     format!("execute plan fragment failed: {e}"),
                 )
             })?;
+            let fragment_instance_id = fragment_sync_executor
+                .execute_encoded(&encoded_plan_params)
+                .map_err(|e| {
+                    ApiError::new(
+                        TStatusCode::RUNTIME_ERROR,
+                        format!("execute plan fragment failed: {e}"),
+                    )
+                })?;
             let write_ms = execute_started.elapsed().as_millis() as i64;
-            let fragment_instance_id = execute_result.fragment_instance_id();
             finst_id = Some(fragment_instance_id);
             let commit_infos = sink_commit::list_tablet_commit_infos(fragment_instance_id);
             let fail_infos = sink_commit::list_tablet_fail_infos(fragment_instance_id);

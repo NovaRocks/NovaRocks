@@ -59,15 +59,13 @@ impl CompatPorts for FakePorts {
     fn start_grpc(
         &mut self,
         _host: &str,
-        fragment_sync_ingress: Arc<
-            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
-        >,
+        fragment_sync_executor: Arc<dyn novarocks::runtime::fragment::io::SyncFragmentExecutor>,
         report_handler: Arc<dyn novarocks::query_execution::report::NativeReportHandler>,
     ) -> Result<(), String> {
         self.grpc_fragment_services
             .lock()
             .unwrap()
-            .push(Arc::as_ptr(&fragment_sync_ingress) as *const () as usize);
+            .push(Arc::as_ptr(&fragment_sync_executor) as *const () as usize);
         let rejection = report_handler
             .handle_native_report(Default::default())
             .expect_err("compat host must inject a rejecting native report handler");

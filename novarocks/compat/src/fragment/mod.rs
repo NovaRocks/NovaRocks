@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod admission;
+mod dependency;
 mod event_io;
 mod ffi;
 mod io;

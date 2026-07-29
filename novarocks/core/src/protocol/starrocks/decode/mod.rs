@@ -46,7 +46,7 @@ pub(crate) use instance::{
     StarRocksPathRewriteFacts, decode_lake_meta_scan_range_facts, decode_lake_scan_program_facts,
     decode_scan_contracts_and_raw_ranges,
 };
-pub use instance::{StarRocksDecodeFacts, decode_incremental_scan_ranges};
+pub use instance::{StarRocksDecodeFacts, decode_incremental_scan_ranges, snapshot_decode_facts};
 pub(crate) use options::decode_query_options;
 pub use submission::{
     DecodedStarRocksFragment, StarRocksDecodeInput, StarRocksFragmentDraft,

@@ -31,11 +31,12 @@ use novarocks::protocol::starrocks::compat::request::backfill_per_node_scan_rang
 use novarocks::protocol::starrocks::decode::{
     StarRocksDecodeInput, StarRocksFragmentDraft, StarRocksReportDestination,
     StarRocksSubmissionMetadata, decode_incremental_scan_ranges, decode_runtime_endpoint,
-    finish_fragment_submission, prepare_fragment_submission,
+    finish_fragment_submission, prepare_fragment_submission, snapshot_decode_facts,
 };
 use novarocks::runtime::exchange;
 use novarocks::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+    SyncFragmentExecutor,
 };
 use novarocks::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
@@ -50,17 +51,19 @@ use novarocks::runtime::starrocks_fragment_query::{
     StarRocksFragmentQueryRuntime,
 };
 use novarocks::service::fe_report;
-use novarocks::service::starrocks_fragment_dependency_resolver::resolve_dependencies;
-use novarocks::service::starrocks_fragment_transport::{
-    StarRocksDescriptorPreparation, StarRocksPrelaunchCancellationToken, StarRocksPrelaunchGuard,
-    commit_descriptor_handoff, prepare_batch_descriptor, prepare_descriptor, snapshot_decode_facts,
-    starrocks_prelaunch_registry,
-};
 use novarocks::thrift::{data_sinks, descriptors, internal_service, planner, types};
+
+use crate::fragment::admission::{
+    DescriptorPreparation, DescriptorTransportCache, PrelaunchCancellationToken, PrelaunchGuard,
+    PrelaunchRegistry,
+};
+use crate::fragment::dependency::resolve_dependencies;
 
 pub struct CompatFragmentService {
     queries: StarRocksFragmentQueryRuntime,
     controls: Arc<CompatFragmentControls>,
+    prelaunch: Arc<PrelaunchRegistry>,
+    descriptor_cache: Arc<DescriptorTransportCache>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
@@ -78,6 +81,8 @@ impl CompatFragmentService {
         Self {
             queries,
             controls: Arc::new(CompatFragmentControls::default()),
+            prelaunch: Arc::new(PrelaunchRegistry::default()),
+            descriptor_cache: Arc::new(DescriptorTransportCache::default()),
             exchange_transmitter,
             lookup_client,
             result_writer,
@@ -96,25 +101,28 @@ impl CompatFragmentService {
     pub fn execute_plan_fragment_sync(
         &self,
         request: internal_service::TExecPlanFragmentParams,
-    ) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String>
-    {
+    ) -> Result<UniqueId, String> {
         execute_plan_fragment_sync_with(self, request)
     }
 
     pub fn cancel_fragment(&self, finst_id: UniqueId) {
-        self.controls
-            .cancel_fragment(finst_id, &format!("query canceled by FE: finst={finst_id}"));
+        let reason = format!("query canceled by FE: finst={finst_id}");
+        if self.prelaunch.cancel_or_run(finst_id, || {
+            self.controls.cancel_fragment(finst_id, &reason);
+            novarocks::service::fragment_control::cancel_runtime_fragment(finst_id);
+        }) {
+            info!(
+                target: "novarocks::exec",
+                finst_id = %finst_id,
+                "cancel request marked StarRocks fragment preparation"
+            );
+        }
     }
 }
 
-impl novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress
-    for CompatFragmentService
-{
-    fn execute(
-        &self,
-        request: internal_service::TExecPlanFragmentParams,
-    ) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String>
-    {
+impl SyncFragmentExecutor for CompatFragmentService {
+    fn execute_encoded(&self, payload: &[u8]) -> Result<UniqueId, String> {
+        let request = thrift_binary_deserialize(payload)?;
         self.execute_plan_fragment_sync(request)
     }
 }
@@ -678,7 +686,7 @@ fn prepare_starrocks_draft(
 
 fn resolve_starrocks_draft(
     draft: &StarRocksFragmentDraftEnvelope,
-    token: &StarRocksPrelaunchCancellationToken,
+    token: &PrelaunchCancellationToken,
 ) -> Result<novarocks::protocol::starrocks::decode::StarRocksResolvedDependencies, String> {
     resolve_dependencies(draft.draft.external_dependencies(), token)
         .map_err(|error| error.to_string())
@@ -832,8 +840,8 @@ fn profile_report_interval_ns(
 fn launch_prepared_fragments(
     service: &CompatFragmentService,
     prepared: Vec<PreparedStarRocksFragment>,
-    descriptor_preparation: StarRocksDescriptorPreparation,
-    guard: StarRocksPrelaunchGuard,
+    descriptor_preparation: DescriptorPreparation,
+    guard: PrelaunchGuard,
 ) -> Result<usize, String> {
     if prepared.is_empty() {
         return Ok(0);
@@ -949,11 +957,13 @@ fn launch_prepared_fragments(
         }
     };
     let committed_handoff = match guard.handoff(|| {
-        commit_descriptor_handoff(&descriptor_preparation, |lease_factory| {
-            queries.commit_handoff(handoff, || {
-                lease_factory.map(|factory| factory.into_cleanup_lease())
+        service
+            .descriptor_cache
+            .commit_handoff(&descriptor_preparation, |lease_factory| {
+                queries.commit_handoff(handoff, || {
+                    lease_factory.map(|factory| factory.into_cleanup_lease())
+                })
             })
-        })
     }) {
         Ok(tracker) => tracker,
         Err(error) => {
@@ -1646,10 +1656,13 @@ fn submit_exec_batch_plan_fragments_with(
     let query_id = query_id_for_batch.expect("non-empty batch has query id");
     let unique_descriptors = envelopes.iter().map(|entry| entry.11).collect::<Vec<_>>();
     let descriptor_preparation =
-        prepare_batch_descriptor(query_id, common_desc_tbl, &unique_descriptors)?;
+        service
+            .descriptor_cache
+            .prepare_batch(query_id, common_desc_tbl, &unique_descriptors)?;
     let generation = descriptor_preparation.generation();
-    let mut guard =
-        starrocks_prelaunch_registry().install(query_id, generation, finst_ids.clone())?;
+    let mut guard = service
+        .prelaunch
+        .install(query_id, generation, finst_ids.clone())?;
     let frontend_endpoint = envelopes
         .first()
         .and_then(|entry| entry.5)
@@ -1732,12 +1745,14 @@ fn submit_exec_plan_fragment_with(
     let query_id = QueryId::new(params.query_id.hi, params.query_id.lo);
     let mut params = params.clone();
     backfill_per_node_scan_ranges(&mut params);
-    let descriptor_preparation = prepare_descriptor(query_id, one.desc_tbl.as_ref(), None)?;
-    let mut guard = starrocks_prelaunch_registry().install(
-        query_id,
-        descriptor_preparation.generation(),
-        [finst_id],
-    )?;
+    let descriptor_preparation =
+        service
+            .descriptor_cache
+            .prepare(query_id, one.desc_tbl.as_ref(), None)?;
+    let mut guard =
+        service
+            .prelaunch
+            .install(query_id, descriptor_preparation.generation(), [finst_id])?;
     guard.set_frontend_endpoint(
         one.coord
             .as_ref()
@@ -1775,7 +1790,7 @@ fn submit_exec_plan_fragment_with(
 fn execute_plan_fragment_sync_with(
     service: &CompatFragmentService,
     one: internal_service::TExecPlanFragmentParams,
-) -> Result<novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String> {
+) -> Result<UniqueId, String> {
     let Some(params) = one.params.as_ref() else {
         return Err("missing params in TExecPlanFragmentParams".to_string());
     };
@@ -1791,12 +1806,14 @@ fn execute_plan_fragment_sync_with(
 
     let mut params = params.clone();
     backfill_per_node_scan_ranges(&mut params);
-    let descriptor_preparation = prepare_descriptor(query_id, one.desc_tbl.as_ref(), None)?;
-    let mut guard = starrocks_prelaunch_registry().install(
-        query_id,
-        descriptor_preparation.generation(),
-        [finst_id],
-    )?;
+    let descriptor_preparation =
+        service
+            .descriptor_cache
+            .prepare(query_id, one.desc_tbl.as_ref(), None)?;
+    let mut guard =
+        service
+            .prelaunch
+            .install(query_id, descriptor_preparation.generation(), [finst_id])?;
     guard.set_frontend_endpoint(
         one.coord
             .as_ref()
@@ -1869,11 +1886,13 @@ fn execute_plan_fragment_sync_with(
             .controls
             .register_pending(query_id, &[finst_id], Arc::clone(&start_gate))?;
     let committed_handoff = guard.handoff(|| {
-        commit_descriptor_handoff(&descriptor_preparation, |lease_factory| {
-            queries.commit_handoff(handoff, || {
-                lease_factory.map(|factory| factory.into_cleanup_lease())
+        service
+            .descriptor_cache
+            .commit_handoff(&descriptor_preparation, |lease_factory| {
+                queries.commit_handoff(handoff, || {
+                    lease_factory.map(|factory| factory.into_cleanup_lease())
+                })
             })
-        })
     })?;
     let query_mem_tracker = committed_handoff.query_mem_tracker();
     debug_assert!(Arc::ptr_eq(
@@ -1926,9 +1945,7 @@ fn execute_plan_fragment_sync_with(
     drop(admission);
 
     match execution_result {
-        Ok(()) => Ok(
-            novarocks::service::starrocks_fragment_sync_ingress::SyncExecPlanResult::new(finst_id),
-        ),
+        Ok(()) => Ok(finst_id),
         Err(error) => Err(error),
     }
 }
@@ -1949,6 +1966,7 @@ mod tests {
     use novarocks::protocol::starrocks::thrift_codec::{
         thrift_binary_deserialize, thrift_binary_serialize,
     };
+    use novarocks::runtime::fragment::io::SyncFragmentExecutor;
     use novarocks::runtime::query_context::QueryId;
     use novarocks::thrift::{
         data_sinks, descriptors, internal_service, partitions, plan_nodes, planner, types,
@@ -2330,9 +2348,9 @@ mod tests {
             crate::fragment::compat_fragment_event_sink(),
         ));
         let execution_service = Arc::clone(&service);
-        let execution = std::thread::spawn(move || {
-            execution_service.execute_plan_fragment_sync(blocking_exchange_request(query, finst))
-        });
+        let payload = thrift_binary_serialize(&blocking_exchange_request(query, finst))
+            .expect("serialize sync fragment request");
+        let execution = std::thread::spawn(move || execution_service.execute_encoded(&payload));
 
         let query_id = runtime_query_id(query);
         let deadline = Instant::now() + Duration::from_secs(5);

@@ -54,6 +54,8 @@ use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 #[cfg(feature = "compat")]
+use crate::runtime::fragment::io::SyncFragmentExecutor;
+#[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
 use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
@@ -63,8 +65,6 @@ use crate::service::grpc_runtime_filter_install_adapter::{
 use crate::service::internal_rpc;
 use crate::service::native_fragment_ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
-#[cfg(feature = "compat")]
-use crate::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress;
 #[cfg(feature = "compat")]
 use crate::service::stream_load_http;
 use crate::service::{load_tracking_http, metrics_http};
@@ -91,14 +91,11 @@ static STANDALONE_GRPC_STARTUP_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
 struct RejectingTestNativeFragmentIngress;
 
 #[cfg(all(test, feature = "compat"))]
-struct RejectingTestStarRocksFragmentSyncIngress;
+struct RejectingTestSyncFragmentExecutor;
 
 #[cfg(all(test, feature = "compat"))]
-impl StarRocksFragmentSyncIngress for RejectingTestStarRocksFragmentSyncIngress {
-    fn execute(
-        &self,
-        _request: crate::thrift::internal_service::TExecPlanFragmentParams,
-    ) -> Result<crate::service::starrocks_fragment_sync_ingress::SyncExecPlanResult, String> {
+impl SyncFragmentExecutor for RejectingTestSyncFragmentExecutor {
+    fn execute_encoded(&self, _payload: &[u8]) -> Result<crate::common::types::UniqueId, String> {
         Err("test StarRocks fragment sync ingress is not configured".to_string())
     }
 }
@@ -530,7 +527,7 @@ impl IndependentGrpcRuntimeFilterNode {
                 #[cfg(feature = "compat")]
                 let app = build_novarocks_http_app(
                     Routes::new(service),
-                    Arc::new(RejectingTestStarRocksFragmentSyncIngress),
+                    Arc::new(RejectingTestSyncFragmentExecutor),
                 );
                 #[cfg(not(feature = "compat"))]
                 let app = build_novarocks_http_app(Routes::new(service));
@@ -1280,7 +1277,7 @@ where
 #[cfg(feature = "compat")]
 fn build_novarocks_http_app(
     grpc_routes: Routes,
-    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+    fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
 ) -> Router {
     grpc_routes
         .into_axum_router()
@@ -1302,7 +1299,7 @@ fn build_novarocks_http_app(
             get(load_tracking_http::handle_load_tracking_log),
         )
         .route("/metrics", get(metrics_http::handle_metrics))
-        .layer(Extension(fragment_sync_ingress))
+        .layer(Extension(fragment_sync_executor))
 }
 
 #[cfg(not(feature = "compat"))]
@@ -1476,7 +1473,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
 #[cfg(feature = "compat")]
 pub fn start_grpc_server(
     host: &str,
-    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+    fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     start_grpc_server_on_ports(
@@ -1484,7 +1481,7 @@ pub fn start_grpc_server(
         http_port(),
         grpc_port(),
         starlet_port(),
-        fragment_sync_ingress,
+        fragment_sync_executor,
         report_handler,
     )
 }
@@ -1648,7 +1645,7 @@ fn start_grpc_server_on_ports(
     http_port: u16,
     grpc_port: u16,
     starlet_port: u16,
-    fragment_sync_ingress: Arc<dyn StarRocksFragmentSyncIngress>,
+    fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
     {
@@ -1724,7 +1721,7 @@ fn start_grpc_server_on_ports(
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                 let http_app =
-                    build_novarocks_http_app(Routes::new(http_svc), fragment_sync_ingress);
+                    build_novarocks_http_app(Routes::new(http_svc), fragment_sync_executor);
                 let grpc_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
                     GrpcService::execution_without_native_fragment_ingress(report_handler),
                 )

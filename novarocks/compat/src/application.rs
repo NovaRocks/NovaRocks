@@ -6,6 +6,7 @@ use std::time::Duration;
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
+use novarocks::runtime::fragment::io::SyncFragmentExecutor;
 use novarocks::service::{
     backend_service, frontend_rpc, grpc_server, heartbeat_service, report_worker,
 };
@@ -231,9 +232,7 @@ impl CompatApplicationHost {
             startup_summary,
         };
         host.ports.init_frontend_rpc();
-        let grpc_fragment_service: Arc<
-            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
-        > = host.fragment_service.clone();
+        let grpc_fragment_service: Arc<dyn SyncFragmentExecutor> = host.fragment_service.clone();
         if let Err(error) = host.ports.start_grpc(
             &server.host,
             grpc_fragment_service,
@@ -387,9 +386,7 @@ trait CompatPorts: Send {
     fn start_grpc(
         &mut self,
         host: &str,
-        fragment_sync_ingress: Arc<
-            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
-        >,
+        fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
         report_handler: Arc<dyn NativeReportHandler>,
     ) -> Result<(), String>;
     fn start_heartbeat(&mut self, config: heartbeat_service::HeartbeatConfig)
@@ -417,12 +414,10 @@ impl CompatPorts for LiveCompatPorts {
     fn start_grpc(
         &mut self,
         host: &str,
-        fragment_sync_ingress: Arc<
-            dyn novarocks::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress,
-        >,
+        fragment_sync_executor: Arc<dyn SyncFragmentExecutor>,
         report_handler: Arc<dyn NativeReportHandler>,
     ) -> Result<(), String> {
-        grpc_server::start_grpc_server(host, fragment_sync_ingress, report_handler)
+        grpc_server::start_grpc_server(host, fragment_sync_executor, report_handler)
     }
 
     fn start_heartbeat(

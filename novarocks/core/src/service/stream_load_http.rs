@@ -21,7 +21,7 @@ use axum::extract::Path;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
-use crate::service::starrocks_fragment_sync_ingress::StarRocksFragmentSyncIngress;
+use crate::runtime::fragment::io::SyncFragmentExecutor;
 use crate::service::stream_load::{self, HttpHeaders};
 
 fn normalize_headers(headers: &HeaderMap) -> HttpHeaders {
@@ -35,7 +35,7 @@ fn normalize_headers(headers: &HeaderMap) -> HttpHeaders {
 }
 
 pub(crate) async fn handle_stream_load(
-    Extension(fragment_sync_ingress): Extension<std::sync::Arc<dyn StarRocksFragmentSyncIngress>>,
+    Extension(fragment_sync_executor): Extension<std::sync::Arc<dyn SyncFragmentExecutor>>,
     Path((db, table)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -48,14 +48,14 @@ pub(crate) async fn handle_stream_load(
             table,
             normalize_headers(&headers),
             body.to_vec(),
-            fragment_sync_ingress.as_ref(),
+            fragment_sync_executor.as_ref(),
         )
     });
     (StatusCode::OK, Json(response))
 }
 
 pub(crate) async fn handle_transaction_load(
-    Extension(fragment_sync_ingress): Extension<std::sync::Arc<dyn StarRocksFragmentSyncIngress>>,
+    Extension(fragment_sync_executor): Extension<std::sync::Arc<dyn SyncFragmentExecutor>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -63,7 +63,7 @@ pub(crate) async fn handle_transaction_load(
         stream_load::handle_transaction_load(
             normalize_headers(&headers),
             body.to_vec(),
-            fragment_sync_ingress.as_ref(),
+            fragment_sync_executor.as_ref(),
         )
     });
     (StatusCode::OK, Json(response))

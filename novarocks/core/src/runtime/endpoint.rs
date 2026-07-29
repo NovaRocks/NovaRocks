@@ -26,7 +26,7 @@ pub struct RuntimeEndpoint {
 }
 
 impl RuntimeEndpoint {
-    pub(crate) fn new(host: impl Into<String>, port: i32) -> Result<Self, String> {
+    pub fn new(host: impl Into<String>, port: i32) -> Result<Self, String> {
         let host = host.into();
         let host = host.trim().to_string();
         if host.is_empty() {

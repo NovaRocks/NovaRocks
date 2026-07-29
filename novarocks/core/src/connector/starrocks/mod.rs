@@ -18,7 +18,7 @@
 pub mod fe_v2_meta;
 pub(crate) mod fs_access;
 pub mod lake;
-pub(crate) mod lake_meta_storage;
+mod lake_meta_storage;
 mod object_store_profile;
 pub mod scan;
 pub(crate) mod schema;
@@ -27,6 +27,8 @@ pub mod starmgr;
 pub mod table;
 pub(crate) mod table_schema_service;
 
+#[cfg(feature = "compat")]
+pub use lake_meta_storage::resolve_lake_meta_storage;
 pub(crate) use object_store_profile::ObjectStoreProfile;
 pub(crate) use scan::StarRocksScanSource;
 pub(crate) use scan::build_native_object_store_profile_from_properties;

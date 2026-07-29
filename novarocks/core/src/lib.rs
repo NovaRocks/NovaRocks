@@ -52,7 +52,6 @@ pub use fs::local as novarocks_fs_local;
 pub use fs::opendal as novarocks_fs_opendal;
 
 pub use common::types::{FetchResult, UniqueId};
-pub use service::fragment_control::cancel;
 pub use service::grpc_server::start_grpc_exchange_server;
 #[cfg(feature = "compat")]
 pub use service::grpc_server::start_grpc_server;

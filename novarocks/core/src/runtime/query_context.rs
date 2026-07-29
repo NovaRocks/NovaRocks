@@ -138,10 +138,15 @@ pub struct QueryCleanupLease {
 }
 
 impl QueryCleanupLease {
-    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
+    /// Creates a query-scoped cleanup action for a consumer-owned resource.
+    pub fn from_release(release: impl FnOnce() + Send + 'static) -> Self {
         Self {
             release: Some(Box::new(release)),
         }
+    }
+
+    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self::from_release(release)
     }
 
     pub(crate) fn release(mut self) {
@@ -156,6 +161,25 @@ impl Drop for QueryCleanupLease {
         if let Some(release) = self.release.take() {
             release();
         }
+    }
+}
+
+#[cfg(test)]
+mod query_cleanup_lease_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::QueryCleanupLease;
+
+    #[test]
+    fn consumer_owned_release_runs_once_when_lease_drops() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let release_counter = Arc::clone(&releases);
+        let lease = QueryCleanupLease::from_release(move || {
+            release_counter.fetch_add(1, Ordering::SeqCst);
+        });
+        drop(lease);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 }
 

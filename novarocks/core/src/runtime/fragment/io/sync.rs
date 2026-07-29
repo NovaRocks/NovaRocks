@@ -16,28 +16,12 @@
 // under the License.
 
 use crate::common::types::UniqueId;
-use crate::thrift::internal_service;
 
-#[derive(Clone, Debug)]
-pub struct SyncExecPlanResult {
-    fragment_instance_id: UniqueId,
-}
-
-impl SyncExecPlanResult {
-    pub const fn new(fragment_instance_id: UniqueId) -> Self {
-        Self {
-            fragment_instance_id,
-        }
-    }
-
-    pub const fn fragment_instance_id(&self) -> UniqueId {
-        self.fragment_instance_id
-    }
-}
-
-pub trait StarRocksFragmentSyncIngress: Send + Sync + 'static {
-    fn execute(
-        &self,
-        request: internal_service::TExecPlanFragmentParams,
-    ) -> Result<SyncExecPlanResult, String>;
+/// Temporary consumer-owned bridge for a synchronous fragment execution request.
+///
+/// The consumer intentionally sees only an encoded payload and a neutral fragment
+/// identity. Compat owns the protocol decode and concrete execution. RCI-5D removes
+/// this bridge together with the remaining core stream-load route owner.
+pub trait SyncFragmentExecutor: Send + Sync + 'static {
+    fn execute_encoded(&self, payload: &[u8]) -> Result<UniqueId, String>;
 }

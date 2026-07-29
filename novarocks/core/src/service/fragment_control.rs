@@ -20,26 +20,7 @@ use crate::novarocks_logging::info;
 use crate::runtime::query_context::{QueryContextManager, query_context_manager};
 use crate::runtime::{exchange, result_buffer};
 
-pub fn cancel(finst_id: UniqueId) {
-    #[cfg(feature = "compat")]
-    if crate::service::starrocks_fragment_transport::starrocks_prelaunch_registry()
-        .cancel_or_run(finst_id, || cancel_runtime(finst_id))
-    {
-        info!(
-            target: "novarocks::exec",
-            finst_id = %finst_id,
-            "cancel request marked StarRocks fragment preparation"
-        );
-        return;
-    }
-    #[cfg(feature = "compat")]
-    return;
-
-    #[cfg(not(feature = "compat"))]
-    cancel_runtime(finst_id);
-}
-
-fn cancel_runtime(finst_id: UniqueId) {
+pub fn cancel_runtime_fragment(finst_id: UniqueId) {
     cancel_with_manager(finst_id, query_context_manager());
 }
 
@@ -78,7 +59,7 @@ pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryC
 
 #[cfg(test)]
 mod tests {
-    use super::cancel;
+    use super::cancel_runtime_fragment;
     use crate::common::types::UniqueId;
     use crate::runtime::{
         exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state},
@@ -110,7 +91,7 @@ mod tests {
         assert!(snapshot_receiver_state(key_a).is_some());
         assert!(snapshot_receiver_state(key_b).is_some());
 
-        cancel(finst_a);
+        cancel_runtime_fragment(finst_a);
 
         assert!(
             snapshot_receiver_state(key_a).is_none(),

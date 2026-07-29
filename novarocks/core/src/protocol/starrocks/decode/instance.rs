@@ -350,6 +350,79 @@ impl StarRocksDecodeFacts {
     }
 }
 
+/// Captures process-local values required by the StarRocks decoder.
+///
+/// This remains with the decoder until RCI-5F moves the protocol owner to
+/// `novarocks-compat`; it is deliberately not part of fragment admission state.
+pub fn snapshot_decode_facts(
+    exec_params: &internal_service::TPlanFragmentExecParams,
+) -> Result<StarRocksDecodeFacts, String> {
+    let mut stream_load_paths = BTreeMap::new();
+    for ranges in exec_params.per_node_scan_ranges.values() {
+        for params in ranges {
+            let Some(broker) = params.scan_range.broker_scan_range.as_ref() else {
+                continue;
+            };
+            for range in &broker.ranges {
+                if range.file_type != types::TFileType::FILE_STREAM {
+                    continue;
+                }
+                let load_id = range
+                    .load_id
+                    .as_ref()
+                    .ok_or_else(|| "FILE_STREAM range is missing load_id".to_string())?;
+                let path =
+                    crate::service::stream_load_registry::resolve_stream_load_file_path(load_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "no registered local file for FILE_STREAM load_id={}:{}",
+                                load_id.hi, load_id.lo
+                            )
+                        })?;
+                stream_load_paths.insert(
+                    UniqueId {
+                        hi: load_id.hi,
+                        lo: load_id.lo,
+                    },
+                    path,
+                );
+            }
+        }
+    }
+    let config = crate::common::app_config::config().map_err(|error| error.to_string())?;
+    let rewrite = &config.runtime.path_rewrite;
+    let path_rewrite = rewrite.enable.then(|| {
+        StarRocksPathRewriteFacts::new(rewrite.from_prefix.clone(), rewrite.to_prefix.clone())
+    });
+    let datacache_available = config.runtime.cache.datacache_enable
+        && crate::cache::DataCacheManager::instance()
+            .block_cache()
+            .is_some();
+    let jdbc = config.jdbc_config().map(|jdbc| {
+        StarRocksJdbcFacts::new(
+            jdbc.url.clone(),
+            jdbc.user.clone(),
+            jdbc.password.clone(),
+            jdbc.default_db.clone(),
+        )
+    });
+    let object_storage = &config.runtime.object_storage;
+    let object_store_defaults = StarRocksObjectStoreDefaults::new(
+        object_storage.retry_max_times,
+        object_storage.retry_min_delay_ms,
+        object_storage.retry_max_delay_ms,
+        object_storage.timeout_ms,
+        object_storage.io_timeout_ms,
+    );
+    Ok(StarRocksDecodeFacts::new(
+        stream_load_paths,
+        path_rewrite,
+        datacache_available,
+        jdbc,
+        object_store_defaults,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_instance_parts(
     params: &internal_service::TPlanFragmentExecParams,

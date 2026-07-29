@@ -6,6 +6,7 @@ pub(crate) mod exchange_queue;
 pub mod lookup;
 pub mod result;
 pub mod result_format;
+pub mod sync;
 
 pub use error::{FragmentIoError, FragmentIoErrorKind, FragmentIoOperation};
 pub use events::{
@@ -21,3 +22,4 @@ pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultPresentation, ResultProjection,
     ResultWriteSpec,
 };
+pub use sync::SyncFragmentExecutor;

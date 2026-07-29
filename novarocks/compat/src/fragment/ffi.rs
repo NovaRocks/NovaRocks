@@ -99,7 +99,6 @@ pub unsafe extern "C" fn novarocks_rs_cancel(
         lo: finst_id_lo,
     };
     service.cancel_fragment(finst_id);
-    novarocks::cancel(finst_id);
     0
 }
 

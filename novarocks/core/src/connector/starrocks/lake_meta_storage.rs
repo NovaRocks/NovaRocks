@@ -40,7 +40,7 @@ struct LoadedTabletSnapshot {
     snapshot: StarRocksTabletSnapshot,
 }
 
-pub(crate) fn resolve_lake_meta_storage(
+pub fn resolve_lake_meta_storage(
     request: &LakeMetaStorageRequest,
 ) -> Result<LakeMetaStorageFacts, String> {
     let table = LakeTableIdentity {
