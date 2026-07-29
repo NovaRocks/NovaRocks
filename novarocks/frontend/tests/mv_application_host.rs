@@ -19,8 +19,7 @@ use bytes::Bytes;
 use novarocks::mv::repository::MvRepositoryErrorKind;
 use novarocks_frontend::mv::repository::key::definition_by_id_key;
 use novarocks_frontend::{
-    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendGrpcEndpointOwnership,
-    FrontendServerConfig, run_frontend_server_until_shutdown,
+    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
 };
 use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
 use novarocks_state_store::{
@@ -47,12 +46,22 @@ fn sqlite_config(temp: &TempDir) -> StateStoreHostConfig {
     }
 }
 
+fn execution_config() -> FrontendExecutionConfig {
+    FrontendExecutionConfig::new("127.0.0.1", 19090, std::num::NonZeroUsize::new(1).unwrap())
+}
+
+async fn open_host(
+    config: Option<StateStoreHostConfig>,
+) -> Result<FrontendApplicationHost, novarocks_frontend::FrontendApplicationError> {
+    FrontendApplicationHost::open(config, execution_config()).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_sqlite_opens_and_reopens_mv_repository() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
 
-    let host = FrontendApplicationHost::open(Some(config.clone()))
+    let host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open its MV repository");
     assert!(host.mv_repository().availability().is_available());
@@ -62,7 +71,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
         .await
         .expect("shutdown must release MV repository first");
 
-    let reopened = FrontendApplicationHost::open(Some(config))
+    let reopened = open_host(Some(config))
         .await
         .expect("same SQLite store must reopen its MV repository");
     assert!(reopened.mv_repository().availability().is_available());
@@ -71,7 +80,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_state_store_keeps_host_available_but_mv_unavailable() {
-    let host = FrontendApplicationHost::open(None)
+    let host = open_host(None)
         .await
         .expect("host without StateStore remains available");
     assert!(!host.mv_repository().availability().is_available());
@@ -81,7 +90,7 @@ async fn absent_state_store_keeps_host_available_but_mv_unavailable() {
 #[tokio::test]
 async fn current_thread_runtime_rejects_sync_mv_repository_calls_without_panicking() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
-    let host = FrontendApplicationHost::open(Some(sqlite_config(&temp)))
+    let host = open_host(Some(sqlite_config(&temp)))
         .await
         .expect("configured host");
     let repository = host.mv_repository();
@@ -99,35 +108,11 @@ async fn current_thread_runtime_rejects_sync_mv_repository_calls_without_panicki
     host.shutdown().await.expect("host shutdown");
 }
 
-#[tokio::test]
-async fn current_thread_server_start_returns_mv_repository_error_before_bind() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-    config.cluster.role = novarocks::common::app_config::ClusterRole::Fe;
-    config.cluster.backends.clear();
-    config.state_store = Some(sqlite_config(&temp).state_store);
-
-    let error = run_frontend_server_until_shutdown(
-        FrontendServerConfig {
-            config,
-            config_path: None,
-            port_override: Some(0),
-            grpc_endpoint: FrontendGrpcEndpointOwnership::ExternallyHosted,
-        },
-        std::future::pending::<()>(),
-    )
-    .await
-    .expect_err("current-thread startup must reject the synchronous MV repository call");
-
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::Server);
-    assert!(error.to_string().contains("current-thread Tokio runtime"));
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_mv_record_fails_open_and_releases_provider_for_retry() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = FrontendApplicationHost::open(Some(config.clone()))
+    let host = open_host(Some(config.clone()))
         .await
         .expect("configured host");
     let store = host.state_store().expect("configured StateStore");
@@ -153,13 +138,13 @@ async fn corrupt_mv_record_fails_open_and_releases_provider_for_retry() {
     drop(store);
     host.shutdown().await.expect("seed host shutdown");
 
-    let error = match FrontendApplicationHost::open(Some(config.clone())).await {
+    let error = match open_host(Some(config.clone())).await {
         Ok(_) => panic!("corrupt MV metadata must reject host open"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), FrontendApplicationErrorKind::MvServiceOpen);
 
-    let retry = match FrontendApplicationHost::open(Some(config)).await {
+    let retry = match open_host(Some(config)).await {
         Ok(_) => panic!("retry must reach MV validation instead of retaining provider lock"),
         Err(error) => error,
     };

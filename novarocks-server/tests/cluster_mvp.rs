@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
-use novarocks_frontend::FrontendApplicationHost;
+use novarocks_frontend::{FrontendApplicationHost, FrontendExecutionConfig};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
     StateStoreProviderConfig,
@@ -638,7 +638,7 @@ deployment_owner = "fe-1"
                     );
                 }
                 while let Ok(line) = be.stdout_rx.try_recv() {
-                    if line.contains("NOVAROCKS_GRPC_SUBMIT") {
+                    if line.starts_with("NOVAROCKS_GRPC_SUBMIT call=") {
                         submitted[index] += 1;
                     }
                     if line.contains("NOVAROCKS_CANCEL") && line.contains(cancel_detail) {
@@ -767,7 +767,7 @@ fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) {
     stream.flush().expect("flush mysql packet");
 }
 
-fn send_mysql_query_and_disconnect(port: u16, sql: &str) {
+fn send_mysql_query(port: u16, sql: &str) -> TcpStream {
     const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
     const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
     const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
@@ -817,8 +817,6 @@ fn send_mysql_query_and_disconnect(port: u16, sql: &str) {
     write_packet(&mut stream, 0, &query_payload);
 
     stream
-        .shutdown(Shutdown::Both)
-        .expect("shutdown raw mysql client");
 }
 
 fn show_backends(conn: &mut MysqlConn) -> Vec<Row> {
@@ -1293,11 +1291,18 @@ fn mysql_disconnect_triggers_cancel() {
         r#"
 [debug]
 emit_cancel_marker = true
+emit_grpc_fragment_marker = true
 "#,
         "",
     );
 
-    send_mysql_query_and_disconnect(cluster.fe_mysql, disconnect_blocking_query_sql());
+    let stream = send_mysql_query(cluster.fe_mysql, disconnect_blocking_query_sql());
+    cluster
+        .be
+        .wait_for_output_contains("NOVAROCKS_GRPC_SUBMIT call=", Duration::from_secs(3));
+    stream
+        .shutdown(Shutdown::Both)
+        .expect("shutdown raw mysql client");
 
     cluster
         .be
@@ -1610,7 +1615,7 @@ fn cross_process_three_be_state_store_baseline() {
         .iter()
         .filter(|row| row.get::<String, usize>(3).as_deref() == Some("Live"))
         .map(|row| {
-            let value = row.get::<String, usize>(9).unwrap_or_else(|| {
+            let value = row.get::<String, usize>(4).unwrap_or_else(|| {
                 panic!("Live backend must expose ScheduledFragments; rows={backend_rows:?}")
             });
             value.parse::<u64>().unwrap_or_else(|err| {
@@ -1967,9 +1972,13 @@ fn cross_process_three_be_mv_state_store_restart() {
         .build()
         .expect("build StateStore inspection runtime");
     let host = runtime
-        .block_on(FrontendApplicationHost::open(Some(
-            sqlite_state_store_config(&state_store_path, "mv-state-store-restart"),
-        )))
+        .block_on(FrontendApplicationHost::open(
+            Some(sqlite_state_store_config(
+                &state_store_path,
+                "mv-state-store-restart",
+            )),
+            frontend_execution_config(),
+        ))
         .expect("reopen MV StateStore after clean FE shutdown");
     let definitions = host
         .mv_repository()
@@ -2009,6 +2018,10 @@ fn sqlite_state_store_config(state_store_path: &Path, cluster_id: &str) -> State
         },
         foundationdb_client: None,
     }
+}
+
+fn frontend_execution_config() -> FrontendExecutionConfig {
+    FrontendExecutionConfig::new("127.0.0.1", 19090, std::num::NonZeroUsize::new(1).unwrap())
 }
 
 #[cfg(unix)]
