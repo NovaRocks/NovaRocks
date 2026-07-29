@@ -21,7 +21,7 @@ use novarocks::novarocks_logging::{error, info, warn};
 
 use novarocks::common::app_config;
 use novarocks::common::config::debug_exec_batch_plan_json;
-use novarocks::common::thrift::{thrift_binary_deserialize, thrift_named_json};
+use novarocks::protocol::starrocks::thrift_codec::{thrift_binary_deserialize, thrift_named_json};
 
 use novarocks::cache::CacheOptions;
 use novarocks::common::types::UniqueId;
@@ -1945,8 +1945,10 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use novarocks::common::thrift::{thrift_binary_deserialize, thrift_binary_serialize};
     use novarocks::common::types::UniqueId;
+    use novarocks::protocol::starrocks::thrift_codec::{
+        thrift_binary_deserialize, thrift_binary_serialize,
+    };
     use novarocks::runtime::query_context::QueryId;
     use novarocks::thrift::{
         data_sinks, descriptors, internal_service, partitions, plan_nodes, planner, types,

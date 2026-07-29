@@ -1,5 +1,5 @@
 use base64::Engine;
-use novarocks::common::thrift::thrift_compact_serialize;
+use novarocks::protocol::starrocks::thrift_codec::thrift_compact_serialize;
 use novarocks::thrift::data;
 use thrift::OrderedFloat;
 

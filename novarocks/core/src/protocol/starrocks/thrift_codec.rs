@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+// This remains a temporary Core owner until RCI-5 moves the StarRocks adapter.
 use thrift::protocol::{
     TBinaryInputProtocol, TBinaryOutputProtocol, TCompactOutputProtocol, TFieldIdentifier,
     TListIdentifier, TMapIdentifier, TMessageIdentifier, TOutputProtocol, TSerializable,
@@ -324,7 +325,21 @@ pub fn thrift_named_json<T: TSerializable>(v: &T) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_unique_id_to_uuid;
+    use thrift::protocol::{TCompactInputProtocol, TSerializable};
+    use thrift::transport::{TBufferChannel, TIoChannel};
+
+    use super::{
+        rewrite_unique_id_to_uuid, thrift_binary_deserialize, thrift_binary_serialize,
+        thrift_compact_serialize,
+    };
+
+    fn thrift_compact_deserialize<T: TSerializable>(bytes: &[u8]) -> Result<T, String> {
+        let mut channel = TBufferChannel::with_capacity(bytes.len(), 1024);
+        channel.set_readable_bytes(bytes);
+        let (reader, _) = channel.split().map_err(|error| error.to_string())?;
+        let mut protocol = TCompactInputProtocol::new(reader);
+        T::read_from_in_protocol(&mut protocol).map_err(|error| error.to_string())
+    }
 
     #[test]
     fn rewrite_named_json_unique_id_objects_to_uuid() {
@@ -343,5 +358,24 @@ mod tests {
             serde_json::Value::String("00000000-0000-0001-0000-000000000002".to_string())
         );
         assert_eq!(value["other"]["hi"], serde_json::Value::from(1));
+    }
+
+    #[test]
+    fn binary_and_compact_serialization_round_trip_generated_thrift_values() {
+        let value = crate::thrift::types::TUniqueId::new(17, 29);
+
+        let binary = thrift_binary_serialize(&value).expect("binary encode");
+        assert_eq!(
+            thrift_binary_deserialize::<crate::thrift::types::TUniqueId>(&binary)
+                .expect("binary decode"),
+            value
+        );
+
+        let compact = thrift_compact_serialize(&value).expect("compact encode");
+        assert_eq!(
+            thrift_compact_deserialize::<crate::thrift::types::TUniqueId>(&compact)
+                .expect("compact decode"),
+            value
+        );
     }
 }

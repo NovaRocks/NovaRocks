@@ -21,6 +21,7 @@ use crate::protocol::starrocks::type_mapping::{
 use crate::thrift::types;
 use arrow::datatypes::{DataType, Field};
 use novarocks_types::PrimitiveType;
+use novarocks_types::arrow_primitive::primitive_to_arrow_type;
 
 /// Extract primitive type from TExprNode.
 pub(crate) fn primitive_type_from_node(
@@ -152,8 +153,7 @@ pub(crate) fn scalar_type_desc(primitive: types::TPrimitiveType) -> types::TType
 /// This is mainly used by expression fields like `TExprNode.child_type` where FE already decides
 /// a comparable type for both children, and BE executes comparison with that single logical type.
 pub(crate) fn arrow_type_from_primitive(primitive: types::TPrimitiveType) -> Option<DataType> {
-    native_primitive_from_thrift(primitive)
-        .and_then(crate::lower::common::type_mapping::arrow_type_from_native_primitive)
+    native_primitive_from_thrift(primitive).and_then(primitive_to_arrow_type)
 }
 
 /// Convert TTypeDesc to Arrow DataType.

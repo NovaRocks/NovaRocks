@@ -17,6 +17,7 @@
 
 pub mod compat;
 pub mod decode;
+pub mod thrift_codec;
 pub(crate) mod type_mapping;
 
 #[cfg(test)]

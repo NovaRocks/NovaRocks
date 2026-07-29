@@ -35,13 +35,13 @@ use thrift::transport::{
 };
 
 use crate::common::network;
-use crate::common::thrift::thrift_named_json;
 use crate::connector::starrocks::lake::{
     create_lake_tablet_from_req, execute_alter_tablet_task,
     execute_update_tablet_meta_info_task as execute_lake_update_tablet_meta_info_task,
 };
 use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_table;
 use crate::novarocks_config::config as novarocks_app_config;
+use crate::protocol::starrocks::thrift_codec::thrift_named_json;
 use crate::runtime::starlet_shard_registry;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::{disk_report, stream_load};

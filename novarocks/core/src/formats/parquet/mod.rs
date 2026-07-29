@@ -2678,6 +2678,7 @@ mod tests {
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use crate::fs::scan_context::{FileScanContext, FileScanRange};
     use novarocks_types::PrimitiveType;
+    use novarocks_types::arrow_primitive::primitive_to_arrow_type;
 
     use super::{
         MinMaxPredicate, MinMaxPredicateValue, ParquetReadCachePolicy, ParquetScanConfig,
@@ -2717,11 +2718,7 @@ mod tests {
                 .iter()
                 .zip(slot_types.iter().copied())
                 .map(|(name, primitive)| {
-                    let data_type =
-                        crate::lower::common::type_mapping::arrow_type_from_native_primitive(
-                            primitive,
-                        )
-                        .expect("arrow type");
+                    let data_type = primitive_to_arrow_type(primitive).expect("arrow type");
                     Field::new(name.clone(), data_type, true)
                 })
                 .collect::<Vec<_>>();

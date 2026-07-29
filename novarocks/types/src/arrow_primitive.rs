@@ -16,8 +16,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 
+use crate::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use crate::largeint;
 use crate::logical::{LogicalType, logical_type_of_field};
 use crate::primitive::PrimitiveType;
 
@@ -36,6 +38,42 @@ pub(crate) fn field_logical_primitive(field: &Field) -> Option<PrimitiveType> {
 
 pub fn arrow_field_to_primitive(field: &Field) -> Option<PrimitiveType> {
     field_logical_primitive(field).or_else(|| arrow_type_to_primitive(field.data_type()).ok())
+}
+
+/// Returns the Arrow storage type when `primitive` carries enough type detail.
+pub fn primitive_to_arrow_type(primitive: PrimitiveType) -> Option<DataType> {
+    let data_type = match primitive {
+        PrimitiveType::Null => DataType::Null,
+        PrimitiveType::Boolean => DataType::Boolean,
+        PrimitiveType::TinyInt => DataType::Int8,
+        PrimitiveType::SmallInt => DataType::Int16,
+        PrimitiveType::Int => DataType::Int32,
+        PrimitiveType::BigInt => DataType::Int64,
+        PrimitiveType::LargeInt => DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
+        PrimitiveType::Float => DataType::Float32,
+        PrimitiveType::Double => DataType::Float64,
+        PrimitiveType::Date => DataType::Date32,
+        PrimitiveType::DateTime => DataType::Timestamp(TimeUnit::Microsecond, None),
+        PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+        PrimitiveType::Binary | PrimitiveType::Varbinary => DataType::Binary,
+        PrimitiveType::Hll | PrimitiveType::Object | PrimitiveType::Percentile => DataType::Binary,
+        PrimitiveType::Char
+        | PrimitiveType::Varchar
+        | PrimitiveType::Json
+        | PrimitiveType::Function => DataType::Utf8,
+        PrimitiveType::Variant => DataType::LargeBinary,
+        PrimitiveType::DecimalV2 => {
+            DataType::Decimal128(LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE)
+        }
+        PrimitiveType::Decimal
+        | PrimitiveType::Decimal32
+        | PrimitiveType::Decimal64
+        | PrimitiveType::Decimal128
+        | PrimitiveType::Decimal256
+        | PrimitiveType::Int256
+        | PrimitiveType::Invalid => return None,
+    };
+    Some(data_type)
 }
 
 pub(crate) fn arrow_type_to_primitive(data_type: &DataType) -> Result<PrimitiveType, String> {
@@ -88,5 +126,55 @@ mod tests {
             arrow_field_to_primitive(&field),
             Some(PrimitiveType::Varchar)
         );
+    }
+
+    #[test]
+    fn primitive_to_arrow_type_preserves_the_complete_legacy_mapping() {
+        let cases = [
+            (PrimitiveType::Invalid, None),
+            (PrimitiveType::Null, Some(DataType::Null)),
+            (PrimitiveType::Boolean, Some(DataType::Boolean)),
+            (PrimitiveType::TinyInt, Some(DataType::Int8)),
+            (PrimitiveType::SmallInt, Some(DataType::Int16)),
+            (PrimitiveType::Int, Some(DataType::Int32)),
+            (PrimitiveType::BigInt, Some(DataType::Int64)),
+            (PrimitiveType::LargeInt, Some(DataType::FixedSizeBinary(16))),
+            (PrimitiveType::Int256, None),
+            (PrimitiveType::Float, Some(DataType::Float32)),
+            (PrimitiveType::Double, Some(DataType::Float64)),
+            (PrimitiveType::Date, Some(DataType::Date32)),
+            (
+                PrimitiveType::DateTime,
+                Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
+            ),
+            (
+                PrimitiveType::Time,
+                Some(DataType::Time64(TimeUnit::Microsecond)),
+            ),
+            (PrimitiveType::Decimal, None),
+            (PrimitiveType::DecimalV2, Some(DataType::Decimal128(27, 9))),
+            (PrimitiveType::Decimal32, None),
+            (PrimitiveType::Decimal64, None),
+            (PrimitiveType::Decimal128, None),
+            (PrimitiveType::Decimal256, None),
+            (PrimitiveType::Char, Some(DataType::Utf8)),
+            (PrimitiveType::Varchar, Some(DataType::Utf8)),
+            (PrimitiveType::Binary, Some(DataType::Binary)),
+            (PrimitiveType::Varbinary, Some(DataType::Binary)),
+            (PrimitiveType::Json, Some(DataType::Utf8)),
+            (PrimitiveType::Hll, Some(DataType::Binary)),
+            (PrimitiveType::Object, Some(DataType::Binary)),
+            (PrimitiveType::Percentile, Some(DataType::Binary)),
+            (PrimitiveType::Function, Some(DataType::Utf8)),
+            (PrimitiveType::Variant, Some(DataType::LargeBinary)),
+        ];
+
+        for (primitive, expected) in cases {
+            assert_eq!(
+                primitive_to_arrow_type(primitive),
+                expected,
+                "{primitive:?}"
+            );
+        }
     }
 }

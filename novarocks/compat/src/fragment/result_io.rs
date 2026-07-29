@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use novarocks::common::types::FetchResult;
 use novarocks::runtime::exchange;
-use novarocks::runtime::fragment::io::result_format::build_result_batch;
+use novarocks::runtime::fragment::io::result_format::{
+    build_result_batch, build_statistic_result_batch,
+};
 use novarocks::runtime::fragment::io::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
     FragmentResultWriter, ResultAbort, ResultPresentation, ResultWriteSpec,
@@ -75,7 +77,7 @@ impl FragmentResultSession for CompatFragmentResultSession {
                         "STATISTIC result session requires output projections",
                     )
                 })?;
-                novarocks::service::result_batch_wire::build_statistic_result_batch_for_chunk(
+                build_statistic_result_batch(
                     &chunk,
                     projections,
                     super::statistic_result::thrift_statistic_row_encoder,

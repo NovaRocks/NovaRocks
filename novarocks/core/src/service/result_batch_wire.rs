@@ -17,7 +17,6 @@
 
 use arrow::array::ArrayRef;
 
-use crate::common::ids::SlotId;
 use crate::common::result_batch::ResultBatch;
 use crate::common::util::{
     FieldRenderSchema, http_json_row_from_arrays_with_primitives,
@@ -32,7 +31,6 @@ use novarocks_types::arrow_primitive::arrow_field_to_primitive;
 pub(crate) enum ResultSinkType {
     MySqlProtocol,
     HttpProtocol,
-    Statistic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,14 +38,10 @@ pub(crate) enum ResultSinkFormat {
     Json,
 }
 
-pub(crate) type StatisticRowEncoder =
-    fn(version: i32, fields: &[Option<Vec<u8>>]) -> Result<Vec<u8>, String>;
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResultSinkConfig {
     pub(crate) sink_type: ResultSinkType,
     pub(crate) format: Option<ResultSinkFormat>,
-    pub(crate) statistic_encoder: Option<StatisticRowEncoder>,
 }
 
 impl ResultSinkConfig {
@@ -55,7 +49,6 @@ impl ResultSinkConfig {
         Self {
             sink_type: ResultSinkType::MySqlProtocol,
             format: None,
-            statistic_encoder: None,
         }
     }
 
@@ -63,20 +56,9 @@ impl ResultSinkConfig {
         Self {
             sink_type: ResultSinkType::HttpProtocol,
             format: Some(ResultSinkFormat::Json),
-            statistic_encoder: None,
-        }
-    }
-
-    pub(crate) fn statistic(encoder: StatisticRowEncoder) -> Self {
-        Self {
-            sink_type: ResultSinkType::Statistic,
-            format: None,
-            statistic_encoder: Some(encoder),
         }
     }
 }
-
-const STATISTIC_DATA_VERSION_V1: i32 = 1;
 
 fn columns_for_projections(
     chunk: &Chunk,
@@ -121,87 +103,6 @@ fn field_schemas_for_chunk_fields(chunk: &Chunk) -> Vec<FieldRenderSchema> {
         .collect()
 }
 
-fn parse_lenenc_fields(
-    row: &[u8],
-    expected_columns: usize,
-) -> Result<Vec<Option<Vec<u8>>>, String> {
-    let mut fields = Vec::with_capacity(expected_columns);
-    let mut cursor = 0usize;
-    while fields.len() < expected_columns {
-        let marker = *row
-            .get(cursor)
-            .ok_or_else(|| "mysql text row ended unexpectedly".to_string())?;
-        cursor += 1;
-
-        if marker == 0xFB {
-            fields.push(None);
-            continue;
-        }
-
-        let len = if marker < 0xFB {
-            marker as usize
-        } else if marker == 0xFC {
-            let bytes = row
-                .get(cursor..cursor + 2)
-                .ok_or_else(|| "mysql text row invalid 0xFC length".to_string())?;
-            cursor += 2;
-            u16::from_le_bytes([bytes[0], bytes[1]]) as usize
-        } else if marker == 0xFD {
-            let bytes = row
-                .get(cursor..cursor + 3)
-                .ok_or_else(|| "mysql text row invalid 0xFD length".to_string())?;
-            cursor += 3;
-            (bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16)
-        } else if marker == 0xFE {
-            let bytes = row
-                .get(cursor..cursor + 8)
-                .ok_or_else(|| "mysql text row invalid 0xFE length".to_string())?;
-            cursor += 8;
-            u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]) as usize
-        } else {
-            return Err(format!(
-                "mysql text row invalid length marker 0x{marker:02x}"
-            ));
-        };
-
-        let value = row
-            .get(cursor..cursor + len)
-            .ok_or_else(|| "mysql text row value length exceeds payload".to_string())?;
-        cursor += len;
-        fields.push(Some(value.to_vec()));
-    }
-    if cursor != row.len() {
-        return Err("mysql text row has trailing bytes".to_string());
-    }
-    Ok(fields)
-}
-
-fn field_bytes<'a>(
-    fields: &'a [Option<Vec<u8>>],
-    idx: usize,
-    field_name: &str,
-) -> Result<Option<&'a [u8]>, String> {
-    let value = fields
-        .get(idx)
-        .ok_or_else(|| format!("missing field {field_name} at column {idx}"))?;
-    Ok(value.as_deref())
-}
-
-fn field_required_i32(
-    fields: &[Option<Vec<u8>>],
-    idx: usize,
-    field_name: &str,
-) -> Result<i32, String> {
-    let raw = field_bytes(fields, idx, field_name)?
-        .ok_or_else(|| format!("field {field_name} at column {idx} is NULL"))?;
-    let text = std::str::from_utf8(raw)
-        .map_err(|e| format!("field {field_name} is not valid UTF-8: {e}"))?;
-    text.parse::<i32>()
-        .map_err(|e| format!("field {field_name} parse i32 failed: {e}"))
-}
-
 pub(crate) fn build_empty_fetch_result_batch_template(
     config: ResultSinkConfig,
 ) -> Result<ResultBatch, String> {
@@ -214,14 +115,7 @@ pub(crate) fn build_empty_fetch_result_batch_template(
         }
     }
 
-    let mut batch = ResultBatch::empty();
-    if config.sink_type == ResultSinkType::Statistic {
-        if config.statistic_encoder.is_none() {
-            return Err("STATISTIC result sink requires statistic encoder".to_string());
-        }
-        batch.statistic_version = Some(STATISTIC_DATA_VERSION_V1);
-    }
-    Ok(batch)
+    Ok(ResultBatch::empty())
 }
 
 pub(crate) fn build_fetch_result_batch_for_chunk(
@@ -229,45 +123,6 @@ pub(crate) fn build_fetch_result_batch_for_chunk(
     projections: Option<&[ResultProjection]>,
     config: ResultSinkConfig,
 ) -> Result<ResultBatch, String> {
-    if config.sink_type == ResultSinkType::Statistic {
-        let encoder = config
-            .statistic_encoder
-            .ok_or_else(|| "STATISTIC result sink requires statistic encoder".to_string())?;
-        let projections = projections
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "STATISTIC result sink requires non-empty projections".to_string())?;
-        let mut batch = ResultBatch::empty();
-        let columns = columns_for_projections(chunk, projections)?;
-        let primitives = primitives_for_projections(projections);
-        let field_schemas = field_schemas_for_projections(projections);
-        for row in 0..chunk.len() {
-            let mysql_row = mysql_text_row_from_arrays_with_primitives(
-                &columns,
-                row,
-                Some(&primitives),
-                Some(&field_schemas),
-            )?;
-            let fields = parse_lenenc_fields(&mysql_row, columns.len())?;
-            let version = field_required_i32(&fields, 0, "version")?;
-            if let Some(existing) = batch.statistic_version {
-                if existing != version {
-                    return Err(format!(
-                        "mixed statistic versions in one batch: {} vs {}",
-                        existing, version
-                    ));
-                }
-            } else {
-                batch.statistic_version = Some(version);
-            }
-            let encoded = encoder(version, &fields)?;
-            batch.rows.push(encoded);
-        }
-        if batch.statistic_version.is_none() {
-            batch.statistic_version = Some(STATISTIC_DATA_VERSION_V1);
-        }
-        return Ok(batch);
-    }
-
     if config.sink_type == ResultSinkType::HttpProtocol {
         if config.format != Some(ResultSinkFormat::Json) {
             return Err(format!(
@@ -334,20 +189,6 @@ pub(crate) fn build_fetch_result_batch_for_chunk(
         }
     }
     Ok(batch)
-}
-
-/// Builds the neutral Statistic batch envelope. The role adapter supplies the
-/// protocol-specific row encoder.
-pub fn build_statistic_result_batch_for_chunk(
-    chunk: &Chunk,
-    projections: &[ResultProjection],
-    encoder: StatisticRowEncoder,
-) -> Result<ResultBatch, String> {
-    build_fetch_result_batch_for_chunk(
-        chunk,
-        Some(projections),
-        ResultSinkConfig::statistic(encoder),
-    )
 }
 
 #[cfg(test)]

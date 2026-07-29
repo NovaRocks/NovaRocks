@@ -31,6 +31,5 @@ pub mod result_batch;
 pub(crate) mod runtime_scan_predicate;
 pub mod scan_predicate;
 pub mod sketch_hash;
-pub mod thrift;
 pub mod types;
 pub mod util;

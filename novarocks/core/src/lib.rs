@@ -29,7 +29,6 @@ pub mod engine;
 pub mod exec;
 pub mod formats;
 pub mod fs;
-pub mod lower;
 pub mod meta;
 pub mod mv;
 pub mod protocol;
