@@ -32,7 +32,7 @@ MySQL client
   |
   v
 NovaRocks role=fe
-  |  cluster.backends = ["be-1:9080", "be-2:9080", ...]
+  |  StateStore durable membership + cluster.backends additive seeds
   v
 NovaRocks role=be  +  NovaRocks role=be  +  ...
 ```
@@ -52,6 +52,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 - BE 节点可以访问 FE 的 `grpc_port`，用于向 coordinator 上报执行状态。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
 - 如果使用对象存储，所有节点的凭据、endpoint 和 path-style 设置应保持一致。
+- `role=fe` 必须配置一个可用的 `[state_store]`。它是 backend membership 的唯一 durable authority；SQLite 只适用于恰好一个 active FE。
 
 ## 编译 NovaRocks
 
@@ -127,7 +128,7 @@ BE 本地启动配置。所有参与同一集群的 BE 必须使用同一组值�
 
 ## 配置 FE 节点
 
-FE 节点也会启动 `server.grpc_port`，用于接收 BE 回报执行状态。该配置默认是 `9080`，如果没有端口冲突可以不显式配置。FE 还需要在 `[cluster].backends` 中配置所有 BE 的 advertise endpoint。该 endpoint 应指向 BE 的 `grpc_port`。
+FE 节点也会启动 `server.grpc_port`，用于接收 BE 回报执行状态。该配置默认是 `9080`，如果没有端口冲突可以不显式配置。FE 必须配置 `[state_store]`，以持久化 backend membership；`[cluster].backends` 则是可选的 additive seeds，endpoint 应指向 BE 的 `grpc_port`。
 
 示例 `fe.toml`：
 
@@ -137,6 +138,12 @@ log_level = "info"
 [metadata]
 provider = "sqlite"
 path = "meta/fe.sqlite"
+
+[state_store]
+provider = "sqlite"
+cluster_id = "production-cluster"
+path = "meta/fe-state-store.sqlite"
+deployment_owner = "fe-a"
 
 [server]
 host = "0.0.0.0"
@@ -160,6 +167,8 @@ backends = [
   "10.0.0.12:9080",
 ]
 ```
+
+`[metadata]` 仍保存 standalone catalog 与 managed-lake metadata；它不是 backend membership 的 fallback 或第二份 authority。`[state_store]` 中的 membership 会在 FE 重启后恢复。`[cluster].backends` 只会补充尚不存在的 endpoint：它不会删除 StateStore 中已有的 backend，也不会重新激活正在 decommissioning 的 backend。
 
 启动 FE：
 
@@ -218,6 +227,8 @@ DROP BACKEND '10.0.0.13:9080' FORCE;
 
 普通 `DROP BACKEND` 会让后端停止接收新查询，并等待在途 fragment 结束后移除；`FORCE` 会立即移除，可能导致在途查询失败。
 
+ADD/DROP 的最终 desired membership 先写入 FE 的 StateStore，因此 clean FE restart 后仍会保留动态 ADD 的 backend，并保持已删除 backend 不被 seeds 静默恢复。要恢复一个已删除 endpoint，需要再次显式执行 `ADD BACKEND`。
+
 ## 启停顺序
 
 推荐启动顺序：
@@ -239,8 +250,9 @@ DROP BACKEND '10.0.0.13:9080' FORCE;
 
 | 现象 | 处理方式 |
 | --- | --- |
-| `SHOW BACKENDS` 为空 | 检查 `[cluster].backends`，或使用 `ADD BACKEND 'host:port'` 注册后端。 |
+| `SHOW BACKENDS` 为空 | 检查 StateStore 中的 durable membership、`[cluster].backends` seeds，或使用 `ADD BACKEND 'host:port'` 注册后端。 |
 | BE 一直不 Alive | 确认 FE 节点能访问 BE 的 `grpc_port`，并检查 BE 的 `advertise_host`。 |
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
+| FE 启动时提示缺少 StateStore | 为 `role=fe` 配置 `[state_store]`；不要使用 core metadata 或内存 registry 作为 membership fallback。 |
 | BE 启动时配置校验失败 | `role=be` 不能配置 `[cluster].backends`。 |
 | all-in-one 配置校验失败 | `role=all-in-one` 不能配置 `[cluster].backends`。 |

@@ -357,6 +357,11 @@ mod tests {
             .unwrap();
         record_completed_attempt(&registry, old_query, 12, finst_id(61));
 
+        activity.on_backend_event(BackendQueryEvent::Restarted {
+            backend_idx: 12,
+            old_epoch: 7,
+            new_epoch: 8,
+        });
         activity.replace_live_backends(2, vec![LiveBackendTarget::new(12, endpoint, 8)]);
         let _new_guard = registry
             .register(
@@ -369,12 +374,6 @@ mod tests {
             .set_scheduled_backend_ownership(new_query, &[(12, 8)])
             .unwrap();
         record_completed_attempt(&registry, new_query, 12, finst_id(71));
-
-        activity.on_backend_event(BackendQueryEvent::Restarted {
-            backend_idx: 12,
-            old_epoch: 7,
-            new_epoch: 8,
-        });
 
         assert_eq!(
             registry.first_failure(old_query).as_deref(),
@@ -403,18 +402,21 @@ mod tests {
             .register(query_id, DistributedQueryIntent::Result, dispatcher.clone())
             .unwrap();
 
-        activity.replace_live_backends(2, vec![LiveBackendTarget::new(12, endpoint, 8)]);
         activity.on_backend_event(BackendQueryEvent::Restarted {
             backend_idx: 12,
             old_epoch: 7,
             new_epoch: 8,
         });
+        activity.replace_live_backends(2, vec![LiveBackendTarget::new(12, endpoint, 8)]);
         let error = registry
             .set_scheduled_backend_ownership(query_id, &[(12, 7)])
             .expect_err("an old resolved snapshot must not register after restart publication");
 
         assert!(error.message().contains("generation 7 is stale"), "{error}");
-        assert_eq!(registry.first_failure(query_id), None);
+        assert_eq!(
+            registry.first_failure(query_id).as_deref(),
+            Some("backend topology revision changed from 1 to 2")
+        );
         assert!(
             dispatcher.cancellations.lock().unwrap().is_empty(),
             "no fragment was attempted before stale ownership was rejected"

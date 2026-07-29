@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+//! Frontend-owned durable backend membership and runtime topology.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
@@ -25,20 +28,425 @@ use std::time::{Duration, Instant};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use novarocks::common::app_config::ClusterRole;
 use novarocks::query_execution::backend::{
-    BackendLifecycleState, BackendQueryEvent, BackendQueryEventSink, BackendTopologyError,
-    BackendTopologyMetadataStore, BackendTopologyMetricsSnapshot, BackendTopologyPort,
-    BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
-    PersistedBackendTopology, publish_backend_topology_metrics,
+    BackendQueryEvent, BackendQueryEventSink, BackendTopologyError, BackendTopologyMetricsSnapshot,
+    BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome,
+    LiveBackendTarget, publish_backend_topology_metrics,
 };
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks_spi::state_store::{
+    CommitResolution, Key, Precondition, StateRecord, StateStore, Value,
+};
+use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
+use serde::{Deserialize, Serialize};
+use tokio::runtime::{Handle, RuntimeFlavor};
+use uuid::Uuid;
+
+const CLUSTER_BACKENDS_KEY: &[u8] = b"novarocks/frontend/cluster-backends/v1/state";
+const CLUSTER_BACKENDS_SCHEMA_VERSION: u8 = 1;
 
 type HeartbeatProbe = dyn Fn(u32, SocketAddr) -> HeartbeatOutcome + Send + Sync + 'static;
+
+/// Immutable configuration used to open the frontend membership owner.
+///
+/// The fields stay private so composition must validate endpoint identity once,
+/// before the service can begin restoring or publishing topology.
+#[derive(Clone, Debug)]
+pub struct ClusterBackendOpenConfig {
+    role: ClusterRole,
+    seed_endpoints: Vec<SocketAddr>,
+    heartbeat_interval: Duration,
+    heartbeat_timeout_retries: u32,
+    decommission_timeout: Duration,
+}
+
+impl ClusterBackendOpenConfig {
+    pub fn new(
+        role: ClusterRole,
+        seed_endpoints: Vec<SocketAddr>,
+        heartbeat_interval: Duration,
+        heartbeat_timeout_retries: u32,
+        decommission_timeout: Duration,
+    ) -> Result<Self, String> {
+        if heartbeat_interval.is_zero() {
+            return Err("cluster backend heartbeat interval must be non-zero".to_string());
+        }
+        if heartbeat_timeout_retries == 0 {
+            return Err("cluster backend heartbeat timeout retries must be non-zero".to_string());
+        }
+        if decommission_timeout.is_zero() {
+            return Err("cluster backend decommission timeout must be non-zero".to_string());
+        }
+        let mut seen = BTreeSet::new();
+        for endpoint in &seed_endpoints {
+            if endpoint.to_string().parse::<SocketAddr>().ok() != Some(*endpoint) {
+                return Err(format!(
+                    "cluster backend endpoint {endpoint} is not canonical"
+                ));
+            }
+            if !seen.insert(*endpoint) {
+                return Err(format!(
+                    "duplicate configured cluster backend endpoint {endpoint}"
+                ));
+            }
+        }
+        Ok(Self {
+            role,
+            seed_endpoints,
+            heartbeat_interval,
+            heartbeat_timeout_retries,
+            decommission_timeout,
+        })
+    }
+
+    pub const fn role(&self) -> ClusterRole {
+        self.role
+    }
+
+    pub fn seed_endpoints(&self) -> &[SocketAddr] {
+        &self.seed_endpoints
+    }
+
+    pub const fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
+    }
+
+    pub const fn heartbeat_timeout_retries(&self) -> u32 {
+        self.heartbeat_timeout_retries
+    }
+
+    pub const fn decommission_timeout(&self) -> Duration {
+        self.decommission_timeout
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DesiredBackendState {
+    Active,
+    Decommissioning,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredClusterBackendEntryV1 {
+    backend_id: u32,
+    endpoint: String,
+    desired_state: DesiredBackendState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredClusterBackendsV1 {
+    schema_version: u8,
+    last_operation_id: Uuid,
+    next_backend_id: u64,
+    entries: Vec<StoredClusterBackendEntryV1>,
+}
+
+impl Default for StoredClusterBackendsV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: CLUSTER_BACKENDS_SCHEMA_VERSION,
+            last_operation_id: Uuid::nil(),
+            next_backend_id: 0,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RepositoryMutation {
+    ReconcileSeeds(Vec<SocketAddr>),
+    Add(SocketAddr),
+    MarkDecommissioning {
+        backend_id: u32,
+        endpoint: SocketAddr,
+    },
+    Remove {
+        backend_id: u32,
+        endpoint: SocketAddr,
+    },
+}
+
+impl RepositoryMutation {
+    fn apply(&self, state: &mut StoredClusterBackendsV1) -> Result<bool, String> {
+        validate_stored_cluster_backends(state)?;
+        match self {
+            Self::ReconcileSeeds(seeds) => {
+                let mut changed = false;
+                for endpoint in seeds {
+                    if state
+                        .entries
+                        .iter()
+                        .any(|entry| entry.endpoint == endpoint.to_string())
+                    {
+                        continue;
+                    }
+                    let backend_id = allocate_backend_id(state)?;
+                    state.entries.push(StoredClusterBackendEntryV1 {
+                        backend_id,
+                        endpoint: endpoint.to_string(),
+                        desired_state: DesiredBackendState::Active,
+                    });
+                    changed = true;
+                }
+                Ok(changed)
+            }
+            Self::Add(endpoint) => {
+                if state
+                    .entries
+                    .iter()
+                    .any(|entry| entry.endpoint == endpoint.to_string())
+                {
+                    return Ok(false);
+                }
+                let backend_id = allocate_backend_id(state)?;
+                state.entries.push(StoredClusterBackendEntryV1 {
+                    backend_id,
+                    endpoint: endpoint.to_string(),
+                    desired_state: DesiredBackendState::Active,
+                });
+                Ok(true)
+            }
+            Self::MarkDecommissioning {
+                backend_id,
+                endpoint,
+            } => {
+                let entry = stored_entry_mut(state, *backend_id, *endpoint)?;
+                if entry.desired_state == DesiredBackendState::Decommissioning {
+                    Ok(false)
+                } else {
+                    entry.desired_state = DesiredBackendState::Decommissioning;
+                    Ok(true)
+                }
+            }
+            Self::Remove {
+                backend_id,
+                endpoint,
+            } => {
+                let index = state
+                    .entries
+                    .iter()
+                    .position(|entry| {
+                        entry.backend_id == *backend_id && entry.endpoint == endpoint.to_string()
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "backend {backend_id} at {endpoint} is absent from durable membership"
+                        )
+                    })?;
+                state.entries.remove(index);
+                Ok(true)
+            }
+        }
+    }
+
+    fn matches_postcondition(&self, state: &StoredClusterBackendsV1) -> bool {
+        match self {
+            Self::ReconcileSeeds(seeds) => seeds.iter().all(|endpoint| {
+                state
+                    .entries
+                    .iter()
+                    .any(|entry| entry.endpoint == endpoint.to_string())
+            }),
+            Self::Add(endpoint) => state
+                .entries
+                .iter()
+                .any(|entry| entry.endpoint == endpoint.to_string()),
+            Self::MarkDecommissioning {
+                backend_id,
+                endpoint,
+            } => state.entries.iter().any(|entry| {
+                entry.backend_id == *backend_id
+                    && entry.endpoint == endpoint.to_string()
+                    && entry.desired_state == DesiredBackendState::Decommissioning
+            }),
+            Self::Remove {
+                backend_id,
+                endpoint,
+            } => !state.entries.iter().any(|entry| {
+                entry.backend_id == *backend_id && entry.endpoint == endpoint.to_string()
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ClusterBackendRepository {
+    store: Arc<dyn StateStore>,
+    metrics: Arc<novarocks_state_store::metrics::StateStoreMetrics>,
+}
+
+impl ClusterBackendRepository {
+    fn new(store: Arc<dyn StateStore>) -> Self {
+        let metrics = Arc::new(novarocks_state_store::metrics::StateStoreMetrics::new(
+            store.metrics_snapshot().provider,
+        ));
+        Self { store, metrics }
+    }
+
+    async fn load(&self) -> Result<Option<StoredClusterBackendsV1>, String> {
+        let key = cluster_backends_key()?;
+        let mut transaction =
+            self.store.begin_read().await.map_err(|error| {
+                format!("begin cluster backend membership read failed: {error}")
+            })?;
+        let record = transaction
+            .get(&key)
+            .await
+            .map_err(|error| format!("read cluster backend membership failed: {error}"))?;
+        transaction
+            .abort()
+            .await
+            .map_err(|error| format!("finish cluster backend membership read failed: {error}"))?;
+        record
+            .map(decode_stored_cluster_backends)
+            .transpose()
+            .map_err(|error| format!("decode cluster backend membership failed: {error}"))
+    }
+
+    async fn mutate(
+        &self,
+        mutation: RepositoryMutation,
+    ) -> Result<StoredClusterBackendsV1, String> {
+        let operation_id = OperationId::new_v7();
+        let key = cluster_backends_key()?;
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "mutate frontend cluster backend membership",
+            |transaction| {
+                let key = key.clone();
+                let mutation = mutation.clone();
+                Box::pin(async move {
+                    let existing = transaction.get(&key).await?;
+                    let (mut state, precondition) = match existing {
+                        Some(record) => {
+                            let version = record.version.clone();
+                            (
+                                decode_stored_cluster_backends(record)?,
+                                Precondition::Version(version),
+                            )
+                        }
+                        None => (StoredClusterBackendsV1::default(), Precondition::Absent),
+                    };
+                    let changed = mutation
+                        .apply(&mut state)
+                        .map_err(invalid_state_store_request)?;
+                    if !changed {
+                        return Ok(state);
+                    }
+                    state.last_operation_id = *operation_id.as_uuid();
+                    validate_stored_cluster_backends(&state)
+                        .map_err(invalid_state_store_request)?;
+                    transaction
+                        .put(key, encode_stored_cluster_backends(&state)?, precondition)
+                        .await?;
+                    Ok(state)
+                })
+            },
+        )
+        .await;
+        match result {
+            Ok(success) => Ok(success.value),
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
+                self.resolve_commit_unknown(transaction_id, operation_id, &mutation, error)
+                    .await
+            }
+            Err(error) => Err(format!(
+                "cluster backend membership mutation failed: {error:?}"
+            )),
+        }
+    }
+
+    async fn resolve_commit_unknown(
+        &self,
+        transaction_id: novarocks_spi::state_store::TransactionId,
+        operation_id: OperationId,
+        mutation: &RepositoryMutation,
+        original_error: novarocks_spi::state_store::StateStoreError,
+    ) -> Result<StoredClusterBackendsV1, String> {
+        match self.store.resolve_commit(&transaction_id).await {
+            Ok(CommitResolution::Committed(receipt)) => {
+                if receipt.transaction_id != transaction_id {
+                    return Err(
+                        "cluster backend commit resolution receipt has a mismatched transaction id"
+                            .to_string(),
+                    );
+                }
+                self.authoritative_committed_state(operation_id, mutation, original_error)
+                    .await
+            }
+            Ok(CommitResolution::NotCommitted) => Err(format!(
+                "cluster backend membership mutation definitely did not commit: {original_error}"
+            )),
+            Ok(CommitResolution::Unresolved) | Err(_) => {
+                self.authoritative_committed_state(operation_id, mutation, original_error)
+                    .await
+            }
+        }
+    }
+
+    async fn authoritative_committed_state(
+        &self,
+        operation_id: OperationId,
+        mutation: &RepositoryMutation,
+        original_error: novarocks_spi::state_store::StateStoreError,
+    ) -> Result<StoredClusterBackendsV1, String> {
+        match self.load().await? {
+            Some(state)
+                if state.last_operation_id == *operation_id.as_uuid()
+                    && mutation.matches_postcondition(&state) =>
+            {
+                Ok(state)
+            }
+            Some(state) if state.last_operation_id == *operation_id.as_uuid() => Err(
+                "cluster backend membership corruption: committed operation has an invalid postcondition"
+                    .to_string(),
+            ),
+            _ => Err(format!(
+                "cluster backend membership commit outcome is unresolved: {original_error}"
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum MembershipStorage {
+    Durable(ClusterBackendRepository),
+    Transient,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeBackendState {
+    Registering,
+    Live,
+    Lost,
+    Decommissioning,
+}
+
+impl RuntimeBackendState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registering => "Registering",
+            Self::Live => "Live",
+            Self::Lost => "Lost",
+            Self::Decommissioning => "Decommissioning",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct FrontendBackendEntry {
     endpoint: SocketAddr,
-    state: BackendLifecycleState,
+    state: RuntimeBackendState,
     start_epoch: u64,
     version: String,
     num_cores: u32,
@@ -47,17 +455,15 @@ struct FrontendBackendEntry {
     scheduled_fragments: u64,
     last_err: Option<String>,
     decommission_started: Option<Instant>,
+    decommission_timeout_event_sent: bool,
 }
 
 struct TopologyState {
-    timeout_retries: Option<u32>,
+    timeout_retries: u32,
     decommission_timeout: Duration,
     topology_revision: u64,
     terminal_error: Option<String>,
     entries: BTreeMap<usize, FrontendBackendEntry>,
-    next_backend_idx: usize,
-    configured_seed_endpoints: Vec<SocketAddr>,
-    metadata_store: Option<Arc<dyn BackendTopologyMetadataStore>>,
 }
 
 #[derive(Clone, Copy)]
@@ -66,12 +472,14 @@ struct HeartbeatSignal {
     stopping: bool,
 }
 
-/// Concrete frontend topology controller.
-///
-/// This is deliberately owned by `novarocks-frontend`: the core crate only
-/// knows the `BackendTopologyPort` trait and has no global topology locator.
-pub(crate) struct FrontendTopologyController {
+/// The sole frontend membership owner. Durable desired membership is kept in
+/// StateStore; liveness and fragment activity remain process-local observations.
+pub(crate) struct ClusterBackendService {
     state: Mutex<TopologyState>,
+    storage: MembershipStorage,
+    runtime: Handle,
+    heartbeat_interval: Duration,
+    mutation: Mutex<()>,
     query_events: Mutex<Option<Arc<dyn BackendQueryEventSink>>>,
     heartbeat_probe: Arc<HeartbeatProbe>,
     heartbeat_thread: Mutex<Option<JoinHandle<()>>>,
@@ -80,81 +488,75 @@ pub(crate) struct FrontendTopologyController {
     heartbeat_wake: Condvar,
 }
 
-impl FrontendTopologyController {
-    pub(crate) fn new_unconfigured() -> Self {
-        Self::new_with_optional_probe(None, |be_id, endpoint| {
+impl ClusterBackendService {
+    pub(crate) async fn open(
+        config: ClusterBackendOpenConfig,
+        state_store: Option<Arc<dyn StateStore>>,
+        runtime: Handle,
+    ) -> Result<Arc<Self>, String> {
+        let storage = match config.role() {
+            ClusterRole::Fe => MembershipStorage::Durable(ClusterBackendRepository::new(
+                state_store.ok_or_else(|| {
+                    "role=fe requires StateStore for durable cluster backend membership".to_string()
+                })?,
+            )),
+            ClusterRole::AllInOne => MembershipStorage::Transient,
+            ClusterRole::Be => {
+                return Err("role=be must not open ClusterBackendService".to_string());
+            }
+        };
+        let service = Arc::new(Self::new(storage, runtime, &config, |be_id, endpoint| {
             novarocks::service::cluster_heartbeat::grpc_heartbeat(be_id, endpoint)
-        })
+        }));
+        if let MembershipStorage::Durable(repository) = &service.storage {
+            let stored = match repository.load().await? {
+                Some(_) => {
+                    repository
+                        .mutate(RepositoryMutation::ReconcileSeeds(
+                            config.seed_endpoints.clone(),
+                        ))
+                        .await?
+                }
+                None if config.seed_endpoints.is_empty() => StoredClusterBackendsV1::default(),
+                None => {
+                    repository
+                        .mutate(RepositoryMutation::ReconcileSeeds(
+                            config.seed_endpoints.clone(),
+                        ))
+                        .await?
+                }
+            };
+            service.restore_durable_state(stored)?;
+        } else {
+            for endpoint in config.seed_endpoints() {
+                service.add_transient(*endpoint)?;
+            }
+        }
+        service.publish_snapshot();
+        Ok(service)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(timeout_retries: u32) -> Self {
-        Self::new_with_probe(timeout_retries, |be_id, endpoint| {
-            novarocks::service::cluster_heartbeat::grpc_heartbeat(be_id, endpoint)
-        })
-    }
-
-    /// Builds a controller whose only state is the request's captured topology.
-    ///
-    /// Contract tests use this to exercise the same snapshot validation as the
-    /// production coordinator without inventing a second topology sequence.
-    #[cfg(test)]
-    pub(crate) fn from_captured_targets_for_test(targets: &[LiveBackendTarget]) -> Self {
-        let controller = Self::new(1);
-        let mut state = controller.state.lock().expect("frontend topology lock");
-        state.entries = targets
-            .iter()
-            .map(|target| {
-                (
-                    target.backend_idx(),
-                    FrontendBackendEntry {
-                        endpoint: target.endpoint(),
-                        state: BackendLifecycleState::Live,
-                        start_epoch: target.start_epoch(),
-                        version: String::new(),
-                        num_cores: 0,
-                        last_heartbeat_ms: 0,
-                        missed_heartbeats: 0,
-                        scheduled_fragments: 0,
-                        last_err: None,
-                        decommission_started: None,
-                    },
-                )
-            })
-            .collect();
-        state.next_backend_idx = targets
-            .iter()
-            .map(|target| target.backend_idx())
-            .max()
-            .and_then(|backend_idx| backend_idx.checked_add(1))
-            .unwrap_or(0);
-        drop(state);
-        controller
-    }
-
-    #[cfg(test)]
-    fn new_with_probe<F>(timeout_retries: u32, heartbeat_probe: F) -> Self
-    where
-        F: Fn(u32, SocketAddr) -> HeartbeatOutcome + Send + Sync + 'static,
-    {
-        Self::new_with_optional_probe(Some(timeout_retries.max(1)), heartbeat_probe)
-    }
-
-    fn new_with_optional_probe<F>(timeout_retries: Option<u32>, heartbeat_probe: F) -> Self
+    fn new<F>(
+        storage: MembershipStorage,
+        runtime: Handle,
+        config: &ClusterBackendOpenConfig,
+        heartbeat_probe: F,
+    ) -> Self
     where
         F: Fn(u32, SocketAddr) -> HeartbeatOutcome + Send + Sync + 'static,
     {
         Self {
             state: Mutex::new(TopologyState {
-                timeout_retries,
-                decommission_timeout: Duration::from_secs(300),
+                timeout_retries: config.heartbeat_timeout_retries,
+                decommission_timeout: config.decommission_timeout,
                 topology_revision: 0,
                 terminal_error: None,
                 entries: BTreeMap::new(),
-                next_backend_idx: 0,
-                configured_seed_endpoints: Vec::new(),
-                metadata_store: None,
             }),
+            storage,
+            runtime,
+            heartbeat_interval: config.heartbeat_interval,
+            mutation: Mutex::new(()),
             query_events: Mutex::new(None),
             heartbeat_probe: Arc::new(heartbeat_probe),
             heartbeat_thread: Mutex::new(None),
@@ -167,35 +569,102 @@ impl FrontendTopologyController {
         }
     }
 
-    pub(crate) fn configure_lifecycle(
-        &self,
-        timeout_retries: u32,
-        decommission_timeout: Duration,
-        configured_seed_endpoints: Vec<SocketAddr>,
-    ) -> Result<(), String> {
-        if self
-            .heartbeat_thread
-            .lock()
-            .map_err(|_| "lock frontend topology heartbeat thread failed".to_string())?
-            .is_some()
-        {
-            return Err(
-                "frontend topology lifecycle cannot be reconfigured after heartbeat start"
-                    .to_string(),
+    #[cfg(test)]
+    pub(crate) fn new_transient_for_test(timeout_retries: u32) -> Self {
+        let config = ClusterBackendOpenConfig::new(
+            ClusterRole::AllInOne,
+            Vec::new(),
+            Duration::from_millis(1),
+            timeout_retries.max(1),
+            Duration::from_secs(1),
+        )
+        .expect("valid test topology configuration");
+        let runtime = Handle::try_current().unwrap_or_else(|_| {
+            novarocks::runtime::global_async_runtime::data_runtime_handle()
+                .expect("initialize data runtime for topology test")
+        });
+        Self::new(
+            MembershipStorage::Transient,
+            runtime,
+            &config,
+            |be_id, endpoint| {
+                novarocks::service::cluster_heartbeat::grpc_heartbeat(be_id, endpoint)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_captured_targets_for_test(targets: &[LiveBackendTarget]) -> Self {
+        let service = Self::new_transient_for_test(1);
+        let mut state = service.state.lock().expect("frontend topology lock");
+        state.entries = targets
+            .iter()
+            .map(|target| {
+                (
+                    target.backend_idx(),
+                    FrontendBackendEntry {
+                        endpoint: target.endpoint(),
+                        state: RuntimeBackendState::Live,
+                        start_epoch: target.start_epoch(),
+                        version: String::new(),
+                        num_cores: 0,
+                        last_heartbeat_ms: 0,
+                        missed_heartbeats: 0,
+                        scheduled_fragments: 0,
+                        last_err: None,
+                        decommission_started: None,
+                        decommission_timeout_event_sent: false,
+                    },
+                )
+            })
+            .collect();
+        drop(state);
+        service
+    }
+
+    fn restore_durable_state(&self, stored: StoredClusterBackendsV1) -> Result<(), String> {
+        validate_stored_cluster_backends(&stored)?;
+        let mut entries = BTreeMap::new();
+        for entry in stored.entries {
+            let endpoint = parse_canonical_endpoint(&entry.endpoint)?;
+            let backend_idx = usize::try_from(entry.backend_id).map_err(|_| {
+                format!(
+                    "backend id {} cannot be represented locally",
+                    entry.backend_id
+                )
+            })?;
+            entries.insert(
+                backend_idx,
+                FrontendBackendEntry {
+                    endpoint,
+                    state: match entry.desired_state {
+                        DesiredBackendState::Active => RuntimeBackendState::Registering,
+                        DesiredBackendState::Decommissioning => {
+                            RuntimeBackendState::Decommissioning
+                        }
+                    },
+                    start_epoch: 0,
+                    version: String::new(),
+                    num_cores: 0,
+                    last_heartbeat_ms: 0,
+                    missed_heartbeats: 0,
+                    scheduled_fragments: 0,
+                    last_err: None,
+                    decommission_started: (entry.desired_state
+                        == DesiredBackendState::Decommissioning)
+                        .then(Instant::now),
+                    decommission_timeout_event_sent: false,
+                },
             );
         }
         let mut state = self
             .state
             .lock()
             .map_err(|_| "lock frontend topology failed".to_string())?;
-        state.timeout_retries = Some(timeout_retries.max(1));
-        state.decommission_timeout = decommission_timeout;
-        state.configured_seed_endpoints = configured_seed_endpoints.clone();
-        for endpoint in configured_seed_endpoints {
-            add_backend_entry(&mut state, endpoint)?;
+        state.entries = entries;
+        if !state.entries.is_empty() {
+            advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
         }
-        drop(state);
-        self.publish_snapshot();
         Ok(())
     }
 
@@ -214,19 +683,7 @@ impl FrontendTopologyController {
             .take();
     }
 
-    pub(crate) fn start_heartbeat_manager(
-        self: &Arc<Self>,
-        interval: Duration,
-    ) -> Result<(), String> {
-        if self
-            .state
-            .lock()
-            .map_err(|_| "lock frontend topology failed".to_string())?
-            .timeout_retries
-            .is_none()
-        {
-            return Err("frontend topology lifecycle is not configured".to_string());
-        }
+    pub(crate) fn start_heartbeat_manager(self: &Arc<Self>) -> Result<(), String> {
         let mut heartbeat_thread = self
             .heartbeat_thread
             .lock()
@@ -234,87 +691,18 @@ impl FrontendTopologyController {
         if heartbeat_thread.is_some() {
             return Ok(());
         }
-        {
-            let mut signal = self
-                .heartbeat_signal
-                .lock()
-                .map_err(|_| "lock frontend topology heartbeat signal failed".to_string())?;
-            signal.stopping = false;
-        }
-        let controller = Arc::clone(self);
-        let join = std::thread::Builder::new()
-            .name("frontend-heartbeat-manager".to_string())
-            .spawn(move || {
-                let mut observed_generation = 0;
-                loop {
-                    if controller.topology_terminal_error().is_some() {
-                        return;
-                    }
-                    if controller.heartbeat_is_stopping() {
-                        return;
-                    }
-                    {
-                        let _round = controller
-                            .heartbeat_round
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if controller.heartbeat_is_stopping() {
-                            return;
-                        }
-                        controller.process_decommissioning_once();
-                        for (backend_idx, entry) in controller.heartbeat_rows() {
-                            if controller.heartbeat_is_stopping() {
-                                return;
-                            }
-                            let Ok(be_id) = u32::try_from(backend_idx) else {
-                                continue;
-                            };
-                            match (controller.heartbeat_probe)(be_id, entry.endpoint) {
-                                HeartbeatOutcome::Ok {
-                                    start_epoch,
-                                    version,
-                                    num_cores,
-                                    now_ms,
-                                } => controller.record_heartbeat_success(
-                                    backend_idx,
-                                    start_epoch,
-                                    version,
-                                    num_cores,
-                                    now_ms,
-                                ),
-                                HeartbeatOutcome::Failed { err } => {
-                                    controller
-                                        .record_heartbeat_failure_with_error(backend_idx, err);
-                                }
-                            }
-                        }
-                    }
-                    let signal = controller
-                        .heartbeat_signal
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if signal.stopping {
-                        return;
-                    }
-                    let signal = if signal.generation == observed_generation {
-                        controller
-                            .heartbeat_wake
-                            .wait_timeout_while(signal, interval, |signal| {
-                                !signal.stopping && signal.generation == observed_generation
-                            })
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .0
-                    } else {
-                        signal
-                    };
-                    if signal.stopping {
-                        return;
-                    }
-                    observed_generation = signal.generation;
-                }
-            })
-            .map_err(|error| format!("spawn frontend heartbeat manager failed: {error}"))?;
-        *heartbeat_thread = Some(join);
+        self.heartbeat_signal
+            .lock()
+            .map_err(|_| "lock frontend topology heartbeat signal failed".to_string())?
+            .stopping = false;
+        let service = Arc::clone(self);
+        let interval = self.heartbeat_interval();
+        *heartbeat_thread = Some(
+            std::thread::Builder::new()
+                .name("frontend-heartbeat-manager".to_string())
+                .spawn(move || service.run_heartbeat_manager(interval))
+                .map_err(|error| format!("spawn frontend heartbeat manager failed: {error}"))?,
+        );
         Ok(())
     }
 
@@ -333,17 +721,81 @@ impl FrontendTopologyController {
             .lock()
             .map_err(|_| "lock frontend topology heartbeat thread failed".to_string())?
             .take();
-        let join_result = match join {
-            Some(join) => join
-                .join()
-                .map_err(|payload| format!("frontend heartbeat manager panicked: {payload:?}")),
-            None => Ok(()),
-        };
+        if let Some(join) = join {
+            join.join()
+                .map_err(|payload| format!("frontend heartbeat manager panicked: {payload:?}"))?;
+        }
         self.heartbeat_signal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .stopping = false;
-        join_result
+        Ok(())
+    }
+
+    fn run_heartbeat_manager(&self, interval: Duration) {
+        let mut observed_generation = 0;
+        loop {
+            if self.topology_terminal_error().is_some() || self.heartbeat_is_stopping() {
+                return;
+            }
+            {
+                let _round = self
+                    .heartbeat_round
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.process_decommissioning_once();
+                for (backend_idx, entry) in self.heartbeat_rows() {
+                    if self.heartbeat_is_stopping() {
+                        return;
+                    }
+                    let Ok(be_id) = u32::try_from(backend_idx) else {
+                        continue;
+                    };
+                    match (self.heartbeat_probe)(be_id, entry.endpoint) {
+                        HeartbeatOutcome::Ok {
+                            start_epoch,
+                            version,
+                            num_cores,
+                            now_ms,
+                        } => self.record_heartbeat_success(
+                            backend_idx,
+                            start_epoch,
+                            version,
+                            num_cores,
+                            now_ms,
+                        ),
+                        HeartbeatOutcome::Failed { err } => {
+                            self.record_heartbeat_failure_with_error(backend_idx, err);
+                        }
+                    }
+                }
+            }
+            let signal = self
+                .heartbeat_signal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if signal.stopping {
+                return;
+            }
+            let signal = if signal.generation == observed_generation {
+                self.heartbeat_wake
+                    .wait_timeout_while(signal, interval, |signal| {
+                        !signal.stopping && signal.generation == observed_generation
+                    })
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0
+            } else {
+                signal
+            };
+            if signal.stopping {
+                return;
+            }
+            observed_generation = signal.generation;
+        }
+    }
+
+    fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
     }
 
     fn heartbeat_is_stopping(&self) -> bool {
@@ -372,28 +824,21 @@ impl FrontendTopologyController {
         now_ms: i64,
     ) {
         let mut state = self.state.lock().expect("frontend topology lock");
-        let (old_state, old_epoch, persisted) = {
-            let Some(entry) = state.entries.get_mut(&backend_idx) else {
-                return;
-            };
-            if entry.state == BackendLifecycleState::Decommissioning {
-                return;
-            }
-            let old_state = entry.state;
-            let old_epoch = entry.start_epoch;
-            entry.state = BackendLifecycleState::Live;
-            entry.start_epoch = start_epoch;
-            entry.version = version.into();
-            entry.num_cores = num_cores;
-            entry.last_heartbeat_ms = now_ms;
-            entry.missed_heartbeats = 0;
-            entry.last_err = None;
-            (
-                old_state,
-                old_epoch,
-                PersistedBackendTopology::new(backend_idx, entry.endpoint, entry.state),
-            )
+        let Some(entry) = state.entries.get_mut(&backend_idx) else {
+            return;
         };
+        if entry.state == RuntimeBackendState::Decommissioning {
+            return;
+        }
+        let old_state = entry.state;
+        let old_epoch = entry.start_epoch;
+        entry.state = RuntimeBackendState::Live;
+        entry.start_epoch = start_epoch;
+        entry.version = version.into();
+        entry.num_cores = num_cores;
+        entry.last_heartbeat_ms = now_ms;
+        entry.missed_heartbeats = 0;
+        entry.last_err = None;
         let restarted = (old_epoch != 0 && start_epoch != 0 && old_epoch != start_epoch).then_some(
             BackendQueryEvent::Restarted {
                 backend_idx,
@@ -401,26 +846,18 @@ impl FrontendTopologyController {
                 new_epoch: start_epoch,
             },
         );
-        let metadata_store = state.metadata_store.clone();
-        if old_state != BackendLifecycleState::Live || old_epoch != start_epoch {
+        if old_state != RuntimeBackendState::Live || old_epoch != start_epoch {
             if advance_topology_revision(&mut state).is_err() {
                 return;
             }
         }
         drop(state);
-        if old_state != BackendLifecycleState::Live {
-            if let Some(store) = metadata_store {
-                let _ = store.upsert_backend(persisted);
-            }
-        }
-        self.publish_snapshot();
         if let Some(event) = restarted {
             self.dispatch_event(event);
         }
+        self.publish_snapshot();
     }
 
-    /// Records one failed frontend-owned heartbeat. Returns `true` exactly
-    /// when this round transitions the backend to Lost.
     #[cfg(test)]
     pub(crate) fn record_heartbeat_failure(&self, backend_idx: usize) -> bool {
         self.record_heartbeat_failure_with_error(backend_idx, "heartbeat failed")
@@ -432,48 +869,205 @@ impl FrontendTopologyController {
         error: impl Into<String>,
     ) -> bool {
         let mut state = self.state.lock().expect("frontend topology lock");
-        let timeout_retries = state
-            .timeout_retries
-            .expect("heartbeat lifecycle is configured before heartbeat results are recorded");
-        let (transitioned, persisted) = {
-            let Some(entry) = state.entries.get_mut(&backend_idx) else {
-                return false;
-            };
-            if entry.state == BackendLifecycleState::Decommissioning {
-                return false;
-            }
-            entry.missed_heartbeats = entry.missed_heartbeats.saturating_add(1);
-            entry.last_err = Some(error.into());
-            let transitioned = entry.state != BackendLifecycleState::Lost
-                && entry.missed_heartbeats >= timeout_retries;
-            if transitioned {
-                entry.state = BackendLifecycleState::Lost;
-            }
-            (
-                transitioned,
-                transitioned.then(|| {
-                    PersistedBackendTopology::new(backend_idx, entry.endpoint, entry.state)
-                }),
-            )
+        let timeout_retries = state.timeout_retries;
+        let Some(entry) = state.entries.get_mut(&backend_idx) else {
+            return false;
         };
-        if transitioned {
-            if advance_topology_revision(&mut state).is_err() {
-                return false;
-            }
+        if entry.state == RuntimeBackendState::Decommissioning {
+            return false;
         }
-        let metadata_store = state.metadata_store.clone();
+        entry.missed_heartbeats = entry.missed_heartbeats.saturating_add(1);
+        entry.last_err = Some(error.into());
+        let transitioned =
+            entry.state != RuntimeBackendState::Lost && entry.missed_heartbeats >= timeout_retries;
+        if transitioned {
+            entry.state = RuntimeBackendState::Lost;
+        }
+        if transitioned && advance_topology_revision(&mut state).is_err() {
+            return false;
+        }
         drop(state);
         if transitioned {
-            if let (Some(store), Some(persisted)) = (metadata_store, persisted) {
-                let _ = store.upsert_backend(persisted);
-            }
-            self.publish_snapshot();
             self.dispatch_event(BackendQueryEvent::Unavailable {
                 backend_idx,
                 reason: format!("backend {backend_idx} lost after heartbeat timeout"),
             });
+            self.publish_snapshot();
         }
         transitioned
+    }
+
+    fn add_transient(&self, endpoint: SocketAddr) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "lock frontend topology failed".to_string())?;
+        if state
+            .entries
+            .values()
+            .any(|entry| entry.endpoint == endpoint)
+        {
+            return Ok(());
+        }
+        let backend_idx = next_runtime_backend_id(&state)?;
+        advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
+        state
+            .entries
+            .insert(backend_idx, registering_entry(endpoint));
+        drop(state);
+        self.publish_snapshot();
+        Ok(())
+    }
+
+    fn block_on<T>(&self, future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+        match Handle::try_current() {
+            Ok(_) if self.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread => Err(
+                "cluster backend membership cannot synchronously use StateStore from a current-thread Tokio runtime"
+                    .to_string(),
+            ),
+            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
+            Err(_) => self.runtime.block_on(future),
+        }
+    }
+
+    fn persist(
+        &self,
+        mutation: RepositoryMutation,
+    ) -> Result<Option<StoredClusterBackendsV1>, String> {
+        match &self.storage {
+            MembershipStorage::Durable(repository) => {
+                self.block_on(repository.mutate(mutation)).map(Some)
+            }
+            MembershipStorage::Transient => Ok(None),
+        }
+    }
+
+    fn apply_added(
+        &self,
+        stored: Option<StoredClusterBackendsV1>,
+        endpoint: SocketAddr,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "lock frontend topology failed".to_string())?;
+        if state
+            .entries
+            .values()
+            .any(|entry| entry.endpoint == endpoint)
+        {
+            return Ok(());
+        }
+        let backend_idx = match stored {
+            Some(stored) => stored
+                .entries
+                .iter()
+                .find(|entry| entry.endpoint == endpoint.to_string())
+                .map(|entry| {
+                    usize::try_from(entry.backend_id)
+                        .map_err(|_| "backend id cannot be represented locally".to_string())
+                })
+                .transpose()?
+                .ok_or_else(|| {
+                    format!("durable membership did not contain added backend {endpoint}")
+                })?,
+            None => next_runtime_backend_id(&state)?,
+        };
+        advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
+        state
+            .entries
+            .insert(backend_idx, registering_entry(endpoint));
+        drop(state);
+        self.publish_snapshot();
+        self.wake_heartbeat_manager();
+        Ok(())
+    }
+
+    fn mark_decommissioning_runtime(
+        &self,
+        backend_idx: usize,
+        endpoint: SocketAddr,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "lock frontend topology failed".to_string())?;
+        let entry = state
+            .entries
+            .get_mut(&backend_idx)
+            .ok_or_else(|| format!("backend {endpoint} not found"))?;
+        if entry.endpoint != endpoint {
+            return Err(format!("backend {backend_idx} identity changed"));
+        }
+        if entry.state != RuntimeBackendState::Decommissioning {
+            entry.state = RuntimeBackendState::Decommissioning;
+            entry.decommission_started = Some(Instant::now());
+            entry.decommission_timeout_event_sent = false;
+            advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
+        }
+        drop(state);
+        self.publish_snapshot();
+        self.wake_heartbeat_manager();
+        Ok(())
+    }
+
+    fn remove_runtime(&self, backend_idx: usize, endpoint: SocketAddr) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "lock frontend topology failed".to_string())?;
+        if !state
+            .entries
+            .get(&backend_idx)
+            .is_some_and(|entry| entry.endpoint == endpoint)
+        {
+            return Ok(());
+        }
+        advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
+        state.entries.remove(&backend_idx);
+        drop(state);
+        self.publish_snapshot();
+        Ok(())
+    }
+
+    fn process_decommissioning_once(&self) {
+        let candidates = self
+            .rows()
+            .into_iter()
+            .filter(|(_, entry)| entry.state == RuntimeBackendState::Decommissioning)
+            .collect::<Vec<_>>();
+        for (backend_idx, entry) in candidates {
+            if self.backend_has_active_queries(backend_idx) {
+                let timed_out = entry
+                    .decommission_started
+                    .is_some_and(|started| started.elapsed() >= self.decommission_timeout());
+                if timed_out && !entry.decommission_timeout_event_sent {
+                    if let Ok(mut state) = self.state.lock() {
+                        if let Some(current) = state.entries.get_mut(&backend_idx) {
+                            current.decommission_timeout_event_sent = true;
+                        }
+                    }
+                    self.dispatch_event(BackendQueryEvent::Unavailable {
+                        backend_idx,
+                        reason: format!("backend {backend_idx} decommission timed out"),
+                    });
+                }
+                continue;
+            }
+            let _guard = self
+                .mutation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self
+                .persist(RepositoryMutation::Remove {
+                    backend_id: backend_idx as u32,
+                    endpoint: entry.endpoint,
+                })
+                .is_ok()
+            {
+                let _ = self.remove_runtime(backend_idx, entry.endpoint);
+            }
+        }
     }
 
     fn rows(&self) -> Vec<(usize, FrontendBackendEntry)> {
@@ -482,14 +1076,14 @@ impl FrontendTopologyController {
             .expect("frontend topology lock")
             .entries
             .iter()
-            .map(|(idx, entry)| (*idx, entry.clone()))
+            .map(|(id, entry)| (*id, entry.clone()))
             .collect()
     }
 
     fn heartbeat_rows(&self) -> Vec<(usize, FrontendBackendEntry)> {
         self.rows()
             .into_iter()
-            .filter(|(_, entry)| entry.state != BackendLifecycleState::Decommissioning)
+            .filter(|(_, entry)| entry.state != RuntimeBackendState::Decommissioning)
             .collect()
     }
 
@@ -501,31 +1095,11 @@ impl FrontendTopologyController {
             .clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn backend_count_for_test(&self) -> usize {
+    fn decommission_timeout(&self) -> Duration {
         self.state
             .lock()
-            .expect("frontend topology lock")
-            .entries
-            .len()
-    }
-
-    #[cfg(test)]
-    fn live_backends(&self) -> Vec<LiveBackendTarget> {
-        self.snapshot()
-            .expect("test topology snapshot is available")
-            .targets()
-            .to_vec()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scheduled_fragment_count_for_test(&self, backend_idx: usize) -> u64 {
-        self.state
-            .lock()
-            .expect("frontend topology lock")
-            .entries
-            .get(&backend_idx)
-            .map_or(0, |entry| entry.scheduled_fragments)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .decommission_timeout
     }
 
     fn publish_snapshot(&self) {
@@ -535,47 +1109,45 @@ impl FrontendTopologyController {
                 state
                     .entries
                     .iter()
-                    .filter_map(|(backend_idx, entry)| {
-                        (entry.state == BackendLifecycleState::Live).then_some(
-                            LiveBackendTarget::new(*backend_idx, entry.endpoint, entry.start_epoch),
+                    .filter_map(|(id, entry)| {
+                        (entry.state == RuntimeBackendState::Live).then_some(
+                            LiveBackendTarget::new(*id, entry.endpoint, entry.start_epoch),
                         )
                     })
                     .collect();
             let mut metrics = BackendTopologyMetricsSnapshot::default();
             for entry in state.entries.values() {
                 match entry.state {
-                    BackendLifecycleState::Registering => metrics.registering += 1,
-                    BackendLifecycleState::Live => metrics.live += 1,
-                    BackendLifecycleState::Lost => metrics.lost += 1,
-                    BackendLifecycleState::Decommissioning => metrics.decommissioning += 1,
+                    RuntimeBackendState::Registering => metrics.registering += 1,
+                    RuntimeBackendState::Live => metrics.live += 1,
+                    RuntimeBackendState::Lost => metrics.lost += 1,
+                    RuntimeBackendState::Decommissioning => metrics.decommissioning += 1,
                 }
             }
             (state.topology_revision, live, metrics)
         };
         publish_backend_topology_metrics(metrics);
-        let Some(events) = self
-            .query_events
-            .lock()
-            .expect("frontend topology event sink lock")
-            .clone()
-        else {
-            return;
-        };
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            events.replace_live_backends(revision, live)
-        }));
-    }
-
-    fn dispatch_event(&self, event: BackendQueryEvent) {
-        let Some(events) = self
+        if let Some(events) = self
             .query_events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-        else {
-            return;
-        };
-        let _ = catch_unwind(AssertUnwindSafe(|| events.on_backend_event(event)));
+        {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                events.replace_live_backends(revision, live)
+            }));
+        }
+    }
+
+    fn dispatch_event(&self, event: BackendQueryEvent) {
+        if let Some(events) = self
+            .query_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            let _ = catch_unwind(AssertUnwindSafe(|| events.on_backend_event(event)));
+        }
     }
 
     fn backend_has_active_queries(&self, backend_idx: usize) -> bool {
@@ -591,105 +1163,35 @@ impl FrontendTopologyController {
             })
     }
 
-    fn remove_backend(&self, backend_idx: usize, endpoint: SocketAddr) -> Result<(), String> {
-        let mut state = self.state.lock().expect("frontend topology lock");
-        let matches = state
+    #[cfg(test)]
+    fn live_backends(&self) -> Vec<LiveBackendTarget> {
+        self.snapshot()
+            .expect("test topology snapshot is available")
+            .targets()
+            .to_vec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_count_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .expect("frontend topology lock")
+            .entries
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduled_fragment_count_for_test(&self, backend_idx: usize) -> u64 {
+        self.state
+            .lock()
+            .expect("frontend topology lock")
             .entries
             .get(&backend_idx)
-            .is_some_and(|entry| entry.endpoint == endpoint);
-        if !matches {
-            return Ok(());
-        }
-        if let Some(store) = state.metadata_store.clone() {
-            store.delete_backend(endpoint)?;
-        }
-        advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
-        state.entries.remove(&backend_idx);
-        drop(state);
-        self.publish_snapshot();
-        Ok(())
-    }
-
-    fn process_decommissioning_once(&self) {
-        let candidates = self
-            .rows()
-            .into_iter()
-            .filter_map(|(backend_idx, entry)| {
-                (entry.state == BackendLifecycleState::Decommissioning)
-                    .then_some((backend_idx, entry))
-            })
-            .collect::<Vec<_>>();
-        let timeout = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .decommission_timeout;
-        for (backend_idx, entry) in candidates {
-            let active = self.backend_has_active_queries(backend_idx);
-            let timed_out = entry
-                .decommission_started
-                .is_some_and(|started| started.elapsed() >= timeout);
-            if active && !timed_out {
-                continue;
-            }
-            if active {
-                self.dispatch_event(BackendQueryEvent::Unavailable {
-                    backend_idx,
-                    reason: format!("backend {backend_idx} decommission timed out"),
-                });
-            }
-            let _ = self.remove_backend(backend_idx, entry.endpoint);
-        }
+            .map_or(0, |entry| entry.scheduled_fragments)
     }
 }
 
-fn add_backend_entry(state: &mut TopologyState, endpoint: SocketAddr) -> Result<usize, String> {
-    if let Some(backend_idx) = state
-        .entries
-        .iter()
-        .find_map(|(backend_idx, entry)| (entry.endpoint == endpoint).then_some(*backend_idx))
-    {
-        return Ok(backend_idx);
-    }
-    advance_topology_revision(state).map_err(|error| error.to_string())?;
-    let backend_idx = state.next_backend_idx;
-    state.next_backend_idx = state
-        .next_backend_idx
-        .checked_add(1)
-        .ok_or_else(|| "frontend backend id overflow".to_string())?;
-    state.entries.insert(
-        backend_idx,
-        FrontendBackendEntry {
-            endpoint,
-            state: BackendLifecycleState::Registering,
-            start_epoch: 0,
-            version: String::new(),
-            num_cores: 0,
-            last_heartbeat_ms: 0,
-            missed_heartbeats: 0,
-            scheduled_fragments: 0,
-            last_err: None,
-            decommission_started: None,
-        },
-    );
-    Ok(backend_idx)
-}
-
-fn advance_topology_revision(state: &mut TopologyState) -> Result<(), BackendTopologyError> {
-    if let Some(message) = &state.terminal_error {
-        return Err(BackendTopologyError::Unavailable {
-            message: message.clone(),
-        });
-    }
-    state.topology_revision = state.topology_revision.checked_add(1).ok_or_else(|| {
-        let message = "frontend topology revision space is exhausted".to_string();
-        state.terminal_error = Some(message);
-        BackendTopologyError::RevisionExhausted
-    })?;
-    Ok(())
-}
-
-impl BackendTopologyPort for FrontendTopologyController {
+impl BackendTopologyPort for ClusterBackendService {
     fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
         let state = self
             .state
@@ -707,9 +1209,9 @@ impl BackendTopologyPort for FrontendTopologyController {
             state
                 .entries
                 .iter()
-                .filter_map(|(backend_idx, entry)| {
-                    (entry.state == BackendLifecycleState::Live).then_some(LiveBackendTarget::new(
-                        *backend_idx,
+                .filter_map(|(id, entry)| {
+                    (entry.state == RuntimeBackendState::Live).then_some(LiveBackendTarget::new(
+                        *id,
                         entry.endpoint,
                         entry.start_epoch,
                     ))
@@ -764,169 +1266,81 @@ impl BackendTopologyPort for FrontendTopologyController {
     }
 
     fn record_successful_fragment_submission(&self, backend_idx: usize) {
-        let mut state = self.state.lock().expect("frontend topology lock");
-        if let Some(entry) = state.entries.get_mut(&backend_idx) {
+        if let Some(entry) = self
+            .state
+            .lock()
+            .expect("frontend topology lock")
+            .entries
+            .get_mut(&backend_idx)
+        {
             entry.scheduled_fragments = entry.scheduled_fragments.saturating_add(1);
         }
     }
 
-    fn install_metadata_store(
-        &self,
-        store: Arc<dyn BackendTopologyMetadataStore>,
-    ) -> Result<(), String> {
-        let persisted = store.load_backends()?;
-        let mut restored = BTreeMap::new();
-        let mut endpoints = BTreeMap::new();
-        let mut next_backend_idx = 0usize;
-        for backend in persisted {
-            if restored.contains_key(&backend.backend_idx()) {
-                return Err(format!(
-                    "duplicate persisted backend id {}",
-                    backend.backend_idx()
-                ));
-            }
-            if let Some(existing) = endpoints.insert(backend.endpoint(), backend.backend_idx()) {
-                return Err(format!(
-                    "persisted backend endpoint {} has duplicate ids {existing} and {}",
-                    backend.endpoint(),
-                    backend.backend_idx()
-                ));
-            }
-            next_backend_idx =
-                next_backend_idx.max(backend.backend_idx().checked_add(1).ok_or_else(|| {
-                    format!("persisted backend id {} overflows", backend.backend_idx())
-                })?);
-            let restored_state = match backend.state() {
-                BackendLifecycleState::Decommissioning => BackendLifecycleState::Decommissioning,
-                BackendLifecycleState::Registering
-                | BackendLifecycleState::Live
-                | BackendLifecycleState::Lost => BackendLifecycleState::Registering,
-            };
-            restored.insert(
-                backend.backend_idx(),
-                FrontendBackendEntry {
-                    endpoint: backend.endpoint(),
-                    state: restored_state,
-                    start_epoch: 0,
-                    version: String::new(),
-                    num_cores: 0,
-                    last_heartbeat_ms: 0,
-                    missed_heartbeats: 0,
-                    scheduled_fragments: 0,
-                    last_err: None,
-                    decommission_started: (restored_state
-                        == BackendLifecycleState::Decommissioning)
-                        .then(Instant::now),
-                },
-            );
-        }
-
-        let heartbeat_round = self
-            .heartbeat_round
-            .lock()
-            .map_err(|_| "lock frontend topology heartbeat round failed".to_string())?;
-        let mut state = self.state.lock().expect("frontend topology lock");
-        state.entries = restored;
-        state.next_backend_idx = next_backend_idx;
-        state.metadata_store = Some(store);
-        for endpoint in state.configured_seed_endpoints.clone() {
-            add_backend_entry(&mut state, endpoint)?;
-        }
-        advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
-        drop(state);
-        drop(heartbeat_round);
-        self.publish_snapshot();
-        self.wake_heartbeat_manager();
-        Ok(())
-    }
-
     fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String> {
-        let mut state = self.state.lock().expect("frontend topology lock");
-        if state
-            .entries
-            .values()
-            .any(|entry| entry.endpoint == endpoint)
+        let _guard = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .rows()
+            .iter()
+            .any(|(_, entry)| entry.endpoint == endpoint)
         {
             return Ok(());
         }
-        let backend_idx = add_backend_entry(&mut state, endpoint)?;
-        let metadata_store = state.metadata_store.clone();
-        drop(state);
-        if let Some(store) = metadata_store {
-            if let Err(error) = store.upsert_backend(PersistedBackendTopology::new(
-                backend_idx,
-                endpoint,
-                BackendLifecycleState::Registering,
-            )) {
-                let mut state = self.state.lock().expect("frontend topology lock");
-                let _ = advance_topology_revision(&mut state);
-                state.entries.remove(&backend_idx);
-                drop(state);
-                self.publish_snapshot();
-                return Err(error);
-            }
-        }
-        self.publish_snapshot();
-        self.wake_heartbeat_manager();
-        Ok(())
+        let stored = self.persist(RepositoryMutation::Add(endpoint))?;
+        self.apply_added(stored, endpoint)
     }
 
     fn drop_backend(&self, endpoint: SocketAddr, force: bool) -> Result<(), String> {
-        let mut state = self.state.lock().expect("frontend topology lock");
-        let backend_idx = state
-            .entries
+        let _guard = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let backend_idx = self
+            .rows()
             .iter()
-            .find_map(|(idx, entry)| (entry.endpoint == endpoint).then_some(*idx))
+            .find_map(|(id, entry)| (entry.endpoint == endpoint).then_some(*id))
             .ok_or_else(|| format!("backend {endpoint} not found"))?;
+        let backend_id = u32::try_from(backend_idx)
+            .map_err(|_| format!("backend id {backend_idx} is outside durable range"))?;
         if force {
-            drop(state);
-            self.remove_backend(backend_idx, endpoint)?;
+            self.persist(RepositoryMutation::Remove {
+                backend_id,
+                endpoint,
+            })?;
+            self.remove_runtime(backend_idx, endpoint)?;
             self.dispatch_event(BackendQueryEvent::Unavailable {
                 backend_idx,
                 reason: format!("backend {backend_idx} dropped forcefully"),
             });
             return Ok(());
         }
-        let needs_decommissioning = state
-            .entries
-            .get(&backend_idx)
-            .is_some_and(|entry| entry.state != BackendLifecycleState::Decommissioning);
-        if needs_decommissioning {
-            advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
-            let entry = state
-                .entries
-                .get_mut(&backend_idx)
-                .expect("backend index was resolved from the same topology snapshot");
-            entry.state = BackendLifecycleState::Decommissioning;
-            entry.decommission_started = Some(Instant::now());
-        }
-        let metadata_store = state.metadata_store.clone();
-        drop(state);
-        self.publish_snapshot();
-
+        self.persist(RepositoryMutation::MarkDecommissioning {
+            backend_id,
+            endpoint,
+        })?;
+        self.mark_decommissioning_runtime(backend_idx, endpoint)?;
         if !self.backend_has_active_queries(backend_idx) {
-            return self.remove_backend(backend_idx, endpoint);
-        }
-        if let Some(store) = metadata_store {
-            store.upsert_backend(PersistedBackendTopology::new(
-                backend_idx,
+            self.persist(RepositoryMutation::Remove {
+                backend_id,
                 endpoint,
-                BackendLifecycleState::Decommissioning,
-            ))?;
+            })?;
+            self.remove_runtime(backend_idx, endpoint)?;
         }
-        self.wake_heartbeat_manager();
         Ok(())
     }
 
     fn show_backends(&self) -> Result<QueryResult, String> {
-        let column_names = [
+        let names = [
             "BackendId",
             "Host",
             "GrpcPort",
             "State",
             "ScheduledFragments",
         ];
-        let mut columns = vec![Vec::<String>::new(); column_names.len()];
+        let mut columns = vec![Vec::<String>::new(); names.len()];
         for (backend_idx, entry) in self.rows() {
             columns[0].push(backend_idx.to_string());
             columns[1].push(entry.endpoint.ip().to_string());
@@ -934,21 +1348,20 @@ impl BackendTopologyPort for FrontendTopologyController {
             columns[3].push(entry.state.as_str().to_string());
             columns[4].push(entry.scheduled_fragments.to_string());
         }
-        let fields = column_names
-            .iter()
-            .map(|name| Field::new(*name, DataType::Utf8, false))
-            .collect::<Vec<_>>();
         let arrays = columns
             .into_iter()
-            .map(|values| {
-                std::sync::Arc::new(StringArray::from(values))
-                    as std::sync::Arc<dyn arrow::array::Array>
-            })
-            .collect::<Vec<_>>();
-        let batch = RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), arrays)
+            .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
+            .collect();
+        let schema = Schema::new(
+            names
+                .iter()
+                .map(|name| Field::new(*name, DataType::Utf8, false))
+                .collect::<Vec<_>>(),
+        );
+        let batch = RecordBatch::try_new(Arc::new(schema), arrays)
             .map_err(|error| format!("build SHOW BACKENDS result failed: {error}"))?;
         Ok(QueryResult {
-            columns: column_names
+            columns: names
                 .iter()
                 .map(|name| QueryResultColumn {
                     name: (*name).to_string(),
@@ -962,465 +1375,220 @@ impl BackendTopologyPort for FrontendTopologyController {
     }
 }
 
+fn registering_entry(endpoint: SocketAddr) -> FrontendBackendEntry {
+    FrontendBackendEntry {
+        endpoint,
+        state: RuntimeBackendState::Registering,
+        start_epoch: 0,
+        version: String::new(),
+        num_cores: 0,
+        last_heartbeat_ms: 0,
+        missed_heartbeats: 0,
+        scheduled_fragments: 0,
+        last_err: None,
+        decommission_started: None,
+        decommission_timeout_event_sent: false,
+    }
+}
+
+fn next_runtime_backend_id(state: &TopologyState) -> Result<usize, String> {
+    state
+        .entries
+        .keys()
+        .next_back()
+        .copied()
+        .map(|id| {
+            id.checked_add(1)
+                .ok_or_else(|| "frontend backend id overflow".to_string())
+        })
+        .transpose()
+        .map(|id| id.unwrap_or(0))
+}
+
+fn advance_topology_revision(state: &mut TopologyState) -> Result<(), BackendTopologyError> {
+    if let Some(message) = &state.terminal_error {
+        return Err(BackendTopologyError::Unavailable {
+            message: message.clone(),
+        });
+    }
+    state.topology_revision = state.topology_revision.checked_add(1).ok_or_else(|| {
+        let message = "frontend topology revision space is exhausted".to_string();
+        state.terminal_error = Some(message);
+        BackendTopologyError::RevisionExhausted
+    })?;
+    Ok(())
+}
+
+fn cluster_backends_key() -> Result<Key, String> {
+    Key::try_from(Bytes::from_static(CLUSTER_BACKENDS_KEY))
+        .map_err(|error| format!("build cluster backend membership key failed: {error}"))
+}
+
+fn encode_stored_cluster_backends(
+    state: &StoredClusterBackendsV1,
+) -> Result<Value, novarocks_spi::state_store::StateStoreError> {
+    let bytes = serde_json::to_vec(state).map_err(|error| {
+        invalid_state_store_request(format!("encode cluster backend membership failed: {error}"))
+    })?;
+    Value::try_from(Bytes::from(bytes))
+}
+
+fn decode_stored_cluster_backends(
+    record: StateRecord,
+) -> Result<StoredClusterBackendsV1, novarocks_spi::state_store::StateStoreError> {
+    let key = cluster_backends_key().map_err(invalid_state_store_request)?;
+    if record.key != key {
+        return Err(invalid_state_store_request(
+            "cluster backend membership record has an unexpected key",
+        ));
+    }
+    let state = serde_json::from_slice(record.value.as_bytes()).map_err(|error| {
+        invalid_state_store_request(format!("decode cluster backend membership failed: {error}"))
+    })?;
+    validate_stored_cluster_backends(&state).map_err(invalid_state_store_request)?;
+    Ok(state)
+}
+
+fn validate_stored_cluster_backends(state: &StoredClusterBackendsV1) -> Result<(), String> {
+    if state.schema_version != CLUSTER_BACKENDS_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported cluster backend membership schema version {}",
+            state.schema_version
+        ));
+    }
+    if state.next_backend_id > u64::from(u32::MAX) + 1 {
+        return Err("cluster backend membership next id exceeds u32 range".to_string());
+    }
+    let mut previous = None;
+    let mut endpoints = BTreeSet::new();
+    for entry in &state.entries {
+        if previous.is_some_and(|id| entry.backend_id <= id) {
+            return Err("cluster backend membership ids are not strictly ordered".to_string());
+        }
+        if u64::from(entry.backend_id) >= state.next_backend_id {
+            return Err(
+                "cluster backend membership next id does not exceed all assigned ids".to_string(),
+            );
+        }
+        parse_canonical_endpoint(&entry.endpoint)?;
+        if !endpoints.insert(&entry.endpoint) {
+            return Err(format!(
+                "cluster backend membership has duplicate endpoint {}",
+                entry.endpoint
+            ));
+        }
+        previous = Some(entry.backend_id);
+    }
+    Ok(())
+}
+
+fn parse_canonical_endpoint(value: &str) -> Result<SocketAddr, String> {
+    let endpoint = value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid cluster backend endpoint {value:?}: {error}"))?;
+    if endpoint.to_string() != value {
+        return Err(format!(
+            "cluster backend endpoint {value:?} is not canonical"
+        ));
+    }
+    Ok(endpoint)
+}
+
+fn allocate_backend_id(state: &mut StoredClusterBackendsV1) -> Result<u32, String> {
+    if state.next_backend_id > u64::from(u32::MAX) {
+        return Err("cluster backend id space is exhausted".to_string());
+    }
+    let id = u32::try_from(state.next_backend_id)
+        .map_err(|_| "cluster backend id exceeds u32 range".to_string())?;
+    state.next_backend_id += 1;
+    Ok(id)
+}
+
+fn stored_entry_mut(
+    state: &mut StoredClusterBackendsV1,
+    backend_id: u32,
+    endpoint: SocketAddr,
+) -> Result<&mut StoredClusterBackendEntryV1, String> {
+    state
+        .entries
+        .iter_mut()
+        .find(|entry| entry.backend_id == backend_id && entry.endpoint == endpoint.to_string())
+        .ok_or_else(|| {
+            format!("backend {backend_id} at {endpoint} is absent from durable membership")
+        })
+}
+
+fn invalid_state_store_request(
+    message: impl Into<String>,
+) -> novarocks_spi::state_store::StateStoreError {
+    let _ = message.into();
+    novarocks_spi::state_store::StateStoreError::new(
+        novarocks_spi::state_store::StateStoreErrorKind::InvalidRequest,
+        "invalid cluster backend membership record",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::time::{Duration, Instant};
 
-    use novarocks::query_execution::backend::{
-        BackendLifecycleState, BackendQueryEvent, BackendQueryEventSink, BackendTopologyError,
-        BackendTopologyMetadataStore, BackendTopologyPort, HeartbeatOutcome, LiveBackendTarget,
-        PersistedBackendTopology,
+    use novarocks::query_execution::backend::{BackendTopologyPort, LiveBackendTarget};
+
+    use super::{
+        ClusterBackendOpenConfig, ClusterBackendService, DesiredBackendState,
+        StoredClusterBackendEntryV1, StoredClusterBackendsV1, validate_stored_cluster_backends,
     };
 
-    use super::FrontendTopologyController;
-
-    #[derive(Default)]
-    struct RecordingQueryEvents {
-        active: AtomicBool,
-        events: Mutex<Vec<BackendQueryEvent>>,
-        snapshots: Mutex<Vec<Vec<LiveBackendTarget>>>,
-        order: Mutex<Vec<&'static str>>,
-    }
-
-    impl BackendQueryEventSink for RecordingQueryEvents {
-        fn on_backend_event(&self, event: BackendQueryEvent) {
-            self.order.lock().unwrap().push("event");
-            self.events.lock().unwrap().push(event);
-        }
-
-        fn backend_has_active_queries(&self, _backend_idx: usize) -> bool {
-            self.active.load(Ordering::SeqCst)
-        }
-
-        fn replace_live_backends(&self, _revision: u64, backends: Vec<LiveBackendTarget>) {
-            self.order.lock().unwrap().push("snapshot");
-            self.snapshots.lock().unwrap().push(backends);
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingMetadataStore {
-        loaded: Mutex<Vec<PersistedBackendTopology>>,
-        upserts: Mutex<Vec<PersistedBackendTopology>>,
-        deletes: Mutex<Vec<SocketAddr>>,
-        fail_deletes: AtomicBool,
-    }
-
-    impl BackendTopologyMetadataStore for RecordingMetadataStore {
-        fn load_backends(&self) -> Result<Vec<PersistedBackendTopology>, String> {
-            Ok(self.loaded.lock().unwrap().clone())
-        }
-
-        fn upsert_backend(&self, backend: PersistedBackendTopology) -> Result<(), String> {
-            self.upserts.lock().unwrap().push(backend);
-            Ok(())
-        }
-
-        fn delete_backend(&self, endpoint: SocketAddr) -> Result<(), String> {
-            if self.fail_deletes.load(Ordering::SeqCst) {
-                return Err("injected backend metadata delete failure".to_string());
-            }
-            self.deletes.lock().unwrap().push(endpoint);
-            Ok(())
-        }
-    }
-
     #[test]
-    fn frontend_controller_owns_live_snapshot_and_management() {
-        let controller = FrontendTopologyController::new(1);
+    fn snapshot_and_management_are_frontend_owned() {
+        let service = ClusterBackendService::new_transient_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
-
-        controller.add_backend(endpoint).unwrap();
-        assert!(controller.live_backends().is_empty());
-
-        controller.record_heartbeat_success(0, 17, "test", 2, 100);
-        assert_eq!(controller.live_backends().len(), 1);
-
-        controller.record_successful_fragment_submission(0);
-        let shown = controller.show_backends().unwrap();
-        assert_eq!(shown.chunks.len(), 1);
+        service.add_backend(endpoint).unwrap();
+        service.record_heartbeat_success(0, 17, "test", 2, 100);
         assert_eq!(
-            shown
-                .columns
-                .iter()
-                .map(|column| column.name.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "BackendId",
-                "Host",
-                "GrpcPort",
-                "State",
-                "ScheduledFragments",
+            service.live_backends(),
+            [LiveBackendTarget::new(0, endpoint, 17)]
+        );
+        service.drop_backend(endpoint, true).unwrap();
+        assert!(service.live_backends().is_empty());
+    }
+
+    #[test]
+    fn stored_membership_rejects_unsorted_duplicate_and_noncanonical_entries() {
+        let mut state = StoredClusterBackendsV1 {
+            schema_version: 1,
+            last_operation_id: uuid::Uuid::nil(),
+            next_backend_id: 2,
+            entries: vec![
+                StoredClusterBackendEntryV1 {
+                    backend_id: 1,
+                    endpoint: "127.0.0.1:9001".to_string(),
+                    desired_state: DesiredBackendState::Active,
+                },
+                StoredClusterBackendEntryV1 {
+                    backend_id: 0,
+                    endpoint: "127.0.0.1:9001".to_string(),
+                    desired_state: DesiredBackendState::Active,
+                },
             ],
-            "the native cross-process runner consumes this compact frontend topology contract"
-        );
-
-        assert!(controller.record_heartbeat_failure(0));
-        assert!(controller.live_backends().is_empty());
-
-        controller.drop_backend(endpoint, true).unwrap();
-        assert!(controller.live_backends().is_empty());
+        };
+        assert!(validate_stored_cluster_backends(&state).is_err());
+        state.entries.reverse();
+        assert!(validate_stored_cluster_backends(&state).is_err());
     }
 
     #[test]
-    fn captured_snapshot_rejects_membership_and_generation_changes() {
-        let controller = FrontendTopologyController::new(1);
-        let first: SocketAddr = "127.0.0.1:9061".parse().unwrap();
-        let second: SocketAddr = "127.0.0.1:9062".parse().unwrap();
-        controller.add_backend(first).unwrap();
-        controller.record_heartbeat_success(0, 7, "v1", 1, 1);
-        let captured = controller.snapshot().expect("capture topology");
-        controller
-            .validate_snapshot(&captured)
-            .expect("unchanged snapshot is valid");
-
-        controller.add_backend(second).unwrap();
-        assert!(matches!(
-            controller.validate_snapshot(&captured),
-            Err(novarocks::query_execution::backend::BackendTopologyValidationError::RevisionChanged { .. })
-        ));
-
-        let captured = controller.snapshot().expect("capture changed topology");
-        controller.record_heartbeat_success(0, 8, "v2", 1, 2);
-        assert!(matches!(
-            controller.validate_snapshot(&captured),
-            Err(novarocks::query_execution::backend::BackendTopologyValidationError::RevisionChanged { .. })
-        ));
-    }
-
-    #[test]
-    fn changed_start_epoch_publishes_new_snapshot_before_restart_event() {
-        let controller = FrontendTopologyController::new(3);
-        let events = Arc::new(RecordingQueryEvents::default());
-        controller.attach_query_events(events.clone());
-        let endpoint: SocketAddr = "127.0.0.1:9071".parse().unwrap();
-        controller.add_backend(endpoint).unwrap();
-        controller.record_heartbeat_success(0, 17, "v1", 2, 100);
-        events.order.lock().unwrap().clear();
-
-        controller.record_heartbeat_success(0, 18, "v2", 4, 200);
-
-        assert_eq!(
-            events.events.lock().unwrap().as_slice(),
-            [BackendQueryEvent::Restarted {
-                backend_idx: 0,
-                old_epoch: 17,
-                new_epoch: 18,
-            }]
-        );
-        assert_eq!(
-            events.order.lock().unwrap().as_slice(),
-            ["snapshot", "event"],
-            "the query registry must see the new generation before restart cancellation"
-        );
-        assert_eq!(controller.live_backends()[0].start_epoch(), 18);
-    }
-
-    #[test]
-    fn configured_heartbeat_retry_threshold_is_applied() {
-        let controller = FrontendTopologyController::new(1);
-        let endpoint: SocketAddr = "127.0.0.1:9072".parse().unwrap();
-        controller
-            .configure_lifecycle(2, Duration::from_secs(1), vec![endpoint])
-            .unwrap();
-        controller.record_heartbeat_success(0, 1, "v", 1, 1);
-
-        assert!(!controller.record_heartbeat_failure(0));
-        assert_eq!(controller.live_backends().len(), 1);
-        assert!(controller.record_heartbeat_failure(0));
-        assert!(controller.live_backends().is_empty());
-    }
-
-    #[test]
-    fn unconfigured_controller_cannot_start_heartbeat_manager() {
-        let controller = Arc::new(FrontendTopologyController::new_unconfigured());
-
-        let error = controller
-            .start_heartbeat_manager(Duration::from_millis(1))
-            .expect_err("application topology must receive cluster lifecycle config first");
-
-        assert!(error.contains("lifecycle is not configured"), "{error}");
-    }
-
-    #[test]
-    fn heartbeat_manager_stop_joins_and_allows_clean_restart() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_probe = Arc::clone(&calls);
-        let controller = Arc::new(FrontendTopologyController::new_with_probe(
-            3,
-            move |_be_id, _endpoint| {
-                calls_for_probe.fetch_add(1, Ordering::SeqCst);
-                HeartbeatOutcome::Failed {
-                    err: "expected test failure".to_string(),
-                }
-            },
-        ));
-        let endpoint: SocketAddr = "127.0.0.1:9073".parse().unwrap();
-        controller
-            .configure_lifecycle(3, Duration::from_secs(1), vec![])
-            .unwrap();
-        controller
-            .start_heartbeat_manager(Duration::from_secs(60))
-            .unwrap();
-        controller.add_backend(endpoint).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while calls.load(Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < deadline, "heartbeat did not wake for ADD");
-            std::thread::yield_now();
-        }
-
-        controller.stop_heartbeat_manager().unwrap();
-        let stopped_calls = calls.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            stopped_calls,
-            "a joined manager cannot probe after shutdown returns"
-        );
-
-        controller
-            .start_heartbeat_manager(Duration::from_secs(60))
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while calls.load(Ordering::SeqCst) == stopped_calls {
-            assert!(
-                Instant::now() < deadline,
-                "restarted heartbeat manager did not probe"
-            );
-            std::thread::yield_now();
-        }
-        controller.stop_heartbeat_manager().unwrap();
-    }
-
-    #[test]
-    fn non_force_drop_drains_active_queries_then_deletes_persisted_backend() {
-        let controller = FrontendTopologyController::new(3);
-        let events = Arc::new(RecordingQueryEvents::default());
-        events.active.store(true, Ordering::SeqCst);
-        controller.attach_query_events(events.clone());
-        let store = Arc::new(RecordingMetadataStore::default());
-        controller.install_metadata_store(store.clone()).unwrap();
-        let endpoint: SocketAddr = "127.0.0.1:9074".parse().unwrap();
-        controller.add_backend(endpoint).unwrap();
-        controller.record_heartbeat_success(0, 11, "v", 1, 1);
-
-        controller.drop_backend(endpoint, false).unwrap();
-
-        assert!(controller.live_backends().is_empty());
-        assert_eq!(controller.backend_count_for_test(), 1);
-        assert_eq!(
-            store.upserts.lock().unwrap().last().unwrap().state(),
-            BackendLifecycleState::Decommissioning
-        );
-        assert!(events.events.lock().unwrap().is_empty());
-
-        events.active.store(false, Ordering::SeqCst);
-        controller.process_decommissioning_once();
-        assert_eq!(controller.backend_count_for_test(), 0);
-        assert_eq!(store.deletes.lock().unwrap().as_slice(), [endpoint]);
-    }
-
-    #[test]
-    fn force_drop_fails_active_queries_and_removes_persisted_backend_immediately() {
-        let controller = FrontendTopologyController::new(3);
-        let events = Arc::new(RecordingQueryEvents::default());
-        events.active.store(true, Ordering::SeqCst);
-        controller.attach_query_events(events.clone());
-        let store = Arc::new(RecordingMetadataStore::default());
-        controller.install_metadata_store(store.clone()).unwrap();
-        let endpoint: SocketAddr = "127.0.0.1:9075".parse().unwrap();
-        controller.add_backend(endpoint).unwrap();
-
-        controller.drop_backend(endpoint, true).unwrap();
-
-        assert_eq!(controller.backend_count_for_test(), 0);
-        assert_eq!(
-            store
-                .upserts
-                .lock()
-                .unwrap()
-                .iter()
-                .map(PersistedBackendTopology::state)
-                .collect::<Vec<_>>(),
-            [BackendLifecycleState::Registering],
-            "force DROP must delete directly without persisting an intermediate decommissioning state"
-        );
-        assert_eq!(store.deletes.lock().unwrap().as_slice(), [endpoint]);
-        assert_eq!(
-            events.events.lock().unwrap().as_slice(),
-            [BackendQueryEvent::Unavailable {
-                backend_idx: 0,
-                reason: "backend 0 dropped forcefully".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn force_drop_delete_failure_preserves_live_topology_and_queries() {
-        let controller = FrontendTopologyController::new(3);
-        let events = Arc::new(RecordingQueryEvents::default());
-        events.active.store(true, Ordering::SeqCst);
-        controller.attach_query_events(events.clone());
-        let store = Arc::new(RecordingMetadataStore::default());
-        controller.install_metadata_store(store.clone()).unwrap();
-        let endpoint: SocketAddr = "127.0.0.1:9082".parse().unwrap();
-        controller.add_backend(endpoint).unwrap();
-        controller.record_heartbeat_success(0, 11, "v", 1, 1);
-        store.fail_deletes.store(true, Ordering::SeqCst);
-
-        let error = controller
-            .drop_backend(endpoint, true)
-            .expect_err("durable delete failure must reject force DROP");
-
+    fn open_config_rejects_duplicate_seed_identity() {
+        let endpoint: SocketAddr = "127.0.0.1:9010".parse().unwrap();
         assert!(
-            error.contains("injected backend metadata delete failure"),
-            "{error}"
+            ClusterBackendOpenConfig::new(
+                novarocks::common::app_config::ClusterRole::Fe,
+                vec![endpoint, endpoint],
+                std::time::Duration::from_secs(1),
+                1,
+                std::time::Duration::from_secs(1),
+            )
+            .is_err()
         );
-        assert_eq!(controller.backend_count_for_test(), 1);
-        assert_eq!(
-            controller.live_backends(),
-            [LiveBackendTarget::new(0, endpoint, 11)],
-            "failed durable deletion must roll the backend back into the schedulable topology"
-        );
-        assert!(
-            events.events.lock().unwrap().is_empty(),
-            "queries must not fail before the durable DROP commits"
-        );
-        let rows = controller.rows();
-        assert_eq!(rows[0].1.state, BackendLifecycleState::Live);
-        assert!(rows[0].1.decommission_started.is_none());
-    }
-
-    #[test]
-    fn metadata_restore_preserves_backend_ids_before_adding_config_seeds() {
-        let controller = FrontendTopologyController::new(3);
-        let configured: SocketAddr = "127.0.0.1:9076".parse().unwrap();
-        let persisted: SocketAddr = "127.0.0.1:9077".parse().unwrap();
-        controller
-            .configure_lifecycle(3, Duration::from_secs(1), vec![configured])
-            .unwrap();
-        let store = Arc::new(RecordingMetadataStore::default());
-        store
-            .loaded
-            .lock()
-            .unwrap()
-            .push(PersistedBackendTopology::new(
-                7,
-                persisted,
-                BackendLifecycleState::Live,
-            ));
-
-        controller.install_metadata_store(store).unwrap();
-
-        let rows = controller.rows();
-        assert!(
-            controller.live_backends().is_empty(),
-            "a persisted Live row must not be scheduled before a fresh heartbeat proves its process epoch"
-        );
-        assert_eq!(
-            rows[0].1.state,
-            BackendLifecycleState::Registering,
-            "persisted physical liveness is stale across frontend restart"
-        );
-        assert_eq!(
-            rows.iter()
-                .map(|(backend_idx, entry)| (*backend_idx, entry.endpoint))
-                .collect::<Vec<_>>(),
-            vec![(7, persisted), (8, configured)]
-        );
-    }
-
-    #[test]
-    fn metadata_restore_waits_for_an_inflight_heartbeat_round() {
-        let (probe_started_tx, probe_started_rx) = mpsc::channel();
-        let (release_probe_tx, release_probe_rx) = mpsc::channel();
-        let release_probe_rx = Mutex::new(release_probe_rx);
-        let probe_calls = AtomicUsize::new(0);
-        let controller = Arc::new(FrontendTopologyController::new_with_probe(
-            3,
-            move |_be_id, _endpoint| {
-                if probe_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    probe_started_tx.send(()).unwrap();
-                    release_probe_rx.lock().unwrap().recv().unwrap();
-                }
-                HeartbeatOutcome::Failed {
-                    err: "expected test failure".to_string(),
-                }
-            },
-        ));
-        let configured: SocketAddr = "127.0.0.1:9078".parse().unwrap();
-        controller
-            .configure_lifecycle(3, Duration::from_secs(1), vec![configured])
-            .unwrap();
-        controller
-            .start_heartbeat_manager(Duration::from_secs(60))
-            .unwrap();
-        probe_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("heartbeat probe must enter before metadata restore");
-
-        let store = Arc::new(RecordingMetadataStore::default());
-        let restored: SocketAddr = "127.0.0.1:9079".parse().unwrap();
-        store
-            .loaded
-            .lock()
-            .unwrap()
-            .push(PersistedBackendTopology::new(
-                7,
-                restored,
-                BackendLifecycleState::Registering,
-            ));
-        let controller_for_install = Arc::clone(&controller);
-        let (install_done_tx, install_done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            install_done_tx
-                .send(controller_for_install.install_metadata_store(store))
-                .unwrap();
-        });
-
-        assert!(
-            install_done_rx
-                .recv_timeout(Duration::from_millis(20))
-                .is_err(),
-            "metadata replacement must wait until an in-flight probe can no longer update the old backend index"
-        );
-        release_probe_tx.send(()).unwrap();
-        install_done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("metadata install thread must finish")
-            .expect("metadata restore");
-        controller.stop_heartbeat_manager().unwrap();
-
-        assert_eq!(
-            controller
-                .rows()
-                .into_iter()
-                .map(|(backend_idx, entry)| (backend_idx, entry.endpoint))
-                .collect::<Vec<_>>(),
-            [(7, restored), (8, configured)]
-        );
-    }
-
-    #[test]
-    fn revision_exhaustion_rejects_membership_mutation_and_poisoned_snapshot() {
-        let controller = FrontendTopologyController::new(1);
-        {
-            let mut state = controller.state.lock().unwrap();
-            state.topology_revision = u64::MAX;
-        }
-
-        let endpoint: SocketAddr = "127.0.0.1:9080".parse().unwrap();
-        let error = controller
-            .add_backend(endpoint)
-            .expect_err("revision exhaustion must reject a new backend");
-        assert!(error.contains("revision space is exhausted"), "{error}");
-        assert!(controller.rows().is_empty());
-        assert!(matches!(
-            controller.snapshot(),
-            Err(BackendTopologyError::Unavailable { .. })
-        ));
     }
 }

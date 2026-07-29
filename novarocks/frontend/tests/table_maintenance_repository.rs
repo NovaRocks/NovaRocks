@@ -19,6 +19,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,14 +29,14 @@ use novarocks_frontend::table_maintenance::repository::{
     OptimizeJobRepository, RepositoryErrorKind,
 };
 use novarocks_spi::state_store::{
-    ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction, Key,
-    KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
-    Value, WriteTransaction,
+    ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction,
+    FeDeploymentView, Key, KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction,
+    StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    StoreIdentity, TransactionId, Value, WriteTransaction,
 };
 use novarocks_state_store::{
-    FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-    StateStoreRuntime, open_state_store,
+    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -58,17 +59,26 @@ fn sqlite_config(path: &Path) -> StateStoreConfig {
 }
 
 async fn open_sqlite(path: &Path) -> Arc<dyn StateStore> {
-    let runtime = StateStoreRuntime::local().expect("local state-store runtime");
-    open_state_store(
-        &runtime,
-        sqlite_config(path),
+    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: sqlite_config(path),
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).unwrap(),
             topology_revision: Bytes::from_static(b"table-maintenance-repository-topology"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
     .expect("open SQLite state store")
+    .state_store()
+    .expect("SQLite state store exposure")
 }
 
 async fn fixture() -> (TempDir, Arc<dyn StateStore>, OptimizeJobRepository) {
@@ -464,10 +474,6 @@ struct CommitUnknownStore {
 
 #[async_trait]
 impl StateStore for CommitUnknownStore {
-    fn provider_name(&self) -> &'static str {
-        "optimize-commit-unknown-test"
-    }
-
     fn limits(&self) -> &StateStoreLimits {
         self.inner.limits()
     }

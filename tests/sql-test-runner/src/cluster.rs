@@ -542,7 +542,9 @@ pub(crate) fn render_cross_process_config(
 /// a second FE launch at a fresh, empty SQLite path while keeping every other
 /// section (server ports, object store, warehouse) identical to a normal
 /// `render_cross_process_config` render — so the second launch talks to the
-/// same lake but starts with no cached IMV definitions.
+/// same lake but starts with no cached IMV definitions. Launch-only rendering
+/// also replaces the FE StateStore path with a runtime-local SQLite file so
+/// membership rows cannot leak across ordinary SQL-test clusters.
 pub(crate) fn render_cross_process_config_with_metadata_db_override(
     base_config: &str,
     role: ClusterProcessRole,
@@ -576,7 +578,7 @@ fn render_cross_process_launch_config(
     runtime_dir: &Path,
     metadata_mode: CrossProcessMetadataMode<'_>,
 ) -> Result<String> {
-    match metadata_mode {
+    let rendered = match metadata_mode {
         CrossProcessMetadataMode::Isolated => {
             let metadata_path = runtime_dir.join("metadata.sqlite");
             let metadata_path = metadata_path
@@ -599,7 +601,37 @@ fn render_cross_process_launch_config(
                 metadata_path,
             )
         }
+    }?;
+
+    let mut value = rendered
+        .parse::<Value>()
+        .context("parse rendered cross-process config for launch StateStore isolation")?;
+    let root = value.as_table_mut().ok_or_else(|| {
+        anyhow::anyhow!("rendered cross-process config root must be a TOML table")
+    })?;
+    if role == ClusterProcessRole::Fe {
+        let state_store_path = runtime_dir.join("state-store.sqlite");
+        let state_store_path = state_store_path
+            .to_str()
+            .context("cross-process runtime StateStore path must be valid UTF-8")?;
+        let state_store = table_mut(root, "state_store");
+        state_store
+            .entry("provider".to_string())
+            .or_insert_with(|| Value::String("sqlite".to_string()));
+        state_store.insert(
+            "path".to_string(),
+            Value::String(state_store_path.to_string()),
+        );
+        state_store
+            .entry("cluster_id".to_string())
+            .or_insert_with(|| Value::String("sql-tests-cross-process".to_string()));
+        state_store
+            .entry("deployment_owner".to_string())
+            .or_insert_with(|| Value::String("fe-1".to_string()));
     }
+
+    toml::to_string(&value)
+        .context("serialize cross-process launch config with isolated StateStore")
 }
 
 struct NoopServerHandle;
@@ -631,8 +663,8 @@ pub(crate) struct CrossProcessServerHandle {
 #[derive(Clone, Copy)]
 enum CrossProcessMetadataMode<'a> {
     /// Ephemeral SQL-test clusters, including IMV L2 cluster A, must never
-    /// restore backend rows from another launch whose dynamically reserved
-    /// endpoints are already stale.
+    /// restore metadata or backend membership from another launch whose
+    /// dynamically reserved endpoints are already stale.
     Isolated,
     Explicit(&'a str),
 }
@@ -1882,7 +1914,7 @@ exec_node_output = true
     }
 
     #[test]
-    fn ordinary_cross_process_launches_do_not_share_persisted_backend_rows() {
+    fn ordinary_cross_process_launches_isolate_metadata_and_backend_state_store() {
         let runtime = make_runtime_1be();
         let first_runtime = Path::new("/tmp/novarocks-cross-process-run-a");
         let second_runtime = Path::new("/tmp/novarocks-cross-process-run-b");
@@ -1920,7 +1952,19 @@ exec_node_output = true
         );
         assert_ne!(
             first["metadata"]["path"], second["metadata"]["path"],
-            "ephemeral clusters must not restore stale backend rows from another launch"
+            "ephemeral clusters must not restore stale metadata from another launch"
+        );
+        assert_eq!(
+            first["state_store"]["path"].as_str(),
+            first_runtime.join("state-store.sqlite").to_str()
+        );
+        assert_eq!(
+            second["state_store"]["path"].as_str(),
+            second_runtime.join("state-store.sqlite").to_str()
+        );
+        assert_ne!(
+            first["state_store"]["path"], second["state_store"]["path"],
+            "ephemeral clusters must not restore stale backend membership from another launch"
         );
     }
 
@@ -1957,7 +2001,7 @@ exec_node_output = true
         assert_eq!(
             cluster_a["metadata"]["path"].as_str(),
             cluster_a_runtime.join("metadata.sqlite").to_str(),
-            "cluster A must not inherit backend topology rows from the base metadata database"
+            "cluster A must not inherit metadata from the base database"
         );
         assert_eq!(
             cluster_b["metadata"]["path"].as_str(),
@@ -1966,6 +2010,18 @@ exec_node_output = true
         assert_ne!(cluster_a["metadata"]["path"], base["metadata"]["path"]);
         assert_ne!(cluster_b["metadata"]["path"], base["metadata"]["path"]);
         assert_ne!(cluster_a["metadata"]["path"], cluster_b["metadata"]["path"]);
+        assert_eq!(
+            cluster_a["state_store"]["path"].as_str(),
+            cluster_a_runtime.join("state-store.sqlite").to_str()
+        );
+        assert_eq!(
+            cluster_b["state_store"]["path"].as_str(),
+            Some("/tmp/novarocks-imv-l2-cluster-b/state-store.sqlite")
+        );
+        assert_ne!(
+            cluster_a["state_store"]["path"], cluster_b["state_store"]["path"],
+            "independent launch runtime directories must isolate backend membership"
+        );
         assert_eq!(
             cluster_a["standalone_server"]["warehouse_uri"],
             base["standalone_server"]["warehouse_uri"]

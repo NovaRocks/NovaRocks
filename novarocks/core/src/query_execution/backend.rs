@@ -37,11 +37,6 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
 
     fn record_successful_fragment_submission(&self, backend_idx: usize);
 
-    fn install_metadata_store(
-        &self,
-        store: Arc<dyn BackendTopologyMetadataStore>,
-    ) -> Result<(), String>;
-
     fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String>;
 
     fn drop_backend(&self, endpoint: SocketAddr, force: bool) -> Result<(), String>;
@@ -142,80 +137,6 @@ impl fmt::Display for BackendTopologyValidationError {
 }
 
 impl std::error::Error for BackendTopologyValidationError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendLifecycleState {
-    Registering,
-    Live,
-    Lost,
-    Decommissioning,
-}
-
-impl BackendLifecycleState {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Registering => "Registering",
-            Self::Live => "Live",
-            Self::Lost => "Lost",
-            Self::Decommissioning => "Decommissioning",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "Registering" => Ok(Self::Registering),
-            "Live" => Ok(Self::Live),
-            "Lost" => Ok(Self::Lost),
-            "Decommissioning" => Ok(Self::Decommissioning),
-            other => Err(format!("invalid persisted backend state '{other}'")),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PersistedBackendTopology {
-    backend_idx: usize,
-    endpoint: SocketAddr,
-    state: BackendLifecycleState,
-}
-
-impl PersistedBackendTopology {
-    pub const fn new(
-        backend_idx: usize,
-        endpoint: SocketAddr,
-        state: BackendLifecycleState,
-    ) -> Self {
-        Self {
-            backend_idx,
-            endpoint,
-            state,
-        }
-    }
-
-    pub const fn backend_idx(&self) -> usize {
-        self.backend_idx
-    }
-
-    pub const fn endpoint(&self) -> SocketAddr {
-        self.endpoint
-    }
-
-    pub const fn state(&self) -> BackendLifecycleState {
-        self.state
-    }
-}
-
-/// Synchronous metadata boundary used by the frontend topology owner.
-///
-/// Core supplies the adapter over its existing metadata repository; frontend
-/// owns lifecycle policy and never imports the repository implementation.
-pub trait BackendTopologyMetadataStore: Send + Sync + 'static {
-    fn load_backends(&self) -> Result<Vec<PersistedBackendTopology>, String>;
-
-    fn upsert_backend(&self, backend: PersistedBackendTopology) -> Result<(), String>;
-
-    fn delete_backend(&self, endpoint: SocketAddr) -> Result<(), String>;
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendTopologyMetricsSnapshot {
@@ -455,13 +376,6 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
     }
 
     fn record_successful_fragment_submission(&self, _backend_idx: usize) {}
-
-    fn install_metadata_store(
-        &self,
-        _store: Arc<dyn BackendTopologyMetadataStore>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
 
     fn add_backend(&self, _endpoint: SocketAddr) -> Result<(), String> {
         Err("backend topology port is not installed".to_string())

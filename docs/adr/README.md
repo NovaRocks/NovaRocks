@@ -92,6 +92,15 @@ code-anchors:
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 
+### cluster-membership
+
+领域哲学：backend membership 的 durable desired state 与 heartbeat/live/generation 等运行期 observation 必须分离。
+frontend 的 `ClusterBackendService` 通过 StateStore 成为唯一 membership authority；core 只消费稳定的
+`BackendTopologyPort`，不保留 metadata bridge、global registry 或内存 durable fallback。配置的 backend 是 additive
+seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来多 FE fencing/takeover 分阶段裁决。
+
+- ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（active）
+
 ### table-maintenance
 
 领域哲学：表维护的 application/lifecycle 由 frontend host 统一拥有，core 只提供一对一、consumer-owned 的 typed

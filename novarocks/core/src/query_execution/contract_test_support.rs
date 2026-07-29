@@ -21,6 +21,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatchOptions;
 use arrow::datatypes::Schema;
@@ -50,6 +51,14 @@ fn fixture_execution(
     backends: &[(usize, SocketAddr)],
     cancellation: QueryCancellationView,
 ) -> QueryExecutionContext {
+    fixture_execution_with_deadline(backends, None, cancellation)
+}
+
+fn fixture_execution_with_deadline(
+    backends: &[(usize, SocketAddr)],
+    deadline: Option<Instant>,
+    cancellation: QueryCancellationView,
+) -> QueryExecutionContext {
     QueryExecutionContext::new(
         crate::common::app_config::ClusterRole::AllInOne,
         BackendTopologySnapshot::try_new(
@@ -60,7 +69,7 @@ fn fixture_execution(
                 .collect(),
         )
         .expect("contract fixture topology"),
-        None,
+        deadline,
         cancellation,
         crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )
@@ -125,6 +134,27 @@ impl ResultContractFixture {
 }
 
 pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
+    let backends = vec![
+        (3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031)),
+        (8, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19032)),
+    ];
+    let topology = BackendTopologySnapshot::try_new(
+        0,
+        backends
+            .iter()
+            .map(|(backend_idx, endpoint)| LiveBackendTarget::new(*backend_idx, *endpoint, 0))
+            .collect(),
+    )
+    .expect("contract fixture topology");
+    non_empty_result_contract_fixture_with_topology(topology)
+}
+
+/// Builds the result fixture with the exact topology captured by the caller.
+/// Frontend contract tests use this to prove that submission consumes the
+/// same snapshot observed at statement admission.
+pub fn non_empty_result_contract_fixture_with_topology(
+    topology: BackendTopologySnapshot,
+) -> ResultContractFixture {
     let edge = FragmentEdge {
         source_fragment_id: 11,
         target_fragment_id: 19,
@@ -155,11 +185,19 @@ pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
             },
         ])
         .expect("contract fixture native bundle");
-    let backends = vec![
-        (3, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19031)),
-        (8, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19032)),
-    ];
+    let backends = topology
+        .targets()
+        .iter()
+        .map(|target| (target.backend_idx(), target.endpoint()))
+        .collect::<Vec<_>>();
     let cancellation = QueryCancellationSource::new();
+    let execution = QueryExecutionContext::new(
+        crate::common::app_config::ClusterRole::AllInOne,
+        topology,
+        None,
+        cancellation.view(),
+        crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    );
     let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
@@ -169,7 +207,7 @@ pub fn non_empty_result_contract_fixture() -> ResultContractFixture {
             ..Default::default()
         }),
         DistributedQueryIntent::Result,
-        &fixture_execution(&backends, cancellation.view()),
+        &execution,
     )
     .expect("contract fixture request");
     let batch = RecordBatch::try_new_with_options(
@@ -565,7 +603,12 @@ pub fn non_empty_write_contract_fixture_with_query_timeout_seconds(
             ..Default::default()
         }),
         DistributedQueryIntent::Write,
-        &fixture_execution(&backends, cancellation.view()),
+        &fixture_execution_with_deadline(
+            &backends,
+            (query_timeout_seconds > 0)
+                .then(|| Instant::now() + Duration::from_secs(query_timeout_seconds as u64)),
+            cancellation.view(),
+        ),
     )
     .expect("write contract request");
     WriteContractFixture {
@@ -748,7 +791,12 @@ pub fn non_empty_profile_contract_fixture_with_query_timeout_seconds(
             ..Default::default()
         }),
         DistributedQueryIntent::Profile,
-        &fixture_execution(&backends, QueryCancellationSource::new().view()),
+        &fixture_execution_with_deadline(
+            &backends,
+            (query_timeout_seconds > 0)
+                .then(|| Instant::now() + Duration::from_secs(query_timeout_seconds as u64)),
+            QueryCancellationSource::new().view(),
+        ),
     )
     .expect("profile contract request");
     let batch = RecordBatch::try_new_with_options(

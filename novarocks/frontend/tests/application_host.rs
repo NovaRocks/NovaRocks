@@ -26,8 +26,8 @@ use novarocks::engine::view::{
 };
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::{
-    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig,
+    ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
+    FrontendApplicationHost, FrontendExecutionConfig,
 };
 use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
 use novarocks_state_store::{
@@ -37,6 +37,7 @@ use novarocks_state_store::{
 use sqlparser::ast::{Query, Statement};
 use sqlparser::parser::Parser;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -47,7 +48,29 @@ fn execution_config() -> FrontendExecutionConfig {
 async fn open_host(
     config: Option<StateStoreHostConfig>,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    FrontendApplicationHost::open(config, execution_config()).await
+    FrontendApplicationHost::open(config, execution_config(), backend_config()).await
+}
+
+fn backend_config() -> ClusterBackendOpenConfig {
+    ClusterBackendOpenConfig::new(
+        novarocks::common::app_config::ClusterRole::AllInOne,
+        Vec::new(),
+        Duration::from_secs(1),
+        1,
+        Duration::from_secs(1),
+    )
+    .expect("valid all-in-one backend config")
+}
+
+fn fe_backend_config() -> ClusterBackendOpenConfig {
+    ClusterBackendOpenConfig::new(
+        novarocks::common::app_config::ClusterRole::Fe,
+        Vec::new(),
+        Duration::from_secs(1),
+        1,
+        Duration::from_secs(1),
+    )
+    .expect("valid FE backend config")
 }
 
 struct SessionViewEngine;
@@ -203,6 +226,24 @@ async fn absent_config_opens_disabled_host() {
     host.shutdown()
         .await
         .expect("disabled host shutdown must succeed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fe_without_state_store_fails_before_frontend_services_open() {
+    let error =
+        match FrontendApplicationHost::open(None, execution_config(), fe_backend_config()).await {
+            Ok(host) => {
+                host.shutdown().await.expect("shutdown unexpected FE host");
+                panic!("role=fe must not open without StateStore membership authority");
+            }
+            Err(error) => error,
+        };
+
+    assert_eq!(
+        error.kind(),
+        FrontendApplicationErrorKind::ClusterBackendOpen
+    );
+    assert!(error.to_string().contains("requires StateStore"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

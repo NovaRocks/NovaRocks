@@ -47,7 +47,7 @@ mod tests {
     use crate::coordinator::FrontendDistributedQueryCoordinator;
     use crate::coordinator::query_registry::FrontendQueryRegistry;
     use crate::coordinator::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
-    use crate::topology::FrontendTopologyController;
+    use crate::topology::ClusterBackendService;
 
     fn report_endpoint() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19040)
@@ -623,7 +623,7 @@ mod tests {
         let backends = fixture.backends().to_vec();
         let batch = fixture.result_batch();
         let request = fixture.into_request();
-        let topology = Arc::new(FrontendTopologyController::from_captured_targets_for_test(
+        let topology = Arc::new(ClusterBackendService::from_captured_targets_for_test(
             &backends
                 .iter()
                 .map(|(backend_idx, endpoint)| LiveBackendTarget::new(*backend_idx, *endpoint, 0))
@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn missing_writer_report_times_out_to_structured_abort_and_exact_cancellation() {
-        let fixture = non_empty_write_contract_fixture_with_query_timeout_seconds(0);
+        let fixture = non_empty_write_contract_fixture_with_query_timeout_seconds(1);
         let backends = fixture.backends().to_vec();
         let request = fixture.into_request();
         let dispatcher = Arc::new(RecordingDispatcher::default());

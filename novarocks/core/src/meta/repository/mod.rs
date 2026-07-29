@@ -19,7 +19,6 @@ use std::fmt;
 
 use crate::meta::{MetaError, MetaErrorKind};
 
-pub mod backend;
 pub mod iceberg_operation;
 pub mod id_scopes;
 pub mod job;

@@ -127,7 +127,17 @@ SQL client / SQL test runner
    registry, never hardcoded or defaulted to "single-process = 1 node". Tests
    must never pass only in standalone while failing under 1FE+3BE.
 
-6. **Language policy**
+6. **Frontend owns durable backend membership**
+   In `role=fe`, StateStore is required and `ClusterBackendService` is the sole
+   durable membership owner. `[cluster].backends` are additive seeds; SQL
+   `ADD BACKEND` / `DROP BACKEND` persist across FE restart. Heartbeat, live
+   state, generation, and fragment activity are runtime observations, not a
+   second durable catalog. Core consumes `BackendTopologyPort` only: do not add
+   a metadata bridge, global registry, in-memory fallback, or direct-call path.
+   `role=all-in-one` keeps loopback membership transient, while `role=be` does
+   not create frontend membership or StateStore services.
+
+7. **Language policy**
    - User interaction and design docs: Chinese
    - Code comments, logs, error messages, commit messages: English
 

@@ -20,7 +20,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::{
@@ -33,11 +33,11 @@ use novarocks_frontend::table_maintenance::model::{OptimizeJob, OptimizeJobCreat
 use novarocks_frontend::table_maintenance::repository::OptimizeJobRepository;
 use novarocks_frontend::table_maintenance::worker::OptimizeWorker;
 use novarocks_spi::state_store::{
-    CommitOutcome, Key, Precondition, StateStore, TransactionId, Value,
+    CommitOutcome, FeDeploymentView, Key, Precondition, StateStore, TransactionId, Value,
 };
 use novarocks_state_store::{
-    FeDeploymentView, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-    StateStoreRuntime, open_state_store,
+    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
@@ -211,17 +211,26 @@ fn sqlite_config(path: &Path) -> StateStoreConfig {
 }
 
 async fn open_sqlite(path: &Path) -> Arc<dyn StateStore> {
-    let runtime = StateStoreRuntime::local().expect("local state-store runtime");
-    open_state_store(
-        &runtime,
-        sqlite_config(path),
+    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: sqlite_config(path),
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).unwrap(),
             topology_revision: Bytes::from_static(b"table-maintenance-worker-topology"),
         },
+        Instant::now() + Duration::from_secs(5),
     )
     .await
     .expect("open SQLite state store")
+    .state_store()
+    .expect("SQLite state store exposure")
 }
 
 async fn fixture() -> (

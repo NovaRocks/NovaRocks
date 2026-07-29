@@ -19,13 +19,15 @@ use bytes::Bytes;
 use novarocks::mv::repository::MvRepositoryErrorKind;
 use novarocks_frontend::mv::repository::key::definition_by_id_key;
 use novarocks_frontend::{
-    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
+    ClusterBackendOpenConfig, FrontendApplicationErrorKind, FrontendApplicationHost,
+    FrontendExecutionConfig,
 };
 use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
     StateStoreProviderConfig,
 };
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -53,7 +55,18 @@ fn execution_config() -> FrontendExecutionConfig {
 async fn open_host(
     config: Option<StateStoreHostConfig>,
 ) -> Result<FrontendApplicationHost, novarocks_frontend::FrontendApplicationError> {
-    FrontendApplicationHost::open(config, execution_config()).await
+    FrontendApplicationHost::open(config, execution_config(), backend_config()).await
+}
+
+fn backend_config() -> ClusterBackendOpenConfig {
+    ClusterBackendOpenConfig::new(
+        novarocks::common::app_config::ClusterRole::AllInOne,
+        Vec::new(),
+        Duration::from_secs(1),
+        1,
+        Duration::from_secs(1),
+    )
+    .expect("valid all-in-one backend config")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -240,7 +240,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_worker_count,
             runtime_filter_dispatcher,
             Arc::new(
-                crate::topology::FrontendTopologyController::from_captured_targets_for_test(
+                crate::topology::ClusterBackendService::from_captured_targets_for_test(
                     &scheduler
                         .backend_entries()
                         .iter()

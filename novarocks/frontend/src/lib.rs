@@ -41,4 +41,5 @@ pub use server::{
 };
 pub use statistics::FrontendStatisticsService;
 pub use system_catalog::SystemCatalogService;
+pub use topology::ClusterBackendOpenConfig;
 pub use view::FrontendViewService;

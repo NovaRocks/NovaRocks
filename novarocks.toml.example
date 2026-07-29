@@ -10,7 +10,9 @@ log_level = "info"
 # Example: "info,novarocks=debug,h2=off,hyper=off,tonic=off"
 # log_filter = "info"
 
-# Optional durable state store. Select exactly one provider configuration.
+# Durable StateStore provider. It is required for `cluster.role = "fe"`, where it
+# is the sole durable owner of backend membership; it remains optional for
+# `all-in-one` and `be`. Select exactly one provider configuration.
 # SQLite is restricted to deployments with exactly one active FE.
 # [state_store]
 # provider = "sqlite"
@@ -56,6 +58,17 @@ log_level = "info"
 # pool_min = 1
 # pool_max = 16
 # inactive_connection_ttl_ms = 30000
+
+# Distributed FE membership example. `backends` are additive seeds only: missing
+# endpoints are added to the StateStore-backed membership, but existing durable
+# entries are never deleted or reactivated by configuration. SQL ADD/DROP changes
+# persist across FE restart. `role = "be"` and `role = "all-in-one"` must not set
+# `backends`; all-in-one keeps its loopback backend transient.
+# [cluster]
+# role = "fe"
+# backends = ["10.0.0.11:9080", "10.0.0.12:9080"]
+# heartbeat_interval_ms = 1000
+# heartbeat_timeout_retries = 3
 
 [server]
 # Service bind host. Default: "127.0.0.1".

@@ -82,7 +82,7 @@ where
             ));
         }
     };
-    let services = novarocks_frontend::standalone_open_services_for_server(&frontend, &config);
+    let services = novarocks_frontend::standalone_open_services_for_server(&frontend);
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let query_control = services.query_control.clone();

@@ -173,7 +173,7 @@ fn load_config_and_resolve_role(
     let config_path = novarocks::common::app_config::resolve_config_path(
         cli.config_path.as_deref().map(std::path::Path::new),
     );
-    let cfg = match config_path.as_ref() {
+    let mut cfg = match config_path.as_ref() {
         Some(p) => novarocks::common::app_config::NovaRocksConfig::load_from_file(p)
             .map_err(|e| anyhow::anyhow!("{}", e))?,
         None => novarocks::common::app_config::NovaRocksConfig::default(),
@@ -183,12 +183,11 @@ fn load_config_and_resolve_role(
 
     let role = resolve_cluster_role(&cfg, role_override);
 
-    // C1: validate using the *effective* (CLI-overridden) role, not the
-    // config-file role.  Cloning only the small ClusterConfig struct avoids
-    // mutating the returned cfg.
-    let mut effective_cluster = cfg.cluster.clone();
-    effective_cluster.role = role;
-    effective_cluster
+    // Persist the effective role into the owned configuration before any
+    // composition root observes it. Frontend admission and topology ownership
+    // must never disagree with the CLI role override.
+    cfg.cluster.role = role;
+    cfg.cluster
         .validate()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 

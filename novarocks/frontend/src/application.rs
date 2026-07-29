@@ -34,7 +34,7 @@ use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::query_control::FrontendQueryControl;
 use crate::statistics::FrontendStatisticsService;
 use crate::table_maintenance::FrontendTableMaintenanceService;
-use crate::topology::FrontendTopologyController;
+use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,6 +47,7 @@ pub enum FrontendApplicationErrorKind {
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
     MvServiceOpen,
+    ClusterBackendOpen,
     CoordinatorOpen,
     Server,
     Shutdown,
@@ -100,7 +101,8 @@ pub struct FrontendApplicationHost {
     query_execution: Option<QueryExecutionService>,
     query_control: novarocks::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
-    topology: Arc<FrontendTopologyController>,
+    execution_role: novarocks::common::app_config::ClusterRole,
+    topology: Option<Arc<ClusterBackendService>>,
 }
 
 #[derive(Clone)]
@@ -128,6 +130,7 @@ impl FrontendApplicationHost {
     pub async fn open(
         config: Option<StateStoreHostConfig>,
         execution: FrontendExecutionConfig,
+        backend: ClusterBackendOpenConfig,
     ) -> Result<Self, FrontendApplicationError> {
         let mut host = Self {
             statistics_service: None,
@@ -139,12 +142,30 @@ impl FrontendApplicationHost {
             query_execution: None,
             query_control: FrontendQueryControl::service(),
             coordinator: None,
-            topology: Arc::new(FrontendTopologyController::new_unconfigured()),
+            execution_role: backend.role(),
+            topology: None,
         };
 
         if let Some(config) = config {
             if let Err(error) = host.open_configured(config).await {
                 return Err(host.cleanup_open_error(error).await);
+            }
+        }
+        match ClusterBackendService::open(
+            backend,
+            host.state_store(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        {
+            Ok(topology) => host.topology = Some(topology),
+            Err(error) => {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::ClusterBackendOpen,
+                        error,
+                    ))
+                    .await);
             }
         }
         host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
@@ -205,6 +226,11 @@ impl FrontendApplicationHost {
         if let Err(error) = host.open_coordinator(execution) {
             return Err(host.cleanup_open_error(error).await);
         }
+        if let Err(error) = host.topology().start_heartbeat_manager().map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::ClusterBackendOpen, error)
+        }) {
+            return Err(host.cleanup_open_error(error).await);
+        }
 
         Ok(host)
     }
@@ -256,6 +282,10 @@ impl FrontendApplicationHost {
         self.state_store_host
             .as_ref()
             .and_then(StateStoreHost::state_store)
+    }
+
+    pub fn execution_role(&self) -> novarocks::common::app_config::ClusterRole {
+        self.execution_role
     }
 
     pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
@@ -332,39 +362,7 @@ impl FrontendApplicationHost {
     pub(crate) fn backend_topology_port(
         &self,
     ) -> novarocks::query_execution::backend::BackendTopologyService {
-        Arc::clone(&self.topology) as novarocks::query_execution::backend::BackendTopologyService
-    }
-
-    pub(crate) fn configure_backend_topology(
-        &self,
-        config: &novarocks::common::app_config::NovaRocksConfig,
-    ) -> Result<(), FrontendApplicationError> {
-        let configured_seed_endpoints = config
-            .cluster
-            .backends
-            .iter()
-            .map(|backend| {
-                backend.parse().map_err(|error| {
-                    FrontendApplicationError::server(format!(
-                        "parse configured backend endpoint '{backend}' failed: {error}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.topology
-            .configure_lifecycle(
-                config.cluster.heartbeat_timeout_retries,
-                Duration::from_secs(config.cluster.decommission_timeout_secs),
-                configured_seed_endpoints,
-            )
-            .map_err(FrontendApplicationError::server)?;
-        self.topology
-            .start_heartbeat_manager(Duration::from_millis(config.cluster.heartbeat_interval_ms))
-            .map_err(|error| {
-                FrontendApplicationError::server(format!(
-                    "start frontend backend heartbeat manager failed: {error}"
-                ))
-            })
+        Arc::clone(self.topology()) as novarocks::query_execution::backend::BackendTopologyService
     }
 
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
@@ -415,7 +413,7 @@ impl FrontendApplicationHost {
             execution.runtime_filter_worker_count,
             self.backend_topology_port(),
         ));
-        self.topology
+        self.topology()
             .attach_query_events(Arc::new(coordinator.backend_query_activity()));
         self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));
         self.coordinator = Some(coordinator);
@@ -433,10 +431,17 @@ impl FrontendApplicationHost {
     }
 
     async fn release_resources(&mut self) -> Result<(), String> {
-        let heartbeat_result = self.topology.stop_heartbeat_manager();
-        self.topology.detach_query_events();
         self.query_execution.take();
         self.coordinator.take();
+        let heartbeat_result = self
+            .topology
+            .as_ref()
+            .map(|topology| topology.stop_heartbeat_manager())
+            .transpose();
+        if let Some(topology) = self.topology.as_ref() {
+            topology.detach_query_events();
+        }
+        self.topology.take();
         let table_maintenance_error = self
             .table_maintenance_service
             .as_ref()
@@ -470,6 +475,12 @@ impl FrontendApplicationHost {
             self.state_store_host.take();
         }
         primary_error.map_or(Ok(()), Err)
+    }
+
+    fn topology(&self) -> &Arc<ClusterBackendService> {
+        self.topology
+            .as_ref()
+            .expect("frontend cluster backend service is installed before host open returns")
     }
 }
 
