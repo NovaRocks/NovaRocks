@@ -384,25 +384,12 @@ fn collect_statistics_through_engine(
         let sqlparser::ast::Statement::Query(query) = query else {
             return Err("statistics aggregate did not parse as query".to_string());
         };
-        let catalog_snapshot = state
-            .catalog_service
-            .local()
-            .read()
-            .expect("standalone catalog read lock")
-            .clone();
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let result = crate::engine::execute_query(
-            &query,
-            &catalog_snapshot,
-            &connectors_snapshot,
+        let result = crate::engine::execute_query_with_catalog_service(
+            state,
+            target.current_catalog.as_deref(),
             &database,
-            state.exchange_port,
+            &query,
             None,
-            &state.query_execution,
         )?;
         let row_count = result_cell(&result, 0, 0)
             .and_then(|value| value.parse::<i64>().ok())

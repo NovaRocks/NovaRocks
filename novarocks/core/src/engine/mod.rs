@@ -3486,6 +3486,55 @@ pub(crate) fn execute_query_with_catalog_service_with_connector_context(
     )
 }
 
+/// Execute a refresh query whose SQL has already been expanded by the MV
+/// refresh path. These reads must not be considered for automatic MV rewrite:
+/// doing so can rewrite a first refresh back to its own still-empty target.
+pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    query_opts: Option<QueryOptions>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<QueryResult, String> {
+    let catalog_service_snapshot = catalog_service_snapshot(state);
+    let catalog_snapshot = catalog_service_snapshot
+        .local()
+        .read()
+        .expect("catalog service snapshot local read lock");
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let analyzer_provider = build_catalog_service_provider(
+        current_catalog,
+        &catalog_service_snapshot,
+        &connectors_snapshot,
+        connector_context.clone(),
+        TableLookupMode::SchemaOnly,
+    );
+    let maintenance_execution = capture_maintenance_execution(state)?;
+    execute_query_with_options_and_imv_validator_with_catalog_provider(
+        query,
+        &analyzer_provider,
+        &catalog_snapshot,
+        &connectors_snapshot,
+        current_database,
+        state.exchange_port,
+        query_opts,
+        &state.query_execution,
+        connector_context,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        Some(&maintenance_execution),
+    )
+}
+
 pub(crate) type IcebergWriteRootDistributionResolver = Box<
     dyn FnOnce(
         &crate::sql::planner::logical::LogicalPlanNode,

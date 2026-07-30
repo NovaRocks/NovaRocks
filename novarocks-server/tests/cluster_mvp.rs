@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
-use novarocks_frontend::{FrontendApplicationHost, FrontendExecutionConfig};
+use novarocks_frontend::{
+    ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
+};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
     StateStoreProviderConfig,
@@ -332,6 +334,7 @@ struct ClusterHarness {
     _fe: ProcessGuard,
     fe_mysql: u16,
     be_grpc: u16,
+    _state_store_root: TempDir,
 }
 
 impl ClusterHarness {
@@ -346,6 +349,11 @@ impl ClusterHarness {
         let fe_mysql_port = fe_mysql.port();
         let fe_http_port = fe_http.port();
         let fe_grpc_port = fe_grpc.port();
+        let state_store_root = TempFileBuilder::new()
+            .prefix("cluster-state-store-")
+            .tempdir_in(runtime_dir())
+            .expect("create cluster StateStore root");
+        let state_store_path = state_store_root.path().join("state.sqlite");
 
         let be_config = write_config(
             "be",
@@ -377,8 +385,15 @@ mysql_port = {fe_mysql_port}
 [cluster]
 role = "fe"
 backends = ["127.0.0.1:{be_grpc_port}"]
+
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "cluster-harness-{fe_mysql_port}"
+deployment_owner = "fe-1"
 {fe_extra}
-"#
+"#,
+                state_store_path.display()
             ),
         );
 
@@ -398,6 +413,7 @@ backends = ["127.0.0.1:{be_grpc_port}"]
             _fe: fe,
             fe_mysql: fe_mysql_port,
             be_grpc: be_grpc_port,
+            _state_store_root: state_store_root,
         }
     }
 }
@@ -418,6 +434,17 @@ struct MultiBeClusterHarness {
 
 impl MultiBeClusterHarness {
     fn start_n_be(n: usize, be_debug: &str, fe_extra: &str) -> Self {
+        // Callers that explicitly exercise StateStore lifecycle supply their
+        // own durable backend; do not render a duplicate TOML table for them.
+        Self::start_n_be_with_options(n, be_debug, fe_extra, !fe_extra.contains("[state_store]"))
+    }
+
+    fn start_n_be_with_options(
+        n: usize,
+        be_debug: &str,
+        fe_extra: &str,
+        default_state_store: bool,
+    ) -> Self {
         assert!(n >= 1, "must spawn at least one BE");
 
         // Reserve all ports up front before releasing any of them.
@@ -449,6 +476,21 @@ impl MultiBeClusterHarness {
             .map(|index| log_root.path().join(format!("be-{index}")))
             .collect::<Vec<_>>();
         let fe_log_dir = log_root.path().join("fe");
+        let default_state_store_config = if default_state_store {
+            format!(
+                r#"
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "cluster-mvp-{}"
+deployment_owner = "fe-1"
+"#,
+                log_root.path().join("frontend-state.sqlite").display(),
+                fe_mysql_port,
+            )
+        } else {
+            String::new()
+        };
 
         // Write all BE configs (while ports are still reserved).
         let be_configs: Vec<NamedTempFile> = be_port_sets
@@ -501,6 +543,7 @@ mysql_port = {fe_mysql_port}
 [cluster]
 role = "fe"
 backends = [{backends_list}]
+{default_state_store_config}
 {fe_extra}
 "#,
                 fe_log_dir.display()
@@ -565,7 +608,7 @@ deployment_owner = "fe-1"
 "#,
             state_store_path.display()
         );
-        Self::start_n_be(3, "", &state_store_config)
+        Self::start_n_be_with_options(3, "", &state_store_config, false)
     }
 
     fn start_three_be_sqlite_state_store_with_metadata(
@@ -598,7 +641,7 @@ deployment_owner = "fe-1"
             metadata_path.display(),
             state_store_path.display(),
         );
-        Self::start_n_be(3, "", &fe_extra)
+        Self::start_n_be_with_options(3, "", &fe_extra, false)
     }
 
     fn fe_mysql_port(&self) -> u16 {
@@ -1121,6 +1164,8 @@ fn cross_process_remote_dispatcher_smoke() {
     let fe_mysql_port = fe_mysql.port();
     let fe_http_port = fe_http.port();
     let fe_grpc_port = fe_grpc.port();
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
 
     let be_config = write_config(
         "be",
@@ -1153,7 +1198,14 @@ mysql_port = {fe_mysql_port}
 [cluster]
 role = "fe"
 backends = ["127.0.0.1:{be_grpc_port}"]
-"#
+
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "remote-dispatcher-{fe_mysql_port}"
+deployment_owner = "fe-1"
+"#,
+            state_store_path.display()
         ),
     );
 
@@ -1260,6 +1312,8 @@ fn d4_dynamic_backend_sql_and_metrics_smoke() {
     let fe_mysql_port = fe_mysql.port();
     let fe_http_port = fe_http.port();
     let fe_grpc_port = fe_grpc.port();
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
 
     let be_config = write_config(
         "d4-be",
@@ -1292,7 +1346,14 @@ role = "fe"
 backends = []
 heartbeat_interval_ms = 200
 heartbeat_timeout_retries = 2
-"#
+
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "d4-dynamic-backend-{fe_mysql_port}"
+deployment_owner = "fe-1"
+"#,
+            state_store_path.display()
         ),
     );
 
@@ -2227,6 +2288,14 @@ fn cross_process_three_be_mv_state_store_restart() {
                 "mv-state-store-restart",
             )),
             frontend_execution_config(),
+            ClusterBackendOpenConfig::new(
+                novarocks::common::app_config::ClusterRole::AllInOne,
+                Vec::new(),
+                Duration::from_secs(1),
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("valid StateStore inspection backend config"),
         ))
         .expect("reopen MV StateStore after clean FE shutdown");
     let definitions = host

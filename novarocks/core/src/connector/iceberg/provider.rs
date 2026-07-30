@@ -1306,14 +1306,34 @@ pub(crate) fn load_table_def_at(
     let files = if schema_only {
         Vec::new()
     } else {
-        plan_scan_files(
-            connectors,
-            context,
-            &table_info,
-            binding,
-            &payload.prepared_files,
-            &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
-        )?
+        let planned = if snapshot_id.is_some() {
+            plan_native_iceberg_read_with_file_override(
+                connectors,
+                context,
+                &table_info,
+                binding,
+                None,
+                &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
+            )?
+        } else {
+            plan_native_iceberg_read(
+                connectors,
+                context,
+                &table_info,
+                binding,
+                &payload.prepared_files,
+                &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
+            )?
+        };
+        planned
+            .splits
+            .iter()
+            .map(|split| {
+                decode_payload::<SplitPayload>(split.payload(), "split")
+                    .map(|payload| payload.data_file)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
     };
     let columns = metadata
         .schema
@@ -1481,6 +1501,24 @@ pub(crate) fn plan_native_iceberg_read(
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
 ) -> Result<PlannedIcebergConnectorRead, String> {
+    plan_native_iceberg_read_with_file_override(
+        connectors,
+        context,
+        table,
+        binding,
+        Some(explicit_files),
+        projection,
+    )
+}
+
+fn plan_native_iceberg_read_with_file_override(
+    connectors: &crate::connector::ConnectorRegistry,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    table: &super::scan_model::IcebergTableInfo,
+    binding: super::scan_model::IcebergDataFileBinding,
+    explicit_files: Option<&[IcebergDataFileInfo]>,
+    projection: &[usize],
+) -> Result<PlannedIcebergConnectorRead, String> {
     use std::num::NonZeroUsize;
 
     let instance_id =
@@ -1511,7 +1549,8 @@ pub(crate) fn plan_native_iceberg_read(
                     binding,
                     super::scan_model::IcebergDataFileBinding::ExplicitFiles
                 )
-                .then(|| explicit_files.to_vec()),
+                .then(|| explicit_files.map(ToOwned::to_owned))
+                .flatten(),
             },
             "table handle",
             context.max_handle_payload_bytes(),

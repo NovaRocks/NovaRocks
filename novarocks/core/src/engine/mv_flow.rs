@@ -864,7 +864,7 @@ pub(crate) fn execute_query_for_mv_refresh_with_catalog(
         )?;
     }
 
-    crate::engine::execute_query_with_catalog_service_with_connector_context(
+    crate::engine::execute_preexpanded_mv_refresh_query_with_catalog_service_with_connector_context(
         state,
         current_catalog,
         current_database,
