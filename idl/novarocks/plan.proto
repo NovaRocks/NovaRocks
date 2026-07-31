@@ -412,6 +412,25 @@ message DataSink {
     DataStreamSink data_stream = 5;                       // Exchange stream sink.
     MultiCastDataStreamSink multi_cast_data_stream = 6;   // CTE-style multicast stream sink.
     ConnectorWriteFragmentSink connector_write = 7;       // Provider-neutral staged writer sink.
+    StatisticsSink statistics = 8;                        // Internal typed statistics partial sink.
+  }
+}
+
+// Core-internal statistics collection sink. This carries only the stable
+// logical metric selection; fragment terminal reports carry the bounded,
+// opaque partial and never materialize user result rows.
+message StatisticsSink {
+  repeated StatisticsMetric metrics = 1;
+}
+
+message StatisticsMetric {
+  oneof kind {
+    bool row_count = 1;
+    string null_count_column = 2;
+    string minimum_column = 3;
+    string maximum_column = 4;
+    string average_size_column = 5;
+    string theta_ndv_column = 6;
   }
 }
 

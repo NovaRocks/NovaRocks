@@ -282,6 +282,7 @@ pub(in crate::sql::planner::distributed) fn build_boundary_catalog(
                 });
             }
             DataSink::Noop => {}
+            DataSink::Statistics(_) => {}
             DataSink::ConnectorWrite(sink) => {
                 let columns = connector_write_input_columns(
                     fragment.fragment_id,

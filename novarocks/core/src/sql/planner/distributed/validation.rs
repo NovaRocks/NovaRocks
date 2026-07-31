@@ -255,13 +255,14 @@ fn validate_structure(
         if fragment.fragment_id == root_fragment_id {
             let root_sink_supported = match fragment.sink {
                 DataSink::Result
+                | DataSink::Statistics(_)
                 | DataSink::ConnectorWrite(_)
                 | DataSink::ChangeStreamRouter(_) => true,
                 _ => false,
             };
             if !root_sink_supported {
                 return Err(format!(
-                    "lower_distributed_plan root fragment id={} must use result, Iceberg write, or Iceberg change-stream router sink",
+                    "lower_distributed_plan root fragment id={} must use result, statistics, connector write, or change-stream router sink",
                     fragment.fragment_id
                 ));
             }

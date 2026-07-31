@@ -1926,7 +1926,7 @@ pub(in crate::sql::planner::distributed) fn build_write_contract_catalog(
                         .insert((fragment.fragment_id, branch.branch_id), partition);
                 }
             }
-            DataSink::Result | DataSink::Noop => {}
+            DataSink::Result | DataSink::Noop | DataSink::Statistics(_) => {}
         }
     }
 

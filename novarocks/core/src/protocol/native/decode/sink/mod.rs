@@ -41,7 +41,8 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorOpenWriterRequest, ConnectorRequestContext, ConnectorWriteExecutionId,
-    ConnectorWriteOperationId, ConnectorWriterHandle, ConnectorWriterIdentity,
+    ConnectorWriteOperationId, ConnectorWriterHandle, ConnectorWriterIdentity, StatisticsMetric,
+    StatisticsMetricRequest,
 };
 
 struct NativeWriterCancellation {
@@ -87,6 +88,9 @@ pub(crate) fn decode_fragment_sink_program_with_context(
             Ok(FragmentSinkProgram::Result)
         }
         plan::data_sink::Kind::Noop(true) => Ok(FragmentSinkProgram::Noop),
+        plan::data_sink::Kind::Statistics(statistics) => decode_statistics_sink(statistics)
+            .map(FragmentSinkProgram::Statistics)
+            .map_err(|error| error.into_native(path.field("statistics"))),
         plan::data_sink::Kind::Result(false) => {
             Err(super::NativeFragmentDecodeError::invalid_value(
                 path.field("result"),
@@ -159,6 +163,62 @@ pub(crate) fn decode_fragment_sink_program_with_context(
         .map(FragmentSinkProgram::SplitDataStream)
         .map_err(|error| error.into_native(path.field("change_stream_router"))),
     }
+}
+
+fn decode_statistics_sink(
+    sink: &plan::StatisticsSink,
+) -> Result<crate::exec::fragment::sink::StatisticsSinkProgram, NativeFragmentLeafDecodeError> {
+    let mut metrics = Vec::with_capacity(sink.metrics.len());
+    for (index, metric) in sink.metrics.iter().enumerate() {
+        let path = format!("statistics metric[{index}]");
+        let kind = metric.kind.as_ref().ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_collection(
+                ProtocolErrorKind::MissingField,
+                format!("{path} requires a kind"),
+            )
+        })?;
+        let column = |value: &String, name: &'static str| {
+            (!value.is_empty())
+                .then(|| value.clone().into())
+                .ok_or_else(|| {
+                    NativeFragmentLeafDecodeError::at_collection(
+                        ProtocolErrorKind::InvalidValue,
+                        format!("{path} {name} must not be empty"),
+                    )
+                })
+        };
+        metrics.push(match kind {
+            plan::statistics_metric::Kind::RowCount(true) => StatisticsMetric::RowCount,
+            plan::statistics_metric::Kind::RowCount(false) => {
+                return Err(NativeFragmentLeafDecodeError::at_collection(
+                    ProtocolErrorKind::InvalidValue,
+                    format!("{path} row_count marker must be true"),
+                ));
+            }
+            plan::statistics_metric::Kind::NullCountColumn(value) => StatisticsMetric::NullCount {
+                column: column(value, "null_count_column")?,
+            },
+            plan::statistics_metric::Kind::MinimumColumn(value) => StatisticsMetric::Minimum {
+                column: column(value, "minimum_column")?,
+            },
+            plan::statistics_metric::Kind::MaximumColumn(value) => StatisticsMetric::Maximum {
+                column: column(value, "maximum_column")?,
+            },
+            plan::statistics_metric::Kind::AverageSizeColumn(value) => {
+                StatisticsMetric::AverageSize {
+                    column: column(value, "average_size_column")?,
+                }
+            }
+            plan::statistics_metric::Kind::ThetaNdvColumn(value) => StatisticsMetric::ThetaNdv {
+                column: column(value, "theta_ndv_column")?,
+            },
+        });
+    }
+    StatisticsMetricRequest::try_new(metrics)
+        .map(crate::exec::fragment::sink::StatisticsSinkProgram::new)
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_collection(ProtocolErrorKind::InvalidValue, error)
+        })
 }
 
 fn decode_connector_write_sink_program(
@@ -511,6 +571,7 @@ pub(crate) fn decode_fragment_sink_assignment(
         }
         plan::data_sink::Kind::Result(_)
         | plan::data_sink::Kind::Noop(_)
+        | plan::data_sink::Kind::Statistics(_)
         | plan::data_sink::Kind::ConnectorWrite(_) => {
             if instance.destinations.is_empty() {
                 Ok(FragmentSinkAssignment::None)
