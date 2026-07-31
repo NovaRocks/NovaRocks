@@ -21,8 +21,9 @@
 //! collection is internal distributed work whose output is handed back to the
 //! connector control plane, never encoded as client MySQL rows.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use arrow::array::{
@@ -43,8 +44,13 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::backend::BackendTopologySnapshot;
-use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::preparation::scan::PlannedConnectorRead;
+use crate::query_execution::contract::{
+    DistributedQueryError, DistributedQueryErrorKind, DistributedQueryRequest,
+    build_statistics_query_request_with_execution,
+};
+use crate::query_execution::preparation::scan::{
+    PlannedConnectorRead, ResolvedScanExecution, ScanBindingResolver,
+};
 use sha2::{Digest, Sha256};
 
 /// The longest independently owned durable ANALYZE attempt. A client wait
@@ -283,6 +289,144 @@ pub(crate) fn prepare_statistics_connector_read(
         batch,
         planning_lease: Some(lease),
     })
+}
+
+/// Compile an already-pinned connector statistics program into a normal
+/// native distributed request.  Preparation receives the opaque read produced
+/// above through a one-shot resolver; it cannot reopen the provider catalog or
+/// reinterpret the table's data version.  The emitted fragment source remains
+/// the regular `ConnectorReadSource`, so BE execution has no statistics-only
+/// connector identity or reader path.
+pub(crate) fn build_statistics_collection_request(
+    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn ConnectorControlResolver,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    context: ConnectorRequestContext,
+    program: StatisticsCollectionProgram,
+) -> Result<DistributedQueryRequest, DistributedQueryError> {
+    let read = prepare_statistics_connector_read(
+        controls,
+        execution.topology(),
+        &program,
+        context.clone(),
+    )?;
+    let physical = statistics_scan_physical_plan(&program)?;
+    let distributed =
+        crate::sql::planner::pipeline::build_statistics_distributed_plan_with_settings(
+            physical,
+            program.plan.metrics.clone(),
+            execution.optimizer_settings(),
+        )
+        .map_err(contract_violation)?;
+    let resolver = PinnedStatisticsReadResolver::new(read);
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed,
+        connectors,
+        controls,
+        &context,
+        Some(&resolver),
+    )
+    .map_err(contract_violation)?;
+    let native_bundle =
+        crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)
+            .map_err(contract_violation)?;
+    Ok(build_statistics_query_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        program,
+        execution,
+    ))
+}
+
+fn statistics_scan_physical_plan(
+    program: &StatisticsCollectionProgram,
+) -> Result<crate::sql::planner::physical::PhysicalPlanNode, DistributedQueryError> {
+    let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+    let mut scan_columns = Vec::with_capacity(program.plan.scan_columns().len());
+    let mut table_columns = Vec::with_capacity(program.plan.scan_columns().len());
+    for column in program.plan.scan_columns() {
+        let name = column.name().to_string();
+        let data_type = column.data_type().clone();
+        let nullable = column.nullable();
+        let column_id = factory.create(None, name.clone(), data_type.clone(), nullable);
+        scan_columns.push(crate::sql::analysis::OutputColumn {
+            column_id,
+            name: name.clone(),
+            data_type: data_type.clone(),
+            nullable,
+            is_internal: false,
+        });
+        table_columns.push(novarocks_catalog::schema::ColumnDef {
+            name,
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        });
+    }
+    Ok(crate::sql::planner::physical::PhysicalPlanNode {
+        kind: crate::sql::planner::physical::PhysicalPlanKind::Scan(
+            crate::sql::planner::payload::PlanScanNode {
+                database: "__statistics".to_string(),
+                table: crate::sql::planner::table::TableDef {
+                    name: "__connector_pinned_statistics".to_string(),
+                    columns: table_columns,
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                },
+                alias: None,
+                columns: scan_columns.clone(),
+                predicates: Vec::new(),
+                required_columns: None,
+                variant_columns: Vec::new(),
+                mv_rewritten_from: None,
+            },
+        ),
+        children: Vec::new(),
+        output_columns: scan_columns,
+        stats: crate::sql::planner::physical::PhysicalPlanStats {
+            output_row_count: 0.0,
+            row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
+            column_statistics: HashMap::new(),
+            cost_estimate: None,
+            broadcast_decision: None,
+        },
+        probe_runtime_filters: Vec::new(),
+    })
+}
+
+struct PinnedStatisticsReadResolver {
+    read: Mutex<Option<PlannedConnectorRead>>,
+}
+
+impl PinnedStatisticsReadResolver {
+    fn new(read: PlannedConnectorRead) -> Self {
+        Self {
+            read: Mutex::new(Some(read)),
+        }
+    }
+}
+
+impl ScanBindingResolver for PinnedStatisticsReadResolver {
+    fn resolve_scan(
+        &self,
+        _node_id: i32,
+        _scan: &crate::sql::planner::payload::PlanScanNode,
+    ) -> Result<Option<ResolvedScanExecution>, String> {
+        Ok(Some(ResolvedScanExecution::ConnectorRead))
+    }
+
+    fn resolve_connector_read(
+        &self,
+        _node_id: i32,
+        _scan: &crate::sql::planner::payload::PlanScanNode,
+    ) -> Result<Option<PlannedConnectorRead>, String> {
+        self.read
+            .lock()
+            .map_err(|_| "pinned statistics connector read lock poisoned".to_string())
+            .map(|mut read| read.take())
+    }
 }
 
 fn connector_planning_error(

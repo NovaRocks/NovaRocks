@@ -144,6 +144,10 @@ impl IcebergMvTargetLocatorScan {
 ///   scans; codegen expands it into an explicit change-file payload.
 #[derive(Clone, Debug)]
 pub enum ScanSource {
+    /// A provider-neutral, already pinned connector read. Preparation obtains
+    /// execution declarations and opaque scan/split handles only from its
+    /// injected resolver, never by resolving latest metadata again.
+    ConnectorPinned,
     /// External/compat StarRocks scan identity. The `(db_id, table_id)` pair
     /// lets execution resolve tablet metadata without relying on mutable
     /// names. It does not grant native DDL, durable catalog, or write

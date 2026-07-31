@@ -88,6 +88,7 @@ fn standalone_open_services(
     .with_statistics_application(host.statistics_application_port())
     .with_statistics_target_resolver_sink(host.statistics_application_port())
     .with_statistics_table_reader_sink(host.statistics_application_port())
+    .with_statistics_attempt_executor_sink(host.statistics_application_port())
 }
 
 /// Opens the frontend services once for an externally composed server. The

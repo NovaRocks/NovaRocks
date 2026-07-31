@@ -22,6 +22,7 @@
 //! It never opens writes or starts a restore: an existing coordination plane
 //! is respected exactly as it was found.
 
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -96,9 +97,15 @@ impl StatisticsAttemptError {
 
 /// Attempt-local collection material. It never crosses a StateStore boundary:
 /// only the separately prepared reconciliation evidence is durable.
-pub trait StatisticsCollectedAttempt: Send + Sync {}
+pub trait StatisticsCollectedAttempt: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
 
-impl StatisticsCollectedAttempt for () {}
+impl StatisticsCollectedAttempt for () {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 /// Connector-neutral execution owned by the frontend worker. Implementations
 /// receive the durable operation ID from `job` and must use it for all

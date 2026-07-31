@@ -517,6 +517,13 @@ impl FrontendApplicationHost {
     }
 
     async fn release_resources(&mut self) -> Result<(), String> {
+        // The worker owns durable attempt activity and must stop before the
+        // coordinator/topology/StateStore it depends on are released.
+        let statistics_worker_error = self
+            .statistics_application_port
+            .as_ref()
+            .and_then(|port| port.shutdown_worker().err())
+            .map(|error| format!("shutdown statistics analyze worker failed: {error}"));
         self.query_execution.take();
         self.coordinator.take();
         let heartbeat_result = self
@@ -534,6 +541,13 @@ impl FrontendApplicationHost {
             .and_then(|service| service.shutdown().err())
             .map(|error| format!("shutdown frontend table-maintenance service failed: {error}"));
         let mut primary_error = heartbeat_result.err();
+        if let Some(statistics_worker_error) = statistics_worker_error {
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {statistics_worker_error}"));
+            } else {
+                primary_error = Some(statistics_worker_error);
+            }
+        }
         if let Some(table_maintenance_error) = table_maintenance_error {
             if let Some(primary) = primary_error.as_mut() {
                 primary.push_str(&format!("; cleanup failed: {table_maintenance_error}"));

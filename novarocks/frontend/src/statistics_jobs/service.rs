@@ -23,6 +23,7 @@
 //! job command, while read-only table-stat display is supplied independently.
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -32,6 +33,10 @@ use super::model::{
     StatisticsJob, StatisticsJobCreate, StatisticsJobTablePin, StatisticsJobTarget,
 };
 use super::repository::{StatisticsJobRepository, StatisticsJobRepositoryError};
+use super::worker::{
+    StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
+    StatisticsCollectedAttempt,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyzeTableStatement {
@@ -204,6 +209,10 @@ impl StatisticsApplicationService {
         }
     }
 
+    pub fn worker_repository(&self) -> Option<StatisticsJobRepository> {
+        self.repository.clone()
+    }
+
     pub fn with_repository_and_target_resolver(
         repository: StatisticsJobRepository,
         target_resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>,
@@ -371,6 +380,8 @@ pub struct FrontendStatisticsApplicationPort {
     service: StatisticsApplicationService,
     table_statistics: std::sync::RwLock<Option<std::sync::Arc<dyn TableStatisticsReader>>>,
     runtime: tokio::runtime::Handle,
+    attempt_executor: Mutex<Option<Arc<dyn StatisticsAttemptExecutor>>>,
+    worker: Mutex<Option<StatisticsAnalyzeWorker>>,
 }
 
 impl FrontendStatisticsApplicationPort {
@@ -379,6 +390,8 @@ impl FrontendStatisticsApplicationPort {
             service,
             table_statistics: std::sync::RwLock::new(None),
             runtime,
+            attempt_executor: Mutex::new(None),
+            worker: Mutex::new(None),
         }
     }
 
@@ -410,6 +423,59 @@ impl FrontendStatisticsApplicationPort {
         self.service.bind_target_resolver(std::sync::Arc::new(
             CoreStatisticsTargetResolverAdapter { inner: resolver },
         ))
+    }
+
+    fn bind_core_statistics_attempt_executor(
+        &self,
+        executor: Arc<dyn core_application::StatisticsAttemptExecutor>,
+    ) -> Result<(), String> {
+        let Some(repository) = self.service.worker_repository() else {
+            // SHOW TABLE STATS remains available without StateStore, but a
+            // durable job worker must never fall back to an in-memory table.
+            return Ok(());
+        };
+        let adapter: Arc<dyn StatisticsAttemptExecutor> =
+            Arc::new(CoreStatisticsAttemptAdapter { inner: executor });
+        let mut executor_slot = self
+            .attempt_executor
+            .lock()
+            .map_err(|_| "statistics attempt executor lock poisoned".to_string())?;
+        if executor_slot.is_some() {
+            return Err("statistics attempt executor is already bound".to_string());
+        }
+        let worker = tokio::task::block_in_place(|| {
+            self.runtime.block_on(StatisticsAnalyzeWorker::start(
+                &self.runtime,
+                Arc::new(repository),
+                Arc::downgrade(&adapter),
+            ))
+        })?;
+        let mut worker_slot = self
+            .worker
+            .lock()
+            .map_err(|_| "statistics worker lock poisoned".to_string())?;
+        if worker_slot.is_some() {
+            return Err("statistics worker is already started".to_string());
+        }
+        *executor_slot = Some(adapter);
+        *worker_slot = Some(worker);
+        Ok(())
+    }
+
+    pub fn shutdown_worker(&self) -> Result<(), String> {
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|_| "statistics worker lock poisoned".to_string())?
+            .take();
+        if let Some(mut worker) = worker {
+            worker.shutdown()?;
+        }
+        self.attempt_executor
+            .lock()
+            .map_err(|_| "statistics attempt executor lock poisoned".to_string())?
+            .take();
+        Ok(())
     }
 }
 
@@ -468,6 +534,13 @@ impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicati
             )
         })
         .map_err(|error| core_application::StatisticsApplicationError::new(error.to_string()))?;
+        if matches!(result, StatisticsStatementResult::JobSubmitted(_)) {
+            if let Ok(worker) = self.worker.lock() {
+                if let Some(worker) = worker.as_ref() {
+                    worker.wakeup();
+                }
+            }
+        }
         Ok(map_core_result(result))
     }
 }
@@ -489,6 +562,121 @@ impl core_application::StatisticsTableReaderSink for FrontendStatisticsApplicati
         self.bind_table_statistics_reader(std::sync::Arc::new(CoreStatisticsTableReaderAdapter {
             inner: reader,
         }))
+    }
+}
+
+impl core_application::StatisticsAttemptExecutorSink for FrontendStatisticsApplicationPort {
+    fn bind_statistics_attempt_executor(
+        &self,
+        executor: Arc<dyn core_application::StatisticsAttemptExecutor>,
+    ) -> Result<(), String> {
+        self.bind_core_statistics_attempt_executor(executor)
+    }
+}
+
+struct CoreCollectedAttempt {
+    inner: Box<dyn core_application::StatisticsCollectedAttempt>,
+}
+
+impl StatisticsCollectedAttempt for CoreCollectedAttempt {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct CoreStatisticsAttemptAdapter {
+    inner: Arc<dyn core_application::StatisticsAttemptExecutor>,
+}
+
+impl CoreStatisticsAttemptAdapter {
+    fn request(job: &StatisticsJob) -> core_application::StatisticsAttemptRequest {
+        core_application::StatisticsAttemptRequest {
+            operation_id: job.operation_id,
+            table_pin: core_application::StatisticsTablePin {
+                connector_instance_id: job.table_pin.connector_instance_id.clone(),
+                table_handle: job.table_pin.table_handle.clone(),
+                data_version: job.table_pin.data_version.clone(),
+            },
+            metric_names: job.metric_names.clone(),
+        }
+    }
+
+    fn collected<'a>(
+        collected: &'a dyn StatisticsCollectedAttempt,
+    ) -> Result<&'a dyn core_application::StatisticsCollectedAttempt, StatisticsAttemptError> {
+        collected
+            .as_any()
+            .downcast_ref::<CoreCollectedAttempt>()
+            .map(|collected| collected.inner.as_ref())
+            .ok_or_else(|| {
+                StatisticsAttemptError::permanent(
+                    super::model::StatisticsJobErrorKind::Internal,
+                    "statistics worker received a collection artifact from another executor",
+                )
+            })
+    }
+
+    fn map_error(error: core_application::StatisticsApplicationError) -> StatisticsAttemptError {
+        if error.requires_reconcile() {
+            StatisticsAttemptError::reconcile(
+                super::model::StatisticsJobErrorKind::Publish,
+                error.to_string(),
+            )
+        } else if error.retryable() {
+            StatisticsAttemptError::transient(
+                super::model::StatisticsJobErrorKind::Connector,
+                error.to_string(),
+            )
+        } else {
+            StatisticsAttemptError::permanent(
+                super::model::StatisticsJobErrorKind::Connector,
+                error.to_string(),
+            )
+        }
+    }
+}
+
+impl StatisticsAttemptExecutor for CoreStatisticsAttemptAdapter {
+    fn collect(
+        &self,
+        job: &StatisticsJob,
+    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
+        self.inner
+            .collect(&Self::request(job))
+            .map(|inner| {
+                Box::new(CoreCollectedAttempt { inner }) as Box<dyn StatisticsCollectedAttempt>
+            })
+            .map_err(Self::map_error)
+    }
+
+    fn prepare_publish(
+        &self,
+        job: &StatisticsJob,
+        collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<novarocks_spi::connector::ExternalMutationEvidence, StatisticsAttemptError> {
+        self.inner
+            .prepare_publish(&Self::request(job), Self::collected(collected)?)
+            .map_err(Self::map_error)
+    }
+
+    fn publish(
+        &self,
+        job: &StatisticsJob,
+        collected: &dyn StatisticsCollectedAttempt,
+        evidence: &novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError> {
+        self.inner
+            .publish(&Self::request(job), Self::collected(collected)?, evidence)
+            .map_err(Self::map_error)
+    }
+
+    fn reconcile(
+        &self,
+        job: &StatisticsJob,
+        evidence: &novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError> {
+        let _ = job;
+        self.inner.reconcile(evidence).map_err(Self::map_error)
     }
 }
 

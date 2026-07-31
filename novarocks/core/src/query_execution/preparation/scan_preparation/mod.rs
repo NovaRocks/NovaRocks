@@ -186,6 +186,24 @@ fn prepare_scan_node(
     reject_target_equality_deletes(node_id, &scan.table.source, &execution)?;
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required, connector_read) = match &execution {
+        ResolvedScanExecution::ConnectorRead => {
+            let resolver = resolver.ok_or_else(|| {
+                format!("connector-pinned scan node_id={node_id} requires a scan binding resolver")
+            })?;
+            let read = resolver
+                .resolve_connector_read(node_id, scan)
+                .map_err(|error| {
+                    format!(
+                        "scan binding resolver failed to provide connector read for node_id={node_id}: {error}"
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "scan binding resolver returned no connector read for connector-pinned node_id={node_id}"
+                    )
+                })?;
+            (Vec::new(), Vec::new(), Some(read))
+        }
         ResolvedScanExecution::IcebergFiles(files) => {
             // Design: ADR-0018 (docs/adr/ADR-0018-static-connector-predicate-disposition.md)
             let static_predicates = options
@@ -257,6 +275,7 @@ fn validate_resolved_execution_kind(
     execution: &ResolvedScanExecution,
 ) -> Result<(), String> {
     let valid = match source {
+        ScanSource::ConnectorPinned => matches!(execution, ResolvedScanExecution::ConnectorRead),
         ScanSource::IcebergDeltaTable { .. } => {
             matches!(execution, ResolvedScanExecution::IcebergDelta(_))
         }
@@ -271,7 +290,9 @@ fn validate_resolved_execution_kind(
     if valid {
         return Ok(());
     }
-    let required = if matches!(source, ScanSource::IcebergDeltaTable { .. }) {
+    let required = if matches!(source, ScanSource::ConnectorPinned) {
+        "ConnectorRead"
+    } else if matches!(source, ScanSource::IcebergDeltaTable { .. }) {
         "IcebergDelta"
     } else {
         "IcebergFiles"
@@ -313,7 +334,8 @@ fn reject_target_equality_deletes(
 fn scan_source_requires_resolver(source: &ScanSource) -> bool {
     matches!(
         source,
-        ScanSource::IcebergVersionTable { .. }
+        ScanSource::ConnectorPinned
+            | ScanSource::IcebergVersionTable { .. }
             | ScanSource::IcebergMvTargetState(_)
             | ScanSource::IcebergMvTargetLocator(_)
             | ScanSource::IcebergDeltaTable { .. }
@@ -322,6 +344,7 @@ fn scan_source_requires_resolver(source: &ScanSource) -> bool {
 
 fn scan_source_kind(source: &ScanSource) -> &'static str {
     match source {
+        ScanSource::ConnectorPinned => "ConnectorPinned",
         ScanSource::StarRocks { .. } => "StarRocks",
         ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
         ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",

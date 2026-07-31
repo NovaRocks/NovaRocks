@@ -583,6 +583,9 @@ fn scan_binding_for_source<'a>(
         ));
     }
     let valid_execution = match source {
+        table_model::ScanSource::ConnectorPinned => {
+            matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
+        }
         table_model::ScanSource::IcebergDeltaTable { .. } => {
             matches!(binding.execution, ResolvedScanExecution::IcebergDelta(_))
         }
@@ -607,6 +610,7 @@ fn scan_binding_for_source<'a>(
 
 fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
     match source {
+        table_model::ScanSource::ConnectorPinned => "ConnectorPinned",
         table_model::ScanSource::StarRocks { .. } => "StarRocks",
         table_model::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
         table_model::ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
@@ -619,6 +623,7 @@ fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
 
 fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
     match execution {
+        ResolvedScanExecution::ConnectorRead => "ConnectorRead",
         ResolvedScanExecution::IcebergFiles(_) => "IcebergFiles",
         ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",
     }
@@ -677,6 +682,14 @@ fn encode_scan_source(
 
     Ok(plan::ScanSource {
         kind: Some(match src {
+            table_model::ScanSource::ConnectorPinned => {
+                return Err(format!(
+                    "native ConnectorPinned node_id={} must be materialized as ConnectorReadSource before encoding",
+                    scan_node_id
+                        .map(|node_id| node_id.to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                ));
+            }
             table_model::ScanSource::StarRocks { .. } => {
                 let node_id = scan_node_id.ok_or_else(|| {
                     "StarRocks table source is only valid on a native ScanNode".to_string()
@@ -801,6 +814,7 @@ fn iceberg_schema_for_connector_source(
     source: &table_model::ScanSource,
 ) -> Option<&iceberg_scan_model::IcebergSchemaDef> {
     match source {
+        table_model::ScanSource::ConnectorPinned => None,
         table_model::ScanSource::IcebergDataFiles { table, .. }
         | table_model::ScanSource::IcebergDeltaTable { table, .. }
         | table_model::ScanSource::IcebergVersionTable { table, .. } => Some(&table.schema),

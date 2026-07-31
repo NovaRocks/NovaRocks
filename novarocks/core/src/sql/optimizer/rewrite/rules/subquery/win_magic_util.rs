@@ -50,6 +50,12 @@ impl TableIdentity {
     #[allow(dead_code)]
     pub(super) fn from_scan(scan: &ScanOp) -> Self {
         match &scan.table.source {
+            ScanSource::ConnectorPinned => TableIdentity::Iceberg {
+                catalog: "__connector_pinned__".to_string(),
+                namespace: "__internal__".to_string(),
+                table: "__statistics__".to_string(),
+                table_uuid: None,
+            },
             ScanSource::StarRocks { db_id, table_id } => TableIdentity::StarRocks {
                 db_id: *db_id,
                 table_id: *table_id,

@@ -21,15 +21,21 @@
 //! its parser variants into these commands exactly once; the frontend owns
 //! durable job state and implements this port without raw-SQL interception.
 
+use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
-    ConnectorStatisticsResolver, ConnectorTableResolution, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsMetric,
-    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsReadRequest,
+    ConnectorCancellation, ConnectorControlRegistry, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorStatisticsResolver, ConnectorTableHandle,
+    ConnectorTableResolution, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsCollectionRequest, StatisticsDataVersion,
+    StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue,
+    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
+    StatisticsReconcileRequest,
 };
 use uuid::Uuid;
 
@@ -87,6 +93,62 @@ pub trait StatisticsTableReaderSink: Send + Sync {
     fn bind_statistics_table_reader(
         &self,
         reader: Arc<dyn StatisticsTableReader>,
+    ) -> Result<(), String>;
+}
+
+/// Durable worker input expressed without any frontend repository type.  The
+/// table/version pin was fixed at ANALYZE submission; Core must not turn this
+/// back into a name lookup when an attempt eventually runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsAttemptRequest {
+    pub operation_id: Uuid,
+    pub table_pin: StatisticsTablePin,
+    pub metric_names: Vec<String>,
+}
+
+/// Attempt-local material retained only by the execution/publish boundary.
+/// It is deliberately opaque to the durable frontend: StateStore persists
+/// just the separately prepared reconciliation evidence.
+pub trait StatisticsCollectedAttempt: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Core implementation of provider-native collection and publication.  The
+/// frontend owns the job state machine and lease fence; Core owns connector
+/// leases, the distributed request, and `ExternalMutationOutcome` handling.
+pub trait StatisticsAttemptExecutor: Send + Sync {
+    fn collect(
+        &self,
+        request: &StatisticsAttemptRequest,
+    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsApplicationError>;
+
+    fn prepare_publish(
+        &self,
+        request: &StatisticsAttemptRequest,
+        collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<ExternalMutationEvidence, StatisticsApplicationError>;
+
+    fn publish(
+        &self,
+        request: &StatisticsAttemptRequest,
+        collected: &dyn StatisticsCollectedAttempt,
+        evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsApplicationError>;
+
+    fn reconcile(
+        &self,
+        evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsApplicationError>;
+}
+
+/// Composition sink used after Core has installed connector control and the
+/// native coordinator.  A frontend with no StateStore may bind the read-only
+/// surfaces above but must decline this executor rather than construct an
+/// in-memory job table.
+pub trait StatisticsAttemptExecutorSink: Send + Sync {
+    fn bind_statistics_attempt_executor(
+        &self,
+        executor: Arc<dyn StatisticsAttemptExecutor>,
     ) -> Result<(), String>;
 }
 
@@ -329,16 +391,298 @@ impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
     }
 }
 
+/// Engine-owned implementation of a durable attempt. The frontend can retain
+/// only this trait object and its opaque collected value; it cannot obtain a
+/// connector reader, catalog handle, or an unpinned metadata path.
+pub struct ConnectorStatisticsAttemptExecutor {
+    state: std::sync::Weak<super::StandaloneState>,
+}
+
+impl ConnectorStatisticsAttemptExecutor {
+    pub(crate) fn new(state: std::sync::Weak<super::StandaloneState>) -> Self {
+        Self { state }
+    }
+
+    fn state(&self) -> Result<Arc<super::StandaloneState>, StatisticsApplicationError> {
+        self.state.upgrade().ok_or_else(|| {
+            StatisticsApplicationError::transient(
+                "statistics engine is shutting down before the durable attempt completed",
+            )
+        })
+    }
+
+    fn collection_context() -> Result<ConnectorRequestContext, StatisticsApplicationError> {
+        ConnectorRequestContext::try_new(
+            Instant::now() + crate::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
+            Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))
+    }
+
+    fn table_and_version(
+        request: &StatisticsAttemptRequest,
+    ) -> Result<(ConnectorTableHandle, StatisticsDataVersion), StatisticsApplicationError> {
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(
+            &request.table_pin.connector_instance_id,
+        )
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let table = ConnectorTableHandle::try_new(
+            instance_id,
+            Bytes::copy_from_slice(&request.table_pin.table_handle),
+        )
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let version =
+            StatisticsDataVersion::try_new(Bytes::copy_from_slice(&request.table_pin.data_version))
+                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        Ok((table, version))
+    }
+
+    fn metrics(
+        request: &StatisticsAttemptRequest,
+    ) -> Result<StatisticsMetricRequest, StatisticsApplicationError> {
+        let mut metrics = vec![StatisticsMetric::RowCount];
+        for column in &request.metric_names {
+            let column: Arc<str> = Arc::from(column.as_str());
+            metrics.extend([
+                StatisticsMetric::NullCount {
+                    column: Arc::clone(&column),
+                },
+                StatisticsMetric::Minimum {
+                    column: Arc::clone(&column),
+                },
+                StatisticsMetric::Maximum {
+                    column: Arc::clone(&column),
+                },
+                StatisticsMetric::AverageSize {
+                    column: Arc::clone(&column),
+                },
+                StatisticsMetric::ThetaNdv { column },
+            ]);
+        }
+        StatisticsMetricRequest::try_new(metrics)
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))
+    }
+
+    fn operation_id(request: &StatisticsAttemptRequest) -> ConnectorMutationOperationId {
+        ConnectorMutationOperationId::from_bytes(*request.operation_id.as_bytes())
+    }
+
+    fn collected<'a>(
+        collected: &'a dyn StatisticsCollectedAttempt,
+    ) -> Result<&'a ConnectorStatisticsCollectedAttempt, StatisticsApplicationError> {
+        collected
+            .as_any()
+            .downcast_ref::<ConnectorStatisticsCollectedAttempt>()
+            .ok_or_else(|| {
+                StatisticsApplicationError::new(
+                    "statistics publication received a collection artifact from another executor",
+                )
+            })
+    }
+
+    fn outcome(
+        outcome: ExternalMutationOutcome<novarocks_spi::connector::StatisticsReceipt>,
+    ) -> Result<(), StatisticsApplicationError> {
+        match outcome {
+            ExternalMutationOutcome::KnownCommitted {
+                finalization: ExternalMutationFinalization::Complete,
+                ..
+            } => Ok(()),
+            ExternalMutationOutcome::KnownCommitted {
+                finalization: ExternalMutationFinalization::Failed(failure),
+                ..
+            }
+            | ExternalMutationOutcome::KnownUncommitted { failure } => {
+                Err(StatisticsApplicationError::new(failure.to_string()))
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+                Err(StatisticsApplicationError::reconcile(failure.to_string()))
+            }
+        }
+    }
+}
+
+struct ConnectorStatisticsCollectedAttempt {
+    lease: novarocks_spi::connector::ConnectorStatisticsLease,
+    table: ConnectorTableHandle,
+    result: novarocks_spi::connector::StatisticsCollectionResult,
+    context: ConnectorRequestContext,
+}
+
+impl StatisticsCollectedAttempt for ConnectorStatisticsCollectedAttempt {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
+    fn collect(
+        &self,
+        request: &StatisticsAttemptRequest,
+    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsApplicationError> {
+        let state = self.state()?;
+        let (table, data_version) = Self::table_and_version(request)?;
+        let metrics = Self::metrics(request)?;
+        let context = Self::collection_context()?;
+        let lease = state
+            .connector_control
+            .acquire_current_statistics(table.owner())
+            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        let plan = lease
+            .prepare_collection(StatisticsCollectionRequest {
+                operation_id: Self::operation_id(request),
+                table: table.clone(),
+                data_version,
+                metrics,
+                context: context.clone(),
+            })
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
+            plan,
+            crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
+                crate::query_execution::statistics::StatisticsExecutionMode::DurableJobAttempt,
+                crate::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
+            )
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
+        )
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let topology = state
+            .backend_topology
+            .snapshot()
+            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
+        let execution = crate::query_execution::request_context::QueryExecutionContext::new(
+            state.execution_role,
+            topology,
+            Some(Instant::now() + program.policy().attempt_timeout()),
+            cancellation.view(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
+        let connectors = state
+            .connectors
+            .read()
+            .map_err(|_| StatisticsApplicationError::transient("connector registry lock poisoned"))?
+            .clone();
+        let distributed = crate::query_execution::statistics::build_statistics_collection_request(
+            &connectors,
+            state.connector_control.as_ref(),
+            &execution,
+            context.clone(),
+            program,
+        )
+        .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        let result = state
+            .query_execution
+            .execute(distributed)
+            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_statistics)
+            .map(|outcome| outcome.into_collection_result())
+            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        Ok(Box::new(ConnectorStatisticsCollectedAttempt {
+            lease,
+            table,
+            result,
+            context,
+        }))
+    }
+
+    fn prepare_publish(
+        &self,
+        request: &StatisticsAttemptRequest,
+        collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<ExternalMutationEvidence, StatisticsApplicationError> {
+        let collected = Self::collected(collected)?;
+        collected
+            .lease
+            .prepare_publish(StatisticsPublishPreparationRequest {
+                operation_id: Self::operation_id(request),
+                table: collected.table.clone(),
+                result: collected.result.clone(),
+                context: collected.context.clone(),
+            })
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))
+    }
+
+    fn publish(
+        &self,
+        request: &StatisticsAttemptRequest,
+        collected: &dyn StatisticsCollectedAttempt,
+        evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsApplicationError> {
+        let collected = Self::collected(collected)?;
+        Self::outcome(
+            collected
+                .lease
+                .publish(StatisticsPublishRequest {
+                    operation_id: Self::operation_id(request),
+                    table: collected.table.clone(),
+                    result: collected.result.clone(),
+                    context: collected.context.clone(),
+                    evidence: evidence.clone(),
+                })
+                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
+        )
+    }
+
+    fn reconcile(
+        &self,
+        evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsApplicationError> {
+        let state = self.state()?;
+        let lease = state
+            .connector_control
+            .acquire_current_statistics(&evidence.descriptor().instance_id)
+            .map_err(|error| StatisticsApplicationError::reconcile(error.to_string()))?;
+        Self::outcome(
+            lease
+                .reconcile(StatisticsReconcileRequest {
+                    evidence: evidence.clone(),
+                    context: Self::collection_context()?,
+                })
+                .map_err(|error| StatisticsApplicationError::reconcile(error.to_string()))?,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsApplicationError {
     message: String,
+    retryable: bool,
+    requires_reconcile: bool,
 }
 
 impl StatisticsApplicationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            retryable: false,
+            requires_reconcile: false,
         }
+    }
+
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            requires_reconcile: false,
+        }
+    }
+
+    pub fn reconcile(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            requires_reconcile: true,
+        }
+    }
+
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    pub const fn requires_reconcile(&self) -> bool {
+        self.requires_reconcile
     }
 }
 

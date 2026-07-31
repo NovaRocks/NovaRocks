@@ -43,10 +43,24 @@ pub(crate) trait ScanBindingResolver: Send + Sync {
         node_id: i32,
         scan: &PlanScanNode,
     ) -> Result<Option<ResolvedScanExecution>, String>;
+
+    /// Supplies the opaque connector execution read for a source whose
+    /// metadata was resolved and pinned before generic preparation.  Normal
+    /// query planning leaves this unimplemented; statistics collection uses
+    /// it to guarantee that preparation does not perform another latest
+    /// metadata lookup.
+    fn resolve_connector_read(
+        &self,
+        _node_id: i32,
+        _scan: &PlanScanNode,
+    ) -> Result<Option<PlannedConnectorRead>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ResolvedScanExecution {
+    ConnectorRead,
     IcebergFiles(ResolvedIcebergFileScan),
     IcebergDelta(ResolvedIcebergDeltaScan),
 }

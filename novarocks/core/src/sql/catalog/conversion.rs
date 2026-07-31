@@ -46,7 +46,8 @@ impl CatalogRuntimeMetadata {
                     cloud_properties: cloud_properties.clone(),
                 }
             }
-            ScanSource::IcebergMetadataTable { .. }
+            ScanSource::ConnectorPinned
+            | ScanSource::IcebergMetadataTable { .. }
             | ScanSource::IcebergDeltaTable { .. }
             | ScanSource::IcebergVersionTable { .. }
             | ScanSource::IcebergMvTargetState { .. }

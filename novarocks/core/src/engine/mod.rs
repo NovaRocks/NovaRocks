@@ -742,6 +742,11 @@ pub struct StandaloneOpenServices {
     /// connector control is ready. It does not imply durable job ownership.
     pub statistics_table_reader_sink:
         Option<std::sync::Arc<dyn statistics_application::StatisticsTableReaderSink>>,
+    /// Receives the Core-owned distributed collection/publish executor after
+    /// connector control and the coordinator are ready. The frontend starts a
+    /// durable worker only when it also owns a StateStore repository.
+    pub statistics_attempt_executor_sink:
+        Option<std::sync::Arc<dyn statistics_application::StatisticsAttemptExecutorSink>>,
     pub table_maintenance_service:
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
@@ -797,6 +802,7 @@ impl StandaloneOpenServices {
             ),
             statistics_target_resolver_sink: None,
             statistics_table_reader_sink: None,
+            statistics_attempt_executor_sink: None,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -844,6 +850,14 @@ impl StandaloneOpenServices {
         sink: std::sync::Arc<dyn statistics_application::StatisticsTableReaderSink>,
     ) -> Self {
         self.statistics_table_reader_sink = Some(sink);
+        self
+    }
+
+    pub fn with_statistics_attempt_executor_sink(
+        mut self,
+        sink: std::sync::Arc<dyn statistics_application::StatisticsAttemptExecutorSink>,
+    ) -> Self {
+        self.statistics_attempt_executor_sink = Some(sink);
         self
     }
 }
@@ -916,6 +930,7 @@ impl StandaloneNovaRocks {
             statistics_application,
             statistics_target_resolver_sink,
             statistics_table_reader_sink,
+            statistics_attempt_executor_sink,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -964,6 +979,9 @@ impl StandaloneNovaRocks {
         }
         if let Some(sink) = statistics_table_reader_sink {
             sink.bind_statistics_table_reader(engine.statistics_table_reader())?;
+        }
+        if let Some(sink) = statistics_attempt_executor_sink {
+            sink.bind_statistics_attempt_executor(engine.statistics_attempt_executor())?;
         }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
@@ -1024,6 +1042,20 @@ impl StandaloneNovaRocks {
         Arc::new(statistics_application::ConnectorStatisticsTableReader::new(
             Arc::clone(&self.inner.connector_control),
         ))
+    }
+
+    /// Native connector statistics execution exposed only to the frontend
+    /// durable job worker. It shares this engine's connector registry,
+    /// coordinator and live backend topology; no standalone/local fallback is
+    /// constructed for ANALYZE.
+    pub fn statistics_attempt_executor(
+        &self,
+    ) -> Arc<dyn statistics_application::StatisticsAttemptExecutor> {
+        Arc::new(
+            statistics_application::ConnectorStatisticsAttemptExecutor::new(Arc::downgrade(
+                &self.inner,
+            )),
+        )
     }
 
     pub(crate) fn publish_coordinator_report_bound_port(&self, port: u16) {

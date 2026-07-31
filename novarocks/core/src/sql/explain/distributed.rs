@@ -1597,6 +1597,7 @@ fn format_scan_pruned_type(data_type: &DataType, top_level: bool) -> String {
 
 fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) -> bool {
     match &table.source {
+        ScanSource::ConnectorPinned => return false,
         ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks { .. } => {}
         ScanSource::IcebergMetadataTable { .. } => return false,
         ScanSource::IcebergDeltaTable { .. }
