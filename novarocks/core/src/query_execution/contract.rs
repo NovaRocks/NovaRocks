@@ -365,6 +365,7 @@ pub struct DistributedQueryRequest {
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
     connector_write: Option<ConnectorWriteExecutionRegistration>,
+    statistics_program: Option<StatisticsCollectionProgram>,
 }
 
 impl DistributedQueryRequest {
@@ -396,6 +397,10 @@ impl DistributedQueryRequest {
         self.connector_write.as_ref()
     }
 
+    pub fn statistics_program(&self) -> Option<&StatisticsCollectionProgram> {
+        self.statistics_program.as_ref()
+    }
+
     pub fn into_parts(self) -> DistributedQueryRequestParts {
         DistributedQueryRequestParts {
             artifacts: self.artifacts,
@@ -405,6 +410,7 @@ impl DistributedQueryRequest {
             cancellation: self.cancellation,
             completion: self.completion,
             connector_write: self.connector_write,
+            statistics_program: self.statistics_program,
         }
     }
 }
@@ -419,6 +425,7 @@ pub struct DistributedQueryRequestParts {
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,
     pub connector_write: Option<ConnectorWriteExecutionRegistration>,
+    pub statistics_program: Option<StatisticsCollectionProgram>,
 }
 
 /// Request construction accepts only the execution projection captured at
@@ -431,6 +438,12 @@ pub(crate) fn build_distributed_query_request_with_execution(
     intent: DistributedQueryIntent,
     execution: &QueryExecutionContext,
 ) -> Result<DistributedQueryRequest, DistributedQueryError> {
+    if intent == DistributedQueryIntent::Statistics {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "statistics execution requires a typed StatisticsCollectionProgram",
+        ));
+    }
     Ok(DistributedQueryRequest {
         artifacts: PreparedDistributedQuery::new(prepared, native_bundle),
         options: ResolvedQueryOptions::from_upstream(options),
@@ -439,11 +452,35 @@ pub(crate) fn build_distributed_query_request_with_execution(
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(intent),
         connector_write: None,
+        statistics_program: None,
     })
 }
 
+/// Build a distributed request for internal statistics collection.  The
+/// program is intentionally required here rather than carried in generic
+/// query options, preventing a client-result request from acquiring a
+/// statistics completion capability.
+pub(crate) fn build_statistics_query_request_with_execution(
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+    options: Option<QueryOptions>,
+    program: StatisticsCollectionProgram,
+    execution: &QueryExecutionContext,
+) -> DistributedQueryRequest {
+    DistributedQueryRequest {
+        artifacts: PreparedDistributedQuery::new(prepared, native_bundle),
+        options: ResolvedQueryOptions::from_upstream(options),
+        topology: execution.topology().clone(),
+        deadline: execution.deadline(),
+        cancellation: execution.cancellation().clone(),
+        completion: QueryOutcomeFactory::new(DistributedQueryIntent::Statistics),
+        connector_write: None,
+        statistics_program: Some(program),
+    }
+}
+
 /// Attach a placement-deferred connector writer request to an otherwise
-/// sealed distributed execution request.  Only the core request builder can
+/// sealed distributed execution request. Only the core request builder can
 /// invoke this: callers cannot recombine prepared/native artifacts.
 pub(crate) fn with_connector_write_operation(
     mut request: DistributedQueryRequest,

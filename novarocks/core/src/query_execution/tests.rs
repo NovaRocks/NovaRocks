@@ -929,3 +929,20 @@ fn query_execution_service_uses_explicitly_injected_coordinator() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(outcome.intent(), DistributedQueryIntent::Result);
 }
+
+#[test]
+fn generic_request_builder_rejects_statistics_without_a_typed_program() {
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let result = build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Statistics,
+        &test_execution(QueryCancellationSource::new().view()),
+    );
+    let Err(error) = result else {
+        panic!("statistics must use the typed request builder");
+    };
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert!(error.message().contains("StatisticsCollectionProgram"));
+}
