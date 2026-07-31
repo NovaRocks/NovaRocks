@@ -38,6 +38,8 @@ pub const MAX_STATISTICS_ATTEMPT_DURATION: Duration = Duration::from_secs(30 * 6
 /// Bound the in-memory, mergeable Theta state produced by one statistics
 /// collection. This is independent of the SPI's wire-payload bound.
 pub const MAX_STATISTICS_THETA_RETAINED_HASHES: usize = 1 << 16;
+const THETA_PARTIAL_WIRE_VERSION: u8 = 1;
+const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 1 + 1 + 8 + 4;
 
 /// A statistics collection is either tied to a statement wait or owned by a
 /// durable frontend job. Only the former observes the statement cancellation
@@ -287,6 +289,83 @@ impl ThetaSketchPartial {
             },
         }
     }
+
+    /// Encode a bounded, deterministic internal wire value for transport from
+    /// distributed collection to a connector's opaque publish payload. This is
+    /// intentionally not a SQL-visible aggregate representation.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            THETA_PARTIAL_WIRE_HEADER_BYTES
+                + self.retained_hashes.len() * std::mem::size_of::<u64>(),
+        );
+        bytes.push(THETA_PARTIAL_WIRE_VERSION);
+        bytes.push(self.lg_k);
+        bytes.extend_from_slice(&self.theta.to_be_bytes());
+        bytes.extend_from_slice(&(self.retained_hashes.len() as u32).to_be_bytes());
+        for hash in &self.retained_hashes {
+            bytes.extend_from_slice(&hash.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// Decode `to_wire_bytes` and re-apply every collection bound. A corrupt
+    /// provider payload must be rejected before it can reach publication.
+    pub fn try_from_wire_bytes(bytes: &[u8]) -> Result<Self, DistributedQueryError> {
+        if bytes.len() < THETA_PARTIAL_WIRE_HEADER_BYTES {
+            return Err(contract_violation(
+                "statistics Theta wire state is truncated",
+            ));
+        }
+        if bytes[0] != THETA_PARTIAL_WIRE_VERSION {
+            return Err(contract_violation(
+                "statistics Theta wire state has an unsupported version",
+            ));
+        }
+        let lg_k = bytes[1];
+        if !(5..=16).contains(&lg_k) {
+            return Err(contract_violation(
+                "statistics Theta wire state has an invalid lg_k",
+            ));
+        }
+        let theta = u64::from_be_bytes(bytes[2..10].try_into().expect("slice width checked"));
+        let count =
+            u32::from_be_bytes(bytes[10..14].try_into().expect("slice width checked")) as usize;
+        if count > MAX_STATISTICS_THETA_RETAINED_HASHES {
+            return Err(resource_exhausted(
+                "statistics Theta wire state exceeds the retained-hash limit",
+            ));
+        }
+        let expected = THETA_PARTIAL_WIRE_HEADER_BYTES
+            .checked_add(
+                count
+                    .checked_mul(std::mem::size_of::<u64>())
+                    .ok_or_else(|| {
+                        resource_exhausted("statistics Theta wire state length overflow")
+                    })?,
+            )
+            .ok_or_else(|| resource_exhausted("statistics Theta wire state length overflow"))?;
+        if bytes.len() != expected {
+            return Err(contract_violation(
+                "statistics Theta wire state has an invalid length",
+            ));
+        }
+        let retained_hashes = bytes[THETA_PARTIAL_WIRE_HEADER_BYTES..]
+            .chunks_exact(std::mem::size_of::<u64>())
+            .map(|chunk| u64::from_be_bytes(chunk.try_into().expect("exact chunks")))
+            .collect::<Vec<_>>();
+        if retained_hashes.windows(2).any(|pair| pair[0] >= pair[1])
+            || retained_hashes.iter().any(|hash| *hash >= theta)
+        {
+            return Err(contract_violation(
+                "statistics Theta wire state is not canonical",
+            ));
+        }
+        Ok(Self {
+            lg_k,
+            theta,
+            retained_hashes,
+        })
+    }
 }
 
 impl ThetaSketchFinal {
@@ -301,4 +380,31 @@ fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
 
 fn resource_exhausted(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Rejected, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theta_wire_roundtrip_preserves_final_estimate() {
+        let partial =
+            ThetaSketchPartial::try_from_i64_values(12, 0_i64..10_000).expect("build partial");
+        let restored = ThetaSketchPartial::try_from_wire_bytes(&partial.to_wire_bytes())
+            .expect("decode canonical wire state");
+        assert_eq!(restored, partial);
+        assert_eq!(restored.finalize(), partial.finalize());
+    }
+
+    #[test]
+    fn theta_wire_rejects_noncanonical_hashes() {
+        let partial =
+            ThetaSketchPartial::try_from_i64_values(12, 0_i64..100).expect("build partial");
+        let mut bytes = partial.to_wire_bytes();
+        if bytes.len() > THETA_PARTIAL_WIRE_HEADER_BYTES + 8 {
+            bytes[THETA_PARTIAL_WIRE_HEADER_BYTES..THETA_PARTIAL_WIRE_HEADER_BYTES + 8]
+                .copy_from_slice(&u64::MAX.to_be_bytes());
+            assert!(ThetaSketchPartial::try_from_wire_bytes(&bytes).is_err());
+        }
+    }
 }
