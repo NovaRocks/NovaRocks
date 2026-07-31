@@ -427,10 +427,9 @@ pub(crate) fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, Stri
 /// Drive Steps C + D: re-execute the SELECT and commit a FastAppend iceberg
 /// transaction against the newly-created table.
 ///
-/// This delegates entirely to `execute_iceberg_insert_or_overwrite` which
-/// handles SELECT execution, writing data files, and committing the snapshot.
-/// On failure the raw error string is returned so the caller can route it
-/// through the rollback quadrant (Step E).
+/// CTAS retains its own legacy transaction composition until DML-3. It shares
+/// core write preparation and commit primitives with INSERT, but it does not
+/// route through the frontend INSERT application service.
 fn drive_data_write(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
@@ -452,17 +451,28 @@ fn drive_data_write(
         .0
     };
 
-    crate::engine::iceberg_writer::execute_iceberg_insert_or_overwrite(
+    execute_ctas_write(state, target, &resolved, query, connector_context)
+}
+
+fn execute_ctas_write(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    resolved: &crate::connector::backend::ResolvedTable,
+    query: &sqlparser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    crate::engine::iceberg_writer::prepare_iceberg_insert_or_overwrite(
         state,
         target,
-        &resolved,
-        &[], // no explicit insert column list — use schema order
+        resolved,
+        &[],
         &InsertSource::FromQuery(Box::new(query.clone())),
         OverwriteMode::None,
         "main",
         None,
         connector_context,
-    )
+    )?
+    .execute_with_legacy_runner()
     .map(|_| ())
 }
 

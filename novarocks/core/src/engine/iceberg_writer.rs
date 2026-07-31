@@ -88,6 +88,35 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    let prepared = prepare_iceberg_insert_or_overwrite(
+        state,
+        target,
+        resolved,
+        insert_columns,
+        source,
+        overwrite_mode,
+        target_ref,
+        execution,
+        connector_context,
+    )?;
+    prepared.execute_with_legacy_runner()?;
+    Ok(StatementResult::Ok)
+}
+
+/// Core-owned Iceberg INSERT preparation. Construction validates and plans the
+/// write but never starts a distributed writer or external metadata commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_iceberg_insert_or_overwrite(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    insert_columns: &[String],
+    source: &InsertSource,
+    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
+    target_ref: &str,
+    execution: Option<QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PreparedIcebergInsertWrite, String> {
     use crate::sql::parser::ast::OverwriteMode;
     debug_assert_eq!(target.backend_name, "iceberg");
 
@@ -152,7 +181,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         }
     }
 
-    execute_iceberg_insert_distributed(
+    prepare_iceberg_insert_distributed(
         state,
         target,
         resolved,
@@ -170,7 +199,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_iceberg_insert_distributed(
+fn prepare_iceberg_insert_distributed(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
     resolved: &ResolvedTable,
@@ -184,7 +213,7 @@ fn execute_iceberg_insert_distributed(
     table_ident: TableIdent,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<PreparedIcebergInsertWrite, String> {
     let metadata = table.metadata();
     let (query, sink_spec) =
         build_insert_write_plan(target, resolved, insert_columns, source, &table, entry)?;
@@ -256,10 +285,52 @@ fn execute_iceberg_insert_distributed(
         },
         source: IcebergWriteSource::CoordinatedPlan,
     };
-    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
-    let _outcome = runner.run(spec)?;
+    Ok(PreparedIcebergInsertWrite { executor, spec })
+}
 
-    Ok(StatementResult::Ok)
+pub(crate) struct PreparedIcebergInsertWrite {
+    executor: DistributedInsertWriteExecutor,
+    spec: IcebergWriteTransactionSpec,
+}
+
+impl PreparedIcebergInsertWrite {
+    pub(crate) fn target(&self) -> &TargetBackend {
+        &self.executor.target
+    }
+
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.spec.attempt_id
+    }
+
+    pub(crate) fn commit_op_kind(&self) -> CommitOpKind {
+        self.spec.commit.commit_op_kind
+    }
+
+    pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
+        self.spec.commit.base_snapshot_id
+    }
+
+    pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {
+        self.executor.run_coordinated_write(&self.spec)
+    }
+
+    pub(crate) fn commit(
+        &self,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.executor.commit(&self.spec, write_commit)
+    }
+
+    pub(crate) fn finalize(&self) -> Result<(), String> {
+        self.executor.finalize(&self.spec)
+    }
+
+    pub(crate) fn execute_with_legacy_runner(
+        self,
+    ) -> Result<crate::engine::write_transaction::IcebergWriteTransactionOutcome, String> {
+        let Self { executor, spec } = self;
+        IcebergWriteTransactionRunner::new(Arc::clone(&executor.state), &executor).run(spec)
+    }
 }
 
 struct DistributedInsertWriteExecutor {

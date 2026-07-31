@@ -858,6 +858,10 @@ impl StandaloneNovaRocks {
         }
     }
 
+    pub fn insert_engine(&self) -> Arc<dyn insert_engine::InsertEngine> {
+        Arc::new(Arc::clone(&self.inner))
+    }
+
     pub(crate) fn publish_coordinator_report_bound_port(&self, port: u16) {
         self.inner.coordinator_report_endpoint.set_bound_port(port);
     }
@@ -3654,6 +3658,47 @@ pub(crate) fn execute_query_with_catalog_service_with_connector_context(
         connector_context,
         Some(state),
         &execution,
+    )
+}
+
+pub(crate) fn execute_query_with_catalog_service_with_execution(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    query_opts: Option<QueryOptions>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<QueryResult, String> {
+    let catalog_service_snapshot = catalog_service_snapshot(state);
+    let catalog_snapshot = catalog_service_snapshot
+        .local()
+        .read()
+        .expect("catalog service snapshot local read lock");
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let analyzer_provider = build_catalog_service_provider(
+        current_catalog,
+        &catalog_service_snapshot,
+        state.connector_control.as_ref(),
+        connector_context.clone(),
+        TableLookupMode::SchemaOnly,
+    );
+    execute_query_with_catalog_provider_with_execution(
+        query,
+        &analyzer_provider,
+        &catalog_snapshot,
+        &connectors_snapshot,
+        current_database,
+        state.exchange_port,
+        query_opts,
+        &state.query_execution,
+        connector_context,
+        Some(state),
+        execution,
     )
 }
 

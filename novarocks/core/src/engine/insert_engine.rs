@@ -22,16 +22,24 @@
 //! dispatch, shaping, and transaction orchestration; core retains execution,
 //! connector, and external commit truth behind this object-safe boundary.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_catalog::schema::ColumnDef;
 
+use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
+use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::statistics::StatisticsEngine;
+use crate::engine::{StandaloneState, iceberg_writer};
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
+use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
+use crate::sql::parser::ast::{InsertSource, Literal, ObjectName, OverwriteMode};
+
+const DEFAULT_CATALOG_NAME: &str = "default_catalog";
 
 /// Parse one statement through NovaRocks' StarRocks normalizer and return its
 /// raw INSERT AST.
@@ -169,10 +177,14 @@ pub struct PrepareIcebergInsert {
 }
 
 /// Opaque core-owned prepared write payload.
-pub trait IcebergPreparedInsert: Send + Sync {}
+pub trait IcebergPreparedInsert: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
 
 /// Opaque core-owned commit payload produced by a coordinated write.
-pub trait IcebergInsertCommit: Send + Sync {}
+pub trait IcebergInsertCommit: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
 
 /// Stable operation facts required by the frontend transaction runner.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,9 +245,426 @@ pub trait InsertEngine: StatisticsEngine + Send + Sync {
     fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String>;
 }
 
+struct CorePreparedIcebergInsert {
+    prepared: iceberg_writer::PreparedIcebergInsertWrite,
+}
+
+impl IcebergPreparedInsert for CorePreparedIcebergInsert {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+struct CoreIcebergInsertCommit {
+    input: Option<WriteCommitInput>,
+}
+
+impl IcebergInsertCommit for CoreIcebergInsertCommit {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl InsertEngine for Arc<StandaloneState> {
+    fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String> {
+        let name = ObjectName {
+            parts: request.target.parts,
+        };
+        let connector_context = crate::connector::connector_request_context_for_execution(
+            request.query_options.as_ref(),
+            &request.execution,
+        )?;
+
+        if let Some(local) = resolve_local_insert_target(
+            &name,
+            request.current_catalog.as_deref(),
+            &request.current_database,
+        )? {
+            let table = self
+                .catalog_service
+                .local()
+                .read()
+                .expect("standalone catalog read lock")
+                .get(&local.database, &local.table)?;
+            let backend = match table.source {
+                crate::sql::planner::table::ScanSource::StarRocks { .. } => {
+                    InsertTargetBackend::StarRocks
+                }
+                _ => InsertTargetBackend::Local,
+            };
+            return Ok(ResolvedInsertTarget {
+                backend,
+                catalog: "default_catalog".to_string(),
+                namespace: local.database,
+                table: local.table,
+                columns: table.columns,
+                supports_pipeline_insert: matches!(backend, InsertTargetBackend::StarRocks),
+            });
+        }
+
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            self,
+            &name,
+            request.current_catalog.as_deref(),
+            &request.current_database,
+        )?;
+        let resolved = crate::connector::metadata_load_table(
+            self.connector_control.as_ref(),
+            connector_context,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )?
+        .0;
+        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+            self,
+            &target,
+            crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
+        )?;
+        Ok(ResolvedInsertTarget {
+            backend: InsertTargetBackend::Iceberg,
+            catalog: target.catalog,
+            namespace: target.namespace,
+            table: target.table,
+            columns: resolved.columns,
+            supports_pipeline_insert: true,
+        })
+    }
+
+    fn append_rows(&self, request: AppendRowsRequest) -> Result<(), String> {
+        let resolved = resolved_table(&request.target);
+        let rows = request
+            .rows
+            .iter()
+            .map(|row| row.iter().map(insert_value_to_literal).collect())
+            .collect::<Vec<Vec<_>>>();
+        match request.target.backend {
+            InsertTargetBackend::StarRocks => append_starrocks_rows(
+                self,
+                &request.target.namespace,
+                &request.target.table,
+                &rows,
+            ),
+            InsertTargetBackend::Local => {
+                let batch = crate::engine::insert::build_local_insert_batch(
+                    &request.target.columns,
+                    &rows,
+                )?;
+                self.connectors
+                    .read()
+                    .expect("connector registry read")
+                    .table_sink("local")?
+                    .append_batch(&resolved, batch)
+            }
+            InsertTargetBackend::Iceberg => {
+                Err("Iceberg rows must use prepare_iceberg_write".to_string())
+            }
+        }
+    }
+
+    fn execute_insert_query(
+        &self,
+        request: InsertQueryRequest,
+    ) -> Result<QueryInsertBatch, String> {
+        let connector_context = crate::connector::connector_request_context_for_execution(
+            request.query_options.as_ref(),
+            &request.execution,
+        )?;
+        let result = crate::engine::execute_query_with_catalog_service_with_execution(
+            self,
+            request.current_catalog.as_deref(),
+            &request.current_database,
+            &request.query,
+            request.query_options,
+            &request.execution,
+            &connector_context,
+        )?;
+        Ok(QueryInsertBatch {
+            columns: result
+                .columns
+                .into_iter()
+                .map(|column| QueryInsertColumn {
+                    name: column.name,
+                    data_type: column.data_type,
+                    nullable: column.nullable,
+                })
+                .collect(),
+            batches: result.chunks.into_iter().map(|chunk| chunk.batch).collect(),
+        })
+    }
+
+    fn append_batch(&self, request: AppendBatchRequest) -> Result<(), String> {
+        if request.batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let resolved = resolved_table(&request.target);
+        match request.target.backend {
+            InsertTargetBackend::StarRocks => append_starrocks_batch(
+                self,
+                &request.target.namespace,
+                &request.target.table,
+                request.batch,
+            ),
+            InsertTargetBackend::Local => self
+                .connectors
+                .read()
+                .expect("connector registry read")
+                .table_sink("local")?
+                .append_batch(&resolved, request.batch),
+            InsertTargetBackend::Iceberg => {
+                Err("Iceberg batches must use prepare_iceberg_write".to_string())
+            }
+        }
+    }
+
+    fn prepare_iceberg_write(
+        &self,
+        request: PrepareIcebergInsert,
+    ) -> Result<PreparedIcebergInsert, String> {
+        if request.target.backend != InsertTargetBackend::Iceberg {
+            return Err("prepare_iceberg_write requires an Iceberg target".to_string());
+        }
+        let target = target_backend(&request.target, "iceberg");
+        let resolved = resolved_table(&request.target);
+        let source = match request.source {
+            IcebergInsertSource::Rows(rows) => InsertSource::Values(
+                rows.iter()
+                    .map(|row| row.iter().map(insert_value_to_literal).collect())
+                    .collect(),
+            ),
+            IcebergInsertSource::Query(query) => InsertSource::FromQuery(query),
+        };
+        let overwrite_mode = match request.overwrite_mode {
+            InsertOverwriteMode::Append => OverwriteMode::None,
+            InsertOverwriteMode::FullTable => OverwriteMode::FullTable,
+            InsertOverwriteMode::DynamicPartitions => OverwriteMode::DynamicPartitions,
+        };
+        let connector_context = crate::connector::connector_request_context_for_execution(
+            request.query_options.as_ref(),
+            &request.execution,
+        )?;
+        let prepared = iceberg_writer::prepare_iceberg_insert_or_overwrite(
+            self,
+            &target,
+            &resolved,
+            &request.insert_columns,
+            &source,
+            overwrite_mode,
+            &request.target_ref,
+            Some(request.execution),
+            &connector_context,
+        )?;
+        let operation = IcebergInsertOperation {
+            catalog: prepared.target().catalog.clone(),
+            namespace: prepared.target().namespace.clone(),
+            table: prepared.target().table.clone(),
+            target_ref: request.target_ref,
+            attempt_id: prepared.attempt_id().to_string(),
+            commit_op_kind: prepared.commit_op_kind(),
+            base_snapshot_id: prepared.base_snapshot_id(),
+        };
+        Ok(PreparedIcebergInsert {
+            operation,
+            handle: Arc::new(CorePreparedIcebergInsert { prepared }),
+        })
+    }
+
+    fn run_iceberg_write(
+        &self,
+        prepared: &dyn IcebergPreparedInsert,
+    ) -> Result<IcebergWriteReport, String> {
+        let prepared = downcast_prepared(prepared)?;
+        Ok(iceberg_write_report_from_result(
+            prepared.prepared.run_coordinated_write()?,
+        ))
+    }
+
+    fn commit_iceberg_write(
+        &self,
+        prepared: &dyn IcebergPreparedInsert,
+        commit: &dyn IcebergInsertCommit,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let prepared = downcast_prepared(prepared).map_err(|message| {
+            CommitServiceError::known_uncommitted(
+                message,
+                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
+            )
+        })?;
+        let commit = commit
+            .as_any()
+            .downcast_ref::<CoreIcebergInsertCommit>()
+            .ok_or_else(|| {
+                CommitServiceError::known_uncommitted(
+                    "foreign Iceberg INSERT commit handle".to_string(),
+                    crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
+                )
+            })?;
+        let input = commit.input.as_ref().ok_or_else(|| {
+            CommitServiceError::known_uncommitted(
+                "Iceberg write produced no commit input".to_string(),
+                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
+            )
+        })?;
+        prepared.prepared.commit(input)
+    }
+
+    fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String> {
+        downcast_prepared(prepared)?.prepared.finalize()
+    }
+}
+
+fn resolve_local_insert_target(
+    name: &ObjectName,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<Option<novarocks_catalog::identifier::LocalTableIdentity>, String> {
+    let explicitly_local = name.parts.len() == 3
+        && novarocks_catalog::identifier::normalize_identifier(&name.parts[0])?
+            == DEFAULT_CATALOG_NAME;
+    let session_is_local = current_catalog
+        .map(novarocks_catalog::identifier::normalize_identifier)
+        .transpose()?
+        .is_none_or(|catalog| catalog == DEFAULT_CATALOG_NAME);
+    let local_parts = if explicitly_local {
+        &name.parts[1..]
+    } else if session_is_local && name.parts.len() <= 2 {
+        name.parts.as_slice()
+    } else {
+        return Ok(None);
+    };
+    novarocks_catalog::identifier::resolve_local_table_name(local_parts, current_database).map(Some)
+}
+
+fn downcast_prepared(
+    prepared: &dyn IcebergPreparedInsert,
+) -> Result<&CorePreparedIcebergInsert, String> {
+    prepared
+        .as_any()
+        .downcast_ref::<CorePreparedIcebergInsert>()
+        .ok_or_else(|| "foreign Iceberg INSERT prepared handle".to_string())
+}
+
+fn iceberg_write_report_from_result(
+    result: crate::query_execution::outcome::QueryExecutionResult,
+) -> IcebergWriteReport {
+    if let Some(abort) = result.write_abort {
+        let has_staged_files = abort
+            .completed_writer_outputs
+            .iter()
+            .flat_map(|writer| &writer.iceberg_commits)
+            .any(|commit| commit.iceberg_data_file.is_some());
+        return IcebergWriteReport::Aborted {
+            reason: abort.reason,
+            has_staged_files,
+        };
+    }
+    let has_files = result
+        .write_commit
+        .as_ref()
+        .is_some_and(crate::engine::write_transaction::write_commit_has_files);
+    let commit: Arc<dyn IcebergInsertCommit> = Arc::new(CoreIcebergInsertCommit {
+        input: result.write_commit,
+    });
+    if has_files {
+        IcebergWriteReport::Committable(commit)
+    } else {
+        IcebergWriteReport::NoOp(commit)
+    }
+}
+
+fn target_backend(target: &ResolvedInsertTarget, backend_name: &'static str) -> TargetBackend {
+    TargetBackend {
+        backend_name,
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+    }
+}
+
+fn resolved_table(target: &ResolvedInsertTarget) -> ResolvedTable {
+    ResolvedTable {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+        columns: target.columns.clone(),
+    }
+}
+
+fn insert_value_to_literal(value: &InsertValue) -> Literal {
+    match value {
+        InsertValue::Null => Literal::Null,
+        InsertValue::Bool(value) => Literal::Bool(*value),
+        InsertValue::Int(value) => Literal::Int(*value),
+        InsertValue::Float(value) => Literal::Float(*value),
+        InsertValue::String(value) => Literal::String(value.clone()),
+        InsertValue::Date(value) => Literal::Date(value.clone()),
+        InsertValue::Array(values) => {
+            Literal::Array(values.iter().map(insert_value_to_literal).collect())
+        }
+        InsertValue::Map(values) => Literal::Map(
+            values
+                .iter()
+                .map(|(key, value)| (insert_value_to_literal(key), insert_value_to_literal(value)))
+                .collect(),
+        ),
+        InsertValue::Struct(values) => {
+            Literal::Struct(values.iter().map(insert_value_to_literal).collect())
+        }
+    }
+}
+
+#[cfg(feature = "compat")]
+fn append_starrocks_rows(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+    rows: &[Vec<Literal>],
+) -> Result<(), String> {
+    crate::connector::starrocks::table::txn::insert_rows_into_starrocks_table(
+        state, database, table, rows,
+    )
+}
+
+#[cfg(not(feature = "compat"))]
+fn append_starrocks_rows(
+    _state: &Arc<StandaloneState>,
+    _database: &str,
+    _table: &str,
+    _rows: &[Vec<Literal>],
+) -> Result<(), String> {
+    Err("StarRocks table INSERT requires the compat feature".to_string())
+}
+
+#[cfg(feature = "compat")]
+fn append_starrocks_batch(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+    batch: RecordBatch,
+) -> Result<(), String> {
+    crate::connector::starrocks::table::txn::insert_batch_into_starrocks_table(
+        state, database, table, batch,
+    )
+}
+
+#[cfg(not(feature = "compat"))]
+fn append_starrocks_batch(
+    _state: &Arc<StandaloneState>,
+    _database: &str,
+    _table: &str,
+    _batch: RecordBatch,
+) -> Result<(), String> {
+    Err("StarRocks table INSERT requires the compat feature".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::UniqueId;
+    use crate::query_execution::outcome::QueryExecutionResult;
+    use crate::query_execution::write::WriteCommitInput;
+    use crate::runtime::query_result::QueryResult;
 
     #[test]
     fn insert_engine_is_object_safe() {
@@ -312,5 +741,119 @@ mod tests {
         );
         assert!(request.execution.cancellation().is_cancelled());
         assert!(context.execution().cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn local_target_resolution_uses_default_catalog_session() {
+        let resolved = resolve_local_insert_target(
+            &ObjectName {
+                parts: vec!["orders".to_string()],
+            },
+            None,
+            "sales",
+        )
+        .unwrap()
+        .expect("local target");
+        assert_eq!(resolved.database, "sales");
+        assert_eq!(resolved.table, "orders");
+    }
+
+    #[test]
+    fn local_target_resolution_honors_explicit_default_catalog() {
+        let resolved = resolve_local_insert_target(
+            &ObjectName {
+                parts: vec![
+                    "default_catalog".to_string(),
+                    "sales".to_string(),
+                    "orders".to_string(),
+                ],
+            },
+            Some("ice"),
+            "ignored",
+        )
+        .unwrap()
+        .expect("explicit local target");
+        assert_eq!(resolved.database, "sales");
+        assert_eq!(resolved.table, "orders");
+    }
+
+    #[test]
+    fn local_target_resolution_defers_to_external_catalog() {
+        let resolved = resolve_local_insert_target(
+            &ObjectName {
+                parts: vec!["orders".to_string()],
+            },
+            Some("ice"),
+            "sales",
+        )
+        .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn query_execution_result_maps_empty_commit_to_opaque_noop_handle() {
+        let report = iceberg_write_report_from_result(QueryExecutionResult {
+            query_result: QueryResult::empty(),
+            write_commit: Some(WriteCommitInput {
+                write_id: UniqueId { hi: 1, lo: 2 },
+                writers: Vec::new(),
+            }),
+            write_abort: None,
+            fragment_profiles: Vec::new(),
+        });
+
+        let IcebergWriteReport::NoOp(handle) = report else {
+            panic!("fileless writer output must be a no-op report");
+        };
+        let handle = handle
+            .as_any()
+            .downcast_ref::<CoreIcebergInsertCommit>()
+            .expect("core commit handle");
+        assert!(handle.input.is_some());
+    }
+
+    #[test]
+    fn query_execution_result_maps_writer_abort_with_staged_files() {
+        let report = iceberg_write_report_from_result(QueryExecutionResult {
+            query_result: QueryResult::empty(),
+            write_commit: None,
+            write_abort: Some(
+                crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file(
+                ),
+            ),
+            fragment_profiles: Vec::new(),
+        });
+
+        let IcebergWriteReport::Aborted {
+            reason,
+            has_staged_files,
+        } = report
+        else {
+            panic!("writer abort must stay an aborted report");
+        };
+        assert!(reason.contains("timed out"));
+        assert!(has_staged_files);
+    }
+
+    #[test]
+    fn query_execution_result_does_not_treat_empty_commit_info_as_staged_file() {
+        let mut abort =
+            crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file();
+        abort.completed_writer_outputs[0].iceberg_commits =
+            vec![crate::proto::novarocks::IcebergCommitInfo::default()];
+        let report = iceberg_write_report_from_result(QueryExecutionResult {
+            query_result: QueryResult::empty(),
+            write_commit: None,
+            write_abort: Some(abort),
+            fragment_profiles: Vec::new(),
+        });
+
+        let IcebergWriteReport::Aborted {
+            has_staged_files, ..
+        } = report
+        else {
+            panic!("writer abort must stay an aborted report");
+        };
+        assert!(!has_staged_files);
     }
 }

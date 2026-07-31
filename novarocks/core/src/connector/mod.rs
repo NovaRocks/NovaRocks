@@ -102,6 +102,28 @@ pub(crate) fn connector_request_context_for_query(
     )
 }
 
+/// Derive connector admission from the immutable query execution captured by
+/// the frontend. A request deadline is authoritative; only requests without an
+/// admission deadline use the bounded connector fallback.
+pub(crate) fn connector_request_context_for_execution(
+    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<ConnectorRequestContext, String> {
+    let cancellation: Arc<dyn ConnectorCancellation> = Arc::new(QueryConnectorCancellation {
+        cancellation: execution.cancellation().clone(),
+    });
+    match execution.deadline() {
+        Some(deadline) => ConnectorRequestContext::try_new(
+            deadline,
+            cancellation,
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .map_err(|error| error.to_string()),
+        None => build_connector_request_context(query_options, cancellation),
+    }
+}
+
 pub(crate) fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), String> {
     if context.cancellation().is_cancelled() {
         return Err("connector request was cancelled".to_string());
@@ -116,6 +138,57 @@ pub(crate) fn validate_request_context(context: &ConnectorRequestContext) -> Res
 pub(crate) fn test_request_context() -> ConnectorRequestContext {
     connector_request_context(None, Arc::new(AtomicBool::new(false)))
         .expect("test connector request context")
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use std::time::{Duration, Instant};
+
+    use super::connector_request_context_for_execution;
+    use crate::common::app_config::ClusterRole;
+    use crate::query_execution::backend::BackendTopologySnapshot;
+    use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
+    use crate::query_execution::request_context::{RequestAdmission, RequestContext};
+    use crate::sql::optimizer::options::SessionOptimizerSettings;
+
+    #[test]
+    fn connector_context_preserves_admitted_deadline_and_cancellation() {
+        let cancellation = QueryCancellationSource::new();
+        let deadline = Instant::now() + Duration::from_secs(17);
+        let request = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db".to_string(),
+            ClusterRole::Fe,
+            BackendTopologySnapshot::empty(41),
+            Some(deadline),
+            cancellation.view(),
+            SessionOptimizerSettings::default(),
+        ));
+
+        let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
+        assert_eq!(connector.deadline(), deadline);
+        assert!(!connector.cancellation().is_cancelled());
+
+        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        assert!(request.execution().cancellation().is_cancelled());
+        assert!(connector.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn connector_context_without_admitted_deadline_uses_bounded_fallback() {
+        let request = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db".to_string(),
+            ClusterRole::Fe,
+            BackendTopologySnapshot::empty(43),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings::default(),
+        ));
+        let before = Instant::now();
+        let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
+        assert!(connector.deadline() > before);
+    }
 }
 
 fn metadata_binding(
