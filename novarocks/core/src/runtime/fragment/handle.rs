@@ -40,7 +40,7 @@ use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
 use crate::runtime::fragment::scan::materialize_scan_bindings;
-use crate::runtime::fragment::sink::materialize_fragment_sink_components_with_result;
+use crate::runtime::fragment::sink::materialize_fragment_sink_with_result;
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
@@ -275,6 +275,7 @@ pub struct DormantFragmentHandle {
     query_id: QueryId,
     fragment_instance_id: crate::common::types::UniqueId,
     profiler: Option<Profiler>,
+    statistics_sink: Option<crate::exec::operators::StatisticsSinkHandle>,
     start_failure: Option<StartFailurePoint>,
 }
 
@@ -307,6 +308,7 @@ impl DormantFragmentHandle {
             query_id,
             fragment_instance_id,
             profiler,
+            statistics_sink,
             ..
         } = self;
         let pipeline = match initial_failure {
@@ -320,6 +322,7 @@ impl DormantFragmentHandle {
                     resources,
                     cancel_reason: None,
                     terminal: None,
+                    statistics_sink,
                 }),
                 query_id,
                 fragment_instance_id,
@@ -346,6 +349,7 @@ struct RunningFragmentState {
     resources: FragmentResources,
     cancel_reason: Option<FragmentCancelReason>,
     terminal: Option<FragmentTerminalFact>,
+    statistics_sink: Option<crate::exec::operators::StatisticsSinkHandle>,
 }
 
 impl RunningFragmentHandle {
@@ -398,7 +402,7 @@ impl RunningFragmentInner {
         if let Some(fact) = state.terminal.as_ref() {
             return fact.clone();
         }
-        let outcome = match result {
+        let mut outcome = match result {
             Ok(()) => FragmentOutcome::Succeeded,
             Err(error) => match state.cancel_reason.clone() {
                 Some(reason) => FragmentOutcome::Cancelled { reason },
@@ -407,6 +411,30 @@ impl RunningFragmentInner {
                     error,
                 )),
             },
+        };
+        let statistics_payload = if matches!(outcome, FragmentOutcome::Succeeded) {
+            match state.statistics_sink.as_ref() {
+                None => Vec::new(),
+                Some(handle) => match handle.take_fragment_payload() {
+                    Ok(Some(payload)) => payload.to_vec(),
+                    Ok(None) => {
+                        outcome = FragmentOutcome::Failed(FragmentExecutionError::new(
+                            FragmentExecutionErrorKind::Pipeline,
+                            "statistics sink completed without a terminal partial",
+                        ));
+                        Vec::new()
+                    }
+                    Err(error) => {
+                        outcome = FragmentOutcome::Failed(FragmentExecutionError::new(
+                            FragmentExecutionErrorKind::Pipeline,
+                            format!("statistics sink failed to encode terminal partial: {error}"),
+                        ));
+                        Vec::new()
+                    }
+                },
+            }
+        } else {
+            Vec::new()
         };
         match &outcome {
             FragmentOutcome::Succeeded => state.resources.finish_success(),
@@ -424,6 +452,7 @@ impl RunningFragmentInner {
             self.fragment_instance_id,
             outcome,
             self.profiler.as_ref().map(Profiler::to_native_tree),
+            statistics_payload,
         );
         state.terminal = Some(fact.clone());
         fact
@@ -505,15 +534,14 @@ pub fn prepare_fragment(
                 error,
             )
         })?;
-        let sink = materialize_fragment_sink_components_with_result(
-            program.sink(),
-            instance.sink_assignment(),
-            finst_id,
-            instance.runtime_options().typed_result_sink(),
-            program.root_plan_node_id().get(),
+        let materialized_sink = materialize_fragment_sink_with_result(
+            program,
+            instance,
             Arc::clone(&context.exchange_transmitter),
             resources.result_session(),
         )?;
+        let statistics_sink = materialized_sink.statistics_handle;
+        let sink = materialized_sink.factory;
         let _group_execution_scan_dop = context.group_execution_scan_dop;
         let exchange_bindings = materialize_exchange_bindings(program, instance);
         let scan_bindings = materialize_scan_bindings(program, instance)?;
@@ -540,14 +568,16 @@ pub fn prepare_fragment(
                 error,
             )
         })
+        .map(|prepared| (prepared, statistics_sink))
     })();
     match prepare_result {
-        Ok(prepared) => Ok(DormantFragmentHandle {
+        Ok((prepared, statistics_sink)) => Ok(DormantFragmentHandle {
             prepared,
             resources,
             query_id,
             fragment_instance_id: finst_id,
             profiler: context.profiler.clone(),
+            statistics_sink,
             start_failure: context.start_failure(),
         }),
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),
@@ -561,6 +591,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
+
+    use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprArena;
@@ -568,7 +604,9 @@ mod tests {
         ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
         FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract,
     };
-    use crate::exec::fragment::sink::{DataStreamSinkProgram, FragmentSinkProgram};
+    use crate::exec::fragment::sink::{
+        DataStreamSinkProgram, FragmentSinkProgram, StatisticsSinkProgram,
+    };
     use crate::exec::node::exchange_source::ExchangeSourceNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
@@ -675,6 +713,53 @@ mod tests {
         FragmentSubmission::try_new(program, instance).expect("valid submission")
     }
 
+    fn statistics_submission(finst_id: UniqueId) -> FragmentSubmission {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        let chunk = Chunk::new_with_chunk_schema(
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 2]))])
+                .expect("values batch"),
+            chunk_schema,
+        );
+        let program = Arc::new(FragmentProgram::new(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: ExecNode {
+                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 29 }),
+                },
+            },
+            FragmentSinkSpec::try_new(FragmentSinkProgram::Statistics(StatisticsSinkProgram::new(
+                StatisticsMetricRequest::try_new(vec![
+                    StatisticsMetric::RowCount,
+                    StatisticsMetric::ThetaNdv { column: "v".into() },
+                ])
+                .expect("statistics metrics"),
+            )))
+            .expect("statistics sink"),
+            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
+        ));
+        let instance = FragmentInstanceSpec::new_native(
+            FragmentContractVersion::CURRENT,
+            QueryId {
+                hi: finst_id.hi - 2,
+                lo: finst_id.lo - 2,
+            },
+            FragmentInstanceId::new(finst_id),
+            ScanAssignments::default(),
+            ExchangeInputAssignments::default(),
+            FragmentSinkAssignment::None,
+            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            NonZeroUsize::new(1).expect("one driver"),
+            BackendNum::try_new(1).expect("backend number"),
+        );
+        FragmentSubmission::try_new(program, instance).expect("valid statistics submission")
+    }
+
     fn data_stream_submission(
         finst_id: UniqueId,
         backend_num: i32,
@@ -753,6 +838,45 @@ mod tests {
             Ok(_) => panic!("expected injected prepare failure"),
             Err(error) => error,
         }
+    }
+
+    #[test]
+    fn statistics_sink_attaches_one_partial_to_the_terminal_fact_without_result_io() {
+        let finst_id = UniqueId {
+            hi: 72_051,
+            lo: 72_052,
+        };
+        let running = prepare_fragment(
+            statistics_submission(finst_id),
+            FragmentPrepareContext::default(),
+        )
+        .expect("statistics fragment prepares")
+        .start();
+        let fact = running.join();
+
+        assert!(matches!(fact.outcome(), FragmentOutcome::Succeeded));
+        assert!(
+            !fact.statistics_payload().is_empty(),
+            "statistics terminal fact must carry one bounded partial"
+        );
+        assert!(
+            !result_buffer::is_registered(finst_id),
+            "statistics collection must not open user result I/O"
+        );
+        let partial = crate::query_execution::statistics::StatisticsCollectionFinalizer::
+            try_from_fragment_payload(fact.statistics_payload())
+            .expect("typed statistics partial");
+        assert!(matches!(
+            partial
+                .metric_states(
+                    &StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount])
+                        .expect("row metric"),
+                )
+                .get(&StatisticsMetric::RowCount),
+            Some(novarocks_spi::connector::StatisticsMetricState::Available(
+                novarocks_spi::connector::StatisticsMetricValue::U64(3)
+            ))
+        ));
     }
 
     #[test]

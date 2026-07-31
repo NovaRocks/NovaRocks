@@ -132,6 +132,7 @@ impl FragmentTerminalSnapshot {
             sink,
             fact.profile().cloned(),
         )
+        .and_then(|snapshot| snapshot.with_statistics_payload(fact.statistics_payload().to_vec()))
     }
 
     pub const fn fragment_instance_id(&self) -> UniqueId {

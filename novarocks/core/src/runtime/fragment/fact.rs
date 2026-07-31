@@ -50,6 +50,7 @@ pub struct FragmentTerminalFact {
     fragment_instance_id: UniqueId,
     outcome: FragmentOutcome,
     profile: Option<RuntimeProfileTree>,
+    statistics_payload: Vec<u8>,
 }
 
 impl FragmentTerminalFact {
@@ -58,12 +59,14 @@ impl FragmentTerminalFact {
         fragment_instance_id: UniqueId,
         outcome: FragmentOutcome,
         profile: Option<RuntimeProfileTree>,
+        statistics_payload: Vec<u8>,
     ) -> Self {
         Self {
             query_id,
             fragment_instance_id,
             outcome,
             profile,
+            statistics_payload,
         }
     }
 
@@ -81,5 +84,11 @@ impl FragmentTerminalFact {
 
     pub const fn profile(&self) -> Option<&RuntimeProfileTree> {
         self.profile.as_ref()
+    }
+
+    /// The bounded opaque partial produced by a statistics terminal sink.
+    /// It is empty for all non-statistics fragments.
+    pub fn statistics_payload(&self) -> &[u8] {
+        &self.statistics_payload
     }
 }

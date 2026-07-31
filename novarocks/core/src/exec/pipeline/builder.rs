@@ -532,7 +532,9 @@ fn ensure_hash_on_input_slots(
     )
 }
 
-fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::ChunkSchemaRef> {
+pub(crate) fn output_chunk_schema_for_node(
+    node: &ExecNode,
+) -> Option<crate::exec::chunk::ChunkSchemaRef> {
     match &node.kind {
         ExecNodeKind::AssertNumRows(AssertNumRowsNode { input, .. }) => {
             output_chunk_schema_for_node(input)

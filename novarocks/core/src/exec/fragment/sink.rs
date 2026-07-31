@@ -30,12 +30,15 @@ use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::operators::DataStreamPartitionType;
 use crate::runtime::connector_write_report::ConnectorStagedReportCollector;
 use crate::sql::common::ChangeStreamBranchKind;
-use novarocks_spi::connector::{ConnectorExecutionBinding, ConnectorOpenWriterRequest};
+use novarocks_spi::connector::{
+    ConnectorExecutionBinding, ConnectorOpenWriterRequest, StatisticsMetricRequest,
+};
 
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
     Result,
     Noop,
+    Statistics(StatisticsSinkProgram),
     DataStream(DataStreamSinkProgram),
     MultiCastDataStream(MultiCastDataStreamSinkProgram),
     SplitDataStream(SplitDataStreamSinkProgram),
@@ -46,7 +49,7 @@ pub enum FragmentSinkProgram {
 impl FragmentSinkProgram {
     pub(crate) fn validate(&self) -> Result<(), ExecPlanBuildError> {
         match self {
-            Self::Result | Self::Noop => Ok(()),
+            Self::Result | Self::Noop | Self::Statistics(_) => Ok(()),
             Self::DataStream(program) => program.validate(),
             Self::MultiCastDataStream(program) => program.validate(),
             Self::SplitDataStream(program) => program.validate(),
@@ -274,6 +277,23 @@ impl ConnectorWriteSinkProgram {
 
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// Typed metric set for the Core-internal distributed statistics terminal
+/// sink. It deliberately contains no client result format or provider handle.
+#[derive(Clone, Debug)]
+pub struct StatisticsSinkProgram {
+    metrics: StatisticsMetricRequest,
+}
+
+impl StatisticsSinkProgram {
+    pub fn new(metrics: StatisticsMetricRequest) -> Self {
+        Self { metrics }
+    }
+
+    pub fn metrics(&self) -> &StatisticsMetricRequest {
+        &self.metrics
     }
 }
 
