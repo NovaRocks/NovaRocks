@@ -36,8 +36,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 
 use crate::exec::hash_table::key_table::KeyLookup;
-use crate::exec::node::aggregate::NativeAggregateTopNProducerSpec;
-use crate::exec::node::runtime_filter::NativeRuntimeFilterContract;
+use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
+use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
 use crate::runtime_filter::model::contract::ComparatorDigest;
 use crate::runtime_filter::port::ordered_bound::{
     OrderContractDigest, OrderContractError, OrderedScalar, OrderedTuple, OrderedTupleError,
@@ -298,9 +298,9 @@ impl AggregateTopNBoundaryBinding {
     }
 
     pub(crate) fn try_from_spec(
-        spec: &NativeAggregateTopNProducerSpec,
+        spec: &AggregateTopNRuntimeFilterProducerBinding,
     ) -> Result<Self, AggregateTopNBoundaryError> {
-        let NativeRuntimeFilterContract::Ordered {
+        let RuntimeFilterExecutionContract::Ordered {
             keys,
             comparator_digest,
             order_contract_digest,
@@ -326,7 +326,7 @@ impl AggregateTopNBoundaryBinding {
 }
 
 pub(crate) fn build_topn_boundary_bindings(
-    specs: &[NativeAggregateTopNProducerSpec],
+    specs: &[AggregateTopNRuntimeFilterProducerBinding],
 ) -> Result<Vec<AggregateTopNBoundaryBinding>, AggregateTopNBoundaryError> {
     specs
         .iter()
@@ -335,10 +335,10 @@ pub(crate) fn build_topn_boundary_bindings(
 }
 
 pub(crate) fn validate_topn_boundary_specs(
-    specs: &[NativeAggregateTopNProducerSpec],
+    specs: &[AggregateTopNRuntimeFilterProducerBinding],
 ) -> Result<(), AggregateTopNBoundaryError> {
     for spec in specs {
-        let NativeRuntimeFilterContract::Ordered {
+        let RuntimeFilterExecutionContract::Ordered {
             keys,
             comparator_digest,
             order_contract_digest,
@@ -577,9 +577,9 @@ mod tests {
     };
     use crate::exec::hash_table::key_builder::build_group_key_views;
     use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-    use crate::exec::node::aggregate::NativeAggregateTopNProducerSpec;
+    use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
     use crate::exec::node::runtime_filter::{
-        NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+        RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
     };
     use crate::runtime_filter::model::contract::{
         ComparatorDigest, CompletionRequirement, ContributionKind, NullOrder, OrderContract,
@@ -1178,18 +1178,18 @@ mod tests {
     fn topn_boundary_bindings_reconstruct_only_the_aggregate_candidate_contract() {
         let contract =
             runtime_contract(DataType::Int64, SortDirection::Descending, NullOrder::First);
-        let spec = NativeAggregateTopNProducerSpec {
+        let spec = AggregateTopNRuntimeFilterProducerBinding {
             binding_id: 11,
             channel_id: 12,
             group_key_expr_id: crate::exec::expr::ExprId(13),
             group_key_ordinal: 2,
             limit: NonZeroU32::new(4).unwrap(),
-            contract: NativeRuntimeFilterContract::Ordered {
+            contract: RuntimeFilterExecutionContract::Ordered {
                 keys: contract.keys().to_vec().into(),
                 comparator_digest: contract.plan_comparator_digest().get(),
                 order_contract_digest: contract.digest().bytes(),
             },
-            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
             contribution_kinds: BTreeSet::from([
                 ContributionKind::OrderedBoundUpdate,
                 ContributionKind::ProducerClosed,

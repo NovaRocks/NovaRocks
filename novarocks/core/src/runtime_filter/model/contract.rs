@@ -65,19 +65,19 @@ pub(crate) enum RuntimeFilterLogicalDomain {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum NullSemantics {
+pub enum NullSemantics {
     NeverMatches,
     NullSafeEqual,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum SortDirection {
+pub enum SortDirection {
     Ascending,
     Descending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum NullOrder {
+pub enum NullOrder {
     First,
     Last,
 }
@@ -97,7 +97,7 @@ pub(crate) struct OrderContract {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ContributionKind {
+pub enum ContributionKind {
     ValueDomainDelta,
     FinalDomainShard,
     OrderedBoundUpdate,
@@ -137,20 +137,20 @@ pub(crate) enum CompletionFenceKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum CompletionRequirement {
+pub enum CompletionRequirement {
     ProducerClosed,
     FencedFinalDomain(CompletionFenceKind),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ArtifactCapability {
+pub enum ArtifactCapability {
     Membership,
     OrderedRange,
     EmptyDomain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum LateApplyGranularity {
+pub enum LateApplyGranularity {
     Row,
     Batch,
     RowGroup,
@@ -159,13 +159,13 @@ pub(crate) enum LateApplyGranularity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConsumerActivation {
+pub enum ConsumerActivation {
     BlockingSnapshot,
     NonBlockingLive { late_apply: LateApplyGranularity },
 }
 
 impl ConsumerActivation {
-    pub(crate) fn is_blocking_or_batch_live(self) -> bool {
+    pub fn is_blocking_or_batch_live(self) -> bool {
         matches!(
             self,
             Self::BlockingSnapshot

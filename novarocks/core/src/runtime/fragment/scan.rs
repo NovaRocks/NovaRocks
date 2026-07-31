@@ -88,7 +88,7 @@ fn visit(
         ExecNodeKind::TableFunction(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Analytic(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::SetOp(node) => visit_inputs(&node.inputs, instance, bindings),
-        ExecNodeKind::NativeRuntimeFilterConsumer(node) => visit(&node.input, instance, bindings),
+        ExecNodeKind::RuntimeFilterConsumer(node) => visit(&node.input, instance, bindings),
     }
 }
 

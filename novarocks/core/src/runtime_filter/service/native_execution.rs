@@ -107,7 +107,7 @@ impl NativeRuntimeFilterExecutionContext {
                 SubscriptionKind::NonBlockingLive,
             )
             .expect("installed ordered test consumer resolves as live");
-        let InstalledNativeRuntimeFilterContract::Ordered {
+        let InstalledRuntimeFilterExecutionContract::Ordered {
             keys,
             comparator_digest,
             order_contract_digest,
@@ -282,7 +282,7 @@ impl NativeRuntimeFilterExecutionContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum InstalledNativeRuntimeFilterContract {
+pub(crate) enum InstalledRuntimeFilterExecutionContract {
     Membership {
         canonical_schema: Arc<[u8]>,
         schema_digest: [u8; 32],
@@ -300,7 +300,7 @@ pub(crate) struct ResolvedNativeProducer {
     channel_id: ChannelId,
     fragment_instance_id: UniqueId,
     kind: ProducerPortKind,
-    contract: InstalledNativeRuntimeFilterContract,
+    contract: InstalledRuntimeFilterExecutionContract,
     reduction_requirement: ReductionRequirement,
     allowed_contribution_kinds: BTreeSet<ContributionKind>,
     completion_requirement: CompletionRequirement,
@@ -325,7 +325,7 @@ impl ResolvedNativeProducer {
         self.kind
     }
 
-    pub(crate) const fn contract(&self) -> &InstalledNativeRuntimeFilterContract {
+    pub(crate) const fn contract(&self) -> &InstalledRuntimeFilterExecutionContract {
         &self.contract
     }
 
@@ -405,7 +405,7 @@ pub(crate) struct ResolvedNativeConsumer {
     activation: crate::runtime_filter::model::contract::ConsumerActivation,
     capabilities: BTreeSet<ArtifactCapability>,
     artifact_profile: ConsumerArtifactProfile,
-    contract: InstalledNativeRuntimeFilterContract,
+    contract: InstalledRuntimeFilterExecutionContract,
     lifecycle: RuntimeFilterLifecycle,
     reduction_requirement: ReductionRequirement,
     topk_contract_digest: Option<[u8; 32]>,
@@ -438,7 +438,7 @@ impl ResolvedNativeConsumer {
         &self.artifact_profile
     }
 
-    pub(crate) const fn contract(&self) -> &InstalledNativeRuntimeFilterContract {
+    pub(crate) const fn contract(&self) -> &InstalledRuntimeFilterExecutionContract {
         &self.contract
     }
 
@@ -477,7 +477,7 @@ impl ResolvedNativeConsumer {
 
 fn installed_contract(
     logical_domain: &RuntimeFilterLogicalDomain,
-) -> Result<InstalledNativeRuntimeFilterContract, RuntimeContractViolation> {
+) -> Result<InstalledRuntimeFilterExecutionContract, RuntimeContractViolation> {
     match logical_domain {
         RuntimeFilterLogicalDomain::Membership {
             value_type,
@@ -490,7 +490,7 @@ fn installed_contract(
                         "installed membership schema is invalid",
                     )
                 })?;
-            Ok(InstalledNativeRuntimeFilterContract::Membership {
+            Ok(InstalledRuntimeFilterExecutionContract::Membership {
                 canonical_schema: Arc::from(schema.canonical_bytes()),
                 schema_digest: schema.digest().bytes(),
             })
@@ -502,7 +502,7 @@ fn installed_contract(
                     "installed ordered contract is invalid",
                 )
             })?;
-            Ok(InstalledNativeRuntimeFilterContract::Ordered {
+            Ok(InstalledRuntimeFilterExecutionContract::Ordered {
                 keys: Arc::from(contract.keys()),
                 comparator_digest: contract.plan_comparator_digest().get(),
                 order_contract_digest: contract.digest().bytes(),

@@ -1630,7 +1630,7 @@ fn decode_order_contract(
             2 => NullOrder::Last,
             _ => return Err(ArtifactCodecError::NonCanonicalPayload),
         };
-        keys.push(RuntimeOrderKey::from_codec(
+        keys.push(RuntimeOrderKey::new(
             data_type, direction, null_order,
         ));
     }

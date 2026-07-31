@@ -21,11 +21,14 @@ use std::sync::Arc;
 
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
-use crate::runtime_filter::model::contract::{ArtifactCapability, ConsumerActivation};
-use crate::runtime_filter::port::ordered_bound::RuntimeOrderKey;
+pub use crate::runtime_filter::model::contract::{
+    ArtifactCapability, CompletionRequirement, ConsumerActivation, ContributionKind,
+    LateApplyGranularity, NullOrder, SortDirection,
+};
+pub use crate::runtime_filter::port::ordered_bound::RuntimeOrderKey;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum NativeRuntimeFilterContract {
+pub enum RuntimeFilterExecutionContract {
     Membership {
         canonical_schema: Arc<[u8]>,
         schema_digest: [u8; 32],
@@ -38,7 +41,7 @@ pub(crate) enum NativeRuntimeFilterContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum NativeRuntimeFilterReduction {
+pub enum RuntimeFilterExecutionReduction {
     SetUnion,
     TightenOrderedBound,
     MergeTopKSummary {
@@ -48,30 +51,124 @@ pub(crate) enum NativeRuntimeFilterReduction {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct NativeRuntimeFilterConsumerSpec {
+pub struct RuntimeFilterConsumerBinding {
     pub(crate) binding_id: u32,
     pub(crate) channel_id: u32,
     pub(crate) expr_id: ExprId,
     pub(crate) activation: ConsumerActivation,
     pub(crate) capabilities: BTreeSet<ArtifactCapability>,
-    pub(crate) contract: NativeRuntimeFilterContract,
-    pub(crate) reduction: NativeRuntimeFilterReduction,
+    pub(crate) contract: RuntimeFilterExecutionContract,
+    pub(crate) reduction: RuntimeFilterExecutionReduction,
 }
 
 #[derive(Clone, Debug)]
-pub struct NativeRuntimeFilterConsumerNode {
+pub struct RuntimeFilterConsumerNode {
     pub(crate) input: Box<ExecNode>,
     pub(crate) owner_node_id: i32,
-    pub(crate) bindings: Vec<NativeRuntimeFilterConsumerSpec>,
+    pub(crate) bindings: Vec<RuntimeFilterConsumerBinding>,
 }
 
-impl NativeRuntimeFilterConsumerNode {
+impl RuntimeFilterConsumerNode {
+    pub fn new(
+        input: ExecNode,
+        owner_node_id: i32,
+        bindings: Vec<RuntimeFilterConsumerBinding>,
+    ) -> Self {
+        Self {
+            input: Box::new(input),
+            owner_node_id,
+            bindings,
+        }
+    }
+
     pub fn input(&self) -> &ExecNode {
         &self.input
     }
 
     pub fn input_mut(&mut self) -> &mut ExecNode {
         &mut self.input
+    }
+}
+
+impl RuntimeFilterExecutionContract {
+    pub fn membership(canonical_schema: Arc<[u8]>, schema_digest: [u8; 32]) -> Self {
+        Self::Membership {
+            canonical_schema,
+            schema_digest,
+        }
+    }
+
+    pub fn try_ordered(
+        keys: Arc<[RuntimeOrderKey]>,
+        comparator_digest: [u8; 32],
+        order_contract_digest: [u8; 32],
+    ) -> Result<Self, String> {
+        if keys.is_empty() {
+            return Err("runtime-filter ordered contract requires at least one key".to_string());
+        }
+        Ok(Self::Ordered {
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        })
+    }
+}
+
+impl RuntimeFilterExecutionReduction {
+    pub const fn set_union() -> Self {
+        Self::SetUnion
+    }
+
+    pub const fn tighten_ordered_bound() -> Self {
+        Self::TightenOrderedBound
+    }
+
+    pub const fn merge_top_k(k: NonZeroU32, contract_digest: [u8; 32]) -> Self {
+        Self::MergeTopKSummary { k, contract_digest }
+    }
+}
+
+impl RuntimeFilterConsumerBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        binding_id: u32,
+        channel_id: u32,
+        expr_id: ExprId,
+        activation: ConsumerActivation,
+        capabilities: BTreeSet<ArtifactCapability>,
+        contract: RuntimeFilterExecutionContract,
+        reduction: RuntimeFilterExecutionReduction,
+    ) -> Result<Self, String> {
+        let expected_capabilities = match &contract {
+            RuntimeFilterExecutionContract::Membership { .. } => {
+                BTreeSet::from([ArtifactCapability::Membership, ArtifactCapability::EmptyDomain])
+            }
+            RuntimeFilterExecutionContract::Ordered { .. } => {
+                BTreeSet::from([ArtifactCapability::OrderedRange])
+            }
+        };
+        if capabilities != expected_capabilities {
+            return Err("runtime-filter consumer capabilities do not match contract".to_string());
+        }
+        if matches!(contract, RuntimeFilterExecutionContract::Membership { .. })
+            != matches!(reduction, RuntimeFilterExecutionReduction::SetUnion)
+        {
+            return Err("runtime-filter consumer reduction does not match contract".to_string());
+        }
+        if matches!(contract, RuntimeFilterExecutionContract::Ordered { .. })
+            && matches!(activation, ConsumerActivation::BlockingSnapshot)
+        {
+            return Err("runtime-filter ordered consumer cannot block on feedback".to_string());
+        }
+        Ok(Self {
+            binding_id,
+            channel_id,
+            expr_id,
+            activation,
+            capabilities,
+            contract,
+            reduction,
+        })
     }
 }
 
@@ -91,7 +188,7 @@ mod tests {
     fn execution_specs_carry_only_binding_contract_data() {
         let mut arena = ExprArena::default();
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-        let consumer = NativeRuntimeFilterConsumerSpec {
+        let consumer = RuntimeFilterConsumerBinding {
             binding_id: 1,
             channel_id: 2,
             expr_id,
@@ -100,14 +197,14 @@ mod tests {
                 ArtifactCapability::Membership,
                 ArtifactCapability::EmptyDomain,
             ]),
-            contract: NativeRuntimeFilterContract::Membership {
+            contract: RuntimeFilterExecutionContract::Membership {
                 canonical_schema: Arc::from([1_u8]),
                 schema_digest: [2; 32],
             },
-            reduction: NativeRuntimeFilterReduction::SetUnion,
+            reduction: RuntimeFilterExecutionReduction::SetUnion,
         };
 
-        let producer = crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec {
+        let producer = crate::exec::node::join::JoinRuntimeFilterProducerBinding {
             binding_id: 3,
             channel_id: 4,
             build_expr_id: expr_id,
@@ -123,7 +220,7 @@ mod tests {
         assert_eq!(producer.contract, consumer.contract);
         assert_eq!(producer.reduction, consumer.reduction);
 
-        let aggregate_producer = crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+        let aggregate_producer = crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding {
             binding_id: 5,
             channel_id: 6,
             group_key_expr_id: expr_id,
@@ -134,9 +231,9 @@ mod tests {
                 ContributionKind::ProducerClosed,
             ]),
             completion_requirement: CompletionRequirement::ProducerClosed,
-            contract: NativeRuntimeFilterContract::Ordered {
+            contract: RuntimeFilterExecutionContract::Ordered {
                 keys: Arc::from([
-                    crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::from_codec(
+                    crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::new(
                         DataType::Int64,
                         crate::runtime_filter::model::contract::SortDirection::Ascending,
                         crate::runtime_filter::model::contract::NullOrder::Last,
@@ -145,13 +242,13 @@ mod tests {
                 comparator_digest: [3; 32],
                 order_contract_digest: [4; 32],
             },
-            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
         };
         assert_eq!(aggregate_producer.group_key_expr_id, expr_id);
         assert_eq!(aggregate_producer.limit.get(), 7);
         assert_eq!(
             aggregate_producer.reduction,
-            NativeRuntimeFilterReduction::TightenOrderedBound
+            RuntimeFilterExecutionReduction::TightenOrderedBound
         );
     }
 }

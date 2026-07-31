@@ -50,14 +50,14 @@ impl OrderContractDigest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeOrderKey {
+pub struct RuntimeOrderKey {
     data_type: DataType,
     direction: SortDirection,
     null_order: NullOrder,
 }
 
 impl RuntimeOrderKey {
-    pub(crate) const fn from_codec(
+    pub const fn new(
         data_type: DataType,
         direction: SortDirection,
         null_order: NullOrder,
@@ -69,15 +69,15 @@ impl RuntimeOrderKey {
         }
     }
 
-    pub(crate) const fn data_type(&self) -> &DataType {
+    pub const fn data_type(&self) -> &DataType {
         &self.data_type
     }
 
-    pub(crate) const fn direction(&self) -> SortDirection {
+    pub const fn direction(&self) -> SortDirection {
         self.direction
     }
 
-    pub(crate) const fn null_order(&self) -> NullOrder {
+    pub const fn null_order(&self) -> NullOrder {
         self.null_order
     }
 }

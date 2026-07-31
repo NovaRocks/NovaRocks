@@ -19,9 +19,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::exec::node::aggregate::NativeAggregateTopNProducerSpec;
+use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
 };
 use crate::exec::operators::aggregate::topn_boundary::AggregateTopNBoundaryBinding;
 use crate::runtime_filter::model::contract::{
@@ -36,7 +36,7 @@ use crate::runtime_filter::port::producer::{
     RuntimeContractViolationKind, SubmitOutcome,
 };
 use crate::runtime_filter::service::{
-    InstalledNativeRuntimeFilterContract, NativeRuntimeFilterExecutionContext,
+    InstalledRuntimeFilterExecutionContract, NativeRuntimeFilterExecutionContext,
     ResolvedNativeProducer,
 };
 
@@ -62,7 +62,7 @@ struct AggregateTopNProducerBinding {
 
 impl AggregateTopNProducerBinding {
     fn from_plan(
-        spec: &NativeAggregateTopNProducerSpec,
+        spec: &AggregateTopNRuntimeFilterProducerBinding,
         context: &NativeRuntimeFilterExecutionContext,
     ) -> Result<Self, String> {
         let resolved = context
@@ -95,7 +95,7 @@ impl AggregateTopNProducerBinding {
 
     #[cfg(test)]
     fn for_test(
-        spec: &NativeAggregateTopNProducerSpec,
+        spec: &AggregateTopNRuntimeFilterProducerBinding,
         resolved: TestResolvedOrderedProducer,
     ) -> Result<Self, String> {
         let contract = validate_binding_contract(
@@ -116,9 +116,9 @@ impl AggregateTopNProducerBinding {
 }
 
 fn validate_binding_contract(
-    spec: &NativeAggregateTopNProducerSpec,
+    spec: &AggregateTopNRuntimeFilterProducerBinding,
     port: ProducerPortKind,
-    installed_contract: &InstalledNativeRuntimeFilterContract,
+    installed_contract: &InstalledRuntimeFilterExecutionContract,
     installed_reduction: ReductionRequirement,
     installed_contribution_kinds: &BTreeSet<ContributionKind>,
     installed_completion: CompletionRequirement,
@@ -129,7 +129,7 @@ fn validate_binding_contract(
             spec.binding_id
         ));
     }
-    if spec.reduction != NativeRuntimeFilterReduction::TightenOrderedBound
+    if spec.reduction != RuntimeFilterExecutionReduction::TightenOrderedBound
         || installed_reduction != ReductionRequirement::TightenOrderedBound
     {
         return Err(format!(
@@ -158,12 +158,12 @@ fn validate_binding_contract(
         ));
     }
     let (
-        NativeRuntimeFilterContract::Ordered {
+        RuntimeFilterExecutionContract::Ordered {
             keys,
             comparator_digest,
             order_contract_digest,
         },
-        InstalledNativeRuntimeFilterContract::Ordered {
+        InstalledRuntimeFilterExecutionContract::Ordered {
             keys: installed_keys,
             comparator_digest: installed_comparator_digest,
             order_contract_digest: installed_order_contract_digest,
@@ -215,7 +215,7 @@ impl std::fmt::Debug for AggregateTopNProducerSessionFactory {
 
 impl AggregateTopNProducerSessionFactory {
     pub(crate) fn from_plan(
-        specs: &[NativeAggregateTopNProducerSpec],
+        specs: &[AggregateTopNRuntimeFilterProducerBinding],
         context: &NativeRuntimeFilterExecutionContext,
         local_partition_count: i32,
     ) -> Result<Self, String> {
@@ -232,7 +232,7 @@ impl AggregateTopNProducerSessionFactory {
 
     #[cfg(test)]
     fn for_test(
-        specs: &[NativeAggregateTopNProducerSpec],
+        specs: &[AggregateTopNRuntimeFilterProducerBinding],
         resolved: Vec<TestResolvedOrderedProducer>,
         local_partition_count: u32,
     ) -> Result<Self, String> {
@@ -627,7 +627,7 @@ impl AggregateTopNProducerStream {
 #[cfg(test)]
 struct TestResolvedOrderedProducer {
     port: ProducerPortKind,
-    contract: InstalledNativeRuntimeFilterContract,
+    contract: InstalledRuntimeFilterExecutionContract,
     reduction: ReductionRequirement,
     contribution_kinds: BTreeSet<ContributionKind>,
     completion_requirement: CompletionRequirement,
@@ -648,9 +648,9 @@ mod tests {
 
     use super::{AggregateTopNProducerSessionFactory, TestResolvedOrderedProducer};
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::node::aggregate::NativeAggregateTopNProducerSpec;
+    use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
     use crate::exec::node::runtime_filter::{
-        NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+        RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
     };
     use crate::exec::operators::aggregate::topn_boundary::{
         AggregateTopNBoundaryBinding, build_topn_boundary_bindings,
@@ -670,7 +670,7 @@ mod tests {
         OrderedBoundProducerAdapter, ProducerFailureReason, ProducerPortKind,
         RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
     };
-    use crate::runtime_filter::service::InstalledNativeRuntimeFilterContract;
+    use crate::runtime_filter::service::InstalledRuntimeFilterExecutionContract;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
@@ -777,19 +777,19 @@ mod tests {
         )
     }
 
-    fn spec(contract: &RuntimeOrderContract, limit: u32) -> NativeAggregateTopNProducerSpec {
-        NativeAggregateTopNProducerSpec {
+    fn spec(contract: &RuntimeOrderContract, limit: u32) -> AggregateTopNRuntimeFilterProducerBinding {
+        AggregateTopNRuntimeFilterProducerBinding {
             binding_id: 11,
             channel_id: 12,
             group_key_expr_id: crate::exec::expr::ExprId(13),
             group_key_ordinal: 0,
             limit: NonZeroU32::new(limit).expect("nonzero limit"),
-            contract: NativeRuntimeFilterContract::Ordered {
+            contract: RuntimeFilterExecutionContract::Ordered {
                 keys: contract.keys().to_vec().into(),
                 comparator_digest: contract.plan_comparator_digest().get(),
                 order_contract_digest: contract.digest().bytes(),
             },
-            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
             contribution_kinds: BTreeSet::from([
                 ContributionKind::OrderedBoundUpdate,
                 ContributionKind::ProducerClosed,
@@ -804,7 +804,7 @@ mod tests {
     ) -> TestResolvedOrderedProducer {
         TestResolvedOrderedProducer {
             port: ProducerPortKind::OrderedBound,
-            contract: InstalledNativeRuntimeFilterContract::Ordered {
+            contract: InstalledRuntimeFilterExecutionContract::Ordered {
                 keys: contract.keys().to_vec().into(),
                 comparator_digest: contract.plan_comparator_digest().get(),
                 order_contract_digest: contract.digest().bytes(),
@@ -820,7 +820,7 @@ mod tests {
     }
 
     fn factory(
-        spec: &NativeAggregateTopNProducerSpec,
+        spec: &AggregateTopNRuntimeFilterProducerBinding,
         contract: &RuntimeOrderContract,
         adapter: Arc<FakeOrderedAdapter>,
         partition_count: u32,
@@ -833,7 +833,7 @@ mod tests {
         .expect("valid producer factory")
     }
 
-    fn bindings(spec: &NativeAggregateTopNProducerSpec) -> Vec<AggregateTopNBoundaryBinding> {
+    fn bindings(spec: &AggregateTopNRuntimeFilterProducerBinding) -> Vec<AggregateTopNBoundaryBinding> {
         build_topn_boundary_bindings(std::slice::from_ref(spec)).expect("boundary bindings")
     }
 
@@ -1267,7 +1267,7 @@ mod tests {
         assert!(error.contains("TightenOrderedBound"));
 
         let mut wrong_digest = resolved(&contract, adapter);
-        wrong_digest.contract = InstalledNativeRuntimeFilterContract::Ordered {
+        wrong_digest.contract = InstalledRuntimeFilterExecutionContract::Ordered {
             keys: contract.keys().to_vec().into(),
             comparator_digest: contract.plan_comparator_digest().get(),
             order_contract_digest: [99; 32],

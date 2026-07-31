@@ -249,7 +249,7 @@ pub trait NativeOutputLayoutDecoder: Send + Sync {
 
 /// Backend-owned runtime-filter contract decoder invoked after plan assembly
 /// has consumed the binding table.
-pub trait NativeRuntimeFilterContractDecoder: Send + Sync {
+pub trait RuntimeFilterExecutionContractDecoder: Send + Sync {
     fn decode_runtime_filter_contract(
         &self,
         fragment: &plan::PlanFragment,
@@ -298,7 +298,7 @@ pub fn assemble_fragment_submission_for_backend(
     output_layout_decoder: Arc<dyn NativeOutputLayoutDecoder>,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
-    runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
+    runtime_filter_contract_decoder: &dyn RuntimeFilterExecutionContractDecoder,
     connectors: Arc<ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<AssembledNativeFragmentSubmission, String> {

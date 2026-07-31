@@ -147,7 +147,7 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
                 collect_incremental_scan_contracts(input, output);
             }
         }
-        ExecNodeKind::NativeRuntimeFilterConsumer(value) => {
+        ExecNodeKind::RuntimeFilterConsumer(value) => {
             collect_incremental_scan_contracts(&value.input, output)
         }
         ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::LookUp(_) => {}
@@ -224,7 +224,7 @@ impl ProgramInventory {
             ExecNodeKind::TableFunction(node) => self.visit(&node.input),
             ExecNodeKind::Analytic(node) => self.visit(&node.input),
             ExecNodeKind::SetOp(node) => self.visit_inputs(&node.inputs),
-            ExecNodeKind::NativeRuntimeFilterConsumer(node) => self.visit(&node.input),
+            ExecNodeKind::RuntimeFilterConsumer(node) => self.visit(&node.input),
         }
     }
 
@@ -602,7 +602,7 @@ mod tests {
     use crate::exec::node::join::{
         JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
     };
-    use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerNode;
+    use crate::exec::node::runtime_filter::RuntimeFilterConsumerNode;
     use crate::exec::node::scan::{
         BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
     };
@@ -1921,8 +1921,8 @@ mod tests {
             ExecPlan {
                 arena: ExprArena::default(),
                 root: ExecNode {
-                    kind: ExecNodeKind::NativeRuntimeFilterConsumer(
-                        NativeRuntimeFilterConsumerNode {
+                    kind: ExecNodeKind::RuntimeFilterConsumer(
+                        RuntimeFilterConsumerNode {
                             input: Box::new(scan_node(Some(10))),
                             owner_node_id: 30,
                             bindings: Vec::new(),

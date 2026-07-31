@@ -52,12 +52,12 @@ use super::runtime_filter::{
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprArena;
 use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-use crate::exec::node::aggregate::{AggregateRuntimeFilterSpec, NativeAggregateTopNProducerSpec};
-use crate::exec::node::join::{JoinRuntimeFilterExecution, NativeJoinRuntimeFilterProducerSpec};
+use crate::exec::node::aggregate::{AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding};
+use crate::exec::node::join::{JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterConsumerNode, NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
-    NativeRuntimeFilterReduction,
+    RuntimeFilterConsumerNode, RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
+    RuntimeFilterExecutionReduction,
 };
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -691,7 +691,7 @@ fn attach_direct_input_consumers(
     path: FieldPath,
     ctx: &NativePlanDecodeContext,
 ) -> Result<(), super::NativeFragmentDecodeError> {
-    let mut grouped = BTreeMap::<usize, Vec<NativeRuntimeFilterConsumerSpec>>::new();
+    let mut grouped = BTreeMap::<usize, Vec<RuntimeFilterConsumerBinding>>::new();
     for binding in bindings {
         let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
             return Err(super::NativeFragmentDecodeError::inconsistent(
@@ -738,7 +738,7 @@ fn attach_direct_input_consumers(
         let child = &mut children[index];
         let input = child.node.clone();
         child.node = ExecNode {
-            kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+            kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode {
                 input: Box::new(input),
                 owner_node_id,
                 bindings: specs,
@@ -849,11 +849,11 @@ fn attach_leaf_consumers(
 fn wrap_source_boundary(
     node: &mut ExecNode,
     owner_node_id: i32,
-    bindings: Vec<NativeRuntimeFilterConsumerSpec>,
+    bindings: Vec<RuntimeFilterConsumerBinding>,
 ) {
     let input = node.clone();
     *node = ExecNode {
-        kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+        kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode {
             input: Box::new(input),
             owner_node_id,
             bindings,
@@ -863,8 +863,8 @@ fn wrap_source_boundary(
 
 fn set_native_scan_specs(
     node: &mut ExecNode,
-    specs: Vec<NativeRuntimeFilterConsumerSpec>,
-) -> Result<(), Vec<NativeRuntimeFilterConsumerSpec>> {
+    specs: Vec<RuntimeFilterConsumerBinding>,
+) -> Result<(), Vec<RuntimeFilterConsumerBinding>> {
     match &mut node.kind {
         ExecNodeKind::Scan(scan) => {
             scan.set_native_runtime_filter_specs(specs);
@@ -1070,7 +1070,7 @@ fn attach_hash_join_producers(
                 ),
             )
         })?;
-        producers.push(NativeJoinRuntimeFilterProducerSpec {
+        producers.push(JoinRuntimeFilterProducerBinding {
             binding_id: binding.binding_id,
             channel_id: binding.channel_id,
             build_expr_id,
@@ -1241,7 +1241,7 @@ fn attach_hash_aggregate_producers(
                 ),
             ));
         }
-        producers.push(NativeAggregateTopNProducerSpec {
+        producers.push(AggregateTopNRuntimeFilterProducerBinding {
             binding_id: binding.binding_id,
             channel_id: binding.channel_id,
             group_key_expr_id,
@@ -1294,7 +1294,7 @@ fn find_hash_join_mut(
 fn consumer_spec(
     binding: &DecodedRuntimeFilterBinding,
     expr_id: crate::exec::expr::ExprId,
-) -> Result<NativeRuntimeFilterConsumerSpec, String> {
+) -> Result<RuntimeFilterConsumerBinding, String> {
     let DecodedBindingRole::Consumer {
         capabilities,
         activation,
@@ -1306,7 +1306,7 @@ fn consumer_spec(
             binding.binding_id
         ));
     };
-    Ok(NativeRuntimeFilterConsumerSpec {
+    Ok(RuntimeFilterConsumerBinding {
         binding_id: binding.binding_id,
         channel_id: binding.channel_id,
         expr_id,
@@ -1317,12 +1317,12 @@ fn consumer_spec(
     })
 }
 
-fn native_contract(contract: &DecodedRuntimeFilterContract) -> NativeRuntimeFilterContract {
+fn native_contract(contract: &DecodedRuntimeFilterContract) -> RuntimeFilterExecutionContract {
     match contract {
         DecodedRuntimeFilterContract::Membership {
             canonical_schema,
             schema_digest,
-        } => NativeRuntimeFilterContract::Membership {
+        } => RuntimeFilterExecutionContract::Membership {
             canonical_schema: Arc::clone(canonical_schema),
             schema_digest: *schema_digest,
         },
@@ -1330,7 +1330,7 @@ fn native_contract(contract: &DecodedRuntimeFilterContract) -> NativeRuntimeFilt
             keys,
             comparator_digest,
             order_contract_digest,
-        } => NativeRuntimeFilterContract::Ordered {
+        } => RuntimeFilterExecutionContract::Ordered {
             keys: Arc::clone(keys),
             comparator_digest: *comparator_digest,
             order_contract_digest: *order_contract_digest,
@@ -1338,14 +1338,14 @@ fn native_contract(contract: &DecodedRuntimeFilterContract) -> NativeRuntimeFilt
     }
 }
 
-fn native_reduction(reduction: &DecodedRuntimeFilterReduction) -> NativeRuntimeFilterReduction {
+fn native_reduction(reduction: &DecodedRuntimeFilterReduction) -> RuntimeFilterExecutionReduction {
     match reduction {
-        DecodedRuntimeFilterReduction::SetUnion => NativeRuntimeFilterReduction::SetUnion,
+        DecodedRuntimeFilterReduction::SetUnion => RuntimeFilterExecutionReduction::SetUnion,
         DecodedRuntimeFilterReduction::TightenOrderedBound => {
-            NativeRuntimeFilterReduction::TightenOrderedBound
+            RuntimeFilterExecutionReduction::TightenOrderedBound
         }
         DecodedRuntimeFilterReduction::MergeTopKSummary { k, contract_digest } => {
-            NativeRuntimeFilterReduction::MergeTopKSummary {
+            RuntimeFilterExecutionReduction::MergeTopKSummary {
                 k: *k,
                 contract_digest: *contract_digest,
             }
@@ -2826,7 +2826,7 @@ mod tests {
             Some(&DataType::Int64)
         );
         assert_eq!(spec.limit.get(), 5);
-        let NativeRuntimeFilterContract::Ordered {
+        let RuntimeFilterExecutionContract::Ordered {
             keys,
             comparator_digest,
             order_contract_digest,
@@ -2848,7 +2848,7 @@ mod tests {
         assert_ne!(*order_contract_digest, [0; 32]);
         assert_eq!(
             spec.reduction,
-            NativeRuntimeFilterReduction::TightenOrderedBound
+            RuntimeFilterExecutionReduction::TightenOrderedBound
         );
         assert_eq!(
             spec.contribution_kinds,
@@ -3526,7 +3526,7 @@ mod tests {
             &NativePlanDecodeContext::default(),
         )
         .expect("attach");
-        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
+        let ExecNodeKind::RuntimeFilterConsumer(consumer) = &children[0].node.kind else {
             panic!("consumer wrapper")
         };
         assert_eq!(consumer.owner_node_id, 20);
@@ -3551,7 +3551,7 @@ mod tests {
         .expect("unique left input");
         assert!(matches!(
             children[0].node.kind,
-            ExecNodeKind::NativeRuntimeFilterConsumer(_)
+            ExecNodeKind::RuntimeFilterConsumer(_)
         ));
         assert!(matches!(children[1].node.kind, ExecNodeKind::Values(_)));
 
@@ -3614,7 +3614,7 @@ mod tests {
             &NativePlanDecodeContext::default(),
         )
         .expect("filter input boundary");
-        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
+        let ExecNodeKind::RuntimeFilterConsumer(consumer) = &children[0].node.kind else {
             panic!("exact filter input wrapper")
         };
         let ExecNodeKind::Scan(scan) = &consumer.input.kind else {
@@ -3636,7 +3636,7 @@ mod tests {
             &NativePlanDecodeContext::default(),
         )
         .expect("values source boundary");
-        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
+        let ExecNodeKind::RuntimeFilterConsumer(consumer) = lowered.node.kind else {
             panic!("consumer")
         };
         assert!(matches!(consumer.input.kind, ExecNodeKind::Values(_)));
@@ -3669,7 +3669,7 @@ mod tests {
             &NativePlanDecodeContext::default(),
         )
         .expect("generate series source boundary");
-        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
+        let ExecNodeKind::RuntimeFilterConsumer(consumer) = lowered.node.kind else {
             panic!("consumer")
         };
         assert!(matches!(

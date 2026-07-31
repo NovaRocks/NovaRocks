@@ -81,7 +81,7 @@ pub enum ExecNodeKind {
     TableFunction(TableFunctionNode),
     Analytic(AnalyticNode),
     SetOp(SetOpNode),
-    NativeRuntimeFilterConsumer(runtime_filter::NativeRuntimeFilterConsumerNode),
+    RuntimeFilterConsumer(runtime_filter::RuntimeFilterConsumerNode),
 }
 
 #[derive(Clone, Debug)]

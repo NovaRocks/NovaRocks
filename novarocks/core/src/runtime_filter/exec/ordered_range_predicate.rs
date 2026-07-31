@@ -859,7 +859,7 @@ mod tests {
 
         let forged_order = Arc::new(
             RuntimeOrderContract::from_codec(
-                vec![RuntimeOrderKey::from_codec(
+                vec![RuntimeOrderKey::new(
                     DataType::Int64,
                     SortDirection::Descending,
                     NullOrder::Last,

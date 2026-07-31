@@ -49,7 +49,7 @@ use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-use crate::exec::node::aggregate::{AggFunction, NativeAggregateTopNProducerSpec};
+use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::mem_tracker::MemTracker;
@@ -80,7 +80,7 @@ pub struct AggregateStreamingSinkFactory {
 
 #[derive(Clone)]
 struct StreamingAggregateRuntimeFilterExecution {
-    topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
 }
 
 impl AggregateStreamingSinkFactory {
@@ -92,7 +92,7 @@ impl AggregateStreamingSinkFactory {
         output_intermediate: bool,
         output_chunk_schema: ChunkSchemaRef,
         state: AggregateStreamingState,
-        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+        topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
         runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
         local_partition_count: i32,
     ) -> Result<Self, String> {
@@ -174,7 +174,7 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
     }
 
     #[cfg(test)]
-    fn native_aggregate_topn_producers(&self) -> &[NativeAggregateTopNProducerSpec] {
+    fn native_aggregate_topn_producers(&self) -> &[AggregateTopNRuntimeFilterProducerBinding] {
         &self.runtime_filter_execution.topn_producers
     }
 
@@ -1082,7 +1082,7 @@ impl Drop for AggregateStreamingSinkOperator {
 
 #[cfg(test)]
 pub(super) fn aggregate_streaming_topn_test_operator(
-    topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
     session_factory: AggregateTopNProducerSessionFactory,
 ) -> Box<dyn Operator> {
     AggregateStreamingSinkFactory {

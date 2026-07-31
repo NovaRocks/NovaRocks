@@ -613,12 +613,12 @@ mod tests {
     };
     use crate::exec::node::join::{
         JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
-        NativeJoinRuntimeFilterProducerSpec,
+        JoinRuntimeFilterProducerBinding,
     };
     use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
     use crate::exec::node::runtime_filter::{
-        NativeRuntimeFilterConsumerNode, NativeRuntimeFilterConsumerSpec,
-        NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+        RuntimeFilterConsumerNode, RuntimeFilterConsumerBinding,
+        RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
     };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
@@ -1098,7 +1098,7 @@ mod tests {
             crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
         )
         .expect("membership schema");
-        let contract = NativeRuntimeFilterContract::Membership {
+        let contract = RuntimeFilterExecutionContract::Membership {
             canonical_schema: Arc::from(membership_schema.canonical_bytes()),
             schema_digest: membership_schema.digest().bytes(),
         };
@@ -1140,7 +1140,7 @@ mod tests {
                     eq_null_safe: vec![false],
                     residual_predicate: None,
                     runtime_filter_execution: JoinRuntimeFilterExecution {
-                        producers: vec![NativeJoinRuntimeFilterProducerSpec {
+                        producers: vec![JoinRuntimeFilterProducerBinding {
                             binding_id: 3,
                             channel_id: 1,
                             build_expr_id: build_expr,
@@ -1151,7 +1151,7 @@ mod tests {
                             ]),
                             completion_requirement: CompletionRequirement::ProducerClosed,
                             contract: contract.clone(),
-                            reduction: NativeRuntimeFilterReduction::SetUnion,
+                            reduction: RuntimeFilterExecutionReduction::SetUnion,
                         }],
                     },
                 }),
@@ -1216,7 +1216,7 @@ mod tests {
         let consumer_plan = ExecPlan {
             arena: consumer_arena,
             root: ExecNode {
-                kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+                kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode {
                     input: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
                             chunk: Chunk::try_new_with_chunk_schema(
@@ -1228,7 +1228,7 @@ mod tests {
                         }),
                     }),
                     owner_node_id: 4,
-                    bindings: vec![NativeRuntimeFilterConsumerSpec {
+                    bindings: vec![RuntimeFilterConsumerBinding {
                         binding_id: 4,
                         channel_id: 1,
                         expr_id: consumer_expr,
@@ -1238,7 +1238,7 @@ mod tests {
                             ArtifactCapability::EmptyDomain,
                         ]),
                         contract,
-                        reduction: NativeRuntimeFilterReduction::SetUnion,
+                        reduction: RuntimeFilterExecutionReduction::SetUnion,
                     }],
                 }),
             },

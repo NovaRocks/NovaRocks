@@ -18,9 +18,9 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    CompletionRequirement, ContributionKind, RuntimeFilterExecutionContract,
+    RuntimeFilterExecutionReduction,
 };
-use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
 use std::collections::BTreeSet;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -43,20 +43,20 @@ pub enum JoinDistributionMode {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct NativeJoinRuntimeFilterProducerSpec {
+pub struct JoinRuntimeFilterProducerBinding {
     pub(crate) binding_id: u32,
     pub(crate) channel_id: u32,
     pub(crate) build_expr_id: ExprId,
     pub(crate) build_key_index: usize,
     pub(crate) contribution_kinds: BTreeSet<ContributionKind>,
     pub(crate) completion_requirement: CompletionRequirement,
-    pub(crate) contract: NativeRuntimeFilterContract,
-    pub(crate) reduction: NativeRuntimeFilterReduction,
+    pub(crate) contract: RuntimeFilterExecutionContract,
+    pub(crate) reduction: RuntimeFilterExecutionReduction,
 }
 
 #[derive(Clone, Debug)]
 pub struct JoinRuntimeFilterExecution {
-    pub(crate) producers: Vec<NativeJoinRuntimeFilterProducerSpec>,
+    pub(crate) producers: Vec<JoinRuntimeFilterProducerBinding>,
 }
 
 impl JoinRuntimeFilterExecution {
@@ -65,6 +65,44 @@ impl JoinRuntimeFilterExecution {
         Self {
             producers: Vec::new(),
         }
+    }
+
+    pub fn try_new(producers: Vec<JoinRuntimeFilterProducerBinding>) -> Result<Self, String> {
+        if producers
+            .iter()
+            .any(|producer| producer.contribution_kinds.is_empty())
+        {
+            return Err("runtime-filter join producer requires contribution kinds".to_string());
+        }
+        Ok(Self { producers })
+    }
+}
+
+impl JoinRuntimeFilterProducerBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        binding_id: u32,
+        channel_id: u32,
+        build_expr_id: ExprId,
+        build_key_index: usize,
+        contribution_kinds: BTreeSet<ContributionKind>,
+        completion_requirement: CompletionRequirement,
+        contract: RuntimeFilterExecutionContract,
+        reduction: RuntimeFilterExecutionReduction,
+    ) -> Result<Self, String> {
+        if contribution_kinds.is_empty() {
+            return Err("runtime-filter join producer requires contribution kinds".to_string());
+        }
+        Ok(Self {
+            binding_id,
+            channel_id,
+            build_expr_id,
+            build_key_index,
+            contribution_kinds,
+            completion_requirement,
+            contract,
+            reduction,
+        })
     }
 }
 

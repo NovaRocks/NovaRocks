@@ -37,7 +37,7 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorselPruneDecision, ScanNode, ScanOp};
 use crate::exec::operators::FilterEncodingPolicy;
 use crate::exec::operators::runtime_filter::{
-    NativeOrderedLiveConsumerSet, NativeRuntimeFilterConsumerSet,
+    NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet,
 };
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::LakeRowPositionSpec;
@@ -115,7 +115,7 @@ pub(super) struct ScanAsyncRunner {
     pub(super) morsel_iter: Option<BoxedExecIter>,
     pub(super) pending_chunk: Option<Chunk>,
     finished: bool,
-    native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
+    native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
     conjunct_predicate: Option<ExprId>,
     conjunct_encoding_policy: Option<FilterEncodingPolicy>,
@@ -149,7 +149,7 @@ impl ScanAsyncRunner {
         scan: ScanNode,
         op: Arc<dyn ScanOp>,
         dispatch: Arc<ScanDispatchState>,
-        native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
+        native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
         native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
         arena: Arc<ExprArena>,
         profiles: Option<crate::runtime::profile::OperatorProfiles>,
@@ -1005,25 +1005,25 @@ mod tests {
         arena: &mut ExprArena,
         order: &Arc<crate::runtime_filter::port::ordered_bound::RuntimeOrderContract>,
         late_apply: LateApplyGranularity,
-    ) -> crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec {
+    ) -> crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding {
         use crate::exec::node::runtime_filter::{
-            NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
-            NativeRuntimeFilterReduction,
+            RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
+            RuntimeFilterExecutionReduction,
         };
 
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-        NativeRuntimeFilterConsumerSpec {
+        RuntimeFilterConsumerBinding {
             binding_id: 2,
             channel_id: 7,
             expr_id,
             activation: ConsumerActivation::NonBlockingLive { late_apply },
             capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: NativeRuntimeFilterContract::Ordered {
+            contract: RuntimeFilterExecutionContract::Ordered {
                 keys: order.keys().to_vec().into(),
                 comparator_digest: order.plan_comparator_digest().get(),
                 order_contract_digest: order.digest().bytes(),
             },
-            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
         }
     }
 
@@ -1170,8 +1170,8 @@ mod tests {
     #[test]
     fn native_scan_ordered_live_polls_chunk_before_blocking_native_filter() {
         use crate::exec::node::runtime_filter::{
-            NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
-            NativeRuntimeFilterReduction,
+            RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
+            RuntimeFilterExecutionReduction,
         };
         use crate::runtime_filter::model::contract::{NullOrder, NullSemantics, SortDirection};
         use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
@@ -1182,7 +1182,7 @@ mod tests {
         let membership_schema =
             ArtifactMembershipSchema::new(&DataType::Int32, NullSemantics::NeverMatches)
                 .expect("membership schema");
-        let blocking_spec = NativeRuntimeFilterConsumerSpec {
+        let blocking_spec = RuntimeFilterConsumerBinding {
             binding_id: 11,
             channel_id: 7,
             expr_id,
@@ -1191,11 +1191,11 @@ mod tests {
                 ArtifactCapability::Membership,
                 ArtifactCapability::EmptyDomain,
             ]),
-            contract: NativeRuntimeFilterContract::Membership {
+            contract: RuntimeFilterExecutionContract::Membership {
                 canonical_schema: Arc::from(membership_schema.canonical_bytes()),
                 schema_digest: membership_schema.digest().bytes(),
             },
-            reduction: NativeRuntimeFilterReduction::SetUnion,
+            reduction: RuntimeFilterExecutionReduction::SetUnion,
         };
         let blocking_subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(PublishedBlockingSubscription(
@@ -1203,7 +1203,7 @@ mod tests {
             ));
         let arena = Arc::new(arena);
         let blocking_consumers =
-            crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet::
+            crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet::
                 from_bound_for_test(
                     vec![blocking_spec],
                     Arc::clone(&arena),
@@ -1218,7 +1218,7 @@ mod tests {
             SortDirection::Ascending,
             NullOrder::Last,
         );
-        let ordered_spec = NativeRuntimeFilterConsumerSpec {
+        let ordered_spec = RuntimeFilterConsumerBinding {
             binding_id: 12,
             channel_id: 7,
             expr_id,
@@ -1226,12 +1226,12 @@ mod tests {
                 late_apply: LateApplyGranularity::Batch,
             },
             capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
-            contract: NativeRuntimeFilterContract::Ordered {
+            contract: RuntimeFilterExecutionContract::Ordered {
                 keys: order.keys().to_vec().into(),
                 comparator_digest: order.plan_comparator_digest().get(),
                 order_contract_digest: order.digest().bytes(),
             },
-            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
         };
         let live = Arc::new(ControllableOrderedLiveSubscription::new());
         let typed: Arc<dyn NonBlockingLiveSubscription> = live.clone();

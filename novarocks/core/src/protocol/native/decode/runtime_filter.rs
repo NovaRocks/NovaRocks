@@ -699,7 +699,7 @@ fn decode_contract(
                         ));
                     }
                 };
-                keys.push(RuntimeOrderKey::from_codec(
+                keys.push(RuntimeOrderKey::new(
                     data_type, direction, null_order,
                 ));
             }

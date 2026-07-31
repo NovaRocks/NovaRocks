@@ -408,7 +408,7 @@ pub struct ScanNode {
     source: Arc<dyn ScanSource>,
     node_id: Option<i32>,
     native_runtime_filter_specs:
-        Vec<crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec>,
+        Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
     conjunct_predicate: Option<ExprId>,
     output_chunk_schema: ChunkSchemaRef,
     connector_io_tasks_per_scan_operator: Option<i32>,
@@ -467,9 +467,17 @@ impl ScanNode {
 
     pub(crate) fn set_native_runtime_filter_specs(
         &mut self,
-        specs: Vec<crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec>,
+        specs: Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
     ) {
         self.native_runtime_filter_specs = specs;
+    }
+
+    pub fn with_runtime_filter_consumers(
+        mut self,
+        specs: Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
+    ) -> Self {
+        self.native_runtime_filter_specs = specs;
+        self
     }
 
     pub fn with_output_chunk_schema(mut self, output_chunk_schema: ChunkSchemaRef) -> Self {
@@ -528,7 +536,7 @@ impl ScanNode {
 
     pub(crate) fn native_runtime_filter_specs(
         &self,
-    ) -> &[crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec] {
+    ) -> &[crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding] {
         &self.native_runtime_filter_specs
     }
 

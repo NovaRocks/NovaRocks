@@ -25,6 +25,8 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use novarocks_spi::connector::ConnectorCancellation;
+
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::query_execution::lifecycle::QueryExecutionId;
@@ -42,6 +44,17 @@ use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
     manager: Arc<QueryContextManager>,
+}
+
+struct NativeExecutionConnectorCancellation {
+    manager: Arc<QueryContextManager>,
+    query_id: QueryId,
+}
+
+impl ConnectorCancellation for NativeExecutionConnectorCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.manager.is_query_canceled(self.query_id)
+    }
 }
 
 impl NativeFragmentQueryRuntime {
@@ -213,6 +226,22 @@ impl NativeFragmentQueryRuntime {
             .cancel_query_execution(execution_key(execution_id), reason);
         self.publish_resource_snapshot();
         cancelled
+    }
+
+    /// Returns the read-only cancellation capability that must be passed into
+    /// backend-owned connector-read decode. The decoder never receives the
+    /// query manager itself.
+    pub fn connector_cancellation_for_execution(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Arc<dyn ConnectorCancellation> {
+        Arc::new(NativeExecutionConnectorCancellation {
+            manager: Arc::clone(&self.manager),
+            query_id: QueryId::new(
+                execution_id.query_id().high(),
+                execution_id.query_id().low(),
+            ),
+        })
     }
 
     pub fn finish_fragment(&self, execution_id: QueryExecutionId) {

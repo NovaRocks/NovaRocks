@@ -21,9 +21,9 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    CompletionRequirement, ContributionKind, RuntimeFilterExecutionContract,
+    RuntimeFilterExecutionReduction,
 };
-use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
 use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug)]
@@ -67,21 +67,21 @@ pub struct AggFunction {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct NativeAggregateTopNProducerSpec {
+pub struct AggregateTopNRuntimeFilterProducerBinding {
     pub(crate) binding_id: u32,
     pub(crate) channel_id: u32,
     pub(crate) group_key_expr_id: ExprId,
     pub(crate) group_key_ordinal: usize,
     pub(crate) limit: NonZeroU32,
-    pub(crate) contract: NativeRuntimeFilterContract,
-    pub(crate) reduction: NativeRuntimeFilterReduction,
+    pub(crate) contract: RuntimeFilterExecutionContract,
+    pub(crate) reduction: RuntimeFilterExecutionReduction,
     pub(crate) contribution_kinds: BTreeSet<ContributionKind>,
     pub(crate) completion_requirement: CompletionRequirement,
 }
 
 #[derive(Clone, Debug)]
 pub struct AggregateRuntimeFilterSpec {
-    pub(crate) topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    pub(crate) topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
 }
 
 impl AggregateRuntimeFilterSpec {
@@ -94,6 +94,48 @@ impl AggregateRuntimeFilterSpec {
 
     pub fn is_empty(&self) -> bool {
         self.topn_producers.is_empty()
+    }
+
+    pub fn try_new(
+        topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
+    ) -> Result<Self, String> {
+        if topn_producers
+            .iter()
+            .any(|producer| producer.contribution_kinds.is_empty())
+        {
+            return Err("runtime-filter aggregate producer requires contribution kinds".to_string());
+        }
+        Ok(Self { topn_producers })
+    }
+}
+
+impl AggregateTopNRuntimeFilterProducerBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        binding_id: u32,
+        channel_id: u32,
+        group_key_expr_id: ExprId,
+        group_key_ordinal: usize,
+        limit: NonZeroU32,
+        contract: RuntimeFilterExecutionContract,
+        reduction: RuntimeFilterExecutionReduction,
+        contribution_kinds: BTreeSet<ContributionKind>,
+        completion_requirement: CompletionRequirement,
+    ) -> Result<Self, String> {
+        if contribution_kinds.is_empty() {
+            return Err("runtime-filter aggregate producer requires contribution kinds".to_string());
+        }
+        Ok(Self {
+            binding_id,
+            channel_id,
+            group_key_expr_id,
+            group_key_ordinal,
+            limit,
+            contract,
+            reduction,
+            contribution_kinds,
+            completion_requirement,
+        })
     }
 }
 

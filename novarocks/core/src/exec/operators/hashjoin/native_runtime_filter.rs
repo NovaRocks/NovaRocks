@@ -27,9 +27,9 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec;
+use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
 };
 use crate::runtime_filter::exec::membership_delta::{
     MembershipDeltaEncoder, MembershipEncodingOutcome,
@@ -44,7 +44,7 @@ use crate::runtime_filter::port::producer::{
     SubmitOutcome,
 };
 use crate::runtime_filter::service::{
-    InstalledNativeRuntimeFilterContract, NativeRuntimeFilterExecutionContext,
+    InstalledRuntimeFilterExecutionContract, NativeRuntimeFilterExecutionContext,
 };
 
 #[derive(Default)]
@@ -68,10 +68,10 @@ pub(crate) struct NativeMembershipProducerBinding {
     channel_id: u32,
     join_key_ordinal: usize,
     data_type: DataType,
-    contract: NativeRuntimeFilterContract,
+    contract: RuntimeFilterExecutionContract,
     contribution_kinds: BTreeSet<ContributionKind>,
     completion_requirement: CompletionRequirement,
-    reduction: NativeRuntimeFilterReduction,
+    reduction: RuntimeFilterExecutionReduction,
     source: NativeMembershipProducerSource,
     coordinator: Arc<NativeProducerInstanceCoordinator>,
 }
@@ -92,7 +92,7 @@ impl NativeMembershipProducerBinding {
             channel_id: binding_id,
             join_key_ordinal,
             data_type,
-            contract: NativeRuntimeFilterContract::Membership {
+            contract: RuntimeFilterExecutionContract::Membership {
                 canonical_schema: Arc::from(schema.canonical_bytes()),
                 schema_digest: schema.digest().bytes(),
             },
@@ -101,7 +101,7 @@ impl NativeMembershipProducerBinding {
                 ContributionKind::ProducerClosed,
             ]),
             completion_requirement: CompletionRequirement::ProducerClosed,
-            reduction: NativeRuntimeFilterReduction::SetUnion,
+            reduction: RuntimeFilterExecutionReduction::SetUnion,
             source: NativeMembershipProducerSource::Prebound {
                 adapter,
                 max_contribution_bytes,
@@ -111,7 +111,7 @@ impl NativeMembershipProducerBinding {
     }
 
     fn from_plan(
-        spec: &NativeJoinRuntimeFilterProducerSpec,
+        spec: &JoinRuntimeFilterProducerBinding,
         build_keys: &[ExprId],
         eq_null_safe: &[bool],
         arena: &ExprArena,
@@ -153,7 +153,7 @@ impl NativeMembershipProducerBinding {
                     spec.binding_id
                 )
             })?;
-        let NativeRuntimeFilterContract::Membership {
+        let RuntimeFilterExecutionContract::Membership {
             canonical_schema,
             schema_digest,
         } = &spec.contract
@@ -177,7 +177,7 @@ impl NativeMembershipProducerBinding {
         ]);
         if spec.contribution_kinds != expected_kinds
             || spec.completion_requirement != CompletionRequirement::ProducerClosed
-            || spec.reduction != NativeRuntimeFilterReduction::SetUnion
+            || spec.reduction != RuntimeFilterExecutionReduction::SetUnion
         {
             return Err(format!(
                 "native runtime-filter binding_id={} hash join producer contract is not Membership + SetUnion + ProducerClosed",
@@ -206,7 +206,7 @@ pub(crate) struct NativeRuntimeFilterProducerFactory {
 
 impl NativeRuntimeFilterProducerFactory {
     pub(crate) fn from_plan(
-        specs: &[NativeJoinRuntimeFilterProducerSpec],
+        specs: &[JoinRuntimeFilterProducerBinding],
         build_keys: &[ExprId],
         eq_null_safe: &[bool],
         arena: &ExprArena,
@@ -767,11 +767,11 @@ fn validate_resolved_binding(
 ) -> Result<(), String> {
     let contract_matches = match (&binding.contract, resolved.contract()) {
         (
-            NativeRuntimeFilterContract::Membership {
+            RuntimeFilterExecutionContract::Membership {
                 canonical_schema: expected_schema,
                 schema_digest: expected_digest,
             },
-            InstalledNativeRuntimeFilterContract::Membership {
+            InstalledRuntimeFilterExecutionContract::Membership {
                 canonical_schema: actual_schema,
                 schema_digest: actual_digest,
             },
@@ -779,7 +779,7 @@ fn validate_resolved_binding(
         _ => false,
     };
     if !contract_matches
-        || binding.reduction != NativeRuntimeFilterReduction::SetUnion
+        || binding.reduction != RuntimeFilterExecutionReduction::SetUnion
         || resolved.reduction_requirement()
             != crate::runtime_filter::model::contract::ReductionRequirement::SetUnion
         || binding.contribution_kinds != *resolved.allowed_contribution_kinds()

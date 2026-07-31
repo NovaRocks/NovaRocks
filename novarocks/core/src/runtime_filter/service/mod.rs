@@ -97,7 +97,7 @@ use self::materialization::{
     claim_materialization_jobs, execute_materialization_jobs, take_materialization_launch_events,
 };
 pub(crate) use self::native_execution::{
-    InstalledNativeRuntimeFilterContract, NativeRuntimeFilterExecutionContext,
+    InstalledRuntimeFilterExecutionContract, NativeRuntimeFilterExecutionContext,
     ResolvedNativeConsumer, ResolvedNativeProducer,
 };
 use self::producer::{RemoteProducerAdapter, RemoteProducerState, ServiceProducerAdapter};

@@ -34,7 +34,7 @@ use std::time::Instant;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::exchange_source::ExchangeSourceNode;
-use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
+use crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet;
 use crate::exec::pipeline::binding::ExchangeBinding;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -60,7 +60,7 @@ pub struct ExchangeSourceFactory {
 }
 
 struct ExchangeSourceRuntimeFilterExecution {
-    consumers: NativeRuntimeFilterConsumerSet,
+    consumers: RuntimeFilterConsumerSet,
 }
 
 impl ExchangeSourceFactory {
@@ -75,7 +75,7 @@ impl ExchangeSourceFactory {
             binding.expected_senders,
             node.expected_chunk_schema(),
         )?;
-        let consumers = NativeRuntimeFilterConsumerSet::from_plan(
+        let consumers = RuntimeFilterConsumerSet::from_plan(
             node.native_runtime_filter_specs(),
             Arc::clone(&arena),
         )?;
@@ -93,7 +93,7 @@ impl ExchangeSourceFactory {
         node: ExchangeSourceNode,
         binding: ExchangeBinding,
         arena: Arc<ExprArena>,
-        consumers: NativeRuntimeFilterConsumerSet,
+        consumers: RuntimeFilterConsumerSet,
     ) -> Result<Self, String> {
         let name = node.profile_name();
         exchange::register_expected_chunk_schema(
@@ -150,7 +150,7 @@ struct ExchangeSourceOperator {
     logged_first_pull: bool,
     logged_first_none: bool,
     arena: Arc<ExprArena>,
-    native_runtime_filter_consumers: Option<NativeRuntimeFilterConsumerSet>,
+    native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     receiver_mem_tracker_ready: bool,
 }

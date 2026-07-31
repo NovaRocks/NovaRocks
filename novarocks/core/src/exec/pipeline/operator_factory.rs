@@ -38,7 +38,7 @@ pub trait OperatorFactory: Send + Sync {
     #[cfg(test)]
     fn native_aggregate_topn_producers(
         &self,
-    ) -> &[crate::exec::node::aggregate::NativeAggregateTopNProducerSpec] {
+    ) -> &[crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding] {
         &[]
     }
 

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::aggregate::{
-    AggregateNode, AggregateRuntimeFilterSpec, NativeAggregateTopNProducerSpec,
+    AggregateNode, AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding,
     StreamingPreaggregationMode,
 };
 use crate::exec::node::analytic::AnalyticNode;
@@ -44,7 +44,7 @@ use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
 };
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::sort::SortNode;
@@ -64,7 +64,7 @@ use crate::runtime_filter::model::contract::ReductionRequirement;
 use crate::runtime_filter::port::producer::ProducerPortKind;
 use crate::runtime_filter::port::subscription::SubscriptionKind;
 use crate::runtime_filter::service::{
-    InstalledNativeRuntimeFilterContract, NativeRuntimeFilterExecutionContext,
+    InstalledRuntimeFilterExecutionContract, NativeRuntimeFilterExecutionContext,
 };
 
 use super::operator_factory::OperatorFactory;
@@ -549,7 +549,7 @@ fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::C
         }
         ExecNodeKind::ExchangeSource(exchange) => Some(Arc::clone(&exchange.expected_chunk_schema)),
         ExecNodeKind::Scan(scan) => Some(scan.output_chunk_schema()),
-        ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
+        ExecNodeKind::RuntimeFilterConsumer(consumer) => {
             output_chunk_schema_for_node(&consumer.input)
         }
         ExecNodeKind::Fetch(fetch) => Some(Arc::clone(&fetch.output_chunk_schema)),
@@ -688,7 +688,7 @@ fn native_runtime_filter_context(
 }
 
 fn native_aggregate_topn_context(
-    specs: &[NativeAggregateTopNProducerSpec],
+    specs: &[AggregateTopNRuntimeFilterProducerBinding],
     execution: &PipelineRuntimeFilterExecution,
 ) -> Result<Option<NativeRuntimeFilterExecutionContext>, String> {
     let Some(spec) = specs.first() else {
@@ -700,14 +700,14 @@ fn native_aggregate_topn_context(
 }
 
 fn validate_native_producer_specs(
-    specs: &[crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec],
+    specs: &[crate::exec::node::join::JoinRuntimeFilterProducerBinding],
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
     for spec in specs {
         let context =
             native_runtime_filter_context(&ctx.runtime_filter_execution, spec.binding_id)?;
         let requested_kind = match (&spec.contract, &spec.reduction) {
-            (_, NativeRuntimeFilterReduction::MergeTopKSummary { .. }) => {
+            (_, RuntimeFilterExecutionReduction::MergeTopKSummary { .. }) => {
                 ProducerPortKind::TopKSummary
             }
             (_, _)
@@ -717,8 +717,8 @@ fn validate_native_producer_specs(
             {
                 ProducerPortKind::FinalDomain
             }
-            (NativeRuntimeFilterContract::Membership { .. }, _) => ProducerPortKind::Membership,
-            (NativeRuntimeFilterContract::Ordered { .. }, _) => ProducerPortKind::OrderedBound,
+            (RuntimeFilterExecutionContract::Membership { .. }, _) => ProducerPortKind::Membership,
+            (RuntimeFilterExecutionContract::Ordered { .. }, _) => ProducerPortKind::OrderedBound,
         };
         let resolved = context
             .resolve_producer(
@@ -756,7 +756,7 @@ fn validate_native_producer_specs(
 }
 
 fn validate_native_aggregate_topn_specs(
-    specs: &[NativeAggregateTopNProducerSpec],
+    specs: &[AggregateTopNRuntimeFilterProducerBinding],
     group_by: &[ExprId],
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
@@ -794,7 +794,7 @@ fn validate_native_aggregate_topn_specs(
                 spec.binding_id
             )
         })?;
-        let NativeRuntimeFilterContract::Ordered { keys, .. } = &spec.contract else {
+        let RuntimeFilterExecutionContract::Ordered { keys, .. } = &spec.contract else {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} requires an ordered contract",
                 spec.binding_id
@@ -806,7 +806,7 @@ fn validate_native_aggregate_topn_specs(
                 spec.binding_id
             ));
         }
-        if spec.reduction != NativeRuntimeFilterReduction::TightenOrderedBound {
+        if spec.reduction != RuntimeFilterExecutionReduction::TightenOrderedBound {
             return Err(format!(
                 "native aggregate TopN producer binding_id={} requires TightenOrderedBound reduction",
                 spec.binding_id
@@ -900,7 +900,7 @@ fn resolve_aggregate_topn_producer_site(
 }
 
 fn resolve_aggregate_topn_producer_site_if_present(
-    specs: &[NativeAggregateTopNProducerSpec],
+    specs: &[AggregateTopNRuntimeFilterProducerBinding],
     candidates: &[AggregateTopNProducerSiteCandidate],
 ) -> Result<Option<AggregateTopNProducerSite>, String> {
     specs
@@ -912,8 +912,8 @@ fn resolve_aggregate_topn_producer_site_if_present(
 fn aggregate_topn_producers_for_site(
     resolved_site: Option<AggregateTopNProducerSite>,
     physical_site: AggregateTopNProducerSite,
-    specs: &[NativeAggregateTopNProducerSpec],
-) -> Vec<NativeAggregateTopNProducerSpec> {
+    specs: &[AggregateTopNRuntimeFilterProducerBinding],
+) -> Vec<AggregateTopNRuntimeFilterProducerBinding> {
     if resolved_site == Some(physical_site) {
         specs.to_vec()
     } else {
@@ -922,7 +922,7 @@ fn aggregate_topn_producers_for_site(
 }
 
 fn native_join_producer_factory(
-    specs: &[crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec],
+    specs: &[crate::exec::node::join::JoinRuntimeFilterProducerBinding],
     build_keys: &[crate::exec::expr::ExprId],
     eq_null_safe: &[bool],
     build_dop: i32,
@@ -946,7 +946,7 @@ fn native_join_producer_factory(
 }
 
 fn validate_native_consumer_specs(
-    specs: &[NativeRuntimeFilterConsumerSpec],
+    specs: &[RuntimeFilterConsumerBinding],
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
     for spec in specs {
@@ -997,16 +997,16 @@ fn validate_native_consumer_specs(
 
 fn validate_native_contract(
     binding_id: u32,
-    expected: &NativeRuntimeFilterContract,
-    installed: &InstalledNativeRuntimeFilterContract,
+    expected: &RuntimeFilterExecutionContract,
+    installed: &InstalledRuntimeFilterExecutionContract,
 ) -> Result<(), String> {
     let matches = match (expected, installed) {
         (
-            NativeRuntimeFilterContract::Membership {
+            RuntimeFilterExecutionContract::Membership {
                 canonical_schema,
                 schema_digest,
             },
-            InstalledNativeRuntimeFilterContract::Membership {
+            InstalledRuntimeFilterExecutionContract::Membership {
                 canonical_schema: installed_schema,
                 schema_digest: installed_digest,
             },
@@ -1015,12 +1015,12 @@ fn validate_native_contract(
                 && schema_digest == installed_digest
         }
         (
-            NativeRuntimeFilterContract::Ordered {
+            RuntimeFilterExecutionContract::Ordered {
                 keys,
                 comparator_digest,
                 order_contract_digest,
             },
-            InstalledNativeRuntimeFilterContract::Ordered {
+            InstalledRuntimeFilterExecutionContract::Ordered {
                 keys: installed_keys,
                 comparator_digest: installed_comparator,
                 order_contract_digest: installed_order,
@@ -1043,18 +1043,18 @@ fn validate_native_contract(
 
 fn validate_native_reduction(
     binding_id: u32,
-    expected: &NativeRuntimeFilterReduction,
+    expected: &RuntimeFilterExecutionReduction,
     installed: ReductionRequirement,
     installed_topk_contract_digest: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let matches = match (expected, installed) {
-        (NativeRuntimeFilterReduction::SetUnion, ReductionRequirement::SetUnion)
+        (RuntimeFilterExecutionReduction::SetUnion, ReductionRequirement::SetUnion)
         | (
-            NativeRuntimeFilterReduction::TightenOrderedBound,
+            RuntimeFilterExecutionReduction::TightenOrderedBound,
             ReductionRequirement::TightenOrderedBound,
         ) => true,
         (
-            NativeRuntimeFilterReduction::MergeTopKSummary { k, contract_digest },
+            RuntimeFilterExecutionReduction::MergeTopKSummary { k, contract_digest },
             ReductionRequirement::MergeTopKSummary(installed),
         ) => *k == installed.k() && installed_topk_contract_digest == Some(*contract_digest),
         _ => false,
@@ -1073,7 +1073,7 @@ fn build_pipeline_for_node(
     ctx: &mut PipelineBuildContext,
 ) -> Result<PipelineBuildResult, String> {
     match &node.kind {
-        ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
+        ExecNodeKind::RuntimeFilterConsumer(consumer) => {
             validate_native_consumer_specs(&consumer.bindings, ctx)?;
             let mut build = build_pipeline_for_node(&consumer.input, ctx)?;
             if !consumer.bindings.is_empty() {
@@ -2140,8 +2140,8 @@ mod tests {
     };
     use crate::exec::node::lookup::LookUpNode;
     use crate::exec::node::runtime_filter::{
-        NativeRuntimeFilterConsumerNode, NativeRuntimeFilterConsumerSpec,
-        NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+        RuntimeFilterConsumerNode, RuntimeFilterConsumerBinding,
+        RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
     };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
@@ -2195,10 +2195,10 @@ mod tests {
         let wrapped = ExecPlan {
             arena: arena.clone(),
             root: ExecNode {
-                kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+                kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode {
                     input: Box::new(lookup_node(1, Arc::clone(&schema))),
                     owner_node_id: 2,
-                    bindings: vec![NativeRuntimeFilterConsumerSpec {
+                    bindings: vec![RuntimeFilterConsumerBinding {
                         binding_id: 4,
                         channel_id: 1,
                         expr_id,
@@ -2208,7 +2208,7 @@ mod tests {
                             crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
                         ]),
                         contract: installed_native_membership_contract_for_activation(activation),
-                        reduction: NativeRuntimeFilterReduction::SetUnion,
+                        reduction: RuntimeFilterExecutionReduction::SetUnion,
                     }],
                 }),
             },
@@ -2292,7 +2292,7 @@ mod tests {
 
     fn installed_native_membership_contract_for_activation(
         activation: crate::runtime_filter::model::contract::ConsumerActivation,
-    ) -> NativeRuntimeFilterContract {
+    ) -> RuntimeFilterExecutionContract {
         use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 
         let installed_schema = ArtifactMembershipSchema::new(
@@ -2307,7 +2307,7 @@ mod tests {
             },
         )
         .expect("membership schema");
-        NativeRuntimeFilterContract::Membership {
+        RuntimeFilterExecutionContract::Membership {
             canonical_schema: Arc::from(installed_schema.canonical_bytes()),
             schema_digest: installed_schema.digest().bytes(),
         }
@@ -2328,7 +2328,7 @@ mod tests {
         ExecPlan {
             arena,
             root: ExecNode {
-                kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+                kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode {
                     input: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
                             chunk: Chunk::new_with_chunk_schema(
@@ -2339,7 +2339,7 @@ mod tests {
                         }),
                     }),
                     owner_node_id: 2,
-                    bindings: vec![NativeRuntimeFilterConsumerSpec {
+                    bindings: vec![RuntimeFilterConsumerBinding {
                         binding_id: 4,
                         channel_id: 1,
                         expr_id,
@@ -2348,11 +2348,11 @@ mod tests {
                             crate::runtime_filter::model::contract::ArtifactCapability::Membership,
                             crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
                         ]),
-                        contract: NativeRuntimeFilterContract::Membership {
+                        contract: RuntimeFilterExecutionContract::Membership {
                             canonical_schema: Arc::from(installed_schema.canonical_bytes()),
                             schema_digest,
                         },
-                        reduction: NativeRuntimeFilterReduction::SetUnion,
+                        reduction: RuntimeFilterExecutionReduction::SetUnion,
                     }],
                 }),
             },
@@ -2362,7 +2362,7 @@ mod tests {
     #[test]
     fn native_direct_consumer_builder_appends_runtime_filter_factory() {
         let (_manager, runtime_filter_context) = installed_native_consumer_context();
-        let NativeRuntimeFilterContract::Membership { schema_digest, .. } =
+        let RuntimeFilterExecutionContract::Membership { schema_digest, .. } =
             installed_native_membership_contract_for_activation(
                 crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
             )
@@ -2406,7 +2406,7 @@ mod tests {
     }
 
     fn native_join_producer_plan(distribution_mode: JoinDistributionMode) -> ExecPlan {
-        use crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec;
+        use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
         use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
         use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 
@@ -2435,7 +2435,7 @@ mod tests {
             crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
         )
         .expect("membership schema");
-        let contract = NativeRuntimeFilterContract::Membership {
+        let contract = RuntimeFilterExecutionContract::Membership {
             canonical_schema: Arc::from(membership_schema.canonical_bytes()),
             schema_digest: membership_schema.digest().bytes(),
         };
@@ -2457,7 +2457,7 @@ mod tests {
                     eq_null_safe: vec![false],
                     residual_predicate: None,
                     runtime_filter_execution: JoinRuntimeFilterExecution {
-                        producers: vec![NativeJoinRuntimeFilterProducerSpec {
+                        producers: vec![JoinRuntimeFilterProducerBinding {
                             binding_id: 3,
                             channel_id: 1,
                             build_expr_id: build_expr,
@@ -2468,7 +2468,7 @@ mod tests {
                             ]),
                             completion_requirement: CompletionRequirement::ProducerClosed,
                             contract,
-                            reduction: NativeRuntimeFilterReduction::SetUnion,
+                            reduction: RuntimeFilterExecutionReduction::SetUnion,
                         }],
                     },
                 }),
@@ -2479,7 +2479,7 @@ mod tests {
     fn native_aggregate_topn_spec(
         binding_id: u32,
         group_key_expr_id: crate::exec::expr::ExprId,
-    ) -> crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+    ) -> crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding {
         native_aggregate_topn_spec_for_type(binding_id, group_key_expr_id, DataType::Int64)
     }
 
@@ -2487,7 +2487,7 @@ mod tests {
         binding_id: u32,
         group_key_expr_id: crate::exec::expr::ExprId,
         data_type: DataType,
-    ) -> crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+    ) -> crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding {
         use crate::runtime_filter::model::contract::{
             CompletionRequirement, ContributionKind, NullOrder, OrderContract, OrderKeyContract,
             SortDirection,
@@ -2507,18 +2507,18 @@ mod tests {
             inclusive: true,
         })
         .expect("canonical aggregate TopN order");
-        crate::exec::node::aggregate::NativeAggregateTopNProducerSpec {
+        crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding {
             binding_id,
             channel_id: 1,
             group_key_expr_id,
             group_key_ordinal: 0,
             limit: std::num::NonZeroU32::new(5).expect("nonzero limit"),
-            contract: NativeRuntimeFilterContract::Ordered {
+            contract: RuntimeFilterExecutionContract::Ordered {
                 keys: Arc::from(runtime.keys()),
                 comparator_digest: runtime.plan_comparator_digest().get(),
                 order_contract_digest: runtime.digest().bytes(),
             },
-            reduction: NativeRuntimeFilterReduction::TightenOrderedBound,
+            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
             contribution_kinds: BTreeSet::from([
                 ContributionKind::OrderedBoundUpdate,
                 ContributionKind::ProducerClosed,
@@ -3113,7 +3113,7 @@ mod tests {
     fn native_runtime_filter_topk_contract_digest_mismatch_fails_before_open() {
         let error = super::validate_native_reduction(
             7,
-            &NativeRuntimeFilterReduction::MergeTopKSummary {
+            &RuntimeFilterExecutionReduction::MergeTopKSummary {
                 k: std::num::NonZeroU32::new(3).expect("non-zero k"),
                 contract_digest: [1; 32],
             },
@@ -3173,7 +3173,7 @@ mod tests {
         let wrapped = ExecPlan {
             arena,
             root: ExecNode {
-                kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+                kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode {
                     input: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
                             chunk: chunk.clone(),
@@ -3181,7 +3181,7 @@ mod tests {
                         }),
                     }),
                     owner_node_id: 2,
-                    bindings: vec![NativeRuntimeFilterConsumerSpec {
+                    bindings: vec![RuntimeFilterConsumerBinding {
                         binding_id: 4,
                         channel_id: 1,
                         expr_id,
@@ -3191,12 +3191,12 @@ mod tests {
                             crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
                         ]),
                         contract: installed_native_membership_contract_for_activation(activation),
-                        reduction: NativeRuntimeFilterReduction::SetUnion,
+                        reduction: RuntimeFilterExecutionReduction::SetUnion,
                     }],
                 }),
             },
         };
-        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &wrapped.root.kind else {
+        let ExecNodeKind::RuntimeFilterConsumer(consumer) = &wrapped.root.kind else {
             panic!("consumer")
         };
         let ExecNodeKind::Values(values) = &consumer.input.kind else {

@@ -46,7 +46,7 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-use crate::exec::node::aggregate::{AggFunction, NativeAggregateTopNProducerSpec};
+use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
@@ -393,7 +393,7 @@ pub struct AggregateProcessorFactory {
 
 #[derive(Clone)]
 struct AggregateRuntimeFilterExecution {
-    topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
 }
 
 impl AggregateProcessorFactory {
@@ -405,7 +405,7 @@ impl AggregateProcessorFactory {
         output_intermediate: bool,
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
-        topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+        topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
         runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
         local_partition_count: i32,
         final_domain_session: Option<AggregateFinalDomainSessionBuilder>,
@@ -570,7 +570,7 @@ impl OperatorFactory for AggregateProcessorFactory {
     }
 
     #[cfg(test)]
-    fn native_aggregate_topn_producers(&self) -> &[NativeAggregateTopNProducerSpec] {
+    fn native_aggregate_topn_producers(&self) -> &[AggregateTopNRuntimeFilterProducerBinding] {
         &self.runtime_filter_execution.topn_producers
     }
 }
@@ -1678,7 +1678,7 @@ impl Drop for AggregateProcessorOperator {
 
 #[cfg(test)]
 fn aggregate_topn_test_operator(
-    topn_producers: Vec<NativeAggregateTopNProducerSpec>,
+    topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
     session_factory: AggregateTopNProducerSessionFactory,
 ) -> Box<dyn Operator> {
     AggregateProcessorFactory {
