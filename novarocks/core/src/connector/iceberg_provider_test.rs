@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -27,8 +28,10 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
     ConnectorTableRequest, ConnectorTableResolution, CreatePolicy, ExternalMutationEffect,
     ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
-    StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsMetric,
-    StatisticsMetricRequest, StatisticsReadRequest, StatisticsReader,
+    StatisticsCollectionRequest, StatisticsCollectionResult, StatisticsCoverage,
+    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
+    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsProvenance,
+    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader,
 };
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
@@ -36,6 +39,7 @@ use super::iceberg::catalog::{IcebergCatalogRegistry, create_namespace};
 use super::iceberg::provider::{
     IcebergConnectorInstaller, IcebergControlProvider, IcebergReadBinding,
 };
+use crate::query_execution::statistics::{StatisticsCollectionFinalizer, ThetaSketchPartial};
 use crate::sql::{Literal, TableColumnDef};
 use novarocks_catalog::schema::SqlType;
 
@@ -207,6 +211,94 @@ fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
         })
         .expect_err("statistics must reject a data-version drift");
     assert!(error.to_string().contains("data version"));
+}
+
+#[test]
+fn iceberg_statistics_publish_uses_a_pinned_operation_specific_puffin() {
+    let (registry, _warehouse) = registry_with_table();
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let control = IcebergControlProvider::new_control(instance_id.clone(), Arc::clone(&registry))
+        .expect("planning Iceberg control binding");
+    let metadata = control
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context(),
+        })
+        .expect("load table metadata");
+    let data_version = metadata
+        .statistics_data_version
+        .clone()
+        .expect("Iceberg metadata supplies data version");
+    let metric = StatisticsMetric::ThetaNdv {
+        column: Arc::from("id"),
+    };
+    let partial =
+        ThetaSketchPartial::try_from_i64_values(12, [7_i64]).expect("build collection theta");
+    let artifact = StatisticsCollectionFinalizer::default()
+        .with_theta("id", partial)
+        .try_visible_row_artifact(&data_version)
+        .expect("encode Core artifact");
+    let result = StatisticsCollectionResult::try_new(
+        StatisticsEvidence {
+            data_version: data_version.clone(),
+            evidence_revision: StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(
+                b"visible-row/v1",
+            ))
+            .expect("revision"),
+            coverage: StatisticsCoverage::Full,
+            accuracy: StatisticsAccuracy::Exact,
+            interval: None,
+            provenance: StatisticsProvenance::VisibleRows,
+            metrics: BTreeMap::from([(
+                metric,
+                StatisticsMetricState::Available(StatisticsMetricValue::F64(1.0)),
+            )]),
+        },
+        artifact,
+    )
+    .expect("collection result");
+    let operation_id = Default::default();
+    let outcome = control
+        .statistics()
+        .expect("statistics capability")
+        .collection()
+        .expect("statistics collection capability")
+        .publish_statistics(StatisticsPublishRequest {
+            operation_id,
+            table: metadata.table,
+            result,
+            context: context(),
+        })
+        .expect("publish pinned Iceberg statistics");
+    let receipt = match outcome {
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt,
+            ..
+        } => receipt,
+        other => panic!("expected committed statistics publication, got {other:?}"),
+    };
+    let path = std::str::from_utf8(receipt.provider_payload()).expect("receipt path");
+    assert!(path.contains(&uuid::Uuid::from_bytes(operation_id.to_bytes()).to_string()));
+    let entry = registry
+        .read()
+        .expect("registry read")
+        .get("ice")
+        .expect("catalog entry");
+    let loaded = load_table(&entry, "db", "orders").expect("reload table metadata");
+    assert!(
+        loaded
+            .table
+            .metadata()
+            .statistics_iter()
+            .any(|file| file.statistics_path == path)
+    );
 }
 
 #[test]

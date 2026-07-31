@@ -426,6 +426,20 @@ pub(crate) fn puffin_path_for_snapshot(table_metadata: &TableMetadata, snapshot_
     format!("{location}/metadata/snap-{snapshot_id}-statistics.puffin")
 }
 
+/// Operation-specific Puffin location for an explicit statistics collection.
+/// A retry/reconcile keeps its operation ID, while two identical ANALYZE jobs
+/// never overwrite each other's staged artifact before the catalog commit is
+/// authoritatively resolved.
+pub(crate) fn puffin_path_for_statistics_operation(
+    table_metadata: &TableMetadata,
+    snapshot_id: i64,
+    operation_id: [u8; 16],
+) -> String {
+    let location = table_metadata.location().trim_end_matches('/');
+    let operation_id = uuid::Uuid::from_bytes(operation_id);
+    format!("{location}/metadata/snap-{snapshot_id}-statistics-{operation_id}.puffin")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
