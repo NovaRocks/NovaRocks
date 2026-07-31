@@ -110,6 +110,17 @@ fn statistics_data_version(
     )))
 }
 
+fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&str> {
+    match metric {
+        StatisticsMetric::RowCount => None,
+        StatisticsMetric::NullCount { column }
+        | StatisticsMetric::Minimum { column }
+        | StatisticsMetric::Maximum { column }
+        | StatisticsMetric::AverageSize { column }
+        | StatisticsMetric::ThetaNdv { column } => Some(column),
+    }
+}
+
 /// Provider-owned, secret-free declaration used to install an Iceberg read
 /// instance into a BE.  Catalog clients and credentials deliberately do not
 /// cross this boundary: the installer resolves the named binding from process
@@ -2960,6 +2971,29 @@ impl StatisticsCollection for IcebergControlProvider {
                 "Iceberg statistics collection request does not match its resolved table pin",
             ));
         }
+        let mut scan_projection = request
+            .metrics
+            .metrics()
+            .iter()
+            .filter_map(statistics_metric_column)
+            .map(|column| {
+                table_info
+                    .schema
+                    .fields
+                    .iter()
+                    .position(|field| field.name.eq_ignore_ascii_case(column))
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            format!(
+                                "Iceberg statistics metric column `{column}` is absent from the resolved schema"
+                            ),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        scan_projection.sort_unstable();
+        scan_projection.dedup();
         // The opaque payload is the provider's resolved table envelope. Core
         // may compile normal distributed scans from it but cannot reinterpret
         // catalog credentials or re-resolve latest metadata.
@@ -2968,6 +3002,7 @@ impl StatisticsCollection for IcebergControlProvider {
             request.table,
             request.data_version,
             request.metrics,
+            scan_projection,
             provider_payload,
         )
     }

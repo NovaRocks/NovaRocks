@@ -614,6 +614,7 @@ fn statistics_program() -> crate::query_execution::statistics::StatisticsCollect
         table,
         data_version,
         metrics,
+        Vec::new(),
         Bytes::from_static(b"provider-plan"),
     )
     .expect("plan");

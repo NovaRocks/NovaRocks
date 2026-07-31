@@ -257,13 +257,17 @@ pub struct StatisticsCollectionRequest {
 /// Provider-neutral collection preparation result. `table` is the exact
 /// already-resolved table handle pinned by `data_version`; Core must compile
 /// ordinary distributed work from this handle and must never resolve latest
-/// metadata a second time. The provider payload remains opaque to the FE and
-/// Core.
+/// metadata a second time. `scan_projection` is resolved against that same
+/// pinned schema.  It is intentionally a physical ordinal list rather than a
+/// Core-owned catalog lookup: providers own their handle/schema codecs while
+/// Core owns only normal connector scan scheduling. The provider payload
+/// remains opaque to the FE and Core.
 #[derive(Clone)]
 pub struct StatisticsCollectionPlan {
     table: ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
     pub metrics: StatisticsMetricRequest,
+    scan_projection: Vec<usize>,
     provider_payload: Bytes,
 }
 
@@ -272,18 +276,39 @@ impl StatisticsCollectionPlan {
         table: ConnectorTableHandle,
         data_version: StatisticsDataVersion,
         metrics: StatisticsMetricRequest,
+        scan_projection: Vec<usize>,
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
+        if scan_projection.len() > MAX_CONNECTOR_STATISTICS_METRICS {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "statistics collection scan projection exceeds the metric limit",
+            ));
+        }
+        if scan_projection.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics collection scan projection must be sorted and unique",
+            ));
+        }
         Ok(Self {
             table,
             data_version,
             metrics,
+            scan_projection,
             provider_payload: bounded_payload(provider_payload, "statistics collection plan")?,
         })
     }
 
     pub fn table(&self) -> &ConnectorTableHandle {
         &self.table
+    }
+
+    /// Provider-resolved physical column ordinals for the normal connector
+    /// scan.  An empty projection is valid for a row-count-only collection;
+    /// the provider's scan implementation decides how to represent it.
+    pub fn scan_projection(&self) -> &[usize] {
+        &self.scan_projection
     }
 
     pub fn provider_payload(&self) -> &Bytes {

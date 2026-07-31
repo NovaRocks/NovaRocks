@@ -167,8 +167,13 @@ fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
         .statistics_data_version
         .clone()
         .expect("Iceberg metadata supplies a separate data-version pin");
-    let metrics = StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount])
-        .expect("statistics metric request");
+    let metrics = StatisticsMetricRequest::try_new(vec![
+        StatisticsMetric::RowCount,
+        StatisticsMetric::ThetaNdv {
+            column: Arc::from("id"),
+        },
+    ])
+    .expect("statistics metric request");
     let evidence = control
         .statistics()
         .expect("statistics capability")
@@ -199,6 +204,7 @@ fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
     assert_eq!(collection.data_version, data_version);
     assert_eq!(collection.table(), &metadata.table);
     assert_eq!(collection.metrics.metrics(), metrics.metrics());
+    assert_eq!(collection.scan_projection(), &[0]);
 
     let wrong_version = StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"wrong"))
         .expect("bounded test version");
