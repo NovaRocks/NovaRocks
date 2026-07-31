@@ -141,8 +141,13 @@ where
         config,
         shutdown,
         |state_store| async move { FrontendApplicationHost::open(state_store, execution, backend).await },
-        move |host| standalone_open_services(system_catalog, host),
-        move |config, services, shutdown| async move {
+        move |host| {
+            (
+                standalone_open_services(system_catalog, host),
+                host.dml_service(),
+            )
+        },
+        move |config, (services, dml), shutdown| async move {
             let query_control = services.query_control.clone();
             let query_execution = services.query_execution.clone();
             let topology = services.backend_topology.clone();
@@ -154,12 +159,15 @@ where
                 config.grpc_endpoint.core_ownership(),
                 services,
                 move |engine| {
+                    let insert_engine = engine.insert_engine();
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
                         engine,
                         query_control,
                         query_execution,
                         role,
                         topology,
+                        dml,
+                        insert_engine,
                     )))
                 },
                 shutdown,
@@ -190,8 +198,13 @@ where
         config,
         signal,
         |state_store| async move { FrontendApplicationHost::open(state_store, execution, backend).await },
-        move |host| standalone_open_services(system_catalog, host),
-        move |config, services, shutdown| async move {
+        move |host| {
+            (
+                standalone_open_services(system_catalog, host),
+                host.dml_service(),
+            )
+        },
+        move |config, (services, dml), shutdown| async move {
             let query_control = services.query_control.clone();
             let query_execution = services.query_execution.clone();
             let topology = services.backend_topology.clone();
@@ -203,12 +216,15 @@ where
                 config.grpc_endpoint.core_ownership(),
                 services,
                 move |engine| {
+                    let insert_engine = engine.insert_engine();
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
                         engine,
                         query_control,
                         query_execution,
                         role,
                         topology,
+                        dml,
+                        insert_engine,
                     )))
                 },
                 shutdown,

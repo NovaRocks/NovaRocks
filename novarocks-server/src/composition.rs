@@ -84,6 +84,7 @@ where
                 ));
             }
         };
+    let dml = frontend.dml_service();
     let services = novarocks_frontend::standalone_open_services_for_server(&frontend);
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -99,6 +100,7 @@ where
             novarocks::server::StandaloneGrpcEndpointOwnership::ExternallyHosted,
             services,
             move |engine| {
+                let insert_engine = engine.insert_engine();
                 Ok(std::sync::Arc::new(
                     novarocks_frontend::FrontendQueryService::new(
                         engine,
@@ -106,6 +108,8 @@ where
                         query_execution,
                         role,
                         topology,
+                        dml,
+                        insert_engine,
                     ),
                 ))
             },

@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared validators used by both the INSERT (`engine/insert_flow.rs`) and
-//! DELETE (`engine/delete_flow.rs`) entry points before lowering.
+//! Shared validators used by both the INSERT write preparation and DELETE
+//! (`engine/delete_flow.rs`) entry points before lowering.
 //! All errors returned here are user-visible — keep the messages action-oriented.
 
 use std::collections::HashMap;

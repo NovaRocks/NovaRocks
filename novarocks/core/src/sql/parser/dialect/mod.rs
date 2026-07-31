@@ -1686,14 +1686,14 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
 /// sqlparser-rs does not recognise the `PARTITIONS` keyword in this position.
 /// This rewriter drops the `PARTITIONS` token and prepends the reserved marker
 /// identifier `__nr_op_dyn` as a leading name segment on the table object.
-/// Downstream code (`convert_sqlparser_insert_to_custom`) detects the marker
-/// and sets `OverwriteMode::DynamicPartitions`.
+/// The frontend INSERT command converter detects the marker and sets
+/// `InsertOverwriteMode::DynamicPartitions`.
 ///
 /// # Marker convention
 ///
 /// `__nr_op_dyn` (NovaRocks reserved identifier — never a real table name).
 /// It carries no meaning to sqlparser; it is purely an out-of-band signal from
-/// the normaliser to the AST converter.
+/// the normaliser to the frontend command converter.
 ///
 /// # Examples
 ///

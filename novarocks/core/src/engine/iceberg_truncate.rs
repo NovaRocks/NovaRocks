@@ -21,8 +21,8 @@
 //! target (with optional branch suffix `t.branch_<name>` resolved at parse
 //! time and threaded through as `target_ref`).
 //!
-//! Mirrors `iceberg_writer::execute_iceberg_insert_or_overwrite` structurally,
-//! minus the chunk → data-file phase: TRUNCATE writes no new files, only a
+//! Mirrors the Iceberg overwrite commit path structurally, minus the chunk →
+//! data-file phase: TRUNCATE writes no new files, only a
 //! `operation=delete` snapshot whose manifests mark every live entry as
 //! DELETED. The `IcebergCommitCollector` is built with
 //! `CommitOpKind::Truncate` and no `inject_written_file` calls; the

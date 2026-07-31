@@ -2477,10 +2477,10 @@ pub(crate) fn execute_merge_statement(
 
     // Validate writability up front (resolvable default-sort-order, no variant
     // in partition spec / sort order) before any branch write. The folded
-    // not-matched INSERT branch builds its own write plan and bypasses
-    // `execute_iceberg_insert_or_overwrite`, which is where this check used to
-    // run for the INSERT path; running it here keeps MERGE failing fast instead
-    // of deep in codegen. Mirrors the INSERT/UPDATE entry call form.
+    // not-matched INSERT branch builds its own write plan and bypasses the
+    // frontend INSERT preparation route; running it here keeps MERGE failing
+    // fast instead of deep in codegen. Mirrors the INSERT/UPDATE entry call
+    // form.
     let _write_mode = ensure_iceberg_write_supported(&table)?;
 
     let target_columns = iceberg_table_columns(&table)?;

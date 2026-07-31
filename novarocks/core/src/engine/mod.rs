@@ -60,7 +60,6 @@ pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub mod insert_engine;
-pub(crate) mod insert_flow;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_flow;
@@ -78,11 +77,11 @@ pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
 
-pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
+#[cfg(test)]
+pub(crate) use self::insert::build_local_insert_batch;
 use self::statement::{
-    convert_sqlparser_insert_to_custom, execute_create_database_statement,
-    execute_create_table_statement, execute_drop_catalog_statement,
-    execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
+    execute_create_database_statement, execute_create_table_statement,
+    execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
     looks_like_add_legacy_range_partition, looks_like_alter_iceberg_properties,
     looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
@@ -1786,14 +1785,9 @@ impl StandaloneSession {
                 )?;
                 Ok(StatementResult::Query(result))
             }
-            sqlast::Statement::Insert(ref insert) => self.handle_sqlparser_insert(
-                insert,
-                current_catalog,
-                current_database,
-                query_opts.as_ref(),
-                Some(request_context.execution()),
-                &connector_context,
-            ),
+            sqlast::Statement::Insert(_) => {
+                Err("INSERT must be routed by frontend DML service".to_string())
+            }
             sqlast::Statement::Delete(ref delete) => {
                 let stmt = crate::engine::statement::convert_sqlparser_delete_to_custom(delete)?;
                 crate::engine::delete_flow::execute_delete_statement(
@@ -2462,54 +2456,6 @@ impl StandaloneSession {
                 Ok(result)
             }
         }
-    }
-
-    /// Consolidated INSERT handler using sqlparser AST. All INSERT targets
-    /// flow through the custom parser so the shared dispatch in
-    /// `execute_insert_statement` chooses between standalone table backends.
-    fn handle_sqlparser_insert(
-        &self,
-        insert: &sqlparser::ast::Insert,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        query_opts: Option<&QueryOptions>,
-        execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
-        self.execute_insert_via_custom_parser(
-            insert,
-            current_catalog,
-            current_database,
-            query_opts,
-            execution,
-            connector_context,
-        )
-    }
-
-    /// Convert sqlparser INSERT to our custom InsertStmt and delegate to the
-    /// shared dispatcher in `execute_insert_statement`.
-    fn execute_insert_via_custom_parser(
-        &self,
-        insert: &sqlparser::ast::Insert,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        query_opts: Option<&QueryOptions>,
-        execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
-        let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
-        execute_insert_statement(
-            &self.inner,
-            &insert_stmt.table,
-            &insert_stmt.columns,
-            &insert_stmt.source,
-            insert_stmt.overwrite_mode,
-            current_catalog,
-            current_database,
-            query_opts,
-            execution,
-            connector_context,
-        )
     }
 }
 
@@ -5497,6 +5443,91 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    trait IntoTestLiteral {
+        fn into_test_literal(self) -> crate::sql::parser::ast::Literal;
+    }
+
+    impl IntoTestLiteral for i32 {
+        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
+            crate::sql::parser::ast::Literal::Int(i64::from(self))
+        }
+    }
+
+    impl IntoTestLiteral for i64 {
+        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
+            crate::sql::parser::ast::Literal::Int(self)
+        }
+    }
+
+    impl IntoTestLiteral for &str {
+        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
+            crate::sql::parser::ast::Literal::String(self.to_string())
+        }
+    }
+
+    impl IntoTestLiteral for String {
+        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
+            crate::sql::parser::ast::Literal::String(self)
+        }
+    }
+
+    impl<T> IntoTestLiteral for Option<T>
+    where
+        T: IntoTestLiteral,
+    {
+        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
+            self.map_or(
+                crate::sql::parser::ast::Literal::Null,
+                IntoTestLiteral::into_test_literal,
+            )
+        }
+    }
+
+    macro_rules! insert_rows {
+        ($session:expr, $target:expr; $([$($value:expr),* $(,)?]),+ $(,)?) => {
+            insert_iceberg_fixture_rows(
+                $session,
+                $target,
+                &[
+                    $(vec![$($value.into_test_literal()),*]),+
+                ],
+            )
+        };
+    }
+
+    macro_rules! nullable_i64 {
+        (NULL) => {
+            None
+        };
+        ($value:expr) => {
+            Some($value as i64)
+        };
+    }
+
+    macro_rules! kv_rows {
+        ($(($key:tt, $value:tt)),* $(,)?) => {
+            &[$((nullable_i64!($key), nullable_i64!($value))),*]
+        };
+    }
+
+    fn insert_iceberg_fixture_rows(
+        session: &StandaloneSession,
+        target_parts: &[&str],
+        rows: &[Vec<crate::sql::parser::ast::Literal>],
+    ) {
+        let [catalog, namespace, table] = target_parts else {
+            panic!("Iceberg row fixture requires catalog.namespace.table");
+        };
+        let registry = session
+            .inner
+            .iceberg_catalogs
+            .read()
+            .expect("Iceberg catalog registry");
+        let entry = registry.get(catalog).expect("fixture Iceberg catalog");
+        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, rows)
+            .expect("insert Iceberg fixture rows");
+    }
 
     struct AlwaysUnavailableMvApplicationService;
 

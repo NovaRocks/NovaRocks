@@ -31,6 +31,7 @@ use crate::coordinator::{
     BackendQueryActivity, FrontendCoordinatorReportHandler, FrontendDistributedQueryCoordinator,
 };
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
+use crate::dml::{DmlService, StateStoreOperationJournal};
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::query_control::FrontendQueryControl;
 use crate::statistics::FrontendStatisticsService;
@@ -45,6 +46,7 @@ const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
     StateStoreHost,
+    DmlServiceOpen,
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
     MvServiceOpen,
@@ -94,6 +96,7 @@ impl std::error::Error for FrontendApplicationError {}
 pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
+    dml_service: Option<Arc<DmlService>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     table_maintenance_service:
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
@@ -137,6 +140,7 @@ impl FrontendApplicationHost {
         let mut host = Self {
             connector_control: Arc::new(ConnectorControlHost::new()),
             statistics_service: None,
+            dml_service: None,
             view_service: None,
             table_maintenance_service: None,
             mv_repository: None,
@@ -172,6 +176,28 @@ impl FrontendApplicationHost {
             }
         }
         host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
+        let journal = match host.state_store() {
+            Some(store) => {
+                match StateStoreOperationJournal::open(store, tokio::runtime::Handle::current())
+                    .await
+                {
+                    Ok(journal) => Some(Arc::new(journal) as Arc<dyn crate::dml::OperationJournal>),
+                    Err(error) => {
+                        return Err(host
+                            .cleanup_open_error(FrontendApplicationError::new(
+                                FrontendApplicationErrorKind::DmlServiceOpen,
+                                error,
+                            ))
+                            .await);
+                    }
+                }
+            }
+            None => None,
+        };
+        host.dml_service = Some(Arc::new(DmlService::compose(
+            journal,
+            host.statistics_service(),
+        )));
         match FrontendViewService::open(host.state_store(), tokio::runtime::Handle::current()).await
         {
             Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
@@ -251,6 +277,14 @@ impl FrontendApplicationHost {
             .as_ref()
             .expect("frontend statistics service is installed before host open returns")
             .clone()
+    }
+
+    pub fn dml_service(&self) -> Arc<DmlService> {
+        Arc::clone(
+            self.dml_service
+                .as_ref()
+                .expect("frontend DML service is installed before host open returns"),
+        )
     }
 
     pub fn table_maintenance_service(
@@ -477,6 +511,7 @@ impl FrontendApplicationHost {
                 primary_error = Some(table_maintenance_error);
             }
         }
+        self.dml_service.take();
         self.table_maintenance_service.take();
         self.statistics_service.take();
         self.view_service.take();

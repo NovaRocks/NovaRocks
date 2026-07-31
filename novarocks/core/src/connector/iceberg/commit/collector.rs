@@ -17,7 +17,7 @@
 
 //! Query-scoped state shared between the engine flow and the commit-action.
 //!
-//! Lifetime: created in `engine/insert_flow.rs` or `engine/delete_flow.rs`
+//! Lifetime: created by Iceberg write preparation or `engine/delete_flow.rs`
 //! before lowering, dropped after `run_iceberg_commit` returns.
 //!
 //! At pipeline finish, [`take_written_files`](IcebergCommitCollector::take_written_files)

@@ -24,6 +24,7 @@ use novarocks::engine::view::{
     CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
     ViewRequestContext, ViewSqlDialect, ViewTarget,
 };
+use novarocks_frontend::dml::{DmlErrorKind, DmlOperationId};
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
@@ -206,6 +207,56 @@ async fn host_exposes_one_statistics_service_identity() {
     let second = host.statistics_service();
     assert!(Arc::ptr_eq(&first, &second));
     host.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn host_exposes_one_dml_service_identity() {
+    let host = open_host(None).await.expect("host");
+    let first = host.dml_service();
+    let second = host.dml_service();
+    assert!(Arc::ptr_eq(&first, &second));
+    host.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn absent_state_store_builds_dml_service_with_disabled_journal() {
+    let host = open_host(None).await.expect("host");
+    let error = host
+        .dml_service()
+        .load_operation(DmlOperationId::new_v7())
+        .expect_err("disabled DML journal must reject operation access");
+    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
+    assert!(
+        error
+            .to_string()
+            .contains("state store is required for Iceberg INSERT"),
+        "{error}"
+    );
+    host.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_host_reopens_dml_journal_after_shutdown() {
+    let temp = TempDir::new().expect("temporary SQLite deployment");
+    let config = sqlite_config(&temp);
+    let host = open_host(Some(config.clone())).await.expect("first host");
+    assert!(
+        host.dml_service()
+            .list_unfinished_operations()
+            .expect("first DML journal")
+            .is_empty()
+    );
+    host.shutdown().await.expect("first shutdown");
+
+    let reopened = open_host(Some(config)).await.expect("reopened host");
+    assert!(
+        reopened
+            .dml_service()
+            .list_unfinished_operations()
+            .expect("reopened DML journal")
+            .is_empty()
+    );
+    reopened.shutdown().await.expect("reopened shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

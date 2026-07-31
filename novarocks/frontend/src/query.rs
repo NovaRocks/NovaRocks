@@ -24,7 +24,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::common::engine_error::{EngineError, EngineErrorCode};
-use novarocks::engine::{PreparedQueryOperation, StandaloneNovaRocks, StatementResult};
+use novarocks::engine::insert_engine::InsertEngine;
+use novarocks::engine::{
+    PreparedQueryOperation, StandaloneCommandExecutor, StandaloneNovaRocks, StatementResult,
+};
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
 use novarocks::query_execution::control::{
@@ -39,11 +42,49 @@ use novarocks::query_execution::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
+use novarocks::runtime::query_options::QueryOptions;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 use tokio::task;
 
+use crate::dml::DmlService;
+
 const DEFAULT_CATALOG: &str = "default_catalog";
+
+trait CoreCommandRoute {
+    fn execute(
+        &self,
+        sql: &str,
+        context: &RequestContext,
+        query_options: QueryOptions,
+    ) -> Result<StatementResult, String>;
+}
+
+impl CoreCommandRoute for StandaloneCommandExecutor {
+    fn execute(
+        &self,
+        sql: &str,
+        context: &RequestContext,
+        query_options: QueryOptions,
+    ) -> Result<StatementResult, String> {
+        StandaloneCommandExecutor::execute(self, sql, context, Some(query_options))
+    }
+}
+
+fn execute_frontend_command(
+    dml: &DmlService,
+    insert_engine: &dyn InsertEngine,
+    command: &dyn CoreCommandRoute,
+    sql: &str,
+    context: &RequestContext,
+    query_options: QueryOptions,
+) -> Result<StatementResult, String> {
+    match dml.try_execute_insert(insert_engine, sql, context, Some(&query_options)) {
+        Ok(Some(())) => Ok(StatementResult::Ok),
+        Ok(None) => command.execute(sql, context, query_options),
+        Err(error) => Err(error.to_string()),
+    }
+}
 
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
@@ -53,6 +94,8 @@ pub struct FrontendQueryService {
     query_execution: QueryExecutionService,
     role: ClusterRole,
     topology: BackendTopologyService,
+    dml: Arc<DmlService>,
+    insert_engine: Arc<dyn InsertEngine>,
 }
 
 impl FrontendQueryService {
@@ -62,6 +105,8 @@ impl FrontendQueryService {
         query_execution: QueryExecutionService,
         role: ClusterRole,
         topology: BackendTopologyService,
+        dml: Arc<DmlService>,
+        insert_engine: Arc<dyn InsertEngine>,
     ) -> Self {
         Self {
             engine,
@@ -69,6 +114,8 @@ impl FrontendQueryService {
             query_execution,
             role,
             topology,
+            dml,
+            insert_engine,
         }
     }
 }
@@ -391,6 +438,8 @@ impl FrontendQuerySession {
         let compiler = self.service.engine.query_compiler();
         let command_executor = self.service.engine.command_executor();
         let query_execution = self.service.query_execution.clone();
+        let dml = Arc::clone(&self.service.dml);
+        let insert_engine = Arc::clone(&self.service.insert_engine);
         let mut query_options = state.execution_settings.query_options();
         query_options.apply_sql_hints(&sql);
         let is_query = is_query_statement(&sql);
@@ -400,7 +449,14 @@ impl FrontendQuerySession {
                     .prepare(&sql, &context, Some(query_options))
                     .and_then(|operation| execute_prepared_query(operation, &query_execution))
             } else {
-                command_executor.execute(&sql, &context, Some(query_options))
+                execute_frontend_command(
+                    dml.as_ref(),
+                    insert_engine.as_ref(),
+                    &command_executor,
+                    &sql,
+                    &context,
+                    query_options,
+                )
             };
             let completion = active.finish();
             (result, completion)
@@ -954,6 +1010,252 @@ fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use novarocks::engine::insert_engine::{
+        AppendBatchRequest, AppendRowsRequest, IcebergInsertCommit, IcebergPreparedInsert,
+        IcebergWriteReport, InsertQueryRequest, PrepareIcebergInsert, PreparedIcebergInsert,
+        QueryInsertBatch, ResolveInsertTarget, ResolvedInsertTarget,
+    };
+    use novarocks::engine::statistics::{
+        CollectedColumnStatistics, EmptyStatisticsService, StatisticsColumn, StatisticsEngine,
+        StatisticsTableTarget,
+    };
+    use novarocks::query_execution::backend::BackendTopologySnapshot;
+    use novarocks::query_execution::cancellation::QueryCancellationSource;
+    use novarocks::query_execution::request_context::QueryExecutionContext;
+    use novarocks_catalog::schema::ColumnDef;
+
+    use crate::dml::{CommitOutcome, CommitServiceError};
+
+    #[derive(Default)]
+    struct RecordingCoreCommand {
+        calls: AtomicUsize,
+        contexts: Mutex<Vec<QueryExecutionContext>>,
+    }
+
+    impl CoreCommandRoute for RecordingCoreCommand {
+        fn execute(
+            &self,
+            _sql: &str,
+            context: &RequestContext,
+            _query_options: QueryOptions,
+        ) -> Result<StatementResult, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.contexts
+                .lock()
+                .expect("recorded command contexts")
+                .push(context.execution().clone());
+            Ok(StatementResult::Ok)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingInsertEngine {
+        resolve_contexts: Mutex<Vec<QueryExecutionContext>>,
+        append_contexts: Mutex<Vec<QueryExecutionContext>>,
+    }
+
+    impl StatisticsEngine for RecordingInsertEngine {
+        fn resolve_table_columns(
+            &self,
+            _target: &StatisticsTableTarget,
+        ) -> Result<Vec<StatisticsColumn>, String> {
+            Ok(Vec::new())
+        }
+
+        fn resolve_local_table_columns(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<Vec<StatisticsColumn>>, String> {
+            Ok(None)
+        }
+
+        fn collect_table_statistics(
+            &self,
+            _target: &StatisticsTableTarget,
+            _columns: &[String],
+        ) -> Result<Vec<CollectedColumnStatistics>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl InsertEngine for RecordingInsertEngine {
+        fn resolve_target(
+            &self,
+            request: ResolveInsertTarget,
+        ) -> Result<ResolvedInsertTarget, String> {
+            self.resolve_contexts
+                .lock()
+                .expect("resolve contexts")
+                .push(request.execution);
+            Ok(ResolvedInsertTarget {
+                backend: novarocks::engine::insert_engine::InsertTargetBackend::Local,
+                catalog: DEFAULT_CATALOG.to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                columns: vec![ColumnDef {
+                    name: "a".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                supports_pipeline_insert: false,
+            })
+        }
+
+        fn append_rows(&self, request: AppendRowsRequest) -> Result<(), String> {
+            self.append_contexts
+                .lock()
+                .expect("append contexts")
+                .push(request.execution);
+            Ok(())
+        }
+
+        fn execute_insert_query(
+            &self,
+            _request: InsertQueryRequest,
+        ) -> Result<QueryInsertBatch, String> {
+            Err("unexpected INSERT query".to_string())
+        }
+
+        fn append_batch(&self, _request: AppendBatchRequest) -> Result<(), String> {
+            Err("unexpected INSERT batch".to_string())
+        }
+
+        fn prepare_iceberg_write(
+            &self,
+            _request: PrepareIcebergInsert,
+        ) -> Result<PreparedIcebergInsert, String> {
+            Err("unexpected Iceberg INSERT".to_string())
+        }
+
+        fn run_iceberg_write(
+            &self,
+            _prepared: &dyn IcebergPreparedInsert,
+        ) -> Result<IcebergWriteReport, String> {
+            Err("unexpected Iceberg INSERT".to_string())
+        }
+
+        fn commit_iceberg_write(
+            &self,
+            _prepared: &dyn IcebergPreparedInsert,
+            _commit: &dyn IcebergInsertCommit,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            Err(CommitServiceError::invalid_input(
+                "unexpected Iceberg INSERT".to_string(),
+            ))
+        }
+
+        fn finalize_iceberg_write(
+            &self,
+            _prepared: &dyn IcebergPreparedInsert,
+        ) -> Result<(), String> {
+            Err("unexpected Iceberg INSERT".to_string())
+        }
+    }
+
+    fn router_test_context(
+        topology_revision: u64,
+        deadline: Instant,
+        cancellation: &QueryCancellationSource,
+    ) -> RequestContext {
+        RequestContext::admit(RequestAdmission::new(
+            None,
+            "db".to_string(),
+            ClusterRole::AllInOne,
+            BackendTopologySnapshot::empty(topology_revision),
+            Some(deadline),
+            cancellation.view(),
+            SessionOptimizerSettings::default(),
+        ))
+    }
+
+    #[test]
+    fn frontend_router_handles_insert_before_core_command() {
+        let engine = RecordingInsertEngine::default();
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(41, Instant::now() + Duration::from_secs(30), &cancellation);
+
+        let result = execute_frontend_command(
+            &dml,
+            &engine,
+            &command,
+            "INSERT INTO t VALUES (1)",
+            &context,
+            QueryOptions::default(),
+        )
+        .expect("frontend INSERT route");
+
+        assert!(matches!(result, StatementResult::Ok));
+        assert_eq!(engine.resolve_contexts.lock().unwrap().len(), 1);
+        assert_eq!(engine.append_contexts.lock().unwrap().len(), 1);
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn frontend_router_passes_one_request_context_to_dml() {
+        let engine = RecordingInsertEngine::default();
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let cancellation = QueryCancellationSource::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let context = router_test_context(73, deadline, &cancellation);
+
+        execute_frontend_command(
+            &dml,
+            &engine,
+            &command,
+            "INSERT INTO t VALUES (1)",
+            &context,
+            QueryOptions::default(),
+        )
+        .expect("frontend INSERT route");
+
+        let resolve = engine.resolve_contexts.lock().unwrap();
+        let append = engine.append_contexts.lock().unwrap();
+        assert_eq!(resolve[0].topology().revision(), 73);
+        assert_eq!(append[0].topology().revision(), 73);
+        assert_eq!(resolve[0].deadline(), Some(deadline));
+        assert_eq!(append[0].deadline(), Some(deadline));
+        cancellation.request(QueryCancellationReason::ExplicitKill {
+            requester_connection_id: 9,
+        });
+        assert!(resolve[0].cancellation().is_cancelled());
+        assert!(append[0].cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn non_insert_still_reaches_core_command_executor() {
+        let engine = RecordingInsertEngine::default();
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let cancellation = QueryCancellationSource::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let context = router_test_context(91, deadline, &cancellation);
+
+        execute_frontend_command(
+            &dml,
+            &engine,
+            &command,
+            "CREATE DATABASE db2",
+            &context,
+            QueryOptions::default(),
+        )
+        .expect("core command route");
+
+        assert!(engine.resolve_contexts.lock().unwrap().is_empty());
+        assert!(engine.append_contexts.lock().unwrap().is_empty());
+        assert_eq!(command.calls.load(Ordering::SeqCst), 1);
+        let contexts = command.contexts.lock().unwrap();
+        assert_eq!(contexts[0].topology().revision(), 91);
+        assert_eq!(contexts[0].deadline(), Some(deadline));
+    }
 
     #[test]
     fn batch_split_preserves_quoted_semicolons_and_statement_order() {

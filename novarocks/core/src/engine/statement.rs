@@ -17,10 +17,9 @@
 
 //! DDL/DML statement handlers for the standalone engine.
 //!
-//! Top-level dispatchers (`execute_create_database_statement`,
-//! `execute_insert_statement`, etc.) route statements to the in-memory
-//! catalog, the iceberg registry, or the StarRocks table based on the parsed name
-//! and current catalog/database session context.
+//! Top-level dispatchers route statement families that remain in the core
+//! command kernel to the in-memory catalog, Iceberg registry, or StarRocks
+//! table based on the parsed name and current catalog/database session context.
 
 use std::sync::Arc;
 
@@ -28,7 +27,7 @@ use crate::engine::{
     StandaloneState, StatementResult, delete_catalog_attachment_if_needed,
     retire_iceberg_control_binding,
 };
-use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, InsertSource, Literal, ObjectName};
+use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
 use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -46,216 +45,6 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use crate::sql::literal::sqlparser_expr_to_literal;
-
-fn convert_set_expr_to_insert_source(
-    body: &sqlparser::ast::SetExpr,
-) -> Result<InsertSource, String> {
-    use sqlparser::ast as sqlast;
-    match body {
-        sqlast::SetExpr::Values(values) => {
-            convert_literal_values_rows(values).map(InsertSource::Values)
-        }
-        sqlast::SetExpr::Select(select) => {
-            if select.from.is_empty() {
-                let row: Vec<Literal> = select
-                    .projection
-                    .iter()
-                    .map(select_item_expr)
-                    .map(|expr| expr.and_then(sqlparser_expr_to_literal))
-                    .collect::<Result<_, _>>()?;
-                Ok(InsertSource::SelectLiteralRow(row))
-            } else {
-                Err("INSERT SELECT with FROM must use the query pipeline".into())
-            }
-        }
-        sqlast::SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => {
-            // Only UNION ALL is handled at this layer. UNION (distinct) would
-            // need output-level dedup with the target schema's types, which we
-            // don't have at parse time.
-            if !matches!(op, sqlast::SetOperator::Union) {
-                return Err("INSERT SELECT set operation is only UNION ALL here".into());
-            }
-            if !matches!(
-                set_quantifier,
-                sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName
-            ) {
-                return Err(
-                    "INSERT SELECT UNION requires UNION ALL (UNION/UNION DISTINCT unsupported)"
-                        .into(),
-                );
-            }
-            let mut parts = Vec::new();
-            flatten_union_all(left, &mut parts)?;
-            flatten_union_all(right, &mut parts)?;
-            Ok(InsertSource::UnionAll(parts))
-        }
-        sqlast::SetExpr::Query(query) => convert_set_expr_to_insert_source(query.body.as_ref()),
-        _ => Err("unsupported INSERT source".into()),
-    }
-}
-
-fn convert_literal_values_rows(
-    values: &sqlparser::ast::Values,
-) -> Result<Vec<Vec<Literal>>, String> {
-    values
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(sqlparser_expr_to_literal)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect()
-}
-
-fn select_item_expr(item: &sqlparser::ast::SelectItem) -> Result<&sqlparser::ast::Expr, String> {
-    use sqlparser::ast as sqlast;
-    match item {
-        sqlast::SelectItem::UnnamedExpr(expr) | sqlast::SelectItem::ExprWithAlias { expr, .. } => {
-            Ok(expr)
-        }
-        _ => Err("INSERT SELECT source only supports expressions".into()),
-    }
-}
-
-fn flatten_union_all(
-    body: &sqlparser::ast::SetExpr,
-    out: &mut Vec<InsertSource>,
-) -> Result<(), String> {
-    use sqlparser::ast as sqlast;
-    if let sqlast::SetExpr::SetOperation {
-        op: sqlast::SetOperator::Union,
-        set_quantifier: sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName,
-        left,
-        right,
-    } = body
-    {
-        flatten_union_all(left, out)?;
-        flatten_union_all(right, out)?;
-        Ok(())
-    } else {
-        out.push(convert_set_expr_to_insert_source(body)?);
-        Ok(())
-    }
-}
-
-/// Decide whether an INSERT's source Query should be executed via the full
-/// plan pipeline (returning `InsertSource::FromQuery`) instead of being
-/// collapsed into literal rows.
-///
-/// We route via the full pipeline whenever the Query carries clauses the
-/// literal fast path can't represent (WITH/ORDER BY/LIMIT/FETCH/locks), the
-/// body reads from a relation (incl. table functions like
-/// `TABLE(generate_series(...))`), or any SELECT projection item is an
-/// expression the constant folder cannot reduce to a `Literal`.
-fn should_route_insert_via_from_query(query: &sqlparser::ast::Query) -> bool {
-    if query.with.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
-        || query.fetch.is_some()
-        || !query.locks.is_empty()
-    {
-        return true;
-    }
-    body_requires_pipeline(query.body.as_ref())
-}
-
-fn body_requires_pipeline(body: &sqlparser::ast::SetExpr) -> bool {
-    use sqlparser::ast as sqlast;
-    match body {
-        sqlast::SetExpr::Select(select) => {
-            !select.from.is_empty() || select_projection_requires_pipeline(select)
-        }
-        sqlast::SetExpr::Query(inner) => should_route_insert_via_from_query(inner.as_ref()),
-        sqlast::SetExpr::SetOperation { left, right, .. } => {
-            body_requires_pipeline(left) || body_requires_pipeline(right)
-        }
-        _ => false,
-    }
-}
-
-fn select_projection_requires_pipeline(select: &sqlparser::ast::Select) -> bool {
-    use sqlparser::ast as sqlast;
-    select.projection.iter().any(|item| match item {
-        sqlast::SelectItem::UnnamedExpr(expr) | sqlast::SelectItem::ExprWithAlias { expr, .. } => {
-            sqlparser_expr_to_literal(expr).is_err()
-        }
-        // Wildcards have no expression to fold; if we ever see one without a
-        // FROM the analyzer will reject it anyway, so it doesn't matter which
-        // path picks it up.
-        _ => false,
-    })
-}
-
-/// Convert a sqlparser INSERT AST to our custom InsertStmt.
-/// Used for Iceberg tables which need the custom AST's InsertSource types.
-pub(crate) fn convert_sqlparser_insert_to_custom(
-    insert: &sqlparser::ast::Insert,
-) -> Result<crate::sql::parser::ast::InsertStmt, String> {
-    use sqlparser::ast as sqlast;
-
-    let table = match &insert.table {
-        sqlast::TableObject::TableName(name) => {
-            crate::sql::parser::dialect::convert_object_name(name.clone())?
-        }
-        other => return Err(format!("unsupported INSERT target: {other}")),
-    };
-    let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
-    let source_query = insert
-        .source
-        .as_ref()
-        .ok_or_else(|| "INSERT requires a source".to_string())?;
-    // If the source reads from a relation, including a table function, or
-    // carries clauses the literal fast path can't express, hand the whole
-    // Query to the analyzer/planner/pipeline stack via `FromQuery`. This keeps
-    // the INSERT entry point aligned with how StarRocks wraps INSERT ... SELECT
-    // as a normal plan with a sink, rather than evaluating SELECT here.
-    let source = if should_route_insert_via_from_query(source_query) {
-        crate::sql::parser::ast::InsertSource::FromQuery(source_query.clone())
-    } else {
-        convert_set_expr_to_insert_source(source_query.body.as_ref())?
-    };
-    use crate::sql::parser::ast::OverwriteMode;
-    // The normaliser may have prepended the magic marker `__nr_op_dyn` as the
-    // first name segment when it detected `INSERT OVERWRITE PARTITIONS`. Peel
-    // that marker here and record the corresponding overwrite mode.
-    //
-    // `__nr_op_dyn` is a NovaRocks reserved identifier; it should never appear
-    // as a real table-name segment in user SQL.
-    let (table, overwrite_mode) = if !table.parts.is_empty() && table.parts[0] == "__nr_op_dyn" {
-        if !insert.overwrite {
-            // Defensive: the marker must only appear when sqlparser parsed an
-            // OVERWRITE statement.  A mismatch indicates a normaliser bug.
-            return Err(
-                "internal: __nr_op_dyn marker present without INSERT OVERWRITE \
-                 (parser/normalizer mismatch)"
-                    .to_string(),
-            );
-        }
-        let stripped = crate::sql::parser::ast::ObjectName {
-            parts: table.parts.into_iter().skip(1).collect(),
-        };
-        (stripped, OverwriteMode::DynamicPartitions)
-    } else {
-        let mode = if insert.overwrite {
-            OverwriteMode::FullTable
-        } else {
-            OverwriteMode::None
-        };
-        (table, mode)
-    };
-    Ok(crate::sql::parser::ast::InsertStmt {
-        table,
-        columns,
-        source,
-        overwrite_mode,
-    })
-}
 
 /// Convert a sqlparser DELETE AST to our custom DeleteStmt.
 ///
@@ -1490,32 +1279,6 @@ pub(crate) fn execute_truncate_table_statement(
     )
 }
 
-pub(crate) fn execute_insert_statement(
-    state: &Arc<StandaloneState>,
-    name: &ObjectName,
-    columns: &[String],
-    source: &InsertSource,
-    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query_opts: Option<&crate::runtime::query_options::QueryOptions>,
-    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    crate::engine::insert_flow::run_insert(
-        state,
-        name,
-        columns,
-        source,
-        overwrite_mode,
-        current_catalog,
-        current_database,
-        query_opts,
-        execution,
-        connector_context,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // ADD FILES SQL parsing
 // ---------------------------------------------------------------------------
@@ -2409,7 +2172,15 @@ pub(crate) fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDele
         .as_ref()
         .ok_or_else(|| "ADD EQUALITY DELETE requires a VALUES source".to_string())?;
     let rows = match source.body.as_ref() {
-        sqlparser::ast::SetExpr::Values(values) => convert_literal_values_rows(values)?,
+        sqlparser::ast::SetExpr::Values(values) => values
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(sqlparser_expr_to_literal)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         other => {
             return Err(format!(
                 "ADD EQUALITY DELETE expects literal VALUES rows, got {other:?}"
@@ -3433,91 +3204,5 @@ mod column_path_tests {
         let _ = AddPosition::First;
         let _ = AddPosition::After("col_a".to_string());
         let _ = AddPosition::Before("col_b".to_string());
-    }
-}
-
-#[cfg(test)]
-mod insert_overwrite_partitions_parser_tests {
-    // ----- INSERT OVERWRITE PARTITIONS parser tests -----
-
-    /// Normalize + parse + convert an INSERT statement through the full pipeline.
-    fn parse_insert_overwrite(sql: &str) -> crate::sql::parser::ast::InsertStmt {
-        use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
-        let normalized = normalize_for_raw_parse(sql).expect("normalize");
-        let statements =
-            sqlparser::parser::Parser::parse_sql(&StarRocksDialect, &normalized).expect("parse");
-        let sqlparser::ast::Statement::Insert(insert) = &statements[0] else {
-            panic!("expected INSERT statement; got {:?}", statements[0]);
-        };
-        super::convert_sqlparser_insert_to_custom(insert).expect("convert")
-    }
-
-    #[test]
-    fn parse_insert_overwrite_partitions_table() {
-        let stmt = parse_insert_overwrite("INSERT OVERWRITE PARTITIONS TABLE t SELECT * FROM s");
-        assert_eq!(
-            stmt.overwrite_mode,
-            crate::sql::parser::ast::OverwriteMode::DynamicPartitions
-        );
-        assert_eq!(stmt.table.parts, vec!["t"]);
-    }
-
-    #[test]
-    fn parse_insert_overwrite_partitions_no_table_keyword() {
-        let stmt = parse_insert_overwrite("INSERT OVERWRITE PARTITIONS t VALUES (1)");
-        assert_eq!(
-            stmt.overwrite_mode,
-            crate::sql::parser::ast::OverwriteMode::DynamicPartitions
-        );
-        assert_eq!(stmt.table.parts, vec!["t"]);
-    }
-
-    #[test]
-    fn parse_insert_overwrite_table_remains_full_table() {
-        let stmt = parse_insert_overwrite("INSERT OVERWRITE TABLE t SELECT * FROM s");
-        assert_eq!(
-            stmt.overwrite_mode,
-            crate::sql::parser::ast::OverwriteMode::FullTable
-        );
-        assert_eq!(stmt.table.parts, vec!["t"]);
-    }
-
-    #[test]
-    fn insert_select_generate_series_routes_via_standard_query_plan() {
-        let stmt = parse_insert_overwrite(
-            "INSERT INTO t SELECT generate_series FROM TABLE(generate_series(1, 3))",
-        );
-        assert!(
-            matches!(
-                stmt.source,
-                crate::sql::parser::ast::InsertSource::FromQuery(_)
-            ),
-            "generate_series INSERT SELECT must use the standard table-function query plan"
-        );
-    }
-
-    #[test]
-    fn convert_insert_values_preserves_escaped_backslash_before_f() {
-        let stmt = parse_insert_overwrite(r"INSERT INTO t VALUES (13, 'e\\f')");
-        let crate::sql::parser::ast::InsertSource::Values(rows) = stmt.source else {
-            panic!("expected VALUES source");
-        };
-        assert_eq!(
-            rows[0][1],
-            crate::sql::parser::ast::Literal::String(r"e\f".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_insert_overwrite_partitions_with_branch() {
-        // Branch resolution happens later in run_insert via split_ref_suffix;
-        // here we just verify the overwrite mode and that the branch segment
-        // is preserved in the table name.
-        let stmt = parse_insert_overwrite("INSERT OVERWRITE PARTITIONS t.branch_dev VALUES (1)");
-        assert_eq!(
-            stmt.overwrite_mode,
-            crate::sql::parser::ast::OverwriteMode::DynamicPartitions
-        );
-        assert_eq!(stmt.table.parts, vec!["t", "branch_dev"]);
     }
 }
