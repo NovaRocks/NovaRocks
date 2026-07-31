@@ -26,6 +26,8 @@ use std::fmt;
 
 use uuid::Uuid;
 
+use novarocks::engine::statistics_application as core_application;
+
 use super::model::{StatisticsJob, StatisticsJobCreate, StatisticsJobTarget};
 use super::repository::{StatisticsJobRepository, StatisticsJobRepositoryError};
 
@@ -203,3 +205,125 @@ impl fmt::Display for StatisticsApplicationError {
 }
 
 impl std::error::Error for StatisticsApplicationError {}
+
+/// Adapter installed by the frontend composition root.  Core owns command
+/// parsing while this service owns durable StateStore access; no SQL text is
+/// accepted across this boundary.
+pub struct FrontendStatisticsApplicationPort {
+    service: StatisticsApplicationService,
+    table_statistics: std::sync::Arc<dyn TableStatisticsReader>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl FrontendStatisticsApplicationPort {
+    pub fn new(
+        service: StatisticsApplicationService,
+        table_statistics: std::sync::Arc<dyn TableStatisticsReader>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            service,
+            table_statistics,
+            runtime,
+        }
+    }
+}
+
+impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicationPort {
+    fn execute(
+        &self,
+        command: core_application::StatisticsApplicationCommand,
+    ) -> Result<
+        core_application::StatisticsApplicationResult,
+        core_application::StatisticsApplicationError,
+    > {
+        let statement = match command {
+            core_application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
+                StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
+                    target: target.into(),
+                    metric_names: columns,
+                })
+            }
+            core_application::StatisticsApplicationCommand::ShowAnalyzeJobs => {
+                StatisticsStatement::ShowAnalyzeJobs(ShowAnalyzeJobsStatement { target: None })
+            }
+            core_application::StatisticsApplicationCommand::CancelAnalyze { job_id } => {
+                StatisticsStatement::CancelAnalyze(CancelAnalyzeStatement { job_id })
+            }
+            core_application::StatisticsApplicationCommand::ShowTableStats { target } => {
+                StatisticsStatement::ShowTableStats(ShowTableStatsStatement {
+                    target: target.into(),
+                })
+            }
+        };
+        let submitted_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| core_application::StatisticsApplicationError::new(error.to_string()))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                core_application::StatisticsApplicationError::new(
+                    "statistics submission timestamp overflow",
+                )
+            })?;
+        let result = tokio::task::block_in_place(|| {
+            self.runtime.block_on(self.service.execute(
+                statement,
+                submitted_at_ms,
+                self.table_statistics.as_ref(),
+            ))
+        })
+        .map_err(|error| core_application::StatisticsApplicationError::new(error.to_string()))?;
+        Ok(map_core_result(result))
+    }
+}
+
+impl From<core_application::StatisticsTableTarget> for StatisticsJobTarget {
+    fn from(value: core_application::StatisticsTableTarget) -> Self {
+        Self {
+            catalog: value.catalog,
+            namespace: value.namespace,
+            table: value.table,
+        }
+    }
+}
+
+fn map_core_result(
+    result: StatisticsStatementResult,
+) -> core_application::StatisticsApplicationResult {
+    match result {
+        StatisticsStatementResult::JobSubmitted(job) => {
+            core_application::StatisticsApplicationResult::JobSubmitted(job_view(job))
+        }
+        StatisticsStatementResult::AnalyzeJobs(jobs) => {
+            core_application::StatisticsApplicationResult::AnalyzeJobs(
+                jobs.into_iter().map(job_view).collect(),
+            )
+        }
+        StatisticsStatementResult::TableStats(rows) => {
+            core_application::StatisticsApplicationResult::TableStats(
+                rows.into_iter()
+                    .map(|row| core_application::StatisticsTableStatView {
+                        metric: row.metric_name,
+                        value: row.value,
+                        status: row.status,
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+fn job_view(job: StatisticsJob) -> core_application::StatisticsJobView {
+    core_application::StatisticsJobView {
+        job_id: job.job_id,
+        operation_id: job.operation_id,
+        state: format!("{:?}", job.state),
+        attempt: job.attempt,
+        target: core_application::StatisticsTableTarget {
+            catalog: job.target.catalog,
+            namespace: job.target.namespace,
+            table: job.target.table,
+        },
+    }
+}
