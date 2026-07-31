@@ -1,0 +1,4 @@
+explicit_only = false
+server_mode = "native"
+cluster_size = 3
+artifact_flavor = "default"

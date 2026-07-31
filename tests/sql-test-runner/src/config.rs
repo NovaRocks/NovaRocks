@@ -182,7 +182,7 @@ pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>,
                 env_or_default("NOVAROCKS_ICEBERG_REST_WAREHOUSE", &rest_warehouse_default),
             );
         }
-        "iceberg-compatibility" => {
+        "iceberg-compatibility" | "statistics" => {
             let rest_warehouse_default = env_or_default(
                 "NOVA_ENV_REST_WAREHOUSE_URI",
                 "s3://warehouse/sql-tests-rest",
