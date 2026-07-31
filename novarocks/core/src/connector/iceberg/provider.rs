@@ -50,10 +50,12 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicateLiteral, ConnectorStatistics, ConnectorTableHandle,
     ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy,
     CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy, StatisticsCoverage,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
-    StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
-    StatisticsProvenance, StatisticsReadRequest, StatisticsReader,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
+    StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
+    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
+    StatisticsMissingKind, StatisticsProvenance, StatisticsPublishRequest, StatisticsReadRequest,
+    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest,
     normalize_predicate_dispositions, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
@@ -2830,7 +2832,78 @@ impl StatisticsReader for IcebergControlProvider {
     }
 }
 
-impl ConnectorStatistics for IcebergControlProvider {}
+impl StatisticsCollection for IcebergControlProvider {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn prepare_collection(
+        &self,
+        request: StatisticsCollectionRequest,
+    ) -> Result<StatisticsCollectionPlan, ConnectorError> {
+        self.validate_context(&request.context)?;
+        let table = self.table_payload(&request.table)?;
+        let table_info = table.table_info.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics collection requires a resolved base table payload",
+            )
+        })?;
+        let expected_data_version = statistics_data_version(
+            table_info.table_uuid.as_deref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg table payload is missing its table UUID",
+                )
+            })?,
+            table_info.current_snapshot_id,
+        )?;
+        if request.data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics collection request does not match its resolved table pin",
+            ));
+        }
+        // The opaque payload is the provider's resolved table envelope. Core
+        // may compile normal distributed scans from it but cannot reinterpret
+        // catalog credentials or re-resolve latest metadata.
+        StatisticsCollectionPlan::try_new(
+            request.data_version,
+            request.metrics,
+            request.table.payload().clone(),
+        )
+    }
+
+    fn publish_statistics(
+        &self,
+        _request: StatisticsPublishRequest,
+    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg statistics publication requires a Core collection artifact",
+        ))
+    }
+
+    fn reconcile_statistics(
+        &self,
+        _request: StatisticsReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg statistics reconciliation requires a Core collection artifact receipt",
+        ))
+    }
+}
+
+impl ConnectorStatistics for IcebergControlProvider {
+    fn collection(&self) -> Option<&dyn StatisticsCollection> {
+        Some(self)
+    }
+}
 
 fn metric_state_u64(value: &StatValue<u64>) -> StatisticsMetricState {
     match value {

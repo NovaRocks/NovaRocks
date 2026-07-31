@@ -26,9 +26,9 @@ use novarocks_spi::connector::{
     ConnectorNamespaceIdentity, ConnectorOpenReaderRequest, ConnectorReadSelector,
     ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
     ConnectorTableRequest, ConnectorTableResolution, CreatePolicy, ExternalMutationEffect,
-    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy, StatisticsCoverage,
-    StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest, StatisticsReadRequest,
-    StatisticsReader,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
+    StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsMetric,
+    StatisticsMetricRequest, StatisticsReadRequest, StatisticsReader,
 };
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
@@ -177,6 +177,22 @@ fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
     assert_eq!(evidence.data_version, data_version);
     assert_eq!(evidence.coverage, StatisticsCoverage::Subset);
     assert_eq!(evidence.accuracy, StatisticsAccuracy::Approximate);
+
+    let collection = control
+        .statistics()
+        .expect("statistics capability")
+        .collection()
+        .expect("Iceberg supports collection preparation")
+        .prepare_collection(StatisticsCollectionRequest {
+            operation_id: Default::default(),
+            table: metadata.table.clone(),
+            data_version: data_version.clone(),
+            metrics: metrics.clone(),
+            context: context(),
+        })
+        .expect("prepare pinned collection");
+    assert_eq!(collection.data_version, data_version);
+    assert_eq!(collection.metrics.metrics(), metrics.metrics());
 
     let wrong_version = StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"wrong"))
         .expect("bounded test version");
