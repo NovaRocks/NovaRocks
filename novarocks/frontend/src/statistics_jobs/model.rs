@@ -105,6 +105,10 @@ pub struct StatisticsJob {
     pub state: StatisticsJobState,
     pub attempt: u32,
     pub retry_not_before_ms: Option<i64>,
+    /// Bounded opaque operation evidence used only to reconcile a publish
+    /// whose external commit outcome became unknown. It is not a statistics
+    /// artifact, sketch, or execution handle.
+    pub publication_evidence: Option<Vec<u8>>,
     /// Client intent only. The fenced worker performs the state transition to
     /// CANCELLED, so an unfenced session cannot race publication.
     pub cancel_requested: bool,
@@ -126,6 +130,8 @@ pub(crate) struct StoredStatisticsJobV1 {
     #[serde(default)]
     pub retry_not_before_ms: Option<i64>,
     #[serde(default)]
+    pub publication_evidence: Option<Vec<u8>>,
+    #[serde(default)]
     pub cancel_requested: bool,
     pub error: Option<StatisticsJobError>,
     pub submitted_at_ms: i64,
@@ -143,6 +149,7 @@ impl From<&StoredStatisticsJobV1> for StatisticsJob {
             state: value.state,
             attempt: value.attempt,
             retry_not_before_ms: value.retry_not_before_ms,
+            publication_evidence: value.publication_evidence.clone(),
             cancel_requested: value.cancel_requested,
             error: value.error.clone(),
             submitted_at_ms: value.submitted_at_ms,

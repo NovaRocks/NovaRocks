@@ -36,6 +36,11 @@ use novarocks_frontend::statistics_jobs::service::{
 };
 use novarocks_frontend::statistics_jobs::worker::{
     StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
+    StatisticsCollectedAttempt,
+};
+use novarocks_spi::connector::{
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMutationOperationId, ConnectorProviderId, ExternalMutationEvidence,
 };
 use novarocks_spi::state_store::{
     Direction, FeDeploymentView, Key, KeyRange, RangeRequest, StateStore,
@@ -47,6 +52,23 @@ use novarocks_state_store::{
 use tempfile::TempDir;
 
 const PREFIX: &str = "novarocks/frontend/statistics/v1/";
+
+fn publication_evidence(
+    job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+) -> ExternalMutationEvidence {
+    ExternalMutationEvidence::try_new(
+        1,
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("statistics-test").expect("provider ID"),
+            instance_id: ConnectorInstanceId::parse("statistics-test").expect("instance ID"),
+        },
+        ConnectorInstanceIncarnation::default(),
+        ConnectorMutationOperationId::from_bytes(*job.operation_id.as_bytes()),
+        "statistics-publish",
+        Bytes::from_static(b"operation-evidence"),
+    )
+    .expect("test evidence")
+}
 
 fn sqlite_config(path: &Path) -> StateStoreConfig {
     StateStoreConfig {
@@ -177,7 +199,7 @@ impl StatisticsAttemptExecutor for TransientlyFailingStatisticsExecutor {
     fn collect(
         &self,
         _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
-    ) -> Result<(), StatisticsAttemptError> {
+    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
         self.attempts.fetch_add(1, Ordering::AcqRel);
         Err(StatisticsAttemptError::transient(
             StatisticsJobErrorKind::Collection,
@@ -185,9 +207,27 @@ impl StatisticsAttemptExecutor for TransientlyFailingStatisticsExecutor {
         ))
     }
 
-    fn publish_or_reconcile(
+    fn prepare_publish(
         &self,
         _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<ExternalMutationEvidence, StatisticsAttemptError> {
+        panic!("collection failure must not enter publish")
+    }
+
+    fn publish(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _collected: &dyn StatisticsCollectedAttempt,
+        _evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError> {
+        panic!("collection failure must not enter publish")
+    }
+
+    fn reconcile(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _evidence: &ExternalMutationEvidence,
     ) -> Result<(), StatisticsAttemptError> {
         panic!("collection failure must not enter publish")
     }
@@ -197,14 +237,33 @@ impl StatisticsAttemptExecutor for SucceedingStatisticsExecutor {
     fn collect(
         &self,
         _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
-    ) -> Result<(), StatisticsAttemptError> {
+    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
         self.collected.fetch_add(1, Ordering::AcqRel);
+        Ok(Box::new(()))
+    }
+
+    fn prepare_publish(
+        &self,
+        job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<ExternalMutationEvidence, StatisticsAttemptError> {
+        Ok(publication_evidence(job))
+    }
+
+    fn publish(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _collected: &dyn StatisticsCollectedAttempt,
+        _evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError> {
+        self.published.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
-    fn publish_or_reconcile(
+    fn reconcile(
         &self,
         _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _evidence: &ExternalMutationEvidence,
     ) -> Result<(), StatisticsAttemptError> {
         self.published.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -276,16 +335,32 @@ async fn worker_reconciles_publishing_without_recollecting() {
         .await
         .expect("run job");
     repository
-        .transition(
+        .begin_publishing(
             created.job_id,
-            StatisticsJobState::Running,
-            StatisticsJobState::Publishing,
             13,
-            None,
+            publication_evidence(&created)
+                .try_to_wire_v1()
+                .expect("encode test evidence"),
             &fence,
         )
         .await
         .expect("begin publish");
+    let publishing_before_recovery = repository
+        .get(created.job_id)
+        .await
+        .expect("read publishing job")
+        .expect("durable publishing job");
+    let stored_evidence = ExternalMutationEvidence::try_from_wire_v1(
+        publishing_before_recovery
+            .publication_evidence
+            .as_deref()
+            .expect("publishing job evidence"),
+    )
+    .expect("decode publishing job evidence");
+    assert_eq!(
+        stored_evidence.operation_id().to_bytes(),
+        *created.operation_id.as_bytes()
+    );
 
     let concrete_executor = Arc::new(SucceedingStatisticsExecutor {
         collected: AtomicUsize::new(0),
@@ -390,12 +465,12 @@ async fn claim_transitions_with_fence_and_cancel_observes_publish_boundary() {
         .expect("start job");
     assert_eq!(running.state, StatisticsJobState::Running);
     let publishing = repository
-        .transition(
+        .begin_publishing(
             created.job_id,
-            StatisticsJobState::Running,
-            StatisticsJobState::Publishing,
             13,
-            None,
+            publication_evidence(&created)
+                .try_to_wire_v1()
+                .expect("encode test evidence"),
             &fence,
         )
         .await

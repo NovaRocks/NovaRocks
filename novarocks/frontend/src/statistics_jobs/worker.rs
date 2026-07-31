@@ -27,6 +27,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use novarocks_spi::connector::ExternalMutationEvidence;
 use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::OperationId;
 use novarocks_state_store::coordination::{
@@ -93,13 +94,41 @@ impl StatisticsAttemptError {
     }
 }
 
+/// Attempt-local collection material. It never crosses a StateStore boundary:
+/// only the separately prepared reconciliation evidence is durable.
+pub trait StatisticsCollectedAttempt: Send + Sync {}
+
+impl StatisticsCollectedAttempt for () {}
+
 /// Connector-neutral execution owned by the frontend worker. Implementations
 /// receive the durable operation ID from `job` and must use it for all
 /// external collection/publish reconciliation.
 pub trait StatisticsAttemptExecutor: Send + Sync {
-    fn collect(&self, job: &StatisticsJob) -> Result<(), StatisticsAttemptError>;
+    fn collect(
+        &self,
+        job: &StatisticsJob,
+    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError>;
 
-    fn publish_or_reconcile(&self, job: &StatisticsJob) -> Result<(), StatisticsAttemptError>;
+    /// Must be side-effect free. Its result is persisted atomically before
+    /// `publish` is ever called.
+    fn prepare_publish(
+        &self,
+        job: &StatisticsJob,
+        collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<ExternalMutationEvidence, StatisticsAttemptError>;
+
+    fn publish(
+        &self,
+        job: &StatisticsJob,
+        collected: &dyn StatisticsCollectedAttempt,
+        evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError>;
+
+    fn reconcile(
+        &self,
+        job: &StatisticsJob,
+        evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError>;
 }
 
 /// Lifecycle owner for the durable statistics worker task.
@@ -295,10 +324,18 @@ async fn reconcile_publishing(
         let Some(executor) = executor.upgrade() else {
             return Ok(());
         };
+        let evidence = job.publication_evidence.as_deref().ok_or_else(|| {
+            format!(
+                "publishing statistics job {} is missing operation evidence",
+                job.job_id
+            )
+        })?;
+        let evidence = ExternalMutationEvidence::try_from_wire_v1(evidence)
+            .map_err(|error| format!("decode statistics publication evidence: {error}"))?;
         let outcome = run_with_lease_renewal(guard, {
             let executor = Arc::clone(&executor);
             let job = job.clone();
-            move || executor.publish_or_reconcile(&job)
+            move || executor.reconcile(&job, &evidence)
         })
         .await;
         match outcome {
@@ -399,10 +436,13 @@ async fn process_submitted(
             move || executor.collect(&running)
         })
         .await;
-        if let Err(error) = collect {
-            resolve_collection_error(repository, &running, error, fence).await?;
-            continue;
-        }
+        let collected: Arc<dyn StatisticsCollectedAttempt> = match collect {
+            Ok(collected) => Arc::from(collected),
+            Err(error) => {
+                resolve_collection_error(repository, &running, error, fence).await?;
+                continue;
+            }
+        };
         // An explicit cancellation can still win before PUBLISHING. Once the
         // state crosses that boundary the repository returns a typed conflict.
         let Some(current) = repository
@@ -434,15 +474,25 @@ async fn process_submitted(
                 })?;
             continue;
         }
+        let evidence = run_with_lease_renewal(guard, {
+            let executor = Arc::clone(&executor);
+            let running = running.clone();
+            let collected = Arc::clone(&collected);
+            move || executor.prepare_publish(&running, collected.as_ref())
+        })
+        .await;
+        let evidence = match evidence {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                resolve_collection_error(repository, &running, error, fence).await?;
+                continue;
+            }
+        };
+        let evidence_wire = evidence
+            .try_to_wire_v1()
+            .map_err(|error| format!("encode statistics publication evidence: {error}"))?;
         let publishing = repository
-            .transition(
-                running.job_id,
-                StatisticsJobState::Running,
-                StatisticsJobState::Publishing,
-                now_unix_millis(),
-                None,
-                fence,
-            )
+            .begin_publishing(running.job_id, now_unix_millis(), evidence_wire, fence)
             .await
             .map_err(|error| {
                 format!(
@@ -453,7 +503,9 @@ async fn process_submitted(
         let publish = run_with_lease_renewal(guard, {
             let executor = Arc::clone(&executor);
             let publishing = publishing.clone();
-            move || executor.publish_or_reconcile(&publishing)
+            let collected = Arc::clone(&collected);
+            let evidence = evidence.clone();
+            move || executor.publish(&publishing, collected.as_ref(), &evidence)
         })
         .await;
         match publish {
@@ -476,8 +528,8 @@ async fn process_submitted(
                     })?;
             }
             Err(error) if error.requires_reconcile => {
-                // Keep PUBLISHING durable. The next fenced worker must call
-                // `publish_or_reconcile` with this same operation ID.
+                // Keep PUBLISHING durable. The next fenced worker reconciles
+                // with the exact evidence written before external publication.
             }
             Err(error) => {
                 repository
@@ -553,12 +605,13 @@ fn retry_backoff(attempt: u32) -> Duration {
         .min(RETRY_BACKOFF_MAX)
 }
 
-async fn run_with_lease_renewal<F>(
+async fn run_with_lease_renewal<T, F>(
     guard: &mut novarocks_state_store::coordination::LeaseGuard,
     work: F,
-) -> Result<(), StatisticsAttemptError>
+) -> Result<T, StatisticsAttemptError>
 where
-    F: FnOnce() -> Result<(), StatisticsAttemptError> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, StatisticsAttemptError> + Send + 'static,
 {
     let mut task = tokio::task::spawn_blocking(work);
     loop {

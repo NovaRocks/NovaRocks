@@ -31,7 +31,8 @@ use novarocks_spi::connector::{
     StatisticsCollectionRequest, StatisticsCollectionResult, StatisticsCoverage,
     StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
     StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsProvenance,
-    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader,
+    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
+    StatisticsReader,
 };
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
@@ -269,11 +270,24 @@ fn iceberg_statistics_publish_uses_a_pinned_operation_specific_puffin() {
         .expect("statistics capability")
         .collection()
         .expect("statistics collection capability")
+        .prepare_publish(StatisticsPublishPreparationRequest {
+            operation_id,
+            table: metadata.table.clone(),
+            result: result.clone(),
+            context: context(),
+        })
+        .expect("prepare pinned Iceberg statistics publication");
+    let outcome = control
+        .statistics()
+        .expect("statistics capability")
+        .collection()
+        .expect("statistics collection capability")
         .publish_statistics(StatisticsPublishRequest {
             operation_id,
             table: metadata.table.clone(),
             result,
             context: context(),
+            evidence: outcome,
         })
         .expect("publish pinned Iceberg statistics");
     let receipt = match outcome {

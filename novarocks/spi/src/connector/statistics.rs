@@ -309,6 +309,18 @@ pub struct StatisticsPublishRequest {
     pub table: ConnectorTableHandle,
     pub result: StatisticsCollectionResult,
     pub context: ConnectorRequestContext,
+    /// Evidence prepared before the durable caller enters PUBLISHING.  The
+    /// provider must use exactly this operation-specific evidence if commit
+    /// status becomes uncertain.
+    pub evidence: ExternalMutationEvidence,
+}
+
+#[derive(Clone)]
+pub struct StatisticsPublishPreparationRequest {
+    pub operation_id: ConnectorMutationOperationId,
+    pub table: ConnectorTableHandle,
+    pub result: StatisticsCollectionResult,
+    pub context: ConnectorRequestContext,
 }
 
 #[derive(Clone)]
@@ -399,6 +411,13 @@ pub trait StatisticsCollection: Send + Sync {
         &self,
         request: StatisticsCollectionRequest,
     ) -> Result<StatisticsCollectionPlan, ConnectorError>;
+    /// Computes deterministic reconciliation evidence before the caller makes
+    /// the PUBLISHING state durable. This method must not perform an external
+    /// catalog write.
+    fn prepare_publish(
+        &self,
+        request: StatisticsPublishPreparationRequest,
+    ) -> Result<ExternalMutationEvidence, ConnectorError>;
     fn publish_statistics(
         &self,
         request: StatisticsPublishRequest,
@@ -500,10 +519,33 @@ impl ConnectorStatisticsLease {
     ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
         self.validate_table(&request.table)?;
         let operation_id = request.operation_id;
+        self.validate_evidence(&request.evidence)?;
+        if request.evidence.operation_id() != operation_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics publication evidence operation ID does not match request",
+            ));
+        }
         let collection = self.collection()?;
         let outcome = collection.publish_statistics(request)?;
         self.validate_outcome(operation_id, &outcome)?;
         Ok(outcome)
+    }
+    pub fn prepare_publish(
+        &self,
+        request: StatisticsPublishPreparationRequest,
+    ) -> Result<ExternalMutationEvidence, ConnectorError> {
+        self.validate_table(&request.table)?;
+        let operation_id = request.operation_id;
+        let evidence = self.collection()?.prepare_publish(request)?;
+        self.validate_evidence(&evidence)?;
+        if evidence.operation_id() != operation_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector statistics publication evidence changed the operation ID",
+            ));
+        }
+        Ok(evidence)
     }
     pub fn reconcile(
         &self,

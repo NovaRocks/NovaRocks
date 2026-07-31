@@ -91,8 +91,8 @@ pub use statistics::{
     StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric, StatisticsMetricError,
     StatisticsMetricErrorKind, StatisticsMetricRequest, StatisticsMetricState,
     StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
-    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
-    StatisticsReconcileRequest,
+    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
+    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest,
 };
 pub use write::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorBatchWriter, ConnectorOpenWriterRequest,

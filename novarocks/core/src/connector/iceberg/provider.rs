@@ -54,9 +54,9 @@ use novarocks_spi::connector::{
     StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
     StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
     StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
-    StatisticsMissingKind, StatisticsProvenance, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest,
-    normalize_predicate_dispositions, validate_static_predicates,
+    StatisticsMissingKind, StatisticsProvenance, StatisticsPublishPreparationRequest,
+    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
+    StatisticsReconcileRequest, normalize_predicate_dispositions, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2970,6 +2970,64 @@ impl StatisticsCollection for IcebergControlProvider {
         )
     }
 
+    fn prepare_publish(
+        &self,
+        request: StatisticsPublishPreparationRequest,
+    ) -> Result<ExternalMutationEvidence, ConnectorError> {
+        self.validate_context(&request.context)?;
+        let table = self.table_payload(&request.table)?;
+        let table_info = table.table_info.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication requires a resolved base table payload",
+            )
+        })?;
+        let expected_data_version = statistics_data_version(
+            table_info.table_uuid.as_deref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg table payload is missing its table UUID",
+                )
+            })?,
+            table_info.current_snapshot_id,
+        )?;
+        if request.result.evidence.data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication does not match its resolved table pin",
+            ));
+        }
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded =
+            load_table(&entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+        let metadata = loaded.table.metadata();
+        let current_data_version =
+            statistics_data_version(&metadata.uuid().to_string(), metadata.current_snapshot_id())?;
+        if current_data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table changed after statistics collection; recompute before publishing",
+            ));
+        }
+        let snapshot_id = metadata.current_snapshot_id().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cannot publish Iceberg statistics for a table without a snapshot",
+            )
+        })?;
+        let statistics_path = super::stats_assembler::puffin_path_for_statistics_operation(
+            metadata,
+            snapshot_id,
+            request.operation_id.to_bytes(),
+        );
+        self.statistics_evidence(
+            request.operation_id,
+            &table,
+            &expected_data_version,
+            &statistics_path,
+        )
+    }
+
     fn publish_statistics(
         &self,
         request: StatisticsPublishRequest,
@@ -3085,12 +3143,18 @@ impl StatisticsCollection for IcebergControlProvider {
             snapshot_id,
             request.operation_id.to_bytes(),
         );
-        let evidence = self.statistics_evidence(
+        let expected_evidence = self.statistics_evidence(
             request.operation_id,
             &table,
             &expected_data_version,
             &statistics_path,
         )?;
+        if request.evidence != expected_evidence {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication evidence does not match its pinned operation",
+            )));
+        }
         let written =
             super::catalog::registry::block_on_iceberg(super::stats_assembler::write_puffin(
                 loaded.table.file_io(),
@@ -3143,14 +3207,14 @@ impl StatisticsCollection for IcebergControlProvider {
                     ConnectorMutationFailureKind::Internal,
                     format!("commit Iceberg statistics: {error}"),
                 ),
-                evidence,
+                evidence: request.evidence,
             }),
             Err(error) => Ok(ExternalMutationOutcome::CommitUnknown {
                 failure: ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Internal,
                     format!("commit Iceberg statistics runtime: {error}"),
                 ),
-                evidence,
+                evidence: request.evidence,
             }),
         }
     }

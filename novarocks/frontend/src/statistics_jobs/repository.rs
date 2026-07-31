@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES;
 use novarocks_spi::state_store::{
     CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, ReadTransaction,
     StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
@@ -40,6 +41,7 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 const MAX_METRIC_NAMES: usize = 128;
 const MAX_METRIC_NAME_BYTES: usize = 256;
 const MAX_TARGET_COMPONENT_BYTES: usize = 1024;
+const MAX_PUBLICATION_EVIDENCE_WIRE_BYTES: usize = MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES + 1024;
 
 /// A worker passes this closure to atomically validate its coordination fence
 /// before a durable job mutation. The repository deliberately has no lease
@@ -140,6 +142,7 @@ impl StatisticsJobRepository {
             state: StatisticsJobState::Submitted,
             attempt: 0,
             retry_not_before_ms: None,
+            publication_evidence: None,
             cancel_requested: false,
             error: None,
             submitted_at_ms: request.submitted_at_ms,
@@ -275,6 +278,7 @@ impl StatisticsJobRepository {
             Some(fence),
             true,
             None,
+            None,
         )
         .await
         .map(Some)
@@ -289,6 +293,11 @@ impl StatisticsJobRepository {
         error: Option<StatisticsJobError>,
         fence: &FenceValidator,
     ) -> RepositoryResult<StatisticsJob> {
+        if next == StatisticsJobState::Publishing {
+            return Err(StatisticsJobRepositoryError::corruption(
+                "statistics publication requires operation evidence",
+            ));
+        }
         self.transition_with_fence(
             job_id,
             expected,
@@ -298,6 +307,39 @@ impl StatisticsJobRepository {
             Some(fence),
             false,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Atomically installs the already-prepared reconciliation evidence and
+    /// crosses the irreversible publish boundary under the active lease
+    /// fence. A crash after this commit can only reconcile, never recollect or
+    /// republish blindly.
+    pub async fn begin_publishing(
+        &self,
+        job_id: Uuid,
+        now_ms: i64,
+        publication_evidence: Bytes,
+        fence: &FenceValidator,
+    ) -> RepositoryResult<StatisticsJob> {
+        if publication_evidence.is_empty()
+            || publication_evidence.len() > MAX_PUBLICATION_EVIDENCE_WIRE_BYTES
+        {
+            return Err(StatisticsJobRepositoryError::corruption(
+                "statistics publication evidence is empty or exceeds the bound",
+            ));
+        }
+        self.transition_with_fence(
+            job_id,
+            StatisticsJobState::Running,
+            StatisticsJobState::Publishing,
+            now_ms,
+            None,
+            Some(fence),
+            false,
+            None,
+            Some(publication_evidence.to_vec()),
         )
         .await
     }
@@ -328,6 +370,7 @@ impl StatisticsJobRepository {
             None,
             Some(fence),
             false,
+            None,
             None,
         )
         .await
@@ -405,6 +448,7 @@ impl StatisticsJobRepository {
             Some(fence),
             false,
             None,
+            None,
         )
         .await
     }
@@ -433,6 +477,7 @@ impl StatisticsJobRepository {
             Some(fence),
             false,
             Some(retry_not_before_ms),
+            None,
         )
         .await
     }
@@ -447,6 +492,7 @@ impl StatisticsJobRepository {
         fence: Option<&FenceValidator>,
         increment_attempt: bool,
         retry_not_before_ms: Option<i64>,
+        publication_evidence: Option<Vec<u8>>,
     ) -> RepositoryResult<StatisticsJob> {
         if !expected.can_transition_to(next) {
             return Err(invalid_transition(job_id, expected, next));
@@ -484,6 +530,14 @@ impl StatisticsJobRepository {
         stored.updated_at_ms = now_ms;
         stored.error = error;
         stored.retry_not_before_ms = retry_not_before_ms;
+        if next == StatisticsJobState::Publishing && publication_evidence.is_none() {
+            return Err(StatisticsJobRepositoryError::corruption(
+                "statistics publication transition is missing operation evidence",
+            ));
+        }
+        if let Some(publication_evidence) = publication_evidence {
+            stored.publication_evidence = Some(publication_evidence);
+        }
         stored.cancel_requested = false;
         if increment_attempt {
             stored.attempt = stored.attempt.checked_add(1).ok_or_else(|| {
@@ -690,6 +744,22 @@ fn validate_stored(stored: &StoredStatisticsJobV1) -> RepositoryResult<()> {
         submitted_at_ms: stored.submitted_at_ms,
     })?;
     validate_error(stored.error.as_ref())?;
+    if stored
+        .publication_evidence
+        .as_ref()
+        .is_some_and(|evidence| {
+            evidence.is_empty() || evidence.len() > MAX_PUBLICATION_EVIDENCE_WIRE_BYTES
+        })
+    {
+        return Err(StatisticsJobRepositoryError::corruption(
+            "statistics job publication evidence is empty or exceeds the bound",
+        ));
+    }
+    if stored.state == StatisticsJobState::Publishing && stored.publication_evidence.is_none() {
+        return Err(StatisticsJobRepositoryError::corruption(
+            "publishing statistics job is missing operation evidence",
+        ));
+    }
     if stored.state.is_terminal() != stored.completed_at_ms.is_some() {
         return Err(StatisticsJobRepositoryError::corruption(
             "statistics job terminal state and completion timestamp disagree",
