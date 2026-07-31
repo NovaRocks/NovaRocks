@@ -50,9 +50,11 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicateLiteral, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy, CreatePolicy,
     DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, normalize_predicate_dispositions, validate_static_predicates,
+    ExternalMutationOutcome, ConnectorRefreshPublicationGuard,
+    normalize_predicate_dispositions, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::catalog::IcebergCatalogEntry;
 use super::catalog::registry::{
@@ -556,6 +558,17 @@ enum IcebergMutationEvidenceTarget {
         ref_name: String,
         expected_snapshot_id: Option<i64>,
     },
+    GuardedFastForward {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        before_metadata_location: Option<String>,
+        source_branch: String,
+        target_branch: String,
+        source_snapshot_id: i64,
+        expected_target_snapshot_id: Option<i64>,
+        guard_digest: [u8; 32],
+    },
 }
 
 impl IcebergControlProvider {
@@ -752,6 +765,190 @@ impl IcebergControlProvider {
         )
     }
 
+    fn guarded_fast_forward_evidence(
+        &self,
+        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        table: &novarocks_spi::connector::ConnectorTableIdentity,
+        source_branch: &str,
+        target_branch: &str,
+        source_snapshot_id: i64,
+        expected_target_snapshot_id: Option<i64>,
+        guard: &ConnectorRefreshPublicationGuard,
+        loaded: &super::catalog::IcebergLoadedTable,
+    ) -> Result<ExternalMutationEvidence, ConnectorError> {
+        let target = IcebergMutationEvidenceTarget::GuardedFastForward {
+            namespace: table.namespace.to_string(),
+            table: table.table.to_string(),
+            table_uuid: loaded.table.metadata().uuid().to_string(),
+            before_metadata_location: loaded.table.metadata_location().map(ToString::to_string),
+            source_branch: source_branch.to_string(),
+            target_branch: target_branch.to_string(),
+            source_snapshot_id,
+            expected_target_snapshot_id,
+            guard_digest: guard.digest(),
+        };
+        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+            version: ICEBERG_MUTATION_EVIDENCE_VERSION,
+            target,
+        })
+        .map_err(|error| internal(format!("encode Iceberg mutation evidence: {error}")))?;
+        ExternalMutationEvidence::try_new(
+            ICEBERG_MUTATION_EVIDENCE_VERSION,
+            self.descriptor.clone(),
+            self.incarnation,
+            operation_id,
+            "alter-ref",
+            Bytes::from(payload),
+        )
+    }
+
+    fn execute_guarded_fast_forward(
+        &self,
+        request: &ConnectorCatalogMutationRequest,
+        table: &novarocks_spi::connector::ConnectorTableIdentity,
+        action: &novarocks_spi::connector::ConnectorRefAction,
+    ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+        let novarocks_spi::connector::ConnectorRefAction::FastForwardBranch {
+            source_branch,
+            target_branch,
+            source_snapshot_id,
+            expected_target_snapshot_id,
+            guard,
+        } = action
+        else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "guarded fast-forward requires the internal publication action",
+            ));
+        };
+        if table.instance_id != self.instance_id {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "ref mutation belongs to another connector instance",
+            )));
+        }
+        let prepared = (|| -> Result<_, ConnectorError> {
+            if source_branch.eq_ignore_ascii_case("main")
+                || !target_branch.eq_ignore_ascii_case("main")
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "MV guarded fast-forward must publish a named staging branch to main",
+                ));
+            }
+            let entry = self.entry(self.instance_id.as_str())?;
+            let loaded = load_existing_table_for_reconcile(&entry, &table.namespace, &table.table)?
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "Iceberg table does not exist for MV publication",
+                    )
+                })?;
+            let evidence = self.guarded_fast_forward_evidence(
+                request.operation_id,
+                table,
+                source_branch,
+                target_branch,
+                *source_snapshot_id,
+                *expected_target_snapshot_id,
+                guard,
+                &loaded,
+            )?;
+            let commit = build_guarded_fast_forward_commit(
+                &table.namespace,
+                &table.table,
+                loaded.table.metadata(),
+                source_branch,
+                target_branch,
+                *source_snapshot_id,
+                *expected_target_snapshot_id,
+                guard,
+            )?;
+            Ok((
+                entry,
+                evidence,
+                commit,
+                provider_version(loaded.table.metadata_location()),
+            ))
+        })();
+        let (entry, evidence, commit, before_version) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+        if let Err(error) = self.validate_context(&request.context) {
+            return Ok(known_uncommitted(error));
+        }
+        let catalog = match super::catalog::registry::build_iceberg_catalog(&entry)
+            .map_err(map_iceberg_error)
+        {
+            Ok(catalog) => catalog,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+        if let Err(error) =
+            super::catalog::registry::block_on_iceberg(async { catalog.update_table(commit).await })
+                .map_err(|error| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        format!("commit guarded Iceberg MV publication: {error}"),
+                    )
+                })
+        {
+            return if mutation_commit_may_be_unknown(error.kind()) {
+                Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        mutation_failure_kind(error.kind()),
+                        error.to_string(),
+                    ),
+                    evidence,
+                })
+            } else {
+                Ok(known_uncommitted(error))
+            };
+        }
+        let receipt = self.receipt(
+            request.operation_id,
+            request.operation.kind(),
+            Some(before_version),
+        )?;
+        match self.validate_context(&request.context).and_then(|()| {
+            load_existing_table_for_reconcile(&entry, &table.namespace, &table.table)?.ok_or_else(
+                || {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        "Iceberg table disappeared after guarded MV publication",
+                    )
+                },
+            )
+        }) {
+            Ok(finalized)
+                if finalized.table.metadata().current_snapshot_id()
+                    == Some(*source_snapshot_id) =>
+            {
+                Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt,
+                    finalization: ExternalMutationFinalization::Complete,
+                })
+            }
+            Ok(_) => Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt,
+                finalization: ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "Iceberg main ref changed before guarded MV publication finalization",
+                )),
+            }),
+            Err(error) => Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt,
+                finalization: ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                    mutation_failure_kind(error.kind()),
+                    error.to_string(),
+                )),
+            }),
+        }
+    }
+
     fn receipt(
         &self,
         operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
@@ -918,6 +1115,14 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
     ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
         if let Err(error) = self.validate_context(&request.context) {
             return Ok(known_uncommitted(error));
+        }
+        if let ConnectorCatalogMutationOperation::AlterRef { table, action } = &request.operation
+            && matches!(
+                action,
+                novarocks_spi::connector::ConnectorRefAction::FastForwardBranch { .. }
+            )
+        {
+            return self.execute_guarded_fast_forward(&request, table, action);
         }
         let operation_kind = request.operation.kind();
         let evidence = match self.mutation_evidence(request.operation_id, &request.operation) {
@@ -1312,7 +1517,13 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
         request: ConnectorCatalogMutationReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
         if let Err(error) = self.validate_context(&request.context) {
-            return Ok(known_uncommitted(error));
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    mutation_failure_kind(error.kind()),
+                    error.to_string(),
+                ),
+                evidence: request.evidence,
+            });
         }
         let decoded: IcebergMutationEvidenceV1 =
             serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
@@ -1379,6 +1590,129 @@ fn mutation_commit_may_be_unknown(kind: ConnectorErrorKind) -> bool {
             | ConnectorErrorKind::Cancelled
             | ConnectorErrorKind::Internal
     )
+}
+
+fn provider_version(metadata_location: Option<&str>) -> Bytes {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.metadata-version.v1");
+    if let Some(metadata_location) = metadata_location {
+        hasher.update(metadata_location.as_bytes());
+    }
+    Bytes::copy_from_slice(&hasher.finalize())
+}
+
+fn snapshot_matches_publication_guard(
+    snapshot: &iceberg::spec::Snapshot,
+    guard: &ConnectorRefreshPublicationGuard,
+) -> bool {
+    let properties = &snapshot.summary().additional_properties;
+    properties
+        .get(super::commit::MV_REFRESH_ID_PROP)
+        .and_then(|value| value.parse::<i64>().ok())
+        == Some(guard.refresh_id())
+        && properties
+            .get(super::commit::MV_ID_PROP)
+            .and_then(|value| value.parse::<i64>().ok())
+            == Some(guard.materialized_view_id())
+        && properties
+            .get(super::commit::MV_REFRESH_TOKEN_PROP)
+            .map(String::as_str)
+            == Some(guard.token())
+}
+
+fn build_guarded_fast_forward_commit(
+    namespace: &str,
+    table: &str,
+    metadata: &iceberg::spec::TableMetadata,
+    source_branch: &str,
+    target_branch: &str,
+    source_snapshot_id: i64,
+    expected_target_snapshot_id: Option<i64>,
+    guard: &ConnectorRefreshPublicationGuard,
+) -> Result<iceberg::TableCommit, ConnectorError> {
+    let source = metadata.refs().get(source_branch).ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::NotFound,
+            "MV publication staging branch does not exist",
+        )
+    })?;
+    if !source.is_branch() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "MV publication staging ref is not a branch",
+        ));
+    }
+    if source.snapshot_id != source_snapshot_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "MV publication staging branch does not match its expected snapshot",
+        ));
+    }
+    let snapshot = metadata.snapshot_by_id(source_snapshot_id).ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::NotFound,
+            "MV publication staging snapshot does not exist",
+        )
+    })?;
+    if !snapshot_matches_publication_guard(snapshot, guard) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "MV publication staging snapshot marker mismatch",
+        ));
+    }
+    let target_snapshot_id = if target_branch.eq_ignore_ascii_case("main") {
+        metadata.current_snapshot_id()
+    } else {
+        let target = metadata.refs().get(target_branch).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "MV publication target branch does not exist",
+            )
+        })?;
+        if !target.is_branch() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "MV publication target ref is not a branch",
+            ));
+        }
+        Some(target.snapshot_id)
+    };
+    if target_snapshot_id != expected_target_snapshot_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "MV publication target branch does not match its expected snapshot",
+        ));
+    }
+    let ident = iceberg::TableIdent::from_strs([namespace, table]).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!("invalid Iceberg MV publication table identity: {error}"),
+        )
+    })?;
+    Ok(iceberg::TableCommit::builder()
+        .ident(ident)
+        .updates(vec![iceberg::TableUpdate::SetSnapshotRef {
+            ref_name: target_branch.to_string(),
+            reference: iceberg::spec::SnapshotReference {
+                snapshot_id: source_snapshot_id,
+                retention: iceberg::spec::SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            },
+        }])
+        .requirements(vec![
+            iceberg::TableRequirement::RefSnapshotIdMatch {
+                r#ref: target_branch.to_string(),
+                snapshot_id: expected_target_snapshot_id,
+            },
+            iceberg::TableRequirement::RefSnapshotIdMatch {
+                r#ref: source_branch.to_string(),
+                snapshot_id: Some(source_snapshot_id),
+            },
+        ])
+        .build())
 }
 
 fn load_existing_table_for_reconcile(
@@ -1572,7 +1906,102 @@ fn reconcile_iceberg_mutation_evidence(
             }),
             Err(error) => Ok(unknown(error)),
         },
+        IcebergMutationEvidenceTarget::GuardedFastForward {
+            namespace,
+            table,
+            table_uuid,
+            before_metadata_location,
+            source_branch,
+            target_branch,
+            source_snapshot_id,
+            expected_target_snapshot_id,
+            guard_digest,
+        } => match load_existing_table_for_reconcile(entry, &namespace, &table) {
+            Ok(Some(current)) if current.table.metadata().uuid().to_string() == table_uuid => {
+                let metadata = current.table.metadata();
+                let target_snapshot_id = if target_branch.eq_ignore_ascii_case("main") {
+                    metadata.current_snapshot_id()
+                } else {
+                    metadata
+                        .refs()
+                        .get(&target_branch)
+                        .filter(|reference| reference.is_branch())
+                        .map(|reference| reference.snapshot_id)
+                };
+                let source_is_matching_branch = matches!(
+                    metadata.refs().get(&source_branch),
+                    Some(reference) if reference.is_branch() && reference.snapshot_id == source_snapshot_id
+                );
+                let marker_matches = metadata
+                    .snapshot_by_id(source_snapshot_id)
+                    .and_then(|snapshot| publication_guard_digest_from_snapshot(snapshot).ok())
+                    .is_some_and(|digest| digest == guard_digest);
+                if target_snapshot_id == Some(source_snapshot_id) && marker_matches {
+                    known_committed(ExternalMutationEffect::Applied)
+                } else if target_snapshot_id == expected_target_snapshot_id
+                    && current.table.metadata_location().map(str::to_string)
+                        == before_metadata_location
+                    && source_is_matching_branch
+                {
+                    Ok(uncommitted(format!(
+                        "authoritative guarded MV publication state for `{namespace}.{table}` did not advance"
+                    )))
+                } else {
+                    Ok(ambiguous(format!(
+                        "authoritative guarded MV publication state for `{namespace}.{table}` diverged"
+                    )))
+                }
+            }
+            Ok(Some(_)) | Ok(None) => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "table identity changed during guarded MV publication reconciliation",
+                ),
+                evidence,
+            }),
+            Err(error) => Ok(unknown(error)),
+        },
     }
+}
+
+fn publication_guard_digest_from_snapshot(
+    snapshot: &iceberg::spec::Snapshot,
+) -> Result<[u8; 32], ConnectorError> {
+    let properties = &snapshot.summary().additional_properties;
+    let refresh_id = properties
+        .get(super::commit::MV_REFRESH_ID_PROP)
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "MV publication snapshot is missing a valid refresh id marker",
+            )
+        })?;
+    let materialized_view_id = properties
+        .get(super::commit::MV_ID_PROP)
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "MV publication snapshot is missing a valid materialized view id marker",
+            )
+        })?;
+    let token = properties
+        .get(super::commit::MV_REFRESH_TOKEN_PROP)
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "MV publication snapshot is missing its refresh token marker",
+            )
+        })?;
+    Ok(
+        ConnectorRefreshPublicationGuard::try_new(
+            refresh_id,
+            materialized_view_id,
+            token.as_str(),
+        )?
+        .digest(),
+    )
 }
 
 fn lower_column(
@@ -1824,34 +2253,11 @@ fn lower_ref_action(
                 },
             }
         }
-        ConnectorRefAction::FastForwardBranch {
-            source_branch,
-            target_branch,
-            source_snapshot_id,
-            expected_target_snapshot_id,
-        } => {
-            if source_branch.eq_ignore_ascii_case("main") {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg fast-forward source must be a named branch",
-                ));
-            }
-            if !matches!(
-                metadata.refs().get(source_branch.as_ref()),
-                Some(reference) if reference.is_branch()
-                    && reference.snapshot_id == source_snapshot_id
-            ) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg fast-forward source branch does not match its expected snapshot",
-                ));
-            }
-            super::commit::RefAction::FastForwardBranch {
-                source_branch: source_branch.to_string(),
-                target_branch: target_branch.to_string(),
-                source_snapshot_id,
-                expected_target_snapshot_id,
-            }
+        ConnectorRefAction::FastForwardBranch { .. } => {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "guarded MV publication bypassed its provider commit path",
+            ));
         }
     };
     Ok(super::commit::RefActionPlan {

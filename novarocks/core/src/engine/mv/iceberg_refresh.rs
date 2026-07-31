@@ -38,9 +38,8 @@ use crate::connector::iceberg::commit::mv_provenance::{
 };
 use crate::connector::iceberg::commit::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
-    MvRefreshPublishPlan, MvRefreshSnapshotMarker, PositionDeleteGroup, RecoveryEvidence,
-    RefAction, RefActionPlan, RunInput, execute_ref_action, publish_staging_branch_to_main,
-    run_iceberg_commit, snapshot_matches_refresh_marker,
+    MvRefreshSnapshotMarker, PositionDeleteGroup, RecoveryEvidence, RunInput, run_iceberg_commit,
+    snapshot_matches_refresh_marker,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::operation_lifecycle::{
@@ -3297,17 +3296,11 @@ pub(crate) fn restore_iceberg_mv_targets(state: &Arc<StandaloneState>) -> Result
 }
 
 pub(crate) fn recover_iceberg_mv_refreshes(state: &Arc<StandaloneState>) -> Result<(), String> {
-    if !state.mv_repository.availability().is_available() {
-        return Ok(());
-    }
-    let unfinished = state
-        .mv_repository
-        .list_unfinished_branch_staged_iceberg_refreshes()
-        .map_err(|e| format!("load unfinished iceberg MV refreshes failed: {e}"))?;
-    for refresh in unfinished {
-        recover_one_iceberg_mv_refresh(state, refresh, None)?;
-    }
-    Ok(())
+    let bootstrap_context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    recover_iceberg_mv_refreshes_with_connector_context(state, &bootstrap_context)
 }
 
 pub(crate) fn recover_iceberg_mv_refreshes_with_connector_context(
@@ -3323,7 +3316,7 @@ pub(crate) fn recover_iceberg_mv_refreshes_with_connector_context(
         .list_unfinished_branch_staged_iceberg_refreshes()
         .map_err(|e| format!("load unfinished iceberg MV refreshes failed: {e}"))?;
     for refresh in unfinished {
-        recover_one_iceberg_mv_refresh(state, refresh, Some(connector_context))?;
+        recover_one_iceberg_mv_refresh(state, refresh, connector_context)?;
     }
     Ok(())
 }
@@ -3331,7 +3324,7 @@ pub(crate) fn recover_iceberg_mv_refreshes_with_connector_context(
 fn recover_one_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     refresh: StoredMvRefresh,
-    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let target =
         IcebergMvTarget {
@@ -3844,6 +3837,7 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
         payload,
         &new_partition_contract,
         Some(repartition_restore),
+        connector_context,
     );
     result.map_err(IcebergMvRefreshExecutionError::into_message)?;
     sync_iceberg_mv_descriptor_for_target(state, &target)
@@ -8149,7 +8143,7 @@ fn reconcile_iceberg_mv_refresh(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     _catalog: &Arc<dyn iceberg::Catalog>,
     table: &iceberg::table::Table,
-    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     if matches!(
         refresh.state,
@@ -8223,7 +8217,7 @@ fn converge_published_iceberg_mv_staging_branch(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     staging_branch: &str,
     staging_snapshot_id: i64,
-    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     // The publish landing is a lake fact (the classifier proved the staged
     // snapshot is on `main`'s lineage). The ledger row is only a derived cache
@@ -8235,17 +8229,13 @@ fn converge_published_iceberg_mv_staging_branch(
     if refresh.state == MvRefreshState::StagingCommitted {
         record_iceberg_mv_publish_commit(state, refresh.refresh_id, staging_snapshot_id)?;
     }
-    if let Some(connector_context) = connector_context {
-        drop_iceberg_mv_staging_branch_with_connector_context(
-            state,
-            target,
-            entry,
-            staging_branch,
-            connector_context,
-        )?;
-    } else {
-        drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
-    }
+    drop_iceberg_mv_staging_branch_with_connector_context(
+        state,
+        target,
+        entry,
+        staging_branch,
+        connector_context,
+    )?;
     finalize_recovered_iceberg_mv_refresh(state, refresh)
 }
 
@@ -8266,7 +8256,7 @@ fn rollback_iceberg_mv_staging_branch(
     table: &iceberg::table::Table,
     staging_branch: &str,
     staging_snapshot_id: i64,
-    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     // The staged snapshot's parent is the pre-repartition `main` snapshot; its
     // data manifests witness the old default partition spec id.
@@ -8282,17 +8272,13 @@ fn rollback_iceberg_mv_staging_branch(
         table,
         reference_snapshot_id,
     )?;
-    if let Some(connector_context) = connector_context {
-        drop_iceberg_mv_staging_branch_with_connector_context(
-            state,
-            target,
-            entry,
-            staging_branch,
-            connector_context,
-        )?;
-    } else {
-        drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
-    }
+    drop_iceberg_mv_staging_branch_with_connector_context(
+        state,
+        target,
+        entry,
+        staging_branch,
+        connector_context,
+    )?;
     mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)
 }
 
@@ -8405,6 +8391,7 @@ fn handle_iceberg_mv_commit_error(
     staging_branch: &str,
     refresh_id: i64,
     err: String,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> IcebergMvRefreshExecutionError {
     handle_iceberg_mv_definite_pre_publish_error(
         state,
@@ -8413,6 +8400,7 @@ fn handle_iceberg_mv_commit_error(
         staging_branch,
         refresh_id,
         err,
+        connector_context,
     )
 }
 
@@ -8423,6 +8411,7 @@ fn handle_iceberg_mv_commit_service_error(
     staging_branch: &str,
     refresh_id: i64,
     err: CommitServiceError,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> IcebergMvRefreshExecutionError {
     handle_iceberg_mv_commit_service_error_with_repartition_restore(
         state,
@@ -8432,6 +8421,7 @@ fn handle_iceberg_mv_commit_service_error(
         refresh_id,
         err,
         None,
+        connector_context,
     )
 }
 
@@ -8443,6 +8433,7 @@ fn handle_iceberg_mv_commit_service_error_with_repartition_restore(
     refresh_id: i64,
     err: CommitServiceError,
     repartition_restore: Option<RepartitionDefaultSpecRestore>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> IcebergMvRefreshExecutionError {
     if repartition_restore.is_some()
         && matches!(
@@ -8459,6 +8450,7 @@ fn handle_iceberg_mv_commit_service_error_with_repartition_restore(
             refresh_id,
             refresh_err.message,
             repartition_restore,
+            connector_context,
         );
     }
 
@@ -8469,9 +8461,13 @@ fn handle_iceberg_mv_commit_service_error_with_repartition_restore(
     let mut refresh_err = refresh_error_from_commit_error(err.clone());
     let mut fact_error = err;
     if cleanup_staging_branch {
-        if let Err(cleanup_err) =
-            drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)
-        {
+        if let Err(cleanup_err) = drop_iceberg_mv_staging_branch(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            connector_context,
+        ) {
             refresh_err.message = mv_staging_cleanup_failure_message(
                 refresh_err.message,
                 staging_branch,
@@ -8491,45 +8487,6 @@ fn handle_iceberg_mv_commit_service_error_with_repartition_restore(
         );
     }
     IcebergMvRefreshExecutionError::commit(refresh_err)
-}
-
-fn is_iceberg_commit_unknown_error(err: &str) -> bool {
-    err.contains("iceberg commit unknown (")
-}
-
-fn is_iceberg_mv_publish_pre_update_error(err: &str) -> bool {
-    !is_iceberg_commit_unknown_error(err) && !err.contains("iceberg mv publish: commit failed:")
-}
-
-fn handle_iceberg_mv_publish_error_with_repartition_restore(
-    state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    staging_branch: &str,
-    refresh_id: i64,
-    err: String,
-    repartition_restore: Option<RepartitionDefaultSpecRestore>,
-) -> IcebergMvRefreshExecutionError {
-    if is_iceberg_commit_unknown_error(&err) {
-        if let Err(mark_err) = mark_iceberg_mv_refresh_commit_unknown(state, refresh_id) {
-            return IcebergMvRefreshExecutionError::commit(RefreshError::commit_unknown(format!(
-                "{err}; additionally failed to mark mv refresh commit unknown: {mark_err}"
-            )));
-        }
-        return IcebergMvRefreshExecutionError::commit(RefreshError::commit_unknown(err));
-    }
-    if repartition_restore.is_some() && is_iceberg_mv_publish_pre_update_error(&err) {
-        return handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-            state,
-            target,
-            target_entry,
-            staging_branch,
-            refresh_id,
-            err,
-            repartition_restore,
-        );
-    }
-    IcebergMvRefreshExecutionError::pre_commit(err)
 }
 
 fn mv_staging_cleanup_failure_message(
@@ -8573,6 +8530,7 @@ fn handle_iceberg_mv_definite_pre_publish_error(
     staging_branch: &str,
     refresh_id: i64,
     err: String,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> IcebergMvRefreshExecutionError {
     handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
         state,
@@ -8582,6 +8540,7 @@ fn handle_iceberg_mv_definite_pre_publish_error(
         refresh_id,
         err,
         None,
+        connector_context,
     )
 }
 
@@ -8593,6 +8552,7 @@ fn handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
     refresh_id: i64,
     err: String,
     repartition_restore: Option<RepartitionDefaultSpecRestore>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> IcebergMvRefreshExecutionError {
     let err = cleanup_iceberg_mv_staging_branch_after_failure(
         state,
@@ -8600,6 +8560,7 @@ fn handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
         target_entry,
         staging_branch,
         err,
+        connector_context,
     );
     if let Some(restore) = repartition_restore {
         return abort_and_restore_iceberg_mv_repartition_default_spec(
@@ -8627,8 +8588,15 @@ fn cleanup_iceberg_mv_staging_branch_after_failure(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     staging_branch: &str,
     err: String,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> String {
-    match drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch) {
+    match drop_iceberg_mv_staging_branch(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        connector_context,
+    ) {
         Ok(()) => err,
         Err(cleanup_err) => format!(
             "{err}; additionally failed to drop staging branch {staging_branch}: {cleanup_err}"
@@ -9215,64 +9183,263 @@ fn mv_partition_state_max_entries() -> usize {
         .unwrap_or(10_000)
 }
 
+fn refresh_connector_context(
+    ctx: &IcebergMvRefreshContext,
+) -> Result<&novarocks_spi::connector::ConnectorRequestContext, String> {
+    ctx.connector_context
+        .as_ref()
+        .ok_or_else(|| "Iceberg MV refresh is missing its caller connector context".to_string())
+}
+
 fn ensure_iceberg_mv_staging_branch(
-    catalog: &Arc<dyn Catalog>,
+    state: &Arc<StandaloneState>,
+    _catalog: &Arc<dyn Catalog>,
     target: &IcebergMvTarget,
     staging_branch: &str,
     expected_main_snapshot_id: Option<i64>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let Some(snapshot_id) = expected_main_snapshot_id else {
         return Ok(());
     };
-    data_block_on(async {
-        execute_ref_action(
-            catalog.as_ref(),
-            &RefActionPlan {
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-                action: RefAction::CreateBranch {
-                    name: staging_branch.to_string(),
-                    snapshot_id,
-                    replace: false,
-                    if_not_exists: false,
-                },
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterRef {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
             },
-        )
-        .await
-    })?
+            action: novarocks_spi::connector::ConnectorRefAction::Create {
+                kind: novarocks_spi::connector::ConnectorRefKind::Branch,
+                name: Arc::from(staging_branch),
+                snapshot_id: Some(snapshot_id),
+                policy: novarocks_spi::connector::CreateOrReplacePolicy::FailIfExists,
+            },
+        },
+        connector_context.clone(),
+    )
     .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+enum IcebergMvPublicationResolution {
+    Published {
+        snapshot_id: i64,
+        finalization: novarocks_spi::connector::ExternalMutationFinalization,
+    },
+    KnownUncommitted {
+        failure: novarocks_spi::connector::ConnectorMutationFailure,
+    },
+    CommitUnknown {
+        failure: novarocks_spi::connector::ConnectorMutationFailure,
+    },
+    ContractFailure {
+        message: String,
+        possibly_dispatched: bool,
+    },
+}
+
+#[cfg(test)]
+impl IcebergMvPublicationResolution {
+    fn expect(self, message: &str) -> i64 {
+        match self {
+            Self::Published {
+                snapshot_id,
+                finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            } => snapshot_id,
+            Self::Published { finalization, .. } => {
+                panic!("{message}: publication finalization failed: {finalization:?}")
+            }
+            Self::KnownUncommitted { failure } => {
+                panic!("{message}: publication was uncommitted: {failure}")
+            }
+            Self::CommitUnknown { failure } => {
+                panic!("{message}: publication commit was unknown: {failure}")
+            }
+            Self::ContractFailure {
+                message: failure, ..
+            } => {
+                panic!("{message}: publication contract failed: {failure}")
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn publish_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    _target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     staging_branch: &str,
     expected_main_snapshot_id: Option<i64>,
     staging_snapshot_id: i64,
     refresh_id: i64,
     mv_id: i64,
-) -> Result<i64, String> {
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_id)?;
-    data_block_on(async {
-        let catalog =
-            crate::connector::iceberg::catalog::registry::build_iceberg_catalog(target_entry)?;
-        publish_staging_branch_to_main(
-            catalog.as_ref(),
-            &MvRefreshPublishPlan {
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-                staging_branch: staging_branch.to_string(),
-                expected_main_snapshot_id,
-                staging_snapshot_id,
-                marker,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> IcebergMvPublicationResolution {
+    let marker = match load_iceberg_mv_refresh_marker(state, refresh_id, mv_id) {
+        Ok(marker) => marker,
+        Err(message) => {
+            return IcebergMvPublicationResolution::ContractFailure {
+                message,
+                possibly_dispatched: false,
+            };
+        }
+    };
+    let guard = novarocks_spi::connector::ConnectorRefreshPublicationGuard::try_new(
+        marker.refresh_id,
+        marker.mv_id,
+        marker.token,
+    )
+    .map_err(|error| error.to_string());
+    let guard = match guard {
+        Ok(guard) => guard,
+        Err(message) => {
+            return IcebergMvPublicationResolution::ContractFailure {
+                message,
+                possibly_dispatched: false,
+            };
+        }
+    };
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string());
+    let instance_id = match instance_id {
+        Ok(instance_id) => instance_id,
+        Err(message) => {
+            return IcebergMvPublicationResolution::ContractFailure {
+                message,
+                possibly_dispatched: false,
+            };
+        }
+    };
+    match crate::connector::mutation::resolve_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterRef {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
             },
-        )
-        .await
-        .map(|outcome| outcome.published_snapshot_id)
-    })?
+            action: novarocks_spi::connector::ConnectorRefAction::FastForwardBranch {
+                source_branch: Arc::from(staging_branch),
+                target_branch: Arc::from("main"),
+                source_snapshot_id: staging_snapshot_id,
+                expected_target_snapshot_id: expected_main_snapshot_id,
+                guard,
+            },
+        },
+        connector_context.clone(),
+    ) {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
+            IcebergMvPublicationResolution::Published {
+                snapshot_id: staging_snapshot_id,
+                finalization: completed.finalization,
+            }
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+            IcebergMvPublicationResolution::KnownUncommitted { failure }
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
+            IcebergMvPublicationResolution::CommitUnknown { failure }
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure {
+            error,
+            dispatch,
+        } => IcebergMvPublicationResolution::ContractFailure {
+            message: error.to_string(),
+            possibly_dispatched: matches!(
+                dispatch,
+                crate::connector::mutation::MutationDispatchState::PossiblyDispatched
+            ),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_iceberg_mv_publication(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    staging_branch: &str,
+    refresh_id: i64,
+    repartition_restore: Option<RepartitionDefaultSpecRestore>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    resolution: IcebergMvPublicationResolution,
+) -> Result<i64, IcebergMvRefreshExecutionError> {
+    match resolution {
+        IcebergMvPublicationResolution::Published {
+            snapshot_id,
+            finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+        } => Ok(snapshot_id),
+        IcebergMvPublicationResolution::Published {
+            snapshot_id,
+            finalization: novarocks_spi::connector::ExternalMutationFinalization::Failed(failure),
+        } => {
+            record_iceberg_mv_publish_commit(state, refresh_id, snapshot_id)?;
+            Err(IcebergMvRefreshExecutionError::commit(
+                RefreshError::commit_known_committed_finalize_failed(
+                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
+                        .to_string(),
+                ),
+            ))
+        }
+        IcebergMvPublicationResolution::KnownUncommitted { failure } => Err(
+            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                failure.to_string(),
+                repartition_restore,
+                connector_context,
+            ),
+        ),
+        IcebergMvPublicationResolution::CommitUnknown { failure } => {
+            mark_iceberg_mv_refresh_commit_unknown(state, refresh_id).map_err(|mark_err| {
+                IcebergMvRefreshExecutionError::commit(RefreshError::commit_unknown(format!(
+                    "{}; additionally failed to mark mv refresh commit unknown: {mark_err}",
+                    failure
+                )))
+            })?;
+            Err(IcebergMvRefreshExecutionError::commit(
+                RefreshError::commit_unknown(failure.to_string()),
+            ))
+        }
+        IcebergMvPublicationResolution::ContractFailure {
+            message,
+            possibly_dispatched: false,
+        } => Err(
+            handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                state,
+                target,
+                target_entry,
+                staging_branch,
+                refresh_id,
+                message,
+                repartition_restore,
+                connector_context,
+            ),
+        ),
+        IcebergMvPublicationResolution::ContractFailure {
+            message,
+            possibly_dispatched: true,
+        } => {
+            mark_iceberg_mv_refresh_commit_unknown(state, refresh_id).map_err(|mark_err| {
+                IcebergMvRefreshExecutionError::commit(RefreshError::commit_unknown(format!(
+                    "{message}; additionally failed to mark mv refresh commit unknown: {mark_err}"
+                )))
+            })?;
+            Err(IcebergMvRefreshExecutionError::commit(
+                RefreshError::commit_unknown(message),
+            ))
+        }
+    }
 }
 
 fn drop_iceberg_mv_staging_branch(
@@ -9280,27 +9447,15 @@ fn drop_iceberg_mv_staging_branch(
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     staging_branch: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    data_block_on(async {
-        let catalog =
-            crate::connector::iceberg::catalog::registry::build_iceberg_catalog(target_entry)?;
-        execute_ref_action(
-            catalog.as_ref(),
-            &RefActionPlan {
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-                action: RefAction::DropBranch {
-                    name: staging_branch.to_string(),
-                    if_exists: false,
-                },
-            },
-        )
-        .await
-    })?
-    .map(|_| ())?;
-    register_iceberg_mv_target_in_catalog(state, target)?;
-    Ok(())
+    drop_iceberg_mv_staging_branch_with_connector_context(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        connector_context,
+    )
 }
 
 fn drop_iceberg_mv_staging_branch_with_connector_context(
@@ -9380,6 +9535,7 @@ fn commit_first_refresh_iceberg_mv(
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
+    let connector_context = refresh_connector_context(ctx)?;
 
     let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
 
@@ -9414,10 +9570,12 @@ fn commit_first_refresh_iceberg_mv(
     )
     .to_summary_properties()?;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
+        state,
         iceberg_catalog,
         target,
         staging_branch,
         expected_main_snapshot_id,
+        connector_context,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
         return Err(err.into());
@@ -9432,6 +9590,7 @@ fn commit_first_refresh_iceberg_mv(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -9461,6 +9620,7 @@ fn commit_first_refresh_iceberg_mv(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
         Ok(Err(err)) => {
@@ -9471,6 +9631,7 @@ fn commit_first_refresh_iceberg_mv(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
         Err(err) => {
@@ -9481,6 +9642,7 @@ fn commit_first_refresh_iceberg_mv(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -9493,20 +9655,36 @@ fn commit_first_refresh_iceberg_mv(
         total_rows,
         table_uuids.clone(),
     )?;
-    let published_snapshot_id = publish_iceberg_mv_refresh(
+    let published_snapshot_id = resolve_iceberg_mv_publication(
         state,
         target,
         target_entry,
         staging_branch,
-        expected_main_snapshot_id,
-        new_snapshot_id,
         refresh_id,
-        mv_definition.mv_id,
+        None,
+        connector_context,
+        publish_iceberg_mv_refresh(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            expected_main_snapshot_id,
+            new_snapshot_id,
+            refresh_id,
+            mv_definition.mv_id,
+            connector_context,
+        ),
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
     // Once publish is recorded, cleanup must happen before terminal metadata
     // finalization so recovery can retry cleanup after a crash.
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+    drop_iceberg_mv_staging_branch(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        connector_context,
+    )?;
     finalize_iceberg_mv_refresh(
         state,
         refresh_id,
@@ -9670,6 +9848,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
     let pin = &*ctx.rewrite.pin;
+    let connector_context = refresh_connector_context(ctx)?;
     let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
 
     if total_rows == 0 {
@@ -9699,10 +9878,12 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     )
     .to_summary_properties()?;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
+        state,
         iceberg_catalog,
         target,
         staging_branch,
         expected_main_snapshot_id,
+        connector_context,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
         return Err(err.into());
@@ -9717,6 +9898,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -9746,6 +9928,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
         Ok(Err(err)) => {
@@ -9756,6 +9939,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
         Err(err) => {
@@ -9766,6 +9950,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -9779,18 +9964,34 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
         total_rows,
         table_uuids.clone(),
     )?;
-    let published_snapshot_id = publish_iceberg_mv_refresh(
+    let published_snapshot_id = resolve_iceberg_mv_publication(
         state,
         target,
         target_entry,
         staging_branch,
-        expected_main_snapshot_id,
-        new_snapshot_id,
         refresh_id,
-        mv_definition.mv_id,
+        None,
+        connector_context,
+        publish_iceberg_mv_refresh(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            expected_main_snapshot_id,
+            new_snapshot_id,
+            refresh_id,
+            mv_definition.mv_id,
+            connector_context,
+        ),
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+    drop_iceberg_mv_staging_branch(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        connector_context,
+    )?;
     finalize_iceberg_mv_refresh(
         state,
         refresh_id,
@@ -10048,6 +10249,7 @@ fn commit_rebuild_payload(
     payload: RebuildChunkPayload,
     partition_contract: Option<&mv_schema::MvPartitionContract>,
     repartition_restore: Option<RepartitionDefaultSpecRestore>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let total_rows = payload.total_rows();
     let ident = match iceberg_mv_table_ident(target) {
@@ -10100,10 +10302,12 @@ fn commit_rebuild_payload(
         }
     };
     if let Err(err) = ensure_iceberg_mv_staging_branch(
+        state,
         iceberg_catalog,
         target,
         staging_branch,
         expected_main_snapshot_id,
+        connector_context,
     ) {
         if let Some(restore) = repartition_restore {
             return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
@@ -10132,6 +10336,7 @@ fn commit_rebuild_payload(
                     refresh_id,
                     err,
                     repartition_restore,
+                    connector_context,
                 ),
             );
         }
@@ -10148,6 +10353,7 @@ fn commit_rebuild_payload(
                     refresh_id,
                     err,
                     repartition_restore,
+                    connector_context,
                 ),
             );
         }
@@ -10174,6 +10380,7 @@ fn commit_rebuild_payload(
                     refresh_id,
                     err,
                     repartition_restore,
+                    connector_context,
                 ),
             );
         }
@@ -10187,6 +10394,7 @@ fn commit_rebuild_payload(
                     refresh_id,
                     err,
                     repartition_restore,
+                    connector_context,
                 ),
             );
         }
@@ -10198,31 +10406,34 @@ fn commit_rebuild_payload(
         total_rows,
         prepared.base_table_uuids.clone(),
     )?;
-    let published_snapshot_id = match publish_iceberg_mv_refresh(
+    let published_snapshot_id = resolve_iceberg_mv_publication(
         state,
         target,
         target_entry,
         staging_branch,
-        expected_main_snapshot_id,
-        new_snapshot_id,
         refresh_id,
-        mv_definition.mv_id,
-    ) {
-        Ok(snapshot_id) => snapshot_id,
-        Err(err) => {
-            return Err(handle_iceberg_mv_publish_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                repartition_restore,
-            ));
-        }
-    };
+        repartition_restore,
+        connector_context,
+        publish_iceberg_mv_refresh(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            expected_main_snapshot_id,
+            new_snapshot_id,
+            refresh_id,
+            mv_definition.mv_id,
+            connector_context,
+        ),
+    )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+    drop_iceberg_mv_staging_branch(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        connector_context,
+    )?;
     if let Some(partition_contract) = partition_contract {
         finalize_iceberg_mv_refresh_with_partition_contract(
             state,
@@ -10262,6 +10473,7 @@ fn commit_repartition_rebuild_payload(
     payload: RepartitionChunkPayload,
     partition_contract: &mv_schema::MvPartitionContract,
     repartition_restore: Option<RepartitionDefaultSpecRestore>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     commit_rebuild_payload(
         state,
@@ -10275,6 +10487,7 @@ fn commit_repartition_rebuild_payload(
         RebuildChunkPayload::Repartition(payload),
         Some(partition_contract),
         repartition_restore,
+        connector_context,
     )
 }
 
@@ -10328,6 +10541,7 @@ fn rebuild_iceberg_mv(
         RebuildChunkPayload::FullRefresh(payload),
         partition_contract,
         None,
+        connector_context,
     )
 }
 
@@ -11416,6 +11630,7 @@ fn repartition_iceberg_join_mv_overwrite(
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
+    let connector_context = refresh_connector_context(ctx)?;
     let ident = match iceberg_mv_table_ident(target) {
         Ok(ident) => ident,
         Err(err) => {
@@ -11447,10 +11662,12 @@ fn repartition_iceberg_join_mv_overwrite(
         }
     };
     if let Err(err) = ensure_iceberg_mv_staging_branch(
+        state,
         iceberg_catalog,
         target,
         staging_branch,
         expected_main_snapshot_id,
+        connector_context,
     ) {
         return Err(abort_and_restore_iceberg_mv_repartition_default_spec(
             state,
@@ -11475,6 +11692,7 @@ fn repartition_iceberg_join_mv_overwrite(
                     refresh_id,
                     err,
                     Some(repartition_restore),
+                    connector_context,
                 ),
             );
         }
@@ -11491,6 +11709,7 @@ fn repartition_iceberg_join_mv_overwrite(
                     refresh_id,
                     err.message,
                     Some(repartition_restore),
+                    connector_context,
                 ),
             );
         }
@@ -11540,6 +11759,7 @@ fn repartition_iceberg_join_mv_overwrite(
                 refresh_id,
                 err.into_message(),
                 Some(repartition_restore),
+                connector_context,
             ),
         )
     })?;
@@ -11572,6 +11792,7 @@ fn repartition_iceberg_join_mv_overwrite(
                     refresh_id,
                     err,
                     Some(repartition_restore),
+                    connector_context,
                 ),
             );
         }
@@ -11585,6 +11806,7 @@ fn repartition_iceberg_join_mv_overwrite(
                     refresh_id,
                     err,
                     Some(repartition_restore),
+                    connector_context,
                 ),
             );
         }
@@ -11598,31 +11820,34 @@ fn repartition_iceberg_join_mv_overwrite(
         total_rows,
         table_uuids.clone(),
     )?;
-    let published_snapshot_id = match publish_iceberg_mv_refresh(
+    let published_snapshot_id = resolve_iceberg_mv_publication(
         state,
         target,
         target_entry,
         staging_branch,
-        expected_main_snapshot_id,
-        commit_outcome.new_snapshot_id,
         refresh_id,
-        mv_definition.mv_id,
-    ) {
-        Ok(snapshot_id) => snapshot_id,
-        Err(err) => {
-            return Err(handle_iceberg_mv_publish_error_with_repartition_restore(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                Some(repartition_restore),
-            ));
-        }
-    };
+        Some(repartition_restore),
+        connector_context,
+        publish_iceberg_mv_refresh(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            expected_main_snapshot_id,
+            commit_outcome.new_snapshot_id,
+            refresh_id,
+            mv_definition.mv_id,
+            connector_context,
+        ),
+    )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+    drop_iceberg_mv_staging_branch(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        connector_context,
+    )?;
     finalize_iceberg_mv_refresh_with_partition_contract(
         state,
         refresh_id,
@@ -11650,11 +11875,14 @@ fn first_refresh_iceberg_join_mv(
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
+    let connector_context = refresh_connector_context(ctx)?;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
+        state,
         iceberg_catalog,
         target,
         staging_branch,
         expected_main_snapshot_id,
+        connector_context,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
         return Err(err.into());
@@ -11669,6 +11897,7 @@ fn first_refresh_iceberg_join_mv(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -11680,6 +11909,7 @@ fn first_refresh_iceberg_join_mv(
             staging_branch,
             refresh_id,
             err.message,
+            connector_context,
         )
     })?;
     let logical_input =
@@ -11694,6 +11924,7 @@ fn first_refresh_iceberg_join_mv(
                     staging_branch,
                     refresh_id,
                     err,
+                    connector_context,
                 )
             })?;
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -11713,10 +11944,26 @@ fn first_refresh_iceberg_join_mv(
     )
     .to_summary_properties()
     .map_err(|err| {
-        handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
+        handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_id,
+            err,
+            connector_context,
+        )
     })?;
     let ident = iceberg_mv_table_ident(target).map_err(|err| {
-        handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
+        handle_iceberg_mv_commit_error(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            refresh_id,
+            err,
+            connector_context,
+        )
     })?;
     let target_backend = iceberg_mv_target_backend(target);
     let populated = crate::mv::refresh::join_first_refresh::execute_join_first_refresh_write(
@@ -11761,6 +12008,7 @@ fn first_refresh_iceberg_join_mv(
             staging_branch,
             refresh_id,
             err.into_message(),
+            connector_context,
         )
     })?;
 
@@ -11775,7 +12023,13 @@ fn first_refresh_iceberg_join_mv(
         populated.effect,
         crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Empty
     ) {
-        drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+        drop_iceberg_mv_staging_branch(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            connector_context,
+        )?;
         abort_iceberg_mv_refresh(state, refresh_id)?;
         return Ok(StatementResult::Ok);
     }
@@ -11798,6 +12052,7 @@ fn first_refresh_iceberg_join_mv(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
         Err(err) => {
@@ -11808,6 +12063,7 @@ fn first_refresh_iceberg_join_mv(
                 staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -11821,18 +12077,34 @@ fn first_refresh_iceberg_join_mv(
         added_rows,
         table_uuids.clone(),
     )?;
-    let published_snapshot_id = publish_iceberg_mv_refresh(
+    let published_snapshot_id = resolve_iceberg_mv_publication(
         state,
         target,
         target_entry,
         staging_branch,
-        expected_main_snapshot_id,
-        new_snapshot_id,
         refresh_id,
-        ctx.rewrite.mv_definition.mv_id,
+        None,
+        connector_context,
+        publish_iceberg_mv_refresh(
+            state,
+            target,
+            target_entry,
+            staging_branch,
+            expected_main_snapshot_id,
+            new_snapshot_id,
+            refresh_id,
+            ctx.rewrite.mv_definition.mv_id,
+            connector_context,
+        ),
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
+    drop_iceberg_mv_staging_branch(
+        state,
+        target,
+        target_entry,
+        staging_branch,
+        connector_context,
+    )?;
     finalize_iceberg_mv_refresh(
         state,
         refresh_id,
@@ -13044,6 +13316,7 @@ fn execute_join_delta_branches_logical(
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
+    let connector_context = refresh_connector_context(ctx)?;
     let pin = &*ctx.rewrite.pin;
     let snapshots = pin.to_snapshot_map();
     let table_uuids = pin.to_table_uuid_map();
@@ -13086,6 +13359,7 @@ fn execute_join_delta_branches_logical(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             )
         })?,
         Err(err) => {
@@ -13096,14 +13370,17 @@ fn execute_join_delta_branches_logical(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
     if let Err(err) = ensure_iceberg_mv_staging_branch(
+        state,
         iceberg_catalog,
         target,
         &staging_branch,
         expected_main_snapshot_id,
+        connector_context,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
         return Err(err.into());
@@ -13118,6 +13395,7 @@ fn execute_join_delta_branches_logical(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -13174,6 +13452,7 @@ fn execute_join_delta_branches_logical(
             &staging_branch,
             refresh_id,
             err.into_message(),
+            connector_context,
         )
     })?;
 
@@ -13196,7 +13475,13 @@ fn execute_join_delta_branches_logical(
                 target.namespace,
                 target.table
             );
-            drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+            drop_iceberg_mv_staging_branch(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                connector_context,
+            )?;
             abort_iceberg_mv_refresh(state, refresh_id)?;
             let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
             let metadata_refresh_id =
@@ -13228,11 +13513,18 @@ fn execute_join_delta_branches_logical(
                         "iceberg join MV append-only row-count overflow: current={:?}, inserts={added_rows}",
                         mv_definition.last_refresh_rows
                     ),
+                    connector_context,
                 )
             })?,
         JoinIncrementalRefreshMode::Coalesce if added_rows == 0 && deleted_rows == 0 =>
         {
-            drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+            drop_iceberg_mv_staging_branch(
+                state,
+                target,
+                target_entry,
+                &staging_branch,
+                connector_context,
+            )?;
             abort_iceberg_mv_refresh(state, refresh_id)?;
             return Ok(
                 finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
@@ -13261,6 +13553,7 @@ fn execute_join_delta_branches_logical(
                         "iceberg join MV row-count delta overflow: current={:?}, inserts={}, deletes={}",
                         mv_definition.last_refresh_rows, added_rows, deleted_rows
                     ),
+                    connector_context,
                 )
             })?,
     };
@@ -13283,6 +13576,7 @@ fn execute_join_delta_branches_logical(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
         Err(err) => {
@@ -13293,6 +13587,7 @@ fn execute_join_delta_branches_logical(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -13304,18 +13599,34 @@ fn execute_join_delta_branches_logical(
         new_total_rows,
         table_uuids.clone(),
     )?;
-    let published_snapshot_id = publish_iceberg_mv_refresh(
+    let published_snapshot_id = resolve_iceberg_mv_publication(
         state,
         target,
         target_entry,
         &staging_branch,
-        expected_main_snapshot_id,
-        commit_outcome.new_snapshot_id,
         refresh_id,
-        mv_definition.mv_id,
+        None,
+        connector_context,
+        publish_iceberg_mv_refresh(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            expected_main_snapshot_id,
+            commit_outcome.new_snapshot_id,
+            refresh_id,
+            mv_definition.mv_id,
+            connector_context,
+        ),
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+    drop_iceberg_mv_staging_branch(
+        state,
+        target,
+        target_entry,
+        &staging_branch,
+        connector_context,
+    )?;
     finalize_iceberg_mv_refresh_with_partition_state(
         state,
         refresh_id,
@@ -14385,6 +14696,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
+    let connector_context = refresh_connector_context(ctx)?;
     let apply_key = options.apply_key;
     let rewrite_evidence = rewrite_merge_refresh_evidence(apply_key);
     // 1. Canonical change planning runs before any refresh intent or staging
@@ -14546,10 +14858,12 @@ fn incremental_refresh_iceberg_mv_with_changes(
     )
     .to_summary_properties()?;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
+        state,
         iceberg_catalog,
         target,
         &staging_branch,
         expected_main_snapshot_id,
+        connector_context,
     ) {
         abort_iceberg_mv_refresh(state, refresh_id)?;
         return Err(err.into());
@@ -14564,6 +14878,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -14593,6 +14908,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -14612,6 +14928,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                     &staging_branch,
                     refresh_id,
                     err,
+                    connector_context,
                 ));
             }
         };
@@ -14625,6 +14942,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 &staging_branch,
                 refresh_id,
                 format!("sql parser error: {err}"),
+                connector_context,
             ));
         }
     };
@@ -14636,6 +14954,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
             &staging_branch,
             refresh_id,
             "REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string(),
+            connector_context,
         ));
     };
     let mut query = *query_box;
@@ -14650,6 +14969,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             )
         })?;
     }
@@ -14706,6 +15026,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
             &staging_branch,
             refresh_id,
             err,
+            connector_context,
         )
     })?;
     let mut producer_branches = Vec::new();
@@ -14740,6 +15061,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
             &staging_branch,
             refresh_id,
             err.into_message(),
+            connector_context,
         )
     })?;
 
@@ -14779,7 +15101,13 @@ fn incremental_refresh_iceberg_mv_with_changes(
             target.namespace,
             target.table
         );
-        drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+        drop_iceberg_mv_staging_branch(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            connector_context,
+        )?;
         abort_iceberg_mv_refresh(state, refresh_id)?;
         let metadata_refresh_id =
             begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
@@ -14831,6 +15159,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
         Err(err) => {
@@ -14841,6 +15170,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                 &staging_branch,
                 refresh_id,
                 err,
+                connector_context,
             ));
         }
     };
@@ -14863,18 +15193,34 @@ fn incremental_refresh_iceberg_mv_with_changes(
         new_total_rows,
         table_uuids.clone(),
     )?;
-    let published_snapshot_id = publish_iceberg_mv_refresh(
+    let published_snapshot_id = resolve_iceberg_mv_publication(
         state,
         target,
         target_entry,
         &staging_branch,
-        expected_main_snapshot_id,
-        new_snapshot_id,
         refresh_id,
-        mv_definition.mv_id,
+        None,
+        connector_context,
+        publish_iceberg_mv_refresh(
+            state,
+            target,
+            target_entry,
+            &staging_branch,
+            expected_main_snapshot_id,
+            new_snapshot_id,
+            refresh_id,
+            mv_definition.mv_id,
+            connector_context,
+        ),
     )?;
     record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
+    drop_iceberg_mv_staging_branch(
+        state,
+        target,
+        target_entry,
+        &staging_branch,
+        connector_context,
+    )?;
     finalize_iceberg_mv_refresh_with_partition_state(
         state,
         refresh_id,
@@ -19091,11 +19437,14 @@ mod tests {
             .current_snapshot()
             .map(|snapshot| snapshot.snapshot_id());
         let staging_branch = format!("__nova_mv_refresh_test_{}", uuid::Uuid::new_v4().simple());
+        let connector_context = crate::connector::test_request_context();
         ensure_iceberg_mv_staging_branch(
+            state,
             &iceberg_catalog,
             &target,
             &staging_branch,
             expected_main_snapshot_id,
+            &connector_context,
         )
         .expect("create staging branch");
         let refresh_id = begin_staged_iceberg_mv_refresh_intent(
@@ -19149,6 +19498,7 @@ mod tests {
                 staging_snapshot,
                 refresh_id,
                 mv.mv_id,
+                &crate::connector::test_request_context(),
             )
             .expect("publish staging");
             record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot)
@@ -20648,6 +20998,7 @@ mod tests {
                 new_default_spec_id,
                 old_default_spec_id,
             }),
+            &crate::connector::test_request_context(),
         )
         .expect_err("publish main mismatch should fail before publishing");
         let err = err.into_message();
@@ -25029,6 +25380,7 @@ mod tests {
             staging_snapshot,
             refresh_id,
             mv.mv_id,
+            &crate::connector::test_request_context(),
         )
         .expect("publish repartition staging");
         record_iceberg_mv_publish_commit(&env.state, refresh_id, published_snapshot)
@@ -25245,6 +25597,7 @@ mod tests {
             staging_snapshot,
             refresh_id,
             mv.mv_id,
+            &crate::connector::test_request_context(),
         )
         .expect("publish staging");
 
@@ -25365,8 +25718,14 @@ mod tests {
             BTreeMap::new(),
         )
         .expect("record staging");
-        drop_iceberg_mv_staging_branch(&env.state, &target, &entry, staging_branch)
-            .expect("drop staging before metadata abort");
+        drop_iceberg_mv_staging_branch(
+            &env.state,
+            &target,
+            &entry,
+            staging_branch,
+            &crate::connector::test_request_context(),
+        )
+        .expect("drop staging before metadata abort");
 
         recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
 
@@ -25468,6 +25827,7 @@ mod tests {
             staging_snapshot,
             refresh_id,
             mv.mv_id,
+            &crate::connector::test_request_context(),
         )
         .expect("publish staging");
         record_iceberg_mv_publish_commit(&env.state, refresh_id, published_snapshot)
@@ -25582,12 +25942,19 @@ mod tests {
             staging_snapshot,
             refresh_id,
             mv.mv_id,
+            &crate::connector::test_request_context(),
         )
         .expect("publish staging");
         record_iceberg_mv_publish_commit(&env.state, refresh_id, published_snapshot)
             .expect("record publish");
-        drop_iceberg_mv_staging_branch(&env.state, &target, &entry, staging_branch)
-            .expect("drop staging before finalize");
+        drop_iceberg_mv_staging_branch(
+            &env.state,
+            &target,
+            &entry,
+            staging_branch,
+            &crate::connector::test_request_context(),
+        )
+        .expect("drop staging before finalize");
 
         recover_iceberg_mv_refreshes(&env.state).expect("recover refresh");
 
@@ -26131,9 +26498,14 @@ mod tests {
             namespace: "test_ns".to_string(),
             table: "t".to_string(),
         };
-        let err =
-            drop_iceberg_mv_staging_branch(&state, &target, &entry, "__missing_staging_branch")
-                .expect_err("missing staging branch must be an error");
+        let err = drop_iceberg_mv_staging_branch(
+            &state,
+            &target,
+            &entry,
+            "__missing_staging_branch",
+            &crate::connector::test_request_context(),
+        )
+        .expect_err("missing staging branch must be an error");
         assert!(
             err.contains("branch '__missing_staging_branch' does not exist"),
             "{err}"
@@ -26239,6 +26611,7 @@ mod tests {
             &entry,
             staging_branch,
             "original failure".to_string(),
+            &crate::connector::test_request_context(),
         );
         assert_eq!(err, "original failure");
 

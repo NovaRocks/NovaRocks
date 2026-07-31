@@ -20,8 +20,9 @@
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-    ConnectorCatalogMutationResolver, ConnectorExecutionBindingKey, ConnectorInstanceId,
-    ConnectorMutationOperationId, ConnectorRequestContext, ExternalMutationEffect,
+    ConnectorCatalogMutationResolver, ConnectorError, ConnectorExecutionBindingKey,
+    ConnectorInstanceId, ConnectorMutationFailure, ConnectorMutationOperationId,
+    ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
@@ -34,6 +35,36 @@ pub(crate) struct CompletedCatalogMutation {
     pub(crate) finalization: ExternalMutationFinalization,
 }
 
+/// Provider outcome after the application has performed its one permitted
+/// authoritative reconciliation. Consumers that own durable state machines
+/// must use this instead of inferring commit state from an EngineError string.
+#[derive(Clone, Debug)]
+pub(crate) enum ResolvedCatalogMutation {
+    KnownCommitted(CompletedCatalogMutation),
+    KnownUncommitted {
+        failure: ConnectorMutationFailure,
+    },
+    CommitUnknown {
+        failure: ConnectorMutationFailure,
+        evidence: ExternalMutationEvidence,
+    },
+    /// A local SPI contract failure. This is deliberately distinct from a
+    /// provider outcome: a caller with durable recovery must know whether the
+    /// operation was definitely never sent to the provider.
+    ContractFailure {
+        error: ConnectorError,
+        dispatch: MutationDispatchState,
+    },
+}
+
+/// What the application can prove about dispatch when the SPI boundary itself
+/// fails. It must not be inferred from a provider error string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutationDispatchState {
+    ConfirmedNotDispatched,
+    PossiblyDispatched,
+}
+
 /// Executes an external mutation once. A provider may return `CommitUnknown`
 /// only with evidence; this adapter reconciles that evidence on the same
 /// generation-fenced lease and deliberately never replays the mutation.
@@ -44,9 +75,45 @@ pub(crate) fn execute_catalog_mutation(
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
 ) -> Result<CompletedCatalogMutation, String> {
-    let lease = resolver
-        .acquire_current_mutation(instance_id)
-        .map_err(|error| error.to_string())?;
+    match resolve_catalog_mutation(resolver, instance_id, operation, context) {
+        ResolvedCatalogMutation::KnownCommitted(completed) => {
+            if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
+                Err(
+                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
+                        .to_string(),
+                )
+            } else {
+                Ok(completed)
+            }
+        }
+        ResolvedCatalogMutation::KnownUncommitted { failure } => {
+            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
+        }
+        ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
+            Err(EngineError::commit_unknown(failure.to_string()).to_string())
+        }
+        ResolvedCatalogMutation::ContractFailure { error, .. } => Err(error.to_string()),
+    }
+}
+
+/// Executes once and, only for `CommitUnknown`, reconciles once through the
+/// same generation-fenced lease. Outer errors are SPI contract failures; every
+/// provider/network/store result stays in the typed state space.
+pub(crate) fn resolve_catalog_mutation(
+    resolver: &dyn ConnectorCatalogMutationResolver,
+    instance_id: &ConnectorInstanceId,
+    operation: ConnectorCatalogMutationOperation,
+    context: ConnectorRequestContext,
+) -> ResolvedCatalogMutation {
+    let lease = match resolver.acquire_current_mutation(instance_id) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return ResolvedCatalogMutation::ContractFailure {
+                error,
+                dispatch: MutationDispatchState::ConfirmedNotDispatched,
+            };
+        }
+    };
     let request = ConnectorCatalogMutationRequest {
         operation_id: ConnectorMutationOperationId::new(),
         target: ConnectorExecutionBindingKey {
@@ -56,7 +123,15 @@ pub(crate) fn execute_catalog_mutation(
         operation,
         context: context.clone(),
     };
-    let outcome = lease.execute(request).map_err(|error| error.to_string())?;
+    let outcome = match lease.execute(request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return ResolvedCatalogMutation::ContractFailure {
+                error,
+                dispatch: MutationDispatchState::PossiblyDispatched,
+            };
+        }
+    };
     resolve_outcome(&lease, outcome, context)
 }
 
@@ -64,11 +139,19 @@ fn resolve_outcome(
     lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
     outcome: ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
     context: ConnectorRequestContext,
-) -> Result<CompletedCatalogMutation, String> {
+) -> ResolvedCatalogMutation {
     let outcome = match outcome {
-        ExternalMutationOutcome::CommitUnknown { evidence, .. } => lease
-            .reconcile(ConnectorCatalogMutationReconcileRequest { evidence, context })
-            .map_err(|error| error.to_string())?,
+        ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+            match lease.reconcile(ConnectorCatalogMutationReconcileRequest {
+                evidence: evidence.clone(),
+                context,
+            }) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return ResolvedCatalogMutation::CommitUnknown { failure, evidence };
+                }
+            }
+        }
         outcome => outcome,
     };
     match outcome {
@@ -76,24 +159,16 @@ fn resolve_outcome(
             effect,
             receipt,
             finalization,
-        } => {
-            if let ExternalMutationFinalization::Failed(failure) = &finalization {
-                return Err(EngineError::commit_known_committed_finalize_failed(
-                    failure.to_string(),
-                )
-                .to_string());
-            }
-            Ok(CompletedCatalogMutation {
-                effect,
-                receipt,
-                finalization,
-            })
-        }
+        } => ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+            effect,
+            receipt,
+            finalization,
+        }),
         ExternalMutationOutcome::KnownUncommitted { failure } => {
-            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
+            ResolvedCatalogMutation::KnownUncommitted { failure }
         }
-        ExternalMutationOutcome::CommitUnknown { failure, .. } => {
-            Err(EngineError::commit_unknown(failure.to_string()).to_string())
+        ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+            ResolvedCatalogMutation::CommitUnknown { failure, evidence }
         }
     }
 }
@@ -190,6 +265,89 @@ mod tests {
         }
     }
 
+    struct MissingResolver;
+    impl ConnectorCatalogMutationResolver for MissingResolver {
+        fn acquire_current_mutation(
+            &self,
+            _instance_id: &ConnectorInstanceId,
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        {
+            Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "mutation capability is unavailable",
+            ))
+        }
+    }
+
+    struct OuterErrorMutation {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+    }
+
+    impl ConnectorCatalogMutation for OuterErrorMutation {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+            self.incarnation
+        }
+        fn execute(
+            &self,
+            _request: ConnectorCatalogMutationRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+        {
+            Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Internal,
+                "provider violated its outcome contract",
+            ))
+        }
+        fn reconcile(
+            &self,
+            _request: ConnectorCatalogMutationReconcileRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+        {
+            unreachable!("execute must fail before reconcile")
+        }
+    }
+
+    struct OuterErrorResolver(Arc<OuterErrorMutation>);
+    impl ConnectorCatalogMutationResolver for OuterErrorResolver {
+        fn acquire_current_mutation(
+            &self,
+            _instance_id: &ConnectorInstanceId,
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        {
+            novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+                self.0.descriptor.clone(),
+                self.0.incarnation,
+                self.0.clone(),
+                || {},
+            )
+        }
+    }
+
+    fn create_namespace_operation(
+        instance_id: ConnectorInstanceId,
+    ) -> ConnectorCatalogMutationOperation {
+        ConnectorCatalogMutationOperation::CreateNamespace {
+            namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+            },
+            policy: CreatePolicy::FailIfExists,
+        }
+    }
+
+    fn test_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            1024,
+        )
+        .expect("context")
+    }
+
     #[test]
     fn unknown_is_reconciled_once_without_replaying_execute() {
         let descriptor = ConnectorInstanceDescriptor {
@@ -203,22 +361,53 @@ mod tests {
         let result = execute_catalog_mutation(
             &Resolver(mutation),
             &descriptor.instance_id,
-            ConnectorCatalogMutationOperation::CreateNamespace {
-                namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
-                    instance_id: descriptor.instance_id.clone(),
-                    namespace: Arc::from("db"),
-                },
-                policy: CreatePolicy::FailIfExists,
-            },
-            ConnectorRequestContext::try_new(
-                Instant::now() + Duration::from_secs(1),
-                Arc::new(NeverCancelled),
-                1024,
-                1024,
-            )
-            .expect("context"),
+            create_namespace_operation(descriptor.instance_id.clone()),
+            test_context(),
         )
         .expect("reconciled committed result");
         assert_eq!(result.effect, ExternalMutationEffect::Applied);
+    }
+
+    #[test]
+    fn missing_mutation_lease_proves_no_dispatch() {
+        let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance");
+        let resolution = resolve_catalog_mutation(
+            &MissingResolver,
+            &instance_id,
+            create_namespace_operation(instance_id.clone()),
+            test_context(),
+        );
+        assert!(matches!(
+            resolution,
+            ResolvedCatalogMutation::ContractFailure {
+                dispatch: MutationDispatchState::ConfirmedNotDispatched,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn outer_execute_contract_failure_is_conservative_about_dispatch() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+            instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance"),
+        };
+        let mutation = Arc::new(OuterErrorMutation {
+            descriptor: descriptor.clone(),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        });
+        let resolution = resolve_catalog_mutation(
+            &OuterErrorResolver(mutation),
+            &descriptor.instance_id,
+            create_namespace_operation(descriptor.instance_id.clone()),
+            test_context(),
+        );
+        assert!(matches!(
+            resolution,
+            ResolvedCatalogMutation::ContractFailure {
+                dispatch: MutationDispatchState::PossiblyDispatched,
+                ..
+            }
+        ));
     }
 }

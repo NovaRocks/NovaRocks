@@ -19,8 +19,8 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorMutationOperationId, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
-    ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
+    ConnectorTableHandle, ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 use std::sync::Arc;
@@ -203,4 +203,39 @@ fn external_mutation_evidence_is_bounded_and_redacted() {
         .kind(),
         ConnectorErrorKind::ResourceExhausted,
     );
+}
+
+#[test]
+fn refresh_publication_guard_is_bounded_stable_and_redacted() {
+    for (refresh_id, materialized_view_id, token) in [(0, 4, "token"), (3, 0, "token"), (3, 4, "")]
+    {
+        assert_eq!(
+            ConnectorRefreshPublicationGuard::try_new(refresh_id, materialized_view_id, token)
+                .expect_err("invalid guard identity must fail")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+    assert_eq!(
+        ConnectorRefreshPublicationGuard::try_new(
+            3,
+            4,
+            "x".repeat(ConnectorRefreshPublicationGuard::MAX_TOKEN_BYTES + 1),
+        )
+        .expect_err("oversized guard token must fail")
+        .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+
+    let guard = ConnectorRefreshPublicationGuard::try_new(3, 4, "secret-refresh-token")
+        .expect("bounded guard");
+    let same = ConnectorRefreshPublicationGuard::try_new(3, 4, "secret-refresh-token")
+        .expect("same guard");
+    let different = ConnectorRefreshPublicationGuard::try_new(3, 4, "different-token")
+        .expect("different guard");
+    assert_eq!(guard.digest(), same.digest());
+    assert_ne!(guard.digest(), different.digest());
+    let debug = format!("{guard:?}");
+    assert!(debug.contains("token_len"));
+    assert!(!debug.contains("secret-refresh-token"));
 }

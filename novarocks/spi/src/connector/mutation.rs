@@ -317,6 +317,87 @@ pub enum ConnectorRefKind {
     Tag,
 }
 
+/// Bounded proof that an internal MV publication belongs to one refresh attempt.
+///
+/// The token intentionally has no `Debug` representation. It is validated by the
+/// provider against the source snapshot summary immediately before publication.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConnectorRefreshPublicationGuard {
+    refresh_id: i64,
+    materialized_view_id: i64,
+    token: Arc<str>,
+}
+
+impl ConnectorRefreshPublicationGuard {
+    pub const MAX_TOKEN_BYTES: usize = 256;
+
+    pub fn try_new(
+        refresh_id: i64,
+        materialized_view_id: i64,
+        token: impl Into<Arc<str>>,
+    ) -> Result<Self, ConnectorError> {
+        if refresh_id <= 0 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "MV refresh publication guard refresh id must be positive",
+            ));
+        }
+        if materialized_view_id <= 0 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "MV refresh publication guard materialized view id must be positive",
+            ));
+        }
+        let token = token.into();
+        if token.is_empty() || token.len() > Self::MAX_TOKEN_BYTES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "MV refresh publication guard token must be non-empty and at most 256 bytes",
+            ));
+        }
+        Ok(Self {
+            refresh_id,
+            materialized_view_id,
+            token,
+        })
+    }
+
+    pub const fn refresh_id(&self) -> i64 {
+        self.refresh_id
+    }
+
+    pub const fn materialized_view_id(&self) -> i64 {
+        self.materialized_view_id
+    }
+
+    /// Provider-only input for authoritative snapshot-summary validation.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Stable redacted identity suitable for bounded provider evidence.
+    pub fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"novarocks.connector.refresh-publication-guard.v1");
+        hasher.update(self.refresh_id.to_be_bytes());
+        hasher.update(self.materialized_view_id.to_be_bytes());
+        hasher.update(self.token.as_bytes());
+        hasher.finalize().into()
+    }
+}
+
+impl fmt::Debug for ConnectorRefreshPublicationGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectorRefreshPublicationGuard")
+            .field("refresh_id", &self.refresh_id)
+            .field("materialized_view_id", &self.materialized_view_id)
+            .field("token_len", &self.token.len())
+            .field("digest", &self.digest())
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorRefAction {
     Create {
@@ -336,6 +417,7 @@ pub enum ConnectorRefAction {
         target_branch: Arc<str>,
         source_snapshot_id: i64,
         expected_target_snapshot_id: Option<i64>,
+        guard: ConnectorRefreshPublicationGuard,
     },
 }
 
