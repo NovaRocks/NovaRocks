@@ -48,6 +48,14 @@ const DEFAULT_CATALOG_NAME: &str = "default_catalog";
 /// custom command conversion, dispatch, and execution belong to the frontend
 /// DML application service.
 pub fn parse_insert_statement(sql: &str) -> Result<Option<sqlparser::ast::Insert>, String> {
+    let sql = sql.trim_start();
+    let keyword_end = sql
+        .char_indices()
+        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic()).then_some(index))
+        .unwrap_or(sql.len());
+    if !sql[..keyword_end].eq_ignore_ascii_case("insert") {
+        return Ok(None);
+    }
     match crate::sql::parser::parse_sql_raw(sql)? {
         sqlparser::ast::Statement::Insert(insert) => Ok(Some(insert)),
         _ => Ok(None),
@@ -687,6 +695,21 @@ mod tests {
                 .expect("SELECT should parse")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parse_insert_statement_does_not_parse_core_only_commands() {
+        for sql in [
+            "CREATE EXTERNAL CATALOG ice PROPERTIES (\"type\"=\"iceberg\")",
+            "ADD BACKEND '127.0.0.1:19170'",
+        ] {
+            assert!(
+                parse_insert_statement(sql)
+                    .unwrap_or_else(|error| panic!("`{sql}` must bypass INSERT parsing: {error}"))
+                    .is_none(),
+                "`{sql}` must remain owned by the core command route"
+            );
+        }
     }
 
     #[test]
