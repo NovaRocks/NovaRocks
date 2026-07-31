@@ -503,6 +503,50 @@ impl novarocks_spi::connector::ConnectorWriteResolver for TestConnectorControlRe
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorStatisticsResolver for TestConnectorControlRegistry {
+    fn acquire_current_statistics(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorStatisticsLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` has no active statistics binding",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        let statistics = binding.statistics().cloned().ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test connector control binding has no statistics capability",
+            )
+        })?;
+        novarocks_spi::connector::ConnectorStatisticsLease::new(
+            binding.descriptor().clone(),
+            binding.incarnation(),
+            statistics,
+            || {},
+        )
+    }
+}
+
+#[cfg(test)]
 impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControlRegistry {
     fn register(
         &self,
@@ -572,6 +616,15 @@ impl crate::query_execution::contract::DistributedQueryCoordinator
         crate::query_execution::contract::DistributedQueryOutcome,
         crate::query_execution::contract::DistributedQueryError,
     > {
+        if request.intent() == crate::query_execution::contract::DistributedQueryIntent::Statistics
+        {
+            return Err(
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::Rejected,
+                    "test query coordinator does not provide a statistics collection sink",
+                ),
+            );
+        }
         crate::query_execution::in_process_test::execute(request)
     }
 }

@@ -20,6 +20,7 @@
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
+use crate::query_execution::statistics::StatisticsCollectionProgram;
 use crate::query_execution::write::{ConnectorWriteCommitInput, WriteAbortInput, WriteCommitInput};
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
@@ -59,6 +60,7 @@ pub enum DistributedQueryOutcome {
     Result(ResultExecutionOutcome),
     Write(WriteExecutionOutcome),
     Profile(ProfileExecutionOutcome),
+    Statistics(StatisticsExecutionOutcome),
 }
 
 pub struct ResultExecutionOutcome {
@@ -202,6 +204,19 @@ pub struct ProfileExecutionOutcome {
     profiles: FragmentProfileSet,
 }
 
+/// Typed internal completion for a statistics collection. This intentionally
+/// has no query-result field, preventing statistics sinks from becoming a
+/// second client-row transport.
+pub struct StatisticsExecutionOutcome {
+    result: novarocks_spi::connector::StatisticsCollectionResult,
+}
+
+impl StatisticsExecutionOutcome {
+    pub fn into_collection_result(self) -> novarocks_spi::connector::StatisticsCollectionResult {
+        self.result
+    }
+}
+
 impl ProfileExecutionOutcome {
     pub(crate) fn into_parts(self) -> (QueryResult, FragmentProfileSet) {
         (self.result, self.profiles)
@@ -214,6 +229,7 @@ impl DistributedQueryOutcome {
             Self::Result(_) => DistributedQueryIntent::Result,
             Self::Write(_) => DistributedQueryIntent::Write,
             Self::Profile(_) => DistributedQueryIntent::Profile,
+            Self::Statistics(_) => DistributedQueryIntent::Statistics,
         }
     }
 
@@ -242,6 +258,16 @@ impl DistributedQueryOutcome {
             Self::Profile(outcome) => Ok(outcome),
             other => Err(outcome_variant_mismatch(
                 DistributedQueryIntent::Profile,
+                other.intent(),
+            )),
+        }
+    }
+
+    pub fn into_statistics(self) -> Result<StatisticsExecutionOutcome, DistributedQueryError> {
+        match self {
+            Self::Statistics(outcome) => Ok(outcome),
+            other => Err(outcome_variant_mismatch(
+                DistributedQueryIntent::Statistics,
                 other.intent(),
             )),
         }
@@ -347,6 +373,10 @@ impl QueryOutcomeFactory {
                 }
                 self.result(query_result)
             }
+            DistributedQueryIntent::Statistics => Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "Statistics outcome must be completed through the typed statistics result sink",
+            )),
         }
     }
 
@@ -370,6 +400,21 @@ impl QueryOutcomeFactory {
             result,
             profiles,
         }))
+    }
+
+    pub fn statistics(
+        self,
+        program: &StatisticsCollectionProgram,
+        result: novarocks_spi::connector::StatisticsCollectionResult,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.require_intent(DistributedQueryIntent::Statistics)?;
+        let mut sink = program.result_sink();
+        sink.accept(result)?;
+        Ok(DistributedQueryOutcome::Statistics(
+            StatisticsExecutionOutcome {
+                result: sink.finish()?,
+            },
+        ))
     }
 
     fn require_intent(

@@ -708,6 +708,16 @@ impl FrontendDistributedQueryCoordinator {
             .as_ref()
             .map(|registration| registration.session().clone());
         let intent = parts.completion.intent();
+        // Statistics collection has a typed completion sink and must be
+        // entered by the statistics application service.  Until that service
+        // supplies the collection program, the generic client-result
+        // coordinator must fail closed rather than manufacture MySQL rows.
+        if intent == DistributedQueryIntent::Statistics {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::Rejected,
+                "statistics execution requires the frontend statistics application service",
+            ));
+        }
         self.backend_topology
             .validate_snapshot(&parts.topology)
             .map_err(|error| failed(error.to_string()))?;
@@ -967,6 +977,10 @@ impl FrontendDistributedQueryCoordinator {
                     }
                     parts.completion.profile(result, builder.finish())
                 }
+                DistributedQueryIntent::Statistics => Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::Rejected,
+                    "statistics execution reached the client-result coordinator without a typed sink",
+                )),
             }
         })();
         if let Err(error) = &outcome {

@@ -36,6 +36,7 @@ mod runtime_filter;
 pub(crate) mod schedule;
 pub mod service;
 pub mod session;
+pub mod statistics;
 pub mod write;
 pub mod write_operation;
 pub mod write_plan;

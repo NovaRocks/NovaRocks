@@ -29,6 +29,9 @@ pub use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::preparation::PreparedFragmentSet;
 pub use crate::query_execution::profile::ProfileTerminalBuilder;
 use crate::query_execution::request_context::QueryExecutionContext;
+pub use crate::query_execution::statistics::StatisticsCollectionProgram;
+pub use crate::query_execution::statistics::StatisticsExecutionMode;
+pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
 use crate::runtime::query_options::QueryOptions;
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
@@ -155,6 +158,9 @@ pub enum DistributedQueryIntent {
     Result,
     Write,
     Profile,
+    /// Internal collection execution. Its completion carries typed evidence,
+    /// never a `QueryResult` that could be returned as user MySQL rows.
+    Statistics,
 }
 
 /// DML-owned facts required to plan one provider-neutral writer manifest
