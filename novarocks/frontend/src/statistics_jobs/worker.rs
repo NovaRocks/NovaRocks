@@ -149,7 +149,7 @@ impl StatisticsAnalyzeWorker {
     pub async fn start(
         runtime: &tokio::runtime::Handle,
         repository: Arc<StatisticsJobRepository>,
-        executor: Weak<dyn StatisticsAttemptExecutor>,
+        executor: Arc<dyn StatisticsAttemptExecutor>,
     ) -> Result<Self, String> {
         let coordination = StatisticsAnalyzeWorkerCoordination::open(repository.store())
             .await
@@ -158,7 +158,7 @@ impl StatisticsAnalyzeWorker {
         let wakeup = Arc::new(tokio::sync::Notify::new());
         let join = runtime.spawn(run_worker(
             repository,
-            executor,
+            Arc::downgrade(&executor),
             coordination,
             Arc::clone(&stop),
             Arc::clone(&wakeup),

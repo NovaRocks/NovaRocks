@@ -231,6 +231,9 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     .with_context(|| format!("invalid restart_be_delay_ms: {}", raw_value))?;
                 meta.restart_be_delay_ms = Some(value);
             }
+            "restart_fe_after_step" => {
+                meta.restart_fe_after_step = parse_bool(&raw_value)?;
+            }
             "drop_next_init_ack_be_index" => {
                 let value = raw_value
                     .parse::<usize>()
@@ -494,6 +497,7 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         restart_be_after_init_ack_index: override_meta
             .restart_be_after_init_ack_index
             .or(base.restart_be_after_init_ack_index),
+        restart_fe_after_step: override_meta.restart_fe_after_step || base.restart_fe_after_step,
         kill_query_after_control_ready_count: override_meta
             .kill_query_after_control_ready_count
             .or(base.kill_query_after_control_ready_count),
@@ -961,6 +965,23 @@ mod opt5_directive_tests {
         assert_eq!(meta.network_partition_be, Some(2));
         assert_eq!(meta.heartbeat_delay_ms, Some(250));
         assert_eq!(meta.restart_be_delay_ms, Some(500));
+    }
+
+    #[test]
+    fn parse_meta_parses_post_step_frontend_restart() {
+        let re = meta_re();
+        let meta = parse_meta(&["-- @restart_fe_after_step=true".to_string()], &re)
+            .expect("parse frontend restart directive");
+        assert!(meta.restart_fe_after_step);
+
+        let inherited = merge_meta(
+            &meta,
+            &QueryMeta {
+                restart_fe_after_step: false,
+                ..QueryMeta::default()
+            },
+        );
+        assert!(inherited.restart_fe_after_step);
     }
 
     #[test]

@@ -344,7 +344,9 @@ pub(crate) fn validate_fragment_output_kind(
 ) -> Result<(), String> {
     if is_root {
         return match output_kind {
-            PreparedFragmentRole::Result | PreparedFragmentRole::TerminalWrite => Ok(()),
+            PreparedFragmentRole::Result
+            | PreparedFragmentRole::Statistics
+            | PreparedFragmentRole::TerminalWrite => Ok(()),
             PreparedFragmentRole::NonTerminal => Err(format!(
                 "root fragment {fragment_id} must have Result or TerminalWrite output kind"
             )),
@@ -1079,6 +1081,8 @@ mod tests {
 
         validate_fragment_output_kind(1, true, false, false, PreparedFragmentRole::Result)
             .expect("result root");
+        validate_fragment_output_kind(1, true, false, false, PreparedFragmentRole::Statistics)
+            .expect("statistics root");
         assert!(validate_fragment_output_kind(
             1,
             true,

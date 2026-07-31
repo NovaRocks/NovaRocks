@@ -1703,6 +1703,17 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         case_failed = true;
                     }
                 } else if let Some(execution) = passed_execution {
+                    if let Err(error) = restart_frontend_after_step(
+                        step,
+                        &ctx.server_handle,
+                        &mut target_session,
+                        &mut log,
+                    )
+                    {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ {error:#}");
+                        continue;
+                    }
                     // Run wait_alter post-execution polling if annotated.
                     let (wait_ok, wait_elapsed) = run_step_wait_alters(
                         step,
@@ -1989,6 +2000,19 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = writeln!(log, "    ❌ {}", last_failure);
                     }
                 } else if let Some(execution) = recorded_execution {
+                    if ctx.record_from == RecordFrom::Target {
+                        if let Err(error) = restart_frontend_after_step(
+                            step,
+                            &ctx.server_handle,
+                            &mut target_session,
+                            &mut log,
+                        )
+                        {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ {error:#}");
+                            continue;
+                        }
+                    }
                     // Run wait_alter post-execution polling if annotated.
                     let (wait_ok, wait_elapsed) = run_step_wait_alters(
                         step,
@@ -2631,7 +2655,7 @@ fn cases_have_fault_directives(cases: &[SqlCase]) -> bool {
     cases
         .iter()
         .flat_map(|case| case.steps.iter())
-        .any(|step| fault_injection::has_fault(&step.meta))
+        .any(|step| fault_injection::has_fault(&step.meta) || step.meta.restart_fe_after_step)
 }
 
 fn validate_fault_injection_jobs(cases: &[SqlCase], jobs: usize) -> Result<()> {
@@ -2640,6 +2664,30 @@ fn validate_fault_injection_jobs(cases: &[SqlCase], jobs: usize) -> Result<()> {
             "fault injection directives require -j 1 because they mutate the shared cross-process cluster"
         );
     }
+    Ok(())
+}
+
+fn restart_frontend_after_step(
+    step: &SqlStep,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    session: &mut MysqlSession,
+    log: &mut String,
+) -> Result<()> {
+    if !step.meta.restart_fe_after_step {
+        return Ok(());
+    }
+    let mut server = server_handle
+        .lock()
+        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+    if server.be_count() == 0 {
+        bail!("@restart_fe_after_step requires a runner-owned cross-process frontend");
+    }
+    server.restart_fe().context("restart frontend after successful SQL step")?;
+    drop(server);
+    session
+        .reconnect()
+        .context("reconnect target SQL session after frontend restart")?;
+    let _ = writeln!(log, "    @restart_fe_after_step PASS");
     Ok(())
 }
 
@@ -3158,6 +3206,15 @@ fn run() -> Result<i32> {
                     {
                         println!(
                             "❌ ERROR: suite {} case {} step {}: {error}",
+                            suite.name, case.case_id, step.query_number
+                        );
+                        return Ok(1);
+                    }
+                    if step.meta.restart_fe_after_step
+                        && selected_cluster_mode != ClusterMode::CrossProcess
+                    {
+                        println!(
+                            "❌ ERROR: suite {} case {} step {}: @restart_fe_after_step requires --cluster-mode cross-process",
                             suite.name, case.case_id, step.query_number
                         );
                         return Ok(1);

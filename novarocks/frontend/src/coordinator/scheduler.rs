@@ -244,7 +244,10 @@ impl FrontendFragmentScheduler {
                 "execution anchor is not present in scheduling view",
             )
         })?;
-        if !root.is_terminal_write() {
+        // A statistics root is an internal fanout terminal: unlike a client
+        // result root it must retain its scan-derived cardinality so every
+        // scheduled backend contributes a bounded partial report.
+        if !root.is_terminal_write() && !root.is_statistics() {
             counts.insert(root_fragment_id, 1);
         }
 

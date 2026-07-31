@@ -274,11 +274,19 @@ impl StatisticsApplicationService {
                 let table_pin = resolver
                     .resolve_table_pin(&statement.target)
                     .map_err(StatisticsApplicationError::target_resolution)?;
+                // An omitted column list means every column from this one-time
+                // resolution. Persist that concrete, bounded list so a later
+                // worker attempt never has to resolve latest metadata again.
+                let metric_names = if statement.metric_names.is_empty() {
+                    table_pin.columns.clone()
+                } else {
+                    statement.metric_names
+                };
                 let job = repository
                     .create(StatisticsJobCreate {
                         target: statement.target,
                         table_pin,
-                        metric_names: statement.metric_names,
+                        metric_names,
                         submitted_at_ms,
                     })
                     .await
@@ -448,7 +456,7 @@ impl FrontendStatisticsApplicationPort {
             self.runtime.block_on(StatisticsAnalyzeWorker::start(
                 &self.runtime,
                 Arc::new(repository),
-                Arc::downgrade(&adapter),
+                Arc::clone(&adapter),
             ))
         })?;
         let mut worker_slot = self
@@ -736,7 +744,7 @@ fn job_view(job: StatisticsJob) -> core_application::StatisticsJobView {
     core_application::StatisticsJobView {
         job_id: job.job_id,
         operation_id: job.operation_id,
-        state: format!("{:?}", job.state),
+        state: format!("{:?}", job.state).to_ascii_uppercase(),
         attempt: job.attempt,
         target: core_application::StatisticsTableTarget {
             catalog: job.target.catalog,

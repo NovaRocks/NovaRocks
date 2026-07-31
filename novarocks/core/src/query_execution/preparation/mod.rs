@@ -166,7 +166,12 @@ pub(crate) fn prepare_fragments(
             }
         }
         let scan_node_ids = scan_nodes.into_iter().map(|(node_id, _)| node_id).collect();
-        let execution_role = if result_fragment_id == Some(fragment.fragment_id) {
+        let execution_role = if matches!(
+            &fragment.sink,
+            crate::sql::planner::distributed::DataSink::Statistics(_)
+        ) {
+            PreparedFragmentRole::Statistics
+        } else if result_fragment_id == Some(fragment.fragment_id) {
             PreparedFragmentRole::Result
         } else if terminal_write_fragment_ids.contains(&fragment.fragment_id) {
             PreparedFragmentRole::TerminalWrite
@@ -281,7 +286,12 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
         .collect::<BTreeSet<_>>();
     let mut by_fragment = BTreeMap::new();
     for fragment in plan.fragments() {
-        let role = if result_fragment_id == Some(fragment.fragment_id) {
+        let role = if matches!(
+            &fragment.sink,
+            crate::sql::planner::distributed::DataSink::Statistics(_)
+        ) {
+            PreparedFragmentRole::Statistics
+        } else if result_fragment_id == Some(fragment.fragment_id) {
             PreparedFragmentRole::Result
         } else if terminal_write_fragment_ids.contains(&fragment.fragment_id) {
             PreparedFragmentRole::TerminalWrite

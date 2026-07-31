@@ -101,6 +101,12 @@ impl StatisticsSinkShared {
         let payload = collector
             .finish_fragment_payload()
             .map_err(|error| error.to_string());
+        if payload.is_ok() {
+            // The cross-process statistics acceptance suite consumes stdout/stderr
+            // only. Keep this marker at the exact BE-local completion boundary so
+            // it proves a non-empty collection partial was produced here.
+            eprintln!("NOVAROCKS_STATISTICS_FRAGMENT_COLLECTED");
+        }
         let mut completion = self
             .completion
             .lock()

@@ -295,7 +295,7 @@ async fn worker_claims_collects_and_publishes_under_the_fenced_lease() {
     let mut worker = StatisticsAnalyzeWorker::start(
         &tokio::runtime::Handle::current(),
         Arc::new(repository.clone()),
-        Arc::downgrade(&executor),
+        Arc::clone(&executor),
     )
     .await
     .expect("start worker");
@@ -380,7 +380,7 @@ async fn worker_reconciles_publishing_without_recollecting() {
     let mut worker = StatisticsAnalyzeWorker::start(
         &tokio::runtime::Handle::current(),
         Arc::new(repository.clone()),
-        Arc::downgrade(&executor),
+        Arc::clone(&executor),
     )
     .await
     .expect("start worker");
@@ -421,7 +421,7 @@ async fn worker_retries_transient_collection_at_most_three_times_with_one_operat
     let mut worker = StatisticsAnalyzeWorker::start(
         &tokio::runtime::Handle::current(),
         Arc::new(repository.clone()),
-        Arc::downgrade(&executor),
+        Arc::clone(&executor),
     )
     .await
     .expect("start worker");
@@ -587,7 +587,7 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
         .execute(
             StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
                 target: target.clone(),
-                metric_names: vec!["row_count".to_string()],
+                metric_names: Vec::new(),
             }),
             10,
             &table_statistics,
@@ -608,7 +608,7 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
         .execute(
             StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
                 target: target.clone(),
-                metric_names: vec!["row_count".to_string()],
+                metric_names: Vec::new(),
             }),
             11,
             &table_statistics,
@@ -617,7 +617,8 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
         .expect("typed ANALYZE creates a job");
     assert!(matches!(
         submitted,
-        StatisticsStatementResult::JobSubmitted(_)
+        StatisticsStatementResult::JobSubmitted(ref job)
+            if job.metric_names == vec!["v".to_string()]
     ));
     let listed = service
         .execute(
@@ -666,7 +667,7 @@ async fn typed_cancel_records_intent_and_the_fenced_worker_transitions_it() {
     let mut worker = StatisticsAnalyzeWorker::start(
         &tokio::runtime::Handle::current(),
         Arc::new(repository.clone()),
-        Arc::downgrade(&executor),
+        Arc::clone(&executor),
     )
     .await
     .expect("start worker");

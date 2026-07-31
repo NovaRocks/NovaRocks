@@ -538,6 +538,10 @@ impl<'a> SchedulingFragmentView<'a> {
     pub fn is_terminal_write(self) -> bool {
         self.fragment.execution_role().is_terminal_write()
     }
+
+    pub fn is_statistics(self) -> bool {
+        self.fragment.execution_role().is_statistics()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1409,7 +1413,7 @@ fn assemble_native_execution(
         fragment_id: root_fragment_id,
         backend_idx: schedule.root_backend_idx,
         finst_id: schedule.root_finst_id,
-        uses_result_buffer: !root.execution_role().is_terminal_write(),
+        uses_result_buffer: root.execution_role().uses_result_buffer(),
     };
 
     let edges = prepared.scheduling_view().edges().to_vec();
