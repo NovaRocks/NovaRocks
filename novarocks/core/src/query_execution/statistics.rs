@@ -54,6 +54,11 @@ pub const MAX_STATISTICS_THETA_RETAINED_HASHES: usize = 1 << 12;
 const THETA_PARTIAL_WIRE_VERSION: u8 = 1;
 const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 1 + 1 + 8 + 4;
 const VISIBLE_ROW_ARTIFACT_VERSION: u8 = 1;
+/// Versioned BE-to-coordinator payload carrying one mergeable visible-row
+/// collection partial.  It is deliberately separate from the provider
+/// artifact: this payload crosses only the native execution lifecycle,
+/// whereas the provider artifact is retained only after finalization.
+const STATISTICS_FRAGMENT_PAYLOAD_VERSION: u8 = 1;
 
 /// A statistics collection is either tied to a statement wait or owned by a
 /// durable frontend job. Only the former observes the statement cancellation
@@ -443,6 +448,108 @@ impl StatisticsCollectionFinalizer {
         self
     }
 
+    /// Merge independently collected fragment partials before constructing
+    /// connector evidence.  The frontend never sees Arrow rows: it receives
+    /// only this bounded associative state through final execution reports.
+    pub fn try_merge(
+        partials: impl IntoIterator<Item = Self>,
+    ) -> Result<Self, DistributedQueryError> {
+        let partials = partials.into_iter().collect::<Vec<_>>();
+        let table = StatisticsScalarPartial::try_merge(
+            partials.iter().filter_map(|partial| partial.table.clone()),
+        )?;
+        let has_table = partials.iter().any(|partial| partial.table.is_some());
+        let mut column_partials =
+            BTreeMap::<std::sync::Arc<str>, Vec<StatisticsScalarPartial>>::new();
+        let mut theta_partials = BTreeMap::<std::sync::Arc<str>, Vec<ThetaSketchPartial>>::new();
+        for partial in partials {
+            for (column, scalar) in partial.columns {
+                column_partials.entry(column).or_default().push(scalar);
+            }
+            for (column, theta) in partial.theta {
+                theta_partials.entry(column).or_default().push(theta);
+            }
+        }
+        let columns = column_partials
+            .into_iter()
+            .map(|(column, partials)| {
+                StatisticsScalarPartial::try_merge(partials).map(|value| (column, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let theta = theta_partials
+            .into_iter()
+            .map(|(column, partials)| {
+                ThetaSketchPartial::try_union(partials).map(|value| (column, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(Self {
+            table: has_table.then_some(table),
+            columns,
+            theta,
+        })
+    }
+
+    /// Encode a bounded fragment report payload for `ExecStatusReport`.
+    /// The payload contains no evidence revision, operation ID, credentials,
+    /// or client result rows; those remain frontend/control-plane concerns.
+    pub fn try_to_fragment_payload(&self) -> Result<Bytes, DistributedQueryError> {
+        let mut bytes = Vec::new();
+        bytes.push(STATISTICS_FRAGMENT_PAYLOAD_VERSION);
+        match &self.table {
+            Some(table) => {
+                bytes.push(1);
+                encode_scalar_partial(&mut bytes, table);
+            }
+            None => bytes.push(0),
+        }
+        encode_scalar_partials(&mut bytes, &self.columns)?;
+        encode_theta_partials(&mut bytes, &self.theta)?;
+        if bytes.len() > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
+            return Err(resource_exhausted(
+                "statistics fragment report exceeds the SPI payload limit",
+            ));
+        }
+        Ok(Bytes::from(bytes))
+    }
+
+    /// Decode a native final-report payload, applying every structural and
+    /// payload bound before it can enter coordinator state.
+    pub fn try_from_fragment_payload(bytes: &[u8]) -> Result<Self, DistributedQueryError> {
+        if bytes.len() > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
+            return Err(resource_exhausted(
+                "statistics fragment report exceeds the SPI payload limit",
+            ));
+        }
+        let mut cursor = 0usize;
+        let version = take_bytes(bytes, &mut cursor, 1)?[0];
+        if version != STATISTICS_FRAGMENT_PAYLOAD_VERSION {
+            return Err(contract_violation(
+                "statistics fragment report has an unsupported version",
+            ));
+        }
+        let table = match take_bytes(bytes, &mut cursor, 1)?[0] {
+            0 => None,
+            1 => Some(decode_scalar_partial(bytes, &mut cursor)?),
+            _ => {
+                return Err(contract_violation(
+                    "statistics fragment report has an invalid table flag",
+                ));
+            }
+        };
+        let columns = decode_scalar_partials(bytes, &mut cursor)?;
+        let theta = decode_theta_partials(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(contract_violation(
+                "statistics fragment report has trailing bytes",
+            ));
+        }
+        Ok(Self {
+            table,
+            columns,
+            theta,
+        })
+    }
+
     pub fn metric_states(
         &self,
         metrics: &StatisticsMetricRequest,
@@ -649,6 +756,170 @@ fn take_bytes<'a>(
         .ok_or_else(|| contract_violation("statistics visible-row artifact is truncated"))?;
     *cursor = end;
     Ok(output)
+}
+
+fn encode_scalar_partial(bytes: &mut Vec<u8>, partial: &StatisticsScalarPartial) {
+    bytes.extend_from_slice(&partial.row_count.to_be_bytes());
+    bytes.extend_from_slice(&partial.null_count.to_be_bytes());
+    bytes.extend_from_slice(&partial.total_size.to_be_bytes());
+    for value in [partial.minimum, partial.maximum] {
+        match value {
+            Some(value) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+            None => bytes.push(0),
+        }
+    }
+}
+
+fn decode_scalar_partial(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<StatisticsScalarPartial, DistributedQueryError> {
+    let read_u64 = |cursor: &mut usize| -> Result<u64, DistributedQueryError> {
+        Ok(u64::from_be_bytes(
+            take_bytes(bytes, cursor, 8)?
+                .try_into()
+                .expect("fixed scalar field width"),
+        ))
+    };
+    let row_count = read_u64(cursor)?;
+    let null_count = read_u64(cursor)?;
+    let total_size = read_u64(cursor)?;
+    let read_bound = |cursor: &mut usize| -> Result<Option<f64>, DistributedQueryError> {
+        match take_bytes(bytes, cursor, 1)?[0] {
+            0 => Ok(None),
+            1 => Ok(Some(f64::from_bits(u64::from_be_bytes(
+                take_bytes(bytes, cursor, 8)?
+                    .try_into()
+                    .expect("fixed scalar field width"),
+            )))),
+            _ => Err(contract_violation(
+                "statistics scalar partial has an invalid bound flag",
+            )),
+        }
+    };
+    StatisticsScalarPartial::try_new(
+        row_count,
+        null_count,
+        total_size,
+        read_bound(cursor)?,
+        read_bound(cursor)?,
+    )
+}
+
+fn encode_scalar_partials(
+    bytes: &mut Vec<u8>,
+    partials: &BTreeMap<std::sync::Arc<str>, StatisticsScalarPartial>,
+) -> Result<(), DistributedQueryError> {
+    let count = u16::try_from(partials.len()).map_err(|_| {
+        resource_exhausted("statistics fragment report has too many scalar columns")
+    })?;
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for (column, partial) in partials {
+        encode_fragment_column(bytes, column)?;
+        encode_scalar_partial(bytes, partial);
+    }
+    Ok(())
+}
+
+fn decode_scalar_partials(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<BTreeMap<std::sync::Arc<str>, StatisticsScalarPartial>, DistributedQueryError> {
+    let count = u16::from_be_bytes(
+        take_bytes(bytes, cursor, 2)?
+            .try_into()
+            .expect("fixed count width"),
+    ) as usize;
+    let mut partials = BTreeMap::new();
+    for _ in 0..count {
+        let column = decode_fragment_column(bytes, cursor)?;
+        let value = decode_scalar_partial(bytes, cursor)?;
+        if partials.insert(column, value).is_some() {
+            return Err(contract_violation(
+                "statistics fragment report has duplicate scalar columns",
+            ));
+        }
+    }
+    Ok(partials)
+}
+
+fn encode_theta_partials(
+    bytes: &mut Vec<u8>,
+    partials: &BTreeMap<std::sync::Arc<str>, ThetaSketchPartial>,
+) -> Result<(), DistributedQueryError> {
+    let count = u16::try_from(partials.len())
+        .map_err(|_| resource_exhausted("statistics fragment report has too many Theta columns"))?;
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for (column, partial) in partials {
+        encode_fragment_column(bytes, column)?;
+        let theta = partial.to_wire_bytes();
+        let theta_len = u32::try_from(theta.len())
+            .map_err(|_| resource_exhausted("statistics fragment Theta state is too large"))?;
+        bytes.extend_from_slice(&theta_len.to_be_bytes());
+        bytes.extend_from_slice(&theta);
+    }
+    Ok(())
+}
+
+fn decode_theta_partials(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<BTreeMap<std::sync::Arc<str>, ThetaSketchPartial>, DistributedQueryError> {
+    let count = u16::from_be_bytes(
+        take_bytes(bytes, cursor, 2)?
+            .try_into()
+            .expect("fixed count width"),
+    ) as usize;
+    let mut partials = BTreeMap::new();
+    for _ in 0..count {
+        let column = decode_fragment_column(bytes, cursor)?;
+        let theta_len = u32::from_be_bytes(
+            take_bytes(bytes, cursor, 4)?
+                .try_into()
+                .expect("fixed length width"),
+        ) as usize;
+        let value = ThetaSketchPartial::try_from_wire_bytes(take_bytes(bytes, cursor, theta_len)?)?;
+        if partials.insert(column, value).is_some() {
+            return Err(contract_violation(
+                "statistics fragment report has duplicate Theta columns",
+            ));
+        }
+    }
+    Ok(partials)
+}
+
+fn encode_fragment_column(
+    bytes: &mut Vec<u8>,
+    column: &std::sync::Arc<str>,
+) -> Result<(), DistributedQueryError> {
+    let column = column.as_bytes();
+    let length = u16::try_from(column.len())
+        .map_err(|_| resource_exhausted("statistics fragment report column name is too large"))?;
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(column);
+    Ok(())
+}
+
+fn decode_fragment_column(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<std::sync::Arc<str>, DistributedQueryError> {
+    let length = u16::from_be_bytes(
+        take_bytes(bytes, cursor, 2)?
+            .try_into()
+            .expect("fixed length width"),
+    ) as usize;
+    let column = std::str::from_utf8(take_bytes(bytes, cursor, length)?)
+        .map_err(|_| contract_violation("statistics fragment report column is not UTF-8"))?;
+    if column.is_empty() {
+        return Err(contract_violation(
+            "statistics fragment report has an empty column name",
+        ));
+    }
+    Ok(std::sync::Arc::from(column))
 }
 
 fn not_collected(metric: &StatisticsMetric) -> StatisticsMetricState {
@@ -983,6 +1254,86 @@ mod tests {
                 StatisticsMetricValue::F64(9.0)
             ))
         );
+    }
+
+    #[test]
+    fn fragment_payload_roundtrip_and_merge_preserve_exact_partials() {
+        let first = StatisticsCollectionFinalizer::default()
+            .with_table(
+                StatisticsScalarPartial::try_new(2, 0, 20, None, None).expect("table partial"),
+            )
+            .with_column(
+                "v",
+                StatisticsScalarPartial::try_new(2, 1, 8, Some(3.0), Some(7.0))
+                    .expect("column partial"),
+            )
+            .with_theta(
+                "v",
+                ThetaSketchPartial::try_from_i64_values(12, [1, 2]).expect("theta partial"),
+            );
+        let second = StatisticsCollectionFinalizer::default()
+            .with_table(
+                StatisticsScalarPartial::try_new(1, 0, 10, None, None).expect("table partial"),
+            )
+            .with_column(
+                "v",
+                StatisticsScalarPartial::try_new(1, 0, 4, Some(1.0), Some(5.0))
+                    .expect("column partial"),
+            )
+            .with_theta(
+                "v",
+                ThetaSketchPartial::try_from_i64_values(12, [2, 3]).expect("theta partial"),
+            );
+        let first = StatisticsCollectionFinalizer::try_from_fragment_payload(
+            &first
+                .try_to_fragment_payload()
+                .expect("encode first fragment"),
+        )
+        .expect("decode first fragment");
+        let second = StatisticsCollectionFinalizer::try_from_fragment_payload(
+            &second
+                .try_to_fragment_payload()
+                .expect("encode second fragment"),
+        )
+        .expect("decode second fragment");
+        let merged = StatisticsCollectionFinalizer::try_merge([first, second])
+            .expect("merge fragment partials");
+        let metrics = StatisticsMetricRequest::try_new(vec![
+            StatisticsMetric::RowCount,
+            StatisticsMetric::NullCount { column: "v".into() },
+            StatisticsMetric::Minimum { column: "v".into() },
+            StatisticsMetric::Maximum { column: "v".into() },
+            StatisticsMetric::AverageSize { column: "v".into() },
+            StatisticsMetric::ThetaNdv { column: "v".into() },
+        ])
+        .expect("metrics");
+        let states = merged.metric_states(&metrics);
+        assert_eq!(
+            states.get(&StatisticsMetric::RowCount),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::U64(3)
+            ))
+        );
+        assert_eq!(
+            states.get(&StatisticsMetric::Minimum { column: "v".into() }),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::F64(1.0)
+            ))
+        );
+        assert!(matches!(
+            states.get(&StatisticsMetric::ThetaNdv { column: "v".into() }),
+            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value >= 3.0
+        ));
+    }
+
+    #[test]
+    fn fragment_payload_rejects_trailing_bytes() {
+        let payload = StatisticsCollectionFinalizer::default()
+            .try_to_fragment_payload()
+            .expect("encode empty fragment");
+        let mut corrupt = payload.to_vec();
+        corrupt.push(0);
+        assert!(StatisticsCollectionFinalizer::try_from_fragment_payload(&corrupt).is_err());
     }
 
     #[test]
