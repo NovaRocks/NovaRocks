@@ -43,15 +43,14 @@ use novarocks_spi::connector::{
     ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReadSelector, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorReadExecution, ConnectorReadSelector, ConnectorRefreshPublicationGuard, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
     ConnectorStaticPredicateLiteral, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy, CreatePolicy,
     DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, ConnectorRefreshPublicationGuard,
-    normalize_predicate_dispositions, validate_static_predicates,
+    ExternalMutationOutcome, normalize_predicate_dispositions, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3605,6 +3604,11 @@ fn map_iceberg_error(error: String) -> ConnectorError {
     let normalized = error.to_ascii_lowercase();
     let kind = if normalized.contains("not found")
         || normalized.contains("does not exist")
+        // `load_table` normalizes an absent table across the local/Hadoop and
+        // REST paths to this stable text.  Mutation existence policies must
+        // interpret it as absence, rather than turning CREATE IF NOT EXISTS
+        // (and ordinary CREATE) into an internal error before dispatch.
+        || normalized.contains("unknown table")
         || normalized.contains("no metadata files")
     {
         ConnectorErrorKind::NotFound
@@ -3737,6 +3741,12 @@ mod tests {
         assert_eq!(evidence.operation_kind(), "create-namespace");
         assert!(format!("{evidence:?}").contains("provider_payload_len"));
         assert!(!format!("{evidence:?}").contains("\"namespace\""));
+    }
+
+    #[test]
+    fn absent_table_error_is_classified_as_not_found_for_mutation_policies() {
+        let error = map_iceberg_error("unknown table: analytics.orders".to_string());
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
     }
 
     #[test]
