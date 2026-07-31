@@ -37,10 +37,10 @@ use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorControlResolver,
     ConnectorReadSelector, ConnectorRequestContext, ConnectorSplitPlanningRequest,
-    StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
-    StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
-    StatisticsProvenance,
+    ConnectorStatisticsLease, StatisticsCollectionPlan, StatisticsCollectionResult,
+    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
+    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
+    StatisticsMissingKind, StatisticsProvenance,
 };
 
 use crate::query_execution::backend::BackendTopologySnapshot;
@@ -219,6 +219,7 @@ pub(crate) fn prepare_statistics_connector_read(
     topology: &BackendTopologySnapshot,
     program: &StatisticsCollectionProgram,
     context: ConnectorRequestContext,
+    expected_statistics_lease: Option<&ConnectorStatisticsLease>,
 ) -> Result<PlannedConnectorRead, DistributedQueryError> {
     let target_parallelism = NonZeroUsize::new(topology.targets().len()).ok_or_else(|| {
         DistributedQueryError::new(
@@ -229,6 +230,16 @@ pub(crate) fn prepare_statistics_connector_read(
     let lease = controls
         .acquire_current(program.plan.table().owner())
         .map_err(connector_planning_error)?;
+    if let Some(expected) = expected_statistics_lease {
+        if lease.binding().descriptor() != expected.descriptor()
+            || lease.binding().incarnation() != expected.incarnation()
+        {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::Rejected,
+                "statistics connector generation changed after collection preparation; retry against a new table pin",
+            ));
+        }
+    }
     if lease.binding().descriptor().instance_id != *program.plan.table().owner() {
         return Err(DistributedQueryError::new(
             DistributedQueryErrorKind::ContractViolation,
@@ -303,12 +314,14 @@ pub(crate) fn build_statistics_collection_request(
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     context: ConnectorRequestContext,
     program: StatisticsCollectionProgram,
+    expected_statistics_lease: Option<&ConnectorStatisticsLease>,
 ) -> Result<DistributedQueryRequest, DistributedQueryError> {
     let read = prepare_statistics_connector_read(
         controls,
         execution.topology(),
         &program,
         context.clone(),
+        expected_statistics_lease,
     )?;
     let physical = statistics_scan_physical_plan(&program)?;
     let distributed =
@@ -1760,6 +1773,7 @@ mod tests {
             &BackendTopologySnapshot::empty(7),
             &program_for_preparation(),
             connector_context(),
+            None,
         ) {
             Ok(_) => panic!("statistics collection cannot run without a live backend"),
             Err(error) => error,

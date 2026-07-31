@@ -585,6 +585,7 @@ impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
             &execution,
             context.clone(),
             program,
+            Some(&lease),
         )
         .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
         let result = state
