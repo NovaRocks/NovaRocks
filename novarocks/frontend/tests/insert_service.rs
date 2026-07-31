@@ -457,6 +457,10 @@ impl OperationJournal for FakeJournal {
             .cloned())
     }
 
+    fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
+        Ok(self.operations.lock().unwrap().values().cloned().collect())
+    }
+
     fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError> {
         Ok(self
             .operations
@@ -534,7 +538,7 @@ fn non_insert_returns_none_without_engine_calls() {
 }
 
 #[test]
-fn local_values_are_reordered_then_appended() {
+fn local_insert_without_state_store_is_reordered_and_appended() {
     let engine = FakeInsertEngine::new(target(InsertTargetBackend::Local, false));
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
@@ -556,7 +560,7 @@ fn local_values_are_reordered_then_appended() {
 }
 
 #[test]
-fn starrocks_insert_select_executes_aligns_then_appends_batch() {
+fn starrocks_insert_without_state_store_executes_aligns_then_appends_batch() {
     let mut resolved = target(InsertTargetBackend::StarRocks, true);
     resolved.columns = vec![column("a", false)];
     let engine = FakeInsertEngine::new(resolved);
@@ -707,12 +711,16 @@ fn iceberg_without_journal_fails_before_prepare() {
     let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    let error = service(None, statistics)
+    let error = service(None, Arc::clone(&statistics))
         .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(error.to_string().contains("state store is required"));
-    assert_eq!(engine.calls().len(), 1);
+    assert!(matches!(
+        engine.calls().as_slice(),
+        [Call::Resolve { target, .. }] if target == &vec!["t".to_string()]
+    ));
+    assert_eq!(statistics.insert_count.load(Ordering::SeqCst), 0);
 }
 
 #[test]

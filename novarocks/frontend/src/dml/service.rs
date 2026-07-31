@@ -101,6 +101,11 @@ impl DmlService {
         self.require_journal()?.load(operation_id)
     }
 
+    /// List all durable operations for lifecycle inspection and recovery audits.
+    pub fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
+        self.require_journal()?.list_operations()
+    }
+
     /// List operations that have not reached a terminal state (recovery input).
     pub fn list_unfinished_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
         self.require_journal()?.list_unfinished()
@@ -173,6 +178,10 @@ mod tests {
             service.load_operation(id).unwrap().unwrap().state,
             OperationState::Finalized
         );
+        let operations = service.list_operations().unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].operation_id, id);
+        assert_eq!(operations[0].state, OperationState::Finalized);
         assert!(service.list_unfinished_operations().unwrap().is_empty());
     }
 }

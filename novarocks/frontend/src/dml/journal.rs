@@ -30,6 +30,7 @@ pub trait OperationJournal: Send + Sync {
         fact: OperationFact,
     ) -> Result<(), DmlError>;
     fn load(&self, operation_id: DmlOperationId) -> Result<Option<StoredOperation>, DmlError>;
+    fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError>;
     fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError>;
 }
 
@@ -162,6 +163,10 @@ pub(crate) mod testing {
                 .unwrap()
                 .get(operation_id.as_uuid())
                 .cloned())
+        }
+
+        fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
+            Ok(self.inner.lock().unwrap().values().cloned().collect())
         }
 
         fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError> {

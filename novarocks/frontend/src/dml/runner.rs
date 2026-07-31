@@ -400,6 +400,10 @@ mod tests {
             self.inner.load(operation_id)
         }
 
+        fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
+            self.inner.list_operations()
+        }
+
         fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError> {
             self.inner.list_unfinished()
         }

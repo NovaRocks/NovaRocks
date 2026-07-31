@@ -487,6 +487,10 @@ impl OperationJournal for StateStoreOperationJournal {
         self.blocking(self.load_async(operation_id))
     }
 
+    fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
+        self.blocking(self.scan_operations())
+    }
+
     fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError> {
         self.blocking(self.list_unfinished_async())
     }
