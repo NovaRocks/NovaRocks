@@ -547,8 +547,8 @@ impl FrontendApplicationHost {
         // The durable application service owns a StateStore reference through
         // its repository, so it must be released before StateStoreHost closes
         // its deployment lock.
-        self.statistics_application_service.take();
         self.statistics_application_port.take();
+        self.statistics_application_service.take();
         self.view_service.take();
         self.mv_application_service.take();
         self.mv_repository.take();

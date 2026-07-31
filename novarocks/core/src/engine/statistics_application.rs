@@ -77,6 +77,21 @@ pub trait StatisticsApplicationPort: Send + Sync {
     ) -> Result<StatisticsApplicationResult, StatisticsApplicationError>;
 }
 
+/// Non-frontend composition must not gain an in-memory statistics authority.
+/// It fails closed until a frontend explicitly installs the durable port.
+pub struct UnavailableStatisticsApplicationPort;
+
+impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
+    fn execute(
+        &self,
+        _command: StatisticsApplicationCommand,
+    ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
+        Err(StatisticsApplicationError::new(
+            "unified statistics application service is not installed",
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsApplicationError {
     message: String,
