@@ -73,6 +73,9 @@ pub struct FragmentTerminalReport {
     error: Option<String>,
     include_runtime_filter_profile: bool,
     connector_staged_report_frames: Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
+    /// Bounded, opaque typed statistics partial. It is populated only by a
+    /// statistics collection sink and is never emitted on progress reports.
+    statistics_payload: Vec<u8>,
 }
 
 impl FragmentTerminalReport {
@@ -81,6 +84,7 @@ impl FragmentTerminalReport {
             error,
             include_runtime_filter_profile,
             connector_staged_report_frames: Vec::new(),
+            statistics_payload: Vec::new(),
         }
     }
 
@@ -98,11 +102,25 @@ impl FragmentTerminalReport {
         &self.connector_staged_report_frames
     }
 
+    /// Attach the Core-internal partial after it has been bounded and encoded
+    /// by the statistics collector. Keeping this on the terminal fact makes
+    /// the normal fragment-report lifecycle the only transport path.
+    pub fn with_statistics_payload(mut self, payload: Vec<u8>) -> Result<Self, String> {
+        if payload.len() > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
+            return Err("statistics terminal report payload exceeds the SPI limit".to_string());
+        }
+        self.statistics_payload = payload;
+        Ok(self)
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
     pub const fn include_runtime_filter_profile(&self) -> bool {
         self.include_runtime_filter_profile
+    }
+    pub fn statistics_payload(&self) -> &[u8] {
+        &self.statistics_payload
     }
 }
 
@@ -161,5 +179,21 @@ mod tests {
         handle.report_terminal(FragmentTerminalReport::default());
         assert_eq!(handle.progress.load(Ordering::Relaxed), 2);
         assert_eq!(handle.terminal.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn terminal_statistics_payload_is_bounded() {
+        let terminal = FragmentTerminalReport::new(None, false)
+            .with_statistics_payload(vec![7, 8])
+            .expect("bounded payload");
+        assert_eq!(terminal.statistics_payload(), &[7, 8]);
+        let error = FragmentTerminalReport::new(None, false)
+            .with_statistics_payload(vec![
+                0;
+                novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
+                    + 1
+            ])
+            .expect_err("oversized payload must be rejected");
+        assert!(error.contains("exceeds"));
     }
 }
