@@ -2845,6 +2845,26 @@ impl StatisticsReader for IcebergControlProvider {
                     format!("read Iceberg statistics: {error:?}"),
                 )
             })?;
+        // A metadata-only `update_statistics` leaves the Iceberg snapshot (and
+        // therefore the data-version) unchanged.  Its registered Puffin path
+        // is nevertheless a new immutable evidence revision, so derive the
+        // resolver-cache key from it rather than from the snapshot alone.
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded =
+            load_table(&entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+        let metadata = loaded.table.metadata();
+        let current_data_version =
+            statistics_data_version(&metadata.uuid().to_string(), metadata.current_snapshot_id())?;
+        if current_data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table changed while its statistics evidence was loading",
+            ));
+        }
+        let evidence_path = metadata
+            .statistics_for_snapshot(snapshot_id)
+            .map(|statistics| statistics.statistics_path.as_str())
+            .unwrap_or("none");
 
         let mut metrics = BTreeMap::new();
         for metric in request.metrics.metrics() {
@@ -2882,12 +2902,11 @@ impl StatisticsReader for IcebergControlProvider {
             metrics.insert(metric.clone(), state);
         }
         let evidence_revision = StatisticsEvidenceRevision::try_new(Bytes::from(format!(
-            "iceberg/v1/{}/{}",
+            "iceberg/v1/{}/{snapshot_id}/{evidence_path}",
             table_info
                 .table_uuid
                 .as_deref()
                 .expect("table UUID checked above"),
-            snapshot_id
         )))?;
         Ok(StatisticsEvidence {
             data_version: expected_data_version,

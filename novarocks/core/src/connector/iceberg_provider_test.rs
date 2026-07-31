@@ -271,7 +271,7 @@ fn iceberg_statistics_publish_uses_a_pinned_operation_specific_puffin() {
         .expect("statistics collection capability")
         .publish_statistics(StatisticsPublishRequest {
             operation_id,
-            table: metadata.table,
+            table: metadata.table.clone(),
             result,
             context: context(),
         })
@@ -298,6 +298,26 @@ fn iceberg_statistics_publish_uses_a_pinned_operation_specific_puffin() {
             .metadata()
             .statistics_iter()
             .any(|file| file.statistics_path == path)
+    );
+    let evidence = control
+        .statistics()
+        .expect("statistics capability")
+        .read_statistics(StatisticsReadRequest {
+            table: metadata.table,
+            data_version,
+            metrics: StatisticsMetricRequest::try_new(vec![StatisticsMetric::ThetaNdv {
+                column: Arc::from("id"),
+            }])
+            .expect("metric request"),
+            context: context(),
+        })
+        .expect("read published statistics evidence");
+    assert!(
+        evidence
+            .evidence_revision
+            .as_bytes()
+            .windows(path.len())
+            .any(|window| window == path.as_bytes())
     );
 }
 
