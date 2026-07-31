@@ -22,7 +22,14 @@
 //! durable job state and implements this port without raw-SQL interception.
 
 use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use novarocks_spi::connector::{
+    ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
+    ConnectorTableResolution, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,6 +37,78 @@ pub struct StatisticsTableTarget {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
+}
+
+/// Portable immutable table/version pin that the frontend may persist in a
+/// durable ANALYZE job. It contains opaque provider bytes only—never a reader,
+/// scan artifact, sketch, or executable runtime object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsTablePin {
+    pub connector_instance_id: String,
+    pub table_handle: Vec<u8>,
+    pub data_version: Vec<u8>,
+}
+
+/// Core resolves a logical ANALYZE target exactly once. The frontend invokes
+/// this before creating a job and persists the returned pin; background work
+/// has no latest-name resolution capability.
+pub trait StatisticsTargetResolver: Send + Sync {
+    fn resolve_table_pin(
+        &self,
+        target: &StatisticsTableTarget,
+    ) -> Result<StatisticsTablePin, StatisticsApplicationError>;
+}
+
+pub struct ConnectorStatisticsTargetResolver {
+    controls: Arc<dyn ConnectorControlRegistry>,
+}
+
+impl ConnectorStatisticsTargetResolver {
+    pub fn new(controls: Arc<dyn ConnectorControlRegistry>) -> Self {
+        Self { controls }
+    }
+}
+
+impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
+    fn resolve_table_pin(
+        &self,
+        target: &StatisticsTableTarget,
+    ) -> Result<StatisticsTablePin, StatisticsApplicationError> {
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let (resolved, _) = crate::connector::metadata_load_table(
+            self.controls.as_ref(),
+            context,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            ConnectorTableResolution::StrictBaseTable,
+        )
+        .map_err(StatisticsApplicationError::new)?;
+        let pin = resolved.statistics_pin.ok_or_else(|| {
+            StatisticsApplicationError::new(
+                "connector metadata did not provide a statistics data-version pin",
+            )
+        })?;
+        Ok(StatisticsTablePin {
+            connector_instance_id: pin.table.owner().as_str().to_string(),
+            table_handle: pin.table.payload().to_vec(),
+            data_version: pin.data_version.as_bytes().to_vec(),
+        })
+    }
+}
+
+struct NeverCancelled;
+
+impl ConnectorCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

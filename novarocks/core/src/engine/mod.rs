@@ -969,6 +969,19 @@ impl StandaloneNovaRocks {
         Arc::new(Arc::clone(&self.inner))
     }
 
+    /// Resolve an ANALYZE target once through the current connector control
+    /// generation. The frontend persists the returned opaque pin before it
+    /// creates a durable job; workers never receive this resolver.
+    pub fn statistics_target_resolver(
+        &self,
+    ) -> Arc<dyn statistics_application::StatisticsTargetResolver> {
+        Arc::new(
+            statistics_application::ConnectorStatisticsTargetResolver::new(Arc::clone(
+                &self.inner.connector_control,
+            )),
+        )
+    }
+
     pub(crate) fn publish_coordinator_report_bound_port(&self, port: u16) {
         self.inner.coordinator_report_endpoint.set_bound_port(port);
     }

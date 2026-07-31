@@ -107,24 +107,72 @@ impl StatisticsJobTargetResolver for UnavailableStatisticsJobTargetResolver {
     }
 }
 
+struct CoreStatisticsTargetResolverAdapter {
+    inner: std::sync::Arc<dyn core_application::StatisticsTargetResolver>,
+}
+
+impl StatisticsJobTargetResolver for CoreStatisticsTargetResolverAdapter {
+    fn resolve_table_pin(
+        &self,
+        target: &StatisticsJobTarget,
+    ) -> Result<StatisticsJobTablePin, String> {
+        let pin = self
+            .inner
+            .resolve_table_pin(&core_application::StatisticsTableTarget {
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(StatisticsJobTablePin {
+            connector_instance_id: pin.connector_instance_id,
+            table_handle: pin.table_handle,
+            data_version: pin.data_version,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct StatisticsApplicationService {
     repository: Option<StatisticsJobRepository>,
-    target_resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>,
+    target_resolver: std::sync::Arc<StatisticsTargetResolverSlot>,
+}
+
+struct StatisticsTargetResolverSlot {
+    resolver: std::sync::RwLock<std::sync::Arc<dyn StatisticsJobTargetResolver>>,
+    bound: std::sync::atomic::AtomicBool,
+}
+
+impl StatisticsTargetResolverSlot {
+    fn unbound() -> Self {
+        Self {
+            resolver: std::sync::RwLock::new(std::sync::Arc::new(
+                UnavailableStatisticsJobTargetResolver,
+            )),
+            bound: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn bound(resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>) -> Self {
+        Self {
+            resolver: std::sync::RwLock::new(resolver),
+            bound: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
 }
 
 impl StatisticsApplicationService {
     pub fn unavailable() -> Self {
         Self {
             repository: None,
-            target_resolver: std::sync::Arc::new(UnavailableStatisticsJobTargetResolver),
+            target_resolver: std::sync::Arc::new(StatisticsTargetResolverSlot::unbound()),
         }
     }
 
     pub fn with_repository(repository: StatisticsJobRepository) -> Self {
         Self {
             repository: Some(repository),
-            target_resolver: std::sync::Arc::new(UnavailableStatisticsJobTargetResolver),
+            target_resolver: std::sync::Arc::new(StatisticsTargetResolverSlot::unbound()),
         }
     }
 
@@ -134,8 +182,36 @@ impl StatisticsApplicationService {
     ) -> Self {
         Self {
             repository: Some(repository),
-            target_resolver,
+            target_resolver: std::sync::Arc::new(StatisticsTargetResolverSlot::bound(
+                target_resolver,
+            )),
         }
+    }
+
+    pub fn bind_target_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>,
+    ) -> Result<(), String> {
+        if self
+            .target_resolver
+            .bound
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err("statistics target resolver is already bound".to_string());
+        }
+        let mut slot = self
+            .target_resolver
+            .resolver
+            .write()
+            .map_err(|_| "statistics target resolver lock poisoned".to_string())?;
+        *slot = resolver;
+        Ok(())
     }
 
     pub async fn execute(
@@ -147,8 +223,17 @@ impl StatisticsApplicationService {
         match statement {
             StatisticsStatement::AnalyzeTable(statement) => {
                 let repository = self.repository()?;
-                let table_pin = self
+                let resolver = self
                     .target_resolver
+                    .resolver
+                    .read()
+                    .map_err(|_| {
+                        StatisticsApplicationError::target_resolution(
+                            "statistics target resolver lock poisoned".to_string(),
+                        )
+                    })?
+                    .clone();
+                let table_pin = resolver
                     .resolve_table_pin(&statement.target)
                     .map_err(StatisticsApplicationError::target_resolution)?;
                 let job = repository
@@ -285,6 +370,18 @@ impl FrontendStatisticsApplicationPort {
         }
         *slot = Some(reader);
         Ok(())
+    }
+
+    /// Called after Core has opened its connector-control registry. Rebinding
+    /// would permit a different engine generation to change ANALYZE target
+    /// resolution while jobs are live, so fail rather than silently replace it.
+    pub fn bind_core_statistics_target_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn core_application::StatisticsTargetResolver>,
+    ) -> Result<(), String> {
+        self.service.bind_target_resolver(std::sync::Arc::new(
+            CoreStatisticsTargetResolverAdapter { inner: resolver },
+        ))
     }
 }
 
