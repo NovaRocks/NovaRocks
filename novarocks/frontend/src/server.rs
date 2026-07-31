@@ -86,6 +86,7 @@ fn standalone_open_services(
     )
     .with_terminal_ingress(host.terminal_ingress())
     .with_statistics_application(host.statistics_application_port())
+    .with_statistics_target_resolver_sink(host.statistics_application_port())
 }
 
 /// Opens the frontend services once for an externally composed server. The

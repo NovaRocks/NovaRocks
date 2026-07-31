@@ -192,6 +192,11 @@ impl StatisticsApplicationService {
         &self,
         resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>,
     ) -> Result<(), String> {
+        let mut slot = self
+            .target_resolver
+            .resolver
+            .write()
+            .map_err(|_| "statistics target resolver lock poisoned".to_string())?;
         if self
             .target_resolver
             .bound
@@ -205,11 +210,6 @@ impl StatisticsApplicationService {
         {
             return Err("statistics target resolver is already bound".to_string());
         }
-        let mut slot = self
-            .target_resolver
-            .resolver
-            .write()
-            .map_err(|_| "statistics target resolver lock poisoned".to_string())?;
         *slot = resolver;
         Ok(())
     }
@@ -441,6 +441,15 @@ impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicati
         })
         .map_err(|error| core_application::StatisticsApplicationError::new(error.to_string()))?;
         Ok(map_core_result(result))
+    }
+}
+
+impl core_application::StatisticsTargetResolverSink for FrontendStatisticsApplicationPort {
+    fn bind_statistics_target_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn core_application::StatisticsTargetResolver>,
+    ) -> Result<(), String> {
+        self.bind_core_statistics_target_resolver(resolver)
     }
 }
 

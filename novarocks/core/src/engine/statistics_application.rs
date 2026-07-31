@@ -59,6 +59,16 @@ pub trait StatisticsTargetResolver: Send + Sync {
     ) -> Result<StatisticsTablePin, StatisticsApplicationError>;
 }
 
+/// Frontend composition sink installed before engine open. Core calls it once
+/// after connector control is ready, so ANALYZE submission can resolve and
+/// persist a pin without giving the durable worker a resolver.
+pub trait StatisticsTargetResolverSink: Send + Sync {
+    fn bind_statistics_target_resolver(
+        &self,
+        resolver: Arc<dyn StatisticsTargetResolver>,
+    ) -> Result<(), String>;
+}
+
 pub struct ConnectorStatisticsTargetResolver {
     controls: Arc<dyn ConnectorControlRegistry>,
 }

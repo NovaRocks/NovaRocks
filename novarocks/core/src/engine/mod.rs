@@ -734,6 +734,10 @@ pub struct StandaloneOpenServices {
     /// unavailable implementation so non-frontend compositions fail closed.
     pub statistics_application:
         std::sync::Arc<dyn statistics_application::StatisticsApplicationPort>,
+    /// Receives the Core-owned target resolver once connector control is
+    /// ready. It is intentionally distinct from command dispatch.
+    pub statistics_target_resolver_sink:
+        Option<std::sync::Arc<dyn statistics_application::StatisticsTargetResolverSink>>,
     pub table_maintenance_service:
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
@@ -787,6 +791,7 @@ impl StandaloneOpenServices {
             statistics_application: std::sync::Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
+            statistics_target_resolver_sink: None,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -818,6 +823,14 @@ impl StandaloneOpenServices {
         >,
     ) -> Self {
         self.statistics_application = statistics_application;
+        self
+    }
+
+    pub fn with_statistics_target_resolver_sink(
+        mut self,
+        sink: std::sync::Arc<dyn statistics_application::StatisticsTargetResolverSink>,
+    ) -> Self {
+        self.statistics_target_resolver_sink = Some(sink);
         self
     }
 }
@@ -888,6 +901,7 @@ impl StandaloneNovaRocks {
             view_service,
             statistics_service,
             statistics_application,
+            statistics_target_resolver_sink,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -931,6 +945,9 @@ impl StandaloneNovaRocks {
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
         let engine = Self { inner };
+        if let Some(sink) = statistics_target_resolver_sink {
+            sink.bind_statistics_target_resolver(engine.statistics_target_resolver())?;
+        }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
         if let Err(error) = engine.inner.table_maintenance_service.start(engine_port) {
