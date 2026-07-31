@@ -283,6 +283,37 @@ impl StatisticsJobRepository {
             .await
     }
 
+    /// Replays an incomplete attempt after frontend failover. Only preparation
+    /// and collection can return to SUBMITTED: PUBLISHING is intentionally
+    /// excluded because it must reconcile its operation-specific receipt.
+    pub async fn requeue_incomplete(
+        &self,
+        job_id: Uuid,
+        now_ms: i64,
+        fence: &FenceValidator,
+    ) -> RepositoryResult<Option<StatisticsJob>> {
+        let Some(job) = self.get(job_id).await? else {
+            return Ok(None);
+        };
+        if !matches!(
+            job.state,
+            StatisticsJobState::Preparing | StatisticsJobState::Running
+        ) {
+            return Ok(None);
+        }
+        self.transition_with_fence(
+            job_id,
+            job.state,
+            StatisticsJobState::Submitted,
+            now_ms,
+            None,
+            Some(fence),
+            false,
+        )
+        .await
+        .map(Some)
+    }
+
     /// Explicit cancellation never races a publish: PUBLISHING is a typed
     /// conflict, while only SUBMITTED/PREPARING/RUNNING can become CANCELLED.
     pub async fn cancel(

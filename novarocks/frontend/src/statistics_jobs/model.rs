@@ -62,6 +62,12 @@ impl StatisticsJobState {
             (Self::Submitted, Self::Preparing)
                 | (Self::Preparing, Self::Running)
                 | (Self::Running, Self::Publishing)
+                // A new fenced owner may replay only work that has not
+                // crossed the external publish boundary. Re-claiming the
+                // returned SUBMITTED job increments the same durable
+                // operation's attempt counter.
+                | (Self::Preparing, Self::Submitted)
+                | (Self::Running, Self::Submitted)
                 | (Self::Publishing, Self::Succeeded)
                 | (Self::Preparing, Self::Failed)
                 | (Self::Running, Self::Failed)

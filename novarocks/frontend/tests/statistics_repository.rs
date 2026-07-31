@@ -325,3 +325,49 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
         .expect("typed SHOW ANALYZE JOBS reads durable jobs");
     assert!(matches!(listed, StatisticsStatementResult::AnalyzeJobs(jobs) if jobs.len() == 1));
 }
+
+#[tokio::test]
+async fn failover_requeues_preparing_and_running_before_publish() {
+    let (_temp, _store, repository) = fixture().await;
+    let fence = always_valid_fence();
+    let job = repository
+        .create(request("orders", 10))
+        .await
+        .expect("create job");
+    let preparing = repository
+        .claim(job.job_id, 11, &fence)
+        .await
+        .expect("claim job")
+        .expect("job claimed");
+    assert_eq!(preparing.attempt, 1);
+    let requeued = repository
+        .requeue_incomplete(job.job_id, 12, &fence)
+        .await
+        .expect("requeue PREPARING job")
+        .expect("PREPARING is replayable");
+    assert_eq!(requeued.state, StatisticsJobState::Submitted);
+    let preparing = repository
+        .claim(job.job_id, 13, &fence)
+        .await
+        .expect("claim replayed job")
+        .expect("job reclaimed");
+    assert_eq!(preparing.attempt, 2);
+    let running = repository
+        .transition(
+            job.job_id,
+            StatisticsJobState::Preparing,
+            StatisticsJobState::Running,
+            14,
+            None,
+            &fence,
+        )
+        .await
+        .expect("begin collection");
+    assert_eq!(running.state, StatisticsJobState::Running);
+    let requeued = repository
+        .requeue_incomplete(job.job_id, 15, &fence)
+        .await
+        .expect("requeue RUNNING job")
+        .expect("RUNNING is replayable");
+    assert_eq!(requeued.state, StatisticsJobState::Submitted);
+}
