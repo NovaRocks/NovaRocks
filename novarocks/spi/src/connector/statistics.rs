@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use arrow::datatypes::DataType;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
@@ -254,12 +255,67 @@ pub struct StatisticsCollectionRequest {
     pub context: ConnectorRequestContext,
 }
 
+/// One provider-resolved physical input column for a statistics collection.
+///
+/// A durable ANALYZE job owns only an opaque table handle and data-version.
+/// It therefore cannot ask Core to resolve the table name or schema again when
+/// the worker eventually runs.  This compact layout supplies exactly the
+/// scan-facing schema needed to compile the already-pinned projection.  It is
+/// not catalog metadata: defaults, field metadata and connector credentials
+/// are deliberately excluded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatisticsScanColumn {
+    ordinal: usize,
+    name: Arc<str>,
+    data_type: DataType,
+    nullable: bool,
+}
+
+impl StatisticsScanColumn {
+    pub fn try_new(
+        ordinal: usize,
+        name: impl Into<Arc<str>>,
+        data_type: DataType,
+        nullable: bool,
+    ) -> Result<Self, ConnectorError> {
+        let name = name.into();
+        if name.is_empty() || name.len() > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics scan column name is empty or exceeds the payload limit",
+            ));
+        }
+        Ok(Self {
+            ordinal,
+            name,
+            data_type,
+            nullable,
+        })
+    }
+
+    pub const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
 /// Provider-neutral collection preparation result. `table` is the exact
 /// already-resolved table handle pinned by `data_version`; Core must compile
 /// ordinary distributed work from this handle and must never resolve latest
-/// metadata a second time. `scan_projection` is resolved against that same
-/// pinned schema.  It is intentionally a physical ordinal list rather than a
-/// Core-owned catalog lookup: providers own their handle/schema codecs while
+/// metadata a second time. `scan_columns` is resolved against that same
+/// pinned schema.  It is intentionally a compact physical layout rather than
+/// a Core-owned catalog lookup: providers own their handle/schema codecs while
 /// Core owns only normal connector scan scheduling. The provider payload
 /// remains opaque to the FE and Core.
 #[derive(Clone)]
@@ -268,7 +324,7 @@ pub struct StatisticsCollectionPlan {
     pub data_version: StatisticsDataVersion,
     evidence_revision: StatisticsEvidenceRevision,
     pub metrics: StatisticsMetricRequest,
-    scan_projection: Vec<usize>,
+    scan_columns: Vec<StatisticsScanColumn>,
     provider_payload: Bytes,
 }
 
@@ -278,19 +334,22 @@ impl StatisticsCollectionPlan {
         data_version: StatisticsDataVersion,
         evidence_revision: StatisticsEvidenceRevision,
         metrics: StatisticsMetricRequest,
-        scan_projection: Vec<usize>,
+        scan_columns: Vec<StatisticsScanColumn>,
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
-        if scan_projection.len() > MAX_CONNECTOR_STATISTICS_METRICS {
+        if scan_columns.len() > MAX_CONNECTOR_STATISTICS_METRICS {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
-                "statistics collection scan projection exceeds the metric limit",
+                "statistics collection scan layout exceeds the metric limit",
             ));
         }
-        if scan_projection.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if scan_columns
+            .windows(2)
+            .any(|pair| pair[0].ordinal() >= pair[1].ordinal())
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "statistics collection scan projection must be sorted and unique",
+                "statistics collection scan layout ordinals must be sorted and unique",
             ));
         }
         Ok(Self {
@@ -298,7 +357,7 @@ impl StatisticsCollectionPlan {
             data_version,
             evidence_revision,
             metrics,
-            scan_projection,
+            scan_columns,
             provider_payload: bounded_payload(provider_payload, "statistics collection plan")?,
         })
     }
@@ -313,11 +372,18 @@ impl StatisticsCollectionPlan {
         &self.evidence_revision
     }
 
-    /// Provider-resolved physical column ordinals for the normal connector
-    /// scan.  An empty projection is valid for a row-count-only collection;
-    /// the provider's scan implementation decides how to represent it.
-    pub fn scan_projection(&self) -> &[usize] {
-        &self.scan_projection
+    /// Provider-resolved compact schema for the normal connector scan. An
+    /// empty layout is valid for a row-count-only collection; the provider's
+    /// scan implementation decides how to represent it.
+    pub fn scan_columns(&self) -> &[StatisticsScanColumn] {
+        &self.scan_columns
+    }
+
+    pub fn scan_projection(&self) -> Vec<usize> {
+        self.scan_columns
+            .iter()
+            .map(StatisticsScanColumn::ordinal)
+            .collect()
     }
 
     pub fn provider_payload(&self) -> &Bytes {

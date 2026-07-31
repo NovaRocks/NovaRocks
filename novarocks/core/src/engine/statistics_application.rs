@@ -27,8 +27,9 @@ use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
-    ConnectorTableResolution, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorStatisticsResolver, ConnectorTableResolution, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsMetric,
+    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsReadRequest,
 };
 use uuid::Uuid;
 
@@ -66,6 +67,26 @@ pub trait StatisticsTargetResolverSink: Send + Sync {
     fn bind_statistics_target_resolver(
         &self,
         resolver: Arc<dyn StatisticsTargetResolver>,
+    ) -> Result<(), String>;
+}
+
+/// Read-only Core table-statistics surface. Unlike ANALYZE submission, it is
+/// intentionally available without a StateStore and resolves its latest table
+/// metadata only for this one short-lived read.
+pub trait StatisticsTableReader: Send + Sync {
+    fn show_table_stats(
+        &self,
+        target: &StatisticsTableTarget,
+    ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError>;
+}
+
+/// Frontend composition sink installed alongside the target resolver. The
+/// frontend adapts this typed result for the SQL application port; it never
+/// receives a raw SQL string or an optimizer/provider handle.
+pub trait StatisticsTableReaderSink: Send + Sync {
+    fn bind_statistics_table_reader(
+        &self,
+        reader: Arc<dyn StatisticsTableReader>,
     ) -> Result<(), String>;
 }
 
@@ -110,6 +131,132 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             table_handle: pin.table.payload().to_vec(),
             data_version: pin.data_version.as_bytes().to_vec(),
         })
+    }
+}
+
+pub struct ConnectorStatisticsTableReader {
+    controls: Arc<dyn ConnectorControlRegistry>,
+}
+
+impl ConnectorStatisticsTableReader {
+    pub fn new(controls: Arc<dyn ConnectorControlRegistry>) -> Self {
+        Self { controls }
+    }
+}
+
+impl StatisticsTableReader for ConnectorStatisticsTableReader {
+    fn show_table_stats(
+        &self,
+        target: &StatisticsTableTarget,
+    ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError> {
+        let context = statistics_request_context()?;
+        let (resolved, _) = crate::connector::metadata_load_table(
+            self.controls.as_ref(),
+            context.clone(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            ConnectorTableResolution::StrictBaseTable,
+        )
+        .map_err(StatisticsApplicationError::new)?;
+        let pin = resolved.statistics_pin.ok_or_else(|| {
+            StatisticsApplicationError::new(
+                "connector metadata did not provide a statistics data-version pin",
+            )
+        })?;
+        let requested_metric_count =
+            1usize.saturating_add(resolved.columns.len().saturating_mul(5));
+        if requested_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
+            return Err(StatisticsApplicationError::new(format!(
+                "SHOW TABLE STATS requires {requested_metric_count} metrics, exceeding the connector statistics limit of {MAX_CONNECTOR_STATISTICS_METRICS}",
+            )));
+        }
+        let mut metrics = Vec::with_capacity(requested_metric_count);
+        metrics.push(StatisticsMetric::RowCount);
+        for column in &resolved.columns {
+            let name: Arc<str> = Arc::from(column.name.as_str());
+            metrics.extend([
+                StatisticsMetric::NullCount {
+                    column: Arc::clone(&name),
+                },
+                StatisticsMetric::Minimum {
+                    column: Arc::clone(&name),
+                },
+                StatisticsMetric::Maximum {
+                    column: Arc::clone(&name),
+                },
+                StatisticsMetric::AverageSize {
+                    column: Arc::clone(&name),
+                },
+                StatisticsMetric::ThetaNdv { column: name },
+            ]);
+        }
+        let metrics = StatisticsMetricRequest::try_new(metrics)
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let lease = self
+            .controls
+            .acquire_current_statistics(pin.table.owner())
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let evidence = lease
+            .read(StatisticsReadRequest {
+                table: pin.table,
+                data_version: pin.data_version,
+                metrics,
+                context,
+            })
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        Ok(evidence
+            .metrics
+            .into_iter()
+            .map(|(metric, state)| statistics_table_stat_view(metric, state))
+            .collect())
+    }
+}
+
+fn statistics_request_context() -> Result<ConnectorRequestContext, StatisticsApplicationError> {
+    ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(30),
+        Arc::new(NeverCancelled),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| StatisticsApplicationError::new(error.to_string()))
+}
+
+fn statistics_table_stat_view(
+    metric: StatisticsMetric,
+    state: StatisticsMetricState,
+) -> StatisticsTableStatView {
+    let metric = match metric {
+        StatisticsMetric::RowCount => "row_count".to_string(),
+        StatisticsMetric::NullCount { column } => format!("null_count:{column}"),
+        StatisticsMetric::Minimum { column } => format!("minimum:{column}"),
+        StatisticsMetric::Maximum { column } => format!("maximum:{column}"),
+        StatisticsMetric::AverageSize { column } => format!("average_size:{column}"),
+        StatisticsMetric::ThetaNdv { column } => format!("theta_ndv:{column}"),
+    };
+    let (value, status) = match state {
+        StatisticsMetricState::Available(value) => {
+            (Some(statistics_metric_value(value)), "AVAILABLE".into())
+        }
+        StatisticsMetricState::Missing(missing) => (None, format!("MISSING:{:?}", missing.kind)),
+        StatisticsMetricState::Error(error) => (None, format!("ERROR:{:?}", error.kind)),
+    };
+    StatisticsTableStatView {
+        metric,
+        value,
+        status,
+    }
+}
+
+fn statistics_metric_value(value: StatisticsMetricValue) -> String {
+    match value {
+        StatisticsMetricValue::U64(value) => value.to_string(),
+        StatisticsMetricValue::I64(value) => value.to_string(),
+        StatisticsMetricValue::F64(value) => value.to_string(),
+        // Do not surface opaque connector bytes through SQL. Providers that
+        // choose a byte metric must publish a user-safe scalar representation.
+        StatisticsMetricValue::Bytes(_) => "<opaque>".to_string(),
     }
 }
 

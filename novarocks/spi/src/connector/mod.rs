@@ -92,7 +92,7 @@ pub use statistics::{
     StatisticsMetricErrorKind, StatisticsMetricRequest, StatisticsMetricState,
     StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
     StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest,
+    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsScanColumn,
 };
 pub use write::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorBatchWriter, ConnectorOpenWriterRequest,

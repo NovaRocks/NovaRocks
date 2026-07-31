@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_catalog::schema::SqlType;
 use novarocks_fs::{
@@ -56,7 +56,8 @@ use novarocks_spi::connector::{
     StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
     StatisticsMissingKind, StatisticsProvenance, StatisticsPublishPreparationRequest,
     StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
-    StatisticsReconcileRequest, normalize_predicate_dispositions, validate_static_predicates,
+    StatisticsReconcileRequest, StatisticsScanColumn, normalize_predicate_dispositions,
+    validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -119,6 +120,77 @@ fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&str> {
         | StatisticsMetric::AverageSize { column }
         | StatisticsMetric::ThetaNdv { column } => Some(column),
     }
+}
+
+/// Build the physical layout from the metadata serialized into the resolved
+/// table handle.  In particular, this must not call `load_table`: durable
+/// ANALYZE consumes the original snapshot/schema pin even if latest metadata
+/// has advanced while a job was waiting for its worker lease.
+fn statistics_scan_layout(
+    table: &TablePayload,
+    projection: &[usize],
+) -> Result<Vec<StatisticsScanColumn>, ConnectorError> {
+    let table_info = table.table_info.as_ref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg statistics collection requires a resolved base table payload",
+        )
+    })?;
+    let serialized = table_info.serialized_metadata.as_deref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg statistics collection payload is missing serialized pinned metadata",
+        )
+    })?;
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(serialized).map_err(|e| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode pinned Iceberg statistics metadata: {e}"),
+        )
+    })?;
+    if metadata.current_schema_id() != table_info.schema_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg statistics collection metadata does not match its pinned schema ID",
+        ));
+    }
+    let schema =
+        iceberg::arrow::schema_to_arrow_schema(metadata.current_schema()).map_err(|e| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("convert pinned Iceberg statistics schema to Arrow: {e}"),
+            )
+        })?;
+    projection
+        .iter()
+        .map(|&ordinal| {
+            let field = schema.fields().get(ordinal).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "Iceberg statistics metric projection index {ordinal} is outside the pinned schema"
+                    ),
+                )
+            })?;
+            // Arrow field metadata can carry provider implementation details;
+            // the cross-layer statistics layout intentionally retains only the
+            // typed scan contract needed by the internal sink.
+            let data_type = match table
+                .logical_type_columns
+                .get(&field.name().to_ascii_lowercase())
+                .map(String::as_str)
+            {
+                Some("bitmap") | Some("hll") => DataType::Binary,
+                _ => field.data_type().clone(),
+            };
+            StatisticsScanColumn::try_new(
+                ordinal,
+                Arc::<str>::from(field.name().as_str()),
+                data_type,
+                field.is_nullable(),
+            )
+        })
+        .collect()
 }
 
 /// Provider-owned, secret-free declaration used to install an Iceberg read
@@ -3007,12 +3079,13 @@ impl StatisticsCollection for IcebergControlProvider {
             table_info.current_snapshot_id.unwrap_or_default(),
             uuid::Uuid::from_bytes(request.operation_id.to_bytes()),
         )))?;
+        let scan_columns = statistics_scan_layout(&table, &scan_projection)?;
         StatisticsCollectionPlan::try_new(
             request.table,
             request.data_version,
             evidence_revision,
             request.metrics,
-            scan_projection,
+            scan_columns,
             provider_payload,
         )
     }

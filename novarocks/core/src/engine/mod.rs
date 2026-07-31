@@ -738,6 +738,10 @@ pub struct StandaloneOpenServices {
     /// ready. It is intentionally distinct from command dispatch.
     pub statistics_target_resolver_sink:
         Option<std::sync::Arc<dyn statistics_application::StatisticsTargetResolverSink>>,
+    /// Receives Core's generation-fenced read-only statistics reader after
+    /// connector control is ready. It does not imply durable job ownership.
+    pub statistics_table_reader_sink:
+        Option<std::sync::Arc<dyn statistics_application::StatisticsTableReaderSink>>,
     pub table_maintenance_service:
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
@@ -792,6 +796,7 @@ impl StandaloneOpenServices {
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
             statistics_target_resolver_sink: None,
+            statistics_table_reader_sink: None,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -831,6 +836,14 @@ impl StandaloneOpenServices {
         sink: std::sync::Arc<dyn statistics_application::StatisticsTargetResolverSink>,
     ) -> Self {
         self.statistics_target_resolver_sink = Some(sink);
+        self
+    }
+
+    pub fn with_statistics_table_reader_sink(
+        mut self,
+        sink: std::sync::Arc<dyn statistics_application::StatisticsTableReaderSink>,
+    ) -> Self {
+        self.statistics_table_reader_sink = Some(sink);
         self
     }
 }
@@ -902,6 +915,7 @@ impl StandaloneNovaRocks {
             statistics_service,
             statistics_application,
             statistics_target_resolver_sink,
+            statistics_table_reader_sink,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -947,6 +961,9 @@ impl StandaloneNovaRocks {
         let engine = Self { inner };
         if let Some(sink) = statistics_target_resolver_sink {
             sink.bind_statistics_target_resolver(engine.statistics_target_resolver())?;
+        }
+        if let Some(sink) = statistics_table_reader_sink {
+            sink.bind_statistics_table_reader(engine.statistics_table_reader())?;
         }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
@@ -997,6 +1014,16 @@ impl StandaloneNovaRocks {
                 &self.inner.connector_control,
             )),
         )
+    }
+
+    /// Read-only generation-fenced statistics reader. It does not require a
+    /// durable job repository and remains valid without StateStore.
+    pub fn statistics_table_reader(
+        &self,
+    ) -> Arc<dyn statistics_application::StatisticsTableReader> {
+        Arc::new(statistics_application::ConnectorStatisticsTableReader::new(
+            Arc::clone(&self.inner.connector_control),
+        ))
     }
 
     pub(crate) fn publish_coordinator_report_bound_port(&self, port: u16) {

@@ -19,6 +19,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use arrow::datatypes::DataType;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCancellation,
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationRequest, ConnectorColumnDefinition,
@@ -205,6 +206,11 @@ fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
     assert_eq!(collection.table(), &metadata.table);
     assert_eq!(collection.metrics.metrics(), metrics.metrics());
     assert_eq!(collection.scan_projection(), &[0]);
+    assert_eq!(collection.scan_columns().len(), 1);
+    assert_eq!(collection.scan_columns()[0].ordinal(), 0);
+    assert_eq!(collection.scan_columns()[0].name(), "id");
+    assert_eq!(collection.scan_columns()[0].data_type(), &DataType::Int32);
+    assert!(!collection.scan_columns()[0].nullable());
 
     let wrong_version = StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"wrong"))
         .expect("bounded test version");

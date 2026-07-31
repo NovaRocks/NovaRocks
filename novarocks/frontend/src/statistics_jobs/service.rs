@@ -111,6 +111,34 @@ struct CoreStatisticsTargetResolverAdapter {
     inner: std::sync::Arc<dyn core_application::StatisticsTargetResolver>,
 }
 
+struct CoreStatisticsTableReaderAdapter {
+    inner: std::sync::Arc<dyn core_application::StatisticsTableReader>,
+}
+
+impl TableStatisticsReader for CoreStatisticsTableReaderAdapter {
+    fn show_table_stats(
+        &self,
+        target: &StatisticsJobTarget,
+    ) -> Result<Vec<StatisticsTableStatRow>, String> {
+        self.inner
+            .show_table_stats(&core_application::StatisticsTableTarget {
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            })
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StatisticsTableStatRow {
+                        metric_name: row.metric,
+                        value: row.value,
+                        status: row.status,
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl StatisticsJobTargetResolver for CoreStatisticsTargetResolverAdapter {
     fn resolve_table_pin(
         &self,
@@ -450,6 +478,17 @@ impl core_application::StatisticsTargetResolverSink for FrontendStatisticsApplic
         resolver: std::sync::Arc<dyn core_application::StatisticsTargetResolver>,
     ) -> Result<(), String> {
         self.bind_core_statistics_target_resolver(resolver)
+    }
+}
+
+impl core_application::StatisticsTableReaderSink for FrontendStatisticsApplicationPort {
+    fn bind_statistics_table_reader(
+        &self,
+        reader: std::sync::Arc<dyn core_application::StatisticsTableReader>,
+    ) -> Result<(), String> {
+        self.bind_table_statistics_reader(std::sync::Arc::new(CoreStatisticsTableReaderAdapter {
+            inner: reader,
+        }))
     }
 }
 

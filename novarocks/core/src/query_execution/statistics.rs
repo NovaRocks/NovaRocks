@@ -243,7 +243,7 @@ pub(crate) fn prepare_statistics_connector_read(
         .begin_scan(
             program.plan.table(),
             ConnectorBeginScanRequest {
-                projection: program.plan.scan_projection().to_vec(),
+                projection: program.plan.scan_projection(),
                 selector: ConnectorReadSelector::Current,
                 limit: None,
                 batch,
