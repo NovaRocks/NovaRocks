@@ -53,6 +53,7 @@ pub(crate) mod scan;
 mod setop;
 mod sort;
 mod split_data_stream_sink;
+mod statistics_sink;
 mod table_function_processor;
 mod values_source;
 
@@ -102,5 +103,6 @@ pub use setop::{
 };
 pub use sort::SortProcessorFactory;
 pub(crate) use split_data_stream_sink::SplitDataStreamSinkFactory;
+pub(crate) use statistics_sink::{StatisticsSinkFactory, StatisticsSinkHandle};
 pub use table_function_processor::TableFunctionProcessorFactory;
 pub use values_source::ValuesSourceFactory;

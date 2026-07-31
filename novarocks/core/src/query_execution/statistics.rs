@@ -584,6 +584,13 @@ impl StatisticsBatchCollector {
         debug_assert!(!self.metrics.metrics().is_empty());
         Ok(finalizer)
     }
+
+    /// Finish one fragment's collection into the bounded terminal-report
+    /// payload. The coordinator is the only component that may merge these
+    /// payloads into provider-facing evidence.
+    pub fn finish_fragment_payload(self) -> Result<Bytes, DistributedQueryError> {
+        self.finish()?.try_to_fragment_payload()
+    }
 }
 
 impl StatisticsScalarAccumulator {
