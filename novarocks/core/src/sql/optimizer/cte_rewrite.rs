@@ -514,7 +514,7 @@ mod tests {
         memo.scalars = arena.clone();
         let root_group = crate::sql::optimizer::memo_copy::opt_expr_to_memo(plan, &mut memo);
         let stats_input =
-            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &HashMap::new(),
             );
         crate::sql::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);

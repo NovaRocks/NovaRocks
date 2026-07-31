@@ -110,7 +110,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn set_empty_stats_input(ctx: &mut RewriteContext) {
-        ctx.set_query_stats_input(OptimizerStatsInput::from_legacy_table_stats_for_migration(
+        ctx.set_query_stats_input(OptimizerStatsInput::from_test_table_statistics(
             &HashMap::new(),
         ));
     }

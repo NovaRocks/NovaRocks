@@ -34,12 +34,6 @@ use super::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 pub(crate) const ICEBERG_ROW_IDENTITY_FILE_COLUMN: &str = "_file";
 pub(crate) const ICEBERG_ROW_IDENTITY_POS_COLUMN: &str = "_pos";
 
-pub(crate) fn iceberg_table_stats_provider(
-    registry: Arc<RwLock<IcebergCatalogRegistry>>,
-) -> Arc<dyn crate::connector::stats::TableStatsProvider> {
-    Arc::new(crate::connector::iceberg::stats::IcebergTableStatsProvider::new(registry))
-}
-
 pub(crate) fn build_iceberg_table_def_with_files(
     entry: &IcebergCatalogEntry,
     catalog_name: &str,

@@ -1158,7 +1158,7 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
-    let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let optimized_tree = crate::sql::optimizer::optimize_with_test_table_statistics(
         optimizer_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
@@ -1188,7 +1188,7 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
-    let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let optimized_tree = crate::sql::optimizer::optimize_with_test_table_statistics(
         optimizer_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
@@ -1231,7 +1231,7 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
-    let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let optimized_tree = crate::sql::optimizer::optimize_with_test_table_statistics(
         optimizer_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
@@ -1264,7 +1264,7 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
-    let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let optimized_tree = crate::sql::optimizer::optimize_with_test_table_statistics(
         optimizer_expr,
         scalar_arena,
         &std::collections::HashMap::new(),

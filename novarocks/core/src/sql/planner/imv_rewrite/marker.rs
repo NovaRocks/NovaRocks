@@ -490,7 +490,7 @@ mod tests {
         let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_query_stats_input(
-            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &std::collections::HashMap::new(),
             ),
         );

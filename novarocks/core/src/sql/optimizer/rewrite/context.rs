@@ -271,14 +271,12 @@ mod tests {
         );
 
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        ctx.set_query_stats_input(OptimizerStatsInput::from_legacy_table_stats_for_migration(
-            &stats,
-        ));
+        ctx.set_query_stats_input(OptimizerStatsInput::from_test_table_statistics(&stats));
 
         assert!(
             ctx.query_stats_input()
                 .unwrap()
-                .legacy_table_stats_for_migration()
+                .test_table_statistics()
                 .unwrap()
                 .contains_key("db.tbl")
         );

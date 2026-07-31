@@ -104,7 +104,10 @@ fn try_prepare(
         .list_definitions()
         .map_err(|e| format!("list mv definitions: {e}"))?;
 
-    let stats_providers = QueryStatsProviders::from_standalone_state(state);
+    let stats_providers = QueryStatsProviders::from_optional_state_with_pins(
+        Some(state),
+        analyzer_catalog.statistics_pins(),
+    );
     let mut candidates = Vec::new();
     for def in definitions {
         if candidates.len() >= MAX_MV_CANDIDATES {
@@ -232,7 +235,7 @@ fn build_candidate(
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    let (target_table, _) = crate::connector::iceberg::provider::load_schema_table_def(
+    let (target_table, _, _) = crate::connector::iceberg::provider::load_schema_table_def(
         state.connector_control.as_ref(),
         crate::connector::connector_request_context(
             None,

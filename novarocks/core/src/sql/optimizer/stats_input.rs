@@ -215,23 +215,23 @@ pub(crate) struct OptimizerStatsInput {
     // Transitional bridge for legacy rewrite/test callers that have not been
     // moved to query-scoped StatsRef binding yet. Base scan row counts must
     // come from `query_stats`, never from this table-name map.
-    legacy_table_stats_for_migration: Option<HashMap<String, TableStatistics>>,
+    test_table_statistics: Option<HashMap<String, TableStatistics>>,
 }
 
 impl OptimizerStatsInput {
     pub(crate) fn from_query_stats(query_stats: &QueryStatsSnapshot) -> Self {
         Self {
             query_stats: query_stats.clone(),
-            legacy_table_stats_for_migration: None,
+            test_table_statistics: None,
         }
     }
 
-    pub(crate) fn from_legacy_table_stats_for_migration(
+    pub(crate) fn from_test_table_statistics(
         table_stats: &HashMap<String, TableStatistics>,
     ) -> Self {
         Self {
             query_stats: QueryStatsSnapshot::empty(),
-            legacy_table_stats_for_migration: Some(table_stats.clone()),
+            test_table_statistics: Some(table_stats.clone()),
         }
     }
 
@@ -239,10 +239,8 @@ impl OptimizerStatsInput {
         &self.query_stats
     }
 
-    pub(crate) fn legacy_table_stats_for_migration(
-        &self,
-    ) -> Option<&HashMap<String, TableStatistics>> {
-        self.legacy_table_stats_for_migration.as_ref()
+    pub(crate) fn test_table_statistics(&self) -> Option<&HashMap<String, TableStatistics>> {
+        self.test_table_statistics.as_ref()
     }
 }
 
@@ -338,7 +336,7 @@ mod tests {
         let input = OptimizerStatsInput::from_query_stats(&snapshot);
 
         assert_eq!(input.query_stats().len(), 1);
-        assert!(input.legacy_table_stats_for_migration().is_none());
+        assert!(input.test_table_statistics().is_none());
     }
 
     #[test]
@@ -352,12 +350,12 @@ mod tests {
             },
         );
 
-        let input = OptimizerStatsInput::from_legacy_table_stats_for_migration(&table_stats);
+        let input = OptimizerStatsInput::from_test_table_statistics(&table_stats);
 
         assert_eq!(input.query_stats().len(), 0);
         assert_eq!(
             input
-                .legacy_table_stats_for_migration()
+                .test_table_statistics()
                 .unwrap()
                 .get("orders")
                 .unwrap()

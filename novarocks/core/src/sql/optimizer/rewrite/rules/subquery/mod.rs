@@ -98,7 +98,7 @@ mod tests {
 
     fn ctx_with_arena() -> RewriteContext {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        ctx.set_query_stats_input(OptimizerStatsInput::from_legacy_table_stats_for_migration(
+        ctx.set_query_stats_input(OptimizerStatsInput::from_test_table_statistics(
             &HashMap::new(),
         ));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
@@ -306,7 +306,7 @@ mod tests {
             "PushDownApplyAggFilter".to_string(),
             "PushDownApplyFilter".to_string(),
         ]);
-        ctx.set_query_stats_input(OptimizerStatsInput::from_legacy_table_stats_for_migration(
+        ctx.set_query_stats_input(OptimizerStatsInput::from_test_table_statistics(
             &HashMap::new(),
         ));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));

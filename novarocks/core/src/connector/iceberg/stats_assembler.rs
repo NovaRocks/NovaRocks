@@ -41,12 +41,18 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
 use iceberg::io::FileIO;
 use iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, Blob, PuffinReader, PuffinWriter};
 use iceberg::spec::{BlobMetadata, StatisticsFile, TableMetadata};
 use iceberg::table::Table;
 
 use super::theta_sketch::ThetaSketchHandle;
+
+/// Provider-owned, versioned evidence blob.  It lives in a standard Iceberg
+/// Puffin file, so other Iceberg readers can retain the StatisticsFile even
+/// when they do not interpret NovaRocks' optional statistics payload.
+pub(crate) const NOVAROCKS_STATISTICS_V1: &str = "novarocks.statistics.v1";
 
 /// The kind of commit being performed. Determines how the assembler combines
 /// new file sketches with the previous snapshot's aggregate Puffin.
@@ -313,6 +319,29 @@ pub(crate) async fn write_puffin(
     sequence_number: i64,
     sketches: &HashMap<i32, ThetaSketchHandle>,
 ) -> Result<Option<StatisticsFile>, String> {
+    write_puffin_with_provider_statistics(
+        file_io,
+        puffin_path,
+        snapshot_id,
+        sequence_number,
+        sketches,
+        None,
+    )
+    .await
+}
+
+/// Write standard Theta blobs and, when supplied by a successful full scan,
+/// one opaque provider evidence blob.  The optional blob is not used for
+/// Iceberg catalog mutation semantics; it merely preserves the exact scalar
+/// evidence that was collected for this snapshot and operation.
+pub(crate) async fn write_puffin_with_provider_statistics(
+    file_io: &FileIO,
+    puffin_path: &str,
+    snapshot_id: i64,
+    sequence_number: i64,
+    sketches: &HashMap<i32, ThetaSketchHandle>,
+    provider_statistics: Option<&[u8]>,
+) -> Result<Option<StatisticsFile>, String> {
     let output_file = file_io
         .new_output(puffin_path)
         .map_err(|e| format!("open output puffin {puffin_path}: {e}"))?;
@@ -325,7 +354,8 @@ pub(crate) async fn write_puffin(
     let mut sorted_fields: Vec<i32> = sketches.keys().copied().collect();
     sorted_fields.sort_unstable();
 
-    let mut blob_metadata: Vec<BlobMetadata> = Vec::with_capacity(sorted_fields.len());
+    let mut blob_metadata: Vec<BlobMetadata> =
+        Vec::with_capacity(sorted_fields.len() + usize::from(provider_statistics.is_some()));
     for field_id in sorted_fields {
         let sketch = sketches
             .get(&field_id)
@@ -349,6 +379,27 @@ pub(crate) async fn write_puffin(
             snapshot_id,
             sequence_number,
             fields: vec![field_id],
+            properties: HashMap::new(),
+        });
+    }
+    if let Some(provider_statistics) = provider_statistics {
+        let blob = Blob::builder()
+            .r#type(NOVAROCKS_STATISTICS_V1.to_string())
+            .fields(Vec::new())
+            .snapshot_id(snapshot_id)
+            .sequence_number(sequence_number)
+            .data(provider_statistics.to_vec())
+            .properties(HashMap::new())
+            .build();
+        writer
+            .add(blob, iceberg::puffin::CompressionCodec::None)
+            .await
+            .map_err(|e| format!("write Puffin provider statistics blob: {e}"))?;
+        blob_metadata.push(BlobMetadata {
+            r#type: NOVAROCKS_STATISTICS_V1.to_string(),
+            snapshot_id,
+            sequence_number,
+            fields: Vec::new(),
             properties: HashMap::new(),
         });
     }
@@ -379,6 +430,34 @@ pub(crate) async fn write_puffin(
         key_metadata: None,
         blob_metadata,
     }))
+}
+
+/// Read the optional provider evidence payload from a standard Puffin file.
+/// Missing payloads are normal for Spark/other-engine statistics files.
+pub(crate) async fn read_provider_statistics_blob(
+    file_io: &FileIO,
+    statistics_path: &str,
+) -> Result<Option<Bytes>, String> {
+    let input = file_io
+        .new_input(statistics_path)
+        .map_err(|e| format!("open Puffin statistics {statistics_path}: {e}"))?;
+    let reader = PuffinReader::new(input);
+    let metadata = reader
+        .file_metadata()
+        .await
+        .map_err(|e| format!("read Puffin statistics metadata {statistics_path}: {e}"))?;
+    let Some(blob_metadata) = metadata
+        .blobs()
+        .iter()
+        .find(|blob| blob.blob_type() == NOVAROCKS_STATISTICS_V1)
+    else {
+        return Ok(None);
+    };
+    let blob = reader
+        .blob(blob_metadata)
+        .await
+        .map_err(|e| format!("read Puffin provider statistics blob {statistics_path}: {e}"))?;
+    Ok(Some(Bytes::copy_from_slice(blob.data())))
 }
 
 /// Read the footer struct trailer and compute the total footer size.
@@ -554,6 +633,46 @@ mod tests {
         assert!(
             (450.0..=550.0).contains(&ndv),
             "field 3 NDV {ndv} should be ~500 (within +/-10%)"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_statistics_blob_round_trips_without_replacing_theta_blobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider-stats.puffin");
+        let path_str = format!("file://{}", path.display());
+        let file_io = crate::connector::iceberg::fs_io::build_file_io_for_location(&path_str, None);
+        let mut sketches = HashMap::new();
+        sketches.insert(3_i32, make_sketch_with_values(0, 10));
+        let payload = br#"{\"version\":1,\"data_version\":[1],\"metrics\":[]}"#;
+
+        let file = write_puffin_with_provider_statistics(
+            &file_io,
+            &path_str,
+            100,
+            1,
+            &sketches,
+            Some(payload),
+        )
+        .await
+        .expect("write provider statistics")
+        .expect("statistics file");
+
+        assert!(
+            file.blob_metadata
+                .iter()
+                .any(|blob| blob.r#type == APACHE_DATASKETCHES_THETA_V1)
+        );
+        assert!(
+            file.blob_metadata
+                .iter()
+                .any(|blob| blob.r#type == NOVAROCKS_STATISTICS_V1)
+        );
+        assert_eq!(
+            read_provider_statistics_blob(&file_io, &path_str)
+                .await
+                .expect("read provider statistics"),
+            Some(Bytes::copy_from_slice(payload))
         );
     }
 

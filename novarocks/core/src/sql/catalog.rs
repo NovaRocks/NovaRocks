@@ -108,6 +108,13 @@ pub(crate) trait PlannerTableProvider {
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
         None
     }
+
+    /// Statistics pins captured while this provider resolved the query's
+    /// tables. A statistics read must use this exact resolution rather than
+    /// resolving `latest` a second time during optimization.
+    fn statistics_pins(&self) -> Option<provider::QueryStatisticsPins> {
+        None
+    }
 }
 
 pub(crate) trait IcebergMetadataTableProvider {

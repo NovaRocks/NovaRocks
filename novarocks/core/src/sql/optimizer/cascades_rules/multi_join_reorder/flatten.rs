@@ -351,7 +351,7 @@ mod tests {
     use std::collections::HashMap as Map;
 
     fn empty_stats_input() -> OptimizerStatsInput {
-        OptimizerStatsInput::from_legacy_table_stats_for_migration(&Map::new())
+        OptimizerStatsInput::from_test_table_statistics(&Map::new())
     }
 
     fn col(memo: &mut Memo, id: u32) -> ScalarId {

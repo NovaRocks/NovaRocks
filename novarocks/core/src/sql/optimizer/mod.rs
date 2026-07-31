@@ -50,7 +50,9 @@ pub(crate) use optimized_tree::OptimizedOperatorNode;
 pub(crate) use property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +60,7 @@ use std::time::{Duration, Instant};
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::ScalarArena;
+#[cfg(test)]
 use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::optimizer::stats_input::{OptimizerStatsInput, QueryStatsSnapshot};
 use memo::MExpr;
@@ -127,7 +130,8 @@ pub(crate) fn optimize_with_root_distribution(
     )
 }
 
-pub(crate) fn optimize_with_legacy_table_stats_for_migration(
+#[cfg(test)]
+pub(crate) fn optimize_with_test_table_statistics(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
@@ -135,10 +139,10 @@ pub(crate) fn optimize_with_legacy_table_stats_for_migration(
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     settings: &options::SessionOptimizerSettings,
 ) -> Result<OptimizedOperatorNode, String> {
-    // Migration-only entry point for callers that still build unbound scan
-    // expressions. The scan estimator ignores this name-keyed map; production
-    // query planning must use `optimize` with a bound QueryStatsSnapshot.
-    let stats_input = OptimizerStatsInput::from_legacy_table_stats_for_migration(table_stats);
+    // Test fixture adapter for planner tests that construct unbound scans.
+    // Production query planning always uses `optimize` with query-scoped
+    // connector evidence.
+    let stats_input = OptimizerStatsInput::from_test_table_statistics(table_stats);
     optimize_with_root_property(
         plan_expr,
         scalar_arena,
@@ -150,7 +154,8 @@ pub(crate) fn optimize_with_legacy_table_stats_for_migration(
     )
 }
 
-pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migration(
+#[cfg(test)]
+pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
@@ -158,12 +163,12 @@ pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migrati
     root_distribution: DistributionSpec,
     settings: &options::SessionOptimizerSettings,
 ) -> Result<OptimizedOperatorNode, String> {
-    // Migration-only entry point; see `optimize_with_legacy_table_stats_for_migration`.
+    // Test fixture adapter; see `optimize_with_test_table_statistics`.
     let root_required = PhysicalPropertySet {
         distribution: root_distribution,
         ordering: OrderingSpec::Any,
     };
-    let stats_input = OptimizerStatsInput::from_legacy_table_stats_for_migration(table_stats);
+    let stats_input = OptimizerStatsInput::from_test_table_statistics(table_stats);
     optimize_with_root_property(
         plan_expr,
         scalar_arena,
@@ -1013,7 +1018,7 @@ mod is_known_rule_name_tests {
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
         let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
-        optimize_with_legacy_table_stats_for_migration(
+        optimize_with_test_table_statistics(
             plan_expr,
             scalar_arena,
             table_stats,
@@ -1031,7 +1036,7 @@ mod is_known_rule_name_tests {
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
         let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
-        optimize_with_root_distribution_and_legacy_table_stats_for_migration(
+        optimize_with_root_distribution_and_test_table_statistics(
             plan_expr,
             scalar_arena,
             table_stats,
@@ -1667,7 +1672,7 @@ mod is_known_rule_name_tests {
         let mut rewrite_ctx =
             crate::sql::optimizer::rewrite::context::RewriteContext::for_query(Vec::new());
         rewrite_ctx.set_query_stats_input(
-            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &HashMap::new(),
             ),
         );

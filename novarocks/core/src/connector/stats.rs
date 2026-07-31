@@ -63,13 +63,6 @@ impl StatsProviderError {
     }
 }
 
-pub(crate) trait TableStatsProvider: Send + Sync {
-    fn estimate_table_statistics(
-        &self,
-        request: &TableStatsRequest,
-    ) -> Result<BaseTableStatistics, StatsProviderError>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

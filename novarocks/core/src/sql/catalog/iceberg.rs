@@ -55,7 +55,7 @@ impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
         table: &str,
     ) -> Result<CatalogRuntimeMetadata, String> {
         let identity = TableIdentity::new(&self.name, namespace, table);
-        let (table_def, current_schema_id) =
+        let (table_def, current_schema_id, _) =
             crate::connector::iceberg::provider::load_schema_table_def(
                 self.controls.as_ref(),
                 crate::connector::connector_request_context(

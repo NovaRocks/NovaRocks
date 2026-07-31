@@ -214,7 +214,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn empty_stats_input() -> OptimizerStatsInput {
-        OptimizerStatsInput::from_legacy_table_stats_for_migration(&HashMap::new())
+        OptimizerStatsInput::from_test_table_statistics(&HashMap::new())
     }
 
     fn col(id: u32) -> TypedExpr {

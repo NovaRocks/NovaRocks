@@ -641,7 +641,7 @@ mod tests {
     pub(super) fn legacy_stats_input(
         table_stats: HashMap<String, TableStatistics>,
     ) -> OptimizerStatsInput {
-        OptimizerStatsInput::from_legacy_table_stats_for_migration(&table_stats)
+        OptimizerStatsInput::from_test_table_statistics(&table_stats)
     }
 
     fn empty_stats_input() -> OptimizerStatsInput {

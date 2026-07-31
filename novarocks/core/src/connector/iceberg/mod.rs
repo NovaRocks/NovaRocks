@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod analyze;
 pub mod catalog;
 pub(crate) mod change_stream_routing;
 pub mod changes;

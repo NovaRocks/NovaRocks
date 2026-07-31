@@ -1713,7 +1713,7 @@ mod tests {
         let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_query_stats_input(
-            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &HashMap::new(),
             ),
         );
@@ -1733,7 +1733,7 @@ mod tests {
         let optimizer_expr = to_optimizer_expr(&plan, &mut scalar_arena);
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         factory.reserve_until(200);
-        crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+        crate::sql::optimizer::optimize_with_test_table_statistics(
             optimizer_expr,
             scalar_arena,
             &HashMap::new(),

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::catalog::{
     CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
     ResolvedAnalyzerTable, TableLookupMode,
@@ -24,6 +25,8 @@ use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::provider::CatalogProvider;
 use novarocks_catalog::service::CatalogService;
 use novarocks_catalog::table::CatalogTable;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 pub(crate) struct CatalogServiceProvider<'a> {
     current_catalog: Option<&'a str>,
@@ -31,7 +34,11 @@ pub(crate) struct CatalogServiceProvider<'a> {
     controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     lookup_mode: TableLookupMode,
+    statistics_pins: QueryStatisticsPins,
 }
+
+pub(crate) type QueryStatisticsPins =
+    Arc<Mutex<HashMap<(String, String, String), ResolvedTableStatisticsPin>>>;
 
 impl<'a> CatalogServiceProvider<'a> {
     pub(crate) fn new(
@@ -47,6 +54,33 @@ impl<'a> CatalogServiceProvider<'a> {
             controls,
             connector_context,
             lookup_mode,
+            statistics_pins: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(crate) fn statistics_pins(&self) -> QueryStatisticsPins {
+        Arc::clone(&self.statistics_pins)
+    }
+
+    fn record_statistics_pin(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        pin: Option<ResolvedTableStatisticsPin>,
+    ) {
+        if let Some(pin) = pin {
+            self.statistics_pins
+                .lock()
+                .expect("query statistics pin lock")
+                .insert(
+                    (
+                        catalog.to_ascii_lowercase(),
+                        namespace.to_ascii_lowercase(),
+                        table.to_ascii_lowercase(),
+                    ),
+                    pin,
+                );
         }
     }
 
@@ -76,13 +110,15 @@ impl<'a> CatalogServiceProvider<'a> {
             }
             Some(catalog) => match self.lookup_mode {
                 TableLookupMode::SchemaOnly => {
-                    let (planner, _) = crate::connector::iceberg::provider::load_schema_table_def(
-                        self.controls,
-                        self.connector_context.clone(),
-                        catalog,
-                        database,
-                        table,
-                    )?;
+                    let (planner, _, pin) =
+                        crate::connector::iceberg::provider::load_schema_table_def(
+                            self.controls,
+                            self.connector_context.clone(),
+                            catalog,
+                            database,
+                            table,
+                        )?;
+                    self.record_statistics_pin(catalog, database, table, pin);
                     Ok(ResolvedAnalyzerTable::from_planner(
                         Some(catalog),
                         database,
@@ -90,13 +126,15 @@ impl<'a> CatalogServiceProvider<'a> {
                     ))
                 }
                 TableLookupMode::ExplainStats => {
-                    let (planner, _) = crate::connector::iceberg::provider::load_schema_table_def(
-                        self.controls,
-                        self.connector_context.clone(),
-                        catalog,
-                        database,
-                        table,
-                    )?;
+                    let (planner, _, pin) =
+                        crate::connector::iceberg::provider::load_schema_table_def(
+                            self.controls,
+                            self.connector_context.clone(),
+                            catalog,
+                            database,
+                            table,
+                        )?;
+                    self.record_statistics_pin(catalog, database, table, pin);
                     Ok(ResolvedAnalyzerTable::from_planner(
                         Some(catalog),
                         database,
@@ -175,6 +213,10 @@ impl PlannerTableProvider for CatalogServiceProvider<'_> {
 
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
         Some(self)
+    }
+
+    fn statistics_pins(&self) -> Option<QueryStatisticsPins> {
+        Some(self.statistics_pins())
     }
 }
 
