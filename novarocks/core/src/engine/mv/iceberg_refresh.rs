@@ -754,7 +754,6 @@ fn prepare_iceberg_mv_create(
     let created_at_ms = now_ms();
     let resolved_dependencies =
         crate::engine::mv::dependency::resolve_create_mv_dependencies_with_repository(
-            state,
             repository,
             &analysis.resolved_refs,
             created_at_ms,

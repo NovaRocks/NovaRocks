@@ -34,10 +34,7 @@ pub mod service;
 pub mod state_store_journal;
 
 pub use error::{DmlError, DmlErrorKind};
-pub use insert::{
-    InsertCommand, InsertCommandSource, align_query_batch_to_target, convert_insert_command,
-    reorder_insert_rows,
-};
+pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows};
 pub use journal::OperationJournal;
 pub use model::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,

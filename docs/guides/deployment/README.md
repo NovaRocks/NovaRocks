@@ -52,7 +52,7 @@ under the License.
 
 ## standalone部署
 
-standalone 部署使用单个 NovaRocks 进程完成 SQL 接入、分析、优化和执行。它不依赖 StarRocks FE，适合用来快速验证 Iceberg、managed-lake、SQL 功能和本地测试环境。
+standalone 部署使用单个 NovaRocks 进程完成 SQL 接入、分析、优化和执行。它不依赖 StarRocks FE，适合用来快速验证 external Iceberg catalog、SQL 功能和本地测试环境；它不提供内部 StarRocks 表类型。
 
 阅读：[standalone部署](standalone.md)
 

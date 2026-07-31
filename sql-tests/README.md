@@ -23,7 +23,7 @@ under the License.
 
 ## Object Store Prerequisite
 
-Only Iceberg REST, managed-lake, and other object-store-backed suites require a
+Only Iceberg and other object-store-backed suites require a
 reachable MinIO-compatible object store at `http://127.0.0.1:9000`.
 
 Default credentials (matching the standalone defaults):
@@ -64,7 +64,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 ```
 
 The runner defaults to `tests/sql-test-runner/conf/sr.conf` when no explicit
-`--config` is provided. Suites that need an Iceberg/managed-lake fixture should
+`--config` is provided. Suites that need an Iceberg fixture should
 pass the generated environment config or an explicit fixture config.
 
 ## Explicit Iceberg Config

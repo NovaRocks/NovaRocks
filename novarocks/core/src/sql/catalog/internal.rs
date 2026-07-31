@@ -64,9 +64,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::InternalCatalog;
-    use crate::sql::catalog::{
-        CatalogRuntimeBinding, CatalogRuntimeMetadata, local::PlannerMemoryCatalog,
-    };
+    use crate::sql::catalog::local::PlannerMemoryCatalog;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use novarocks_catalog::registry::Catalog;
     use novarocks_catalog::schema::ColumnDef;
@@ -90,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn default_catalog_resolves_registered_local_table() {
+    fn default_catalog_rejects_registered_internal_starrocks_table() {
         let mut local = PlannerMemoryCatalog::default();
         local.create_database("sales").expect("create database");
         local
@@ -98,20 +96,12 @@ mod tests {
             .expect("register table");
         let catalog = InternalCatalog::new("default_catalog", Arc::new(RwLock::new(local)));
 
-        let metadata: CatalogRuntimeMetadata = catalog
+        let error = catalog
             .get_table_metadata("sales", "orders")
-            .expect("resolve table");
-
-        assert_eq!(metadata.table.identity.catalog, "default_catalog");
-        assert_eq!(metadata.table.identity.namespace, "sales");
-        assert_eq!(metadata.table.identity.table, "orders");
-        assert_eq!(metadata.table.columns.len(), 1);
+            .expect_err("native session catalog must reject internal StarRocks tables");
         assert_eq!(
-            metadata.binding,
-            CatalogRuntimeBinding::Internal {
-                db_id: 5,
-                table_id: 6,
-            }
+            error,
+            "StarRocks scan source default_catalog.sales.orders requires an external connector binding; native session catalogs cannot register internal StarRocks tables"
         );
     }
 

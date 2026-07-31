@@ -314,9 +314,8 @@ EOF
   fi
 fi
 
-managed_warehouse="s3://novarocks/$env_id/sql-tests-managed-lake"
 iceberg_warehouse="s3://novarocks/$env_id/iceberg-catalog"
-starrocks_table_warehouse="s3://novarocks/$env_id/sql-tests-starrocks-table"
+iceberg_test_warehouse="s3://novarocks/$env_id/sql-tests-iceberg-extra"
 rest_warehouse="s3://warehouse/$env_id/rest"
 shared_rest_warehouse="${NOVA_ENV_SHARED_REST_WAREHOUSE_URI:-s3://warehouse/shared/rest}"
 compose_rest_warehouse="$rest_warehouse"
@@ -345,7 +344,7 @@ NOVA_ENV_SPARK_VERSION=$spark_version
 NOVA_ENV_ICEBERG_VERSION=$iceberg_version
 EOF
 
-cat > "$runtime_dir/standalone-managed-lake.toml" <<EOF
+cat > "$runtime_dir/standalone.toml" <<EOF
 [server]
 host = "127.0.0.1"
 grpc_port = $grpc_port
@@ -355,7 +354,7 @@ exchange_wait_ms = 300000
 
 [metadata]
 provider = "sqlite"
-path = "$runtime_dir/standalone-managed-lake.sqlite"
+path = "$runtime_dir/metadata.sqlite"
 
 [state_store]
 provider = "sqlite"
@@ -366,13 +365,6 @@ deployment_owner = "fe-1"
 [standalone_server]
 mysql_port = $mysql_port
 user = "root"
-warehouse_uri = "$managed_warehouse"
-
-[standalone_server.object_store]
-endpoint = "$minio_endpoint"
-access_key_id = "$minio_user"
-access_key_secret = "$minio_password"
-enable_path_style_access = true
 
 [connector.object_store]
 endpoint = "$minio_endpoint"
@@ -381,7 +373,7 @@ access_key_secret = "$minio_password"
 enable_path_style_access = true
 EOF
 
-cat > "$runtime_dir/standalone-managed-lake-scheduler.toml" <<EOF
+cat > "$runtime_dir/standalone-scheduler.toml" <<EOF
 [server]
 host = "127.0.0.1"
 grpc_port = $grpc_port
@@ -391,7 +383,7 @@ exchange_wait_ms = 300000
 
 [metadata]
 provider = "sqlite"
-path = "$runtime_dir/standalone-managed-lake.sqlite"
+path = "$runtime_dir/metadata.sqlite"
 
 [state_store]
 provider = "sqlite"
@@ -402,18 +394,11 @@ deployment_owner = "fe-1"
 [standalone_server]
 mysql_port = $mysql_port
 user = "root"
-warehouse_uri = "$managed_warehouse"
 mv_refresh_scheduler_enabled = true
 mv_refresh_scheduler_interval_ms = 200
 mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 500
 mv_refresh_scheduler_max_failure_backoff_ms = 2000
-
-[standalone_server.object_store]
-endpoint = "$minio_endpoint"
-access_key_id = "$minio_user"
-access_key_secret = "$minio_password"
-enable_path_style_access = true
 
 [connector.object_store]
 endpoint = "$minio_endpoint"
@@ -434,10 +419,9 @@ url = http://127.0.0.1:8030
 oss_ak = $minio_user
 oss_sk = $minio_password
 oss_endpoint = $minio_endpoint
-managed_lake_warehouse = $managed_warehouse
 iceberg_catalog_type = hadoop
 iceberg_catalog_warehouse = $iceberg_warehouse
-starrocks_table_warehouse = $starrocks_table_warehouse
+iceberg_test_warehouse = $iceberg_test_warehouse
 iceberg_rest_uri = $rest_uri
 iceberg_rest_warehouse = $rest_warehouse
 EOF
@@ -531,16 +515,15 @@ export AWS_S3_SECRET_ACCESS_KEY="$minio_password"
 export MINIO_ROOT_USER="$minio_user"
 export MINIO_ROOT_PASSWORD="$minio_password"
 export CATALOG_WAREHOUSE_URI="$iceberg_warehouse"
-export NOVAROCKS_MANAGED_LAKE_WAREHOUSE="$managed_warehouse"
-export NOVAROCKS_STARROCKS_TABLE_WAREHOUSE="$starrocks_table_warehouse"
+export NOVAROCKS_ICEBERG_TEST_WAREHOUSE="$iceberg_test_warehouse"
 export NOVAROCKS_ICEBERG_REST_URI="$rest_uri"
 export NOVA_ENV_SHARED_REST_WAREHOUSE_URI="$shared_rest_warehouse"
 export NOVA_ENV_REST_SERVER_WAREHOUSE_URI="$compose_rest_warehouse"
 export NOVA_ENV_REST_WAREHOUSE_URI="$rest_warehouse"
 export NOVAROCKS_ICEBERG_REST_WAREHOUSE="$rest_warehouse"
-export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone-managed-lake.toml"
-export NOVAROCKS_STANDALONE_SCHEDULER_CONFIG="$runtime_dir/standalone-managed-lake-scheduler.toml"
-export NOVAROCKS_STATE_STORE_PATH="$runtime_dir/state-store.sqlite"
+export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone.toml"
+export NOVAROCKS_STANDALONE_SCHEDULER_CONFIG="$runtime_dir/standalone-scheduler.toml"
+export NOVAROCKS_STATE_STORE_PATH="$runtime_dir/frontend-state.sqlite"
 export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.conf"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
 export NOVAROCKS_SPARK_IMAGE="$spark_image"
@@ -591,14 +574,13 @@ cat > "$manifest_file" <<EOF
   "novarocks": {
     "mysql_port": $mysql_port,
     "grpc_port": $grpc_port,
-    "standalone_config": "$runtime_dir/standalone-managed-lake.toml",
-    "standalone_scheduler_config": "$runtime_dir/standalone-managed-lake-scheduler.toml",
-    "state_store_path": "$runtime_dir/state-store.sqlite",
+    "standalone_config": "$runtime_dir/standalone.toml",
+    "standalone_scheduler_config": "$runtime_dir/standalone-scheduler.toml",
+    "state_store_path": "$runtime_dir/frontend-state.sqlite",
     "sql_test_config": "$runtime_dir/sql-test.conf",
     "ice_rest_catalog_sql": "$runtime_dir/ice-rest-catalog.sql",
-    "managed_lake_warehouse": "$managed_warehouse",
     "iceberg_catalog_warehouse": "$iceberg_warehouse",
-    "starrocks_table_warehouse": "$starrocks_table_warehouse"
+    "iceberg_test_warehouse": "$iceberg_test_warehouse"
   }
 }
 EOF
@@ -627,11 +609,11 @@ Do not guess ports.
 - NovaRocks gRPC port: \`$grpc_port\`
 - Manifest: \`$manifest_file\`
 - Env exports: \`$exports_file\`
-- Standalone config: \`$runtime_dir/standalone-managed-lake.toml\`
-- Scheduler-enabled standalone config: \`$runtime_dir/standalone-managed-lake-scheduler.toml\`
+- Standalone config: \`$runtime_dir/standalone.toml\`
+- Scheduler-enabled standalone config: \`$runtime_dir/standalone-scheduler.toml\`
 - Frontend StateStore: \`$runtime_dir/frontend-state.sqlite\`
 - SQL test config: \`$runtime_dir/sql-test.conf\`
-- StarRocks-table test warehouse: \`$starrocks_table_warehouse\`
+- Additional Iceberg test warehouse: \`$iceberg_test_warehouse\`
 - REST catalog SQL: \`$runtime_dir/ice-rest-catalog.sql\`
 - Spark defaults: \`$spark_defaults_file\`
 - Spark v3 smoke SQL: \`$spark_v3_smoke_sql\`

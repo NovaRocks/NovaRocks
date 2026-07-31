@@ -25,8 +25,6 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
 use novarocks_catalog::schema::ColumnDef;
 
 use crate::connector::backend::ResolvedTable;
@@ -37,9 +35,7 @@ use crate::engine::{StandaloneState, iceberg_writer};
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
 use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
-use crate::sql::parser::ast::{InsertSource, Literal, ObjectName, OverwriteMode};
-
-const DEFAULT_CATALOG_NAME: &str = "default_catalog";
+use crate::sql::parser::ast::{Literal, ObjectName};
 
 /// Parse one statement through NovaRocks' StarRocks normalizer and return its
 /// raw INSERT AST.
@@ -83,14 +79,6 @@ pub struct InsertTargetName {
     pub parts: Vec<String>,
 }
 
-/// Backend capability selected for an INSERT target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InsertTargetBackend {
-    Local,
-    StarRocks,
-    Iceberg,
-}
-
 /// INSERT literal independent of core's legacy custom statement AST.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InsertValue {
@@ -123,55 +111,13 @@ pub struct ResolveInsertTarget {
     pub execution: QueryExecutionContext,
 }
 
-/// Connector-neutral target metadata used by frontend dispatch and shaping.
+/// Iceberg target metadata used by frontend dispatch and shaping.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedInsertTarget {
-    pub backend: InsertTargetBackend,
     pub catalog: String,
     pub namespace: String,
     pub table: String,
     pub columns: Vec<ColumnDef>,
-    pub supports_pipeline_insert: bool,
-}
-
-/// Append already target-ordered literal rows.
-pub struct AppendRowsRequest {
-    pub target: ResolvedInsertTarget,
-    pub rows: Vec<Vec<InsertValue>>,
-    pub query_options: Option<QueryOptions>,
-    pub execution: QueryExecutionContext,
-}
-
-/// Execute an INSERT SELECT query with the exact admitted execution identity.
-pub struct InsertQueryRequest {
-    pub current_catalog: Option<String>,
-    pub current_database: String,
-    pub query: Box<sqlparser::ast::Query>,
-    pub query_options: Option<QueryOptions>,
-    pub execution: QueryExecutionContext,
-}
-
-/// One query-result column exposed for frontend batch shaping.
-#[derive(Clone, Debug, PartialEq)]
-pub struct QueryInsertColumn {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-}
-
-/// Query output without core runtime `QueryResult` or `Chunk` internals.
-#[derive(Clone, Debug)]
-pub struct QueryInsertBatch {
-    pub columns: Vec<QueryInsertColumn>,
-    pub batches: Vec<RecordBatch>,
-}
-
-/// Append a batch already aligned to the target schema.
-pub struct AppendBatchRequest {
-    pub target: ResolvedInsertTarget,
-    pub batch: RecordBatch,
-    pub query_options: Option<QueryOptions>,
-    pub execution: QueryExecutionContext,
 }
 
 /// One non-UNION source for an Iceberg INSERT transaction.
@@ -230,17 +176,10 @@ pub enum IcebergWriteReport {
     CommitRequired(Arc<dyn IcebergInsertCommit>),
 }
 
-/// Transitional one-to-one core domain port used by frontend DML.
-// Design: ADR-0019 (docs/adr/ADR-0019-frontend-insert-application-owner.md)
+/// Iceberg write port used by frontend-owned native INSERT orchestration.
+// Design: ADR-0021 (docs/adr/ADR-0021-native-frontend-insert-is-iceberg-only.md)
 pub trait InsertEngine: StatisticsEngine + Send + Sync {
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String>;
-
-    fn append_rows(&self, request: AppendRowsRequest) -> Result<(), String>;
-
-    fn execute_insert_query(&self, request: InsertQueryRequest)
-    -> Result<QueryInsertBatch, String>;
-
-    fn append_batch(&self, request: AppendBatchRequest) -> Result<(), String>;
 
     fn prepare_iceberg_write(
         &self,
@@ -262,7 +201,7 @@ pub trait InsertEngine: StatisticsEngine + Send + Sync {
 }
 
 struct CorePreparedIcebergInsert {
-    prepared: iceberg_writer::PreparedIcebergInsertWrite,
+    prepared: iceberg_writer::PreparedIcebergWrite,
 }
 
 impl IcebergPreparedInsert for CorePreparedIcebergInsert {
@@ -290,33 +229,7 @@ impl InsertEngine for Arc<StandaloneState> {
             request.query_options.as_ref(),
             &request.execution,
         )?;
-
-        if let Some(local) = resolve_local_insert_target(
-            &name,
-            request.current_catalog.as_deref(),
-            &request.current_database,
-        )? {
-            let table = self
-                .catalog_service
-                .local()
-                .read()
-                .expect("standalone catalog read lock")
-                .get(&local.database, &local.table)?;
-            let backend = match table.source {
-                crate::sql::planner::table::ScanSource::StarRocks { .. } => {
-                    InsertTargetBackend::StarRocks
-                }
-                _ => InsertTargetBackend::Local,
-            };
-            return Ok(ResolvedInsertTarget {
-                backend,
-                catalog: "default_catalog".to_string(),
-                namespace: local.database,
-                table: local.table,
-                columns: table.columns,
-                supports_pipeline_insert: matches!(backend, InsertTargetBackend::StarRocks),
-            });
-        }
+        crate::connector::validate_request_context(&connector_context)?;
 
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
             self,
@@ -355,128 +268,40 @@ impl InsertEngine for Arc<StandaloneState> {
             .columns
         };
         Ok(ResolvedInsertTarget {
-            backend: InsertTargetBackend::Iceberg,
             catalog: target.catalog,
             namespace: target.namespace,
             table: target.table,
             columns,
-            supports_pipeline_insert: true,
         })
-    }
-
-    fn append_rows(&self, request: AppendRowsRequest) -> Result<(), String> {
-        let resolved = resolved_table(&request.target);
-        let rows = request
-            .rows
-            .iter()
-            .map(|row| row.iter().map(insert_value_to_literal).collect())
-            .collect::<Vec<Vec<_>>>();
-        match request.target.backend {
-            InsertTargetBackend::StarRocks => append_starrocks_rows(
-                self,
-                &request.target.namespace,
-                &request.target.table,
-                &rows,
-            ),
-            InsertTargetBackend::Local => {
-                let batch = crate::engine::insert::build_local_insert_batch(
-                    &request.target.columns,
-                    &rows,
-                )?;
-                self.connectors
-                    .read()
-                    .expect("connector registry read")
-                    .table_sink("local")?
-                    .append_batch(&resolved, batch)
-            }
-            InsertTargetBackend::Iceberg => {
-                Err("Iceberg rows must use prepare_iceberg_write".to_string())
-            }
-        }
-    }
-
-    fn execute_insert_query(
-        &self,
-        request: InsertQueryRequest,
-    ) -> Result<QueryInsertBatch, String> {
-        let connector_context = crate::connector::connector_request_context_for_execution(
-            request.query_options.as_ref(),
-            &request.execution,
-        )?;
-        let result = crate::engine::execute_query_with_catalog_service_with_execution(
-            self,
-            request.current_catalog.as_deref(),
-            &request.current_database,
-            &request.query,
-            request.query_options,
-            &request.execution,
-            &connector_context,
-        )?;
-        Ok(QueryInsertBatch {
-            columns: result
-                .columns
-                .into_iter()
-                .map(|column| QueryInsertColumn {
-                    name: column.name,
-                    data_type: column.data_type,
-                    nullable: column.nullable,
-                })
-                .collect(),
-            batches: result.chunks.into_iter().map(|chunk| chunk.batch).collect(),
-        })
-    }
-
-    fn append_batch(&self, request: AppendBatchRequest) -> Result<(), String> {
-        if request.batch.num_rows() == 0 {
-            return Ok(());
-        }
-        let resolved = resolved_table(&request.target);
-        match request.target.backend {
-            InsertTargetBackend::StarRocks => append_starrocks_batch(
-                self,
-                &request.target.namespace,
-                &request.target.table,
-                request.batch,
-            ),
-            InsertTargetBackend::Local => self
-                .connectors
-                .read()
-                .expect("connector registry read")
-                .table_sink("local")?
-                .append_batch(&resolved, request.batch),
-            InsertTargetBackend::Iceberg => {
-                Err("Iceberg batches must use prepare_iceberg_write".to_string())
-            }
-        }
     }
 
     fn prepare_iceberg_write(
         &self,
         request: PrepareIcebergInsert,
     ) -> Result<PreparedIcebergInsert, String> {
-        if request.target.backend != InsertTargetBackend::Iceberg {
-            return Err("prepare_iceberg_write requires an Iceberg target".to_string());
-        }
         let target = target_backend(&request.target, "iceberg");
         let resolved = resolved_table(&request.target);
         let source = match request.source {
-            IcebergInsertSource::Rows(rows) => InsertSource::Values(
+            IcebergInsertSource::Rows(rows) => iceberg_writer::IcebergWriteInput::Rows(
                 rows.iter()
                     .map(|row| row.iter().map(insert_value_to_literal).collect())
                     .collect(),
             ),
-            IcebergInsertSource::Query(query) => InsertSource::FromQuery(query),
+            IcebergInsertSource::Query(query) => iceberg_writer::IcebergWriteInput::Query(query),
         };
         let overwrite_mode = match request.overwrite_mode {
-            InsertOverwriteMode::Append => OverwriteMode::None,
-            InsertOverwriteMode::FullTable => OverwriteMode::FullTable,
-            InsertOverwriteMode::DynamicPartitions => OverwriteMode::DynamicPartitions,
+            InsertOverwriteMode::Append => iceberg_writer::IcebergWriteMode::Append,
+            InsertOverwriteMode::FullTable => iceberg_writer::IcebergWriteMode::FullTableOverwrite,
+            InsertOverwriteMode::DynamicPartitions => {
+                iceberg_writer::IcebergWriteMode::DynamicPartitionOverwrite
+            }
         };
         let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;
-        let prepared = iceberg_writer::prepare_iceberg_insert_or_overwrite(
+        crate::connector::validate_request_context(&connector_context)?;
+        let prepared = iceberg_writer::prepare_iceberg_write(
             self,
             &target,
             &resolved,
@@ -545,28 +370,6 @@ impl InsertEngine for Arc<StandaloneState> {
     fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String> {
         downcast_prepared(prepared)?.prepared.finalize()
     }
-}
-
-fn resolve_local_insert_target(
-    name: &ObjectName,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<Option<novarocks_catalog::identifier::LocalTableIdentity>, String> {
-    let explicitly_local = name.parts.len() == 3
-        && novarocks_catalog::identifier::normalize_identifier(&name.parts[0])?
-            == DEFAULT_CATALOG_NAME;
-    let session_is_local = current_catalog
-        .map(novarocks_catalog::identifier::normalize_identifier)
-        .transpose()?
-        .is_none_or(|catalog| catalog == DEFAULT_CATALOG_NAME);
-    let local_parts = if explicitly_local {
-        &name.parts[1..]
-    } else if session_is_local && name.parts.len() <= 2 {
-        name.parts.as_slice()
-    } else {
-        return Ok(None);
-    };
-    novarocks_catalog::identifier::resolve_local_table_name(local_parts, current_database).map(Some)
 }
 
 fn downcast_prepared(
@@ -646,57 +449,33 @@ fn insert_value_to_literal(value: &InsertValue) -> Literal {
     }
 }
 
-#[cfg(feature = "compat")]
-fn append_starrocks_rows(
-    state: &Arc<StandaloneState>,
-    database: &str,
-    table: &str,
-    rows: &[Vec<Literal>],
-) -> Result<(), String> {
-    crate::connector::starrocks::table::txn::insert_rows_into_starrocks_table(
-        state, database, table, rows,
-    )
-}
-
-#[cfg(not(feature = "compat"))]
-fn append_starrocks_rows(
-    _state: &Arc<StandaloneState>,
-    _database: &str,
-    _table: &str,
-    _rows: &[Vec<Literal>],
-) -> Result<(), String> {
-    Err("StarRocks table INSERT requires the compat feature".to_string())
-}
-
-#[cfg(feature = "compat")]
-fn append_starrocks_batch(
-    state: &Arc<StandaloneState>,
-    database: &str,
-    table: &str,
-    batch: RecordBatch,
-) -> Result<(), String> {
-    crate::connector::starrocks::table::txn::insert_batch_into_starrocks_table(
-        state, database, table, batch,
-    )
-}
-
-#[cfg(not(feature = "compat"))]
-fn append_starrocks_batch(
-    _state: &Arc<StandaloneState>,
-    _database: &str,
-    _table: &str,
-    _batch: RecordBatch,
-) -> Result<(), String> {
-    Err("StarRocks table INSERT requires the compat feature".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::app_config::ClusterRole;
     use crate::common::types::UniqueId;
+    use crate::query_execution::backend::BackendTopologySnapshot;
+    use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::outcome::QueryExecutionResult;
+    use crate::query_execution::request_context::{RequestAdmission, RequestContext};
     use crate::query_execution::write::WriteCommitInput;
     use crate::runtime::query_result::QueryResult;
+    use crate::sql::optimizer::options::SessionOptimizerSettings;
+
+    fn cancelled_execution() -> QueryExecutionContext {
+        let cancellation = QueryCancellationSource::new();
+        let request = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db".to_string(),
+            ClusterRole::Fe,
+            BackendTopologySnapshot::empty(19),
+            None,
+            cancellation.view(),
+            SessionOptimizerSettings::default(),
+        ));
+        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        request.execution().clone()
+    }
 
     #[test]
     fn insert_engine_is_object_safe() {
@@ -755,86 +534,21 @@ mod tests {
     }
 
     #[test]
-    fn query_request_clones_one_execution_context() {
-        let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
-        let context = crate::query_execution::request_context::RequestContext::admit(
-            crate::query_execution::request_context::RequestAdmission::new(
-                None,
-                "db".to_string(),
-                crate::common::app_config::ClusterRole::Fe,
-                crate::query_execution::backend::BackendTopologySnapshot::empty(17),
-                None,
-                cancellation.view(),
-                crate::query_execution::request_context::SessionOptimizerSettings::default(),
-            ),
-        );
-        let query = match crate::sql::parser::parse_normalized_sql_raw("SELECT 1")
-            .expect("query should parse")
-        {
-            sqlparser::ast::Statement::Query(query) => query,
-            other => panic!("expected query, got {other:?}"),
-        };
-        let request = InsertQueryRequest {
-            current_catalog: None,
-            current_database: "db".to_string(),
-            query,
-            query_options: None,
-            execution: context.execution().clone(),
-        };
+    fn target_resolution_rechecks_cancellation_before_metadata_lookup() {
+        let state = Arc::new(StandaloneState::default());
+        let error = state
+            .resolve_target(ResolveInsertTarget {
+                current_catalog: None,
+                current_database: "db".to_string(),
+                target: InsertTargetName {
+                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
+                },
+                query_options: None,
+                execution: cancelled_execution(),
+            })
+            .expect_err("cancelled INSERT must fail before connector metadata lookup");
 
-        assert_eq!(request.execution.topology().revision(), 17);
-        cancellation.request(
-            crate::query_execution::cancellation::QueryCancellationReason::ClientDisconnected,
-        );
-        assert!(request.execution.cancellation().is_cancelled());
-        assert!(context.execution().cancellation().is_cancelled());
-    }
-
-    #[test]
-    fn local_target_resolution_uses_default_catalog_session() {
-        let resolved = resolve_local_insert_target(
-            &ObjectName {
-                parts: vec!["orders".to_string()],
-            },
-            None,
-            "sales",
-        )
-        .unwrap()
-        .expect("local target");
-        assert_eq!(resolved.database, "sales");
-        assert_eq!(resolved.table, "orders");
-    }
-
-    #[test]
-    fn local_target_resolution_honors_explicit_default_catalog() {
-        let resolved = resolve_local_insert_target(
-            &ObjectName {
-                parts: vec![
-                    "default_catalog".to_string(),
-                    "sales".to_string(),
-                    "orders".to_string(),
-                ],
-            },
-            Some("ice"),
-            "ignored",
-        )
-        .unwrap()
-        .expect("explicit local target");
-        assert_eq!(resolved.database, "sales");
-        assert_eq!(resolved.table, "orders");
-    }
-
-    #[test]
-    fn local_target_resolution_defers_to_external_catalog() {
-        let resolved = resolve_local_insert_target(
-            &ObjectName {
-                parts: vec!["orders".to_string()],
-            },
-            Some("ice"),
-            "sales",
-        )
-        .unwrap();
-        assert!(resolved.is_none());
+        assert_eq!(error, "connector request was cancelled");
     }
 
     #[test]

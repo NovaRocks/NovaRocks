@@ -22,10 +22,6 @@ use novarocks_catalog::table::CatalogTable;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum CatalogRuntimeBinding {
-    Internal {
-        db_id: i64,
-        table_id: i64,
-    },
     Iceberg {
         info: IcebergTableInfo,
         cloud_properties: BTreeMap<String, String>,
@@ -112,23 +108,19 @@ mod tests {
         assert_eq!(metadata.table.identity, identity);
         assert_eq!(metadata.table.columns.len(), 1);
         assert_eq!(metadata.table.hidden_columns.len(), 1);
-        match &metadata.binding {
-            CatalogRuntimeBinding::Iceberg {
-                info,
-                cloud_properties: preserved_cloud_properties,
-            } => {
-                assert_eq!(info.schema_id, 3);
-                assert_eq!(info.table_uuid.as_deref(), Some("uuid-1"));
-                assert_eq!(info.current_snapshot_id, None);
-                assert_eq!(info.serialized_metadata, None);
-                assert_eq!(
-                    info.serialized_metadata_rows.as_deref(),
-                    Some("[{\"file_path\":\"data.parquet\"}]")
-                );
-                assert_eq!(preserved_cloud_properties, &cloud_properties());
-            }
-            other => panic!("expected Iceberg binding, got {other:?}"),
-        }
+        let CatalogRuntimeBinding::Iceberg {
+            info,
+            cloud_properties: preserved_cloud_properties,
+        } = &metadata.binding;
+        assert_eq!(info.schema_id, 3);
+        assert_eq!(info.table_uuid.as_deref(), Some("uuid-1"));
+        assert_eq!(info.current_snapshot_id, None);
+        assert_eq!(info.serialized_metadata, None);
+        assert_eq!(
+            info.serialized_metadata_rows.as_deref(),
+            Some("[{\"file_path\":\"data.parquet\"}]")
+        );
+        assert_eq!(preserved_cloud_properties, &cloud_properties());
 
         let rebuilt = metadata.to_table_def();
         let ScanSource::IcebergDataFiles { files, binding, .. } = rebuilt.source else {

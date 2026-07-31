@@ -38,6 +38,7 @@ use crate::mv::persistence::dependency::stored_definition_dependency_ref;
 use crate::mv::repository::MvRepository;
 use novarocks_catalog::identifier::TableIdentity;
 
+#[derive(Debug)]
 pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) base_refs: Vec<TableIdentity>,
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
@@ -72,7 +73,6 @@ pub(crate) fn resolve_create_mv_dependencies(
     created_at_ms: i64,
 ) -> Result<ResolvedCreateMvDependencies, String> {
     resolve_create_mv_dependencies_with_repository(
-        state,
         state.mv_repository.as_ref(),
         resolved_refs,
         created_at_ms,
@@ -80,7 +80,6 @@ pub(crate) fn resolve_create_mv_dependencies(
 }
 
 pub(crate) fn resolve_create_mv_dependencies_with_repository(
-    state: &Arc<StandaloneState>,
     repository: &dyn MvRepository,
     resolved_refs: &[ResolvedTableRef],
     created_at_ms: i64,
@@ -120,9 +119,9 @@ pub(crate) fn resolve_create_mv_dependencies_with_repository(
                     created_at_ms,
                 });
             }
-            ResolvedTableRef::StarRocks { database, table } => {
+            ResolvedTableRef::UnsupportedNative { display_name } => {
                 return Err(format!(
-                    "standalone StarRocks table MV dependency `{database}.{table}` is unavailable"
+                    "materialized view base table `{display_name}` requires an external catalog; native internal tables are not supported"
                 ));
             }
         }
@@ -255,14 +254,14 @@ pub(crate) fn validate_no_create_cycle_with_repository(
 }
 
 fn stored_definition_dependency_ref_from_state(
-    state: &Arc<StandaloneState>,
+    _state: &Arc<StandaloneState>,
     definition: &StoredMvDefinition,
 ) -> Result<MvDependencyObjectRef, String> {
     if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
         return stored_definition_dependency_ref(definition, None);
     }
     Err(format!(
-        "standalone StarRocks materialized view definition {} is unavailable",
+        "legacy materialized view definition {} uses an unsupported storage engine",
         definition.mv_id
     ))
 }
@@ -341,5 +340,23 @@ mod tests {
         .expect_err("the complete mixed-case target must remain visible to the scope check");
         assert!(err.contains("Catalog.Namespace.Table"), "err: {err}");
         assert!(!err.contains("mv:"), "err: {err}");
+    }
+
+    #[test]
+    fn native_internal_mv_base_table_is_rejected() {
+        let state = Arc::new(StandaloneState::default());
+        let error = resolve_create_mv_dependencies(
+            &state,
+            &[ResolvedTableRef::UnsupportedNative {
+                display_name: "sales.orders".to_string(),
+            }],
+            1,
+        )
+        .expect_err("native internal MV base tables must stay unsupported");
+
+        assert_eq!(
+            error,
+            "materialized view base table `sales.orders` requires an external catalog; native internal tables are not supported"
+        );
     }
 }

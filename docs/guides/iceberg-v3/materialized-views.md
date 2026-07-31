@@ -44,7 +44,7 @@ under the License.
 | Window 函数 MV | ❌ | |
 | 含 DISTINCT / 子查询的 MV | ❌ | |
 | 跨 catalog 的 MV | ❌ | |
-| MV 物化结果存到 Iceberg | ❌ | 当前物化在 StarRocks table |
+| MV 物化结果存到 Iceberg | ✅ | MV target 是 external Iceberg catalog 中的 Iceberg 表 |
 
 ---
 
@@ -64,7 +64,7 @@ FROM ice.demo.orders
 GROUP BY date_trunc('day', ts), user_id;
 ```
 
-> 当前 MV 物化在 StarRocks table；让 MV 自身也作为 Iceberg 表对外暴露还在路线图上。
+> 当前 MV target 是 external Iceberg catalog 中的 Iceberg 表；native 不创建内部 StarRocks 表。
 
 ## ✅ 增量刷新（IVM）覆盖范围
 
@@ -134,8 +134,6 @@ Window 函数（`ROW_NUMBER` / `LAG` / 滑动聚合等）的 IVM 算法复杂度
 
 **TODO**：未实现。当前 MV 只能与基表同 catalog。
 
-## ❌ MV 物化结果存到 Iceberg
+## ✅ MV 物化结果存到 Iceberg
 
-当前 MV 物化在 StarRocks table 内部表。让 MV 自身也作为 Iceberg 表对外可读（被 Spark / Trino / PyIceberg 消费）能更好融入湖仓生态。
-
-**TODO**：未实现。
+当前 MV target 直接创建在 external Iceberg catalog 中，不依赖内部 StarRocks 表。外部引擎能否读取还取决于所用 catalog、表格式版本与该 MV 的可见列契约。

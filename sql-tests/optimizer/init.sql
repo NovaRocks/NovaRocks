@@ -18,7 +18,7 @@
 -- @catalog=iceberg_opt
 -- Create the iceberg catalog the optimizer suite uses for its base tables, so
 -- ANALYZE-derived NDV (Puffin statistics) reaches the cost-based optimizer.
--- Managed-lake (StarRocks-type) tables are intentionally not exercised by this
+-- Native internal tables do not exist and are not exercised by this
 -- suite. The catalog name is stable (per-case case_db reset isolates data);
 -- a distinct warehouse sub-path keeps these tables separate from other iceberg
 -- suites that share the warehouse root.

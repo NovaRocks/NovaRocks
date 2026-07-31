@@ -304,7 +304,7 @@ under the License.
 | Window 函数 MV | ❌ | |
 | 含 DISTINCT / 子查询的 MV | ❌ | |
 | 跨 catalog 的 MV | ❌ | |
-| MV 物化结果存到 Iceberg | ❌ | 当前物化在 StarRocks table |
+| MV 物化结果存到 Iceberg | ✅ | MV target 是 external Iceberg catalog 中的 Iceberg 表 |
 
 ## 15. SQL 语言特性（与 Iceberg 协同的部分）
 

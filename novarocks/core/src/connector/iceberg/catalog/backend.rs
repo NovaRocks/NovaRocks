@@ -15,26 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Iceberg table-sink implementation and table-definition helpers.
+//! Iceberg table-definition helpers.
 
 use std::sync::{Arc, RwLock};
 
-use arrow::record_batch::RecordBatch;
-
-use crate::connector::backend::{ResolvedTable, TableSink};
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use crate::mv::persistence::schema::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY};
-use crate::sql::parser::ast::Literal;
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 
-use super::registry::{
-    IcebergCatalogEntry, IcebergCatalogRegistry, insert_rows as reg_insert_rows,
-    load_table as reg_load_table,
-};
+#[cfg(test)]
+use super::registry::load_table as reg_load_table;
+use super::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 
 pub(crate) const ICEBERG_ROW_IDENTITY_FILE_COLUMN: &str = "_file";
 pub(crate) const ICEBERG_ROW_IDENTITY_POS_COLUMN: &str = "_pos";
@@ -590,39 +585,6 @@ fn empty_iceberg_scan_source(
         files: Vec::new(),
         cloud_properties: Default::default(),
         binding,
-    }
-}
-
-pub(crate) struct IcebergTableSink {
-    registry: Arc<RwLock<IcebergCatalogRegistry>>,
-}
-
-impl IcebergTableSink {
-    pub(crate) fn new(registry: Arc<RwLock<IcebergCatalogRegistry>>) -> Self {
-        Self { registry }
-    }
-}
-
-impl TableSink for IcebergTableSink {
-    fn name(&self) -> &'static str {
-        "iceberg"
-    }
-
-    fn append_rows(&self, table: &ResolvedTable, rows: &[Vec<Literal>]) -> Result<(), String> {
-        let guard = self.registry.read().expect("iceberg catalog read lock");
-        let entry = guard.get(&table.catalog)?;
-        reg_insert_rows(&entry, &table.namespace, &table.table, rows)
-    }
-
-    fn append_batch(&self, _table: &ResolvedTable, _batch: RecordBatch) -> Result<(), String> {
-        Err(
-            "iceberg append_batch uses IcebergTableSinkFactory through the execution layer"
-                .to_string(),
-        )
-    }
-
-    fn supports_pipeline_insert(&self) -> bool {
-        false
     }
 }
 

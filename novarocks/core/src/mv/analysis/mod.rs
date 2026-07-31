@@ -40,9 +40,8 @@ pub(crate) enum ResolvedTableRef {
         namespace: String,
         table: String,
     },
-    StarRocks {
-        database: String,
-        table: String,
+    UnsupportedNative {
+        display_name: String,
     },
 }
 
@@ -669,9 +668,12 @@ fn collect_table_refs_from_factor(
                         namespace: current_database.to_ascii_lowercase(),
                         table: table.clone(),
                     },
-                    None => ResolvedTableRef::StarRocks {
-                        database: current_database.to_ascii_lowercase(),
-                        table: table.clone(),
+                    None => ResolvedTableRef::UnsupportedNative {
+                        display_name: format!(
+                            "{}.{}",
+                            current_database.to_ascii_lowercase(),
+                            table
+                        ),
                     },
                 },
                 [database, table] => match current_catalog {
@@ -680,18 +682,13 @@ fn collect_table_refs_from_factor(
                         namespace: database.clone(),
                         table: table.clone(),
                     },
-                    None => ResolvedTableRef::StarRocks {
-                        database: database.clone(),
-                        table: table.clone(),
+                    None => ResolvedTableRef::UnsupportedNative {
+                        display_name: format!("{database}.{table}"),
                     },
                 },
-                _ => {
-                    let rendered = parts.join(".");
-                    ResolvedTableRef::StarRocks {
-                        database: current_database.to_ascii_lowercase(),
-                        table: rendered,
-                    }
-                }
+                _ => ResolvedTableRef::UnsupportedNative {
+                    display_name: parts.join("."),
+                },
             };
             if !refs.contains(&resolved) {
                 refs.push(resolved);

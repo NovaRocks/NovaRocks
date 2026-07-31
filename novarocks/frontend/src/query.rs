@@ -1029,9 +1029,8 @@ mod tests {
         PrepareDeleteRequest, PreparedDelete,
     };
     use novarocks::engine::insert_engine::{
-        AppendBatchRequest, AppendRowsRequest, IcebergInsertCommit, IcebergPreparedInsert,
-        IcebergWriteReport, InsertQueryRequest, PrepareIcebergInsert, PreparedIcebergInsert,
-        QueryInsertBatch, ResolveInsertTarget, ResolvedInsertTarget,
+        IcebergInsertCommit, IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert,
+        PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
     };
     use novarocks::engine::statistics::{
         CollectedColumnStatistics, EmptyStatisticsService, StatisticsColumn, StatisticsEngine,
@@ -1122,7 +1121,6 @@ mod tests {
     #[derive(Default)]
     struct RecordingInsertEngine {
         resolve_contexts: Mutex<Vec<QueryExecutionContext>>,
-        append_contexts: Mutex<Vec<QueryExecutionContext>>,
     }
 
     impl StatisticsEngine for RecordingInsertEngine {
@@ -1160,8 +1158,7 @@ mod tests {
                 .expect("resolve contexts")
                 .push(request.execution);
             Ok(ResolvedInsertTarget {
-                backend: novarocks::engine::insert_engine::InsertTargetBackend::Local,
-                catalog: DEFAULT_CATALOG.to_string(),
+                catalog: "ice".to_string(),
                 namespace: "db".to_string(),
                 table: "t".to_string(),
                 columns: vec![ColumnDef {
@@ -1171,27 +1168,7 @@ mod tests {
                     write_default: None,
                     logical_type: None,
                 }],
-                supports_pipeline_insert: false,
             })
-        }
-
-        fn append_rows(&self, request: AppendRowsRequest) -> Result<(), String> {
-            self.append_contexts
-                .lock()
-                .expect("append contexts")
-                .push(request.execution);
-            Ok(())
-        }
-
-        fn execute_insert_query(
-            &self,
-            _request: InsertQueryRequest,
-        ) -> Result<QueryInsertBatch, String> {
-            Err("unexpected INSERT query".to_string())
-        }
-
-        fn append_batch(&self, _request: AppendBatchRequest) -> Result<(), String> {
-            Err("unexpected INSERT batch".to_string())
         }
 
         fn prepare_iceberg_write(
@@ -1252,7 +1229,7 @@ mod tests {
         let context =
             router_test_context(41, Instant::now() + Duration::from_secs(30), &cancellation);
 
-        let result = execute_frontend_command(
+        let error = execute_frontend_command(
             &dml,
             &engine,
             &delete_engine,
@@ -1261,11 +1238,10 @@ mod tests {
             &context,
             QueryOptions::default(),
         )
-        .expect("frontend INSERT route");
+        .expect_err("Iceberg INSERT without StateStore must fail in DML");
 
-        assert!(matches!(result, StatementResult::Ok));
+        assert!(error.to_string().contains("state store is required"));
         assert_eq!(engine.resolve_contexts.lock().unwrap().len(), 1);
-        assert_eq!(engine.append_contexts.lock().unwrap().len(), 1);
         assert_eq!(command.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1279,7 +1255,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(73, deadline, &cancellation);
 
-        execute_frontend_command(
+        let error = execute_frontend_command(
             &dml,
             &engine,
             &delete_engine,
@@ -1288,19 +1264,16 @@ mod tests {
             &context,
             QueryOptions::default(),
         )
-        .expect("frontend INSERT route");
+        .expect_err("Iceberg INSERT without StateStore must fail in DML");
+        assert!(error.to_string().contains("state store is required"));
 
         let resolve = engine.resolve_contexts.lock().unwrap();
-        let append = engine.append_contexts.lock().unwrap();
         assert_eq!(resolve[0].topology().revision(), 73);
-        assert_eq!(append[0].topology().revision(), 73);
         assert_eq!(resolve[0].deadline(), Some(deadline));
-        assert_eq!(append[0].deadline(), Some(deadline));
         cancellation.request(QueryCancellationReason::ExplicitKill {
             requester_connection_id: 9,
         });
         assert!(resolve[0].cancellation().is_cancelled());
-        assert!(append[0].cancellation().is_cancelled());
     }
 
     #[test]
@@ -1355,7 +1328,6 @@ mod tests {
         .expect("core command route");
 
         assert!(engine.resolve_contexts.lock().unwrap().is_empty());
-        assert!(engine.append_contexts.lock().unwrap().is_empty());
         assert_eq!(command.calls.load(Ordering::SeqCst), 1);
         let contexts = command.contexts.lock().unwrap();
         assert_eq!(contexts[0].topology().revision(), 91);

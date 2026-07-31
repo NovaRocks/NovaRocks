@@ -131,8 +131,9 @@ impl IcebergMvTargetLocatorScan {
 /// Plan-time description of how the scan operator enumerates physical
 /// inputs for a table. Each variant covers a different lane:
 ///
-/// - `StarRocks`: StarRocks table identity; the connector scan planner reads
-///   the current tablet/version layout from the live StarRocks runtime.
+/// - `StarRocks`: external/compat StarRocks execution identity; the connector
+///   scan planner reads the current tablet/version layout from the live
+///   StarRocks runtime. This is not a native NovaRocks internal-table kind.
 /// - `IcebergDataFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped
 ///   parquet files — a concrete list of data files plus table identity,
 ///   optional cloud-store credentials, and scan-binding provenance.
@@ -143,12 +144,11 @@ impl IcebergMvTargetLocatorScan {
 ///   scans; codegen expands it into an explicit change-file payload.
 #[derive(Clone, Debug)]
 pub enum ScanSource {
-    /// StarRocks table: data lives in object storage (s3:// or
-    /// file://) and metadata lives in a `MetaStoreProvider` (currently
-    /// SQLite). The `(db_id, table_id)` identity carried here lets plan-time
-    /// consumers resolve the StarRocks table without relying on mutable names.
-    /// The connector scan planner validates this planned identity against the
-    /// live runtime before producing splits.
+    /// External/compat StarRocks scan identity. The `(db_id, table_id)` pair
+    /// lets execution resolve tablet metadata without relying on mutable
+    /// names. It does not grant native DDL, durable catalog, or write
+    /// ownership; a future native StarRocks connector must supply those
+    /// contracts through the external connector boundary.
     StarRocks { db_id: i64, table_id: i64 },
     IcebergDataFiles {
         table: IcebergTableInfo,

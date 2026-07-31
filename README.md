@@ -35,12 +35,12 @@ The project currently has two first-class execution modes:
    - NovaRocks can parse and execute SQL without StarRocks FE.
    - `standalone` exposes a MySQL-compatible endpoint for SQL clients and
      SQL regression tests.
-   - The standalone engine has its own in-process catalog, Iceberg catalog
-     registry, managed-lake metadata store, and connector-backed DDL/DML flows.
+   - The standalone engine has its own SQL catalog/session layer and external
+     Iceberg catalog registry. It does not own a native internal table type.
 
 NovaRocks is still experimental and is not production-ready. It is useful for
 learning StarRocks-style execution internals, iterating on connector and
-Iceberg semantics, testing managed-lake behavior, and running local SQL
+Iceberg semantics, and running local SQL
 experiments on macOS/Linux without maintaining a full StarRocks FE/BE cluster.
 
 ## Current Scope
@@ -66,8 +66,7 @@ Implemented or actively exercised areas include:
   - Iceberg catalogs: memory, Hadoop/filesystem, and REST
   - Iceberg SELECT, INSERT, DELETE, UPDATE/MERGE-related mutation flows, schema
     changes, refs, and compaction experiments
-  - managed-lake DDL/DML, SQLite metadata, object-store-backed storage, and
-    materialized-view lifecycle work
+  - Iceberg-backed materialized-view lifecycle work
 
 Known limits:
 
@@ -76,7 +75,7 @@ Known limits:
   validation.
 - Share-nothing mode is not supported; share-data style storage is the main
   target.
-- Some Iceberg/managed-lake features are phase-based and may have narrow
+- Some Iceberg features are phase-based and may have narrow
   contract support rather than full StarRocks parity.
 
 ## Architecture
@@ -114,10 +113,8 @@ SQL client / mysql CLI / SQL test runner
        v
   exec/pipeline + runtime
        v
-  connector backends
-     |- local catalog / Parquet
-     |- Iceberg catalog registry
-     `- managed-lake metadata + object store
+  external connector backends
+     `- Iceberg catalog registry
 ```
 
 ## Design Principles
@@ -132,7 +129,7 @@ SQL client / mysql CLI / SQL test runner
 - **Fail fast on unsupported semantics.** Ambiguous or unsupported plan/SQL
   behavior should return explicit errors instead of silently falling back.
 - **Connector-backed storage semantics.** Standalone DDL/DML routes through
-  catalog/table-source/table-sink/MV backends instead of hard-coding storage
+  external catalog/provider and Iceberg write contracts instead of hard-coding storage
   behavior into the SQL server.
 
 ## Prerequisites
@@ -228,18 +225,18 @@ path = "meta/standalone.sqlite"
 [standalone_server]
 mysql_port = 9030
 user = "root"
-warehouse_uri = "s3://novarocks/standalone"
 
-[standalone_server.object_store]
+[connector.object_store]
 endpoint = "http://127.0.0.1:9000"
 access_key_id = "admin"
 access_key_secret = "admin123"
 enable_path_style_access = true
 ```
 
-`[metadata].path` stores standalone catalog/managed-lake metadata in SQLite.
-`warehouse_uri` plus `[standalone_server.object_store]` enables managed-lake
-storage.
+`[metadata].path` stores native control metadata in SQLite. Persistent user
+tables belong to explicitly created external Iceberg catalogs;
+`[connector.object_store]` supplies process-local object-store credentials for
+connector execution and does not create a native internal table store.
 
 ## Run
 

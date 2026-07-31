@@ -22,7 +22,7 @@
 //!   - <kind>_state_signed(args, __op TINYINT) -> VARBINARY (with INSERT/DELETE sign)
 //!
 //! All produce VARBINARY columns with byte layout defined in
-//! src/connector/starrocks/managed/state_codec.rs
+//! src/mv/aggregate_state/state_codec.rs
 
 pub(super) mod approx_count_distinct;
 pub(super) mod avg;

@@ -24,7 +24,7 @@ pub mod schema;
 pub mod starrocks;
 pub(crate) mod stats;
 
-pub(crate) use backend::{MvBackend, TableSink};
+pub(crate) use backend::MvBackend;
 #[cfg(test)]
 pub(crate) use iceberg::catalog::load_table as load_iceberg_table;
 pub(crate) use iceberg::catalog::{
@@ -330,7 +330,6 @@ mod tests {
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
-    table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
     #[cfg(test)]
     fixture_controls: Arc<
@@ -343,7 +342,6 @@ pub struct ConnectorRegistry {
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
-            table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
             #[cfg(test)]
             fixture_controls: Arc::new(Mutex::new(BTreeMap::new())),
@@ -387,17 +385,6 @@ impl ConnectorRegistry {
                 )
             })?;
         Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
-    }
-
-    pub(crate) fn register_table_sink(&mut self, sink: Arc<dyn TableSink>) {
-        self.table_sinks.insert(sink.name(), sink);
-    }
-
-    pub(crate) fn table_sink(&self, name: &str) -> Result<Arc<dyn TableSink>, String> {
-        self.table_sinks
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("unknown table sink: {name}"))
     }
 
     pub(crate) fn register_mv_backend(&mut self, backend: Arc<dyn MvBackend>) {
@@ -481,15 +468,11 @@ pub fn compose_compat_iceberg_execution_binding(
 }
 
 pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
-    let iceberg_catalogs = Arc::clone(&state.iceberg_catalogs);
     {
         let mut connectors = state
             .connectors
             .write()
             .expect("standalone connector registry write lock");
-        connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
-            Arc::clone(&iceberg_catalogs),
-        )));
         connectors.register_mv_backend(Arc::new(
             crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
         ));
@@ -504,12 +487,9 @@ impl Default for ConnectorRegistry {
 
 impl std::fmt::Debug for ConnectorRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut table_sinks: Vec<_> = self.table_sinks.keys().copied().collect();
-        table_sinks.sort();
         let mut mv_backends: Vec<_> = self.mv_backends.keys().copied().collect();
         mv_backends.sort();
         f.debug_struct("ConnectorRegistry")
-            .field("table_sinks", &table_sinks)
             .field("mv_backends", &mv_backends)
             .finish()
     }

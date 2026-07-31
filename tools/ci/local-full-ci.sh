@@ -348,17 +348,17 @@ prepare_runtime() {
   ci_render_summary "RUNNING"
 }
 
-reset_managed_lake_metadata_stage() {
+reset_native_metadata_stage() {
   local log_path="$CI_RUN_DIR/metadata-reset.log"
   local start
   local code
   local duration
   local metadata_db
 
-  metadata_db="$NOVA_ENV_RUNTIME_DIR/standalone-managed-lake.sqlite"
+  metadata_db="$NOVA_ENV_RUNTIME_DIR/metadata.sqlite"
   start="$(ci_epoch)"
   {
-    echo "Reset managed-lake metadata before SQL CI."
+    echo "Reset native control metadata before SQL CI."
     echo "metadata_db=$metadata_db"
     rm -f "$metadata_db" "$metadata_db-shm" "$metadata_db-wal"
   } >"$log_path" 2>&1
@@ -1176,7 +1176,7 @@ main() {
 
   prepare_runtime
   run_cargo_gates
-  reset_managed_lake_metadata_stage
+  reset_native_metadata_stage
   if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
     start_server_stage
   else

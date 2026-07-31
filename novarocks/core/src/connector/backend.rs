@@ -15,15 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Connector-agnostic write and materialized-view backend traits.
-
-use arrow::record_batch::RecordBatch;
+//! Connector-agnostic metadata and materialized-view backend traits.
 
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow, RefreshCtx, RefreshError,
     RefreshOutcome, RefreshPlan, RefreshRequest,
 };
-use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 
 /// Resolved table metadata returned by the connector metadata SPI. This is
@@ -37,23 +34,10 @@ pub(crate) struct ResolvedTable {
     pub columns: Vec<ColumnDef>,
 }
 
-/// Write-side: append rows or RecordBatches to a table. The INSERT
-/// orchestration layer (`insert_flow.rs`, Phase 3) chooses between the two
-/// depending on whether the source is literal VALUES or a pipeline result.
-pub(crate) trait TableSink: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn append_rows(&self, table: &ResolvedTable, rows: &[Vec<Literal>]) -> Result<(), String>;
-    fn append_batch(&self, table: &ResolvedTable, batch: RecordBatch) -> Result<(), String>;
-
-    /// Whether this trait path supports INSERT SELECT materialized as a
-    /// RecordBatch. FE-driven Iceberg pipeline sinks use
-    /// `IcebergTableSinkFactory` directly and do not go through this trait.
-    fn supports_pipeline_insert(&self) -> bool;
-}
-
-/// Materialized-view backend: CREATE / DROP / REFRESH / SHOW. Today only
-/// StarRocks table implements this. Future backends (e.g. iceberg-as-MV-target)
-/// plug in here.
+/// Materialized-view backend: CREATE / DROP / REFRESH / SHOW.
+///
+/// Backends implement external storage-specific ownership behind this boundary;
+/// the trait does not define a native internal-table storage engine.
 pub(crate) trait MvBackend: Send + Sync {
     fn name(&self) -> &'static str;
 

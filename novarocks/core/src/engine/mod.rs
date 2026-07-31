@@ -59,7 +59,6 @@ pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
-pub(crate) mod insert;
 pub mod insert_engine;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
@@ -78,15 +77,12 @@ pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
 
-#[cfg(test)]
-pub(crate) use self::insert::build_local_insert_batch;
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
-    looks_like_add_legacy_range_partition, looks_like_alter_iceberg_properties,
-    looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
-    looks_like_show_create_table, parse_add_legacy_range_partition_sql,
+    looks_like_alter_iceberg_properties, looks_like_alter_iceberg_schema,
+    looks_like_alter_partition_column, looks_like_show_create_table,
     parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql, parse_show_create_table,
 };
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
@@ -1320,10 +1316,6 @@ impl StandaloneSession {
         use sqlparser::ast as sqlast;
 
         let mut normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-        if looks_like_add_legacy_range_partition(&normalized) {
-            let stmt = parse_add_legacy_range_partition_sql(&normalized)?;
-            return self.handle_add_legacy_range_partition(stmt, current_catalog, current_database);
-        }
         normalized =
             rewrite_legacy_partition_references(&self.inner, &normalized, current_database)?;
         normalized = rewrite_named_partition_insert_overwrite(&normalized)?;
@@ -1856,47 +1848,6 @@ impl StandaloneSession {
         current_database: &str,
     ) -> Result<StatementResult, String> {
         crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
-    }
-
-    fn handle_add_legacy_range_partition(
-        &self,
-        stmt: crate::engine::statement::AlterLegacyRangePartitionStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name == "iceberg" {
-            return Err(
-                "ALTER TABLE ADD PARTITION only supports standalone StarRocks tables".into(),
-            );
-        }
-        let mut catalog = self
-            .inner
-            .catalog_service
-            .local()
-            .write()
-            .expect("standalone catalog write lock");
-        let table_def = catalog.get(&target.namespace, &target.table)?;
-        let mut partition = stmt.partition;
-        if partition.column.is_empty() {
-            partition.column = table_def
-                .columns
-                .first()
-                .map(|column| column.name.clone())
-                .ok_or_else(|| {
-                    format!(
-                        "cannot infer range partition column for empty table schema {}.{}",
-                        target.namespace, target.table
-                    )
-                })?;
-        }
-        catalog.add_legacy_range_partition(&target.namespace, &target.table, partition)?;
-        Ok(StatementResult::Ok)
     }
 
     fn handle_show_create_table(
@@ -7114,337 +7065,12 @@ mysql_port = 47892
     }
 
     #[test]
-    fn build_local_insert_batch_supports_array_columns() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        let columns = vec![
-            ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            },
-            ColumnDef {
-                name: "score_items".to_string(),
-                data_type: DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-                nullable: true,
-                write_default: None,
-                logical_type: None,
-            },
-            ColumnDef {
-                name: "tags".to_string(),
-                data_type: DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                nullable: true,
-                write_default: None,
-                logical_type: None,
-            },
-        ];
-        let rows = vec![
-            vec![
-                Literal::Int(1),
-                Literal::Array(vec![Literal::Int(90), Literal::Null, Literal::Int(80)]),
-                Literal::Array(vec![
-                    Literal::String("a".to_string()),
-                    Literal::Null,
-                    Literal::String("c".to_string()),
-                ]),
-            ],
-            vec![Literal::Int(2), Literal::Null, Literal::Array(vec![])],
-        ];
-
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let scores = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("score_items list array");
-        let tags = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("tags list array");
-
-        assert_eq!(scores.len(), 2);
-        assert_eq!(scores.value(0).len(), 3);
-        assert!(scores.is_null(1));
-
-        assert_eq!(tags.len(), 2);
-        assert_eq!(tags.value(0).len(), 3);
-        assert_eq!(tags.value(1).len(), 0);
-    }
-
-    #[test]
     fn sql_type_to_arrow_type_maps_largeint_to_fixed_size_binary() {
         assert_eq!(
             super::sql_type_to_arrow_type(&novarocks_catalog::schema::SqlType::LargeInt)
                 .expect("map largeint type"),
             DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
         );
-    }
-
-    #[test]
-    fn build_local_insert_batch_supports_largeint_columns() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-        use novarocks_types::largeint;
-
-        let columns = vec![ColumnDef {
-            name: "v".to_string(),
-            data_type: DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![
-            vec![Literal::String(
-                "-170141183460469231731687303715884105728".to_string(),
-            )],
-            vec![Literal::String("0".to_string())],
-            vec![Literal::Null],
-            vec![Literal::String(
-                "170141183460469231731687303715884105727".to_string(),
-            )],
-        ];
-
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("largeint array");
-
-        assert_eq!(
-            largeint::value_at(values, 0).expect("decode min"),
-            i128::MIN
-        );
-        assert_eq!(largeint::value_at(values, 1).expect("decode zero"), 0);
-        assert!(values.is_null(2));
-        assert_eq!(
-            largeint::value_at(values, 3).expect("decode max"),
-            i128::MAX
-        );
-    }
-
-    #[test]
-    fn build_local_insert_batch_accepts_integral_float_literals_for_bigint_arrays() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        let columns = vec![ColumnDef {
-            name: "nums".to_string(),
-            data_type: DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![vec![Literal::Array(vec![
-            Literal::Float(1.0),
-            Literal::Float(2.0),
-        ])]];
-
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let nums = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("nums list array");
-        let values_ref = nums.value(0);
-        let values = values_ref
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 values");
-
-        assert_eq!(values.value(0), 1);
-        assert_eq!(values.value(1), 2);
-    }
-
-    #[test]
-    fn build_local_insert_batch_drops_null_map_keys() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        // Arrow's Map layout requires `entries.key` to be non-nullable; map
-        // literals with NULL keys must drop those kv-pairs so that the output
-        // array matches the catalog schema.
-        let entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, false)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let columns = vec![ColumnDef {
-            name: "m".to_string(),
-            data_type: DataType::Map(entries_field, false),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![vec![Literal::Map(vec![
-            (Literal::Null, Literal::String("dropped".to_string())),
-            (Literal::Int(7), Literal::String("kept".to_string())),
-        ])]];
-
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let map = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::MapArray>()
-            .expect("map array");
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.value_length(0), 1);
-        let entries = map.entries();
-        let keys = entries
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("key array");
-        assert_eq!(keys.null_count(), 0);
-        assert_eq!(keys.value(0), 7);
-
-        let schema = batch.schema();
-        let DataType::Map(entries_field, _) = schema.field(0).data_type() else {
-            panic!("expected map field");
-        };
-        let DataType::Struct(entry_fields) = entries_field.data_type() else {
-            panic!("expected struct entries");
-        };
-        assert!(!entry_fields[0].is_nullable());
-    }
-
-    #[test]
-    fn cast_batch_to_schema_relaxes_map_key_nullability() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        let source_entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, false)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let source_columns = vec![ColumnDef {
-            name: "m".to_string(),
-            data_type: DataType::Map(source_entries_field, false),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![vec![Literal::Map(vec![(
-            Literal::Int(1),
-            Literal::String("v".to_string()),
-        )])]];
-        let source_batch =
-            super::build_local_insert_batch(&source_columns, &rows).expect("build source batch");
-
-        let target_entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, true)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let target_schema = Arc::new(Schema::new(vec![Field::new(
-            "m",
-            DataType::Map(target_entries_field, false),
-            true,
-        )]));
-
-        let casted =
-            crate::formats::parquet::local_io::cast_batch_to_schema(&source_batch, &target_schema)
-                .expect("cast batch");
-        let casted_schema = casted.schema();
-        let DataType::Map(entries_field, _) = casted_schema.field(0).data_type() else {
-            panic!("expected MAP column");
-        };
-        let DataType::Struct(entry_fields) = entries_field.data_type() else {
-            panic!("expected MAP entries to be STRUCT");
-        };
-
-        assert!(
-            entry_fields[0].is_nullable(),
-            "expected casted map key field to become nullable"
-        );
-    }
-
-    #[test]
-    fn local_parquet_round_trip_drops_null_map_keys() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        // Arrow's Map layout requires non-null keys; when a literal carries a
-        // NULL key, the insert path drops the kv-pair and the resulting
-        // parquet round trip must preserve that (no null keys).
-        let entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, false)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let columns = vec![ColumnDef {
-            name: "m".to_string(),
-            data_type: DataType::Map(entries_field, false),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![vec![Literal::Map(vec![
-            (Literal::Null, Literal::String("dropped".to_string())),
-            (Literal::Int(5), Literal::String("kept".to_string())),
-        ])]];
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("map_round_trip.parquet");
-
-        crate::formats::parquet::local_io::write_parquet_to_path(&path, &batch)
-            .expect("write local parquet");
-        let round_tripped =
-            crate::formats::parquet::local_io::read_local_parquet_data(&path, &batch.schema())
-                .expect("read local parquet");
-        let map = round_tripped
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::MapArray>()
-            .expect("map array");
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.value_length(0), 1);
-        let entries = map.entries();
-        let keys = entries
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("key array");
-        assert_eq!(keys.null_count(), 0);
-        assert_eq!(keys.value(0), 5);
-
-        let round_schema = round_tripped.schema();
-        let DataType::Map(entries_field, _) = round_schema.field(0).data_type() else {
-            panic!("expected map field");
-        };
-        let DataType::Struct(entry_fields) = entries_field.data_type() else {
-            panic!("expected struct entries");
-        };
-        assert!(!entry_fields[0].is_nullable());
     }
 
     #[test]
@@ -8043,10 +7669,8 @@ mysql_port = 47892
         .expect_err("refresh should fail without MV runtime prerequisites");
         assert!(
             err.contains("requires current Iceberg catalog context")
-                || err.contains("StarRocks table config is missing")
                 || err.contains("sqlite metadata store")
-                || err.contains("materialized view")
-                || err.contains("StarRocks table"),
+                || err.contains("materialized view"),
             "unexpected dispatch error: {err}"
         );
     }
@@ -9411,7 +9035,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn iceberg_v3_update_from_source_table() {
         // Use a second iceberg table (in the same catalog/namespace) as the
-        // source so the test does not depend on StarRocks table configuration.
+        // source so both sides exercise the same external-table contract.
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
         session
@@ -9758,8 +9382,8 @@ path = "meta/operations.sqlite"
     #[test]
     fn select_last_updated_sequence_number_fails_on_non_row_lineage_iceberg_table() {
         // Tests that _last_updated_sequence_number fails on a regular V3 iceberg
-        // table without write.row-lineage=true (same fail-fast path as non-iceberg
-        // tables, verified without needing StarRocks table config).
+        // table without write.row-lineage=true (same fail-fast path as unsupported
+        // source tables).
         let warehouse = TempDir::new().expect("warehouse tempdir");
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
             .expect("open standalone engine");

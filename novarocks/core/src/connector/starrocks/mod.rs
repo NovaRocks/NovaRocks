@@ -27,9 +27,12 @@ pub mod schema;
 pub mod sink;
 pub(crate) mod table_schema_service;
 
-/// Stable StarRocks internal catalog identity shared by native and compat protocol adapters.
-/// It is a connector domain constant, not part of the retired standalone table subsystem.
-pub const INTERNAL_CATALOG_NAME: &str = "default_catalog";
+/// StarRocks wire-plan catalog identity used by compatibility adapters.
+///
+/// This value does not represent a native NovaRocks internal-table catalog.
+/// A future native StarRocks integration must bind an external connector
+/// instance instead of treating this compatibility identity as native DDL.
+pub const STARROCKS_WIRE_INTERNAL_CATALOG_NAME: &str = "default_catalog";
 
 pub(crate) use object_store_profile::ObjectStoreProfile;
 pub(crate) use scan::build_native_object_store_profile_from_properties;

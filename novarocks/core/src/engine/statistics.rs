@@ -59,7 +59,6 @@ pub enum StatisticsLiteral {
 pub enum StatisticsInsertSource {
     Values(Vec<Vec<StatisticsLiteral>>),
     SelectLiteralRow(Vec<StatisticsLiteral>),
-    UnionAll(Vec<StatisticsInsertSource>),
     FromQuery(Box<sqlparser::ast::Query>),
 }
 

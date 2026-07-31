@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub const NS_STARROCKS: &str = "starrocks";
-pub const NS_STARROCKS_TXN: &str = "starrocks.txn";
 pub const NS_ICEBERG_OPERATION: &str = "iceberg.operation";
 pub const NS_JOB: &str = "job";
 pub const NS_DICTIONARY: &str = "dictionary";

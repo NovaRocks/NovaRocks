@@ -45,7 +45,7 @@ It now has two first-class modes:
   - Runs without StarRocks FE.
   - Provides a MySQL-compatible local server through `standalone`.
   - Owns SQL parsing, analysis, planning, codegen, catalog state, Iceberg catalog
-    dispatch, managed-lake metadata, and SQL test execution.
+    dispatch, and SQL test execution.
 
 Columnar processing is centered on Arrow `RecordBatch` / `Chunk` in both modes.
 
@@ -94,10 +94,8 @@ SQL client / SQL test runner
                                       v
                             Pipeline / Runtime / Connectors
                                       |
-                 +--------------------+--------------------+
-                 |                    |                    |
-          Local Parquet        Iceberg Catalogs        Managed Lake
-        in-memory catalog    memory/hadoop/rest/hive   SQLite + object store
+                               Iceberg Catalogs
+                            memory/hadoop/rest/hive
 ```
 
 ---
@@ -182,8 +180,7 @@ SQL client / SQL test runner
 
 - `src/engine/mod.rs`
   `StandaloneNovaRocks`, `StandaloneSession`, standalone state, query execution,
-  catalog registration, execution-plan selection, and managed-lake open
-  reconciliation.
+  external catalog registration, and execution-plan selection.
 
 - `src/engine/statement.rs`
   Standalone DDL/DML dispatch: database/catalog/table DDL, INSERT, DELETE,
@@ -307,10 +304,6 @@ SQL client / SQL test runner
   data/delete writers, commit actions, refs, compaction, and schema/default
   value helpers.
 
-- `src/connector/starrocks/managed/**`
-  Standalone managed-lake catalog backend, SQLite metadata store, DDL/DML,
-  transaction lifecycle, erase worker, and materialized-view management.
-
 - `src/formats/**`
   Parquet/ORC/StarRocks format readers.
 
@@ -349,8 +342,9 @@ SQL client / SQL test runner
 2. The standalone server resolves session state (`USE`, `SET catalog`,
    timeouts, current database) and forwards supported statements to
    `StandaloneSession::execute_in_context`.
-3. `src/sql/parser/**` and `src/engine/statement.rs` route DDL/DML statements
-   to local catalog, Iceberg catalog, or managed-lake backends.
+3. `src/sql/parser/**` and `src/engine/statement.rs` route persistent-table
+   DDL/DML to external Iceberg catalogs. Native does not own an internal
+   StarRocks table type.
 4. SELECT/EXPLAIN statements go through standalone analyzer, optimizer, and
    codegen under `src/sql/**`.
 5. Generated execution plans run through the shared pipeline/runtime stack.
@@ -359,14 +353,13 @@ SQL client / SQL test runner
 
 ### 5.3 Standalone Catalog and Storage Path
 
-1. Local Parquet tables are registered in the standalone in-memory catalog.
-2. Iceberg catalogs are registered in `IcebergCatalogRegistry`; supported
+1. Iceberg catalogs are registered in `IcebergCatalogRegistry`; supported
    catalog types are `memory`, `hadoop`, `rest`, and `hive`.
-3. Managed-lake tables use SQLite metadata (`metadata_db_path`) plus object
-   store configuration (`warehouse_uri` and `[standalone_server.object_store]`).
-4. Standalone DDL/DML uses connector backends (`CatalogBackend`, `TableSource`,
-   `TableSink`, `MvBackend`) to keep SQL dispatch separate from storage
-   implementation.
+2. Native has no managed internal-table storage engine. Future StarRocks
+   support must be an external connector, not a restored standalone table
+   subsystem.
+3. Standalone DDL/DML uses connector provider contracts and the Iceberg writer
+   path to keep SQL application flow separate from external storage ownership.
 
 ### 5.4 Exchange Path
 
@@ -418,8 +411,8 @@ SQL client / SQL test runner
   Exchange routing key (`fragment_instance_id + node_id`).
 
 - `StandaloneNovaRocks` / `StandaloneSession` / `StandaloneState`: `src/engine/mod.rs`
-  Standalone SQL engine state, catalog registries, managed-lake metadata handle,
-  connector registry, and session execution surface.
+  Standalone SQL engine state, external catalog registries, connector registry,
+  and session execution surface.
 
 - `QueryResult` / `QueryResultColumn`: `src/runtime/query_result.rs`
   Generic result type used by standalone SQL execution and MySQL response
@@ -459,11 +452,11 @@ SQL client / SQL test runner
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.
 
 - `[standalone_server]`
-  `mysql_port`, `user`, `metadata_db_path`, `warehouse_uri`,
-  and `mv_default_storage_engine`.
+  `mysql_port`, `user`, MV scheduler settings, and Iceberg maintenance settings.
 
-- `[standalone_server.object_store]`
-  Object-store endpoint and credentials for managed-lake standalone storage.
+- `[connector.object_store]`
+  Process-local object-store credentials for connector execution; this does
+  not define a native internal table store.
 
 - `[debug]`
   `exec_node_output`, `exec_batch_plan_json`
@@ -835,7 +828,9 @@ env NO_PROXY=127.0.0.1,localhost \
   Init + ControlReady production barrier; do not add a compat lifecycle shim,
   standalone direct-call path, or no-runtime-filter retry inside an attempt.
 - **Connector behavior**: inspect `src/connector/*`, `src/connector/iceberg/**`,
-  `src/connector/starrocks/managed/**`, and `src/formats/*`.
+  `src/connector/starrocks/**`, and `src/formats/*`. StarRocks code here is
+  compat execution infrastructure or future external-connector substrate, not
+  a native internal-table catalog.
 - **FE/BE interface behavior**: inspect `src/service/internal_service.rs`, `src/service/backend_service.rs`, `src/service/engine_ffi.rs`, `src/shim/compat.h`.
 - **Optimizer observability / plan-shape regression**: see
   `src/sql/explain.rs` for the EXPLAIN formatter (Normal/Verbose/Costs/

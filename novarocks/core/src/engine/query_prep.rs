@@ -428,11 +428,10 @@ fn rewrite_time_travel_in_factor(
 /// query-prep flow (e.g. `ANALYZE TABLE` / `ANALYZE FULL TABLE`) can still
 /// resolve its schema.
 ///
-/// Non-iceberg backends (local / StarRocks) register themselves on `CREATE`, so
-/// this is a no-op for them — the caller's existing local-catalog lookup
-/// already succeeds. Unlike the best-effort query-prep loop, a load failure for
-/// an iceberg table here is surfaced as an error: the table was named
-/// explicitly by the statement, so an unresolvable name is a real error.
+/// Already-materialized non-Iceberg sources are a no-op here. Unlike the
+/// best-effort query-prep loop, an Iceberg load failure is surfaced as an
+/// error: the table was named explicitly by the statement, so an unresolvable
+/// name is a real error.
 pub(crate) fn materialize_external_schema_table_for_statement(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -441,8 +440,7 @@ pub(crate) fn materialize_external_schema_table_for_statement(
 ) -> Result<(), String> {
     let target = resolve_table_target(state, name, current_catalog, current_database)?;
     if target.backend_name != "iceberg" {
-        // Local / StarRocks tables register themselves on CREATE; nothing to
-        // materialize here.
+        // Non-Iceberg sources are already represented in the logical catalog.
         return Ok(());
     }
     // Synthetic time-travel tables live only in the in-memory catalog and are

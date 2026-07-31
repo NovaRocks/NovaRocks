@@ -222,30 +222,6 @@ pub(crate) enum Statement {
     ShowBackends(ShowBackendsStmt),
 }
 
-/// Describes the overwrite semantics of an INSERT statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OverwriteMode {
-    /// `INSERT INTO ...` — append.
-    None,
-    /// `INSERT OVERWRITE [TABLE] ...` — replace all rows in the table.
-    FullTable,
-    /// `INSERT OVERWRITE PARTITIONS [TABLE] ...` — replace only the partitions
-    /// touched by the new data; other partitions preserved. v3 row-lineage only.
-    DynamicPartitions,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct InsertStmt {
-    pub table: ObjectName,
-    pub columns: Vec<String>,
-    pub source: InsertSource,
-    /// Overwrite semantics for this INSERT statement. `OverwriteMode::None` for
-    /// `INSERT INTO`; `OverwriteMode::FullTable` for `INSERT OVERWRITE [TABLE]`.
-    /// Phase 1 only honors non-None for iceberg backends — non-iceberg backends
-    /// reject overwrite at the engine layer.
-    pub overwrite_mode: OverwriteMode,
-}
-
 /// `DELETE FROM <table> WHERE <predicate>`. Phase 1 only supports iceberg
 /// backends; the engine layer rejects other backends. WHERE is required;
 /// `DELETE FROM <table>` (no filter) is rejected — the spec recommends
@@ -320,22 +296,6 @@ pub(crate) struct MergeNotMatchedAction {
     /// element count must match `columns` (or the target schema when
     /// `columns` is empty).
     pub values: Vec<sqlparser::ast::Expr>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum InsertSource {
-    Values(Vec<Vec<Literal>>),
-    SelectLiteralRow(Vec<Literal>),
-    /// `a UNION ALL b` and chains thereof. Each sub-source is evaluated in
-    /// order and their rows are concatenated. UNION (distinct) is not
-    /// supported: INSERT-level deduplication would need table-side semantics
-    /// we don't want to replicate at the parser layer.
-    UnionAll(Vec<InsertSource>),
-    /// A full SELECT query that cannot be collapsed into literal rows. Carrying
-    /// the raw sqlparser AST lets us hand the SELECT back to the normal
-    /// analyzer/planner/pipeline stack at execution time instead of evaluating
-    /// it in the parser layer.
-    FromQuery(Box<sqlparser::ast::Query>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

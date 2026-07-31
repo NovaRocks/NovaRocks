@@ -405,9 +405,6 @@ fn estimated_source_row_count(source: &StatisticsInsertSource) -> i64 {
     match source {
         StatisticsInsertSource::Values(rows) => rows.len() as i64,
         StatisticsInsertSource::SelectLiteralRow(_) => 1,
-        StatisticsInsertSource::UnionAll(sources) => {
-            sources.iter().map(estimated_source_row_count).sum()
-        }
         StatisticsInsertSource::FromQuery(query) => {
             estimate_generate_series_row_count(query).unwrap_or(0)
         }
@@ -460,11 +457,6 @@ fn collect_source_column_values<'a>(
         }
         StatisticsInsertSource::SelectLiteralRow(row) => {
             values.extend(row.get(column_index));
-        }
-        StatisticsInsertSource::UnionAll(sources) => {
-            for source in sources {
-                collect_source_column_values(source, column_index, values);
-            }
         }
         StatisticsInsertSource::FromQuery(_) => {}
     }

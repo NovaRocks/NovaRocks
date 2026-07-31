@@ -1109,7 +1109,7 @@ fn is_nested_dtype(dtype: &arrow::datatypes::DataType) -> bool {
 ///
 /// Beyond field-id reannotation, this is also the single place that reconciles
 /// an INSERT's source Arrow type to the sink column's target type, matching the
-/// native (managed-lake) write path. The arms are tried in order:
+/// native Iceberg write path. The arms are tried in order:
 ///   1. exact type equality -> passthrough;
 ///   2. supported nested rebuilds (Map / Struct / List -> same kind), recursing
 ///      into children;
@@ -1246,8 +1246,8 @@ fn reannotate_array(
         //     integer -> float widening, float narrowing/float -> integer);
         //   * scalar -> STRING (numeric/boolean/temporal -> Utf8);
         //   * STRING -> scalar and temporal <-> string, etc.
-        // The native (managed-lake) write path accepts these coercions, so the
-        // iceberg write path must too. We delegate to the same relaxed cast the
+        // The native Iceberg write path accepts these coercions. We delegate to
+        // the same relaxed cast the
         // engine uses for `CAST(... AS <type>)`, which applies safe=true
         // semantics (out-of-range values become NULL, matching the DECIMAL
         // overflow convention) and identical textual formatting for ->STRING.

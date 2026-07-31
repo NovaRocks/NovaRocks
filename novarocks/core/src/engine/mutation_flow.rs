@@ -45,7 +45,7 @@ use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
-    InsertSource, MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
+    MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
 };
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 
@@ -2620,11 +2620,11 @@ pub(crate) fn execute_merge_statement(
                 )?
                 .0
             };
-            let plan = crate::engine::iceberg_writer::build_insert_write_plan(
+            let plan = crate::engine::iceberg_writer::build_iceberg_write_plan(
                 &target,
                 &resolved,
                 &[],
-                &InsertSource::FromQuery(Box::new(insert_query)),
+                &crate::engine::iceberg_writer::IcebergWriteInput::Query(Box::new(insert_query)),
                 &table,
                 &entry,
             )?;
@@ -3487,7 +3487,7 @@ enum MergeMatchedBranch {
 /// All active write branches of one MERGE statement, fed to
 /// [`DistributedMergeExecutor`] so they share one collector and one commit.
 struct MergeBranchSet {
-    /// Not-matched INSERT plan (`build_insert_write_plan` output). Its files are
+    /// Not-matched INSERT plan (`build_iceberg_write_plan` output). Its files are
     /// FRESH (net-new rows, no preserved `_row_id`).
     insert: Option<(sqlparser::ast::Query, IcebergWriteSinkSpec)>,
     matched: MergeMatchedBranch,

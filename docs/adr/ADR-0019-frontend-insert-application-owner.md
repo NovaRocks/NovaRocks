@@ -2,9 +2,9 @@
 id: ADR-0019
 title: "Frontend owns the INSERT application flow"
 domain: [frontend-dml]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0021
 date: 2026-07-31
 provenance:
   - "PR: frontend query session and router ownership #763"

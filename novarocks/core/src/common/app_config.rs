@@ -313,6 +313,7 @@ impl NovaRocksConfig {
         let value: toml::Value =
             toml::from_str(&s).with_context(|| format!("parse toml: {}", path.display()))?;
         reject_removed_plan_wire_format(&value)?;
+        reject_retired_native_table_config(&value)?;
         let cfg: NovaRocksConfig = value
             .try_into()
             .with_context(|| format!("parse toml: {}", path.display()))?;
@@ -370,6 +371,26 @@ fn reject_removed_plan_wire_format(value: &toml::Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn reject_retired_native_table_config(value: &toml::Value) -> Result<()> {
+    let Some(standalone) = value
+        .get("standalone_server")
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(());
+    };
+    let retired = ["warehouse_uri", "object_store", "mv_default_storage_engine"]
+        .into_iter()
+        .filter(|key| standalone.contains_key(*key))
+        .collect::<Vec<_>>();
+    if retired.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "retired native table configuration under [standalone_server]: {}; native persistent tables must be external Iceberg catalog tables, and shared object-store credentials belong under [connector.object_store]",
+        retired.join(", ")
+    );
 }
 
 impl Default for NovaRocksConfig {
@@ -494,20 +515,6 @@ pub enum MetadataProviderConfig {
     Sqlite,
 }
 
-#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
-pub struct StandaloneObjectStoreConfig {
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub access_key_id: Option<String>,
-    #[serde(default)]
-    pub access_key_secret: Option<String>,
-    #[serde(default)]
-    pub region: Option<String>,
-    #[serde(default)]
-    pub enable_path_style_access: Option<bool>,
-}
-
 /// Shared object-store credentials loaded independently by every backend at
 /// startup. Native plans may reference this binding but must never carry its
 /// values.
@@ -558,12 +565,6 @@ pub struct StandaloneServerConfig {
     pub mysql_port: u16,
     #[serde(default = "default_standalone_server_user")]
     pub user: String,
-    #[serde(default)]
-    pub warehouse_uri: Option<String>,
-    #[serde(default)]
-    pub object_store: Option<StandaloneObjectStoreConfig>,
-    #[serde(default)]
-    pub mv_default_storage_engine: Option<String>,
     #[serde(default)]
     pub mv_refresh_scheduler_enabled: bool,
     #[serde(default = "default_standalone_mv_refresh_scheduler_interval_ms")]
@@ -665,9 +666,6 @@ impl Default for StandaloneServerConfig {
         Self {
             mysql_port: default_standalone_server_mysql_port(),
             user: default_standalone_server_user(),
-            warehouse_uri: None,
-            object_store: None,
-            mv_default_storage_engine: None,
             mv_refresh_scheduler_enabled: false,
             mv_refresh_scheduler_interval_ms: default_standalone_mv_refresh_scheduler_interval_ms(),
             mv_refresh_scheduler_max_concurrent:
@@ -694,60 +692,6 @@ impl Default for StandaloneServerConfig {
             iceberg_maintenance_max_consecutive_failures:
                 default_standalone_iceberg_maintenance_max_consecutive_failures(),
         }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandaloneStarRocksTableConfig {
-    pub warehouse_uri: String,
-    pub endpoint: String,
-    pub access_key_id: String,
-    pub access_key_secret: String,
-    pub region: Option<String>,
-    pub enable_path_style_access: Option<bool>,
-    pub mv_default_storage_engine: Option<String>,
-}
-
-impl StandaloneServerConfig {
-    pub fn starrocks_table_config(
-        &self,
-    ) -> std::result::Result<Option<StandaloneStarRocksTableConfig>, String> {
-        let Some(warehouse_uri) = self
-            .warehouse_uri
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-        else {
-            return Ok(None);
-        };
-
-        let object_store = self.object_store.as_ref().ok_or_else(|| {
-            "standalone StarRocks table requires [standalone_server.object_store]".to_string()
-        })?;
-        let endpoint = object_store.endpoint.as_deref().unwrap_or_default();
-        let access_key_id = object_store.access_key_id.as_deref().unwrap_or_default();
-        let access_key_secret = object_store
-            .access_key_secret
-            .as_deref()
-            .unwrap_or_default();
-        let credentials = crate::fs::object_store_credentials::ObjectStoreCredentials::from_parts(
-            crate::fs::object_store_credentials::ObjectStoreCredentialsSource::StandaloneConfig,
-            endpoint,
-            access_key_id,
-            access_key_secret,
-            object_store.region.as_deref(),
-            object_store.enable_path_style_access,
-        )?;
-
-        Ok(Some(StandaloneStarRocksTableConfig {
-            warehouse_uri: warehouse_uri.to_string(),
-            endpoint: credentials.endpoint,
-            access_key_id: credentials.access_key_id,
-            access_key_secret: credentials.access_key_secret,
-            region: credentials.region,
-            enable_path_style_access: credentials.enable_path_style_access,
-            mv_default_storage_engine: self.mv_default_storage_engine.clone(),
-        }))
     }
 }
 
@@ -2029,8 +1973,7 @@ mod tests {
 
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
-        StandaloneObjectStoreConfig, StandaloneServerConfig, StandaloneStarRocksTableConfig,
-        validate_query_control_config,
+        StandaloneServerConfig, validate_query_control_config,
     };
 
     #[test]
@@ -2368,9 +2311,6 @@ grpc_port = 19080
             Some(StandaloneServerConfig {
                 mysql_port: 9030,
                 user: "root".to_string(),
-                warehouse_uri: None,
-                object_store: None,
-                mv_default_storage_engine: None,
                 mv_refresh_scheduler_enabled: false,
                 mv_refresh_scheduler_interval_ms: 30_000,
                 mv_refresh_scheduler_max_concurrent: 1,
@@ -2437,38 +2377,6 @@ mysql_port = 19030
         let metadata = cfg.metadata.expect("metadata config");
         assert_eq!(metadata.provider, MetadataProviderConfig::Sqlite);
         assert_eq!(metadata.path, PathBuf::from("meta/catalog.db"));
-    }
-
-    #[test]
-    fn test_standalone_server_parses_starrocks_table_object_store() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[standalone_server]
-mysql_port = 9030
-user = "root"
-warehouse_uri = "s3://novarocks/standalone"
-
-[standalone_server.object_store]
-endpoint = "http://127.0.0.1:9000"
-access_key_id = "admin"
-access_key_secret = "admin123"
-enable_path_style_access = true
-"#,
-        )
-        .expect("parse config");
-
-        let standalone = cfg.standalone_server.expect("standalone config");
-        assert_eq!(
-            standalone.warehouse_uri.as_deref(),
-            Some("s3://novarocks/standalone")
-        );
-        let object_store = standalone.object_store.expect("object_store");
-        assert_eq!(
-            object_store.endpoint.as_deref(),
-            Some("http://127.0.0.1:9000")
-        );
-        assert_eq!(object_store.access_key_id.as_deref(), Some("admin"));
-        assert_eq!(object_store.enable_path_style_access, Some(true));
     }
 
     #[test]
@@ -2562,185 +2470,6 @@ emit_connector_reader_marker = false
     }
 
     #[test]
-    fn test_standalone_server_defaults_without_starrocks_table_section() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[standalone_server]
-mysql_port = 9030
-user = "root"
-"#,
-        )
-        .expect("parse config");
-
-        let standalone = cfg.standalone_server.expect("standalone config");
-        assert_eq!(standalone.warehouse_uri, None);
-        assert!(standalone.object_store.is_none());
-    }
-
-    #[test]
-    fn test_standalone_server_starrocks_table_config_normalizes_required_fields() {
-        let standalone = StandaloneServerConfig {
-            warehouse_uri: Some(" s3://novarocks/standalone ".to_string()),
-            object_store: Some(StandaloneObjectStoreConfig {
-                endpoint: Some(" http://127.0.0.1:9000 ".to_string()),
-                access_key_id: Some(" admin ".to_string()),
-                access_key_secret: Some(" admin123 ".to_string()),
-                region: Some("us-east-1".to_string()),
-                enable_path_style_access: Some(true),
-            }),
-            ..StandaloneServerConfig::default()
-        };
-
-        assert_eq!(
-            standalone
-                .starrocks_table_config()
-                .expect("StarRocks table config"),
-            Some(StandaloneStarRocksTableConfig {
-                warehouse_uri: "s3://novarocks/standalone".to_string(),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                access_key_id: "admin".to_string(),
-                access_key_secret: "admin123".to_string(),
-                region: Some("us-east-1".to_string()),
-                enable_path_style_access: Some(true),
-                mv_default_storage_engine: None,
-            })
-        );
-    }
-
-    #[test]
-    fn test_standalone_server_starrocks_table_config_uses_shared_credentials() {
-        let standalone = StandaloneServerConfig {
-            warehouse_uri: Some(" s3://novarocks/standalone ".to_string()),
-            object_store: Some(StandaloneObjectStoreConfig {
-                endpoint: Some(" http://127.0.0.1:9000 ".to_string()),
-                access_key_id: Some(" admin ".to_string()),
-                access_key_secret: Some(" admin123 ".to_string()),
-                region: Some(" us-east-1 ".to_string()),
-                enable_path_style_access: Some(true),
-            }),
-            ..StandaloneServerConfig::default()
-        };
-
-        let cfg = standalone
-            .starrocks_table_config()
-            .expect("StarRocks table config")
-            .expect("StarRocks table config should be present");
-
-        assert_eq!(cfg.endpoint, "http://127.0.0.1:9000");
-        assert_eq!(cfg.access_key_id, "admin");
-        assert_eq!(cfg.access_key_secret, "admin123");
-        assert_eq!(cfg.region.as_deref(), Some("us-east-1"));
-        assert_eq!(cfg.enable_path_style_access, Some(true));
-    }
-
-    #[test]
-    fn test_standalone_server_starrocks_table_config_propagates_mv_default_storage_engine() {
-        let standalone = StandaloneServerConfig {
-            warehouse_uri: Some("s3://bucket/wh".to_string()),
-            object_store: Some(StandaloneObjectStoreConfig {
-                endpoint: Some("http://localhost:9000".to_string()),
-                access_key_id: Some("ak".to_string()),
-                access_key_secret: Some("sk".to_string()),
-                region: None,
-                enable_path_style_access: Some(true),
-            }),
-            mv_default_storage_engine: Some("iceberg".to_string()),
-            ..StandaloneServerConfig::default()
-        };
-        let cfg = standalone
-            .starrocks_table_config()
-            .expect("ok")
-            .expect("some");
-        assert_eq!(cfg.mv_default_storage_engine.as_deref(), Some("iceberg"));
-    }
-
-    #[test]
-    fn test_standalone_server_starrocks_table_config_returns_none_without_warehouse_uri() {
-        let standalone = StandaloneServerConfig::default();
-        assert_eq!(
-            standalone
-                .starrocks_table_config()
-                .expect("StarRocks table config"),
-            None
-        );
-
-        let standalone = StandaloneServerConfig {
-            warehouse_uri: Some("   ".to_string()),
-            ..StandaloneServerConfig::default()
-        };
-        assert_eq!(
-            standalone
-                .starrocks_table_config()
-                .expect("StarRocks table config"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_standalone_server_starrocks_table_config_validates_required_object_store_fields() {
-        let base = StandaloneServerConfig {
-            warehouse_uri: Some("s3://novarocks/standalone".to_string()),
-            object_store: Some(StandaloneObjectStoreConfig {
-                endpoint: Some("http://127.0.0.1:9000".to_string()),
-                access_key_id: Some("admin".to_string()),
-                access_key_secret: Some("admin123".to_string()),
-                region: None,
-                enable_path_style_access: None,
-            }),
-            ..StandaloneServerConfig::default()
-        };
-
-        let cases = vec![
-            (
-                StandaloneServerConfig {
-                    object_store: None,
-                    ..base.clone()
-                },
-                "standalone StarRocks table requires [standalone_server.object_store]",
-            ),
-            (
-                StandaloneServerConfig {
-                    object_store: Some(StandaloneObjectStoreConfig {
-                        endpoint: None,
-                        ..base.object_store.clone().expect("object store")
-                    }),
-                    ..base.clone()
-                },
-                "standalone_config object-store credentials missing aws.s3.endpoint",
-            ),
-            (
-                StandaloneServerConfig {
-                    object_store: Some(StandaloneObjectStoreConfig {
-                        access_key_id: None,
-                        ..base.object_store.clone().expect("object store")
-                    }),
-                    ..base.clone()
-                },
-                "standalone_config object-store credentials missing aws.s3.access_key",
-            ),
-            (
-                StandaloneServerConfig {
-                    object_store: Some(StandaloneObjectStoreConfig {
-                        access_key_secret: None,
-                        ..base.object_store.clone().expect("object store")
-                    }),
-                    ..base
-                },
-                "standalone_config object-store credentials missing aws.s3.secret_key",
-            ),
-        ];
-
-        for (standalone, expected) in cases {
-            assert_eq!(
-                standalone
-                    .starrocks_table_config()
-                    .expect_err("StarRocks table error"),
-                expected
-            );
-        }
-    }
-
-    #[test]
     fn test_runtime_olap_sink_threshold_defaults() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
@@ -2804,6 +2533,37 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
     #[test]
     fn test_load_from_file_rejects_removed_thrift_plan_wire_format() {
         assert_removed_plan_wire_format_is_rejected("thrift");
+    }
+
+    #[test]
+    fn test_load_from_file_rejects_retired_native_table_config() {
+        let path = std::env::temp_dir().join(format!(
+            "novarocks-retired-native-table-config-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[standalone_server]
+warehouse_uri = "s3://novarocks/internal"
+mv_default_storage_engine = "starrocks"
+
+[standalone_server.object_store]
+endpoint = "http://127.0.0.1:9000"
+"#,
+        )
+        .expect("write config fixture");
+
+        let result = NovaRocksConfig::load_from_file(&path);
+        std::fs::remove_file(&path).expect("remove config fixture");
+        let err = match result {
+            Ok(_) => panic!("retired native table keys must fail config loading"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "retired native table configuration under [standalone_server]: warehouse_uri, object_store, mv_default_storage_engine; native persistent tables must be external Iceberg catalog tables, and shared object-store credentials belong under [connector.object_store]"
+        );
     }
 
     #[test]

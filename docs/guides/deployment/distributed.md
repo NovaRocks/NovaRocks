@@ -152,9 +152,8 @@ grpc_port = 9080
 [standalone_server]
 mysql_port = 9030
 user = "root"
-warehouse_uri = "s3://novarocks/warehouse"
 
-[standalone_server.object_store]
+[connector.object_store]
 endpoint = "http://10.0.0.20:9000"
 access_key_id = "admin"
 access_key_secret = "admin123"
@@ -168,7 +167,7 @@ backends = [
 ]
 ```
 
-`[metadata]` 仍保存 standalone catalog 与 managed-lake metadata；它不是 backend membership 的 fallback 或第二份 authority。`[state_store]` 中的 membership 会在 FE 重启后恢复。`[cluster].backends` 只会补充尚不存在的 endpoint：它不会删除 StateStore 中已有的 backend，也不会重新激活正在 decommissioning 的 backend。
+`[metadata]` 保存 native control metadata，不提供内部 StarRocks 表或 backend membership fallback。持久用户表属于 external Iceberg catalog；`[connector.object_store]` 只提供 connector execution 的进程本地凭据。`[state_store]` 中的 membership 会在 FE 重启后恢复。`[cluster].backends` 只会补充尚不存在的 endpoint：它不会删除 StateStore 中已有的 backend，也不会重新激活正在 decommissioning 的 backend。
 
 启动 FE：
 
@@ -207,7 +206,7 @@ SHOW BACKENDS;
 SELECT 1;
 ```
 
-如果集群连接了 Iceberg 或 managed-lake，再执行一条真实表查询，确认 FE 调度、BE 执行和存储访问均可用。
+如果集群连接了 external Iceberg catalog，再执行一条真实表查询，确认 FE 调度、BE 执行和外部存储访问均可用。
 
 ## 管理 BE
 

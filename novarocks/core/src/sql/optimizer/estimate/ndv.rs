@@ -52,7 +52,7 @@ fn real_expr_ndv(
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> Option<(f64, Confidence)> {
     // A column is only useful for cardinality if it carries a real NDV.
-    // ColumnStatistic::unknown() (propagated for no-stats / managed-lake tables)
+    // ColumnStatistic::unknown() (propagated for tables without usable stats)
     // reports no NDV; treating an unknown NDV as true would make
     // join-key estimation divide left*right by ~1 and explode joins to near
     // cross-products, so fall back to the default NDV for unknown columns.
@@ -159,8 +159,8 @@ mod tests {
 
     #[test]
     fn get_expr_ndv_ignores_unknown_ndv() {
-        // OQ-3 propagates ColumnStatistic::unknown() for no-stats /
-        // managed-lake tables. get_expr_ndv must treat that as "no
+        // OQ-3 propagates ColumnStatistic::unknown() for no-stats tables.
+        // get_expr_ndv must treat that as "no
         // information" and return the generic expression default.
         let mut column_stats: HashMap<ColumnId, ColumnStatistic> = HashMap::new();
         column_stats.insert(test_col_id("unknown_col"), ColumnStatistic::unknown());

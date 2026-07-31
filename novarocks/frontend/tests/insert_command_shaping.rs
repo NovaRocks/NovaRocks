@@ -17,16 +17,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use novarocks::engine::insert_engine::{
-    InsertOverwriteMode, InsertValue, QueryInsertBatch, QueryInsertColumn, parse_insert_statement,
-};
+use arrow::datatypes::{DataType, Field};
+use novarocks::engine::insert_engine::{InsertOverwriteMode, InsertValue, parse_insert_statement};
 use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
-use novarocks_frontend::dml::{
-    InsertCommandSource, align_query_batch_to_target, convert_insert_command, reorder_insert_rows,
-};
+use novarocks_frontend::dml::{InsertCommandSource, convert_insert_command, reorder_insert_rows};
 
 fn parse_insert(sql: &str) -> sqlparser::ast::Insert {
     parse_insert_statement(sql)
@@ -46,21 +40,6 @@ fn column(
         nullable,
         write_default,
         logical_type: None,
-    }
-}
-
-fn query_batch(columns: Vec<QueryInsertColumn>, batch: RecordBatch) -> QueryInsertBatch {
-    QueryInsertBatch {
-        columns,
-        batches: vec![batch],
-    }
-}
-
-fn query_column(name: &str, data_type: DataType, nullable: bool) -> QueryInsertColumn {
-    QueryInsertColumn {
-        name: name.to_string(),
-        data_type,
-        nullable,
     }
 }
 
@@ -143,15 +122,15 @@ fn union_all_flattens_in_source_order() {
         "INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3",
     ))
     .expect("convert command");
-    let InsertCommandSource::UnionAll(parts) = command.source else {
-        panic!("expected UNION ALL source");
+    let InsertCommandSource::Values(rows) = command.source else {
+        panic!("expected UNION ALL literals to normalize into one VALUES source");
     };
     assert_eq!(
-        parts,
+        rows,
         vec![
-            InsertCommandSource::SelectLiteralRow(vec![InsertValue::Int(1)]),
-            InsertCommandSource::SelectLiteralRow(vec![InsertValue::Int(2)]),
-            InsertCommandSource::SelectLiteralRow(vec![InsertValue::Int(3)]),
+            vec![InsertValue::Int(1)],
+            vec![InsertValue::Int(2)],
+            vec![InsertValue::Int(3)],
         ]
     );
 }
@@ -305,101 +284,6 @@ fn preserves_array_map_struct_literals() {
 }
 
 #[test]
-fn aligns_query_batch_by_target_column_order() {
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("b", DataType::Int64, false),
-            Field::new("a", DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from(vec![20])),
-            Arc::new(Int64Array::from(vec![10])),
-        ],
-    )
-    .expect("source batch");
-    let result = query_batch(
-        vec![
-            query_column("b", DataType::Int64, false),
-            query_column("a", DataType::Int64, false),
-        ],
-        batch,
-    );
-    let target = vec![
-        column("a", DataType::Int64, false, None),
-        column("b", DataType::Int64, false, None),
-    ];
-
-    let aligned =
-        align_query_batch_to_target(&result, &["b".to_string(), "a".to_string()], &target)
-            .expect("align batch");
-    assert_eq!(
-        aligned
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
-        10
-    );
-    assert_eq!(
-        aligned
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
-        20
-    );
-}
-
-#[test]
-fn casts_query_batch_to_target_types() {
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)])),
-        vec![Arc::new(StringArray::from(vec![Some("42"), None]))],
-    )
-    .expect("source batch");
-    let result = query_batch(vec![query_column("value", DataType::Utf8, true)], batch);
-    let aligned = align_query_batch_to_target(
-        &result,
-        &[],
-        &[column("value", DataType::Int64, true, None)],
-    )
-    .expect("cast batch");
-    let values = aligned
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("Int64 output");
-    assert_eq!(values.value(0), 42);
-    assert!(values.is_null(1));
-}
-
-#[test]
-fn rejects_query_output_arity_mismatch() {
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )])),
-        vec![Arc::new(Int64Array::from(vec![1]))],
-    )
-    .expect("source batch");
-    let result = query_batch(vec![query_column("value", DataType::Int64, false)], batch);
-    let error = align_query_batch_to_target(
-        &result,
-        &[],
-        &[
-            column("a", DataType::Int64, false, None),
-            column("b", DataType::Int64, false, None),
-        ],
-    )
-    .unwrap_err();
-    assert!(error.contains("column count mismatch"), "{error}");
-}
-
-#[test]
 fn applies_write_defaults() {
     let target = vec![
         column("a", DataType::Int64, false, Some(ColumnDefault::Int64(99))),
@@ -411,21 +295,6 @@ fn applies_write_defaults() {
         reordered,
         vec![vec![InsertValue::Int(99), InsertValue::Int(7)]]
     );
-
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)])),
-        vec![Arc::new(Int64Array::from(vec![7, 8]))],
-    )
-    .expect("source batch");
-    let result = query_batch(vec![query_column("b", DataType::Int64, false)], batch);
-    let aligned = align_query_batch_to_target(&result, &["b".to_string()], &target)
-        .expect("apply batch default");
-    let defaults = aligned
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("Int64 defaults");
-    assert_eq!(defaults.values(), &[99, 99]);
 }
 
 #[test]
@@ -447,32 +316,4 @@ fn supports_largeint_and_integral_float_array_inputs() {
         reorder_insert_rows(&[values.clone()], &[], &target).expect("preserve inputs"),
         vec![values]
     );
-}
-
-#[test]
-fn concatenates_multiple_query_batches() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::Float64,
-        false,
-    )]));
-    let result = QueryInsertBatch {
-        columns: vec![query_column("value", DataType::Float64, false)],
-        batches: vec![
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Float64Array::from(vec![1.0]))],
-            )
-            .unwrap(),
-            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![2.0, 3.0]))])
-                .unwrap(),
-        ],
-    };
-    let aligned = align_query_batch_to_target(
-        &result,
-        &[],
-        &[column("value", DataType::Float64, false, None)],
-    )
-    .expect("concat batches");
-    assert_eq!(aligned.num_rows(), 3);
 }

@@ -625,31 +625,24 @@ fn standalone_mysql_server_rejects_default_catalog_persistent_table() {
 }
 
 #[test]
-fn standalone_mysql_server_rejects_legacy_starrocks_table_config_target() {
+fn standalone_mysql_server_rejects_legacy_starrocks_table_config_at_startup() {
     let port = alloc_port();
     let (_config_dir, config_path) = write_legacy_starrocks_table_config(port);
-
-    let args = vec![
-        "standalone".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
-
-    let err = conn
-        .query_drop("create database analytics")
-        .expect_err("legacy StarRocks table config must not enable local CREATE DATABASE");
-    let err = err.to_string().to_ascii_lowercase();
-    assert!(err.contains("iceberg catalog"), "unexpected error: {err}");
-
-    let err = conn
-        .query_drop(
-            "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
-        )
-        .expect_err("legacy StarRocks table config must not enable local CREATE TABLE");
-    let err = err.to_string().to_ascii_lowercase();
-    assert!(err.contains("iceberg catalog"), "unexpected error: {err}");
+    let output = Command::new(env!("CARGO_BIN_EXE_novarocks"))
+        .args(["standalone", "--config"])
+        .arg(config_path)
+        .output()
+        .expect("run standalone with retired config");
+    assert!(!output.status.success(), "retired config must fail startup");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.contains("retired native table configuration"),
+        "unexpected output: {output}"
+    );
 }
 
 #[test]

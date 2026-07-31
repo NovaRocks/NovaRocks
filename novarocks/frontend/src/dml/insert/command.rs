@@ -34,7 +34,6 @@ pub struct InsertCommand {
 pub enum InsertCommandSource {
     Values(Vec<Vec<InsertValue>>),
     SelectLiteralRow(Vec<InsertValue>),
-    UnionAll(Vec<InsertCommandSource>),
     FromQuery(Box<sqlast::Query>),
 }
 
@@ -139,19 +138,19 @@ fn convert_set_expr_to_source(body: &sqlast::SetExpr) -> Result<InsertCommandSou
                         .to_string(),
                 );
             }
-            let mut parts = Vec::new();
-            flatten_union_all(left, &mut parts)?;
-            flatten_union_all(right, &mut parts)?;
-            Ok(InsertCommandSource::UnionAll(parts))
+            let mut rows = Vec::new();
+            flatten_literal_union_all(left, &mut rows)?;
+            flatten_literal_union_all(right, &mut rows)?;
+            Ok(InsertCommandSource::Values(rows))
         }
         sqlast::SetExpr::Query(query) => convert_set_expr_to_source(query.body.as_ref()),
         _ => Err("unsupported INSERT source".to_string()),
     }
 }
 
-fn flatten_union_all(
+fn flatten_literal_union_all(
     body: &sqlast::SetExpr,
-    out: &mut Vec<InsertCommandSource>,
+    out: &mut Vec<Vec<InsertValue>>,
 ) -> Result<(), String> {
     if let sqlast::SetExpr::SetOperation {
         op: sqlast::SetOperator::Union,
@@ -160,10 +159,18 @@ fn flatten_union_all(
         right,
     } = body
     {
-        flatten_union_all(left, out)?;
-        flatten_union_all(right, out)
+        flatten_literal_union_all(left, out)?;
+        flatten_literal_union_all(right, out)
     } else {
-        out.push(convert_set_expr_to_source(body)?);
+        match convert_set_expr_to_source(body)? {
+            InsertCommandSource::Values(rows) => out.extend(rows),
+            InsertCommandSource::SelectLiteralRow(row) => out.push(row),
+            InsertCommandSource::FromQuery(_) => {
+                return Err(
+                    "internal: query-backed UNION ALL must use the query pipeline".to_string(),
+                );
+            }
+        }
         Ok(())
     }
 }

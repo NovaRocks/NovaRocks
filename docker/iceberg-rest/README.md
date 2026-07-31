@@ -73,8 +73,8 @@ Important generated files (under the runtime entry):
 - `env.sh` — shell exports for this workspace.
 - `manifest.json` — machine-readable ports, endpoints, compose project, and config paths.
 - `README.md` — human-readable summary of the active environment.
-- `standalone-managed-lake.toml` — NovaRocks standalone config.
-- `standalone-managed-lake-scheduler.toml` — the same fixture with the MV refresh scheduler enabled.
+- `standalone.toml` — NovaRocks standalone config.
+- `standalone-scheduler.toml` — the same fixture with the MV refresh scheduler enabled.
 - `sql-test.conf` — SQL test runner config.
 - `ice-rest-catalog.sql` — REST catalog DDL for this workspace.
 - `spark-defaults.conf` — Spark catalog config for REST Catalog + MinIO.

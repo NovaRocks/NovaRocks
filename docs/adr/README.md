@@ -108,12 +108,17 @@ seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来�
 ### frontend-dml
 
 领域哲学：frontend 拥有 DML 的 statement application flow、durable operation lifecycle 与 production routing；
-core 只通过一对一 typed engine port 保留 query、connector 和 external commit truth。每次写入必须复用 admission
-冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque handles，不以 service locator、core callback、
-metadata fallback 或公共 SPI 模糊 owner。
+core 只通过一对一 typed engine port 保留 query、connector 和 external commit truth。native persistent INSERT 当前只支持
+Iceberg；StarRocks 能力只存在于隔离的 compat BE execution，未来 native 支持只能作为 external connector，不能恢复
+内部 StarRocks 表。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
+handles，不以 service locator、core callback、metadata fallback 或公共 SPI 模糊 owner。
 
-- ADR-0019 — INSERT application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
+- ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 compat/external StarRocks connector 隔离（active）
+
+#### 历史
+
+- ADR-0019 — INSERT application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（superseded by ADR-0021）
 
 ### table-maintenance
 

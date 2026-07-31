@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::connector::starrocks::INTERNAL_CATALOG_NAME;
+use crate::connector::starrocks::STARROCKS_WIRE_INTERNAL_CATALOG_NAME;
 use crate::connector::starrocks::fe_v2_meta::{LakeScanTabletRef, LakeTableIdentity};
 use crate::connector::starrocks::scan::{
     DeferredLakeScanResolution, LakeScanSchemaMeta, StarRocksScanRange, StarRocksSchemaColumnHint,
@@ -123,9 +123,9 @@ fn validate_source(
                 "StarRocks ScanNode node_id={node_id} catalog_name must not be empty"
             ));
         }
-        if source.catalog_name != INTERNAL_CATALOG_NAME {
+        if source.catalog_name != STARROCKS_WIRE_INTERNAL_CATALOG_NAME {
             return invalid(format!(
-                "StarRocks ScanNode node_id={node_id} catalog_name must be {INTERNAL_CATALOG_NAME}, got {}",
+                "StarRocks ScanNode node_id={node_id} catalog_name must be {STARROCKS_WIRE_INTERNAL_CATALOG_NAME}, got {}",
                 source.catalog_name
             ));
         }

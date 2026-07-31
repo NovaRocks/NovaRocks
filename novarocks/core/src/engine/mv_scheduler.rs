@@ -794,7 +794,7 @@ fn refresh_execution_target_for_definition(
     }
 
     Err(format!(
-        "standalone StarRocks materialized view definition {} is unavailable",
+        "legacy materialized view definition {} has no external target identity",
         definition.mv_id
     ))
 }

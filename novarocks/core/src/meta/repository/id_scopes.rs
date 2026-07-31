@@ -17,30 +17,6 @@
 
 use crate::meta::{IdScope, MetaError};
 
-pub fn starrocks_db() -> IdScope {
-    stable("starrocks.db")
-}
-
-pub fn starrocks_table() -> IdScope {
-    stable("starrocks.table")
-}
-
-pub fn starrocks_partition() -> IdScope {
-    stable("starrocks.partition")
-}
-
-pub fn starrocks_index() -> IdScope {
-    stable("starrocks.index")
-}
-
-pub fn starrocks_tablet() -> IdScope {
-    stable("starrocks.tablet")
-}
-
-pub fn starrocks_txn() -> IdScope {
-    stable("starrocks.txn")
-}
-
 pub fn mv_id() -> IdScope {
     stable("mv.id")
 }

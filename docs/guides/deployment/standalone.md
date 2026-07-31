@@ -89,9 +89,8 @@ path = "meta/standalone.sqlite"
 [standalone_server]
 mysql_port = 9030
 user = "root"
-warehouse_uri = "s3://novarocks/standalone"
 
-[standalone_server.object_store]
+[connector.object_store]
 endpoint = "http://127.0.0.1:9000"
 access_key_id = "admin"
 access_key_secret = "admin123"
@@ -103,9 +102,9 @@ enable_path_style_access = true
 - `mysql_port` 是客户端连接 NovaRocks 的端口。
 - `[server].grpc_port` 是 NovaRocksGrpc 端口。`role=be` 和 `role=all-in-one` 由 BE host 提供完整 fragment/exchange 服务；`role=fe` 只提供 coordinator report 服务。`all-in-one` 仍通过该 gRPC 边界调度本机 BE，不使用 direct-call shortcut。默认值为 `9080`。
 - `user` 当前只支持 `root`。
-- `[metadata].path` 用于保存 standalone catalog、managed-lake 和部分管理状态。
-- `warehouse_uri` 是 managed-lake 表和写入数据的默认仓库路径。
-- `[standalone_server.object_store]` 用于访问对象存储；本地文件或纯 Parquet 验证场景可以不配置对象存储。
+- `[metadata].path` 用于保存 native control metadata，不承载用户内表数据。
+- native 持久表必须属于显式创建的 external Iceberg catalog；NovaRocks 不创建内部 StarRocks 类型表。
+- `[connector.object_store]` 为 connector execution 提供进程本地对象存储凭据；它本身不创建 catalog 或内表。
 
 ## 启动服务
 
@@ -151,7 +150,7 @@ SELECT 1;
 SHOW DATABASES;
 ```
 
-如果配置了 Iceberg 或 managed-lake，可以继续创建 catalog、database 和 table。Iceberg v3 的快速验证流程见 [Iceberg v3 快速上手](../iceberg-v3/quickstart.md)。
+配置 external Iceberg catalog 后，可以继续创建 database 和 table。Native 不提供内部 StarRocks 表类型；未来 StarRocks 数据源也必须通过 external connector 接入。Iceberg v3 的快速验证流程见 [Iceberg v3 快速上手](../iceberg-v3/quickstart.md)。
 
 ## 使用本地 Iceberg REST 环境
 

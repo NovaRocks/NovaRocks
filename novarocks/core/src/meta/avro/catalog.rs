@@ -205,56 +205,6 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/job.erase/0001.avsc"),
         },
         SchemaSource {
-            subject: "starrocks.database",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.database/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.database_name",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.database_name/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.table",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.table/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.table_name",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.table_name/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.schema",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.schema/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.column",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.column/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.partition",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.partition/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.index",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.index/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.tablet",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.tablet/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "starrocks.txn",
-            id: 1,
-            raw_schema: include_str!("schemas/starrocks.txn/0001.avsc"),
-        },
-        SchemaSource {
             subject: "test.evolution",
             id: 1,
             raw_schema: include_str!("schemas/test.evolution/0001.avsc"),

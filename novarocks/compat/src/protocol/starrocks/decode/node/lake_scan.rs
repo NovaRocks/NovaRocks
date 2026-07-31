@@ -26,7 +26,7 @@ use crate::protocol::starrocks::decode::node::decode::build_scan_query_global_di
 use crate::protocol::starrocks::decode::node::{Lowered, QueryGlobalDictMap, ScanRangeCarrier};
 use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::common::ids::SlotId;
-use novarocks::connector::starrocks::INTERNAL_CATALOG_NAME;
+use novarocks::connector::starrocks::STARROCKS_WIRE_INTERNAL_CATALOG_NAME;
 use novarocks::connector::starrocks::fe_v2_meta::{
     LakeScanTabletRef, LakeTableIdentity, find_cached_table_identity_names,
     lake_scan_execution_properties,
@@ -383,7 +383,7 @@ pub(crate) fn lower_lake_scan_node(
             table_id, table_desc.id
         ));
     }
-    let catalog = INTERNAL_CATALOG_NAME.to_string();
+    let catalog = STARROCKS_WIRE_INTERNAL_CATALOG_NAME.to_string();
     if (db_name == "__unknown_db__" || table_name == "__unknown_table__")
         && let Some((cached_db_name, cached_table_name)) =
             find_cached_table_identity_names(&catalog, db_id, table_id)
@@ -625,7 +625,7 @@ pub(super) fn internal_lake_table_identity(
     schema_id: i64,
 ) -> LakeTableIdentity {
     LakeTableIdentity {
-        catalog: INTERNAL_CATALOG_NAME.to_string(),
+        catalog: STARROCKS_WIRE_INTERNAL_CATALOG_NAME.to_string(),
         db_name,
         table_name,
         db_id,

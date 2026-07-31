@@ -18,8 +18,8 @@
 //! DDL/DML statement handlers for the standalone engine.
 //!
 //! Top-level dispatchers route statement families that remain in the core
-//! command kernel to the in-memory catalog, Iceberg registry, or StarRocks
-//! table based on the parsed name and current catalog/database session context.
+//! command kernel to connector-owned catalogs based on the parsed name and
+//! current catalog/database session context.
 
 use std::sync::Arc;
 
@@ -32,7 +32,6 @@ use crate::sql::parser::dialect::StarRocksDialect;
 use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::identifier::resolve_local_table_name;
-use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::schema::SqlType;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
@@ -1137,7 +1136,11 @@ pub(crate) fn execute_drop_table_statement(
             &target.table,
         )
     } else {
-        crate::mv::dependency::model::starrocks_table_object_ref(&target.namespace, &target.table)
+        crate::mv::dependency::model::external_table_object_ref(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )
     };
     match crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
         state,
@@ -1341,12 +1344,6 @@ pub(crate) enum PropertiesOp {
     Unset { keys: Vec<String>, if_exists: bool },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AlterLegacyRangePartitionStmt {
-    pub(crate) table: ObjectName,
-    pub(crate) partition: LegacyRangePartition,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ColumnPath {
     segments: Vec<String>,
@@ -1502,65 +1499,6 @@ pub(crate) fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
         && parser.parse_keyword(Keyword::ALTER)
         && parser.parse_keyword(Keyword::TABLE)
         && peek_token_word_eq(&parser, "OPTIMIZE")
-}
-
-pub(crate) fn looks_like_add_legacy_range_partition(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
-    upper.starts_with("ALTER TABLE")
-        && upper.contains(" ADD ")
-        && upper.contains(" PARTITION ")
-        && upper.contains(" VALUES ")
-}
-
-pub(crate) fn parse_add_legacy_range_partition_sql(
-    sql: &str,
-) -> Result<AlterLegacyRangePartitionStmt, String> {
-    let dialect = StarRocksDialect;
-    let mut parser = Parser::new(&dialect)
-        .try_with_sql(sql)
-        .map_err(|e| format!("parse ALTER TABLE ADD PARTITION: {e}"))?;
-    parser
-        .expect_keyword(Keyword::ALTER)
-        .map_err(|e| format!("expected ALTER: {e}"))?;
-    parser
-        .expect_keyword(Keyword::TABLE)
-        .map_err(|e| format!("expected TABLE: {e}"))?;
-    let table = crate::sql::parser::dialect::convert_object_name(
-        parser
-            .parse_object_name(false)
-            .map_err(|e| format!("parse ALTER TABLE name: {e}"))?,
-    )?;
-    expect_word(&mut parser, "ADD")?;
-    let _ = parser.parse_keyword(Keyword::TEMPORARY);
-    expect_word(&mut parser, "PARTITION")?;
-    let name = parser
-        .parse_identifier()
-        .map_err(|e| format!("expected partition name: {e}"))?
-        .value;
-    expect_word(&mut parser, "VALUES")?;
-    let (lower_sql, upper_sql) =
-        crate::sql::parser::dialect::create_table::parse_legacy_range_values(&mut parser)?;
-    if parser.consume_token(&Token::SemiColon) && parser.peek_token_ref().token != Token::EOF {
-        return Err(format!(
-            "unsupported trailing ALTER TABLE ADD PARTITION tokens: {}",
-            parser.peek_token_ref().token
-        ));
-    }
-    if parser.peek_token_ref().token != Token::EOF {
-        return Err(format!(
-            "unsupported trailing ALTER TABLE ADD PARTITION tokens: {}",
-            parser.peek_token_ref().token
-        ));
-    }
-    Ok(AlterLegacyRangePartitionStmt {
-        table,
-        partition: LegacyRangePartition {
-            name,
-            column: String::new(),
-            lower_sql,
-            upper_sql,
-        },
-    })
 }
 
 /// Check if SQL looks like ALTER TABLE ... ADD FILES FROM ...

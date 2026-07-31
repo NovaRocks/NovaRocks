@@ -62,7 +62,7 @@ use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOp
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::WriteCommitInput;
-use crate::sql::parser::ast::{InsertSource, Literal};
+use crate::sql::parser::ast::Literal;
 use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     synthetic_iceberg_write_table_id, transform_to_sink_string,
@@ -71,33 +71,39 @@ use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::SqlType;
 
-/// Core-owned Iceberg INSERT preparation. Construction validates and plans the
-/// write but never starts a distributed writer or external metadata commit.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum IcebergWriteInput {
+    Rows(Vec<Vec<Literal>>),
+    Query(Box<sqlparser::ast::Query>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IcebergWriteMode {
+    Append,
+    FullTableOverwrite,
+    DynamicPartitionOverwrite,
+}
+
+/// Core Iceberg write preparation shared by the frontend INSERT adapter,
+/// CTAS, and mutation flows. Construction validates and plans the write but
+/// never starts a distributed writer or external metadata commit.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_iceberg_insert_or_overwrite(
+pub(crate) fn prepare_iceberg_write(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
-    source: &InsertSource,
-    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
+    source: &IcebergWriteInput,
+    overwrite_mode: IcebergWriteMode,
     target_ref: &str,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedIcebergInsertWrite, String> {
-    use crate::sql::parser::ast::OverwriteMode;
+) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
-    let overwrite_full_table = matches!(overwrite_mode, OverwriteMode::FullTable);
-    let overwrite_partitions = matches!(overwrite_mode, OverwriteMode::DynamicPartitions);
-
-    // Reject UNION ALL on this path; caller enforces this for branch writes,
-    // and OVERWRITE with this source is never valid.
-    if matches!(source, InsertSource::UnionAll(_)) {
-        return Err(
-            "iceberg INSERT/OVERWRITE does not support UNION ALL sources on this path".to_string(),
-        );
-    }
+    let overwrite_full_table = matches!(overwrite_mode, IcebergWriteMode::FullTableOverwrite);
+    let overwrite_partitions =
+        matches!(overwrite_mode, IcebergWriteMode::DynamicPartitionOverwrite);
 
     // 1. Resolve catalog entry + build iceberg-rust Catalog handle.
     let entry = {
@@ -149,7 +155,7 @@ pub(crate) fn prepare_iceberg_insert_or_overwrite(
         }
     }
 
-    prepare_iceberg_insert_distributed(
+    prepare_iceberg_distributed_write(
         state,
         target,
         resolved,
@@ -167,13 +173,13 @@ pub(crate) fn prepare_iceberg_insert_or_overwrite(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_iceberg_insert_distributed(
+fn prepare_iceberg_distributed_write(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
-    source: &InsertSource,
-    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
+    source: &IcebergWriteInput,
+    overwrite_mode: IcebergWriteMode,
     target_ref: &str,
     catalog: Arc<dyn Catalog>,
     table: iceberg::table::Table,
@@ -181,10 +187,10 @@ fn prepare_iceberg_insert_distributed(
     table_ident: TableIdent,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedIcebergInsertWrite, String> {
+) -> Result<PreparedIcebergWrite, String> {
     let metadata = table.metadata();
     let (query, sink_spec) =
-        build_insert_write_plan(target, resolved, insert_columns, source, &table, entry)?;
+        build_iceberg_write_plan(target, resolved, insert_columns, source, &table, entry)?;
 
     let commit_op_kind = commit_op_kind_for_overwrite_mode(overwrite_mode);
     let base_snapshot_id = write_base_snapshot_id(metadata, target_ref)?;
@@ -253,15 +259,15 @@ fn prepare_iceberg_insert_distributed(
         },
         source: IcebergWriteSource::CoordinatedPlan,
     };
-    Ok(PreparedIcebergInsertWrite { executor, spec })
+    Ok(PreparedIcebergWrite { executor, spec })
 }
 
-pub(crate) struct PreparedIcebergInsertWrite {
+pub(crate) struct PreparedIcebergWrite {
     executor: PreparedIcebergWriteExecutor,
     spec: IcebergWriteTransactionSpec,
 }
 
-impl PreparedIcebergInsertWrite {
+impl PreparedIcebergWrite {
     pub(crate) fn target(&self) -> &TargetBackend {
         &self.executor.target
     }
@@ -301,7 +307,8 @@ impl PreparedIcebergInsertWrite {
     }
 }
 
-/// Execution payload prepared behind the narrow `InsertEngine` port.
+/// Prepared execution payload consumed by the frontend INSERT adapter and
+/// CTAS/mutation composition roots.
 ///
 /// This type owns no SQL routing or application transaction policy. The
 /// frontend DML service drives production INSERT, while CTAS may explicitly
@@ -353,11 +360,11 @@ impl IcebergWriteTransactionExecutor for PreparedIcebergWriteExecutor {
 /// branch runs the same pair into a shared collector so the INSERT commits in
 /// the same snapshot as the matched branch. Both callers share one query/sink
 /// construction to avoid semantic drift.
-pub(crate) fn build_insert_write_plan(
+pub(crate) fn build_iceberg_write_plan(
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
-    source: &InsertSource,
+    source: &IcebergWriteInput,
     table: &iceberg::table::Table,
     entry: &IcebergCatalogEntry,
 ) -> Result<(sqlparser::ast::Query, IcebergWriteSinkSpec), String> {
@@ -698,7 +705,7 @@ fn build_position_delete_output_descriptor(
 }
 
 fn append_source_to_query(
-    source: &InsertSource,
+    source: &IcebergWriteInput,
     insert_columns: &[String],
     target_columns: &[ColumnDef],
 ) -> Result<sqlparser::ast::Query, String> {
@@ -706,38 +713,29 @@ fn append_source_to_query(
 }
 
 fn append_source_to_query_for_write(
-    source: &InsertSource,
+    source: &IcebergWriteInput,
     insert_columns: &[String],
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
 ) -> Result<sqlparser::ast::Query, String> {
     match source {
-        InsertSource::FromQuery(query)
+        IcebergWriteInput::Query(query)
             if insert_columns.is_empty() && same_column_sequence(source_columns, write_columns) =>
         {
             Ok((**query).clone())
         }
-        InsertSource::FromQuery(query) => wrap_insert_query_with_write_projection(
+        IcebergWriteInput::Query(query) => wrap_insert_query_with_write_projection(
             query,
             insert_columns,
             source_columns,
             write_columns,
         ),
-        InsertSource::Values(rows) => values_append_source_to_query_for_write(
+        IcebergWriteInput::Rows(rows) => values_append_source_to_query_for_write(
             rows,
             insert_columns,
             source_columns,
             write_columns,
         ),
-        InsertSource::SelectLiteralRow(row) => values_append_source_to_query_for_write(
-            std::slice::from_ref(row),
-            insert_columns,
-            source_columns,
-            write_columns,
-        ),
-        InsertSource::UnionAll(_) => {
-            Err("iceberg INSERT append does not support UNION ALL sources on this path".to_string())
-        }
     }
 }
 
@@ -1209,14 +1207,11 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
     })
 }
 
-fn commit_op_kind_for_overwrite_mode(
-    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
-) -> CommitOpKind {
-    use crate::sql::parser::ast::OverwriteMode;
+fn commit_op_kind_for_overwrite_mode(overwrite_mode: IcebergWriteMode) -> CommitOpKind {
     match overwrite_mode {
-        OverwriteMode::DynamicPartitions => CommitOpKind::OverwritePartitions,
-        OverwriteMode::FullTable => CommitOpKind::Overwrite,
-        OverwriteMode::None => CommitOpKind::FastAppend,
+        IcebergWriteMode::DynamicPartitionOverwrite => CommitOpKind::OverwritePartitions,
+        IcebergWriteMode::FullTableOverwrite => CommitOpKind::Overwrite,
+        IcebergWriteMode::Append => CommitOpKind::FastAppend,
     }
 }
 
@@ -1414,6 +1409,7 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+    use iceberg::spec::{SnapshotReference, SnapshotRetention};
     use sqlparser::ast as sqlast;
 
     use novarocks_catalog::schema::ColumnDefault;
@@ -1461,6 +1457,23 @@ mod tests {
                 .map(|(name, data_type)| Arc::new(Field::new(name, data_type, true)))
                 .collect::<Vec<_>>(),
         ))
+    }
+
+    #[test]
+    fn branch_write_uses_the_branch_head_as_its_base_snapshot() {
+        let metadata = crate::sql::analyzer::iceberg_ref::test_utils::metadata_with_two_snapshots()
+            .into_builder(None)
+            .set_ref(
+                "dev",
+                SnapshotReference::new(1, SnapshotRetention::branch(None, None, None)),
+            )
+            .expect("add dev branch")
+            .build()
+            .expect("build metadata with dev branch")
+            .metadata;
+
+        assert_eq!(write_base_snapshot_id(&metadata, "main").unwrap(), Some(2));
+        assert_eq!(write_base_snapshot_id(&metadata, "dev").unwrap(), Some(1));
     }
 
     fn test_iceberg_metadata_with_identity_partition(
@@ -1783,7 +1796,7 @@ mod tests {
             test_column("b", DataType::Int32, Some(ColumnDefault::Int32(5))),
             test_column("c", DataType::Int32, None),
         ];
-        let source = InsertSource::Values(vec![vec![
+        let source = IcebergWriteInput::Rows(vec![vec![
             crate::sql::parser::ast::Literal::Int(30),
             crate::sql::parser::ast::Literal::Int(10),
         ]]);
@@ -1936,7 +1949,7 @@ mod tests {
             test_column("region", DataType::Utf8, None),
             test_column("amount", DataType::Float64, None),
         ];
-        let source = InsertSource::Values(vec![
+        let source = IcebergWriteInput::Rows(vec![
             vec![
                 crate::sql::parser::ast::Literal::Int(1),
                 crate::sql::parser::ast::Literal::String("us".to_string()),
@@ -1986,7 +1999,7 @@ mod tests {
             test_column("category", DataType::Utf8, None),
             test_column("amount", DataType::Int32, None),
         ];
-        let source = InsertSource::Values(vec![vec![
+        let source = IcebergWriteInput::Rows(vec![vec![
             crate::sql::parser::ast::Literal::Int(1),
             crate::sql::parser::ast::Literal::Int(10),
         ]]);
@@ -2007,7 +2020,7 @@ mod tests {
     #[test]
     fn append_source_to_query_values_preserves_backslash_string_literals() {
         let target_columns = vec![test_column("region", DataType::Utf8, None)];
-        let source = InsertSource::Values(vec![vec![crate::sql::parser::ast::Literal::String(
+        let source = IcebergWriteInput::Rows(vec![vec![crate::sql::parser::ast::Literal::String(
             r"e\f".to_string(),
         )]]);
 
@@ -2034,7 +2047,7 @@ mod tests {
         let target_columns = vec![test_column("payload", DataType::Binary, None)];
         let packed = crate::sql::literal::bytes_to_latin1_string(&[0xab, 0x01]);
         let source =
-            InsertSource::Values(vec![vec![crate::sql::parser::ast::Literal::String(packed)]]);
+            IcebergWriteInput::Rows(vec![vec![crate::sql::parser::ast::Literal::String(packed)]]);
 
         let query =
             append_source_to_query(&source, &[], &target_columns).expect("append source query");
@@ -2069,7 +2082,7 @@ mod tests {
             test_column("a", DataType::Int32, None),
             test_column("b", DataType::Int32, None),
         ];
-        let source = InsertSource::Values(vec![vec![
+        let source = IcebergWriteInput::Rows(vec![vec![
             crate::sql::parser::ast::Literal::Int(1),
             crate::sql::parser::ast::Literal::Int(2),
         ]]);
@@ -2089,7 +2102,7 @@ mod tests {
             test_column("b", DataType::Int32, Some(ColumnDefault::Int32(7))),
             test_column("c", DataType::Int32, None),
         ];
-        let source = InsertSource::FromQuery(Box::new(parse_query("SELECT x, y FROM src")));
+        let source = IcebergWriteInput::Query(Box::new(parse_query("SELECT x, y FROM src")));
 
         let query = append_source_to_query(
             &source,
@@ -2126,7 +2139,7 @@ mod tests {
                 None,
             ),
         ];
-        let source = InsertSource::FromQuery(Box::new(parse_query(
+        let source = IcebergWriteInput::Query(Box::new(parse_query(
             "SELECT idx FROM row_util ORDER BY idx LIMIT 1000",
         )));
 

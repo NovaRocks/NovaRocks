@@ -19,6 +19,8 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MvStorageEngine {
+    /// Legacy persisted state only. Native DDL rejects this value; future
+    /// StarRocks support must be represented by an external connector.
     StarRocks,
     Iceberg,
 }

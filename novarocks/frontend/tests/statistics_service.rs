@@ -340,18 +340,16 @@ fn analyze_engine_error_does_not_publish_partial_memory_rows() {
 }
 
 #[test]
-fn values_and_union_sources_preserve_numeric_min_max() {
+fn normalized_union_values_preserve_numeric_min_max() {
     let service = FrontendStatisticsService::new();
     let engine = FakeStatisticsEngine::with_local_columns(vec![StatisticsColumn {
         name: "k".to_string(),
         data_type: DataType::Int64,
     }]);
-    let source = StatisticsInsertSource::UnionAll(vec![
-        StatisticsInsertSource::Values(vec![
-            vec![StatisticsLiteral::Int(9)],
-            vec![StatisticsLiteral::Int(-3)],
-        ]),
-        StatisticsInsertSource::SelectLiteralRow(vec![StatisticsLiteral::Int(4)]),
+    let source = StatisticsInsertSource::Values(vec![
+        vec![StatisticsLiteral::Int(9)],
+        vec![StatisticsLiteral::Int(-3)],
+        vec![StatisticsLiteral::Int(4)],
     ]);
     service
         .observe_insert(

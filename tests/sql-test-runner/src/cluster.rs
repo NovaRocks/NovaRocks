@@ -785,12 +785,10 @@ pub(crate) fn resolve_base_app_config_path(
         }
     }
 
-    let fallback = repo_root.join("tests/sql-test-runner/conf/standalone_managed_lake.toml");
-    if fallback.is_file() {
-        return Ok(fallback);
-    }
-
-    bail!("failed to locate standalone config for cross-process mode")
+    bail!(
+        "failed to locate standalone config for cross-process mode under {}",
+        repo_root.display()
+    )
 }
 
 /// Render the per-process TOML config for cross-process mode.
@@ -884,14 +882,12 @@ pub(crate) fn render_cross_process_config(
 /// The override targets `[metadata].path` — the key read by
 /// `open_metadata_provider` via `MetadataConfig { provider, path }` — because
 /// that is where the IMV definition cache (and other standalone metadata)
-/// actually lives. This is deliberately **not**
-/// `[standalone_server].metadata_db_path`, which is a different, legacy
-/// managed-lake key unrelated to the `[metadata]` SQLite store that
-/// `restore_metadata_if_needed` / `rebuild_imv_cache_from_lake` operate on.
+/// actually lives. This is deliberately **not** the retired
+/// `[standalone_server].metadata_db_path` internal-table key.
 ///
 /// Used by the L2 cross-process empty-metadata statelessness harness to point
 /// a second FE launch at a fresh, empty SQLite path while keeping every other
-/// section (server ports, object store, warehouse) identical to a normal
+/// section (server ports and connector configuration) identical to a normal
 /// `render_cross_process_config` render — so the second launch talks to the
 /// same lake but starts with no cached IMV definitions.
 pub(crate) fn render_cross_process_config_with_metadata_db_override(
@@ -3081,10 +3077,9 @@ deployment_owner = "fe-1"
 
 [standalone_server]
 mysql_port = 9030
-warehouse_uri = "s3://warehouse/sql-tests"
 user = "root"
 
-[standalone_server.object_store]
+[connector.object_store]
 endpoint = "http://127.0.0.1:9000"
 access_key_id = "admin"
 enable_path_style_access = true
@@ -3119,7 +3114,7 @@ exec_node_output = true
             "MV StateStore must not share the legacy metadata SQLite path"
         );
         assert_eq!(
-            fe_value["standalone_server"]["object_store"]["endpoint"].as_str(),
+            fe_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
         assert_eq!(fe_value["debug"]["exec_node_output"].as_bool(), Some(true));
@@ -3156,7 +3151,7 @@ exec_node_output = true
             "BE rendering must not invent a separate MV StateStore"
         );
         assert_eq!(
-            be_value["standalone_server"]["object_store"]["endpoint"].as_str(),
+            be_value["connector"]["object_store"]["endpoint"].as_str(),
             Some("http://127.0.0.1:9000")
         );
         assert_eq!(be_value["debug"]["exec_node_output"].as_bool(), Some(true));
@@ -3246,9 +3241,9 @@ exec_node_output = true
     /// Locally-validated unit test for the M7 L2 harness helper: confirms the
     /// override lands on `[metadata].path` (the key `open_metadata_provider`
     /// actually reads via `MetadataConfig { provider, path }`) and leaves every
-    /// other section — server ports, cluster role/backends, object store,
-    /// warehouse — exactly as `render_cross_process_config` would have
-    /// produced them. This is the piece the harness can prove correct without
+    /// other section — server ports, cluster role/backends, and connector
+    /// object-store settings — exactly as `render_cross_process_config` would
+    /// have produced them. This is the piece the harness can prove correct without
     /// a live cluster; the L2 e2e (two cross-process launches over the same
     /// lake) is exercised in CI via `imv_stateless::run_imv_stateless_l2_case`.
     #[test]
@@ -3266,8 +3261,7 @@ exec_node_output = true
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
 
         // The override key: [metadata].path, NOT
-        // [standalone_server].metadata_db_path (a different, legacy
-        // managed-lake key from the archived W0 plan).
+        // [standalone_server].metadata_db_path (a retired internal-table key).
         assert_eq!(
             fe_value["metadata"]["path"].as_str(),
             Some("/new/empty.sqlite")
@@ -3293,14 +3287,7 @@ exec_node_output = true
             fe_value["standalone_server"]["mysql_port"],
             plain_fe_value["standalone_server"]["mysql_port"]
         );
-        assert_eq!(
-            fe_value["standalone_server"]["warehouse_uri"],
-            plain_fe_value["standalone_server"]["warehouse_uri"]
-        );
-        assert_eq!(
-            fe_value["standalone_server"]["object_store"],
-            plain_fe_value["standalone_server"]["object_store"]
-        );
+        assert_eq!(fe_value["connector"], plain_fe_value["connector"]);
         assert_eq!(fe_value["debug"], plain_fe_value["debug"]);
 
         // BE role also gets the override, independent of FE.
@@ -3369,18 +3356,6 @@ exec_node_output = true
         assert_ne!(
             first["state_store"]["path"], second["state_store"]["path"],
             "ephemeral clusters must not restore stale backend rows from another launch"
-        );
-        assert_eq!(
-            first["state_store"]["path"].as_str(),
-            first_runtime.join("state-store.sqlite").to_str()
-        );
-        assert_eq!(
-            second["state_store"]["path"].as_str(),
-            second_runtime.join("state-store.sqlite").to_str()
-        );
-        assert_ne!(
-            first["state_store"]["path"], second["state_store"]["path"],
-            "ephemeral clusters must not restore stale backend membership from another launch"
         );
         assert!(
             first["debug"].get("query_lifecycle_fault_dir").is_none(),
@@ -3459,22 +3434,8 @@ exec_node_output = true
         assert_ne!(cluster_a["metadata"]["path"], base["metadata"]["path"]);
         assert_ne!(cluster_b["metadata"]["path"], base["metadata"]["path"]);
         assert_ne!(cluster_a["metadata"]["path"], cluster_b["metadata"]["path"]);
-        assert_eq!(
-            cluster_a["standalone_server"]["warehouse_uri"],
-            base["standalone_server"]["warehouse_uri"]
-        );
-        assert_eq!(
-            cluster_b["standalone_server"]["warehouse_uri"],
-            base["standalone_server"]["warehouse_uri"]
-        );
-        assert_eq!(
-            cluster_a["standalone_server"]["object_store"],
-            base["standalone_server"]["object_store"]
-        );
-        assert_eq!(
-            cluster_b["standalone_server"]["object_store"],
-            base["standalone_server"]["object_store"]
-        );
+        assert_eq!(cluster_a["connector"], base["connector"]);
+        assert_eq!(cluster_b["connector"], base["connector"]);
     }
 
     #[test]

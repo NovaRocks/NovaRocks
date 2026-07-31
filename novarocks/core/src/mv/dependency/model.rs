@@ -29,6 +29,8 @@ pub enum MvDependencyObjectType {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MvDependencyStorageEngine {
+    /// Legacy serialized value retained for explicit rejection/migration.
+    /// It is not a native internal-table capability.
     StarRocks,
     Iceberg,
     ExternalTable,
@@ -104,6 +106,22 @@ pub(crate) fn iceberg_table_object_ref(
     }
 }
 
+pub(crate) fn external_table_object_ref(
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> MvDependencyObjectRef {
+    MvDependencyObjectRef {
+        catalog: Some(catalog.to_string()),
+        database_or_namespace: namespace.to_string(),
+        name: table.to_string(),
+        object_type: MvDependencyObjectType::Table,
+        storage_engine: MvDependencyStorageEngine::ExternalTable,
+    }
+}
+
+/// Build a legacy native StarRocks identity while reading persisted state.
+/// New connector-backed tables must use `external_table_object_ref`.
 pub(crate) fn starrocks_table_object_ref(database: &str, table: &str) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: None,

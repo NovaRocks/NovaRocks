@@ -1,8 +1,0 @@
-{
-  "type": "record",
-  "name": "StarRocksDatabaseNameLookup",
-  "namespace": "novarocks.meta.starrocks",
-  "fields": [
-    { "name": "id", "type": "long" }
-  ]
-}

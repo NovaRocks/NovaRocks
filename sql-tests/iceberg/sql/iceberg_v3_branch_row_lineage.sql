@@ -36,7 +36,7 @@ CREATE EXTERNAL CATALOG br_rl_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
   "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${starrocks_table_warehouse}/br_rl_${uuid0}",
+  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/br_rl_${uuid0}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "aws.s3.access_key" = "${oss_ak}",
   "aws.s3.secret_key" = "${oss_sk}",

@@ -1,9 +1,0 @@
-{
-  "type": "record",
-  "name": "StoredStarRocksDatabase",
-  "namespace": "novarocks.meta.starrocks",
-  "fields": [
-    { "name": "db_id", "type": "long" },
-    { "name": "name", "type": "string" }
-  ]
-}

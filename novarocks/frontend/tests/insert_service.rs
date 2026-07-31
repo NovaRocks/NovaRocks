@@ -21,16 +21,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::Int64Array;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::DataType;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::engine::insert_engine::{
-    AppendBatchRequest, AppendRowsRequest, IcebergInsertCommit, IcebergInsertOperation,
-    IcebergPreparedInsert, IcebergWriteReport, InsertEngine, InsertOverwriteMode,
-    InsertQueryRequest, InsertTargetBackend, InsertValue, PrepareIcebergInsert,
-    PreparedIcebergInsert, QueryInsertBatch, QueryInsertColumn, ResolveInsertTarget,
-    ResolvedInsertTarget,
+    IcebergInsertCommit, IcebergInsertOperation, IcebergInsertSource, IcebergPreparedInsert,
+    IcebergWriteReport, InsertEngine, InsertOverwriteMode, InsertValue, PrepareIcebergInsert,
+    PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
 use novarocks::engine::statistics::{
     CatalogTableStatistics, CollectedColumnStatistics, StatisticsColumn, StatisticsEngine,
@@ -57,20 +53,12 @@ enum Call {
         topology_revision: u64,
         deadline: Option<Instant>,
     },
-    AppendRows(Vec<Vec<InsertValue>>),
-    ExecuteQuery {
-        topology_revision: u64,
-        deadline: Option<Instant>,
-    },
-    AppendBatch {
-        rows: usize,
-        topology_revision: u64,
-    },
     Prepare {
         target_ref: String,
         overwrite_mode: InsertOverwriteMode,
         topology_revision: u64,
         insert_columns: Vec<String>,
+        source: IcebergInsertSource,
     },
     Run,
     Commit,
@@ -109,7 +97,6 @@ impl IcebergInsertCommit for FakeCommit {
 struct FakeInsertEngine {
     target: Mutex<ResolvedInsertTarget>,
     calls: Mutex<Vec<Call>>,
-    query_result: Mutex<QueryInsertBatch>,
     write_behavior: Mutex<WriteBehavior>,
     commit_behavior: Mutex<CommitBehavior>,
     prepare_error: Mutex<Option<String>>,
@@ -120,20 +107,6 @@ impl FakeInsertEngine {
         Self {
             target: Mutex::new(target),
             calls: Mutex::new(Vec::new()),
-            query_result: Mutex::new(QueryInsertBatch {
-                columns: vec![QueryInsertColumn {
-                    name: "a".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                }],
-                batches: vec![
-                    RecordBatch::try_new(
-                        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
-                        vec![Arc::new(Int64Array::from(vec![5_i64]))],
-                    )
-                    .unwrap(),
-                ],
-            }),
             write_behavior: Mutex::new(WriteBehavior::Committable),
             commit_behavior: Mutex::new(CommitBehavior::Success),
             prepare_error: Mutex::new(None),
@@ -192,33 +165,6 @@ impl InsertEngine for FakeInsertEngine {
         Ok(self.target.lock().unwrap().clone())
     }
 
-    fn append_rows(&self, request: AppendRowsRequest) -> Result<(), String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(Call::AppendRows(request.rows));
-        Ok(())
-    }
-
-    fn execute_insert_query(
-        &self,
-        request: InsertQueryRequest,
-    ) -> Result<QueryInsertBatch, String> {
-        self.calls.lock().unwrap().push(Call::ExecuteQuery {
-            topology_revision: request.execution.topology().revision(),
-            deadline: request.execution.deadline(),
-        });
-        Ok(self.query_result.lock().unwrap().clone())
-    }
-
-    fn append_batch(&self, request: AppendBatchRequest) -> Result<(), String> {
-        self.calls.lock().unwrap().push(Call::AppendBatch {
-            rows: request.batch.num_rows(),
-            topology_revision: request.execution.topology().revision(),
-        });
-        Ok(())
-    }
-
     fn prepare_iceberg_write(
         &self,
         request: PrepareIcebergInsert,
@@ -228,6 +174,7 @@ impl InsertEngine for FakeInsertEngine {
             overwrite_mode: request.overwrite_mode,
             topology_revision: request.execution.topology().revision(),
             insert_columns: request.insert_columns,
+            source: request.source,
         });
         if let Some(message) = self.prepare_error.lock().unwrap().clone() {
             return Err(message);
@@ -385,6 +332,12 @@ impl FakeJournal {
             .map(|operation| operation.state)
             .collect()
     }
+
+    fn only_operation(&self) -> StoredOperation {
+        let operations = self.operations.lock().unwrap();
+        assert_eq!(operations.len(), 1, "expected exactly one DML operation");
+        operations.values().next().unwrap().clone()
+    }
 }
 
 impl OperationJournal for FakeJournal {
@@ -483,18 +436,12 @@ fn column(name: &str, nullable: bool) -> ColumnDef {
     }
 }
 
-fn target(backend: InsertTargetBackend, supports_pipeline_insert: bool) -> ResolvedInsertTarget {
+fn target() -> ResolvedInsertTarget {
     ResolvedInsertTarget {
-        backend,
-        catalog: if backend == InsertTargetBackend::Iceberg {
-            "ice".to_string()
-        } else {
-            "default_catalog".to_string()
-        },
+        catalog: "ice".to_string(),
         namespace: "db".to_string(),
         table: "t".to_string(),
         columns: vec![column("a", false), column("b", true)],
-        supports_pipeline_insert,
     }
 }
 
@@ -525,7 +472,7 @@ fn service(journal: Option<Arc<FakeJournal>>, statistics: Arc<RecordingStatistic
 
 #[test]
 fn non_insert_returns_none_without_engine_calls() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Local, false));
+    let engine = FakeInsertEngine::new(target());
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     assert_eq!(
@@ -538,87 +485,14 @@ fn non_insert_returns_none_without_engine_calls() {
 }
 
 #[test]
-fn local_insert_without_state_store_is_reordered_and_appended() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Local, false));
-    let statistics = Arc::new(RecordingStatistics::new());
-    let (context, _, _) = context();
-    service(None, Arc::clone(&statistics))
-        .try_execute_insert(&engine, "INSERT INTO t (a) VALUES (7)", &context, None)
-        .unwrap();
-    assert_eq!(
-        engine.calls(),
-        vec![
-            Call::Resolve {
-                target: vec!["t".to_string()],
-                topology_revision: 91,
-                deadline: context.execution().deadline(),
-            },
-            Call::AppendRows(vec![vec![InsertValue::Int(7), InsertValue::Null]]),
-        ]
-    );
-    assert_eq!(statistics.insert_count.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn starrocks_insert_without_state_store_executes_aligns_then_appends_batch() {
-    let mut resolved = target(InsertTargetBackend::StarRocks, true);
+fn union_all_commits_once_in_source_order() {
+    let mut resolved = target();
     resolved.columns = vec![column("a", false)];
     let engine = FakeInsertEngine::new(resolved);
-    let statistics = Arc::new(RecordingStatistics::new());
-    let (context, _, deadline) = context();
-    service(None, statistics)
-        .try_execute_insert(
-            &engine,
-            "INSERT INTO t (a) SELECT a FROM src",
-            &context,
-            None,
-        )
-        .unwrap();
-    assert_eq!(
-        engine.calls(),
-        vec![
-            Call::Resolve {
-                target: vec!["t".to_string()],
-                topology_revision: 91,
-                deadline: Some(deadline),
-            },
-            Call::ExecuteQuery {
-                topology_revision: 91,
-                deadline: Some(deadline),
-            },
-            Call::AppendBatch {
-                rows: 1,
-                topology_revision: 91,
-            },
-        ]
-    );
-}
-
-#[test]
-fn unsupported_pipeline_insert_fails_before_query_execution() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Local, false));
+    let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    let error = service(None, statistics)
-        .try_execute_insert(
-            &engine,
-            "INSERT INTO t SELECT a, b FROM src",
-            &context,
-            None,
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("does not support INSERT SELECT"));
-    assert_eq!(engine.calls().len(), 1);
-}
-
-#[test]
-fn union_all_dispatches_parts_in_source_order() {
-    let mut resolved = target(InsertTargetBackend::Local, false);
-    resolved.columns = vec![column("a", false)];
-    let engine = FakeInsertEngine::new(resolved);
-    let statistics = Arc::new(RecordingStatistics::new());
-    let (context, _, _) = context();
-    service(None, statistics)
+    service(Some(Arc::clone(&journal)), statistics)
         .try_execute_insert(
             &engine,
             "INSERT INTO t SELECT 1 UNION ALL SELECT 2",
@@ -626,48 +500,32 @@ fn union_all_dispatches_parts_in_source_order() {
             None,
         )
         .unwrap();
-    let calls = engine.calls();
+    assert_eq!(journal.states(), vec![OperationState::Finalized]);
     assert_eq!(
-        &calls[1..],
-        &[
-            Call::AppendRows(vec![vec![InsertValue::Int(1)]]),
-            Call::AppendRows(vec![vec![InsertValue::Int(2)]]),
-        ]
+        engine
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, Call::Prepare { .. }))
+            .count(),
+        1
+    );
+    let Call::Prepare { source, .. } = engine
+        .calls()
+        .into_iter()
+        .find(|call| matches!(call, Call::Prepare { .. }))
+        .expect("prepare call")
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        source,
+        IcebergInsertSource::Rows(vec![vec![InsertValue::Int(1)], vec![InsertValue::Int(2)]])
     );
 }
 
 #[test]
-fn non_iceberg_overwrite_is_rejected() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::StarRocks, true));
-    let statistics = Arc::new(RecordingStatistics::new());
-    let (context, _, _) = context();
-    let error = service(None, statistics)
-        .try_execute_insert(&engine, "INSERT OVERWRITE t VALUES (1, 2)", &context, None)
-        .unwrap_err();
-    assert!(error.to_string().contains("only supported for iceberg"));
-    assert_eq!(engine.calls().len(), 1);
-}
-
-#[test]
-fn dynamic_overwrite_requires_iceberg() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Local, false));
-    let statistics = Arc::new(RecordingStatistics::new());
-    let (context, _, _) = context();
-    let error = service(None, statistics)
-        .try_execute_insert(
-            &engine,
-            "INSERT OVERWRITE PARTITIONS TABLE t SELECT 1, 2",
-            &context,
-            None,
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("OVERWRITE PARTITIONS"));
-    assert_eq!(engine.calls().len(), 1);
-}
-
-#[test]
 fn tag_target_is_read_only() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
+    let engine = FakeInsertEngine::new(target());
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     let error = service(Some(Arc::new(FakeJournal::default())), statistics)
@@ -687,7 +545,7 @@ fn tag_target_is_read_only() {
 
 #[test]
 fn branch_insert_requires_iceberg_v3() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
+    let engine = FakeInsertEngine::new(target());
     engine.set_prepare_error("iceberg ref: branch writes require Iceberg v3 tables");
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
@@ -707,8 +565,37 @@ fn branch_insert_requires_iceberg_v3() {
 }
 
 #[test]
+fn branch_insert_journals_the_prepared_branch_base_snapshot() {
+    let engine = FakeInsertEngine::new(target());
+    let journal = Arc::new(FakeJournal::default());
+    let statistics = Arc::new(RecordingStatistics::new());
+    let (context, _, _) = context();
+
+    service(Some(Arc::clone(&journal)), statistics)
+        .try_execute_insert(
+            &engine,
+            "INSERT INTO t.branch_dev VALUES (1, 2)",
+            &context,
+            None,
+        )
+        .expect("branch INSERT");
+
+    let operation = journal.only_operation();
+    assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
+    assert_eq!(operation.base_snapshot_id, Some(10));
+    assert_eq!(operation.state, OperationState::Finalized);
+    assert_eq!(
+        operation
+            .commit_outcome
+            .as_ref()
+            .map(|outcome| outcome.snapshot_id),
+        Some(11)
+    );
+}
+
+#[test]
 fn iceberg_without_journal_fails_before_prepare() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
+    let engine = FakeInsertEngine::new(target());
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     let error = service(None, Arc::clone(&statistics))
@@ -725,7 +612,7 @@ fn iceberg_without_journal_fails_before_prepare() {
 
 #[test]
 fn iceberg_append_empty_records_aborted_noop() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
+    let engine = FakeInsertEngine::new(target());
     engine.set_write_behavior(WriteBehavior::NoOp);
     let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());
@@ -740,7 +627,7 @@ fn iceberg_append_empty_records_aborted_noop() {
 
 #[test]
 fn iceberg_overwrite_empty_commits_and_finalizes() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
+    let engine = FakeInsertEngine::new(target());
     engine.set_write_behavior(WriteBehavior::NoOp);
     let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());
@@ -755,7 +642,7 @@ fn iceberg_overwrite_empty_commits_and_finalizes() {
 
 #[test]
 fn iceberg_commit_unknown_is_persisted_without_retry() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
+    let engine = FakeInsertEngine::new(target());
     engine.set_commit_behavior(CommitBehavior::Unknown);
     let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());
@@ -778,25 +665,10 @@ fn iceberg_commit_unknown_is_persisted_without_retry() {
 
 #[test]
 fn admitted_context_reaches_insert_select_and_iceberg_write() {
-    let mut starrocks_target = target(InsertTargetBackend::StarRocks, true);
-    starrocks_target.columns = vec![column("a", false)];
-    let starrocks = FakeInsertEngine::new(starrocks_target);
+    let mut resolved = target();
+    resolved.columns = vec![column("a", false)];
+    let iceberg = FakeInsertEngine::new(resolved);
     let statistics = Arc::new(RecordingStatistics::new());
-    let (query_context, _, deadline) = context();
-    service(None, Arc::clone(&statistics))
-        .try_execute_insert(
-            &starrocks,
-            "INSERT INTO t SELECT a FROM src",
-            &query_context,
-            None,
-        )
-        .unwrap();
-    assert!(starrocks.calls().iter().any(|call| matches!(
-        call,
-        Call::ExecuteQuery { topology_revision: 91, deadline: Some(value) } if *value == deadline
-    )));
-
-    let iceberg = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
     let (write_context, _, write_deadline) = context();
     service(
         Some(Arc::new(FakeJournal::default())),
@@ -804,7 +676,7 @@ fn admitted_context_reaches_insert_select_and_iceberg_write() {
     )
     .try_execute_insert(
         &iceberg,
-        "INSERT INTO t VALUES (1, 2)",
+        "INSERT INTO t SELECT a FROM src",
         &write_context,
         None,
     )
@@ -813,8 +685,9 @@ fn admitted_context_reaches_insert_select_and_iceberg_write() {
         call,
         Call::Prepare {
             topology_revision: 91,
+            insert_columns,
             ..
-        }
+        } if insert_columns.is_empty()
     )));
     assert!(iceberg.calls().iter().any(|call| matches!(
         call,
@@ -824,10 +697,11 @@ fn admitted_context_reaches_insert_select_and_iceberg_write() {
 
 #[test]
 fn statistics_runs_once_after_success() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Local, false));
+    let engine = FakeInsertEngine::new(target());
+    let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    service(None, Arc::clone(&statistics))
+    service(Some(journal), Arc::clone(&statistics))
         .try_execute_insert(
             &engine,
             "INSERT INTO t VALUES (1, 2), (3, 4)",
@@ -840,7 +714,7 @@ fn statistics_runs_once_after_success() {
 
 #[test]
 fn statistics_error_does_not_change_finalized_operation() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
+    let engine = FakeInsertEngine::new(target());
     let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());
     statistics.fail_insert();
@@ -863,7 +737,7 @@ fn statistics_error_does_not_change_finalized_operation() {
 
 #[test]
 fn writer_abort_is_recorded_without_commit() {
-    let engine = FakeInsertEngine::new(target(InsertTargetBackend::Iceberg, true));
+    let engine = FakeInsertEngine::new(target());
     engine.set_write_behavior(WriteBehavior::Aborted);
     let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());

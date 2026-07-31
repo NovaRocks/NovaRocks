@@ -364,39 +364,6 @@ fn build_row_routing_plan(
     })
 }
 
-/// Build a `RowRoutingPlan` for unpartitioned StarRocks tables where the
-/// caller already knows the tablet ids and which slot ids carry distribution
-/// keys. Used by the standalone StarRocks table insert path which bypasses the
-/// normal OLAP_TABLE_SINK partition/location metadata.
-pub(crate) fn build_unpartitioned_hash_routing(
-    tablet_ids: Vec<i64>,
-    distributed_slot_ids: Vec<SlotId>,
-    partition_id: i64,
-) -> Result<RowRoutingPlan, String> {
-    if tablet_ids.is_empty() {
-        return Err("StarRocks table insert routing requires at least one tablet".to_string());
-    }
-    let mut tablet_idx_by_id = HashMap::with_capacity(tablet_ids.len());
-    for (idx, tablet_id) in tablet_ids.iter().enumerate() {
-        tablet_idx_by_id.insert(*tablet_id, idx);
-    }
-    Ok(RowRoutingPlan {
-        tablet_ids: tablet_ids.clone(),
-        tablet_idx_by_id,
-        distributed_slot_ids,
-        partition_key_source: PartitionKeySource::None,
-        partition_key_len: 0,
-        partition_mode: PartitionMode::Unpartitioned,
-        partitions: vec![PartitionRoutingEntry {
-            partition_id,
-            tablet_ids,
-            start_key: None,
-            end_key: None,
-            in_keys: Vec::new(),
-        }],
-    })
-}
-
 fn build_location_only_row_routing(
     location: &SinkLocationDescriptor,
     distributed_slot_ids: Vec<SlotId>,

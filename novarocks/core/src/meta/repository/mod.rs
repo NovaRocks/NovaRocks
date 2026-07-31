@@ -22,27 +22,16 @@ use crate::meta::{MetaError, MetaErrorKind};
 pub mod iceberg_operation;
 pub mod id_scopes;
 pub mod job;
-pub mod starrocks_table;
-pub mod starrocks_txn;
 
 pub use crate::meta::payload::{decode_payload_for_kind, encode_record_payload};
 
 #[cfg(test)]
 pub(crate) mod test_avro_seed {
-    use std::fmt;
-
-    use serde::de::{Error as DeError, SeqAccess, Visitor};
-    use serde::ser::Serializer;
     use serde::{Deserialize, Serialize};
 
     use crate::meta::MetaPayload;
     use crate::meta::repository::iceberg_operation::StoredIcebergOperation;
     use crate::meta::repository::job::StoredEraseJob;
-    use crate::meta::repository::starrocks_table::{
-        StoredStarRocksColumn, StoredStarRocksDatabase, StoredStarRocksIndex,
-        StoredStarRocksPartition, StoredStarRocksTable, StoredStarRocksTablet,
-    };
-    use crate::meta::repository::starrocks_txn::StoredStarRocksTxn;
     use crate::meta::repository::{RepositoryError, RepositoryResult, encode_record_payload};
 
     pub(crate) fn encode_seed_payload(
@@ -50,14 +39,6 @@ pub(crate) mod test_avro_seed {
         payload: &serde_json::Value,
     ) -> RepositoryResult<MetaPayload> {
         match kind {
-            "starrocks.database" => encode_from_json::<StoredStarRocksDatabase>(kind, payload),
-            "starrocks.table" => encode_from_json::<StoredStarRocksTable>(kind, payload),
-            "starrocks.schema" => encode_from_json::<StoredStarRocksSchemaAvro>(kind, payload),
-            "starrocks.column" => encode_from_json::<StoredStarRocksColumn>(kind, payload),
-            "starrocks.partition" => encode_from_json::<StoredStarRocksPartition>(kind, payload),
-            "starrocks.index" => encode_from_json::<StoredStarRocksIndex>(kind, payload),
-            "starrocks.tablet" => encode_from_json::<StoredStarRocksTablet>(kind, payload),
-            "starrocks.txn" => encode_from_json::<StoredStarRocksTxn>(kind, payload),
             "job.erase" => encode_from_json::<StoredEraseJob>(kind, payload),
             "iceberg.operation" => encode_from_json::<StoredIcebergOperation>(kind, payload),
             _ => Err(RepositoryError::invalid(format!(
@@ -76,68 +57,6 @@ pub(crate) mod test_avro_seed {
             ))
         })?;
         encode_record_payload(kind, &value)
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    struct StoredStarRocksSchemaAvro {
-        schema_id: i64,
-        table_id: i64,
-        schema_version: i64,
-        #[serde(with = "avro_bytes_vec")]
-        tablet_schema_pb: Vec<u8>,
-    }
-
-    mod avro_bytes_vec {
-        use super::*;
-
-        pub fn serialize<S>(value: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            serializer.serialize_bytes(value)
-        }
-
-        pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            deserializer.deserialize_byte_buf(BytesVecVisitor)
-        }
-
-        struct BytesVecVisitor;
-
-        impl<'de> Visitor<'de> for BytesVecVisitor {
-            type Value = Vec<u8>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("Avro bytes")
-            }
-
-            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                Ok(value.to_vec())
-            }
-
-            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                Ok(value)
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(byte) = seq.next_element::<u8>()? {
-                    bytes.push(byte);
-                }
-                Ok(bytes)
-            }
-        }
     }
 }
 

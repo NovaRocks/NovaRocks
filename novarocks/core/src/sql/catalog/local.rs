@@ -49,6 +49,14 @@ impl PlannerTableProvider for PlannerMemoryCatalog {
         table: &str,
     ) -> Result<ResolvedAnalyzerTable, String> {
         let planner = self.get(database, table)?;
+        if matches!(
+            planner.source,
+            crate::sql::planner::table::ScanSource::StarRocks { .. }
+        ) {
+            return Err(format!(
+                "StarRocks scan source {DEFAULT_CATALOG}.{database}.{table} requires an external connector binding; native planner catalogs cannot register internal StarRocks tables"
+            ));
+        }
         Ok(ResolvedAnalyzerTable::from_planner(
             Some(DEFAULT_CATALOG),
             database,
@@ -81,6 +89,7 @@ mod tests {
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
+    use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use novarocks_catalog::identifier::TableIdentity;
     use novarocks_catalog::memory::DEFAULT_DATABASE;
@@ -158,6 +167,22 @@ mod tests {
                 .expect("overwritten table")
                 .columns[0]
                 .nullable
+        );
+    }
+
+    #[test]
+    fn analyzer_lookup_rejects_internal_starrocks_table() {
+        let mut catalog = PlannerMemoryCatalog::default();
+        catalog
+            .register(DEFAULT_DATABASE, test_table("starrocks_tbl"))
+            .expect("register table");
+
+        let error = catalog
+            .resolve_table_for_analysis(None, DEFAULT_DATABASE, "starrocks_tbl")
+            .expect_err("native planner catalog must reject internal StarRocks tables");
+        assert_eq!(
+            error,
+            "StarRocks scan source default_catalog.default.starrocks_tbl requires an external connector binding; native planner catalogs cannot register internal StarRocks tables"
         );
     }
 
