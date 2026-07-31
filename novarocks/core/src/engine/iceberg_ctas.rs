@@ -40,10 +40,10 @@
 //! table.
 //!
 //! Phase-1 trade-off: the SELECT is executed twice — once here for schema
-//! inference (Step A) and once inside `execute_iceberg_insert_or_overwrite`
-//! for the actual data write (Steps C+D). This duplication avoids wiring
-//! chunk re-use through the insert path; a future optimisation can buffer
-//! the chunks from Step A and replay them without re-running the query.
+//! inference (Step A) and once inside CTAS-owned `execute_ctas_write` for the
+//! actual data write (Steps C+D). This duplication avoids wiring chunk re-use
+//! through the write path; a future optimisation can buffer the chunks from
+//! Step A and replay them without re-running the query.
 
 use std::sync::Arc;
 

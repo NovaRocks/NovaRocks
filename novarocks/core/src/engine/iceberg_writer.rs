@@ -223,7 +223,7 @@ fn prepare_iceberg_insert_distributed(
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
     };
-    let executor = DistributedInsertWriteExecutor {
+    let executor = PreparedIcebergWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
         query,
@@ -257,7 +257,7 @@ fn prepare_iceberg_insert_distributed(
 }
 
 pub(crate) struct PreparedIcebergInsertWrite {
-    executor: DistributedInsertWriteExecutor,
+    executor: PreparedIcebergWriteExecutor,
     spec: IcebergWriteTransactionSpec,
 }
 
@@ -301,7 +301,12 @@ impl PreparedIcebergInsertWrite {
     }
 }
 
-struct DistributedInsertWriteExecutor {
+/// Execution payload prepared behind the narrow `InsertEngine` port.
+///
+/// This type owns no SQL routing or application transaction policy. The
+/// frontend DML service drives production INSERT, while CTAS may explicitly
+/// compose the legacy transaction runner over the same prepared primitives.
+struct PreparedIcebergWriteExecutor {
     state: Arc<StandaloneState>,
     target: TargetBackend,
     query: sqlparser::ast::Query,
@@ -311,7 +316,7 @@ struct DistributedInsertWriteExecutor {
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
-impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
+impl IcebergWriteTransactionExecutor for PreparedIcebergWriteExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
@@ -343,11 +348,11 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
 }
 
 /// Build the `(query, sink_spec)` pair for an iceberg INSERT/OVERWRITE write
-/// without driving a transaction. The standalone INSERT path runs this through
-/// its own runner; the folded MERGE not-matched INSERT branch runs the same
-/// pair into a shared collector so the INSERT commits in the same snapshot as
-/// the matched branch. Factored out of `execute_iceberg_insert_distributed` so
-/// both callers share one query/sink construction (no semantic drift).
+/// without driving a transaction. The frontend INSERT adapter consumes this
+/// plan through its DML-owned runner; the folded MERGE not-matched INSERT
+/// branch runs the same pair into a shared collector so the INSERT commits in
+/// the same snapshot as the matched branch. Both callers share one query/sink
+/// construction to avoid semantic drift.
 pub(crate) fn build_insert_write_plan(
     target: &TargetBackend,
     resolved: &ResolvedTable,
