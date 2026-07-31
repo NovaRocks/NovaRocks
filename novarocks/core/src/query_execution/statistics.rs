@@ -21,12 +21,13 @@
 //! collection is internal distributed work whose output is handed back to the
 //! connector control plane, never encoded as client MySQL rows.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
-    StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsMetricRequest,
+    StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsMetric,
+    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue,
 };
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
@@ -195,6 +196,115 @@ pub struct ThetaSketchPartial {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThetaSketchFinal {
     estimate: f64,
+}
+
+/// Mergeable scalar partial for row/null/min/max/size collection. Numeric
+/// bounds are deliberately typed at the compiler boundary; unsupported input
+/// types must be reported as missing rather than coerced through strings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatisticsScalarPartial {
+    row_count: u64,
+    null_count: u64,
+    total_size: u64,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+}
+
+impl StatisticsScalarPartial {
+    pub fn try_new(
+        row_count: u64,
+        null_count: u64,
+        total_size: u64,
+        minimum: Option<f64>,
+        maximum: Option<f64>,
+    ) -> Result<Self, DistributedQueryError> {
+        if null_count > row_count {
+            return Err(contract_violation(
+                "statistics null count exceeds row count",
+            ));
+        }
+        if minimum.is_some_and(|value| !value.is_finite())
+            || maximum.is_some_and(|value| !value.is_finite())
+            || matches!((minimum, maximum), (Some(minimum), Some(maximum)) if minimum > maximum)
+        {
+            return Err(contract_violation(
+                "statistics scalar bounds must be finite and ordered",
+            ));
+        }
+        Ok(Self {
+            row_count,
+            null_count,
+            total_size,
+            minimum,
+            maximum,
+        })
+    }
+
+    pub fn try_merge(
+        partials: impl IntoIterator<Item = Self>,
+    ) -> Result<Self, DistributedQueryError> {
+        let mut merged = Self::try_new(0, 0, 0, None, None)?;
+        for partial in partials {
+            merged.row_count = merged
+                .row_count
+                .checked_add(partial.row_count)
+                .ok_or_else(|| resource_exhausted("statistics row count overflow"))?;
+            merged.null_count = merged
+                .null_count
+                .checked_add(partial.null_count)
+                .ok_or_else(|| resource_exhausted("statistics null count overflow"))?;
+            merged.total_size = merged
+                .total_size
+                .checked_add(partial.total_size)
+                .ok_or_else(|| resource_exhausted("statistics total size overflow"))?;
+            merged.minimum = match (merged.minimum, partial.minimum) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (value @ Some(_), None) | (None, value @ Some(_)) => value,
+                (None, None) => None,
+            };
+            merged.maximum = match (merged.maximum, partial.maximum) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (value @ Some(_), None) | (None, value @ Some(_)) => value,
+                (None, None) => None,
+            };
+        }
+        Self::try_new(
+            merged.row_count,
+            merged.null_count,
+            merged.total_size,
+            merged.minimum,
+            merged.maximum,
+        )
+    }
+
+    pub fn metric_values(
+        &self,
+        metrics: impl IntoIterator<Item = StatisticsMetric>,
+    ) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricState>, DistributedQueryError> {
+        let mut output = BTreeMap::new();
+        for metric in metrics {
+            let value = match &metric {
+                StatisticsMetric::RowCount => StatisticsMetricValue::U64(self.row_count),
+                StatisticsMetric::NullCount { .. } => StatisticsMetricValue::U64(self.null_count),
+                StatisticsMetric::AverageSize { .. } => StatisticsMetricValue::F64(
+                    (self.row_count != 0)
+                        .then(|| self.total_size as f64 / self.row_count as f64)
+                        .unwrap_or(0.0),
+                ),
+                StatisticsMetric::Minimum { .. } => StatisticsMetricValue::F64(
+                    self.minimum
+                        .ok_or_else(|| contract_violation("statistics minimum is unavailable"))?,
+                ),
+                StatisticsMetric::Maximum { .. } => StatisticsMetricValue::F64(
+                    self.maximum
+                        .ok_or_else(|| contract_violation("statistics maximum is unavailable"))?,
+                ),
+                StatisticsMetric::ThetaNdv { .. } => continue,
+            };
+            output.insert(metric, StatisticsMetricState::Available(value));
+        }
+        Ok(output)
+    }
 }
 
 impl ThetaSketchPartial {
@@ -406,5 +516,43 @@ mod tests {
                 .copy_from_slice(&u64::MAX.to_be_bytes());
             assert!(ThetaSketchPartial::try_from_wire_bytes(&bytes).is_err());
         }
+    }
+
+    #[test]
+    fn scalar_partials_merge_row_null_bounds_and_size() {
+        let merged = StatisticsScalarPartial::try_merge([
+            StatisticsScalarPartial::try_new(3, 1, 30, Some(4.0), Some(9.0))
+                .expect("first partial"),
+            StatisticsScalarPartial::try_new(2, 0, 10, Some(1.0), Some(7.0))
+                .expect("second partial"),
+        ])
+        .expect("merge partials");
+        let values = merged
+            .metric_values([
+                StatisticsMetric::RowCount,
+                StatisticsMetric::NullCount { column: "v".into() },
+                StatisticsMetric::Minimum { column: "v".into() },
+                StatisticsMetric::Maximum { column: "v".into() },
+                StatisticsMetric::AverageSize { column: "v".into() },
+            ])
+            .expect("metric values");
+        assert_eq!(
+            values.get(&StatisticsMetric::RowCount),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::U64(5)
+            ))
+        );
+        assert_eq!(
+            values.get(&StatisticsMetric::Minimum { column: "v".into() }),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::F64(1.0)
+            ))
+        );
+        assert_eq!(
+            values.get(&StatisticsMetric::Maximum { column: "v".into() }),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::F64(9.0)
+            ))
+        );
     }
 }
