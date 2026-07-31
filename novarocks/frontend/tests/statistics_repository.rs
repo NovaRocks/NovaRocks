@@ -169,6 +169,30 @@ struct SucceedingStatisticsExecutor {
     published: AtomicUsize,
 }
 
+struct TransientlyFailingStatisticsExecutor {
+    attempts: AtomicUsize,
+}
+
+impl StatisticsAttemptExecutor for TransientlyFailingStatisticsExecutor {
+    fn collect(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+    ) -> Result<(), StatisticsAttemptError> {
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+        Err(StatisticsAttemptError::transient(
+            StatisticsJobErrorKind::Collection,
+            "temporary collector outage",
+        ))
+    }
+
+    fn publish_or_reconcile(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+    ) -> Result<(), StatisticsAttemptError> {
+        panic!("collection failure must not enter publish")
+    }
+}
+
 impl StatisticsAttemptExecutor for SucceedingStatisticsExecutor {
     fn collect(
         &self,
@@ -296,6 +320,46 @@ async fn worker_reconciles_publishing_without_recollecting() {
     worker.shutdown().expect("shutdown worker");
     assert_eq!(concrete_executor.collected.load(Ordering::Acquire), 0);
     assert_eq!(concrete_executor.published.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_retries_transient_collection_at_most_three_times_with_one_operation() {
+    let (_temp, _store, repository) = fixture().await;
+    let created = repository
+        .create(request("retry_orders", 10))
+        .await
+        .expect("create job");
+    let concrete_executor = Arc::new(TransientlyFailingStatisticsExecutor {
+        attempts: AtomicUsize::new(0),
+    });
+    let executor: Arc<dyn StatisticsAttemptExecutor> = concrete_executor.clone();
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        Arc::new(repository.clone()),
+        Arc::downgrade(&executor),
+    )
+    .await
+    .expect("start worker");
+
+    let failed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = repository
+                .get(created.job_id)
+                .await
+                .expect("read job")
+                .expect("durable job");
+            if current.state == StatisticsJobState::Failed {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker must exhaust retries");
+    worker.shutdown().expect("shutdown worker");
+    assert_eq!(failed.operation_id, created.operation_id);
+    assert_eq!(failed.attempt, 3);
+    assert_eq!(concrete_executor.attempts.load(Ordering::Acquire), 3);
 }
 
 #[tokio::test]
