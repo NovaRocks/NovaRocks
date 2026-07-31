@@ -965,3 +965,50 @@ impl Drop for MutationLeaseRelease {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::{ConnectorMutationOperationId, ExternalMutationEvidence};
+    use crate::connector::{
+        ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorProviderId,
+    };
+
+    fn evidence() -> ExternalMutationEvidence {
+        ExternalMutationEvidence::try_new(
+            1,
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                instance_id: ConnectorInstanceId::parse("analytics").expect("instance ID"),
+            },
+            ConnectorInstanceIncarnation::new(),
+            ConnectorMutationOperationId::new(),
+            "statistics-publish",
+            Bytes::from_static(b"operation-specific-evidence"),
+        )
+        .expect("evidence")
+    }
+
+    #[test]
+    fn external_mutation_evidence_wire_round_trips_exactly() {
+        let evidence = evidence();
+        let wire = evidence.try_to_wire_v1().expect("encode evidence");
+        let decoded = ExternalMutationEvidence::try_from_wire_v1(&wire).expect("decode evidence");
+        assert_eq!(decoded, evidence);
+        assert_eq!(decoded.digest(), evidence.digest());
+    }
+
+    #[test]
+    fn external_mutation_evidence_wire_rejects_trailing_data() {
+        let mut wire = evidence()
+            .try_to_wire_v1()
+            .expect("encode evidence")
+            .to_vec();
+        wire.push(0);
+        let error = ExternalMutationEvidence::try_from_wire_v1(&wire)
+            .expect_err("trailing bytes must not be accepted");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+}
