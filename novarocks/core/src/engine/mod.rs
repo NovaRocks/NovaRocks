@@ -1287,18 +1287,6 @@ impl StandaloneSession {
                 )
             }
             sqlast::Statement::Query(ref query) => {
-                if let Some(result) = self.inner.statistics_service.try_query(
-                    &normalized,
-                    query,
-                    statistics::StatisticsRequestContext {
-                        current_catalog,
-                        current_database,
-                    },
-                )? {
-                    return Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
-                        result: StatementResult::Query(result),
-                    }));
-                }
                 if let Some(result) =
                     self::information_schema::try_query_materialized_views(&self.inner, query)?
                 {
@@ -1344,9 +1332,6 @@ impl StandaloneSession {
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
                 );
-                self.inner
-                    .statistics_service
-                    .observe_query(&prepared, current_database)?;
                 let request = prepare_query_with_options_and_imv_validator_with_catalog_provider(
                     &prepared,
                     &analyzer_provider,
@@ -1608,21 +1593,6 @@ impl StandaloneSession {
                     );
                 }
             }
-        }
-        if let Some(result) = self.inner.statistics_service.try_handle_statement(
-            &self.inner,
-            &normalized,
-            statistics::StatisticsRequestContext {
-                current_catalog,
-                current_database,
-            },
-        )? {
-            return Ok(match result {
-                statistics::StatisticsStatementResult::Ok => StatementResult::Ok,
-                statistics::StatisticsStatementResult::Query(result) => {
-                    StatementResult::Query(result)
-                }
-            });
         }
         if let Some((target, source)) = parse_create_table_like(&normalized)? {
             return self.handle_create_table_like(
@@ -1922,16 +1892,6 @@ impl StandaloneSession {
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Query(ref query) => {
-                if let Some(result) = self.inner.statistics_service.try_query(
-                    &normalized,
-                    query,
-                    statistics::StatisticsRequestContext {
-                        current_catalog,
-                        current_database,
-                    },
-                )? {
-                    return Ok(StatementResult::Query(result));
-                }
                 if let Some(result) =
                     self::information_schema::try_query_materialized_views(&self.inner, query)?
                 {
@@ -1991,9 +1951,6 @@ impl StandaloneSession {
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
                 );
-                self.inner
-                    .statistics_service
-                    .observe_query(&prepared, current_database)?;
                 let result = execute_query_with_catalog_provider_with_execution(
                     &prepared,
                     &analyzer_provider,
@@ -2030,9 +1987,6 @@ impl StandaloneSession {
                     request_context.execution(),
                     &connector_context,
                 )?;
-                self.inner
-                    .statistics_service
-                    .observe_update(&normalized, current_database)?;
                 Ok(result)
             }
             ref merge_stmt @ sqlast::Statement::Merge(_) => {
@@ -2618,7 +2572,6 @@ impl StandaloneSession {
                     self.inner
                         .view_service
                         .drop_database("default_catalog", &database)?;
-                    self.inner.statistics_service.drop_database(&database);
                     return Ok(StatementResult::Ok);
                 }
                 let target = crate::engine::backend_resolver::resolve_namespace_target(
@@ -2637,9 +2590,6 @@ impl StandaloneSession {
                 self.inner
                     .view_service
                     .drop_database(&target.catalog, &target.namespace)?;
-                self.inner
-                    .statistics_service
-                    .drop_database(&target.namespace);
                 Ok(result)
             }
             DropResult::Table(stmt) => {
@@ -2652,17 +2602,6 @@ impl StandaloneSession {
                     stmt.force,
                     connector_context,
                 )?;
-                match stmt.name.parts.as_slice() {
-                    [table] => self
-                        .inner
-                        .statistics_service
-                        .drop_table(current_database, table),
-                    [database, table] => self.inner.statistics_service.drop_table(database, table),
-                    [_, database, table] => {
-                        self.inner.statistics_service.drop_table(database, table)
-                    }
-                    _ => {}
-                }
                 Ok(result)
             }
         }
