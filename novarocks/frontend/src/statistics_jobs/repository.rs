@@ -139,6 +139,7 @@ impl StatisticsJobRepository {
             metric_names: request.metric_names,
             state: StatisticsJobState::Submitted,
             attempt: 0,
+            retry_not_before_ms: None,
             error: None,
             submitted_at_ms: request.submitted_at_ms,
             updated_at_ms: request.submitted_at_ms,
@@ -269,6 +270,7 @@ impl StatisticsJobRepository {
             None,
             Some(fence),
             true,
+            None,
         )
         .await
         .map(Some)
@@ -283,8 +285,17 @@ impl StatisticsJobRepository {
         error: Option<StatisticsJobError>,
         fence: &FenceValidator,
     ) -> RepositoryResult<StatisticsJob> {
-        self.transition_with_fence(job_id, expected, next, now_ms, error, Some(fence), false)
-            .await
+        self.transition_with_fence(
+            job_id,
+            expected,
+            next,
+            now_ms,
+            error,
+            Some(fence),
+            false,
+            None,
+        )
+        .await
     }
 
     /// Replays an incomplete attempt after frontend failover. Only preparation
@@ -313,6 +324,7 @@ impl StatisticsJobRepository {
             None,
             Some(fence),
             false,
+            None,
         )
         .await
         .map(Some)
@@ -341,6 +353,35 @@ impl StatisticsJobRepository {
             None,
             Some(fence),
             false,
+            None,
+        )
+        .await
+    }
+
+    /// Requeues a transient collection failure with a durable retry deadline.
+    /// The deadline is atomically written with the CAS and fence validation,
+    /// so frontend failover cannot convert backoff into an immediate retry.
+    pub async fn retry_running(
+        &self,
+        job_id: Uuid,
+        now_ms: i64,
+        retry_not_before_ms: i64,
+        fence: &FenceValidator,
+    ) -> RepositoryResult<StatisticsJob> {
+        if retry_not_before_ms <= now_ms {
+            return Err(StatisticsJobRepositoryError::corruption(
+                "statistics retry deadline must be after transition time",
+            ));
+        }
+        self.transition_with_fence(
+            job_id,
+            StatisticsJobState::Running,
+            StatisticsJobState::Submitted,
+            now_ms,
+            None,
+            Some(fence),
+            false,
+            Some(retry_not_before_ms),
         )
         .await
     }
@@ -354,6 +395,7 @@ impl StatisticsJobRepository {
         error: Option<StatisticsJobError>,
         fence: Option<&FenceValidator>,
         increment_attempt: bool,
+        retry_not_before_ms: Option<i64>,
     ) -> RepositoryResult<StatisticsJob> {
         if !expected.can_transition_to(next) {
             return Err(invalid_transition(job_id, expected, next));
@@ -390,6 +432,7 @@ impl StatisticsJobRepository {
         stored.state = next;
         stored.updated_at_ms = now_ms;
         stored.error = error;
+        stored.retry_not_before_ms = retry_not_before_ms;
         if increment_attempt {
             stored.attempt = stored.attempt.checked_add(1).ok_or_else(|| {
                 StatisticsJobRepositoryError::corruption("statistics job attempt overflow")

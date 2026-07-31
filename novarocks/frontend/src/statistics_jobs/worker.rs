@@ -50,6 +50,8 @@ pub const STATISTICS_MAX_CLOCK_SKEW: Duration = Duration::from_secs(1);
 pub const STATISTICS_TAKEOVER_OBSERVATION: Duration = Duration::from_secs(2);
 const STATISTICS_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_STATISTICS_ATTEMPTS: u32 = 3;
+const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// An execution error whose retry semantics are explicit. A publish outcome
 /// that may have reached the connector is never retried by this worker: its
@@ -322,6 +324,12 @@ async fn process_submitted(
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
+        if job
+            .retry_not_before_ms
+            .is_some_and(|deadline| deadline > now_unix_millis())
+        {
+            continue;
+        }
         let Some(executor) = executor.upgrade() else {
             return Ok(());
         };
@@ -441,28 +449,49 @@ async fn resolve_collection_error(
     error: StatisticsAttemptError,
     fence: &FenceValidator,
 ) -> Result<(), String> {
-    let next = if error.transient && job.attempt < MAX_STATISTICS_ATTEMPTS {
-        StatisticsJobState::Submitted
-    } else {
-        StatisticsJobState::Failed
-    };
-    repository
-        .transition(
-            job.job_id,
-            StatisticsJobState::Running,
-            next,
-            now_unix_millis(),
-            (next == StatisticsJobState::Failed).then(|| job_error(&error)),
-            fence,
-        )
-        .await
-        .map_err(|repository_error| {
-            format!(
-                "record collection failure for statistics job {} failed: {repository_error}",
-                job.job_id
+    if error.transient && job.attempt < MAX_STATISTICS_ATTEMPTS {
+        let now_ms = now_unix_millis();
+        repository
+            .retry_running(
+                job.job_id,
+                now_ms,
+                now_ms.saturating_add(retry_backoff(job.attempt).as_millis() as i64),
+                fence,
             )
-        })?;
+            .await
+            .map_err(|repository_error| {
+                format!(
+                    "schedule retry for statistics job {} failed: {repository_error}",
+                    job.job_id
+                )
+            })?;
+    } else {
+        repository
+            .transition(
+                job.job_id,
+                StatisticsJobState::Running,
+                StatisticsJobState::Failed,
+                now_unix_millis(),
+                Some(job_error(&error)),
+                fence,
+            )
+            .await
+            .map_err(|repository_error| {
+                format!(
+                    "record collection failure for statistics job {} failed: {repository_error}",
+                    job.job_id
+                )
+            })?;
+    }
     Ok(())
+}
+
+fn retry_backoff(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(5);
+    RETRY_BACKOFF_BASE
+        .checked_mul(1_u32 << exponent)
+        .unwrap_or(RETRY_BACKOFF_MAX)
+        .min(RETRY_BACKOFF_MAX)
 }
 
 async fn run_with_lease_renewal<F>(
