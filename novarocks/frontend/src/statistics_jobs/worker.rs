@@ -22,7 +22,8 @@
 //! It never opens writes or starts a restore: an existing coordination plane
 //! is respected exactly as it was found.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -34,7 +35,9 @@ use novarocks_state_store::coordination::{
 };
 use uuid::Uuid;
 
+use super::model::{StatisticsJob, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState};
 use super::repository::FenceValidator;
+use super::repository::StatisticsJobRepository;
 
 /// One process-wide lease protects all durable ANALYZE attempts for a frontend
 /// deployment. It is deliberately not keyed by table or session.
@@ -45,6 +48,467 @@ pub const STATISTICS_LEASE_DURATION: Duration = Duration::from_secs(15);
 pub const STATISTICS_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 pub const STATISTICS_MAX_CLOCK_SKEW: Duration = Duration::from_secs(1);
 pub const STATISTICS_TAKEOVER_OBSERVATION: Duration = Duration::from_secs(2);
+const STATISTICS_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_STATISTICS_ATTEMPTS: u32 = 3;
+
+/// An execution error whose retry semantics are explicit. A publish outcome
+/// that may have reached the connector is never retried by this worker: its
+/// operation ID must be reconciled from the `PUBLISHING` record instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsAttemptError {
+    pub kind: StatisticsJobErrorKind,
+    pub message: String,
+    pub transient: bool,
+    pub requires_reconcile: bool,
+}
+
+impl StatisticsAttemptError {
+    pub fn transient(kind: StatisticsJobErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            transient: true,
+            requires_reconcile: false,
+        }
+    }
+
+    pub fn permanent(kind: StatisticsJobErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            transient: false,
+            requires_reconcile: false,
+        }
+    }
+
+    pub fn reconcile(kind: StatisticsJobErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            transient: false,
+            requires_reconcile: true,
+        }
+    }
+}
+
+/// Connector-neutral execution owned by the frontend worker. Implementations
+/// receive the durable operation ID from `job` and must use it for all
+/// external collection/publish reconciliation.
+pub trait StatisticsAttemptExecutor: Send + Sync {
+    fn collect(&self, job: &StatisticsJob) -> Result<(), StatisticsAttemptError>;
+
+    fn publish_or_reconcile(&self, job: &StatisticsJob) -> Result<(), StatisticsAttemptError>;
+}
+
+/// Lifecycle owner for the durable statistics worker task.
+pub struct StatisticsAnalyzeWorker {
+    stop: Arc<AtomicBool>,
+    wakeup: Arc<tokio::sync::Notify>,
+    join: Option<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+impl StatisticsAnalyzeWorker {
+    pub async fn start(
+        runtime: &tokio::runtime::Handle,
+        repository: Arc<StatisticsJobRepository>,
+        executor: Weak<dyn StatisticsAttemptExecutor>,
+    ) -> Result<Self, String> {
+        let coordination = StatisticsAnalyzeWorkerCoordination::open(repository.store())
+            .await
+            .map_err(|error| format!("open statistics worker coordination failed: {error}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let wakeup = Arc::new(tokio::sync::Notify::new());
+        let join = runtime.spawn(run_worker(
+            repository,
+            executor,
+            coordination,
+            Arc::clone(&stop),
+            Arc::clone(&wakeup),
+        ));
+        Ok(Self {
+            stop,
+            wakeup,
+            join: Some(join),
+        })
+    }
+
+    pub fn wakeup(&self) {
+        self.wakeup.notify_one();
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        self.stop.store(true, Ordering::Release);
+        self.wakeup();
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        let joined = if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| runtime.block_on(join))
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("build statistics worker join runtime failed: {error}"))?
+                .block_on(join)
+        };
+        joined.map_err(|error| format!("statistics worker join failed: {error}"))?
+    }
+}
+
+async fn run_worker(
+    repository: Arc<StatisticsJobRepository>,
+    executor: Weak<dyn StatisticsAttemptExecutor>,
+    coordination: StatisticsAnalyzeWorkerCoordination,
+    stop: Arc<AtomicBool>,
+    wakeup: Arc<tokio::sync::Notify>,
+) -> Result<(), String> {
+    loop {
+        if stop.load(Ordering::Acquire) || executor.upgrade().is_none() {
+            return Ok(());
+        }
+        match coordination
+            .acquire()
+            .await
+            .map_err(|error| format!("acquire statistics worker lease failed: {error}"))?
+        {
+            AcquireOutcome::Acquired(mut guard) => {
+                let fence = StatisticsAnalyzeWorkerCoordination::fence_validator(guard.fence());
+                recover_incomplete(&repository, now_unix_millis(), &fence).await?;
+                let result = reconcile_publishing(
+                    repository.as_ref(),
+                    &executor,
+                    &mut guard,
+                    &fence,
+                    stop.as_ref(),
+                )
+                .await;
+                let result = match result {
+                    Ok(()) => {
+                        process_submitted(
+                            repository.as_ref(),
+                            &executor,
+                            &mut guard,
+                            &fence,
+                            stop.as_ref(),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let release = guard.release(OperationId::new_v7()).await;
+                result?;
+                release
+                    .map_err(|error| format!("release statistics worker lease failed: {error}"))?;
+            }
+            AcquireOutcome::Contended(_) | AcquireOutcome::AwaitingTakeover(_) => {}
+        }
+        tokio::select! {
+            _ = wakeup.notified() => {}
+            _ = tokio::time::sleep(STATISTICS_WORKER_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+async fn recover_incomplete(
+    repository: &StatisticsJobRepository,
+    now_ms: i64,
+    fence: &FenceValidator,
+) -> Result<(), String> {
+    for state in [StatisticsJobState::Preparing, StatisticsJobState::Running] {
+        for job in repository
+            .list_by_state(state)
+            .await
+            .map_err(|error| format!("list recoverable statistics jobs failed: {error}"))?
+        {
+            repository
+                .requeue_incomplete(job.job_id, now_ms, fence)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "requeue incomplete statistics job {} failed: {error}",
+                        job.job_id
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_publishing(
+    repository: &StatisticsJobRepository,
+    executor: &Weak<dyn StatisticsAttemptExecutor>,
+    guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    fence: &FenceValidator,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let mut publishing = repository
+        .list_by_state(StatisticsJobState::Publishing)
+        .await
+        .map_err(|error| format!("list publishing statistics jobs failed: {error}"))?;
+    publishing.sort_by_key(|job| job.job_id);
+    for job in publishing {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(executor) = executor.upgrade() else {
+            return Ok(());
+        };
+        let outcome = run_with_lease_renewal(guard, {
+            let executor = Arc::clone(&executor);
+            let job = job.clone();
+            move || executor.publish_or_reconcile(&job)
+        })
+        .await;
+        match outcome {
+            Ok(()) => {
+                repository
+                    .transition(
+                        job.job_id,
+                        StatisticsJobState::Publishing,
+                        StatisticsJobState::Succeeded,
+                        now_unix_millis(),
+                        None,
+                        fence,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "finish reconciled statistics job {} failed: {error}",
+                            job.job_id
+                        )
+                    })?;
+            }
+            Err(error) if error.requires_reconcile => {
+                // The receipt remains uncertain; preserve PUBLISHING and let
+                // a future fenced owner retry reconciliation with exactly the
+                // same operation ID.
+            }
+            Err(error) => {
+                repository
+                    .transition(
+                        job.job_id,
+                        StatisticsJobState::Publishing,
+                        StatisticsJobState::Failed,
+                        now_unix_millis(),
+                        Some(job_error(&error)),
+                        fence,
+                    )
+                    .await
+                    .map_err(|repository_error| {
+                        format!(
+                            "fail reconciled statistics job {} failed: {repository_error}",
+                            job.job_id
+                        )
+                    })?;
+            }
+        };
+    }
+    Ok(())
+}
+
+async fn process_submitted(
+    repository: &StatisticsJobRepository,
+    executor: &Weak<dyn StatisticsAttemptExecutor>,
+    guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    fence: &FenceValidator,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let mut submitted = repository
+        .list_by_state(StatisticsJobState::Submitted)
+        .await
+        .map_err(|error| format!("list submitted statistics jobs failed: {error}"))?;
+    submitted.sort_by_key(|job| job.job_id);
+    for job in submitted {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(executor) = executor.upgrade() else {
+            return Ok(());
+        };
+        let Some(preparing) = repository
+            .claim(job.job_id, now_unix_millis(), fence)
+            .await
+            .map_err(|error| format!("claim statistics job {} failed: {error}", job.job_id))?
+        else {
+            continue;
+        };
+        let running = repository
+            .transition(
+                preparing.job_id,
+                StatisticsJobState::Preparing,
+                StatisticsJobState::Running,
+                now_unix_millis(),
+                None,
+                fence,
+            )
+            .await
+            .map_err(|error| {
+                format!("start statistics job {} failed: {error}", preparing.job_id)
+            })?;
+        let collect = run_with_lease_renewal(guard, {
+            let executor = Arc::clone(&executor);
+            let running = running.clone();
+            move || executor.collect(&running)
+        })
+        .await;
+        if let Err(error) = collect {
+            resolve_collection_error(repository, &running, error, fence).await?;
+            continue;
+        }
+        // An explicit cancellation can still win before PUBLISHING. Once the
+        // state crosses that boundary the repository returns a typed conflict.
+        let Some(current) = repository
+            .get(running.job_id)
+            .await
+            .map_err(|error| format!("read statistics job {} failed: {error}", running.job_id))?
+        else {
+            return Err(format!("statistics job {} disappeared", running.job_id));
+        };
+        if current.state == StatisticsJobState::Cancelled {
+            continue;
+        }
+        let publishing = repository
+            .transition(
+                running.job_id,
+                StatisticsJobState::Running,
+                StatisticsJobState::Publishing,
+                now_unix_millis(),
+                None,
+                fence,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "begin publish for statistics job {} failed: {error}",
+                    running.job_id
+                )
+            })?;
+        let publish = run_with_lease_renewal(guard, {
+            let executor = Arc::clone(&executor);
+            let publishing = publishing.clone();
+            move || executor.publish_or_reconcile(&publishing)
+        })
+        .await;
+        match publish {
+            Ok(()) => {
+                repository
+                    .transition(
+                        publishing.job_id,
+                        StatisticsJobState::Publishing,
+                        StatisticsJobState::Succeeded,
+                        now_unix_millis(),
+                        None,
+                        fence,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "finish statistics job {} failed: {error}",
+                            publishing.job_id
+                        )
+                    })?;
+            }
+            Err(error) if error.requires_reconcile => {
+                // Keep PUBLISHING durable. The next fenced worker must call
+                // `publish_or_reconcile` with this same operation ID.
+            }
+            Err(error) => {
+                repository
+                    .transition(
+                        publishing.job_id,
+                        StatisticsJobState::Publishing,
+                        StatisticsJobState::Failed,
+                        now_unix_millis(),
+                        Some(job_error(&error)),
+                        fence,
+                    )
+                    .await
+                    .map_err(|repository_error| {
+                        format!(
+                            "fail publish for statistics job {} failed: {repository_error}",
+                            publishing.job_id
+                        )
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_collection_error(
+    repository: &StatisticsJobRepository,
+    job: &StatisticsJob,
+    error: StatisticsAttemptError,
+    fence: &FenceValidator,
+) -> Result<(), String> {
+    let next = if error.transient && job.attempt < MAX_STATISTICS_ATTEMPTS {
+        StatisticsJobState::Submitted
+    } else {
+        StatisticsJobState::Failed
+    };
+    repository
+        .transition(
+            job.job_id,
+            StatisticsJobState::Running,
+            next,
+            now_unix_millis(),
+            (next == StatisticsJobState::Failed).then(|| job_error(&error)),
+            fence,
+        )
+        .await
+        .map_err(|repository_error| {
+            format!(
+                "record collection failure for statistics job {} failed: {repository_error}",
+                job.job_id
+            )
+        })?;
+    Ok(())
+}
+
+async fn run_with_lease_renewal<F>(
+    guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    work: F,
+) -> Result<(), StatisticsAttemptError>
+where
+    F: FnOnce() -> Result<(), StatisticsAttemptError> + Send + 'static,
+{
+    let mut task = tokio::task::spawn_blocking(work);
+    loop {
+        tokio::select! {
+            result = &mut task => {
+                return result.map_err(|error| StatisticsAttemptError::permanent(
+                    StatisticsJobErrorKind::Internal,
+                    format!("statistics attempt task failed: {error}"),
+                ))?;
+            }
+            _ = tokio::time::sleep(guard.renew_after()) => {
+                guard.renew(OperationId::new_v7()).await.map_err(|error| {
+                    StatisticsAttemptError::reconcile(
+                        StatisticsJobErrorKind::Internal,
+                        format!("statistics worker lease renewal failed: {error}"),
+                    )
+                })?;
+            }
+        }
+    }
+}
+
+fn job_error(error: &StatisticsAttemptError) -> StatisticsJobError {
+    StatisticsJobError {
+        kind: error.kind,
+        message: error.message.clone(),
+    }
+}
+
+fn now_unix_millis() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
 
 /// Production wall/monotonic clock for the statistics worker. Tests inject a
 /// deterministic `LeaseClock` directly through `open_with_clock`.

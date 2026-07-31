@@ -115,6 +115,10 @@ impl StatisticsJobRepository {
         Ok(repository)
     }
 
+    pub(crate) fn store(&self) -> Arc<dyn StateStore> {
+        Arc::clone(&self.store)
+    }
+
     pub async fn create(&self, request: StatisticsJobCreate) -> RepositoryResult<StatisticsJob> {
         self.create_with_fence(request, None).await
     }

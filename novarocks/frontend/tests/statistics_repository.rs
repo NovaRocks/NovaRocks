@@ -18,6 +18,7 @@
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -32,6 +33,9 @@ use novarocks_frontend::statistics_jobs::service::{
     AnalyzeTableStatement, ShowAnalyzeJobsStatement, ShowTableStatsStatement,
     StatisticsApplicationErrorKind, StatisticsApplicationService, StatisticsStatement,
     StatisticsStatementResult, StatisticsTableStatRow, TableStatisticsReader,
+};
+use novarocks_frontend::statistics_jobs::worker::{
+    StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
 };
 use novarocks_spi::state_store::{
     Direction, FeDeploymentView, Key, KeyRange, RangeRequest, StateStore,
@@ -158,6 +162,140 @@ async fn records_are_versioned_durable_and_identical_analyze_requests_remain_dis
     for forbidden in ["artifact", "sketch", "runtime_handle", "record_batch"] {
         assert!(payloads.iter().all(|payload| !payload.contains(forbidden)));
     }
+}
+
+struct SucceedingStatisticsExecutor {
+    collected: AtomicUsize,
+    published: AtomicUsize,
+}
+
+impl StatisticsAttemptExecutor for SucceedingStatisticsExecutor {
+    fn collect(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+    ) -> Result<(), StatisticsAttemptError> {
+        self.collected.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn publish_or_reconcile(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+    ) -> Result<(), StatisticsAttemptError> {
+        self.published.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_claims_collects_and_publishes_under_the_fenced_lease() {
+    let (_temp, _store, repository) = fixture().await;
+    let job = repository
+        .create(request("worker_orders", 10))
+        .await
+        .expect("create job");
+    let concrete_executor = Arc::new(SucceedingStatisticsExecutor {
+        collected: AtomicUsize::new(0),
+        published: AtomicUsize::new(0),
+    });
+    let executor: Arc<dyn StatisticsAttemptExecutor> = concrete_executor.clone();
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        Arc::new(repository.clone()),
+        Arc::downgrade(&executor),
+    )
+    .await
+    .expect("start worker");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = repository
+                .get(job.job_id)
+                .await
+                .expect("read job")
+                .expect("durable job");
+            if current.state == StatisticsJobState::Succeeded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker must finish job");
+    worker.shutdown().expect("shutdown worker");
+
+    assert_eq!(concrete_executor.collected.load(Ordering::Acquire), 1);
+    assert_eq!(concrete_executor.published.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_reconciles_publishing_without_recollecting() {
+    let (_temp, _store, repository) = fixture().await;
+    let fence = always_valid_fence();
+    let created = repository
+        .create(request("publishing_orders", 10))
+        .await
+        .expect("create job");
+    repository
+        .claim(created.job_id, 11, &fence)
+        .await
+        .expect("claim job");
+    repository
+        .transition(
+            created.job_id,
+            StatisticsJobState::Preparing,
+            StatisticsJobState::Running,
+            12,
+            None,
+            &fence,
+        )
+        .await
+        .expect("run job");
+    repository
+        .transition(
+            created.job_id,
+            StatisticsJobState::Running,
+            StatisticsJobState::Publishing,
+            13,
+            None,
+            &fence,
+        )
+        .await
+        .expect("begin publish");
+
+    let concrete_executor = Arc::new(SucceedingStatisticsExecutor {
+        collected: AtomicUsize::new(0),
+        published: AtomicUsize::new(0),
+    });
+    let executor: Arc<dyn StatisticsAttemptExecutor> = concrete_executor.clone();
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        Arc::new(repository.clone()),
+        Arc::downgrade(&executor),
+    )
+    .await
+    .expect("start worker");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if repository
+                .get(created.job_id)
+                .await
+                .expect("read job")
+                .expect("durable job")
+                .state
+                == StatisticsJobState::Succeeded
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker must reconcile publishing job");
+    worker.shutdown().expect("shutdown worker");
+    assert_eq!(concrete_executor.collected.load(Ordering::Acquire), 0);
+    assert_eq!(concrete_executor.published.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test]
