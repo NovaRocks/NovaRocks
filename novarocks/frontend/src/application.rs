@@ -34,7 +34,9 @@ use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::query_control::FrontendQueryControl;
 use crate::statistics::FrontendStatisticsService;
 use crate::statistics_jobs::repository::StatisticsJobRepository;
-use crate::statistics_jobs::service::StatisticsApplicationService;
+use crate::statistics_jobs::service::{
+    FrontendStatisticsApplicationPort, StatisticsApplicationService,
+};
 use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
@@ -99,6 +101,7 @@ pub struct FrontendApplicationHost {
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
+    statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     table_maintenance_service:
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
@@ -144,6 +147,7 @@ impl FrontendApplicationHost {
             statistics_service: None,
             dml_service: None,
             statistics_application_service: None,
+            statistics_application_port: None,
             view_service: None,
             table_maintenance_service: None,
             mv_repository: None,
@@ -279,6 +283,10 @@ impl FrontendApplicationHost {
             },
             None => Some(Arc::new(StatisticsApplicationService::unavailable())),
         };
+        host.statistics_application_port = Some(Arc::new(FrontendStatisticsApplicationPort::new(
+            host.statistics_application_service().as_ref().clone(),
+            tokio::runtime::Handle::current(),
+        )));
 
         Ok(host)
     }
@@ -311,6 +319,14 @@ impl FrontendApplicationHost {
             self.statistics_application_service
                 .as_ref()
                 .expect("statistics application service is installed before host open returns"),
+        )
+    }
+
+    pub fn statistics_application_port(&self) -> Arc<FrontendStatisticsApplicationPort> {
+        Arc::clone(
+            self.statistics_application_port
+                .as_ref()
+                .expect("statistics application port is installed before host open returns"),
         )
     }
 
@@ -532,6 +548,7 @@ impl FrontendApplicationHost {
         // its repository, so it must be released before StateStoreHost closes
         // its deployment lock.
         self.statistics_application_service.take();
+        self.statistics_application_port.take();
         self.view_service.take();
         self.mv_application_service.take();
         self.mv_repository.take();
