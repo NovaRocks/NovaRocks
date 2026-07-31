@@ -30,7 +30,10 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan,
     ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ExternalMutationOutcome,
+    ConnectorStatistics, ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTableRequest, ExternalMutationOutcome, StatisticsAccuracy, StatisticsCoverage,
+    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetricRequest,
+    StatisticsProvenance, StatisticsReadRequest, StatisticsReader,
 };
 
 struct TestControl {
@@ -177,6 +180,63 @@ fn binding_with_mutation(incarnation: u8) -> ConnectorControlBinding {
     .expect("control binding with mutation")
 }
 
+struct TestStatistics {
+    descriptor: ConnectorInstanceDescriptor,
+    incarnation: ConnectorInstanceIncarnation,
+}
+
+impl StatisticsReader for TestStatistics {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn read_statistics(
+        &self,
+        _request: StatisticsReadRequest,
+    ) -> Result<StatisticsEvidence, ConnectorError> {
+        Ok(StatisticsEvidence {
+            data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1"))?,
+            evidence_revision: StatisticsEvidenceRevision::try_new(Bytes::from_static(
+                b"evidence-v1",
+            ))?,
+            coverage: StatisticsCoverage::Full,
+            accuracy: StatisticsAccuracy::Exact,
+            interval: None,
+            provenance: StatisticsProvenance::ProviderArtifact,
+            metrics: Default::default(),
+        })
+    }
+}
+
+impl ConnectorStatistics for TestStatistics {}
+
+fn binding_with_statistics(incarnation: u8) -> ConnectorControlBinding {
+    let binding = binding(incarnation);
+    let descriptor = binding.descriptor().clone();
+    let incarnation = binding.incarnation();
+    let provider = Arc::new(TestControl {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    });
+    ConnectorControlBinding::try_new_with_statistics(
+        descriptor.clone(),
+        incarnation,
+        provider.clone(),
+        provider.clone(),
+        provider,
+        None,
+        Some(Arc::new(TestStatistics {
+            descriptor,
+            incarnation,
+        })),
+    )
+    .expect("control binding with statistics")
+}
+
 #[derive(Default)]
 struct RecordingRetirementSink(Mutex<Vec<ConnectorControlRetirement>>);
 
@@ -242,6 +302,34 @@ fn mutation_lease_fences_retirement_and_missing_capability_is_unsupported() {
     drop(planning);
     assert!(host.take_ready_retires().expect("retire queue").is_empty());
     drop(mutation);
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+}
+
+#[test]
+fn statistics_lease_fences_retirement_and_missing_capability_is_unsupported() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    host.register(binding(7))
+        .expect("register no-statistics generation");
+    let error = match host.acquire_current_statistics(&instance_id) {
+        Ok(_) => panic!("missing capability must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    host.retire_current(&instance_id)
+        .expect("retire no-statistics generation");
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+
+    host.register(binding_with_statistics(8))
+        .expect("register replacement generation");
+    let lease = host
+        .acquire_current_statistics(&instance_id)
+        .expect("statistics lease");
+    assert!(!lease.supports_collection());
+    host.retire_current(&instance_id)
+        .expect("retire statistics generation");
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(lease);
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
 }
 

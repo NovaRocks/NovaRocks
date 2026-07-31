@@ -82,6 +82,7 @@ code-anchors:
 - ADR-0016 — Connector 为何共享逻辑 identity、但不共享 FE control 与 BE execution runtime（active）
 - ADR-0017 — Connector catalog mutation 为何使用 FE-only lease 与三态 external outcome（active）
 - ADR-0018 — 静态 Connector predicate 为何以 Exact/PruningOnly/Unsupported 协商、而不扩展 native wire（active）
+- ADR-0022 — Connector statistics capability 为何保持 FE-only、generation-fenced 且不进入 BE binding（active）
 
 ### distributed-query-lifecycle
 

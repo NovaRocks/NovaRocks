@@ -35,7 +35,8 @@ use novarocks_spi::connector::{
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType,
     ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorStatistics, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableRequest, StatisticsEvidence, StatisticsReadRequest,
     normalize_predicate_dispositions, validate_static_predicates,
 };
 
@@ -216,6 +217,60 @@ fn control_binding_rejects_metadata_owned_by_another_instance() {
         )
         .err()
         .expect("a host must not attach foreign metadata")
+        .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+}
+
+struct OwnerStatistics {
+    descriptor: ConnectorInstanceDescriptor,
+    incarnation: ConnectorInstanceIncarnation,
+}
+
+impl novarocks_spi::connector::StatisticsReader for OwnerStatistics {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn read_statistics(
+        &self,
+        _: StatisticsReadRequest,
+    ) -> Result<StatisticsEvidence, ConnectorError> {
+        unreachable!("control binding construction must not read statistics")
+    }
+}
+
+impl ConnectorStatistics for OwnerStatistics {}
+
+#[test]
+fn control_binding_rejects_statistics_owned_by_another_generation() {
+    let descriptor = descriptor("file");
+    let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+    let foreign = Arc::new(OwnerStatistics {
+        descriptor: descriptor.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+    });
+    assert_eq!(
+        ConnectorControlBinding::try_new_with_statistics(
+            descriptor.clone(),
+            incarnation,
+            Arc::new(OwnerMetadata::new("file")),
+            Arc::new(OwnerPlanning {
+                instance_id: descriptor.instance_id.clone(),
+            }),
+            Arc::new(OwnerDistribution {
+                descriptor,
+                incarnation,
+            }),
+            None,
+            Some(foreign),
+        )
+        .err()
+        .expect("a host must not attach foreign statistics")
         .kind(),
         ConnectorErrorKind::InvalidRequest
     );

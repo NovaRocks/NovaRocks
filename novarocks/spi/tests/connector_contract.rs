@@ -21,7 +21,9 @@ use novarocks_spi::connector::{
     ConnectorInstanceIncarnation, ConnectorMutationOperationId, ConnectorProviderId,
     ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
     ConnectorTableHandle, ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, StatisticsDataVersion, StatisticsEvidenceRevision,
+    StatisticsMetric, StatisticsMetricRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -238,4 +240,45 @@ fn refresh_publication_guard_is_bounded_stable_and_redacted() {
     let debug = format!("{guard:?}");
     assert!(debug.contains("token_len"));
     assert!(!debug.contains("secret-refresh-token"));
+}
+
+#[test]
+fn statistics_tokens_are_bounded_and_redacted() {
+    let version = StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-42"))
+        .expect("bounded data version");
+    let revision = StatisticsEvidenceRevision::try_new(Bytes::from_static(b"puffin-42"))
+        .expect("bounded evidence revision");
+    let debug = format!("{version:?} {revision:?}");
+    assert!(debug.contains("digest"));
+    assert!(!debug.contains("snapshot-42"));
+    assert!(!debug.contains("puffin-42"));
+
+    assert_eq!(
+        StatisticsDataVersion::try_new(Bytes::from(vec![
+            0;
+            MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES + 1
+        ]))
+        .expect_err("oversized token must fail")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
+}
+
+#[test]
+fn statistics_metric_request_requires_a_bounded_nonempty_typed_selection() {
+    assert_eq!(
+        StatisticsMetricRequest::try_new(vec![])
+            .expect_err("empty statistics request must fail")
+            .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+    assert_eq!(
+        StatisticsMetricRequest::try_new(vec![
+            StatisticsMetric::RowCount;
+            MAX_CONNECTOR_STATISTICS_METRICS + 1
+        ])
+        .expect_err("oversized statistics request must fail")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
 }

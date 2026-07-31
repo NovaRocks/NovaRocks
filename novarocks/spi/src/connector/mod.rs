@@ -26,6 +26,7 @@ mod metadata;
 mod mutation;
 mod predicate;
 mod read;
+mod statistics;
 mod write;
 
 pub mod conformance;
@@ -81,6 +82,17 @@ pub use read::{
     ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorReaderMetricsSnapshot,
     ConnectorScan, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult,
+};
+pub use statistics::{
+    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, StatisticsAccuracy,
+    StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
+    StatisticsCollectionResult, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric, StatisticsMetricError,
+    StatisticsMetricErrorKind, StatisticsMetricRequest, StatisticsMetricState,
+    StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
+    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
+    StatisticsReconcileRequest,
 };
 pub use write::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorBatchWriter, ConnectorOpenWriterRequest,
