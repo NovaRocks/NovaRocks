@@ -17,6 +17,8 @@
 
 use std::sync::Arc;
 
+use novarocks::engine::statistics::{EmptyStatisticsService, StatisticsService};
+
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
@@ -28,25 +30,44 @@ use crate::dml::runner::{AlwaysAdmit, WriteAdmission, WriteExecutor, WriteTransa
 /// admission) and drives write transactions. Constructed from narrow handles —
 /// never from the host or a service locator.
 pub struct DmlService {
-    journal: Arc<dyn OperationJournal>,
+    journal: Option<Arc<dyn OperationJournal>>,
+    statistics: Arc<dyn StatisticsService>,
     admission: Arc<dyn WriteAdmission>,
 }
 
 impl DmlService {
-    /// Build a service with single-FE (always-admit) admission.
+    /// Build a journal-backed service with no-op statistics.
+    ///
+    /// Production composition uses [`Self::compose`]; this constructor keeps
+    /// the statement-agnostic DML-1 runner usable in focused tests.
     pub fn new(journal: Arc<dyn OperationJournal>) -> Self {
+        Self::compose(Some(journal), Arc::new(EmptyStatisticsService))
+    }
+
+    /// Compose the production DML owner from optional StateStore capability
+    /// and the host-owned statistics service.
+    pub fn compose(
+        journal: Option<Arc<dyn OperationJournal>>,
+        statistics: Arc<dyn StatisticsService>,
+    ) -> Self {
         Self {
             journal,
+            statistics,
             admission: Arc::new(AlwaysAdmit),
         }
     }
 
     /// Build a service with a custom admission gate (CP-3 fencing).
     pub fn with_admission(
-        journal: Arc<dyn OperationJournal>,
+        journal: Option<Arc<dyn OperationJournal>>,
+        statistics: Arc<dyn StatisticsService>,
         admission: Arc<dyn WriteAdmission>,
     ) -> Self {
-        Self { journal, admission }
+        Self {
+            journal,
+            statistics,
+            admission,
+        }
     }
 
     /// Run one Iceberg write transaction with the given executor.
@@ -55,9 +76,21 @@ impl DmlService {
         spec: WriteTransactionSpec,
         executor: &E,
     ) -> Result<WriteTransactionOutcome, DmlError> {
-        let runner =
-            WriteTransactionRunner::new(self.journal.as_ref(), executor, self.admission.as_ref());
+        let journal = self.require_journal()?;
+        let runner = WriteTransactionRunner::new(journal, executor, self.admission.as_ref());
         runner.run(spec)
+    }
+
+    pub(crate) fn require_journal(&self) -> Result<&dyn OperationJournal, DmlError> {
+        self.journal.as_deref().ok_or_else(|| {
+            DmlError::journal_unavailable(
+                "state store is required for Iceberg INSERT; configure [state_store]",
+            )
+        })
+    }
+
+    pub(crate) fn statistics(&self) -> &dyn StatisticsService {
+        self.statistics.as_ref()
     }
 
     /// Load a stored operation by id.
@@ -65,12 +98,12 @@ impl DmlService {
         &self,
         operation_id: DmlOperationId,
     ) -> Result<Option<StoredOperation>, DmlError> {
-        self.journal.load(operation_id)
+        self.require_journal()?.load(operation_id)
     }
 
     /// List operations that have not reached a terminal state (recovery input).
     pub fn list_unfinished_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
-        self.journal.list_unfinished()
+        self.require_journal()?.list_unfinished()
     }
 }
 

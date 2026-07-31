@@ -18,7 +18,388 @@
 //! Frontend-owned INSERT command conversion and source shaping.
 
 mod command;
+mod iceberg;
 mod shaping;
+
+use novarocks::engine::insert_engine::{
+    AppendBatchRequest, AppendRowsRequest, IcebergInsertSource, InsertEngine, InsertOverwriteMode,
+    InsertQueryRequest, InsertTargetBackend, InsertTargetName, InsertValue, PrepareIcebergInsert,
+    ResolveInsertTarget, ResolvedInsertTarget,
+};
+use novarocks::engine::statistics::{
+    StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode,
+};
+use novarocks::query_execution::request_context::RequestContext;
+use novarocks::runtime::query_options::QueryOptions;
+
+use crate::dml::error::DmlError;
+use crate::dml::service::DmlService;
 
 pub use command::{InsertCommand, InsertCommandSource, convert_insert_command};
 pub use shaping::{align_query_batch_to_target, reorder_insert_rows};
+
+use self::iceberg::{IcebergInsertWriteExecutor, write_transaction_spec};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InsertTargetRef {
+    Main,
+    Branch(String),
+    Tag(String),
+}
+
+impl DmlService {
+    /// Recognize and execute one INSERT through the frontend application owner.
+    ///
+    /// `Ok(None)` means the SQL is not an INSERT and may be delegated to the
+    /// remaining core command kernel.
+    pub fn try_execute_insert(
+        &self,
+        engine: &dyn InsertEngine,
+        sql: &str,
+        context: &RequestContext,
+        query_options: Option<&QueryOptions>,
+    ) -> Result<Option<()>, DmlError> {
+        let Some(statement) = novarocks::engine::insert_engine::parse_insert_statement(sql)
+            .map_err(DmlError::executor)?
+        else {
+            return Ok(None);
+        };
+        let mut command = convert_insert_command(&statement).map_err(DmlError::executor)?;
+        let statistics_source = statistics_source(&command.source);
+        let (target, target_ref) = split_target_ref(&command.target).map_err(DmlError::executor)?;
+        command.target = target.clone();
+
+        let session = context.session();
+        let resolved = engine
+            .resolve_target(ResolveInsertTarget {
+                current_catalog: session.current_catalog().map(ToOwned::to_owned),
+                current_database: session.current_database().to_string(),
+                target,
+                query_options: query_options.cloned(),
+                execution: context.execution().clone(),
+            })
+            .map_err(DmlError::executor)?;
+        validate_target(
+            &resolved,
+            command.overwrite_mode,
+            &target_ref,
+            &command.source,
+        )
+        .map_err(DmlError::executor)?;
+        self.execute_source(
+            engine,
+            &resolved,
+            &command.columns,
+            &command.source,
+            command.overwrite_mode,
+            &target_ref,
+            context,
+            query_options,
+        )?;
+
+        let statistics_overwrite_mode = match command.overwrite_mode {
+            InsertOverwriteMode::Append => StatisticsOverwriteMode::Append,
+            InsertOverwriteMode::FullTable => StatisticsOverwriteMode::FullTable,
+            InsertOverwriteMode::DynamicPartitions => StatisticsOverwriteMode::DynamicPartitions,
+        };
+        self.statistics()
+            .observe_insert(
+                engine,
+                StatisticsInsertObservation {
+                    database: &resolved.namespace,
+                    table: &resolved.table,
+                    insert_columns: &command.columns,
+                    source: &statistics_source,
+                    overwrite_mode: statistics_overwrite_mode,
+                },
+            )
+            .map_err(DmlError::executor)?;
+        Ok(Some(()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_source(
+        &self,
+        engine: &dyn InsertEngine,
+        target: &ResolvedInsertTarget,
+        insert_columns: &[String],
+        source: &InsertCommandSource,
+        overwrite_mode: InsertOverwriteMode,
+        target_ref: &InsertTargetRef,
+        context: &RequestContext,
+        query_options: Option<&QueryOptions>,
+    ) -> Result<(), DmlError> {
+        if target.backend == InsertTargetBackend::Iceberg {
+            return self.execute_iceberg_source(
+                engine,
+                target,
+                insert_columns,
+                source,
+                overwrite_mode,
+                target_ref,
+                context,
+                query_options,
+            );
+        }
+
+        match source {
+            InsertCommandSource::Values(rows) => {
+                self.append_rows(engine, target, insert_columns, rows, context, query_options)
+            }
+            InsertCommandSource::SelectLiteralRow(row) => self.append_rows(
+                engine,
+                target,
+                insert_columns,
+                std::slice::from_ref(row),
+                context,
+                query_options,
+            ),
+            InsertCommandSource::UnionAll(parts) => {
+                for part in parts {
+                    self.execute_source(
+                        engine,
+                        target,
+                        insert_columns,
+                        part,
+                        overwrite_mode,
+                        target_ref,
+                        context,
+                        query_options,
+                    )?;
+                }
+                Ok(())
+            }
+            InsertCommandSource::FromQuery(query) => {
+                if !target.supports_pipeline_insert {
+                    return Err(DmlError::executor(format!(
+                        "backend {:?} does not support INSERT SELECT",
+                        target.backend
+                    )));
+                }
+                let session = context.session();
+                let result = engine
+                    .execute_insert_query(InsertQueryRequest {
+                        current_catalog: session.current_catalog().map(ToOwned::to_owned),
+                        current_database: session.current_database().to_string(),
+                        query: query.clone(),
+                        query_options: query_options.cloned(),
+                        execution: context.execution().clone(),
+                    })
+                    .map_err(DmlError::executor)?;
+                let batch = align_query_batch_to_target(&result, insert_columns, &target.columns)
+                    .map_err(DmlError::executor)?;
+                engine
+                    .append_batch(AppendBatchRequest {
+                        target: target.clone(),
+                        batch,
+                        query_options: query_options.cloned(),
+                        execution: context.execution().clone(),
+                    })
+                    .map_err(DmlError::executor)
+            }
+        }
+    }
+
+    fn append_rows(
+        &self,
+        engine: &dyn InsertEngine,
+        target: &ResolvedInsertTarget,
+        insert_columns: &[String],
+        rows: &[Vec<InsertValue>],
+        context: &RequestContext,
+        query_options: Option<&QueryOptions>,
+    ) -> Result<(), DmlError> {
+        let rows = reorder_insert_rows(rows, insert_columns, &target.columns)
+            .map_err(DmlError::executor)?;
+        engine
+            .append_rows(AppendRowsRequest {
+                target: target.clone(),
+                rows,
+                query_options: query_options.cloned(),
+                execution: context.execution().clone(),
+            })
+            .map_err(DmlError::executor)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_iceberg_source(
+        &self,
+        engine: &dyn InsertEngine,
+        target: &ResolvedInsertTarget,
+        insert_columns: &[String],
+        source: &InsertCommandSource,
+        overwrite_mode: InsertOverwriteMode,
+        target_ref: &InsertTargetRef,
+        context: &RequestContext,
+        query_options: Option<&QueryOptions>,
+    ) -> Result<(), DmlError> {
+        self.require_journal()?;
+        if let InsertCommandSource::UnionAll(parts) = source {
+            for part in parts {
+                self.execute_iceberg_source(
+                    engine,
+                    target,
+                    insert_columns,
+                    part,
+                    overwrite_mode,
+                    target_ref,
+                    context,
+                    query_options,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let (source, prepared_insert_columns) = match source {
+            InsertCommandSource::Values(rows) => (
+                IcebergInsertSource::Rows(
+                    reorder_insert_rows(rows, insert_columns, &target.columns)
+                        .map_err(DmlError::executor)?,
+                ),
+                Vec::new(),
+            ),
+            InsertCommandSource::SelectLiteralRow(row) => (
+                IcebergInsertSource::Rows(
+                    reorder_insert_rows(std::slice::from_ref(row), insert_columns, &target.columns)
+                        .map_err(DmlError::executor)?,
+                ),
+                Vec::new(),
+            ),
+            InsertCommandSource::FromQuery(query) => (
+                IcebergInsertSource::Query(query.clone()),
+                insert_columns.to_vec(),
+            ),
+            InsertCommandSource::UnionAll(_) => unreachable!("handled above"),
+        };
+        let prepared = engine
+            .prepare_iceberg_write(PrepareIcebergInsert {
+                target: target.clone(),
+                insert_columns: prepared_insert_columns,
+                source,
+                overwrite_mode,
+                target_ref: match target_ref {
+                    InsertTargetRef::Main => "main".to_string(),
+                    InsertTargetRef::Branch(name) => name.clone(),
+                    InsertTargetRef::Tag(_) => unreachable!("tag rejected before execution"),
+                },
+                query_options: query_options.cloned(),
+                execution: context.execution().clone(),
+            })
+            .map_err(DmlError::executor)?;
+        let spec = write_transaction_spec(&prepared);
+        let executor = IcebergInsertWriteExecutor::new(engine, &prepared);
+        self.run_write(spec, &executor).map(|_| ())
+    }
+}
+
+fn split_target_ref(
+    target: &InsertTargetName,
+) -> Result<(InsertTargetName, InsertTargetRef), String> {
+    let Some(last) = target.parts.last() else {
+        return Err("INSERT target is empty".to_string());
+    };
+    let target_ref = if let Some(name) = last.strip_prefix("branch_")
+        && !name.is_empty()
+    {
+        Some(InsertTargetRef::Branch(name.to_string()))
+    } else if let Some(name) = last.strip_prefix("tag_")
+        && !name.is_empty()
+    {
+        Some(InsertTargetRef::Tag(name.to_string()))
+    } else {
+        None
+    };
+    let Some(target_ref) = target_ref else {
+        return Ok((target.clone(), InsertTargetRef::Main));
+    };
+    let parts = target.parts[..target.parts.len() - 1].to_vec();
+    if parts.is_empty() {
+        return Err("INSERT target is empty before Iceberg ref suffix".to_string());
+    }
+    Ok((InsertTargetName { parts }, target_ref))
+}
+
+fn validate_target(
+    target: &ResolvedInsertTarget,
+    overwrite_mode: InsertOverwriteMode,
+    target_ref: &InsertTargetRef,
+    source: &InsertCommandSource,
+) -> Result<(), String> {
+    if let InsertTargetRef::Tag(name) = target_ref {
+        return Err(format!(
+            "iceberg ref: tag '{name}' is read-only; use a branch as DML target"
+        ));
+    }
+    if matches!(target_ref, InsertTargetRef::Branch(_))
+        && target.backend != InsertTargetBackend::Iceberg
+    {
+        return Err(format!(
+            "iceberg ref: branch-qualified INSERT is only supported for iceberg backends, got `{:?}`",
+            target.backend
+        ));
+    }
+    if matches!(target_ref, InsertTargetRef::Branch(_))
+        && matches!(source, InsertCommandSource::UnionAll(_))
+    {
+        return Err(
+            "iceberg ref: branch-qualified INSERT does not support UNION ALL sources".to_string(),
+        );
+    }
+    if overwrite_mode == InsertOverwriteMode::DynamicPartitions
+        && target.backend != InsertTargetBackend::Iceberg
+    {
+        return Err(format!(
+            "INSERT OVERWRITE PARTITIONS is only supported for iceberg backends, target uses backend `{:?}`",
+            target.backend
+        ));
+    }
+    if overwrite_mode != InsertOverwriteMode::Append
+        && target.backend != InsertTargetBackend::Iceberg
+    {
+        return Err(format!(
+            "INSERT OVERWRITE is only supported for iceberg backends in phase 1, target uses backend `{:?}`",
+            target.backend
+        ));
+    }
+    Ok(())
+}
+
+fn statistics_source(source: &InsertCommandSource) -> StatisticsInsertSource {
+    match source {
+        InsertCommandSource::Values(rows) => StatisticsInsertSource::Values(
+            rows.iter()
+                .map(|row| row.iter().map(statistics_literal).collect())
+                .collect(),
+        ),
+        InsertCommandSource::SelectLiteralRow(row) => {
+            StatisticsInsertSource::SelectLiteralRow(row.iter().map(statistics_literal).collect())
+        }
+        InsertCommandSource::UnionAll(parts) => {
+            StatisticsInsertSource::UnionAll(parts.iter().map(statistics_source).collect())
+        }
+        InsertCommandSource::FromQuery(query) => StatisticsInsertSource::FromQuery(query.clone()),
+    }
+}
+
+fn statistics_literal(value: &InsertValue) -> StatisticsLiteral {
+    match value {
+        InsertValue::Null => StatisticsLiteral::Null,
+        InsertValue::Bool(value) => StatisticsLiteral::Bool(*value),
+        InsertValue::Int(value) => StatisticsLiteral::Int(*value),
+        InsertValue::Float(value) => StatisticsLiteral::Float(*value),
+        InsertValue::String(value) => StatisticsLiteral::String(value.clone()),
+        InsertValue::Date(value) => StatisticsLiteral::Date(value.clone()),
+        InsertValue::Array(values) => {
+            StatisticsLiteral::Array(values.iter().map(statistics_literal).collect())
+        }
+        InsertValue::Map(values) => StatisticsLiteral::Map(
+            values
+                .iter()
+                .map(|(key, value)| (statistics_literal(key), statistics_literal(value)))
+                .collect(),
+        ),
+        InsertValue::Struct(values) => {
+            StatisticsLiteral::Struct(values.iter().map(statistics_literal).collect())
+        }
+    }
+}
