@@ -25,6 +25,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use arrow::array::{
+    Array, ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
@@ -39,6 +45,7 @@ use novarocks_spi::connector::{
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
+use sha2::{Digest, Sha256};
 
 /// The longest independently owned durable ANALYZE attempt. A client wait
 /// deadline is intentionally not an attempt deadline.
@@ -354,6 +361,37 @@ pub struct StatisticsScalarPartial {
     maximum: Option<f64>,
 }
 
+/// Per-fragment Arrow collector used by the native statistics sink.  It is
+/// schema-bound at construction time, so logical metric names can never be
+/// rebound to a different scan projection after the connector's table pin
+/// has been resolved.
+pub struct StatisticsBatchCollector {
+    schema: SchemaRef,
+    metrics: StatisticsMetricRequest,
+    column_indexes: BTreeMap<std::sync::Arc<str>, usize>,
+    table_rows: u64,
+    columns: BTreeMap<std::sync::Arc<str>, StatisticsScalarAccumulator>,
+    theta: BTreeMap<std::sync::Arc<str>, StatisticsThetaAccumulator>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StatisticsScalarAccumulator {
+    row_count: u64,
+    null_count: u64,
+    total_size: u64,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+}
+
+/// Keeps one bounded Theta sketch per requested column.  Batch input may be
+/// arbitrarily large over the lifetime of a fragment, so retaining every
+/// hashed value until `finish` would turn an approximate metric into an
+/// unbounded memory sink.
+#[derive(Debug)]
+struct StatisticsThetaAccumulator {
+    sketch: ThetaSketch,
+}
+
 impl StatisticsScalarPartial {
     pub fn try_new(
         row_count: u64,
@@ -449,6 +487,318 @@ impl StatisticsScalarPartial {
         }
         Ok(output)
     }
+}
+
+impl StatisticsBatchCollector {
+    pub fn try_new(
+        schema: SchemaRef,
+        metrics: StatisticsMetricRequest,
+    ) -> Result<Self, DistributedQueryError> {
+        let mut column_indexes = BTreeMap::new();
+        for metric in metrics.metrics() {
+            let Some(column) = statistics_metric_column(metric) else {
+                continue;
+            };
+            let index = schema
+                .fields()
+                .iter()
+                .position(|field| field.name().eq_ignore_ascii_case(column))
+                .ok_or_else(|| {
+                    contract_violation(format!(
+                        "statistics scan schema does not contain requested column `{column}`"
+                    ))
+                })?;
+            column_indexes.insert(column.clone(), index);
+        }
+        let scalar_columns = metrics
+            .metrics()
+            .iter()
+            .filter_map(|metric| match metric {
+                StatisticsMetric::NullCount { column }
+                | StatisticsMetric::Minimum { column }
+                | StatisticsMetric::Maximum { column }
+                | StatisticsMetric::AverageSize { column } => Some(column.clone()),
+                StatisticsMetric::RowCount | StatisticsMetric::ThetaNdv { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let theta_columns = metrics
+            .metrics()
+            .iter()
+            .filter_map(|metric| match metric {
+                StatisticsMetric::ThetaNdv { column } => Some(column.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        Ok(Self {
+            schema,
+            metrics,
+            column_indexes,
+            table_rows: 0,
+            columns: scalar_columns
+                .into_iter()
+                .map(|column| (column, StatisticsScalarAccumulator::default()))
+                .collect(),
+            theta: theta_columns
+                .into_iter()
+                .map(|column| (column, StatisticsThetaAccumulator::new(12)))
+                .collect(),
+        })
+    }
+
+    pub fn push_batch(&mut self, batch: &RecordBatch) -> Result<(), DistributedQueryError> {
+        if batch.schema().as_ref() != self.schema.as_ref() {
+            return Err(contract_violation(
+                "statistics batch schema differs from the pinned scan schema",
+            ));
+        }
+        let rows = u64::try_from(batch.num_rows())
+            .map_err(|_| resource_exhausted("statistics batch row count exceeds u64"))?;
+        self.table_rows = self
+            .table_rows
+            .checked_add(rows)
+            .ok_or_else(|| resource_exhausted("statistics row count overflow"))?;
+        for (column, index) in &self.column_indexes {
+            let array = batch.column(*index);
+            if let Some(accumulator) = self.columns.get_mut(column) {
+                accumulator.push(array, rows)?;
+            }
+            if let Some(accumulator) = self.theta.get_mut(column) {
+                accumulator.push(array)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<StatisticsCollectionFinalizer, DistributedQueryError> {
+        let table = StatisticsScalarPartial::try_new(self.table_rows, 0, 0, None, None)?;
+        let mut finalizer = StatisticsCollectionFinalizer::default().with_table(table);
+        for (column, accumulator) in self.columns {
+            finalizer = finalizer.with_column(column, accumulator.finish()?);
+        }
+        for (column, accumulator) in self.theta {
+            finalizer = finalizer.with_theta(column, accumulator.finish()?);
+        }
+        // Keep the requested metric set in the collector state so accidental
+        // construction with an empty or replaced selection remains visible to
+        // the compiler and does not silently widen collection behavior.
+        debug_assert!(!self.metrics.metrics().is_empty());
+        Ok(finalizer)
+    }
+}
+
+impl StatisticsScalarAccumulator {
+    fn push(&mut self, array: &ArrayRef, rows: u64) -> Result<(), DistributedQueryError> {
+        self.row_count = self
+            .row_count
+            .checked_add(rows)
+            .ok_or_else(|| resource_exhausted("statistics row count overflow"))?;
+        self.null_count = self
+            .null_count
+            .checked_add(
+                u64::try_from(array.null_count())
+                    .map_err(|_| resource_exhausted("statistics null count exceeds u64"))?,
+            )
+            .ok_or_else(|| resource_exhausted("statistics null count overflow"))?;
+        self.total_size = self
+            .total_size
+            .checked_add(estimated_value_bytes(array)?)
+            .ok_or_else(|| resource_exhausted("statistics total size overflow"))?;
+        for value in array_numeric_values(array)? {
+            self.minimum = Some(self.minimum.map_or(value, |current| current.min(value)));
+            self.maximum = Some(self.maximum.map_or(value, |current| current.max(value)));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<StatisticsScalarPartial, DistributedQueryError> {
+        StatisticsScalarPartial::try_new(
+            self.row_count,
+            self.null_count,
+            self.total_size,
+            self.minimum,
+            self.maximum,
+        )
+    }
+}
+
+impl StatisticsThetaAccumulator {
+    fn new(lg_k: u8) -> Self {
+        debug_assert!((5..=12).contains(&lg_k));
+        Self {
+            sketch: ThetaSketch::builder().lg_k(lg_k).build(),
+        }
+    }
+
+    fn push(&mut self, array: &ArrayRef) -> Result<(), DistributedQueryError> {
+        for hash in array_hashes(array)? {
+            // `ThetaSketch` performs bounded sampling internally. The SHA-256
+            // value keeps the Arrow representation out of the sketch's public
+            // hash domain and makes every supported scalar type deterministic.
+            self.sketch.update(hash as i64);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ThetaSketchPartial, DistributedQueryError> {
+        ThetaSketchPartial::try_from_sketch(self.sketch)
+    }
+}
+
+fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&std::sync::Arc<str>> {
+    match metric {
+        StatisticsMetric::RowCount => None,
+        StatisticsMetric::NullCount { column }
+        | StatisticsMetric::Minimum { column }
+        | StatisticsMetric::Maximum { column }
+        | StatisticsMetric::AverageSize { column }
+        | StatisticsMetric::ThetaNdv { column } => Some(column),
+    }
+}
+
+fn estimated_value_bytes(array: &ArrayRef) -> Result<u64, DistributedQueryError> {
+    let bytes = if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        array
+            .iter()
+            .flatten()
+            .map(|value| value.len() as u64)
+            .try_fold(0_u64, |total, value| total.checked_add(value).ok_or(()))
+            .map_err(|_| resource_exhausted("statistics string size overflow"))?
+    } else if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        array
+            .iter()
+            .flatten()
+            .map(|value| value.len() as u64)
+            .try_fold(0_u64, |total, value| total.checked_add(value).ok_or(()))
+            .map_err(|_| resource_exhausted("statistics string size overflow"))?
+    } else {
+        u64::try_from(array.get_array_memory_size())
+            .map_err(|_| resource_exhausted("statistics value size exceeds u64"))?
+    };
+    Ok(bytes)
+}
+
+fn array_numeric_values(array: &ArrayRef) -> Result<Vec<f64>, DistributedQueryError> {
+    macro_rules! values {
+        ($array:expr) => {
+            return Ok($array.iter().flatten().map(|value| value as f64).collect())
+        };
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Int8Array>() {
+        values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Int16Array>() {
+        values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
+        values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+        values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt8Array>() {
+        values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt16Array>() {
+        values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
+        values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(array.iter().flatten().map(|value| value as f64).collect());
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
+        return array
+            .iter()
+            .flatten()
+            .map(|value| {
+                let value = value as f64;
+                value
+                    .is_finite()
+                    .then_some(value)
+                    .ok_or_else(|| contract_violation("statistics numeric value is not finite"))
+            })
+            .collect();
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
+        return array
+            .iter()
+            .flatten()
+            .map(|value| {
+                value
+                    .is_finite()
+                    .then_some(value)
+                    .ok_or_else(|| contract_violation("statistics numeric value is not finite"))
+            })
+            .collect();
+    }
+    Ok(Vec::new())
+}
+
+fn array_hashes(array: &ArrayRef) -> Result<Vec<u64>, DistributedQueryError> {
+    let mut values = Vec::new();
+    macro_rules! hash_values {
+        ($array:expr) => {
+            for value in $array.iter().flatten() {
+                values.push(statistics_value_hash(&value.to_be_bytes()));
+            }
+            return Ok(values);
+        };
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Int8Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Int16Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt8Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt16Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
+        hash_values!(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        for value in array.iter().flatten() {
+            values.push(statistics_value_hash(value.as_bytes()));
+        }
+        return Ok(values);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        for value in array.iter().flatten() {
+            values.push(statistics_value_hash(value.as_bytes()));
+        }
+        return Ok(values);
+    }
+    Err(contract_violation(
+        "statistics Theta collection does not support the requested Arrow type",
+    ))
+}
+
+fn statistics_value_hash(bytes: &[u8]) -> u64 {
+    let digest = Sha256::digest(bytes);
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest has at least eight bytes"),
+    )
 }
 
 /// Typed finalization input for a visible-row collection. The table scalar is
@@ -982,6 +1332,34 @@ impl ThetaSketchPartial {
         for value in values {
             sketch.update(value);
         }
+        Self::try_from_sketch(sketch)
+    }
+
+    /// Build a Theta partial from canonical value hashes emitted by the
+    /// Arrow statistics collector. Hashes remain internal; no SQL aggregate
+    /// surface exposes this representation.
+    pub fn try_from_hashes(
+        lg_k: u8,
+        hashes: impl IntoIterator<Item = u64>,
+    ) -> Result<Self, DistributedQueryError> {
+        if !(5..=12).contains(&lg_k) {
+            return Err(contract_violation(
+                "statistics Theta lg_k must be between 5 and 12",
+            ));
+        }
+        let mut sketch = ThetaSketch::builder().lg_k(lg_k).build();
+        for hash in hashes {
+            sketch.update(hash as i64);
+        }
+        Self::try_from_sketch(sketch)
+    }
+
+    fn try_from_sketch(mut sketch: ThetaSketch) -> Result<Self, DistributedQueryError> {
+        // The implementation grows its hash table before it reaches nominal
+        // capacity. Compact before serializing so the bounded wire contract is
+        // independent of how many input batches the fragment processed.
+        sketch.trim();
+        let lg_k = sketch.lg_k();
         let mut retained_hashes = sketch.iter().collect::<Vec<_>>();
         retained_hashes.sort_unstable();
         if retained_hashes.len() > MAX_STATISTICS_THETA_RETAINED_HASHES {
@@ -1159,6 +1537,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle,
@@ -1407,6 +1788,111 @@ mod tests {
             .finish_fragment_payloads([Bytes::new()])
             .expect_err("missing partial must fail closed");
         assert!(error.message().contains("without a fragment partial"));
+    }
+
+    #[test]
+    fn batch_collector_accumulates_typed_scalar_and_theta_metrics() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let metrics = StatisticsMetricRequest::try_new(vec![
+            StatisticsMetric::RowCount,
+            StatisticsMetric::NullCount { column: "v".into() },
+            StatisticsMetric::Minimum { column: "v".into() },
+            StatisticsMetric::Maximum { column: "v".into() },
+            StatisticsMetric::AverageSize { column: "v".into() },
+            StatisticsMetric::ThetaNdv { column: "v".into() },
+        ])
+        .expect("metrics");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![Some(3), None, Some(1)]))],
+        )
+        .expect("batch");
+        let mut collector =
+            StatisticsBatchCollector::try_new(schema, metrics.clone()).expect("collector");
+        collector.push_batch(&batch).expect("collect batch");
+        let states = collector
+            .finish()
+            .expect("finish collector")
+            .metric_states(&metrics);
+        assert_eq!(
+            states.get(&StatisticsMetric::RowCount),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::U64(3)
+            ))
+        );
+        assert_eq!(
+            states.get(&StatisticsMetric::NullCount { column: "v".into() }),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::U64(1)
+            ))
+        );
+        assert_eq!(
+            states.get(&StatisticsMetric::Minimum { column: "v".into() }),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::F64(1.0)
+            ))
+        );
+        assert_eq!(
+            states.get(&StatisticsMetric::Maximum { column: "v".into() }),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::F64(3.0)
+            ))
+        );
+        assert!(matches!(
+            states.get(&StatisticsMetric::AverageSize { column: "v".into() }),
+            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value > 0.0
+        ));
+        assert!(matches!(
+            states.get(&StatisticsMetric::ThetaNdv { column: "v".into() }),
+            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value >= 2.0
+        ));
+    }
+
+    #[test]
+    fn batch_collector_rejects_metric_column_absent_from_pinned_schema() {
+        let schema = Arc::new(Schema::empty());
+        let metrics = StatisticsMetricRequest::try_new(vec![StatisticsMetric::ThetaNdv {
+            column: "missing".into(),
+        }])
+        .expect("metrics");
+        let error = match StatisticsBatchCollector::try_new(schema, metrics) {
+            Ok(_) => panic!("missing projection must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message()
+                .contains("does not contain requested column")
+        );
+    }
+
+    #[test]
+    fn batch_collector_keeps_theta_state_bounded_across_many_batches() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let metrics = StatisticsMetricRequest::try_new(vec![StatisticsMetric::ThetaNdv {
+            column: "v".into(),
+        }])
+        .expect("metrics");
+        let mut collector =
+            StatisticsBatchCollector::try_new(schema.clone(), metrics.clone()).expect("collector");
+        for start in (0_i64..10_000).step_by(100) {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(
+                    (start..start + 100).map(Some).collect::<Vec<_>>(),
+                ))],
+            )
+            .expect("batch");
+            collector.push_batch(&batch).expect("collect batch");
+        }
+        let states = collector
+            .finish()
+            .expect("finish collector")
+            .metric_states(&metrics);
+        assert!(matches!(
+            states.get(&StatisticsMetric::ThetaNdv { column: "v".into() }),
+            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value > 9_000.0
+        ));
     }
 
     #[test]
