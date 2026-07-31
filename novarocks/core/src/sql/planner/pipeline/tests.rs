@@ -211,6 +211,28 @@ fn pipeline_builds_distributed_plan_from_physical_values() {
 fn assert_sealed_plan(_: &crate::sql::planner::distributed::DistributedPlan) {}
 
 #[test]
+fn statistics_entrypoint_seals_a_typed_internal_root_sink() {
+    let metrics = novarocks_spi::connector::StatisticsMetricRequest::try_new(vec![
+        novarocks_spi::connector::StatisticsMetric::RowCount,
+    ])
+    .expect("statistics metrics");
+    let distributed = build_statistics_distributed_plan_with_settings(
+        physical_values_node(vec![int_col(ColumnId::new_for_test(17), "value")]),
+        metrics.clone(),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    )
+    .expect("statistics entrypoint seals");
+
+    assert_sealed_plan(&distributed);
+    assert!(matches!(
+        &distributed.fragments()[0].sink,
+        crate::sql::planner::distributed::DataSink::Statistics(actual)
+            if actual.metrics() == metrics.metrics()
+    ));
+    assert_eq!(distributed.topology().result_fragment_id(), None);
+}
+
+#[test]
 fn plain_write_and_change_stream_entrypoints_return_sealed_plans() {
     let id = OutputColumn {
         column_id: ColumnId::new_for_test(1),

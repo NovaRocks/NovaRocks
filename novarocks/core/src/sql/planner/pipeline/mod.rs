@@ -41,6 +41,21 @@ pub(crate) fn build_distributed_plan_with_settings(
     crate::sql::planner::distributed::build::build_distributed_plan(&physical)
 }
 
+/// Compile a regular physical query into internal statistics collection work.
+/// Callers must provide a plan whose scan sources were derived from the same
+/// provider table/data-version pin as the statistics collection program.
+pub(crate) fn build_statistics_distributed_plan_with_settings(
+    mut physical: PhysicalPlanNode,
+    metrics: novarocks_spi::connector::StatisticsMetricRequest,
+    settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+) -> Result<DistributedPlan, String> {
+    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    crate::sql::planner::distributed::build::build_statistics_distributed_plan(&physical, metrics)
+}
+
 pub(crate) fn build_iceberg_write_distributed_plan(
     physical: PhysicalPlanNode,
     sink: crate::sql::planner::distributed::write::sink::IcebergWritePlanInput,

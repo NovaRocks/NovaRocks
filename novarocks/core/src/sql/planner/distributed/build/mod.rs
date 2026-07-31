@@ -29,6 +29,28 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
     super::seal::seal_draft(draft).map_err(|error| error.to_string())
 }
 
+/// Build a normal distributed plan whose root has an internal statistics sink.
+/// The fragment graph, placement and exchange shape remain exactly those of a
+/// regular query; only the terminal capability changes before sealing. This is
+/// intentionally not a post-seal mutation, so topology/output contracts see
+/// the statistics terminal from the start.
+pub(crate) fn build_statistics_distributed_plan(
+    plan: &PhysicalPlanNode,
+    metrics: novarocks_spi::connector::StatisticsMetricRequest,
+) -> Result<DistributedPlan, String> {
+    let mut draft = build_distributed_plan_draft(plan)?;
+    let root_id = draft
+        .root_fragment_id
+        .ok_or_else(|| "statistics distributed plan is missing a root fragment".to_string())?;
+    let root = draft
+        .fragments
+        .iter_mut()
+        .find(|fragment| fragment.fragment_id == root_id)
+        .ok_or_else(|| format!("statistics distributed plan root fragment {root_id} is absent"))?;
+    root.sink = super::fragment::DataSink::Statistics(metrics);
+    super::seal::seal_draft(draft).map_err(|error| error.to_string())
+}
+
 pub(in crate::sql::planner::distributed) fn build_distributed_plan_draft(
     plan: &PhysicalPlanNode,
 ) -> Result<DistributedPlanDraft, String> {
