@@ -1408,7 +1408,10 @@ impl StandaloneSession {
                 &mut scalar_arena,
             )?;
         let mut query_stats = query_stats::QueryStatsCollector::new(
-            query_stats::QueryStatsProviders::from_standalone_state(&self.inner),
+            query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+                &self.inner,
+                analyzer_provider.statistics_pins(),
+            ),
         )
         .collect(&mut optimizer_expr);
         let optimizer_settings = optimizer_settings_for_execution(Some(execution));
@@ -3553,8 +3556,13 @@ fn explain_analyze_query(
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
-        .map(query_stats::QueryStatsProviders::from_standalone_state)
-        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+        .map(|state| {
+            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+                Some(state),
+                analyzer_catalog.statistics_pins(),
+            )
+        })
+        .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
     let mut query_stats =
         query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
@@ -3772,8 +3780,13 @@ fn explain_query(
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
-        .map(query_stats::QueryStatsProviders::from_standalone_state)
-        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+        .map(|state| {
+            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+                Some(state),
+                analyzer_catalog.statistics_pins(),
+            )
+        })
+        .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
     let mut query_stats =
         query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     // MV query rewrite candidate prep (plain EXPLAIN has no MV refresh
@@ -4202,7 +4215,10 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = query_stats::QueryStatsProviders::from_standalone_state(state);
+    let providers = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+        state,
+        analyzer_provider.statistics_pins(),
+    );
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimized_tree = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
@@ -4780,7 +4796,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
+    let providers = query_stats::QueryStatisticsContext::unavailable();
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
@@ -4812,7 +4828,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
+    let providers = query_stats::QueryStatisticsContext::unavailable();
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
@@ -4930,8 +4946,13 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
-        .map(query_stats::QueryStatsProviders::from_standalone_state)
-        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+        .map(|state| {
+            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+                Some(state),
+                analyzer_catalog.statistics_pins(),
+            )
+        })
+        .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
     let mut query_stats =
         query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     // MV query rewrite: discover fresh Iceberg MV candidates and inject their
@@ -5061,9 +5082,9 @@ pub(crate) fn execute_logical_plan_with_options(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = mv_rewrite_state
-        .map(query_stats::QueryStatsProviders::from_standalone_state)
-        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+    // This entrypoint is handed an already-analyzed logical plan, so it has
+    // no query-resolution pins. Do not re-resolve `latest` for statistics.
+    let providers = query_stats::QueryStatisticsContext::unavailable();
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,

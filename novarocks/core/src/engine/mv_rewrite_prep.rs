@@ -35,7 +35,7 @@ use crate::sql::planner::logical::LogicalPlanNode;
 use crate::sql::planner::table::ScanSource;
 
 use super::StandaloneState;
-use super::query_stats::{QueryStatsPlan, QueryStatsProviders};
+use super::query_stats::{QueryStatisticsContext, QueryStatsPlan};
 
 /// Upper bound on candidates per query; aligned with the StarRocks default
 /// cbo_materialized_view_rewrite_related_mvs_limit = 16.
@@ -104,7 +104,7 @@ fn try_prepare(
         .list_definitions()
         .map_err(|e| format!("list mv definitions: {e}"))?;
 
-    let stats_providers = QueryStatsProviders::from_optional_state_with_pins(
+    let statistics_context = QueryStatisticsContext::from_optional_state_with_pins(
         Some(state),
         analyzer_catalog.statistics_pins(),
     );
@@ -125,7 +125,7 @@ fn try_prepare(
         match build_candidate(state, analyzer_catalog, current_database, &def, factory) {
             Ok(Some(c)) => {
                 let (target_label, target_stats) = super::query_stats::collect_table_stats(
-                    &stats_providers,
+                    &statistics_context,
                     &c.target_database,
                     &c.target_table,
                 );

@@ -35,18 +35,21 @@ use crate::sql::optimizer::stats_input::{
 use crate::sql::planner::table::ScanSource;
 
 #[derive(Clone, Default)]
-pub(crate) struct QueryStatsProviders {
+/// Query-scoped handles for the one unified statistics resolver.  This is not
+/// a provider registry: absent pins intentionally produce missing statistics
+/// rather than a second latest-resolution path.
+pub(crate) struct QueryStatisticsContext {
     connector_control: Option<Arc<dyn ConnectorControlRegistry>>,
     resolver: Option<Arc<UnifiedStatisticsResolver>>,
     pins: Option<QueryStatisticsPins>,
 }
 
-impl QueryStatsProviders {
+impl QueryStatisticsContext {
     pub(crate) fn none() -> Self {
         Self::default()
     }
 
-    pub(crate) fn from_connectors(_connectors: &crate::connector::ConnectorRegistry) -> Self {
+    pub(crate) fn unavailable() -> Self {
         Self::none()
     }
 
@@ -101,15 +104,15 @@ impl QueryStatsPlan {
 }
 
 pub(crate) struct QueryStatsCollector {
-    providers: QueryStatsProviders,
+    context: QueryStatisticsContext,
     next_stats_ref: u32,
     snapshot: QueryStatsSnapshot,
 }
 
 impl QueryStatsCollector {
-    pub(crate) fn new(providers: QueryStatsProviders) -> Self {
+    pub(crate) fn new(context: QueryStatisticsContext) -> Self {
         Self {
-            providers,
+            context,
             next_stats_ref: 0,
             snapshot: QueryStatsSnapshot::empty(),
         }
@@ -139,12 +142,12 @@ impl QueryStatsCollector {
         &self,
         scan: &crate::sql::optimizer::operator::ScanOp,
     ) -> (String, BaseTableStatistics) {
-        collect_table_stats(&self.providers, &scan.database, &scan.table)
+        collect_table_stats(&self.context, &scan.database, &scan.table)
     }
 }
 
 pub(super) fn collect_table_stats(
-    providers: &QueryStatsProviders,
+    context: &QueryStatisticsContext,
     database: &str,
     table_def: &crate::sql::planner::table::TableDef,
 ) -> (String, BaseTableStatistics) {
@@ -157,7 +160,7 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(control) = providers.connector_control.as_deref() else {
+    let Some(control) = context.connector_control.as_deref() else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
@@ -165,7 +168,7 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(resolver) = providers.resolver.as_deref() else {
+    let Some(resolver) = context.resolver.as_deref() else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
@@ -173,7 +176,7 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(pins) = providers.pins.as_ref() else {
+    let Some(pins) = context.pins.as_ref() else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
