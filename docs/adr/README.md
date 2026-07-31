@@ -105,6 +105,15 @@ seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来�
 
 - ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（active）
 
+### frontend-dml
+
+领域哲学：frontend 拥有 DML 的 statement application flow、durable operation lifecycle 与 production routing；
+core 只通过一对一 typed engine port 保留 query、connector 和 external commit truth。每次写入必须复用 admission
+冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque handles，不以 service locator、core callback、
+metadata fallback 或公共 SPI 模糊 owner。
+
+- ADR-0017 — INSERT application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
+
 ### table-maintenance
 
 领域哲学：表维护的 application/lifecycle 由 frontend host 统一拥有，core 只提供一对一、consumer-owned 的 typed

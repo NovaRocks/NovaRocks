@@ -59,6 +59,7 @@ pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
+pub mod insert_engine;
 pub(crate) mod insert_flow;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
