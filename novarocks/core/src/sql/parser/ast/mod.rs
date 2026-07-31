@@ -201,6 +201,30 @@ pub(crate) struct DropBackendStmt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShowBackendsStmt;
 
+/// `ANALYZE TABLE <name> [(column, ...)]`.
+///
+/// This is deliberately a typed command rather than a preserved SQL string:
+/// the frontend statistics application receives the resolved statement and
+/// never needs to inspect SQL text a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnalyzeTableStmt {
+    pub name: ObjectName,
+    pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShowAnalyzeJobsStmt;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CancelAnalyzeStmt {
+    pub job_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShowTableStatsStmt {
+    pub name: ObjectName,
+}
+
 /// Top-level statement variants produced by the custom dialect `parse_sql`
 /// entry point. Phase 1 only covers materialized-view DDL; other statements
 /// still flow through the legacy `parse_sql_raw` path.
@@ -220,6 +244,10 @@ pub(crate) enum Statement {
     AddBackend(AddBackendStmt),
     DropBackend(DropBackendStmt),
     ShowBackends(ShowBackendsStmt),
+    AnalyzeTable(AnalyzeTableStmt),
+    ShowAnalyzeJobs(ShowAnalyzeJobsStmt),
+    CancelAnalyze(CancelAnalyzeStmt),
+    ShowTableStats(ShowTableStatsStmt),
 }
 
 /// `DELETE FROM <table> WHERE <predicate>`. Phase 1 only supports iceberg

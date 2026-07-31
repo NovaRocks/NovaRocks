@@ -100,6 +100,23 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
         return Ok(vec![stmt]);
     }
 
+    if dialect::statistics::looks_like_analyze_table(&parser) {
+        let stmt = dialect::statistics::parse_analyze_table(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+    if dialect::statistics::looks_like_show_analyze_jobs(&parser) {
+        let stmt = dialect::statistics::parse_show_analyze_jobs(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+    if dialect::statistics::looks_like_cancel_analyze(&parser) {
+        let stmt = dialect::statistics::parse_cancel_analyze(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+    if dialect::statistics::looks_like_show_table_stats(&parser) {
+        let stmt = dialect::statistics::parse_show_table_stats(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+
     Err("parse_sql: only materialized-view DDL is recognized in Phase 1".to_string())
 }
 

@@ -2943,6 +2943,13 @@ pub(crate) fn dispatch_statement(
                 .show_backends()
                 .map(StatementResult::Query)
         }
+        Statement::AnalyzeTable(_)
+        | Statement::ShowAnalyzeJobs(_)
+        | Statement::CancelAnalyze(_)
+        | Statement::ShowTableStats(_) => Err(
+            "unified statistics statements require the frontend statistics application service"
+                .to_string(),
+        ),
     }
 }
 
