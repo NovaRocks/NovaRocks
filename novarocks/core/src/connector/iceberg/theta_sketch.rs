@@ -243,6 +243,31 @@ impl ThetaSketchHandle {
         })
     }
 
+    /// Rebuild a compact sketch from Core's bounded, canonical collection
+    /// state.  This is intentionally crate-visible: it lets the native
+    /// Iceberg statistics provider emit standard Puffin blobs without making
+    /// an Iceberg representation part of the provider-neutral SPI.
+    pub(crate) fn from_compact_parts(
+        lg_k: u8,
+        theta: u64,
+        hashes: Vec<u64>,
+    ) -> Result<Self, String> {
+        if !(5..=16).contains(&lg_k) {
+            return Err("Theta compact lg_k must be between 5 and 16".to_string());
+        }
+        if hashes.windows(2).any(|pair| pair[0] >= pair[1])
+            || hashes.iter().any(|hash| *hash >= theta)
+        {
+            return Err("Theta compact hashes are not canonical".to_string());
+        }
+        Ok(Self {
+            inner: None,
+            compact_hashes: Some(hashes),
+            compact_theta: theta,
+            lg_k,
+        })
+    }
+
     /// Union multiple sketches into a single result sketch.
     ///
     /// Algorithm: collect all retained hashes from all sketches, take the

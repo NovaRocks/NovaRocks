@@ -24,9 +24,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use bytes::Bytes;
 use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
-    StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsMetric,
+    StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsDataVersion, StatisticsMetric,
     StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
     StatisticsMissingKind,
 };
@@ -39,9 +40,14 @@ pub const MAX_STATISTICS_ATTEMPT_DURATION: Duration = Duration::from_secs(30 * 6
 
 /// Bound the in-memory, mergeable Theta state produced by one statistics
 /// collection. This is independent of the SPI's wire-payload bound.
-pub const MAX_STATISTICS_THETA_RETAINED_HASHES: usize = 1 << 16;
+/// The SPI's complete opaque result is capped at 64 KiB.  Keep one Theta
+/// state safely below that ceiling so it can coexist with a data-version and
+/// other requested metrics; a larger sketch would only fail late at the SPI
+/// boundary after distributed work had already completed.
+pub const MAX_STATISTICS_THETA_RETAINED_HASHES: usize = 1 << 12;
 const THETA_PARTIAL_WIRE_VERSION: u8 = 1;
 const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 1 + 1 + 8 + 4;
+const VISIBLE_ROW_ARTIFACT_VERSION: u8 = 1;
 
 /// A statistics collection is either tied to a statement wait or owned by a
 /// durable frontend job. Only the former observes the statement cancellation
@@ -383,6 +389,133 @@ impl StatisticsCollectionFinalizer {
             })
             .collect()
     }
+
+    /// Encode the exact, mergeable NDV states which an external statistics
+    /// publisher needs in addition to the user-visible scalar evidence.  This
+    /// is a versioned Core artifact, not an Iceberg payload: providers may
+    /// validate and consume it only after they have checked the same pinned
+    /// data version used by the scan.
+    pub fn try_visible_row_artifact(
+        &self,
+        data_version: &StatisticsDataVersion,
+    ) -> Result<Bytes, DistributedQueryError> {
+        let version = data_version.as_bytes();
+        let version_len = u16::try_from(version.len())
+            .map_err(|_| resource_exhausted("statistics data version is too large"))?;
+        let count = u16::try_from(self.theta.len())
+            .map_err(|_| resource_exhausted("statistics artifact has too many Theta columns"))?;
+        let mut bytes = Vec::with_capacity(1 + 2 + version.len() + 2);
+        bytes.push(VISIBLE_ROW_ARTIFACT_VERSION);
+        bytes.extend_from_slice(&version_len.to_be_bytes());
+        bytes.extend_from_slice(version);
+        bytes.extend_from_slice(&count.to_be_bytes());
+        for (column, partial) in &self.theta {
+            let column = column.as_bytes();
+            let column_len = u16::try_from(column.len())
+                .map_err(|_| resource_exhausted("statistics artifact column name is too large"))?;
+            let theta = partial.to_wire_bytes();
+            let theta_len = u32::try_from(theta.len())
+                .map_err(|_| resource_exhausted("statistics Theta artifact is too large"))?;
+            bytes.extend_from_slice(&column_len.to_be_bytes());
+            bytes.extend_from_slice(column);
+            bytes.extend_from_slice(&theta_len.to_be_bytes());
+            bytes.extend_from_slice(&theta);
+        }
+        if bytes.len() > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
+            return Err(resource_exhausted(
+                "statistics visible-row artifact exceeds the SPI payload limit",
+            ));
+        }
+        Ok(Bytes::from(bytes))
+    }
+}
+
+/// Decode the provider-neutral visible-row artifact.  It is public within the
+/// Core crate because the Iceberg provider is still hosted here until SPI-5;
+/// it deliberately is not exposed as a connector-specific wire type.
+pub(crate) fn decode_visible_row_artifact(
+    bytes: &[u8],
+) -> Result<
+    (
+        StatisticsDataVersion,
+        BTreeMap<std::sync::Arc<str>, ThetaSketchPartial>,
+    ),
+    DistributedQueryError,
+> {
+    let mut cursor = 0usize;
+    let version = take_bytes(bytes, &mut cursor, 1)?[0];
+    if version != VISIBLE_ROW_ARTIFACT_VERSION {
+        return Err(contract_violation(
+            "statistics visible-row artifact has an unsupported version",
+        ));
+    }
+    let data_version_len = u16::from_be_bytes(
+        take_bytes(bytes, &mut cursor, 2)?
+            .try_into()
+            .expect("fixed artifact field width"),
+    ) as usize;
+    let data_version = StatisticsDataVersion::try_new(Bytes::copy_from_slice(take_bytes(
+        bytes,
+        &mut cursor,
+        data_version_len,
+    )?))
+    .map_err(|error| contract_violation(format!("decode statistics data version: {error}")))?;
+    let count = u16::from_be_bytes(
+        take_bytes(bytes, &mut cursor, 2)?
+            .try_into()
+            .expect("fixed artifact field width"),
+    ) as usize;
+    let mut theta = BTreeMap::new();
+    for _ in 0..count {
+        let column_len = u16::from_be_bytes(
+            take_bytes(bytes, &mut cursor, 2)?
+                .try_into()
+                .expect("fixed artifact field width"),
+        ) as usize;
+        let column = std::str::from_utf8(take_bytes(bytes, &mut cursor, column_len)?)
+            .map_err(|_| contract_violation("statistics artifact column is not UTF-8"))?;
+        if column.is_empty() {
+            return Err(contract_violation(
+                "statistics artifact has an empty column name",
+            ));
+        }
+        let theta_len = u32::from_be_bytes(
+            take_bytes(bytes, &mut cursor, 4)?
+                .try_into()
+                .expect("fixed artifact field width"),
+        ) as usize;
+        let partial =
+            ThetaSketchPartial::try_from_wire_bytes(take_bytes(bytes, &mut cursor, theta_len)?)?;
+        if theta
+            .insert(std::sync::Arc::from(column), partial)
+            .is_some()
+        {
+            return Err(contract_violation(
+                "statistics artifact contains duplicate Theta column",
+            ));
+        }
+    }
+    if cursor != bytes.len() {
+        return Err(contract_violation(
+            "statistics visible-row artifact has trailing bytes",
+        ));
+    }
+    Ok((data_version, theta))
+}
+
+fn take_bytes<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<&'a [u8], DistributedQueryError> {
+    let end = cursor
+        .checked_add(count)
+        .ok_or_else(|| contract_violation("statistics artifact length overflow"))?;
+    let output = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| contract_violation("statistics visible-row artifact is truncated"))?;
+    *cursor = end;
+    Ok(output)
 }
 
 fn not_collected(metric: &StatisticsMetric) -> StatisticsMetricState {
@@ -400,9 +533,9 @@ impl ThetaSketchPartial {
         lg_k: u8,
         values: impl IntoIterator<Item = i64>,
     ) -> Result<Self, DistributedQueryError> {
-        if !(5..=16).contains(&lg_k) {
+        if !(5..=12).contains(&lg_k) {
             return Err(contract_violation(
-                "statistics Theta lg_k must be between 5 and 16",
+                "statistics Theta lg_k must be between 5 and 12",
             ));
         }
         let mut sketch = ThetaSketch::builder().lg_k(lg_k).build();
@@ -485,6 +618,10 @@ impl ThetaSketchPartial {
         }
     }
 
+    pub(crate) fn compact_parts(&self) -> (u8, u64, Vec<u64>) {
+        (self.lg_k, self.theta, self.retained_hashes.clone())
+    }
+
     /// Encode a bounded, deterministic internal wire value for transport from
     /// distributed collection to a connector's opaque publish payload. This is
     /// intentionally not a SQL-visible aggregate representation.
@@ -517,7 +654,7 @@ impl ThetaSketchPartial {
             ));
         }
         let lg_k = bytes[1];
-        if !(5..=16).contains(&lg_k) {
+        if !(5..=12).contains(&lg_k) {
             return Err(contract_violation(
                 "statistics Theta wire state has an invalid lg_k",
             ));
@@ -668,5 +805,32 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn visible_row_artifact_round_trips_the_pinned_version_and_theta_state() {
+        let data_version =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table/v1")).expect("version");
+        let partial =
+            ThetaSketchPartial::try_from_i64_values(12, 0_i64..1_000).expect("theta partial");
+        let artifact = StatisticsCollectionFinalizer::default()
+            .with_theta("customer_id", partial.clone())
+            .try_visible_row_artifact(&data_version)
+            .expect("encode artifact");
+        let (decoded_version, theta) = decode_visible_row_artifact(&artifact).expect("decode");
+        assert_eq!(decoded_version, data_version);
+        assert_eq!(theta.get("customer_id"), Some(&partial));
+    }
+
+    #[test]
+    fn visible_row_artifact_rejects_trailing_bytes() {
+        let data_version =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table/v1")).expect("version");
+        let mut artifact = StatisticsCollectionFinalizer::default()
+            .try_visible_row_artifact(&data_version)
+            .expect("encode artifact")
+            .to_vec();
+        artifact.push(1);
+        assert!(decode_visible_row_artifact(&artifact).is_err());
     }
 }
