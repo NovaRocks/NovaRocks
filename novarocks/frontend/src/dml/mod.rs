@@ -29,18 +29,22 @@ pub mod model;
 pub mod reconcile;
 pub mod runner;
 pub mod service;
+pub mod state_store_journal;
 
 pub use error::{DmlError, DmlErrorKind};
-pub use journal::{MetaStoreOperationJournal, OperationJournal};
+pub use journal::OperationJournal;
 pub use model::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
-    OperationFact, OperationKind, OperationState, OperationTarget, RecoveryEvidence,
-    StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
+    DmlOperationId, IcebergCleanupOutcomeRecord, IcebergCommitOutcomeRecord,
+    IcebergOperationFailureKind, IcebergOperationFailureRecord, IcebergOperationNextAction,
+    IcebergRecoveryEvidenceRecord, OperationFact, OperationKind, OperationState, OperationTarget,
+    RecoveryEvidence, StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
 };
 pub use runner::{
     AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,
 };
 pub use service::DmlService;
+pub use state_store_journal::StateStoreOperationJournal;
 
 /// Current wall-clock time in Unix milliseconds, used for operation timestamps.
 pub(crate) fn now_unix_millis() -> i64 {

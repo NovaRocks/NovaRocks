@@ -17,28 +17,25 @@
 
 use std::fmt;
 
-/// Category of a DML foundation failure.
+use crate::dml::model::{CommitOutcome, DmlOperationId};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DmlErrorKind {
-    /// Operation-journal persistence failure (provider/repository).
-    Journal,
-    /// Coordinated-write execution failure before commit.
+    JournalUnavailable,
+    JournalCorruption,
+    JournalUnresolved,
     Executor,
-    /// Typed commit service failure.
     Commit,
-    /// Post-commit finalization failure (metadata already committed).
-    Finalize,
-    /// Write admission (fencing) rejected the operation.
+    CommittedButUnfinalized,
     Admission,
 }
 
-/// A DML foundation error. Wraps lower-layer errors as a message; the original
-/// repository/provider error is not surfaced directly (frontend wire mapping is
-/// a caller concern).
 #[derive(Debug)]
 pub struct DmlError {
     kind: DmlErrorKind,
     message: String,
+    operation_id: Option<DmlOperationId>,
+    committed_outcome: Option<CommitOutcome>,
 }
 
 impl DmlError {
@@ -46,11 +43,21 @@ impl DmlError {
         Self {
             kind,
             message: error.to_string(),
+            operation_id: None,
+            committed_outcome: None,
         }
     }
 
-    pub(crate) fn journal(error: impl fmt::Display) -> Self {
-        Self::new(DmlErrorKind::Journal, error)
+    pub(crate) fn journal_unavailable(error: impl fmt::Display) -> Self {
+        Self::new(DmlErrorKind::JournalUnavailable, error)
+    }
+
+    pub(crate) fn journal_corruption(error: impl fmt::Display) -> Self {
+        Self::new(DmlErrorKind::JournalCorruption, error)
+    }
+
+    pub(crate) fn journal_unresolved(error: impl fmt::Display) -> Self {
+        Self::new(DmlErrorKind::JournalUnresolved, error)
     }
 
     pub(crate) fn executor(error: impl fmt::Display) -> Self {
@@ -61,15 +68,19 @@ impl DmlError {
         Self::new(DmlErrorKind::Commit, error)
     }
 
-    pub(crate) fn finalize(error: impl fmt::Display) -> Self {
-        Self::new(DmlErrorKind::Finalize, error)
+    pub(crate) fn committed_but_unfinalized(
+        operation_id: DmlOperationId,
+        committed_outcome: Option<CommitOutcome>,
+        error: impl fmt::Display,
+    ) -> Self {
+        Self {
+            kind: DmlErrorKind::CommittedButUnfinalized,
+            message: format!("{error}; do not retry commit"),
+            operation_id: Some(operation_id),
+            committed_outcome,
+        }
     }
 
-    // Constructed by `WriteAdmission` implementations that deny a write (CP-3
-    // fencing). DML-1 ships only `AlwaysAdmit`, which never denies, so the only
-    // non-test caller arrives later; keep it to complete the error API surface.
-    // (`#[allow]`, not `#[expect]`: under `--all-targets` the cfg(test) build uses
-    // it via the test `DenyAdmission`, so `#[expect]` would be unfulfilled there.)
     #[allow(dead_code)]
     pub(crate) fn admission(error: impl fmt::Display) -> Self {
         Self::new(DmlErrorKind::Admission, error)
@@ -78,11 +89,30 @@ impl DmlError {
     pub const fn kind(&self) -> DmlErrorKind {
         self.kind
     }
+
+    pub const fn operation_id(&self) -> Option<DmlOperationId> {
+        self.operation_id
+    }
+
+    pub const fn committed_outcome(&self) -> Option<&CommitOutcome> {
+        self.committed_outcome.as_ref()
+    }
 }
 
 impl fmt::Display for DmlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}: {}", self.kind, self.message)
+        write!(formatter, "{:?}: {}", self.kind, self.message)?;
+        if let Some(operation_id) = self.operation_id {
+            write!(formatter, " (operation {operation_id})")?;
+        }
+        if let Some(outcome) = &self.committed_outcome {
+            write!(
+                formatter,
+                " (known committed snapshot {})",
+                outcome.new_snapshot_id
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -94,8 +124,8 @@ mod tests {
 
     #[test]
     fn display_includes_kind_and_message() {
-        let error = DmlError::journal("boom");
-        assert_eq!(error.kind(), DmlErrorKind::Journal);
-        assert_eq!(error.to_string(), "Journal: boom");
+        let error = DmlError::journal_unavailable("boom");
+        assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
+        assert_eq!(error.to_string(), "JournalUnavailable: boom");
     }
 }

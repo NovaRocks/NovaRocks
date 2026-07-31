@@ -16,13 +16,21 @@
 // under the License.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use novarocks::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
+use bytes::Bytes;
 use novarocks_frontend::dml::{
     CommitOpKind, CommitOutcome, CommitServiceError, CoordinatedWriteReport, DmlErrorKind,
-    DmlService, MetaStoreOperationJournal, OperationKind, OperationState, OperationTarget,
-    RecoveryEvidence, WriteExecutor, WriteTransactionSpec,
+    DmlService, IcebergOperationFailureKind, IcebergOperationNextAction, OperationKind,
+    OperationState, OperationTarget, RecoveryEvidence, StateStoreOperationJournal, WriteExecutor,
+    WriteTransactionSpec,
+};
+use novarocks_spi::state_store::{FeDeploymentView, StateStore};
+use novarocks_state_store::{
+    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 
 struct FakeExecutor;
@@ -91,12 +99,51 @@ impl WriteExecutor for KnownCommittedCommitErrorExecutor {
     }
 }
 
-#[test]
-fn dml_service_commits_over_real_meta_store() {
+async fn open_journal(
+    path: &std::path::Path,
+) -> (
+    StateStoreHost,
+    Arc<dyn StateStore>,
+    StateStoreOperationJournal,
+) {
+    let registry = builtin_state_store_provider_registry().expect("provider registry");
+    let host = StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: StateStoreConfig {
+                    cluster_id: "dml-service-test".to_string(),
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path: path.to_path_buf(),
+                        deployment_owner: "dml-service-fe".to_string(),
+                    },
+                },
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
+        FeDeploymentView {
+            active_fe_count: NonZeroUsize::new(1).unwrap(),
+            topology_revision: Bytes::from_static(b"dml-service-topology"),
+        },
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .expect("open SQLite StateStore");
+    let store = host.state_store().expect("StateStore exposure");
+    let journal =
+        StateStoreOperationJournal::open(Arc::clone(&store), tokio::runtime::Handle::current())
+            .await
+            .expect("open DML journal");
+    (host, store, journal)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dml_service_commits_over_real_state_store() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let provider: Arc<dyn MetaStoreProvider> =
-        Arc::new(SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite")).expect("provider"));
-    let service = DmlService::new(Arc::new(MetaStoreOperationJournal::new(provider)));
+    let (_host, _store, journal) = open_journal(&dir.path().join("state.sqlite")).await;
+    let service = DmlService::new(Arc::new(journal));
 
     let spec = WriteTransactionSpec {
         target: OperationTarget {
@@ -127,12 +174,11 @@ fn dml_service_commits_over_real_meta_store() {
     assert!(service.list_unfinished_operations().unwrap().is_empty());
 }
 
-#[test]
-fn known_committed_commit_error_persists_retry_finalize_fact_over_real_meta_store() {
+#[tokio::test(flavor = "multi_thread")]
+async fn known_committed_commit_error_persists_retry_finalize_fact_over_real_state_store() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let provider: Arc<dyn MetaStoreProvider> =
-        Arc::new(SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite")).expect("provider"));
-    let service = DmlService::new(Arc::new(MetaStoreOperationJournal::new(provider)));
+    let (_host, _store, journal) = open_journal(&dir.path().join("state.sqlite")).await;
+    let service = DmlService::new(Arc::new(journal));
 
     let spec = WriteTransactionSpec {
         target: OperationTarget {
@@ -151,7 +197,7 @@ fn known_committed_commit_error_persists_retry_finalize_fact_over_real_meta_stor
     let error = service
         .run_write(spec, &KnownCommittedCommitErrorExecutor)
         .expect_err("known-committed finalize failure must remain an error");
-    assert_eq!(error.kind(), DmlErrorKind::Commit);
+    assert_eq!(error.kind(), DmlErrorKind::CommittedButUnfinalized);
     assert!(
         error
             .to_string()
@@ -159,8 +205,10 @@ fn known_committed_commit_error_persists_retry_finalize_fact_over_real_meta_stor
     );
 
     let stored = service
-        .load_operation(1)
+        .list_unfinished_operations()
         .unwrap()
+        .into_iter()
+        .next()
         .expect("operation persisted");
     assert_eq!(stored.state, OperationState::FinalizeFailedKnownCommitted);
     let outcome = stored.commit_outcome.expect("commit outcome persisted");
@@ -177,11 +225,11 @@ fn known_committed_commit_error_persists_retry_finalize_fact_over_real_meta_stor
     let failure = stored.failure.expect("failure classification persisted");
     assert_eq!(
         failure.kind,
-        novarocks::meta::repository::iceberg_operation::IcebergOperationFailureKind::FinalizeKnownCommitted
+        IcebergOperationFailureKind::FinalizeKnownCommitted
     );
     assert_eq!(failure.message, "finalize failed inside commit service");
     assert_eq!(
         failure.next_action,
-        novarocks::meta::repository::iceberg_operation::IcebergOperationNextAction::RetryFinalize
+        IcebergOperationNextAction::RetryFinalize
     );
 }

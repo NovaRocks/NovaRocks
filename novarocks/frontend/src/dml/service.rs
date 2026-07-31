@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
-use crate::dml::model::{StoredOperation, WriteTransactionOutcome, WriteTransactionSpec};
+use crate::dml::model::{
+    DmlOperationId, StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
+};
 use crate::dml::runner::{AlwaysAdmit, WriteAdmission, WriteExecutor, WriteTransactionRunner};
 
 /// The frontend DML application owner. Composes the narrow ports (journal +
@@ -59,7 +61,10 @@ impl DmlService {
     }
 
     /// Load a stored operation by id.
-    pub fn load_operation(&self, operation_id: i64) -> Result<Option<StoredOperation>, DmlError> {
+    pub fn load_operation(
+        &self,
+        operation_id: DmlOperationId,
+    ) -> Result<Option<StoredOperation>, DmlError> {
         self.journal.load(operation_id)
     }
 

@@ -168,31 +168,62 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         match self.executor.commit(&spec, &handle) {
             Ok(outcome) => {
                 let snapshot_id = outcome.new_snapshot_id;
-                self.journal.record_fact(
+                if let Err(error) = self.journal.record_fact(
                     operation_id,
                     reconcile::operation_fact_from_commit_result(Ok(&outcome)),
-                )?;
-                self.journal
-                    .transition(operation_id, OperationState::Finalizing)?;
+                ) {
+                    return Err(DmlError::committed_but_unfinalized(
+                        operation_id,
+                        Some(outcome),
+                        format!("persist known-committed journal fact failed: {error}"),
+                    ));
+                }
+                if let Err(error) = self
+                    .journal
+                    .transition(operation_id, OperationState::Finalizing)
+                {
+                    return Err(DmlError::committed_but_unfinalized(
+                        operation_id,
+                        Some(outcome),
+                        format!("persist finalizing journal state failed: {error}"),
+                    ));
+                }
                 match self.executor.finalize(&spec) {
                     Ok(()) => {
-                        self.journal
-                            .transition(operation_id, OperationState::Finalized)?;
+                        if let Err(error) = self
+                            .journal
+                            .transition(operation_id, OperationState::Finalized)
+                        {
+                            return Err(DmlError::committed_but_unfinalized(
+                                operation_id,
+                                Some(outcome),
+                                format!("persist finalized journal state failed: {error}"),
+                            ));
+                        }
                         Ok(WriteTransactionOutcome {
                             operation_id: Some(operation_id),
                             committed_snapshot_id: Some(snapshot_id),
                         })
                     }
                     Err(message) => {
-                        self.journal.record_fact(
+                        if let Err(error) = self.journal.record_fact(
                             operation_id,
                             reconcile::operation_fact_from_finalize_failure(message.clone()),
-                        )?;
-                        Err(DmlError::finalize(format!(
-                            "iceberg write operation {operation_id}: metadata commit succeeded \
-                             (snapshot {snapshot_id}, known committed) but finalization failed; \
-                             do not retry the write: {message}"
-                        )))
+                        ) {
+                            return Err(DmlError::committed_but_unfinalized(
+                                operation_id,
+                                Some(outcome),
+                                format!(
+                                    "finalization failed ({message}) and persisting the recovery \
+                                     fact failed: {error}"
+                                ),
+                            ));
+                        }
+                        Err(DmlError::committed_but_unfinalized(
+                            operation_id,
+                            Some(outcome),
+                            format!("post-commit finalization failed: {message}"),
+                        ))
                     }
                 }
             }
@@ -202,7 +233,13 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                     commit_error,
                     CommitServiceError::FinalizeFailedKnownCommitted { .. }
                 ) {
-                    self.journal.record_fact(
+                    let known_outcome = match &commit_error {
+                        CommitServiceError::FinalizeFailedKnownCommitted { outcome, .. } => {
+                            outcome.clone()
+                        }
+                        _ => None,
+                    };
+                    if let Err(error) = self.journal.record_fact(
                         operation_id,
                         OperationFact {
                             state: OperationState::Committed,
@@ -211,12 +248,61 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                             recovery_evidence: None,
                             failure: None,
                         },
-                    )?;
-                    self.journal
-                        .transition(operation_id, OperationState::Finalizing)?;
+                    ) {
+                        return Err(DmlError::committed_but_unfinalized(
+                            operation_id,
+                            known_outcome,
+                            format!("persist known-committed journal fact failed: {error}"),
+                        ));
+                    }
+                    if let Err(error) = self
+                        .journal
+                        .transition(operation_id, OperationState::Finalizing)
+                    {
+                        return Err(DmlError::committed_but_unfinalized(
+                            operation_id,
+                            known_outcome,
+                            format!("persist finalizing journal state failed: {error}"),
+                        ));
+                    }
                 }
-                self.journal.record_fact(operation_id, fact)?;
-                Err(DmlError::commit(commit_error.message().to_string()))
+                if let Err(error) = self.journal.record_fact(operation_id, fact) {
+                    let known_outcome = match &commit_error {
+                        CommitServiceError::FinalizeFailedKnownCommitted { outcome, .. } => {
+                            outcome.clone()
+                        }
+                        _ => None,
+                    };
+                    if matches!(
+                        commit_error,
+                        CommitServiceError::FinalizeFailedKnownCommitted { .. }
+                    ) {
+                        return Err(DmlError::committed_but_unfinalized(
+                            operation_id,
+                            known_outcome,
+                            format!("persist committed failure fact failed: {error}"),
+                        ));
+                    }
+                    return Err(error);
+                }
+                if matches!(
+                    commit_error,
+                    CommitServiceError::FinalizeFailedKnownCommitted { .. }
+                ) {
+                    let known_outcome = match &commit_error {
+                        CommitServiceError::FinalizeFailedKnownCommitted { outcome, .. } => {
+                            outcome.clone()
+                        }
+                        _ => None,
+                    };
+                    Err(DmlError::committed_but_unfinalized(
+                        operation_id,
+                        known_outcome,
+                        commit_error.message(),
+                    ))
+                } else {
+                    Err(DmlError::commit(commit_error.message().to_string()))
+                }
             }
         }
     }
@@ -230,7 +316,8 @@ mod tests {
     use crate::dml::error::DmlErrorKind;
     use crate::dml::journal::testing::InMemoryOperationJournal;
     use crate::dml::model::{
-        CommitOpKind, OperationKind, OperationTarget, RecoveryEvidence, StoredOperation,
+        CommitOpKind, DmlOperationId, OperationKind, OperationTarget, RecoveryEvidence,
+        StoredOperation,
     };
 
     struct FakeExecutor {
@@ -281,22 +368,35 @@ mod tests {
     }
 
     impl OperationJournal for FailCommittedFactJournal {
-        fn create_preparing(&self, request: CreatePreparingRequest) -> Result<i64, DmlError> {
+        fn create_preparing(
+            &self,
+            request: CreatePreparingRequest,
+        ) -> Result<DmlOperationId, DmlError> {
             self.inner.create_preparing(request)
         }
 
-        fn transition(&self, operation_id: i64, to: OperationState) -> Result<(), DmlError> {
+        fn transition(
+            &self,
+            operation_id: DmlOperationId,
+            to: OperationState,
+        ) -> Result<(), DmlError> {
             self.inner.transition(operation_id, to)
         }
 
-        fn record_fact(&self, operation_id: i64, fact: OperationFact) -> Result<(), DmlError> {
+        fn record_fact(
+            &self,
+            operation_id: DmlOperationId,
+            fact: OperationFact,
+        ) -> Result<(), DmlError> {
             if fact.state == OperationState::Committed {
-                return Err(DmlError::journal("committed fact persistence failed"));
+                return Err(DmlError::journal_unavailable(
+                    "committed fact persistence failed",
+                ));
             }
             self.inner.record_fact(operation_id, fact)
         }
 
-        fn load(&self, operation_id: i64) -> Result<Option<StoredOperation>, DmlError> {
+        fn load(&self, operation_id: DmlOperationId) -> Result<Option<StoredOperation>, DmlError> {
             self.inner.load(operation_id)
         }
 
@@ -346,15 +446,15 @@ mod tests {
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
         let outcome = runner.run(spec()).unwrap();
-        assert_eq!(outcome.operation_id, Some(1));
+        let operation_id = outcome.operation_id.expect("operation id");
         assert_eq!(outcome.committed_snapshot_id, Some(42));
         assert_eq!(
-            journal.load(1).unwrap().unwrap().state,
+            journal.load(operation_id).unwrap().unwrap().state,
             OperationState::Finalized
         );
         assert_eq!(
             journal
-                .load(1)
+                .load(operation_id)
                 .unwrap()
                 .unwrap()
                 .commit_outcome
@@ -376,10 +476,7 @@ mod tests {
 
         let outcome = runner.run(spec()).unwrap();
         assert_eq!(outcome.operation_id, None);
-        assert_eq!(
-            journal.load(1).unwrap().unwrap().state,
-            OperationState::Aborted
-        );
+        assert_eq!(journal.only_operation().state, OperationState::Aborted);
     }
 
     #[test]
@@ -396,10 +493,10 @@ mod tests {
         overwrite.commit_op_kind = CommitOpKind::Overwrite;
 
         let outcome = runner.run(overwrite).unwrap();
-        assert_eq!(outcome.operation_id, Some(1));
+        let operation_id = outcome.operation_id.expect("operation id");
         assert_eq!(outcome.committed_snapshot_id, Some(42));
         assert_eq!(
-            journal.load(1).unwrap().unwrap().state,
+            journal.load(operation_id).unwrap().unwrap().state,
             OperationState::Finalized
         );
     }
@@ -419,7 +516,7 @@ mod tests {
 
         let err = runner.run(spec()).unwrap_err();
         assert_eq!(err.kind(), DmlErrorKind::Executor);
-        let stored = journal.load(1).unwrap().unwrap();
+        let stored = journal.only_operation();
         assert_eq!(stored.state, OperationState::FailedKnownUncommitted);
         assert_eq!(
             stored.failure.unwrap().next_action,
@@ -440,7 +537,7 @@ mod tests {
         let err = runner.run(spec()).unwrap_err();
         assert_eq!(err.kind(), DmlErrorKind::Executor);
         assert_eq!(
-            journal.load(1).unwrap().unwrap().state,
+            journal.only_operation().state,
             OperationState::FailedKnownUncommitted
         );
     }
@@ -460,7 +557,7 @@ mod tests {
 
         let err = runner.run(spec()).unwrap_err();
         assert_eq!(err.kind(), DmlErrorKind::Commit);
-        let stored = journal.load(1).unwrap().unwrap();
+        let stored = journal.only_operation();
         assert_eq!(stored.state, OperationState::CommitUnknown);
         assert_eq!(
             stored.failure.unwrap().next_action,
@@ -484,7 +581,7 @@ mod tests {
         let err = runner.run(spec()).unwrap_err();
         assert_eq!(err.kind(), DmlErrorKind::Commit);
         assert_eq!(
-            journal.load(1).unwrap().unwrap().state,
+            journal.only_operation().state,
             OperationState::FailedKnownUncommitted
         );
     }
@@ -507,14 +604,21 @@ mod tests {
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
         let error = runner.run(spec()).unwrap_err();
-        assert_eq!(error.kind(), DmlErrorKind::Journal);
+        assert_eq!(error.kind(), DmlErrorKind::CommittedButUnfinalized);
+        assert!(error.operation_id().is_some());
+        assert_eq!(
+            error
+                .committed_outcome()
+                .map(|outcome| outcome.new_snapshot_id),
+            Some(42)
+        );
         assert!(
             error
                 .to_string()
                 .contains("committed fact persistence failed")
         );
         assert_eq!(
-            journal.load(1).unwrap().unwrap().state,
+            journal.inner.only_operation().state,
             OperationState::Committing
         );
     }
@@ -537,10 +641,10 @@ mod tests {
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
         let error = runner.run(spec()).unwrap_err();
-        assert_eq!(error.kind(), DmlErrorKind::Commit);
+        assert_eq!(error.kind(), DmlErrorKind::CommittedButUnfinalized);
         assert!(error.to_string().contains("commit-service finalize failed"));
 
-        let stored = journal.load(1).unwrap().unwrap();
+        let stored = journal.only_operation();
         assert_eq!(stored.state, OperationState::FinalizeFailedKnownCommitted);
         let outcome = stored.commit_outcome.unwrap();
         assert_eq!(outcome.snapshot_id, 43);
@@ -574,8 +678,8 @@ mod tests {
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
         let err = runner.run(spec()).unwrap_err();
-        assert_eq!(err.kind(), DmlErrorKind::Finalize);
-        let stored = journal.load(1).unwrap().unwrap();
+        assert_eq!(err.kind(), DmlErrorKind::CommittedButUnfinalized);
+        let stored = journal.only_operation();
         assert_eq!(stored.state, OperationState::FinalizeFailedKnownCommitted);
         assert_eq!(
             stored.failure.unwrap().next_action,
@@ -592,6 +696,6 @@ mod tests {
 
         let error = runner.run(spec()).unwrap_err();
         assert_eq!(error.kind(), DmlErrorKind::Admission);
-        assert!(journal.load(1).unwrap().is_none());
+        assert!(journal.list_unfinished().unwrap().is_empty());
     }
 }
