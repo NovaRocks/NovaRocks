@@ -849,7 +849,81 @@ fn resource_exhausted(message: impl Into<String>) -> DistributedQueryError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle,
+        StatisticsCollectionPlan,
+    };
+
     use super::*;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn connector_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            1024,
+            4096,
+        )
+        .expect("valid connector context")
+    }
+
+    fn program_for_preparation() -> StatisticsCollectionProgram {
+        let table = ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("statistics-test").expect("instance id"),
+            Bytes::from_static(b"pinned-table"),
+        )
+        .expect("table handle");
+        let data_version = StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-1"))
+            .expect("data version");
+        let metrics =
+            StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount]).expect("metrics");
+        let plan = StatisticsCollectionPlan::try_new(
+            table,
+            data_version,
+            metrics,
+            Vec::new(),
+            Bytes::from_static(b"provider-plan"),
+        )
+        .expect("collection plan");
+        StatisticsCollectionProgram::try_new(
+            plan,
+            StatisticsExecutionPolicy::try_new(
+                StatisticsExecutionMode::DurableJobAttempt,
+                Duration::from_secs(60),
+            )
+            .expect("policy"),
+        )
+        .expect("program")
+    }
+
+    #[test]
+    fn connector_preparation_rejects_empty_topology_without_local_fallback() {
+        let resolver = crate::connector::FixtureControlResolver::new(
+            crate::connector::ConnectorRegistry::new(),
+        );
+        let error = match prepare_statistics_connector_read(
+            &resolver,
+            &BackendTopologySnapshot::empty(7),
+            &program_for_preparation(),
+            connector_context(),
+        ) {
+            Ok(_) => panic!("statistics collection cannot run without a live backend"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), DistributedQueryErrorKind::Rejected);
+        assert!(error.message().contains("at least one live backend"));
+    }
 
     #[test]
     fn theta_wire_roundtrip_preserves_final_estimate() {
