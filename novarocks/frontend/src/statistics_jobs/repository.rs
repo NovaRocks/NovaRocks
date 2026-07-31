@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES;
+use novarocks_spi::connector::{ExternalMutationEvidence, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES};
 use novarocks_spi::state_store::{
     CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, ReadTransaction,
     StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
@@ -759,6 +759,18 @@ fn validate_stored(stored: &StoredStatisticsJobV1) -> RepositoryResult<()> {
         return Err(StatisticsJobRepositoryError::corruption(
             "publishing statistics job is missing operation evidence",
         ));
+    }
+    if let Some(wire) = &stored.publication_evidence {
+        let evidence = ExternalMutationEvidence::try_from_wire_v1(wire).map_err(|error| {
+            StatisticsJobRepositoryError::corruption(format!(
+                "statistics job publication evidence is invalid: {error}"
+            ))
+        })?;
+        if evidence.operation_id().to_bytes() != *stored.operation_id.as_bytes() {
+            return Err(StatisticsJobRepositoryError::corruption(
+                "statistics job publication evidence operation ID does not match its job",
+            ));
+        }
     }
     if stored.state.is_terminal() != stored.completed_at_ms.is_some() {
         return Err(StatisticsJobRepositoryError::corruption(
