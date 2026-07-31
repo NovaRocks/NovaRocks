@@ -321,6 +321,19 @@ fn function_to_insert_value(function: &sqlast::Function) -> Result<InsertValue, 
     let args = function_expr_args(&function.args)?;
     let name = function.name.to_string().to_ascii_lowercase();
     match name.as_str() {
+        "parse_json" => {
+            if args.len() != 1 {
+                return Err("parse_json expects 1 argument".to_string());
+            }
+            let InsertValue::String(json_text) = expr_to_insert_value(args[0])? else {
+                return Err("parse_json expects VARCHAR argument".to_string());
+            };
+            let bytes = novarocks::engine::insert_engine::encode_insert_variant_json(&json_text)
+                .map_err(|error| format!("parse_json failed: {error}"))?;
+            Ok(InsertValue::String(
+                bytes.into_iter().map(char::from).collect(),
+            ))
+        }
         "array" => Ok(InsertValue::Array(
             args.into_iter()
                 .map(expr_to_insert_value)

@@ -116,6 +116,28 @@ fn non_literal_values_function_uses_query_pipeline() {
 }
 
 #[test]
+fn parse_json_values_fold_to_packed_variant_literal() {
+    let command = convert_insert_command(&parse_insert(
+        r#"INSERT INTO t VALUES (1, parse_json('{"a":1}'))"#,
+    ))
+    .expect("convert command");
+    let InsertCommandSource::Values(rows) = command.source else {
+        panic!("constant parse_json must stay on the literal VALUES path");
+    };
+    let InsertValue::String(packed) = &rows[0][1] else {
+        panic!("parse_json must produce packed variant bytes");
+    };
+    assert!(
+        packed.chars().all(|ch| u32::from(ch) <= 0xff),
+        "packed variant must preserve every byte through the Latin-1 bridge"
+    );
+    let unpacked = packed.chars().map(|ch| ch as u8).collect::<Vec<_>>();
+    let expected = novarocks::engine::insert_engine::encode_insert_variant_json(r#"{"a":1}"#)
+        .expect("encode expected variant");
+    assert_eq!(unpacked, expected);
+}
+
+#[test]
 fn union_all_flattens_in_source_order() {
     let command = convert_insert_command(&parse_insert(
         "INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3",

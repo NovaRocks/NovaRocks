@@ -62,6 +62,14 @@ pub fn parse_insert_statement(sql: &str) -> Result<Option<sqlparser::ast::Insert
     }
 }
 
+/// Encode one constant JSON literal for frontend-owned INSERT conversion.
+///
+/// The binary format remains an execution-layer concern; frontend receives
+/// only opaque bytes and owns the decision to fold `parse_json(...)`.
+pub fn encode_insert_variant_json(json_text: &str) -> Result<Vec<u8>, String> {
+    crate::exec::variant_encode::encode_json_text_to_variant_bytes(json_text)
+}
+
 /// One admitted INSERT statement at the frontend route boundary.
 pub struct InsertRequest<'a> {
     pub statement: &'a sqlparser::ast::Insert,
@@ -316,26 +324,42 @@ impl InsertEngine for Arc<StandaloneState> {
             request.current_catalog.as_deref(),
             &request.current_database,
         )?;
-        let resolved = crate::connector::metadata_load_table(
+        crate::connector::metadata_load_table(
             self.connector_control.as_ref(),
             connector_context,
             &target.catalog,
             &target.namespace,
             &target.table,
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )?
-        .0;
+        )?;
         crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
             self,
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
         )?;
+        // Connector metadata intentionally carries only Arrow schema fields.
+        // INSERT shaping additionally needs Iceberg write-defaults and logical
+        // types, so expose the write-side catalog view through this narrow
+        // adapter instead of making frontend depend on connector internals.
+        let columns = {
+            let entry = self
+                .iceberg_catalogs
+                .read()
+                .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?
+                .get(&target.catalog)?;
+            crate::connector::iceberg::catalog::registry::load_table(
+                &entry,
+                &target.namespace,
+                &target.table,
+            )?
+            .columns
+        };
         Ok(ResolvedInsertTarget {
             backend: InsertTargetBackend::Iceberg,
             catalog: target.catalog,
             namespace: target.namespace,
             table: target.table,
-            columns: resolved.columns,
+            columns,
             supports_pipeline_insert: true,
         })
     }
