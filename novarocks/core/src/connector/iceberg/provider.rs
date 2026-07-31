@@ -3652,6 +3652,7 @@ fn map_iceberg_error(error: String) -> ConnectorError {
     } else if normalized.contains("format-version 3")
         || normalized.contains("nanosecond")
         || normalized.contains("invalid partition")
+        || normalized.contains("variant columns cannot appear in the partition spec")
         || normalized.contains("unsupported iceberg type evolution")
         || normalized.contains("decimal scale change is not allowed")
         || normalized.contains("format-version is reserved")
@@ -3682,6 +3683,15 @@ mod tests {
     fn unknown_table_catalog_error_is_not_found() {
         let error = map_iceberg_error("unknown table: analytics.orders".to_string());
         assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    }
+
+    #[test]
+    fn variant_partition_validation_is_known_uncommitted() {
+        let error = map_iceberg_error(
+            "iceberg table column `v` is variant; variant columns cannot appear in the partition spec"
+                .to_string(),
+        );
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     struct NotCancelled;
