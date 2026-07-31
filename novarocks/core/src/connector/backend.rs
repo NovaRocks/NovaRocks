@@ -22,6 +22,24 @@ use crate::engine::mv::lifecycle::{
     RefreshOutcome, RefreshPlan, RefreshRequest,
 };
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_spi::connector::{ConnectorTableHandle, StatisticsDataVersion};
+
+/// Immutable table/version pair from one connector metadata resolution.
+#[derive(Clone)]
+pub(crate) struct ResolvedTableStatisticsPin {
+    pub table: ConnectorTableHandle,
+    pub data_version: StatisticsDataVersion,
+}
+
+impl std::fmt::Debug for ResolvedTableStatisticsPin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedTableStatisticsPin")
+            .field("owner", self.table.owner())
+            .field("data_version", &self.data_version)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Resolved table metadata returned by the connector metadata SPI. This is
 /// the subset of table shape the engine layer needs in order to plan INSERTs
@@ -32,6 +50,9 @@ pub(crate) struct ResolvedTable {
     pub namespace: String,
     pub table: String,
     pub columns: Vec<ColumnDef>,
+    /// This pin is distinct from the schema version and must travel with any
+    /// scan that later consumes connector statistics.
+    pub statistics_pin: Option<ResolvedTableStatisticsPin>,
 }
 
 /// Materialized-view backend: CREATE / DROP / REFRESH / SHOW.

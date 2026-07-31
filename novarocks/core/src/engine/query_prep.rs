@@ -787,6 +787,7 @@ mod tests {
             namespace: "scratch".to_string(),
             table: "rewrite_piece".to_string(),
             columns: vec![],
+            statistics_pin: None,
         };
         let table_def = table_def_with_binding(
             &table,

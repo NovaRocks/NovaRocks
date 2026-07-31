@@ -1864,6 +1864,7 @@ mod tests {
             namespace: "test_db".to_string(),
             table: "target_orders".to_string(),
             columns,
+            statistics_pin: None,
         }
     }
 
