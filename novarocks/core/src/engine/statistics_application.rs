@@ -54,6 +54,10 @@ pub struct StatisticsTablePin {
     pub connector_instance_id: String,
     pub table_handle: Vec<u8>,
     pub data_version: Vec<u8>,
+    /// Resolved base-table column names from the same metadata snapshot as
+    /// the handle/data-version pair. Empty `ANALYZE TABLE` uses this list;
+    /// the worker must never load latest schema merely to expand `*`.
+    pub columns: Vec<String>,
 }
 
 /// Core resolves a logical ANALYZE target exactly once. The frontend invokes
@@ -192,6 +196,11 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             connector_instance_id: pin.table.owner().as_str().to_string(),
             table_handle: pin.table.payload().to_vec(),
             data_version: pin.data_version.as_bytes().to_vec(),
+            columns: resolved
+                .columns
+                .into_iter()
+                .map(|column| column.name)
+                .collect(),
         })
     }
 }
@@ -443,7 +452,12 @@ impl ConnectorStatisticsAttemptExecutor {
         request: &StatisticsAttemptRequest,
     ) -> Result<StatisticsMetricRequest, StatisticsApplicationError> {
         let mut metrics = vec![StatisticsMetric::RowCount];
-        for column in &request.metric_names {
+        let columns = if request.metric_names.is_empty() {
+            &request.table_pin.columns
+        } else {
+            &request.metric_names
+        };
+        for column in columns {
             let column: Arc<str> = Arc::from(column.as_str());
             metrics.extend([
                 StatisticsMetric::NullCount {

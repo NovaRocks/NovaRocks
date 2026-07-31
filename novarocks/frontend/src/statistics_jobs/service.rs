@@ -161,6 +161,7 @@ impl StatisticsJobTargetResolver for CoreStatisticsTargetResolverAdapter {
             connector_instance_id: pin.connector_instance_id,
             table_handle: pin.table_handle,
             data_version: pin.data_version,
+            columns: pin.columns,
         })
     }
 }
@@ -596,6 +597,7 @@ impl CoreStatisticsAttemptAdapter {
                 connector_instance_id: job.table_pin.connector_instance_id.clone(),
                 table_handle: job.table_pin.table_handle.clone(),
                 data_version: job.table_pin.data_version.clone(),
+                columns: job.table_pin.columns.clone(),
             },
             metric_names: job.metric_names.clone(),
         }

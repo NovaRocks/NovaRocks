@@ -121,6 +121,7 @@ fn request(table: &str, submitted_at_ms: i64) -> StatisticsJobCreate {
             connector_instance_id: "ice".to_string(),
             table_handle: format!("table:{table}").into_bytes(),
             data_version: b"snapshot:1".to_vec(),
+            columns: vec!["v".to_string()],
         },
         metric_names: vec!["row_count".to_string(), "ndv".to_string()],
         submitted_at_ms,
@@ -545,6 +546,7 @@ impl StatisticsJobTargetResolver for StaticStatisticsTargetResolver {
             connector_instance_id: target.catalog.clone(),
             table_handle: format!("table:{}:{}", target.namespace, target.table).into_bytes(),
             data_version: b"snapshot:1".to_vec(),
+            columns: vec!["v".to_string()],
         })
     }
 }

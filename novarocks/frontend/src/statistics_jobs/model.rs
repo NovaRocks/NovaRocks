@@ -21,6 +21,9 @@ use novarocks_spi::connector::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const MAX_STATISTICS_PINNED_COLUMNS: usize = 128;
+const MAX_STATISTICS_PINNED_COLUMN_BYTES: usize = 256;
+
 /// The durable schema carried by a statistics job record.
 pub const STATISTICS_JOB_SCHEMA_VERSION: u8 = 2;
 
@@ -42,6 +45,11 @@ pub struct StatisticsJobTablePin {
     pub connector_instance_id: String,
     pub table_handle: Vec<u8>,
     pub data_version: Vec<u8>,
+    /// Columns resolved alongside the pinned table handle. This is metadata
+    /// only (not a statistics artifact) and lets an empty ANALYZE column list
+    /// expand without rereading the latest table schema in a worker.
+    #[serde(default)]
+    pub columns: Vec<String>,
 }
 
 impl StatisticsJobTablePin {
@@ -57,6 +65,18 @@ impl StatisticsJobTablePin {
             || self.data_version.len() > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
         {
             return Err("statistics data version is empty or exceeds the SPI bound".to_string());
+        }
+        if self.columns.len() > MAX_STATISTICS_PINNED_COLUMNS
+            || self.columns.iter().any(|column| {
+                column.is_empty() || column.len() > MAX_STATISTICS_PINNED_COLUMN_BYTES
+            })
+            || self.columns.iter().enumerate().any(|(index, column)| {
+                self.columns[..index]
+                    .iter()
+                    .any(|seen| seen.eq_ignore_ascii_case(column))
+            })
+        {
+            return Err("statistics pinned columns are invalid or exceed the bound".to_string());
         }
         Ok(())
     }
