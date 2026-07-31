@@ -53,15 +53,7 @@ fn convert_set_expr_to_insert_source(
     use sqlparser::ast as sqlast;
     match body {
         sqlast::SetExpr::Values(values) => {
-            let mut rows = Vec::new();
-            for row in &values.rows {
-                let literal_row: Vec<Literal> = row
-                    .iter()
-                    .map(sqlparser_expr_to_literal)
-                    .collect::<Result<_, _>>()?;
-                rows.push(literal_row);
-            }
-            Ok(InsertSource::Values(rows))
+            convert_literal_values_rows(values).map(InsertSource::Values)
         }
         sqlast::SetExpr::Select(select) => {
             if select.from.is_empty() {
@@ -105,6 +97,20 @@ fn convert_set_expr_to_insert_source(
         sqlast::SetExpr::Query(query) => convert_set_expr_to_insert_source(query.body.as_ref()),
         _ => Err("unsupported INSERT source".into()),
     }
+}
+
+fn convert_literal_values_rows(
+    values: &sqlparser::ast::Values,
+) -> Result<Vec<Vec<Literal>>, String> {
+    values
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(sqlparser_expr_to_literal)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect()
 }
 
 fn select_item_expr(item: &sqlparser::ast::SelectItem) -> Result<&sqlparser::ast::Expr, String> {
@@ -2398,9 +2404,12 @@ pub(crate) fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDele
             ));
         }
     };
-    let converted = convert_sqlparser_insert_to_custom(&insert)?;
-    let rows = match converted.source {
-        InsertSource::Values(rows) => rows,
+    let source = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| "ADD EQUALITY DELETE requires a VALUES source".to_string())?;
+    let rows = match source.body.as_ref() {
+        sqlparser::ast::SetExpr::Values(values) => convert_literal_values_rows(values)?,
         other => {
             return Err(format!(
                 "ADD EQUALITY DELETE expects literal VALUES rows, got {other:?}"
