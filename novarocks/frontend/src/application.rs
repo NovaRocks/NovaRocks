@@ -33,6 +33,8 @@ use crate::dml::{DmlService, StateStoreOperationJournal};
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::query_control::FrontendQueryControl;
 use crate::statistics::FrontendStatisticsService;
+use crate::statistics_jobs::repository::StatisticsJobRepository;
+use crate::statistics_jobs::service::StatisticsApplicationService;
 use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
@@ -48,6 +50,7 @@ pub enum FrontendApplicationErrorKind {
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
     MvServiceOpen,
+    StatisticsApplicationServiceOpen,
     ClusterBackendOpen,
     CoordinatorOpen,
     Server,
@@ -95,6 +98,7 @@ pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
+    statistics_application_service: Option<Arc<StatisticsApplicationService>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     table_maintenance_service:
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
@@ -139,6 +143,7 @@ impl FrontendApplicationHost {
             connector_control: Arc::new(ConnectorControlHost::new()),
             statistics_service: None,
             dml_service: None,
+            statistics_application_service: None,
             view_service: None,
             table_maintenance_service: None,
             mv_repository: None,
@@ -258,6 +263,22 @@ impl FrontendApplicationHost {
         }) {
             return Err(host.cleanup_open_error(error).await);
         }
+        host.statistics_application_service = match host.state_store() {
+            Some(store) => match StatisticsJobRepository::open(store).await {
+                Ok(repository) => Some(Arc::new(StatisticsApplicationService::with_repository(
+                    repository,
+                ))),
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::StatisticsApplicationServiceOpen,
+                            error,
+                        ))
+                        .await);
+                }
+            },
+            None => Some(Arc::new(StatisticsApplicationService::unavailable())),
+        };
 
         Ok(host)
     }
@@ -282,6 +303,14 @@ impl FrontendApplicationHost {
             self.dml_service
                 .as_ref()
                 .expect("frontend DML service is installed before host open returns"),
+        )
+    }
+
+    pub fn statistics_application_service(&self) -> Arc<StatisticsApplicationService> {
+        Arc::clone(
+            self.statistics_application_service
+                .as_ref()
+                .expect("statistics application service is installed before host open returns"),
         )
     }
 
@@ -499,6 +528,10 @@ impl FrontendApplicationHost {
         self.dml_service.take();
         self.table_maintenance_service.take();
         self.statistics_service.take();
+        // The durable application service owns a StateStore reference through
+        // its repository, so it must be released before StateStoreHost closes
+        // its deployment lock.
+        self.statistics_application_service.take();
         self.view_service.take();
         self.mv_application_service.take();
         self.mv_repository.take();

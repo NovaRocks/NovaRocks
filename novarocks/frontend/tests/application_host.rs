@@ -206,6 +206,11 @@ async fn host_exposes_one_statistics_service_identity() {
     let first = host.statistics_service();
     let second = host.statistics_service();
     assert!(Arc::ptr_eq(&first, &second));
+    let first_application = host.statistics_application_service();
+    let second_application = host.statistics_application_service();
+    assert!(Arc::ptr_eq(&first_application, &second_application));
+    drop(first_application);
+    drop(second_application);
     host.shutdown().await.expect("shutdown");
 }
 
