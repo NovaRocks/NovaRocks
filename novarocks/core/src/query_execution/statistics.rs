@@ -22,18 +22,23 @@
 //! connector control plane, never encoded as client MySQL rows.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use bytes::Bytes;
 use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorControlResolver,
+    ConnectorReadSelector, ConnectorRequestContext, ConnectorSplitPlanningRequest,
     StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsDataVersion,
     StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
     StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
     StatisticsProvenance,
 };
 
+use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::preparation::scan::PlannedConnectorRead;
 
 /// The longest independently owned durable ANALYZE attempt. A client wait
 /// deadline is intentionally not an attempt deadline.
@@ -146,6 +151,96 @@ impl StatisticsCollectionProgram {
             result: None,
         }
     }
+}
+
+/// Prepare the provider-neutral read portion of a statistics collection using
+/// the normal connector control path.  The table handle and physical
+/// projection originate from the provider's one-time pinned metadata
+/// resolution; this helper intentionally performs no catalog lookup and never
+/// opens a BE reader locally.  The returned planning lease keeps that exact
+/// connector generation live until the normal execution-binding barrier has
+/// consumed the declaration.
+pub(crate) fn prepare_statistics_connector_read(
+    controls: &dyn ConnectorControlResolver,
+    topology: &BackendTopologySnapshot,
+    program: &StatisticsCollectionProgram,
+    context: ConnectorRequestContext,
+) -> Result<PlannedConnectorRead, DistributedQueryError> {
+    let target_parallelism = NonZeroUsize::new(topology.targets().len()).ok_or_else(|| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "statistics collection requires at least one live backend",
+        )
+    })?;
+    let lease = controls
+        .acquire_current(program.plan.table().owner())
+        .map_err(connector_planning_error)?;
+    if lease.binding().descriptor().instance_id != *program.plan.table().owner() {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "statistics collection planning lease does not own its resolved table handle",
+        ));
+    }
+    let batch = ConnectorBatchBudget {
+        max_rows: NonZeroUsize::new(4096).expect("statistics batch rows are nonzero"),
+        max_bytes: NonZeroUsize::new(context.max_handle_payload_bytes())
+            .expect("validated connector payload budget is nonzero"),
+    };
+    // `Current` here is not a latest metadata lookup: the opaque table handle
+    // is the provider-resolved data-version pin.  Providers must bind this
+    // selector to that handle's version, as Iceberg does with snapshot_id.
+    let scan = lease
+        .binding()
+        .planning()
+        .begin_scan(
+            program.plan.table(),
+            ConnectorBeginScanRequest {
+                projection: program.plan.scan_projection().to_vec(),
+                selector: ConnectorReadSelector::Current,
+                limit: None,
+                batch,
+                context: context.clone(),
+            },
+        )
+        .map_err(connector_planning_error)?;
+    let splits = lease
+        .binding()
+        .planning()
+        .plan_splits(
+            &scan.handle,
+            ConnectorSplitPlanningRequest {
+                target_parallelism,
+                max_split_bytes: None,
+                context: context.clone(),
+            },
+        )
+        .map_err(connector_planning_error)?;
+    if splits
+        .iter()
+        .any(|split| split.owner() != &lease.binding().descriptor().instance_id)
+    {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "statistics collection provider planned a split for another connector instance",
+        ));
+    }
+    let declaration = lease
+        .binding()
+        .execution_declaration(&context)
+        .map_err(connector_planning_error)?;
+    Ok(PlannedConnectorRead {
+        declaration,
+        scan,
+        splits,
+        batch,
+        planning_lease: Some(lease),
+    })
+}
+
+fn connector_planning_error(
+    error: novarocks_spi::connector::ConnectorError,
+) -> DistributedQueryError {
+    DistributedQueryError::new(DistributedQueryErrorKind::Failed, error.to_string())
 }
 
 /// A one-result bounded sink for an internal statistics execution. It rejects
