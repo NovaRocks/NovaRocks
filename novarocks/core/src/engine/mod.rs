@@ -70,6 +70,7 @@ pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
 pub mod statistics;
+pub mod statistics_application;
 pub mod system_catalog;
 pub mod table_maintenance;
 pub mod view;
