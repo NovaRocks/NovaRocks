@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_spi::connector::{
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The durable schema carried by a statistics job record.
-pub const STATISTICS_JOB_SCHEMA_VERSION: u8 = 1;
+pub const STATISTICS_JOB_SCHEMA_VERSION: u8 = 2;
 
 /// A stable table reference for a submitted ANALYZE request.
 ///
-/// It deliberately contains no scan artifact, sketch, or runtime handle. The
-/// worker resolves the connector and data version afresh after it owns a job.
+/// It deliberately contains no scan artifact, sketch, or runtime handle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StatisticsJobTarget {
     pub catalog: String,
@@ -32,9 +34,38 @@ pub struct StatisticsJobTarget {
     pub table: String,
 }
 
+/// Immutable connector table/data-version pin resolved when ANALYZE is
+/// submitted. The worker consumes it directly and must never resolve the
+/// logical name to latest after it owns the job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StatisticsJobTablePin {
+    pub connector_instance_id: String,
+    pub table_handle: Vec<u8>,
+    pub data_version: Vec<u8>,
+}
+
+impl StatisticsJobTablePin {
+    pub fn validate(&self) -> Result<(), String> {
+        novarocks_spi::connector::ConnectorInstanceId::parse(&self.connector_instance_id)
+            .map_err(|error| format!("invalid statistics connector instance ID: {error}"))?;
+        if self.table_handle.is_empty()
+            || self.table_handle.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
+        {
+            return Err("statistics table handle is empty or exceeds the SPI bound".to_string());
+        }
+        if self.data_version.is_empty()
+            || self.data_version.len() > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
+        {
+            return Err("statistics data version is empty or exceeds the SPI bound".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsJobCreate {
     pub target: StatisticsJobTarget,
+    pub table_pin: StatisticsJobTablePin,
     pub metric_names: Vec<String>,
     pub submitted_at_ms: i64,
 }
@@ -101,6 +132,7 @@ pub struct StatisticsJob {
     pub job_id: Uuid,
     pub operation_id: Uuid,
     pub target: StatisticsJobTarget,
+    pub table_pin: StatisticsJobTablePin,
     pub metric_names: Vec<String>,
     pub state: StatisticsJobState,
     pub attempt: u32,
@@ -119,11 +151,12 @@ pub struct StatisticsJob {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct StoredStatisticsJobV1 {
+pub(crate) struct StoredStatisticsJobV2 {
     pub schema_version: u8,
     pub job_id: Uuid,
     pub operation_id: Uuid,
     pub target: StatisticsJobTarget,
+    pub table_pin: StatisticsJobTablePin,
     pub metric_names: Vec<String>,
     pub state: StatisticsJobState,
     pub attempt: u32,
@@ -139,12 +172,13 @@ pub(crate) struct StoredStatisticsJobV1 {
     pub completed_at_ms: Option<i64>,
 }
 
-impl From<&StoredStatisticsJobV1> for StatisticsJob {
-    fn from(value: &StoredStatisticsJobV1) -> Self {
+impl From<&StoredStatisticsJobV2> for StatisticsJob {
+    fn from(value: &StoredStatisticsJobV2) -> Self {
         Self {
             job_id: value.job_id,
             operation_id: value.operation_id,
             target: value.target.clone(),
+            table_pin: value.table_pin.clone(),
             metric_names: value.metric_names.clone(),
             state: value.state,
             attempt: value.attempt,

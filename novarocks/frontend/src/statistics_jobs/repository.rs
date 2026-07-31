@@ -33,10 +33,10 @@ use uuid::Uuid;
 
 use super::model::{
     STATISTICS_JOB_SCHEMA_VERSION, StatisticsJob, StatisticsJobCreate, StatisticsJobError,
-    StatisticsJobState, StoredStatisticsJobV1,
+    StatisticsJobState, StoredStatisticsJobV2,
 };
 
-const JOB_PREFIX: &str = "novarocks/frontend/statistics/v1/jobs/";
+const JOB_PREFIX: &str = "novarocks/frontend/statistics/v2/jobs/";
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 const MAX_METRIC_NAMES: usize = 128;
 const MAX_METRIC_NAME_BYTES: usize = 256;
@@ -133,11 +133,12 @@ impl StatisticsJobRepository {
         validate_create(&request)?;
         let job_id = Uuid::now_v7();
         let operation_id = Uuid::now_v7();
-        let stored = StoredStatisticsJobV1 {
+        let stored = StoredStatisticsJobV2 {
             schema_version: STATISTICS_JOB_SCHEMA_VERSION,
             job_id,
             operation_id,
             target: request.target,
+            table_pin: request.table_pin,
             metric_names: request.metric_names,
             state: StatisticsJobState::Submitted,
             attempt: 0,
@@ -194,7 +195,7 @@ impl StatisticsJobRepository {
         loop {
             let page = transaction.range(&request).await.map_err(store_error)?;
             for record in page.records {
-                let stored: StoredStatisticsJobV1 =
+                let stored: StoredStatisticsJobV2 =
                     decode_json(record.value.as_bytes(), "statistics job")?;
                 validate_stored(&stored)?;
                 jobs.push(StatisticsJob::from(&stored));
@@ -582,7 +583,7 @@ impl StatisticsJobRepository {
         &self,
         transaction: Box<dyn WriteTransaction>,
         context: &str,
-        expected: &StoredStatisticsJobV1,
+        expected: &StoredStatisticsJobV2,
     ) -> RepositoryResult<StatisticsJob> {
         let transaction_id = *transaction.transaction_id();
         match transaction.commit().await {
@@ -605,7 +606,7 @@ impl StatisticsJobRepository {
         &self,
         transaction_id: TransactionId,
         context: &str,
-        expected: &StoredStatisticsJobV1,
+        expected: &StoredStatisticsJobV2,
         commit_error: StateStoreError,
     ) -> RepositoryResult<StatisticsJob> {
         let resolution = self
@@ -652,7 +653,7 @@ impl StatisticsJobRepository {
 }
 
 struct VersionedJob {
-    stored: StoredStatisticsJobV1,
+    stored: StoredStatisticsJobV2,
     version: VersionToken,
 }
 
@@ -667,7 +668,7 @@ async fn load_job(
     else {
         return Ok(None);
     };
-    let stored: StoredStatisticsJobV1 = decode_json(record.value.as_bytes(), "statistics job")?;
+    let stored: StoredStatisticsJobV2 = decode_json(record.value.as_bytes(), "statistics job")?;
     validate_stored(&stored)?;
     if stored.job_id != job_id {
         return Err(StatisticsJobRepositoryError::corruption(
@@ -704,6 +705,11 @@ fn validate_create(request: &StatisticsJobCreate) -> RepositoryResult<()> {
             ));
         }
     }
+    request.table_pin.validate().map_err(|error| {
+        StatisticsJobRepositoryError::corruption(format!(
+            "invalid statistics job table pin: {error}"
+        ))
+    })?;
     if request.metric_names.is_empty() || request.metric_names.len() > MAX_METRIC_NAMES {
         return Err(StatisticsJobRepositoryError::corruption(
             "statistics job metric names must be non-empty and bounded",
@@ -732,7 +738,7 @@ fn validate_error(error: Option<&StatisticsJobError>) -> RepositoryResult<()> {
     Ok(())
 }
 
-fn validate_stored(stored: &StoredStatisticsJobV1) -> RepositoryResult<()> {
+fn validate_stored(stored: &StoredStatisticsJobV2) -> RepositoryResult<()> {
     if stored.schema_version != STATISTICS_JOB_SCHEMA_VERSION {
         return Err(StatisticsJobRepositoryError::corruption(
             "statistics job record has an unsupported schema version",
@@ -740,6 +746,7 @@ fn validate_stored(stored: &StoredStatisticsJobV1) -> RepositoryResult<()> {
     }
     validate_create(&StatisticsJobCreate {
         target: stored.target.clone(),
+        table_pin: stored.table_pin.clone(),
         metric_names: stored.metric_names.clone(),
         submitted_at_ms: stored.submitted_at_ms,
     })?;

@@ -28,7 +28,9 @@ use uuid::Uuid;
 
 use novarocks::engine::statistics_application as core_application;
 
-use super::model::{StatisticsJob, StatisticsJobCreate, StatisticsJobTarget};
+use super::model::{
+    StatisticsJob, StatisticsJobCreate, StatisticsJobTablePin, StatisticsJobTarget,
+};
 use super::repository::{StatisticsJobRepository, StatisticsJobRepositoryError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,19 +86,55 @@ pub trait TableStatisticsReader: Send + Sync {
     ) -> Result<Vec<StatisticsTableStatRow>, String>;
 }
 
+/// Resolves an ANALYZE logical target exactly once, before its durable job is
+/// created. The returned pin is persisted with the job and never refreshed by
+/// the worker; this keeps collection and publication on one data version.
+pub trait StatisticsJobTargetResolver: Send + Sync {
+    fn resolve_table_pin(
+        &self,
+        target: &StatisticsJobTarget,
+    ) -> Result<StatisticsJobTablePin, String>;
+}
+
+struct UnavailableStatisticsJobTargetResolver;
+
+impl StatisticsJobTargetResolver for UnavailableStatisticsJobTargetResolver {
+    fn resolve_table_pin(
+        &self,
+        _target: &StatisticsJobTarget,
+    ) -> Result<StatisticsJobTablePin, String> {
+        Err("ANALYZE is unavailable until the Core statistics target resolver is bound".into())
+    }
+}
+
 #[derive(Clone)]
 pub struct StatisticsApplicationService {
     repository: Option<StatisticsJobRepository>,
+    target_resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>,
 }
 
 impl StatisticsApplicationService {
-    pub const fn unavailable() -> Self {
-        Self { repository: None }
+    pub fn unavailable() -> Self {
+        Self {
+            repository: None,
+            target_resolver: std::sync::Arc::new(UnavailableStatisticsJobTargetResolver),
+        }
     }
 
     pub fn with_repository(repository: StatisticsJobRepository) -> Self {
         Self {
             repository: Some(repository),
+            target_resolver: std::sync::Arc::new(UnavailableStatisticsJobTargetResolver),
+        }
+    }
+
+    pub fn with_repository_and_target_resolver(
+        repository: StatisticsJobRepository,
+        target_resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>,
+    ) -> Self {
+        Self {
+            repository: Some(repository),
+            target_resolver,
         }
     }
 
@@ -109,9 +147,14 @@ impl StatisticsApplicationService {
         match statement {
             StatisticsStatement::AnalyzeTable(statement) => {
                 let repository = self.repository()?;
+                let table_pin = self
+                    .target_resolver
+                    .resolve_table_pin(&statement.target)
+                    .map_err(StatisticsApplicationError::target_resolution)?;
                 let job = repository
                     .create(StatisticsJobCreate {
                         target: statement.target,
+                        table_pin,
                         metric_names: statement.metric_names,
                         submitted_at_ms,
                     })
@@ -157,6 +200,7 @@ pub enum StatisticsApplicationErrorKind {
     StateStoreRequired,
     Repository,
     TableStatistics,
+    TargetResolution,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +227,13 @@ impl StatisticsApplicationError {
     fn table_statistics(error: String) -> Self {
         Self {
             kind: StatisticsApplicationErrorKind::TableStatistics,
+            message: error,
+        }
+    }
+
+    fn target_resolution(error: String) -> Self {
+        Self {
+            kind: StatisticsApplicationErrorKind::TargetResolution,
             message: error,
         }
     }

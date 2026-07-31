@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use novarocks_frontend::statistics_jobs::model::{
     StatisticsJobCreate, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState,
-    StatisticsJobTarget,
+    StatisticsJobTablePin, StatisticsJobTarget,
 };
 use novarocks_frontend::statistics_jobs::repository::{
     FenceValidator, StatisticsJobRepository, StatisticsJobRepositoryErrorKind,
@@ -32,7 +32,8 @@ use novarocks_frontend::statistics_jobs::repository::{
 use novarocks_frontend::statistics_jobs::service::{
     AnalyzeTableStatement, CancelAnalyzeStatement, ShowAnalyzeJobsStatement,
     ShowTableStatsStatement, StatisticsApplicationErrorKind, StatisticsApplicationService,
-    StatisticsStatement, StatisticsStatementResult, StatisticsTableStatRow, TableStatisticsReader,
+    StatisticsJobTargetResolver, StatisticsStatement, StatisticsStatementResult,
+    StatisticsTableStatRow, TableStatisticsReader,
 };
 use novarocks_frontend::statistics_jobs::worker::{
     StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
@@ -51,7 +52,7 @@ use novarocks_state_store::{
 };
 use tempfile::TempDir;
 
-const PREFIX: &str = "novarocks/frontend/statistics/v1/";
+const PREFIX: &str = "novarocks/frontend/statistics/v2/";
 
 fn publication_evidence(
     job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
@@ -116,6 +117,11 @@ fn request(table: &str, submitted_at_ms: i64) -> StatisticsJobCreate {
             namespace: "db".to_string(),
             table: table.to_string(),
         },
+        table_pin: StatisticsJobTablePin {
+            connector_instance_id: "ice".to_string(),
+            table_handle: format!("table:{table}").into_bytes(),
+            data_version: b"snapshot:1".to_vec(),
+        },
         metric_names: vec!["row_count".to_string(), "ndv".to_string()],
         submitted_at_ms,
     }
@@ -164,6 +170,9 @@ async fn records_are_versioned_durable_and_identical_analyze_requests_remain_dis
 
     assert_ne!(first.job_id, second.job_id);
     assert_ne!(first.operation_id, second.operation_id);
+    assert_eq!(first.table_pin.connector_instance_id, "ice");
+    assert_eq!(first.table_pin.table_handle, b"table:orders");
+    assert_eq!(first.table_pin.data_version, b"snapshot:1");
     assert_eq!(first.job_id.get_version_num(), 7);
     assert_eq!(first.operation_id.get_version_num(), 7);
     assert_eq!(
@@ -179,7 +188,7 @@ async fn records_are_versioned_durable_and_identical_analyze_requests_remain_dis
     assert!(
         payloads
             .iter()
-            .any(|payload| payload.contains("\"schema_version\":1"))
+            .any(|payload| payload.contains("\"schema_version\":2"))
     );
     for forbidden in ["artifact", "sketch", "runtime_handle", "record_batch"] {
         assert!(payloads.iter().all(|payload| !payload.contains(forbidden)));
@@ -525,6 +534,21 @@ async fn claim_transitions_with_fence_and_cancel_observes_publish_boundary() {
 
 struct StaticTableStatistics;
 
+struct StaticStatisticsTargetResolver;
+
+impl StatisticsJobTargetResolver for StaticStatisticsTargetResolver {
+    fn resolve_table_pin(
+        &self,
+        target: &StatisticsJobTarget,
+    ) -> Result<StatisticsJobTablePin, String> {
+        Ok(StatisticsJobTablePin {
+            connector_instance_id: target.catalog.clone(),
+            table_handle: format!("table:{}:{}", target.namespace, target.table).into_bytes(),
+            data_version: b"snapshot:1".to_vec(),
+        })
+    }
+}
+
 impl TableStatisticsReader for StaticTableStatistics {
     fn show_table_stats(
         &self,
@@ -574,7 +598,10 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
     );
 
     let (_temp, _store, repository) = fixture().await;
-    let service = StatisticsApplicationService::with_repository(repository);
+    let service = StatisticsApplicationService::with_repository_and_target_resolver(
+        repository,
+        Arc::new(StaticStatisticsTargetResolver),
+    );
     let submitted = service
         .execute(
             StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
@@ -603,7 +630,7 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
     assert!(matches!(listed, StatisticsStatementResult::AnalyzeJobs(jobs) if jobs.len() == 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn typed_cancel_records_intent_and_the_fenced_worker_transitions_it() {
     let (_temp, _store, repository) = fixture().await;
     let service = StatisticsApplicationService::with_repository(repository.clone());
