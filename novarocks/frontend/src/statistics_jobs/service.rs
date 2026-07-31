@@ -211,21 +211,35 @@ impl std::error::Error for StatisticsApplicationError {}
 /// accepted across this boundary.
 pub struct FrontendStatisticsApplicationPort {
     service: StatisticsApplicationService,
-    table_statistics: std::sync::Arc<dyn TableStatisticsReader>,
+    table_statistics: std::sync::RwLock<Option<std::sync::Arc<dyn TableStatisticsReader>>>,
     runtime: tokio::runtime::Handle,
 }
 
 impl FrontendStatisticsApplicationPort {
-    pub fn new(
-        service: StatisticsApplicationService,
-        table_statistics: std::sync::Arc<dyn TableStatisticsReader>,
-        runtime: tokio::runtime::Handle,
-    ) -> Self {
+    pub fn new(service: StatisticsApplicationService, runtime: tokio::runtime::Handle) -> Self {
         Self {
             service,
-            table_statistics,
+            table_statistics: std::sync::RwLock::new(None),
             runtime,
         }
+    }
+
+    /// Called only after Core has opened its pin-aware statistics reader.
+    /// Rebinding would permit a stale engine to replace the active reader, so
+    /// reject it rather than silently changing a live application boundary.
+    pub fn bind_table_statistics_reader(
+        &self,
+        reader: std::sync::Arc<dyn TableStatisticsReader>,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .table_statistics
+            .write()
+            .map_err(|_| "statistics table reader lock poisoned".to_string())?;
+        if slot.is_some() {
+            return Err("statistics table reader is already bound".to_string());
+        }
+        *slot = Some(reader);
+        Ok(())
     }
 }
 
@@ -266,15 +280,36 @@ impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicati
                     "statistics submission timestamp overflow",
                 )
             })?;
+        let reader = self
+            .table_statistics
+            .read()
+            .map_err(|_| {
+                core_application::StatisticsApplicationError::new(
+                    "statistics table reader lock poisoned",
+                )
+            })?
+            .clone();
+        let reader: std::sync::Arc<dyn TableStatisticsReader> =
+            reader.unwrap_or_else(|| std::sync::Arc::new(UnboundTableStatisticsReader));
         let result = tokio::task::block_in_place(|| {
-            self.runtime.block_on(self.service.execute(
-                statement,
-                submitted_at_ms,
-                self.table_statistics.as_ref(),
-            ))
+            self.runtime.block_on(
+                self.service
+                    .execute(statement, submitted_at_ms, reader.as_ref()),
+            )
         })
         .map_err(|error| core_application::StatisticsApplicationError::new(error.to_string()))?;
         Ok(map_core_result(result))
+    }
+}
+
+struct UnboundTableStatisticsReader;
+
+impl TableStatisticsReader for UnboundTableStatisticsReader {
+    fn show_table_stats(
+        &self,
+        _target: &StatisticsJobTarget,
+    ) -> Result<Vec<StatisticsTableStatRow>, String> {
+        Err("SHOW TABLE STATS is unavailable until the Core statistics reader is bound".into())
     }
 }
 
