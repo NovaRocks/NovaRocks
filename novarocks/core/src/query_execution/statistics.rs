@@ -27,9 +27,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
-    StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsDataVersion, StatisticsMetric,
-    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
-    StatisticsMissingKind,
+    StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
+    StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
+    StatisticsProvenance,
 };
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
@@ -427,6 +428,43 @@ impl StatisticsCollectionFinalizer {
             ));
         }
         Ok(Bytes::from(bytes))
+    }
+
+    /// Finalize one visible-row collection into the exact typed result handed
+    /// to a connector publisher.  The method owns the relationship between
+    /// evidence and artifact so a distributed executor cannot accidentally
+    /// publish a sketch under another data-version or metric selection.
+    pub fn finish_visible_row(
+        &self,
+        data_version: StatisticsDataVersion,
+        evidence_revision: StatisticsEvidenceRevision,
+        metrics: &StatisticsMetricRequest,
+    ) -> Result<StatisticsCollectionResult, DistributedQueryError> {
+        let metric_states = self.metric_states(metrics);
+        if metric_states
+            .values()
+            .any(|state| !matches!(state, StatisticsMetricState::Available(_)))
+        {
+            return Err(contract_violation(
+                "visible-row statistics collection did not produce every requested metric",
+            ));
+        }
+        let artifact = self.try_visible_row_artifact(&data_version)?;
+        StatisticsCollectionResult::try_new(
+            StatisticsEvidence {
+                data_version,
+                evidence_revision,
+                coverage: novarocks_spi::connector::StatisticsCoverage::Full,
+                accuracy: novarocks_spi::connector::StatisticsAccuracy::Exact,
+                interval: None,
+                provenance: StatisticsProvenance::VisibleRows,
+                metrics: metric_states,
+            },
+            artifact,
+        )
+        .map_err(|error| {
+            contract_violation(format!("encode statistics collection result: {error}"))
+        })
     }
 }
 
@@ -832,5 +870,36 @@ mod tests {
             .to_vec();
         artifact.push(1);
         assert!(decode_visible_row_artifact(&artifact).is_err());
+    }
+
+    #[test]
+    fn finalizer_binds_visible_row_evidence_to_the_artifact_version() {
+        let data_version =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table/v1")).expect("version");
+        let revision =
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run/v1")).expect("revision");
+        let metrics = StatisticsMetricRequest::try_new(vec![StatisticsMetric::ThetaNdv {
+            column: "customer_id".into(),
+        }])
+        .expect("metrics");
+        let result = StatisticsCollectionFinalizer::default()
+            .with_theta(
+                "customer_id",
+                ThetaSketchPartial::try_from_i64_values(12, 0_i64..100).expect("theta"),
+            )
+            .finish_visible_row(data_version.clone(), revision.clone(), &metrics)
+            .expect("finalize");
+        assert_eq!(result.evidence.data_version, data_version);
+        assert_eq!(result.evidence.evidence_revision, revision);
+        assert_eq!(
+            result.evidence.provenance,
+            StatisticsProvenance::VisibleRows
+        );
+        assert_eq!(
+            decode_visible_row_artifact(result.provider_payload())
+                .expect("decode artifact")
+                .0,
+            result.evidence.data_version
+        );
     }
 }
