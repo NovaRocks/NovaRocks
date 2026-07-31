@@ -20,7 +20,10 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 
-use super::{ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle};
+use super::{
+    ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle,
+    StatisticsDataVersion,
+};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConnectorNamespaceIdentity {
@@ -39,7 +42,13 @@ pub struct ConnectorTableIdentity {
 pub struct ConnectorTableMetadata {
     pub identity: ConnectorTableIdentity,
     pub schema: SchemaRef,
+    /// Provider-owned schema identity. This remains deliberately distinct
+    /// from the data-version pin used by statistics and scan planning.
     pub version: Option<Bytes>,
+    /// Opaque data-version resolved together with this table metadata. Core
+    /// must pass this exact pin to both scan and statistics consumers rather
+    /// than resolving `latest` a second time.
+    pub statistics_data_version: Option<StatisticsDataVersion>,
     pub table: ConnectorTableHandle,
 }
 

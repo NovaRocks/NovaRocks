@@ -23,6 +23,7 @@ pub(crate) mod scan_model;
 pub mod schema;
 pub mod starrocks;
 pub(crate) mod stats;
+pub(crate) mod unified_statistics;
 
 pub(crate) use backend::MvBackend;
 #[cfg(test)]

@@ -26,7 +26,9 @@ use novarocks_spi::connector::{
     ConnectorNamespaceIdentity, ConnectorOpenReaderRequest, ConnectorReadSelector,
     ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
     ConnectorTableRequest, ConnectorTableResolution, CreatePolicy, ExternalMutationEffect,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy, StatisticsCoverage,
+    StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest, StatisticsReadRequest,
+    StatisticsReader,
 };
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
@@ -136,6 +138,59 @@ fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
         execution.provider_id(),
         &declaration.descriptor().provider_id
     );
+}
+
+#[test]
+fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
+    let (registry, _warehouse) = registry_with_table();
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let control = IcebergControlProvider::new_control(instance_id.clone(), registry)
+        .expect("planning Iceberg control binding");
+    let metadata = control
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context(),
+        })
+        .expect("load table metadata");
+    let data_version = metadata
+        .statistics_data_version
+        .clone()
+        .expect("Iceberg metadata supplies a separate data-version pin");
+    let metrics = StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount])
+        .expect("statistics metric request");
+    let evidence = control
+        .statistics()
+        .expect("statistics capability")
+        .read_statistics(StatisticsReadRequest {
+            table: metadata.table.clone(),
+            data_version: data_version.clone(),
+            metrics: metrics.clone(),
+            context: context(),
+        })
+        .expect("read pinned statistics");
+    assert_eq!(evidence.data_version, data_version);
+    assert_eq!(evidence.coverage, StatisticsCoverage::Subset);
+    assert_eq!(evidence.accuracy, StatisticsAccuracy::Approximate);
+
+    let wrong_version = StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"wrong"))
+        .expect("bounded test version");
+    let error = control
+        .statistics()
+        .expect("statistics capability")
+        .read_statistics(StatisticsReadRequest {
+            table: metadata.table,
+            data_version: wrong_version,
+            metrics,
+            context: context(),
+        })
+        .expect_err("statistics must reject a data-version drift");
+    assert!(error.to_string().contains("data version"));
 }
 
 #[test]
