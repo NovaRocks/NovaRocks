@@ -266,6 +266,7 @@ pub struct StatisticsCollectionRequest {
 pub struct StatisticsCollectionPlan {
     table: ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
+    evidence_revision: StatisticsEvidenceRevision,
     pub metrics: StatisticsMetricRequest,
     scan_projection: Vec<usize>,
     provider_payload: Bytes,
@@ -275,6 +276,7 @@ impl StatisticsCollectionPlan {
     pub fn try_new(
         table: ConnectorTableHandle,
         data_version: StatisticsDataVersion,
+        evidence_revision: StatisticsEvidenceRevision,
         metrics: StatisticsMetricRequest,
         scan_projection: Vec<usize>,
         provider_payload: Bytes,
@@ -294,6 +296,7 @@ impl StatisticsCollectionPlan {
         Ok(Self {
             table,
             data_version,
+            evidence_revision,
             metrics,
             scan_projection,
             provider_payload: bounded_payload(provider_payload, "statistics collection plan")?,
@@ -302,6 +305,12 @@ impl StatisticsCollectionPlan {
 
     pub fn table(&self) -> &ConnectorTableHandle {
         &self.table
+    }
+
+    /// Provider-owned revision fixed at collection preparation.  Core carries
+    /// it unchanged to the final evidence and must never synthesize a token.
+    pub fn evidence_revision(&self) -> &StatisticsEvidenceRevision {
+        &self.evidence_revision
     }
 
     /// Provider-resolved physical column ordinals for the normal connector
@@ -552,6 +561,7 @@ impl ConnectorStatisticsLease {
         let plan = collection.prepare_collection(request)?;
         if plan.table() != &expected_table
             || plan.data_version != expected_data_version
+            || plan.evidence_revision.as_bytes().is_empty()
             || plan.metrics != expected_metrics
         {
             return Err(ConnectorError::new(

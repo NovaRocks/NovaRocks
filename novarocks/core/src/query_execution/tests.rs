@@ -606,6 +606,10 @@ fn statistics_program() -> crate::query_execution::statistics::StatisticsCollect
         Bytes::from_static(b"snapshot-42"),
     )
     .expect("data version");
+    let evidence_revision = novarocks_spi::connector::StatisticsEvidenceRevision::try_new(
+        Bytes::from_static(b"collection-42"),
+    )
+    .expect("evidence revision");
     let metrics = novarocks_spi::connector::StatisticsMetricRequest::try_new(vec![
         novarocks_spi::connector::StatisticsMetric::RowCount,
     ])
@@ -613,6 +617,7 @@ fn statistics_program() -> crate::query_execution::statistics::StatisticsCollect
     let plan = novarocks_spi::connector::StatisticsCollectionPlan::try_new(
         table,
         data_version,
+        evidence_revision,
         metrics,
         Vec::new(),
         Bytes::from_static(b"provider-plan"),

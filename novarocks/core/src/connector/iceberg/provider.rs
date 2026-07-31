@@ -2998,9 +2998,19 @@ impl StatisticsCollection for IcebergControlProvider {
         // may compile normal distributed scans from it but cannot reinterpret
         // catalog credentials or re-resolve latest metadata.
         let provider_payload = request.table.payload().clone();
+        let evidence_revision = StatisticsEvidenceRevision::try_new(Bytes::from(format!(
+            "iceberg/v1/{}/{}/collection/{}",
+            table_info
+                .table_uuid
+                .as_deref()
+                .expect("table UUID checked above"),
+            table_info.current_snapshot_id.unwrap_or_default(),
+            uuid::Uuid::from_bytes(request.operation_id.to_bytes()),
+        )))?;
         StatisticsCollectionPlan::try_new(
             request.table,
             request.data_version,
+            evidence_revision,
             request.metrics,
             scan_projection,
             provider_payload,

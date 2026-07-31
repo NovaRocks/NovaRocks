@@ -708,14 +708,12 @@ impl FrontendDistributedQueryCoordinator {
             .as_ref()
             .map(|registration| registration.session().clone());
         let intent = parts.completion.intent();
-        // Statistics collection has a typed completion sink and must be
-        // entered by the statistics application service.  Until that service
-        // supplies the collection program, the generic client-result
-        // coordinator must fail closed rather than manufacture MySQL rows.
-        if intent == DistributedQueryIntent::Statistics {
+        // Statistics collection enters only with its Core-owned typed program.
+        // It never falls through to client-result construction.
+        if intent == DistributedQueryIntent::Statistics && parts.statistics_program.is_none() {
             return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::Rejected,
-                "statistics execution requires the frontend statistics application service",
+                DistributedQueryErrorKind::ContractViolation,
+                "statistics execution requires a typed StatisticsCollectionProgram",
             ));
         }
         self.backend_topology
@@ -763,7 +761,18 @@ impl FrontendDistributedQueryCoordinator {
             }
             None => scheduled,
         };
-        let timeout_ms = parts.options.timeout_ms().max(0);
+        let timeout_ms = parts
+            .statistics_program
+            .as_ref()
+            .map(|program| {
+                program
+                    .policy()
+                    .attempt_timeout()
+                    .as_millis()
+                    .max(1)
+                    .min(i64::MAX as u128) as i64
+            })
+            .unwrap_or_else(|| parts.options.timeout_ms().max(0));
         let query_deadline_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| failed(format!("system clock precedes Unix epoch: {error}")))?
@@ -925,62 +934,68 @@ impl FrontendDistributedQueryCoordinator {
         }
 
         let query_failure = self.registry.first_failure(query_id);
-        let outcome = (|| {
-            let result = expected_output.into_query_result(batches)?;
-            match intent {
-                DistributedQueryIntent::Result => parts.completion.result(result),
-                DistributedQueryIntent::Write => {
-                    let mut builder = WriteTerminalBuilder::new(writer_registrations)?;
-                    if let Some(message) = query_failure {
-                        builder.latch_failure(message);
+        let outcome = (|| match intent {
+            DistributedQueryIntent::Result => parts
+                .completion
+                .result(expected_output.into_query_result(batches)?),
+            DistributedQueryIntent::Write => {
+                let result = expected_output.into_query_result(batches)?;
+                let mut builder = WriteTerminalBuilder::new(writer_registrations)?;
+                if let Some(message) = query_failure {
+                    builder.latch_failure(message);
+                }
+                for fragment in terminal_set.fragments() {
+                    builder.apply_terminal(fragment)?;
+                }
+                let report_outcome = builder.finish()?;
+                let (commit, abort) = report_outcome.into_payloads();
+                let connector_completion = match (
+                    connector_write_session,
+                    connector_write_plan,
+                    commit.as_ref(),
+                ) {
+                    (Some(session), Some(attachment), Some(commit)) => Some(
+                        ConnectorWriteCompletion::from_write_commit(session, attachment, commit)?,
+                    ),
+                    (Some(_), Some(_), None) => {
+                        return Err(DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            "connector write execution ended without a complete staged-report commit",
+                        ));
                     }
-                    for fragment in terminal_set.fragments() {
-                        builder.apply_terminal(fragment)?;
+                    (None, None, _) => None,
+                    _ => {
+                        return Err(DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            "connector write operation session and planned attachment disagree",
+                        ));
                     }
-                    let report_outcome = builder.finish()?;
-                    let (commit, abort) = report_outcome.into_payloads();
-                    let connector_completion = match (
-                        connector_write_session,
-                        connector_write_plan,
-                        commit.as_ref(),
-                    ) {
-                        (Some(session), Some(attachment), Some(commit)) => {
-                            Some(ConnectorWriteCompletion::from_write_commit(
-                                session, attachment, commit,
-                            )?)
-                        }
-                        (Some(_), Some(_), None) => {
-                            return Err(DistributedQueryError::new(
-                                DistributedQueryErrorKind::ContractViolation,
-                                "connector write execution ended without a complete staged-report commit",
-                            ));
-                        }
-                        (None, None, _) => None,
-                        _ => {
-                            return Err(DistributedQueryError::new(
-                                DistributedQueryErrorKind::ContractViolation,
-                                "connector write operation session and planned attachment disagree",
-                            ));
-                        }
-                    };
-                    parts.completion.write_with_connector(
-                        result,
-                        commit,
-                        abort,
-                        connector_completion,
+                };
+                parts
+                    .completion
+                    .write_with_connector(result, commit, abort, connector_completion)
+            }
+            DistributedQueryIntent::Profile => {
+                let result = expected_output.into_query_result(batches)?;
+                let mut builder = ProfileTerminalBuilder::new();
+                for fragment in terminal_set.fragments() {
+                    builder.apply_terminal(fragment)?;
+                }
+                parts.completion.profile(result, builder.finish())
+            }
+            DistributedQueryIntent::Statistics => {
+                let program = parts.statistics_program.as_ref().ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "statistics execution lost its typed collection program",
                     )
-                }
-                DistributedQueryIntent::Profile => {
-                    let mut builder = ProfileTerminalBuilder::new();
-                    for fragment in terminal_set.fragments() {
-                        builder.apply_terminal(fragment)?;
-                    }
-                    parts.completion.profile(result, builder.finish())
-                }
-                DistributedQueryIntent::Statistics => Err(DistributedQueryError::new(
-                    DistributedQueryErrorKind::Rejected,
-                    "statistics execution reached the client-result coordinator without a typed sink",
-                )),
+                })?;
+                let result = program.finish_fragment_payloads(
+                    terminal_set
+                        .fragments()
+                        .map(|fragment| fragment.statistics_payload()),
+                )?;
+                parts.completion.statistics(program, result)
             }
         })();
         if let Err(error) = &outcome {

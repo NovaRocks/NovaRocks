@@ -132,6 +132,11 @@ impl StatisticsCollectionProgram {
                 "statistics collection plan has an empty data-version token",
             ));
         }
+        if plan.evidence_revision().as_bytes().is_empty() {
+            return Err(contract_violation(
+                "statistics collection plan has an empty evidence-revision token",
+            ));
+        }
         let distinct_metrics = plan.metrics.metrics().iter().collect::<BTreeSet<_>>();
         if distinct_metrics.len() != plan.metrics.metrics().len() {
             return Err(contract_violation(
@@ -155,6 +160,37 @@ impl StatisticsCollectionProgram {
             metrics: self.plan.metrics.clone(),
             result: None,
         }
+    }
+
+    /// Finalize the non-empty native fragment reports received by the
+    /// coordinator. Empty reports are permitted for non-root fragments in an
+    /// exchange-shaped collection, but a successful collection without any
+    /// bounded partial is always rejected rather than treated as zero rows.
+    pub fn finish_fragment_payloads<T>(
+        &self,
+        payloads: impl IntoIterator<Item = T>,
+    ) -> Result<StatisticsCollectionResult, DistributedQueryError>
+    where
+        T: AsRef<[u8]>,
+    {
+        let partials = payloads
+            .into_iter()
+            .filter_map(|payload| {
+                (!payload.as_ref().is_empty()).then(|| {
+                    StatisticsCollectionFinalizer::try_from_fragment_payload(payload.as_ref())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if partials.is_empty() {
+            return Err(contract_violation(
+                "statistics collection completed without a fragment partial",
+            ));
+        }
+        StatisticsCollectionFinalizer::try_merge(partials)?.finish_visible_row(
+            self.plan.data_version.clone(),
+            self.plan.evidence_revision().clone(),
+            &self.plan.metrics,
+        )
     }
 }
 
@@ -1157,11 +1193,15 @@ mod tests {
         .expect("table handle");
         let data_version = StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-1"))
             .expect("data version");
+        let evidence_revision =
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"collection-1"))
+                .expect("evidence revision");
         let metrics =
             StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount]).expect("metrics");
         let plan = StatisticsCollectionPlan::try_new(
             table,
             data_version,
+            evidence_revision,
             metrics,
             Vec::new(),
             Bytes::from_static(b"provider-plan"),
@@ -1334,6 +1374,39 @@ mod tests {
         let mut corrupt = payload.to_vec();
         corrupt.push(0);
         assert!(StatisticsCollectionFinalizer::try_from_fragment_payload(&corrupt).is_err());
+    }
+
+    #[test]
+    fn program_finalizes_fragment_payloads_with_provider_revision() {
+        let program = program_for_preparation();
+        let payload = StatisticsCollectionFinalizer::default()
+            .with_table(
+                StatisticsScalarPartial::try_new(4, 0, 32, None, None).expect("table partial"),
+            )
+            .try_to_fragment_payload()
+            .expect("fragment payload");
+        let result = program
+            .finish_fragment_payloads([payload])
+            .expect("final collection result");
+        assert_eq!(result.evidence.data_version, program.plan().data_version);
+        assert_eq!(
+            result.evidence.evidence_revision,
+            *program.plan().evidence_revision()
+        );
+        assert_eq!(
+            result.evidence.metrics.get(&StatisticsMetric::RowCount),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::U64(4)
+            ))
+        );
+    }
+
+    #[test]
+    fn program_rejects_completion_without_fragment_payload() {
+        let error = program_for_preparation()
+            .finish_fragment_payloads([Bytes::new()])
+            .expect_err("missing partial must fail closed");
+        assert!(error.message().contains("without a fragment partial"));
     }
 
     #[test]
