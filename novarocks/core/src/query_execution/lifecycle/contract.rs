@@ -1204,6 +1204,7 @@ pub fn encode_query_terminal_snapshot(
                     filtered_rows: fragment.sink().load_stats.filtered_rows,
                 }),
                 profile: fragment.profile().map(|profile| profile.to_proto()),
+                statistics_payload: fragment.statistics_payload().to_vec(),
             }
         })
         .collect();
@@ -1298,6 +1299,9 @@ pub fn decode_query_terminal_snapshot(
                 sink,
                 profile,
             )
+            .and_then(|snapshot| {
+                snapshot.with_statistics_payload(fragment.statistics_payload.clone())
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let snapshot = QueryTerminalSnapshot::new(

@@ -79,6 +79,7 @@ pub struct FragmentTerminalSnapshot {
     outcome: FragmentTerminalOutcome,
     sink: SinkCommitReportSnapshot,
     profile: Option<RuntimeProfileTree>,
+    statistics_payload: Vec<u8>,
 }
 
 impl FragmentTerminalSnapshot {
@@ -105,6 +106,7 @@ impl FragmentTerminalSnapshot {
             outcome,
             sink,
             profile,
+            statistics_payload: Vec::new(),
         })
     }
 
@@ -150,6 +152,25 @@ impl FragmentTerminalSnapshot {
 
     pub const fn profile(&self) -> Option<&RuntimeProfileTree> {
         self.profile.as_ref()
+    }
+
+    pub fn with_statistics_payload(
+        mut self,
+        statistics_payload: Vec<u8>,
+    ) -> Result<Self, QueryLifecycleError> {
+        if statistics_payload.len()
+            > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
+        {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal fragment statistics payload exceeds the connector statistics limit",
+            ));
+        }
+        self.statistics_payload = statistics_payload;
+        Ok(self)
+    }
+
+    pub fn statistics_payload(&self) -> &[u8] {
+        &self.statistics_payload
     }
 }
 
@@ -283,6 +304,7 @@ impl QueryTerminalSnapshot {
                 }
                 None => put_u8(&mut bytes, 0),
             }
+            put_bytes(&mut bytes, &fragment.statistics_payload);
         }
         // V1's query-scoped contribution is explicitly empty and versioned.
         put_u8(&mut bytes, 0);

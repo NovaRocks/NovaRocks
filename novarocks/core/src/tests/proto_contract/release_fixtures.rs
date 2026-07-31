@@ -410,6 +410,7 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
                         children: vec![],
                     }),
                 }),
+                statistics_payload: Vec::new(),
             }],
         }),
     }

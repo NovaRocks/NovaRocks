@@ -360,6 +360,9 @@ message QueryTerminalFragmentSnapshot {
   QueryTerminalLoadStats load_stats = 9;
   RuntimeProfileTree profile = 10;
   repeated ConnectorStagedReportFrame connector_staged_report_frames = 11;
+  // Bounded, opaque statistics collection state. It is internal to the
+  // native lifecycle and never encoded as a client result row.
+  bytes statistics_payload = 12;
 }
 
 message QueryTerminalSnapshot {
