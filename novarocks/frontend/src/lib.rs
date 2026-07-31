@@ -25,6 +25,7 @@ pub mod query;
 pub mod query_control;
 mod server;
 pub mod statistics;
+pub mod statistics_jobs;
 pub mod system_catalog;
 pub mod table_maintenance;
 mod topology;

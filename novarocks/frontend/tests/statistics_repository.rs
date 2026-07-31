@@ -1,0 +1,242 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::num::NonZeroUsize;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use novarocks_frontend::statistics_jobs::model::{
+    StatisticsJobCreate, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState,
+    StatisticsJobTarget,
+};
+use novarocks_frontend::statistics_jobs::repository::{
+    FenceValidator, StatisticsJobRepository, StatisticsJobRepositoryErrorKind,
+};
+use novarocks_spi::state_store::{
+    Direction, FeDeploymentView, Key, KeyRange, RangeRequest, StateStore,
+};
+use novarocks_state_store::{
+    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
+};
+use tempfile::TempDir;
+
+const PREFIX: &str = "novarocks/frontend/statistics/v1/";
+
+fn sqlite_config(path: &Path) -> StateStoreConfig {
+    StateStoreConfig {
+        cluster_id: "statistics-repository-test".to_string(),
+        limits: StateStoreLimitOverrides::default(),
+        provider: StateStoreProviderConfig::Sqlite {
+            path: path.to_path_buf(),
+            deployment_owner: "statistics-repository-fe".to_string(),
+        },
+    }
+}
+
+async fn fixture() -> (TempDir, Arc<dyn StateStore>, StatisticsJobRepository) {
+    let temp = TempDir::new().expect("create temp directory");
+    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    let store = StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: sqlite_config(&temp.path().join("state.sqlite")),
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
+        FeDeploymentView {
+            active_fe_count: NonZeroUsize::new(1).unwrap(),
+            topology_revision: Bytes::from_static(b"statistics-repository-topology"),
+        },
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .expect("open SQLite state store")
+    .state_store()
+    .expect("SQLite state store exposure");
+    let repository = StatisticsJobRepository::open(Arc::clone(&store))
+        .await
+        .expect("open statistics repository");
+    (temp, store, repository)
+}
+
+fn request(table: &str, submitted_at_ms: i64) -> StatisticsJobCreate {
+    StatisticsJobCreate {
+        target: StatisticsJobTarget {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: table.to_string(),
+        },
+        metric_names: vec!["row_count".to_string(), "ndv".to_string()],
+        submitted_at_ms,
+    }
+}
+
+fn always_valid_fence() -> FenceValidator {
+    Arc::new(|_| Box::pin(async { Ok(()) }))
+}
+
+async fn stored_payloads(store: &dyn StateStore) -> Vec<String> {
+    let prefix = Key::try_from(Bytes::from(PREFIX)).expect("valid statistics prefix");
+    let range = KeyRange::for_prefix(prefix).expect("valid range");
+    let mut transaction = store.begin_read().await.expect("begin raw read");
+    let mut request = RangeRequest {
+        range,
+        direction: Direction::Forward,
+        page_size: store.limits().max_page_size,
+        continuation: None,
+    };
+    let mut payloads = Vec::new();
+    loop {
+        let page = transaction.range(&request).await.expect("read raw page");
+        for record in page.records {
+            payloads.push(String::from_utf8_lossy(record.value.as_bytes()).into_owned());
+        }
+        let Some(continuation) = page.continuation else {
+            break;
+        };
+        request.continuation = Some(continuation);
+    }
+    transaction.abort().await.expect("finish raw read");
+    payloads
+}
+
+#[tokio::test]
+async fn records_are_versioned_durable_and_identical_analyze_requests_remain_distinct() {
+    let (_temp, store, repository) = fixture().await;
+    let first = repository
+        .create(request("orders", 10))
+        .await
+        .expect("create first job");
+    let second = repository
+        .create(request("orders", 11))
+        .await
+        .expect("create second job");
+
+    assert_ne!(first.job_id, second.job_id);
+    assert_ne!(first.operation_id, second.operation_id);
+    assert_eq!(first.job_id.get_version_num(), 7);
+    assert_eq!(first.operation_id.get_version_num(), 7);
+    assert_eq!(
+        repository
+            .list_by_state(StatisticsJobState::Submitted)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let payloads = stored_payloads(store.as_ref()).await;
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| payload.contains("\"schema_version\":1"))
+    );
+    for forbidden in ["artifact", "sketch", "runtime_handle", "record_batch"] {
+        assert!(payloads.iter().all(|payload| !payload.contains(forbidden)));
+    }
+}
+
+#[tokio::test]
+async fn claim_transitions_with_fence_and_cancel_observes_publish_boundary() {
+    let (_temp, _store, repository) = fixture().await;
+    let fence = always_valid_fence();
+    let created = repository
+        .create(request("orders", 10))
+        .await
+        .expect("create job");
+    let preparing = repository
+        .claim(created.job_id, 11, &fence)
+        .await
+        .expect("claim job")
+        .expect("submitted job claimed");
+    assert_eq!(preparing.state, StatisticsJobState::Preparing);
+    assert_eq!(preparing.attempt, 1);
+    let running = repository
+        .transition(
+            created.job_id,
+            StatisticsJobState::Preparing,
+            StatisticsJobState::Running,
+            12,
+            None,
+            &fence,
+        )
+        .await
+        .expect("start job");
+    assert_eq!(running.state, StatisticsJobState::Running);
+    let publishing = repository
+        .transition(
+            created.job_id,
+            StatisticsJobState::Running,
+            StatisticsJobState::Publishing,
+            13,
+            None,
+            &fence,
+        )
+        .await
+        .expect("publish job");
+    assert_eq!(publishing.state, StatisticsJobState::Publishing);
+    let conflict = repository
+        .cancel(created.job_id, 14, &fence)
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.kind(), StatisticsJobRepositoryErrorKind::Conflict);
+    let succeeded = repository
+        .transition(
+            created.job_id,
+            StatisticsJobState::Publishing,
+            StatisticsJobState::Succeeded,
+            15,
+            None,
+            &fence,
+        )
+        .await
+        .expect("complete job");
+    assert_eq!(succeeded.completed_at_ms, Some(15));
+
+    let failed = repository
+        .create(request("lineitem", 20))
+        .await
+        .expect("create failed job");
+    let _ = repository
+        .claim(failed.job_id, 21, &fence)
+        .await
+        .expect("claim failed job");
+    let failed = repository
+        .transition(
+            failed.job_id,
+            StatisticsJobState::Preparing,
+            StatisticsJobState::Failed,
+            22,
+            Some(StatisticsJobError {
+                kind: StatisticsJobErrorKind::Collection,
+                message: "connector timed out".to_string(),
+            }),
+            &fence,
+        )
+        .await
+        .expect("fail job");
+    assert_eq!(failed.state, StatisticsJobState::Failed);
+    assert_eq!(
+        failed.error.unwrap().kind,
+        StatisticsJobErrorKind::Collection
+    );
+}
