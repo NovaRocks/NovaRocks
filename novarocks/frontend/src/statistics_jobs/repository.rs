@@ -140,6 +140,7 @@ impl StatisticsJobRepository {
             state: StatisticsJobState::Submitted,
             attempt: 0,
             retry_not_before_ms: None,
+            cancel_requested: false,
             error: None,
             submitted_at_ms: request.submitted_at_ms,
             updated_at_ms: request.submitted_at_ms,
@@ -262,6 +263,9 @@ impl StatisticsJobRepository {
         if job.state != StatisticsJobState::Submitted {
             return Ok(None);
         }
+        if job.cancel_requested {
+            return Ok(None);
+        }
         self.transition_with_fence(
             job_id,
             StatisticsJobState::Submitted,
@@ -330,8 +334,55 @@ impl StatisticsJobRepository {
         .map(Some)
     }
 
-    /// Explicit cancellation never races a publish: PUBLISHING is a typed
-    /// conflict, while only SUBMITTED/PREPARING/RUNNING can become CANCELLED.
+    /// Records client cancellation intent without changing the worker-owned
+    /// lifecycle state.  The active fenced worker consumes this bit in the
+    /// same transaction as its `state -> CANCELLED` CAS.
+    pub async fn request_cancel(
+        &self,
+        job_id: Uuid,
+        now_ms: i64,
+    ) -> RepositoryResult<StatisticsJob> {
+        let mut transaction = self
+            .begin_write("request frontend statistics job cancellation")
+            .await?;
+        let versioned = load_job(transaction.as_mut(), job_id)
+            .await?
+            .ok_or_else(|| not_found(job_id))?;
+        if !matches!(
+            versioned.stored.state,
+            StatisticsJobState::Submitted
+                | StatisticsJobState::Preparing
+                | StatisticsJobState::Running
+        ) {
+            return Err(StatisticsJobRepositoryError::new(
+                StatisticsJobRepositoryErrorKind::Conflict,
+                format!(
+                    "cancel statistics job {job_id} conflicts with {:?}",
+                    versioned.stored.state
+                ),
+            ));
+        }
+        let mut stored = versioned.stored;
+        stored.cancel_requested = true;
+        stored.updated_at_ms = now_ms;
+        transaction
+            .put(
+                job_key(job_id)?,
+                encode_json(&stored, "statistics job")?,
+                Precondition::Version(versioned.version),
+            )
+            .await
+            .map_err(store_error)?;
+        self.commit_or_recover(
+            transaction,
+            "request frontend statistics job cancellation",
+            &stored,
+        )
+        .await
+    }
+
+    /// Worker-only cancellation transition. Callers must provide the active
+    /// lease fence; clients use `request_cancel` instead.
     pub async fn cancel(
         &self,
         job_id: Uuid,
@@ -433,6 +484,7 @@ impl StatisticsJobRepository {
         stored.updated_at_ms = now_ms;
         stored.error = error;
         stored.retry_not_before_ms = retry_not_before_ms;
+        stored.cancel_requested = false;
         if increment_attempt {
             stored.attempt = stored.attempt.checked_add(1).ok_or_else(|| {
                 StatisticsJobRepositoryError::corruption("statistics job attempt overflow")

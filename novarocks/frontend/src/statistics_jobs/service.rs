@@ -63,6 +63,7 @@ pub enum StatisticsStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatisticsStatementResult {
     JobSubmitted(StatisticsJob),
+    JobCancellationRequested(StatisticsJob),
     AnalyzeJobs(Vec<StatisticsJob>),
     TableStats(Vec<StatisticsTableStatRow>),
 }
@@ -129,11 +130,13 @@ impl StatisticsApplicationService {
                 }
                 Ok(StatisticsStatementResult::AnalyzeJobs(jobs))
             }
-            StatisticsStatement::CancelAnalyze(_) => {
-                // Cancellation must be routed to the active fenced worker; a
-                // session cannot mutate a durable job directly.
-                self.repository()?;
-                Err(StatisticsApplicationError::worker_required())
+            StatisticsStatement::CancelAnalyze(statement) => {
+                let repository = self.repository()?;
+                repository
+                    .request_cancel(statement.job_id, submitted_at_ms)
+                    .await
+                    .map(StatisticsStatementResult::JobCancellationRequested)
+                    .map_err(StatisticsApplicationError::repository)
             }
             StatisticsStatement::ShowTableStats(statement) => table_statistics
                 .show_table_stats(&statement.target)
@@ -152,7 +155,6 @@ impl StatisticsApplicationService {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsApplicationErrorKind {
     StateStoreRequired,
-    WorkerRequired,
     Repository,
     TableStatistics,
 }
@@ -168,14 +170,6 @@ impl StatisticsApplicationError {
         Self {
             kind: StatisticsApplicationErrorKind::StateStoreRequired,
             message: "statistics job commands require a configured frontend StateStore".into(),
-        }
-    }
-
-    fn worker_required() -> Self {
-        Self {
-            kind: StatisticsApplicationErrorKind::WorkerRequired,
-            message: "CANCEL ANALYZE must be executed by the active fenced statistics worker"
-                .into(),
         }
     }
 
@@ -329,6 +323,9 @@ fn map_core_result(
     match result {
         StatisticsStatementResult::JobSubmitted(job) => {
             core_application::StatisticsApplicationResult::JobSubmitted(job_view(job))
+        }
+        StatisticsStatementResult::JobCancellationRequested(job) => {
+            core_application::StatisticsApplicationResult::JobCancellationRequested(job_view(job))
         }
         StatisticsStatementResult::AnalyzeJobs(jobs) => {
             core_application::StatisticsApplicationResult::AnalyzeJobs(

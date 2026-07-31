@@ -3076,7 +3076,8 @@ fn statistics_application_result(
     use statistics_application::StatisticsApplicationResult;
 
     match result {
-        StatisticsApplicationResult::JobSubmitted(_) => Ok(StatementResult::Ok),
+        StatisticsApplicationResult::JobSubmitted(_)
+        | StatisticsApplicationResult::JobCancellationRequested(_) => Ok(StatementResult::Ok),
         StatisticsApplicationResult::AnalyzeJobs(jobs) => statistics_string_result(
             &[
                 "job_id",

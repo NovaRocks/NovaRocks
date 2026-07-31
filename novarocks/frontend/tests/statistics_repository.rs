@@ -30,9 +30,9 @@ use novarocks_frontend::statistics_jobs::repository::{
     FenceValidator, StatisticsJobRepository, StatisticsJobRepositoryErrorKind,
 };
 use novarocks_frontend::statistics_jobs::service::{
-    AnalyzeTableStatement, ShowAnalyzeJobsStatement, ShowTableStatsStatement,
-    StatisticsApplicationErrorKind, StatisticsApplicationService, StatisticsStatement,
-    StatisticsStatementResult, StatisticsTableStatRow, TableStatisticsReader,
+    AnalyzeTableStatement, CancelAnalyzeStatement, ShowAnalyzeJobsStatement,
+    ShowTableStatsStatement, StatisticsApplicationErrorKind, StatisticsApplicationService,
+    StatisticsStatement, StatisticsStatementResult, StatisticsTableStatRow, TableStatisticsReader,
 };
 use novarocks_frontend::statistics_jobs::worker::{
     StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
@@ -526,6 +526,65 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
         .await
         .expect("typed SHOW ANALYZE JOBS reads durable jobs");
     assert!(matches!(listed, StatisticsStatementResult::AnalyzeJobs(jobs) if jobs.len() == 1));
+}
+
+#[tokio::test]
+async fn typed_cancel_records_intent_and_the_fenced_worker_transitions_it() {
+    let (_temp, _store, repository) = fixture().await;
+    let service = StatisticsApplicationService::with_repository(repository.clone());
+    let table_statistics = StaticTableStatistics;
+    let created = repository
+        .create(request("cancelled_orders", 10))
+        .await
+        .expect("create durable job");
+
+    let requested = service
+        .execute(
+            StatisticsStatement::CancelAnalyze(CancelAnalyzeStatement {
+                job_id: created.job_id,
+            }),
+            11,
+            &table_statistics,
+        )
+        .await
+        .expect("record cancellation request");
+    assert!(matches!(
+        requested,
+        StatisticsStatementResult::JobCancellationRequested(job)
+            if job.cancel_requested && job.state == StatisticsJobState::Submitted
+    ));
+
+    let concrete_executor = Arc::new(SucceedingStatisticsExecutor {
+        collected: AtomicUsize::new(0),
+        published: AtomicUsize::new(0),
+    });
+    let executor: Arc<dyn StatisticsAttemptExecutor> = concrete_executor.clone();
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        Arc::new(repository.clone()),
+        Arc::downgrade(&executor),
+    )
+    .await
+    .expect("start worker");
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = repository
+                .get(created.job_id)
+                .await
+                .expect("read job")
+                .expect("durable job");
+            if current.state == StatisticsJobState::Cancelled {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker must consume cancellation intent");
+    worker.shutdown().expect("shutdown worker");
+    assert!(!cancelled.cancel_requested);
+    assert_eq!(concrete_executor.collected.load(Ordering::Acquire), 0);
+    assert_eq!(concrete_executor.published.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]

@@ -175,6 +175,7 @@ async fn run_worker(
         {
             AcquireOutcome::Acquired(mut guard) => {
                 let fence = StatisticsAnalyzeWorkerCoordination::fence_validator(guard.fence());
+                process_cancellation_requests(&repository, now_unix_millis(), &fence).await?;
                 recover_incomplete(&repository, now_unix_millis(), &fence).await?;
                 let result = reconcile_publishing(
                     repository.as_ref(),
@@ -228,6 +229,45 @@ async fn recover_incomplete(
                 .map_err(|error| {
                     format!(
                         "requeue incomplete statistics job {} failed: {error}",
+                        job.job_id
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+async fn process_cancellation_requests(
+    repository: &StatisticsJobRepository,
+    now_ms: i64,
+    fence: &FenceValidator,
+) -> Result<(), String> {
+    for state in [
+        StatisticsJobState::Submitted,
+        StatisticsJobState::Preparing,
+        StatisticsJobState::Running,
+    ] {
+        for job in repository
+            .list_by_state(state)
+            .await
+            .map_err(|error| format!("list cancellable statistics jobs failed: {error}"))?
+        {
+            if !job.cancel_requested {
+                continue;
+            }
+            repository
+                .transition(
+                    job.job_id,
+                    state,
+                    StatisticsJobState::Cancelled,
+                    now_ms,
+                    None,
+                    fence,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "cancel statistics job {} under worker fence failed: {error}",
                         job.job_id
                     )
                 })?;
@@ -373,6 +413,25 @@ async fn process_submitted(
             return Err(format!("statistics job {} disappeared", running.job_id));
         };
         if current.state == StatisticsJobState::Cancelled {
+            continue;
+        }
+        if current.cancel_requested {
+            repository
+                .transition(
+                    running.job_id,
+                    StatisticsJobState::Running,
+                    StatisticsJobState::Cancelled,
+                    now_unix_millis(),
+                    None,
+                    fence,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "cancel running statistics job {} failed: {error}",
+                        running.job_id
+                    )
+                })?;
             continue;
         }
         let publishing = repository

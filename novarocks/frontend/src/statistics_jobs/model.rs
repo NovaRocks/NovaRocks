@@ -105,6 +105,9 @@ pub struct StatisticsJob {
     pub state: StatisticsJobState,
     pub attempt: u32,
     pub retry_not_before_ms: Option<i64>,
+    /// Client intent only. The fenced worker performs the state transition to
+    /// CANCELLED, so an unfenced session cannot race publication.
+    pub cancel_requested: bool,
     pub error: Option<StatisticsJobError>,
     pub submitted_at_ms: i64,
     pub updated_at_ms: i64,
@@ -122,6 +125,8 @@ pub(crate) struct StoredStatisticsJobV1 {
     pub attempt: u32,
     #[serde(default)]
     pub retry_not_before_ms: Option<i64>,
+    #[serde(default)]
+    pub cancel_requested: bool,
     pub error: Option<StatisticsJobError>,
     pub submitted_at_ms: i64,
     pub updated_at_ms: i64,
@@ -138,6 +143,7 @@ impl From<&StoredStatisticsJobV1> for StatisticsJob {
             state: value.state,
             attempt: value.attempt,
             retry_not_before_ms: value.retry_not_before_ms,
+            cancel_requested: value.cancel_requested,
             error: value.error.clone(),
             submitted_at_ms: value.submitted_at_ms,
             updated_at_ms: value.updated_at_ms,

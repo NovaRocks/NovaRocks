@@ -66,6 +66,7 @@ pub struct StatisticsTableStatView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatisticsApplicationResult {
     JobSubmitted(StatisticsJobView),
+    JobCancellationRequested(StatisticsJobView),
     AnalyzeJobs(Vec<StatisticsJobView>),
     TableStats(Vec<StatisticsTableStatView>),
 }
