@@ -67,7 +67,7 @@ enum Call {
 
 #[derive(Clone, Copy)]
 enum WriteBehavior {
-    NoOp,
+    FilelessOutput,
     Committable,
     Aborted,
 }
@@ -78,7 +78,9 @@ enum CommitBehavior {
     Unknown,
 }
 
-struct FakePrepared;
+struct FakePrepared {
+    commit_op_kind: CommitOpKind,
+}
 
 impl IcebergPreparedInsert for FakePrepared {
     fn as_any(&self) -> &dyn Any {
@@ -194,17 +196,27 @@ impl InsertEngine for FakeInsertEngine {
                 commit_op_kind,
                 base_snapshot_id: Some(10),
             },
-            handle: Arc::new(FakePrepared),
+            handle: Arc::new(FakePrepared { commit_op_kind }),
         })
     }
 
     fn run_iceberg_write(
         &self,
-        _prepared: &dyn IcebergPreparedInsert,
+        prepared: &dyn IcebergPreparedInsert,
     ) -> Result<IcebergWriteReport, String> {
         self.calls.lock().unwrap().push(Call::Run);
         Ok(match *self.write_behavior.lock().unwrap() {
-            WriteBehavior::NoOp => IcebergWriteReport::NoOp,
+            WriteBehavior::FilelessOutput => {
+                let prepared = prepared
+                    .as_any()
+                    .downcast_ref::<FakePrepared>()
+                    .ok_or_else(|| "foreign fake prepared handle".to_string())?;
+                if matches!(prepared.commit_op_kind, CommitOpKind::FastAppend) {
+                    IcebergWriteReport::NoOp
+                } else {
+                    IcebergWriteReport::CommitRequired(Arc::new(FakeCommit))
+                }
+            }
             WriteBehavior::Committable => IcebergWriteReport::CommitRequired(Arc::new(FakeCommit)),
             WriteBehavior::Aborted => IcebergWriteReport::Aborted {
                 reason: "writer aborted".to_string(),
@@ -613,7 +625,7 @@ fn iceberg_without_journal_fails_before_prepare() {
 #[test]
 fn iceberg_append_empty_records_aborted_noop() {
     let engine = FakeInsertEngine::new(target());
-    engine.set_write_behavior(WriteBehavior::NoOp);
+    engine.set_write_behavior(WriteBehavior::FilelessOutput);
     let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
@@ -628,7 +640,7 @@ fn iceberg_append_empty_records_aborted_noop() {
 #[test]
 fn iceberg_overwrite_empty_commits_and_finalizes() {
     let engine = FakeInsertEngine::new(target());
-    engine.set_write_behavior(WriteBehavior::NoOp);
+    engine.set_write_behavior(WriteBehavior::FilelessOutput);
     let journal = Arc::new(FakeJournal::default());
     let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
