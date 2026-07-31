@@ -28,6 +28,11 @@ use novarocks_frontend::statistics_jobs::model::{
 use novarocks_frontend::statistics_jobs::repository::{
     FenceValidator, StatisticsJobRepository, StatisticsJobRepositoryErrorKind,
 };
+use novarocks_frontend::statistics_jobs::service::{
+    AnalyzeTableStatement, ShowAnalyzeJobsStatement, ShowTableStatsStatement,
+    StatisticsApplicationErrorKind, StatisticsApplicationService, StatisticsStatement,
+    StatisticsStatementResult, StatisticsTableStatRow, TableStatisticsReader,
+};
 use novarocks_spi::state_store::{
     Direction, FeDeploymentView, Key, KeyRange, RangeRequest, StateStore,
 };
@@ -239,4 +244,84 @@ async fn claim_transitions_with_fence_and_cancel_observes_publish_boundary() {
         failed.error.unwrap().kind,
         StatisticsJobErrorKind::Collection
     );
+}
+
+struct StaticTableStatistics;
+
+impl TableStatisticsReader for StaticTableStatistics {
+    fn show_table_stats(
+        &self,
+        target: &StatisticsJobTarget,
+    ) -> Result<Vec<StatisticsTableStatRow>, String> {
+        Ok(vec![StatisticsTableStatRow {
+            metric_name: format!(
+                "{}.{}.{}.row_count",
+                target.catalog, target.namespace, target.table
+            ),
+            value: Some("1".to_string()),
+            status: "AVAILABLE".to_string(),
+        }])
+    }
+}
+
+#[tokio::test]
+async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_state_store() {
+    let table_statistics = StaticTableStatistics;
+    let target = request("orders", 10).target;
+    let unavailable = StatisticsApplicationService::unavailable();
+    let read = unavailable
+        .execute(
+            StatisticsStatement::ShowTableStats(ShowTableStatsStatement {
+                target: target.clone(),
+            }),
+            10,
+            &table_statistics,
+        )
+        .await
+        .expect("read-only table statistics remain available without StateStore");
+    assert!(matches!(read, StatisticsStatementResult::TableStats(_)));
+    let error = unavailable
+        .execute(
+            StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
+                target: target.clone(),
+                metric_names: vec!["row_count".to_string()],
+            }),
+            10,
+            &table_statistics,
+        )
+        .await
+        .expect_err("ANALYZE requires a durable StateStore");
+    assert_eq!(
+        error.kind(),
+        StatisticsApplicationErrorKind::StateStoreRequired
+    );
+
+    let (_temp, _store, repository) = fixture().await;
+    let service = StatisticsApplicationService::with_repository(repository);
+    let submitted = service
+        .execute(
+            StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
+                target: target.clone(),
+                metric_names: vec!["row_count".to_string()],
+            }),
+            11,
+            &table_statistics,
+        )
+        .await
+        .expect("typed ANALYZE creates a job");
+    assert!(matches!(
+        submitted,
+        StatisticsStatementResult::JobSubmitted(_)
+    ));
+    let listed = service
+        .execute(
+            StatisticsStatement::ShowAnalyzeJobs(ShowAnalyzeJobsStatement {
+                target: Some(target),
+            }),
+            12,
+            &table_statistics,
+        )
+        .await
+        .expect("typed SHOW ANALYZE JOBS reads durable jobs");
+    assert!(matches!(listed, StatisticsStatementResult::AnalyzeJobs(jobs) if jobs.len() == 1));
 }
