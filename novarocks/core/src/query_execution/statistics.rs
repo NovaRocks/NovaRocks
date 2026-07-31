@@ -27,7 +27,8 @@ use std::time::Duration;
 use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
     StatisticsCollectionPlan, StatisticsCollectionResult, StatisticsMetric,
-    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue,
+    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
+    StatisticsMissingKind,
 };
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
@@ -307,6 +308,90 @@ impl StatisticsScalarPartial {
     }
 }
 
+/// Typed finalization input for a visible-row collection. The table scalar is
+/// used only for ROW_COUNT; every column owns an independent scalar partial.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StatisticsCollectionFinalizer {
+    table: Option<StatisticsScalarPartial>,
+    columns: BTreeMap<std::sync::Arc<str>, StatisticsScalarPartial>,
+    theta: BTreeMap<std::sync::Arc<str>, ThetaSketchPartial>,
+}
+
+impl StatisticsCollectionFinalizer {
+    pub fn with_table(mut self, partial: StatisticsScalarPartial) -> Self {
+        self.table = Some(partial);
+        self
+    }
+
+    pub fn with_column(
+        mut self,
+        column: impl Into<std::sync::Arc<str>>,
+        partial: StatisticsScalarPartial,
+    ) -> Self {
+        self.columns.insert(column.into(), partial);
+        self
+    }
+
+    pub fn with_theta(
+        mut self,
+        column: impl Into<std::sync::Arc<str>>,
+        partial: ThetaSketchPartial,
+    ) -> Self {
+        self.theta.insert(column.into(), partial);
+        self
+    }
+
+    pub fn metric_states(
+        &self,
+        metrics: &StatisticsMetricRequest,
+    ) -> BTreeMap<StatisticsMetric, StatisticsMetricState> {
+        metrics
+            .metrics()
+            .iter()
+            .cloned()
+            .map(|metric| {
+                let state = match &metric {
+                    StatisticsMetric::RowCount => self.table.as_ref().and_then(|partial| {
+                        partial
+                            .metric_values([metric.clone()])
+                            .ok()?
+                            .remove(&metric)
+                    }),
+                    StatisticsMetric::NullCount { column }
+                    | StatisticsMetric::Minimum { column }
+                    | StatisticsMetric::Maximum { column }
+                    | StatisticsMetric::AverageSize { column } => {
+                        self.columns.get(column).and_then(|partial| {
+                            partial
+                                .metric_values([metric.clone()])
+                                .ok()?
+                                .remove(&metric)
+                        })
+                    }
+                    StatisticsMetric::ThetaNdv { column } => {
+                        self.theta.get(column).map(|partial| {
+                            StatisticsMetricState::Available(StatisticsMetricValue::F64(
+                                partial.finalize().estimate(),
+                            ))
+                        })
+                    }
+                };
+                (
+                    metric.clone(),
+                    state.unwrap_or_else(|| not_collected(&metric)),
+                )
+            })
+            .collect()
+    }
+}
+
+fn not_collected(metric: &StatisticsMetric) -> StatisticsMetricState {
+    StatisticsMetricState::Missing(StatisticsMissing {
+        kind: StatisticsMissingKind::NotCollected,
+        message: format!("visible-row collection did not produce metric {metric:?}").into(),
+    })
+}
+
 impl ThetaSketchPartial {
     /// Build a scalar partial from signed integer values. Collection compilers
     /// use typed Arrow kernels for other input types; this small constructor is
@@ -554,5 +639,34 @@ mod tests {
                 StatisticsMetricValue::F64(9.0)
             ))
         );
+    }
+
+    #[test]
+    fn finalizer_preserves_missing_metrics_instead_of_fabricating_values() {
+        let metrics = StatisticsMetricRequest::try_new(vec![
+            StatisticsMetric::RowCount,
+            StatisticsMetric::ThetaNdv {
+                column: "missing".into(),
+            },
+        ])
+        .expect("metrics");
+        let states = StatisticsCollectionFinalizer::default()
+            .with_table(StatisticsScalarPartial::try_new(3, 0, 12, None, None).expect("scalar"))
+            .metric_states(&metrics);
+        assert!(matches!(
+            states.get(&StatisticsMetric::RowCount),
+            Some(StatisticsMetricState::Available(
+                StatisticsMetricValue::U64(3)
+            ))
+        ));
+        assert!(matches!(
+            states.get(&StatisticsMetric::ThetaNdv {
+                column: "missing".into()
+            }),
+            Some(StatisticsMetricState::Missing(StatisticsMissing {
+                kind: StatisticsMissingKind::NotCollected,
+                ..
+            }))
+        ));
     }
 }
