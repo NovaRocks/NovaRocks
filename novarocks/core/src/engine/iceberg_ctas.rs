@@ -437,8 +437,8 @@ fn drive_data_write(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     // Load the just-created table through the connector read registry.
-    // path — this is the same path used by run_insert and returns the
-    // ResolvedTable that execute_iceberg_insert_or_overwrite expects.
+    // path — this is the same path used by the frontend INSERT adapter and
+    // returns the ResolvedTable that the shared write preparation expects.
     let resolved = {
         crate::connector::metadata_load_table(
             state.connector_control.as_ref(),
