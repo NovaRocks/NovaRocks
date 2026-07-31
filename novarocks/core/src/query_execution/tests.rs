@@ -596,6 +596,12 @@ fn outcome_factory_rejects_intent_mismatch() {
 }
 
 fn statistics_program() -> crate::query_execution::statistics::StatisticsCollectionProgram {
+    let table = novarocks_spi::connector::ConnectorTableHandle::try_new(
+        novarocks_spi::connector::ConnectorInstanceId::parse("statistics-test")
+            .expect("instance ID"),
+        Bytes::from_static(b"pinned-table"),
+    )
+    .expect("table handle");
     let data_version = novarocks_spi::connector::StatisticsDataVersion::try_new(
         Bytes::from_static(b"snapshot-42"),
     )
@@ -605,6 +611,7 @@ fn statistics_program() -> crate::query_execution::statistics::StatisticsCollect
     ])
     .expect("metrics");
     let plan = novarocks_spi::connector::StatisticsCollectionPlan::try_new(
+        table,
         data_version,
         metrics,
         Bytes::from_static(b"provider-plan"),

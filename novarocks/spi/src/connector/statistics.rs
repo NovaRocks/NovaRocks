@@ -254,10 +254,14 @@ pub struct StatisticsCollectionRequest {
     pub context: ConnectorRequestContext,
 }
 
-/// Provider-neutral collection preparation result. The payload is opaque to
-/// the FE and bounded; Core later compiles it into ordinary distributed work.
+/// Provider-neutral collection preparation result. `table` is the exact
+/// already-resolved table handle pinned by `data_version`; Core must compile
+/// ordinary distributed work from this handle and must never resolve latest
+/// metadata a second time. The provider payload remains opaque to the FE and
+/// Core.
 #[derive(Clone)]
 pub struct StatisticsCollectionPlan {
+    table: ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
     pub metrics: StatisticsMetricRequest,
     provider_payload: Bytes,
@@ -265,15 +269,21 @@ pub struct StatisticsCollectionPlan {
 
 impl StatisticsCollectionPlan {
     pub fn try_new(
+        table: ConnectorTableHandle,
         data_version: StatisticsDataVersion,
         metrics: StatisticsMetricRequest,
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
+            table,
             data_version,
             metrics,
             provider_payload: bounded_payload(provider_payload, "statistics collection plan")?,
         })
+    }
+
+    pub fn table(&self) -> &ConnectorTableHandle {
+        &self.table
     }
 
     pub fn provider_payload(&self) -> &Bytes {
@@ -505,13 +515,26 @@ impl ConnectorStatisticsLease {
         request: StatisticsCollectionRequest,
     ) -> Result<StatisticsCollectionPlan, ConnectorError> {
         self.validate_table(&request.table)?;
+        let expected_table = request.table.clone();
+        let expected_data_version = request.data_version.clone();
+        let expected_metrics = request.metrics.clone();
         let collection = self.statistics.collection().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 "connector statistics capability does not support collection",
             )
         })?;
-        collection.prepare_collection(request)
+        let plan = collection.prepare_collection(request)?;
+        if plan.table() != &expected_table
+            || plan.data_version != expected_data_version
+            || plan.metrics != expected_metrics
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector statistics collection plan does not preserve its resolved table pin",
+            ));
+        }
+        Ok(plan)
     }
     pub fn publish(
         &self,

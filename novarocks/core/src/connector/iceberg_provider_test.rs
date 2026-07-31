@@ -197,6 +197,7 @@ fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
         })
         .expect("prepare pinned collection");
     assert_eq!(collection.data_version, data_version);
+    assert_eq!(collection.table(), &metadata.table);
     assert_eq!(collection.metrics.metrics(), metrics.metrics());
 
     let wrong_version = StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"wrong"))

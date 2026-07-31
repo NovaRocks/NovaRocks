@@ -2963,10 +2963,12 @@ impl StatisticsCollection for IcebergControlProvider {
         // The opaque payload is the provider's resolved table envelope. Core
         // may compile normal distributed scans from it but cannot reinterpret
         // catalog credentials or re-resolve latest metadata.
+        let provider_payload = request.table.payload().clone();
         StatisticsCollectionPlan::try_new(
+            request.table,
             request.data_version,
             request.metrics,
-            request.table.payload().clone(),
+            provider_payload,
         )
     }
 
