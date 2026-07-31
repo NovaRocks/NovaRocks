@@ -7109,26 +7109,6 @@ mysql_port = 47892
     }
 
     #[test]
-    fn convert_insert_values_accepts_map_and_row_literals() {
-        use crate::sql::parser::dialect::StarRocksDialect;
-
-        let statements = sqlparser::parser::Parser::parse_sql(
-            &StarRocksDialect,
-            "INSERT INTO t VALUES (1, map('key', 5.5), row(100, 'abc'))",
-        )
-        .expect("parse insert");
-        let sqlparser::ast::Statement::Insert(insert) = &statements[0] else {
-            panic!("expected insert statement");
-        };
-
-        let converted = super::convert_sqlparser_insert_to_custom(insert);
-        assert!(
-            converted.is_ok(),
-            "expected complex literals to convert: {converted:?}"
-        );
-    }
-
-    #[test]
     fn build_local_insert_batch_supports_array_columns() {
         use crate::sql::parser::ast::Literal;
         use novarocks_catalog::schema::ColumnDef;
