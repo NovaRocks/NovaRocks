@@ -63,7 +63,7 @@ const LOAD_OP_COLUMN: &str = "__op";
 pub(crate) const STARROCKS_DEFAULT_PARTITION_VALUE: &str = "__STARROCKS_DEFAULT_PARTITION__";
 
 #[derive(Clone)]
-pub struct OlapTableSinkFactory {
+pub(crate) struct OlapTableSinkFactory {
     name: String,
     plan: Arc<OlapTableSinkPlan>,
     finalize_shared: Arc<OlapSinkFinalizeSharedState>,

@@ -44,10 +44,8 @@ use novarocks::runtime::starrocks_fragment_query::{
     LookupFetcherLifecycle, StarRocksFragmentQueryRuntime,
 };
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
-use novarocks_types::QueryId as RuntimeQueryId;
 
 use super::dependency::{
     FragmentExprArenaOwner, QueryProfilePatch, StarRocksExternalDependency,
@@ -1048,7 +1046,7 @@ mod tests {
     use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TStringLiteral};
     use crate::thrift::{data_sinks, partitions, plan_nodes};
     use novarocks::exec::expr::{ExprNode, LiteralValue};
-    use novarocks::exec::fragment::program::{FragmentSinkKind, FragmentSinkSpec};
+    use novarocks::exec::fragment::program::FragmentSinkKind;
     use novarocks::exec::fragment::sink::FragmentSinkProgram;
     use novarocks::exec::node::ExecNodeKind;
     use novarocks::runtime::endpoint::FragmentDestination;
@@ -1060,17 +1058,6 @@ mod tests {
     use novarocks_types::QueryId;
     use novarocks_types::UniqueId;
     use std::sync::LazyLock;
-
-    use novarocks::connector::starrocks::lake::context::PartialUpdateWriteMode;
-    use novarocks::connector::starrocks::schema::{
-        StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
-    };
-    use novarocks::connector::starrocks::sink::partition_key::PartitionExprPlan;
-    use novarocks::connector::starrocks::sink::plan::{
-        SinkIndexDescriptor, SinkLocationDescriptor, SinkNodesDescriptor, SinkOutputProjectionPlan,
-        SinkPartitionDescriptor, SinkPredicatePlan, SinkSchemaDescriptor,
-        StarRocksTableSinkDescriptor, StarRocksTableSinkProgram,
-    };
 
     static EMPTY_BATCH_SENDERS: LazyLock<HashMap<i32, usize>> = LazyLock::new(HashMap::new);
     static EMPTY_DECODE_FACTS: LazyLock<StarRocksDecodeFacts> =
@@ -1520,105 +1507,93 @@ mod tests {
     }
 
     #[test]
-    fn instance_first_decode_builds_non_empty_scan_contract_and_assignment() {
+    fn broker_file_scan_is_rejected_as_unsupported() {
         let mut scan_node = empty_set_node();
         scan_node.node_id = 17;
         scan_node.node_type = plan_nodes::TPlanNodeType::FILE_SCAN_NODE;
-        let broker_params = plan_nodes::TBrokerScanRangeParams::new(
-            b',' as i8,
-            b'\n' as i8,
-            1,
-            vec![1],
-            2,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let broker_range = plan_nodes::TBrokerScanRange::new(
-            vec![plan_nodes::TBrokerRangeDesc::new(
-                types::TFileType::FILE_LOCAL,
-                plan_nodes::TFileFormatType::FORMAT_CSV_PLAIN,
-                true,
-                "/tmp/pbf3.csv".to_string(),
-                0,
-                128,
-                None,
-                Some(128),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )],
-            broker_params,
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
-        );
-        let raw_ranges = BTreeMap::from([(
-            17,
-            vec![internal_service::TScanRangeParams::new(
-                plan_nodes::TScanRange::new(None, None, Some(broker_range), None, None, None, None),
-                None,
-                Some(false),
-                Some(false),
-            )],
-        )]);
-        let facts = super::super::instance::StarRocksDecodeFacts::default();
-        let (contracts, assignments) =
-            super::super::instance::decode_scan_contracts_and_raw_ranges(
-                &[scan_node],
-                &raw_ranges,
-                None,
-                &facts,
-                FieldPath::root("exec_plan_fragment")
-                    .field("params")
-                    .field("per_node_scan_ranges"),
-            )
-            .expect("decode normalized scan inventory");
-        let node_id = FragmentNodeId::new(17);
+        let mut fragment = values_noop_fragment();
+        fragment.plan.as_mut().expect("plan").nodes = vec![scan_node];
+        let params = params(UniqueId::new(71, 72), UniqueId::new(81, 82));
+        let error = prepare_fragment_submission(decode_input(&fragment, &params))
+            .expect_err("broker FILE_SCAN_NODE must be retired");
+        let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
-            contracts
-                .get(&node_id)
-                .expect("scan contract")
-                .assignment_kind(),
-            novarocks::exec::fragment::program::ScanAssignmentKind::BrokerFile
+            protocol.kind(),
+            novarocks::protocol::ProtocolErrorKind::Unsupported
         );
-        // `decode_scan_contracts_and_raw_ranges` now returns the transient
-        // enrichment carrier (kind, raw ScanRangeParams) per node.
-        let (_, assignment_ranges) = assignments.get(&node_id).expect("scan assignment");
-        assert_eq!(assignment_ranges.len(), 1);
-        assert!(matches!(
-            assignment_ranges[0].range,
-            novarocks::runtime::scan_range::ScanRange::BrokerFile(_)
-        ));
+        assert_eq!(
+            protocol.path().to_string(),
+            "exec_plan_fragment.fragment.plan.nodes[0].node_type"
+        );
+    }
+
+    #[test]
+    fn olap_table_sink_is_rejected_as_unsupported() {
+        let mut fragment = values_noop_fragment();
+        fragment.output_sink.as_mut().expect("output sink").type_ =
+            data_sinks::TDataSinkType::OLAP_TABLE_SINK;
+        let params = params(UniqueId::new(73, 74), UniqueId::new(83, 84));
+        let error = prepare_fragment_submission(decode_input(&fragment, &params))
+            .expect_err("OLAP_TABLE_SINK must be retired");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.kind(),
+            novarocks::protocol::ProtocolErrorKind::Unsupported
+        );
+        assert_eq!(
+            protocol.path().to_string(),
+            "exec_plan_fragment.fragment.output_sink.type"
+        );
+    }
+
+    #[test]
+    fn lake_late_materialization_is_rejected_as_unsupported() {
+        let mut scan_node = empty_set_node();
+        scan_node.node_type = plan_nodes::TPlanNodeType::LAKE_SCAN_NODE;
+        let lake = plan_nodes::TLakeScanNode::new(
+            0,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        );
+        scan_node.lake_scan_node = Some(lake);
+        let mut fragment = values_noop_fragment();
+        fragment.plan.as_mut().expect("plan").nodes = vec![scan_node];
+        let params = params(UniqueId::new(75, 76), UniqueId::new(85, 86));
+        let error = prepare_fragment_submission(decode_input(&fragment, &params))
+            .expect_err("lake late materialization must be retired");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.kind(),
+            novarocks::protocol::ProtocolErrorKind::Unsupported
+        );
+        assert_eq!(
+            protocol.path().to_string(),
+            "exec_plan_fragment.fragment.plan.nodes[0].lake_scan_node.enable_global_late_materialization"
+        );
     }
 
     #[test]

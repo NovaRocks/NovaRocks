@@ -109,11 +109,14 @@ fn compile_external(source: &str) -> Output {
     fs::write(&source_path, source).expect("external caller source");
     let rlib = current_novarocks_rlib();
     let deps = rlib.parent().expect("rlib profile directory").join("deps");
+    let metadata_path = workspace.path().join("external.rmeta");
 
     Command::new("rustc")
         .arg("--edition=2024")
         .arg("--crate-name=external_final_domain_boundary")
         .arg("--emit=metadata")
+        .arg("-o")
+        .arg(metadata_path)
         .arg(&source_path)
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
@@ -123,14 +126,15 @@ fn compile_external(source: &str) -> Output {
         .expect("run rustc for external caller")
 }
 
-fn assert_private(output: Output, capability: &str) {
+fn assert_inaccessible(output: Output, capability: &str) {
     assert!(
         !output.status.success(),
         "external caller unexpectedly reached {capability}"
     );
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(
-        diagnostics.contains("private") && diagnostics.contains(capability),
+        (diagnostics.contains("private") || diagnostics.contains("unresolved import"))
+            && diagnostics.contains(capability),
         "external caller failed for an unexpected reason: {diagnostics}"
     );
 }
@@ -142,7 +146,7 @@ fn external_callers_cannot_reach_final_domain_issuance_authority() {
          fn main() { let _ = core::mem::size_of::<CompletionFenceAuthority>(); }\n",
     );
 
-    assert_private(output, "runtime_filter");
+    assert_inaccessible(output, "runtime_filter");
 }
 
 #[test]
@@ -152,13 +156,13 @@ fn external_callers_cannot_open_aggregate_final_domain_sessions() {
          fn main() { let _ = core::mem::size_of::<AggregateFinalDomainSessionBuilder>(); }\n",
     );
 
-    assert_private(output, "AggregateFinalDomainSessionBuilder");
+    assert_inaccessible(output, "AggregateFinalDomainSessionBuilder");
 }
 
 #[test]
 fn fragment_kernel_exposes_only_the_canonical_construction_and_runtime_paths() {
     let output = compile_external(
-        "use novarocks::exec::fragment::program::FragmentProgramBuilder;\n\
+        "use novarocks::exec::fragment::FragmentProgramBuilder;\n\
          use novarocks::exec::node::ExecPlanBuilder;\n\
          use novarocks::runtime::fragment::{FragmentInstanceSpec, FragmentSubmission};\n\
          fn main() {\n\
@@ -204,6 +208,16 @@ fn external_callers_cannot_reach_fragment_kernel_legacy_paths() {
             "query_context",
         ),
     ] {
-        assert_private(compile_external(source), capability);
+        assert_inaccessible(compile_external(source), capability);
     }
+}
+
+#[test]
+fn external_callers_cannot_reach_concrete_starrocks_sink_factories() {
+    let output = compile_external(
+        "use novarocks::connector::starrocks::sink::OlapTableSinkFactory;\n\
+         fn main() { let _ = core::mem::size_of::<OlapTableSinkFactory>(); }\n",
+    );
+
+    assert_inaccessible(output, "OlapTableSinkFactory");
 }

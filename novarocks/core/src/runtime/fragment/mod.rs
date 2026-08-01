@@ -41,5 +41,11 @@ pub use handle::{
 };
 pub use instance::*;
 pub use io::result_format::{build_result_batch, build_statistic_result_batch, empty_result_batch};
-pub use io::*;
+pub use io::{
+    ExchangeFrame, ExchangeFrameTransmitter, FragmentEvent, FragmentEventSink, FragmentIoError,
+    FragmentIoErrorKind, FragmentIoOperation, FragmentLookupClient, FragmentProfileSnapshot,
+    FragmentProgress, FragmentResultSession, FragmentResultWriter, LookupBatch, LookupColumn,
+    LookupKind, LookupRequest, LookupTarget, NoopFragmentEventSink, ResultAbort,
+    ResultPresentation, ResultProjection, ResultWriteSpec, UnavailableFragmentLookupClient,
+};
 pub use submission::FragmentSubmission;

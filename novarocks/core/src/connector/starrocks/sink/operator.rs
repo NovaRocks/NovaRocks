@@ -1910,9 +1910,7 @@ impl OlapTableSinkOperator {
 
         self.loaded_rows = flush_start_loaded_rows.saturating_add(flush_loaded_rows_delta);
         self.filtered_rows = flush_start_filtered_rows.saturating_add(flush_filtered_rows_delta);
-        if !flush_tracking_logs.is_empty() {
-            state.add_load_tracking_logs(flush_tracking_logs);
-        }
+        let _ = flush_tracking_logs;
 
         Ok(())
     }

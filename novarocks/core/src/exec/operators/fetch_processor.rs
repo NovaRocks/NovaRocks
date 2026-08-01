@@ -176,6 +176,12 @@ impl FetchProcessor {
             }
             let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
             let is_lake = is_lake_row_position(row_pos_desc.row_position_type);
+            if is_lake {
+                return Err(
+                    "lake late-materialization lookup is retired; row-position virtual columns are not part of the fragment kernel"
+                        .to_string(),
+                );
+            }
             let expected_ref_slots = if is_lake { 3 } else { 2 };
             if fetch_ref_slots.len() != expected_ref_slots {
                 return Err(format!(
@@ -212,11 +218,7 @@ impl FetchProcessor {
                     query_id,
                     self.target_node_id,
                     *tuple_id,
-                    if is_lake {
-                        LookupKind::Lake
-                    } else {
-                        LookupKind::PrimaryKey
-                    },
+                    LookupKind::PrimaryKey,
                     LookupTarget::new(*backend_id, self.lookup_endpoint(*backend_id)?),
                     request_columns
                         .into_iter()

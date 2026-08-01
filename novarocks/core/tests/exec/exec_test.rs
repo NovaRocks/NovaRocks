@@ -44,18 +44,8 @@ fn test_expr_module() {
 }
 
 #[test]
-fn test_pipeline_module() {
-    assert_type_accessible::<novarocks::exec::pipeline::builder::PipelineGraph>();
-}
-
-#[test]
 fn test_node_module() {
     assert_type_accessible::<novarocks::exec::node::ExecNode>();
-}
-
-#[test]
-fn test_operators_module() {
-    assert_type_accessible::<novarocks::exec::operators::ScanSourceFactory>();
 }
 
 #[test]

@@ -18,3 +18,5 @@
 pub mod error;
 pub mod program;
 pub mod sink;
+
+pub use program::{FragmentProgram, FragmentProgramBuilder};

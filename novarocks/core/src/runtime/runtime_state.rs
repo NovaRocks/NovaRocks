@@ -22,7 +22,6 @@ use crate::common::config;
 use crate::common::types::UniqueId;
 use crate::exec::spill::{QuerySpillManager, SpillConfig};
 use crate::novarocks_logging::debug;
-use crate::runtime::fragment::io::load_tracking::LoadTrackingLogSink;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_context::QueryId;
@@ -47,7 +46,6 @@ pub struct RuntimeState {
     spill_config: Option<SpillConfig>,
     spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
     native_runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
-    load_tracking_sink: Option<std::sync::Arc<dyn LoadTrackingLogSink>>,
     connector_staged_report_collector:
         Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
 }
@@ -87,7 +85,6 @@ impl Default for RuntimeState {
             spill_config: None,
             spill_manager: None,
             native_runtime_filter_context: None,
-            load_tracking_sink: None,
             connector_staged_report_collector: None,
         }
     }
@@ -109,7 +106,6 @@ impl Clone for RuntimeState {
             spill_config: self.spill_config.clone(),
             spill_manager: self.spill_manager.clone(),
             native_runtime_filter_context: self.native_runtime_filter_context.clone(),
-            load_tracking_sink: self.load_tracking_sink.clone(),
             connector_staged_report_collector: self.connector_staged_report_collector.clone(),
         }
     }
@@ -152,7 +148,6 @@ impl RuntimeState {
             spill_config,
             spill_manager,
             native_runtime_filter_context: None,
-            load_tracking_sink: None,
             connector_staged_report_collector: None,
         }
     }
@@ -162,14 +157,6 @@ impl RuntimeState {
         context: Option<NativeRuntimeFilterExecutionContext>,
     ) -> Self {
         self.native_runtime_filter_context = context;
-        self
-    }
-
-    pub(crate) fn with_load_tracking_sink(
-        mut self,
-        sink: Option<std::sync::Arc<dyn LoadTrackingLogSink>>,
-    ) -> Self {
-        self.load_tracking_sink = sink;
         self
     }
 
@@ -261,21 +248,6 @@ impl RuntimeState {
             "add sink load counters"
         );
         sink_commit::add_load_stats(finst_id, loaded_rows, loaded_bytes, filtered_rows);
-    }
-
-    pub(crate) fn add_load_tracking_logs(&self, logs: impl IntoIterator<Item = String>) {
-        let Some(query_id) = self.query_id else {
-            debug!(
-                target: "novarocks::sink_commit",
-                "skip load tracking logs because query_id is missing"
-            );
-            return;
-        };
-        let logs = logs.into_iter().collect::<Vec<_>>();
-        let Some(sink) = self.load_tracking_sink.as_ref() else {
-            return;
-        };
-        sink.append(query_id, logs);
     }
 
     pub(crate) fn add_tablet_commit_info(&self, info: sink_commit::TabletCommitInfo) {
@@ -440,21 +412,7 @@ fn monotonic_now_ns() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
-
-    #[derive(Debug, Default)]
-    struct RecordingTrackingSink(Mutex<Vec<(QueryId, Vec<String>)>>);
-
-    impl LoadTrackingLogSink for RecordingTrackingSink {
-        fn append(&self, query_id: QueryId, logs: Vec<String>) {
-            self.0
-                .lock()
-                .expect("tracking sink lock")
-                .push((query_id, logs));
-        }
-    }
 
     #[test]
     fn construction_does_not_register_sink_commit_side_effect() {
@@ -494,23 +452,5 @@ mod tests {
             name.contains("novarocks-sink-io"),
             "sink_io task ran on unexpected thread: {name}"
         );
-    }
-
-    #[test]
-    fn load_tracking_logs_require_explicit_sink_injection() {
-        let query_id = QueryId::new(7101, 7102);
-        let sink = Arc::new(RecordingTrackingSink::default());
-        let state = RuntimeState::new(None, None, Some(query_id), None, None, None, None, None)
-            .with_load_tracking_sink(Some(sink.clone()));
-
-        state.add_load_tracking_logs(["first row".to_string()]);
-
-        assert_eq!(
-            sink.0.lock().expect("tracking sink lock").as_slice(),
-            &[(query_id, vec!["first row".to_string()])]
-        );
-        RuntimeState::new(None, None, Some(query_id), None, None, None, None, None)
-            .add_load_tracking_logs(["ignored".to_string()]);
-        assert_eq!(sink.0.lock().expect("tracking sink lock").len(), 1);
     }
 }

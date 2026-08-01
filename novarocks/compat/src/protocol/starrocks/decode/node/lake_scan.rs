@@ -63,6 +63,14 @@ pub(crate) fn reject_lake_late_materialization(
     let Some(lake) = node.lake_scan_node.as_ref() else {
         return Ok(());
     };
+    if lake.enable_global_late_materialization == Some(true) {
+        return Err(StarRocksFragmentDecodeError::unsupported(
+            node_path
+                .field("lake_scan_node")
+                .field("enable_global_late_materialization"),
+            "LAKE_SCAN_NODE late materialization is retired; it is not part of the fragment kernel",
+        ));
+    }
     let slots = layout_hints
         .get(&lake.tuple_id)
         .filter(|slots| !slots.is_empty())

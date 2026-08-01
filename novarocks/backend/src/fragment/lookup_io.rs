@@ -68,15 +68,12 @@ fn local_lookup(request: LookupRequest) -> Result<LookupBatch, FragmentIoError> 
                 .map(|column| (column.slot_id(), column.values().clone()))
                 .collect(),
         ),
-        LookupKind::Lake => novarocks::runtime::lookup::execute_lake_lookup_request(
-            request.query_id(),
-            request.tuple_id(),
-            request
-                .columns()
-                .iter()
-                .map(|column| (column.slot_id(), column.values().clone()))
-                .collect(),
-        ),
+        LookupKind::Lake => {
+            return Err(lookup_error(
+                FragmentIoErrorKind::Internal,
+                "lake late-materialization lookup is retired",
+            ));
+        }
     }
     .map_err(|error| lookup_error(FragmentIoErrorKind::Internal, error))?;
     Ok(LookupBatch::new(

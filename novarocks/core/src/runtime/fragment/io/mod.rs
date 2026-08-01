@@ -3,7 +3,6 @@ pub mod events;
 pub mod exchange;
 pub(crate) mod exchange_metrics;
 pub(crate) mod exchange_queue;
-pub(crate) mod load_tracking;
 pub mod lookup;
 pub mod result;
 pub mod result_format;
