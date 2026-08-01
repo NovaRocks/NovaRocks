@@ -25,6 +25,7 @@
 #![allow(dead_code)] // Fixture-only domain variants document the read closure.
 
 mod kernel;
+mod model;
 mod page;
 mod remote;
 mod segment;

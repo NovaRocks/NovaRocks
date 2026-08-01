@@ -25,7 +25,7 @@ use arrow::array::{
     Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, StringArray,
 };
-use arrow::compute::filter_record_batch;
+use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -47,6 +47,7 @@ use crate::direct::{
 };
 
 use super::kernel::{decode_frozen_column, decode_plain_segment};
+use super::model::merge_key_model_batches;
 use super::segment::decode_segment_footer;
 use super::wire::{
     StorageDeletePredicate, StorageModel, StorageRowset, StorageSchema, StorageTabletMetadata,
@@ -123,7 +124,7 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
         }?;
         validate_metadata(split, &metadata)?;
 
-        let mut chunks = VecDeque::new();
+        let mut decoded_batches = Vec::new();
         let mut bytes_read = if metadata_cache_hit {
             0
         } else {
@@ -203,9 +204,39 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                     }
                     batch = apply_delvec(&batch, &deleted)?;
                 }
-                chunks.extend(slice_batch(&batch, request.batch)?);
+                if matches!(
+                    metadata.schema.model,
+                    StorageModel::Aggregate | StorageModel::Unique
+                ) {
+                    batch = augment_key_model_batch(
+                        &batch,
+                        &segment_path,
+                        &segment,
+                        &footer,
+                        &metadata,
+                        rowset,
+                    )?;
+                }
+                decoded_batches.push(batch);
             }
         }
+        let output_batch = if decoded_batches.is_empty() {
+            RecordBatch::new_empty(request.expected_schema.clone())
+        } else if matches!(
+            metadata.schema.model,
+            StorageModel::Aggregate | StorageModel::Unique
+        ) {
+            merge_key_model_batches(
+                metadata.schema.model,
+                &metadata.schema,
+                request.expected_schema.clone(),
+                &decoded_batches,
+            )?
+        } else {
+            concat_batches(&request.expected_schema, &decoded_batches)
+                .map_err(|_| corrupt("cannot concatenate StarRocks direct storage batches"))?
+        };
+        let chunks = VecDeque::from(slice_batch(&output_batch, request.batch)?);
         Ok(Box::new(DirectStorageConnectorReader::new(
             Box::new(FrozenStorageReader {
                 chunks,
@@ -399,14 +430,6 @@ fn validate_metadata(
             "StarRocks storage metadata identity differs from frozen split",
         ));
     }
-    if !matches!(
-        metadata.schema.model,
-        StorageModel::Duplicate | StorageModel::Primary
-    ) {
-        return Err(unsupported(
-            "StarRocks direct aggregate and unique key-model merge readers are not implemented",
-        ));
-    }
     if metadata
         .delvecs
         .values()
@@ -583,6 +606,70 @@ fn augment_predicate_batch(
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|_| corrupt("StarRocks direct storage predicate batch is invalid"))
+}
+
+fn augment_key_model_batch(
+    batch: &RecordBatch,
+    segment_path: &str,
+    segment: &[u8],
+    footer: &super::segment::StarRocksSegmentFooter,
+    metadata: &StorageTabletMetadata,
+    rowset: &StorageRowset,
+) -> Result<RecordBatch, ConnectorError> {
+    let mut columns = batch.columns().to_vec();
+    let mut fields = batch.schema().fields().to_vec();
+    let source_schema = metadata
+        .rowset_to_schema
+        .get(&rowset.id)
+        .map(|schema_id| {
+            metadata.historical_schemas.get(schema_id).ok_or_else(|| {
+                corrupt("StarRocks rowset key schema is missing from frozen metadata")
+            })
+        })
+        .transpose()?
+        .unwrap_or(&metadata.schema);
+    for current in metadata
+        .schema
+        .columns
+        .iter()
+        .filter(|column| column.is_key)
+    {
+        if batch.column_by_name(&current.name).is_some() {
+            continue;
+        }
+        let source = source_schema
+            .columns
+            .iter()
+            .find(|column| column.unique_id == current.unique_id);
+        let physical_type = source
+            .map(|column| column.physical_type.as_str())
+            .unwrap_or(current.physical_type.as_str());
+        let data_type = storage_arrow_type(physical_type)?;
+        let binding = StarRocksDirectColumnBinding::try_new(
+            0,
+            current.unique_id,
+            current.name.clone(),
+            physical_type,
+            source
+                .map(|column| column.nullable)
+                .unwrap_or(current.nullable),
+            current.default_value.clone().map(Bytes::from),
+        )?;
+        let column = decode_frozen_column(segment_path, segment, footer, &binding, &data_type)?;
+        if column.len() != batch.num_rows() {
+            return Err(corrupt(
+                "StarRocks direct key-model column row count differs from output",
+            ));
+        }
+        fields.push(Arc::new(Field::new(
+            current.name.clone(),
+            data_type,
+            binding.nullable,
+        )));
+        columns.push(column);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|_| corrupt("StarRocks direct key-model batch is invalid"))
 }
 
 fn project_frozen_output(
