@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::starrocks::sink::plan::{
-    FrontendAddress, StarRocksSinkDescriptor, StarRocksSinkFactoryInput, StarRocksTableSinkProgram,
-};
 use crate::exec::fragment::program::{FragmentProgram, FragmentSinkSpec};
 use crate::exec::fragment::sink::{
     DataStreamSinkBranchProgram, FragmentSinkProgram, MultiCastDataStreamSinkProgram,
@@ -218,70 +215,11 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
                 })
                 .map_err(materialization_error)
         }
-        (
-            FragmentSinkProgram::StarRocksTable(table),
-            FragmentSinkAssignment::StarRocksTable(assignment),
-        ) => {
-            materialize_starrocks_table(table, assignment).map(|factory| MaterializedFragmentSink {
-                factory,
-                statistics_handle: None,
-            })
-        }
         (static_program, dynamic_assignment) => Err(materialization_error(format!(
             "sink {} cannot be materialized with assignment {}",
             sink_program_name(static_program),
             sink_assignment_name(dynamic_assignment)
         ))),
-    }
-}
-
-fn materialize_starrocks_table(
-    program: &StarRocksTableSinkProgram,
-    assignment: &crate::runtime::fragment::instance::StarRocksTableSinkAssignment,
-) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    let input = starrocks_factory_input(program, assignment);
-    OlapTableSinkFactory::try_new(input)
-        .map(|factory| Box::new(factory) as Box<dyn OperatorFactory>)
-        .map_err(materialization_error)
-}
-
-fn starrocks_factory_input(
-    program: &StarRocksTableSinkProgram,
-    assignment: &crate::runtime::fragment::instance::StarRocksTableSinkAssignment,
-) -> StarRocksSinkFactoryInput {
-    let descriptor = &program.descriptor;
-    StarRocksSinkFactoryInput {
-        name: program.name.clone(),
-        descriptor: StarRocksSinkDescriptor {
-            db_id: descriptor.db_id,
-            table_id: descriptor.table_id,
-            db_name: descriptor.db_name.clone(),
-            table_name: descriptor.table_name.clone(),
-            txn_id: assignment.txn_id(),
-            load_id: assignment.load_id(),
-            keys_type: descriptor.keys_type,
-            is_lake_table: descriptor.is_lake_table,
-            dynamic_overwrite: descriptor.dynamic_overwrite,
-            partial_update_mode: descriptor.partial_update_mode.clone(),
-            merge_condition: descriptor.merge_condition.clone(),
-            null_expr_in_auto_increment: descriptor.null_expr_in_auto_increment,
-            miss_auto_increment_column: descriptor.miss_auto_increment_column,
-            schema: descriptor.schema.clone(),
-            partition: descriptor.partition.clone(),
-            location: descriptor.location.clone(),
-            nodes: descriptor.nodes.clone(),
-            frontend: assignment.frontend().map(|endpoint| FrontendAddress {
-                hostname: endpoint.host().to_string(),
-                port: endpoint.port(),
-            }),
-            frontend_provider: descriptor.frontend_provider.clone(),
-            starlet_metadata_provider: descriptor.starlet_metadata_provider.clone(),
-            storage_metadata_provider: descriptor.storage_metadata_provider.clone(),
-        },
-        output_projection: program.output_projection.clone(),
-        output_expr_slot_name_map: program.output_expr_slot_name_map.clone(),
-        output_expr_slot_ids: program.output_expr_slot_ids.clone(),
-        literal_partition_values: program.literal_partition_values.clone(),
     }
 }
 
@@ -393,7 +331,6 @@ fn sink_program_name(program: &FragmentSinkProgram) -> &'static str {
         FragmentSinkProgram::DataStream(_) => "data_stream",
         FragmentSinkProgram::MultiCastDataStream(_) => "multi_cast_data_stream",
         FragmentSinkProgram::SplitDataStream(_) => "split_data_stream",
-        FragmentSinkProgram::StarRocksTable(_) => "starrocks_table",
         FragmentSinkProgram::ConnectorWrite(_) => "connector_write",
     }
 }
@@ -403,41 +340,30 @@ fn sink_assignment_name(assignment: &FragmentSinkAssignment) -> &'static str {
         FragmentSinkAssignment::None => "none",
         FragmentSinkAssignment::StreamDestinations { .. } => "stream_destinations",
         FragmentSinkAssignment::DestinationGroups { .. } => "destination_groups",
-        FragmentSinkAssignment::StarRocksTable(_) => "starrocks_table",
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
 
     use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
-    use crate::connector::starrocks::lake::context::PartialUpdateWriteMode;
-    use crate::connector::starrocks::schema::{
-        StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
-    };
-    use crate::connector::starrocks::sink::plan::{
-        SinkIndexDescriptor, SinkLocationDescriptor, SinkNodesDescriptor, SinkPartitionDescriptor,
-        SinkSchemaDescriptor, StarRocksTableSinkDescriptor, StarRocksTableSinkProgram,
-    };
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::{
         FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
         RuntimeFilterContract,
     };
+    use crate::exec::fragment::sink::DataStreamPartitionType;
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
         MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    use crate::exec::operators::DataStreamPartitionType;
-    use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::fragment::error::{FragmentLaunchErrorKind, FragmentLaunchStage};
-    use crate::runtime::fragment::instance::StarRocksTableSinkAssignment;
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
@@ -446,7 +372,6 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
 
-    use super::starrocks_factory_input;
     use super::{materialize_fragment_sink, materialize_fragment_sink_components};
 
     fn test_transmitter() -> std::sync::Arc<dyn ExchangeFrameTransmitter> {
@@ -511,68 +436,6 @@ mod tests {
         )
     }
 
-    fn starrocks_table_program() -> StarRocksTableSinkProgram {
-        let tablet_schema = StarRocksTabletSchema::try_new(
-            Some(10),
-            Some(StarRocksKeysType::Primary),
-            vec![StarRocksColumnSchema {
-                unique_id: 1,
-                name: Some("k".to_string()),
-                r#type: "BIGINT".to_string(),
-                is_key: Some(true),
-                is_nullable: Some(false),
-                ..StarRocksColumnSchema::default()
-            }],
-        )
-        .expect("tablet schema");
-        StarRocksTableSinkProgram {
-            name: "OLAP_TABLE_SINK".to_string(),
-            descriptor: StarRocksTableSinkDescriptor {
-                db_id: 1,
-                table_id: 2,
-                db_name: Some("db".to_string()),
-                table_name: Some("tbl".to_string()),
-                keys_type: StarRocksKeysType::Primary,
-                is_lake_table: true,
-                dynamic_overwrite: false,
-                partial_update_mode: PartialUpdateWriteMode::Row,
-                merge_condition: None,
-                null_expr_in_auto_increment: false,
-                miss_auto_increment_column: false,
-                schema: SinkSchemaDescriptor {
-                    slot_descs: Vec::new(),
-                    indexes: vec![SinkIndexDescriptor {
-                        index_id: 10,
-                        schema_id: 10,
-                        column_names: vec!["k".to_string()],
-                        tablet_schema,
-                        column_to_expr_value: HashMap::new(),
-                        is_shadow: false,
-                        where_clause: None,
-                    }],
-                },
-                partition: SinkPartitionDescriptor {
-                    enable_automatic_partition: false,
-                    partition_columns: Vec::new(),
-                    distributed_columns: Vec::new(),
-                    partition_exprs: None,
-                    partitions: Vec::new(),
-                },
-                location: SinkLocationDescriptor {
-                    tablets: Vec::new(),
-                },
-                nodes: SinkNodesDescriptor { nodes: Vec::new() },
-                frontend_provider: None,
-                starlet_metadata_provider: None,
-                storage_metadata_provider: None,
-            },
-            output_projection: None,
-            output_expr_slot_name_map: HashMap::new(),
-            output_expr_slot_ids: Vec::new(),
-            literal_partition_values: None,
-        }
-    }
-
     fn assert_factory_and_operator_name(
         factory: &dyn crate::exec::pipeline::operator_factory::OperatorFactory,
         expected: &str,
@@ -632,32 +495,6 @@ mod tests {
             .expect("split sink");
 
         assert_factory_and_operator_name(factory.as_ref(), "SPLIT_DATA_STREAM_SINK (id=99)");
-    }
-
-    #[test]
-    fn starrocks_materializer_assembles_dynamic_identity_only_at_runtime() {
-        let program = starrocks_table_program();
-        let frontend = RuntimeEndpoint::new("frontend", 9020).expect("frontend");
-        let assignment =
-            StarRocksTableSinkAssignment::new(97, UniqueId::new(101, 103), Some(frontend));
-
-        let input = starrocks_factory_input(&program, &assignment);
-
-        assert_eq!(input.name, "OLAP_TABLE_SINK");
-        assert_eq!((input.descriptor.db_id, input.descriptor.table_id), (1, 2));
-        assert_eq!(input.descriptor.txn_id, 97);
-        assert_eq!(
-            (
-                input.descriptor.load_id.high(),
-                input.descriptor.load_id.low()
-            ),
-            (101, 103)
-        );
-        let frontend = input.descriptor.frontend.expect("frontend address");
-        assert_eq!(
-            (frontend.hostname.as_str(), frontend.port),
-            ("frontend", 9020)
-        );
     }
 
     #[test]

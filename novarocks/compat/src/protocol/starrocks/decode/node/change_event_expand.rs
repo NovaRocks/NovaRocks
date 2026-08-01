@@ -25,13 +25,13 @@ use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::common::ids::SlotId;
+use novarocks::exec::change_op::ChangeStreamBranchKind;
 use novarocks::exec::expr::{ExprArena, ExprId};
 use novarocks::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::FieldPath;
-use novarocks::sql::common::ChangeStreamBranchKind;
 
 pub(crate) fn lower_change_event_expand_node(
     children: Vec<Lowered>,

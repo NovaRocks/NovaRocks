@@ -173,36 +173,6 @@ pub enum FragmentSinkAssignment {
         groups: Vec<Vec<FragmentDestination>>,
         sender_id: Option<i32>,
     },
-    StarRocksTable(StarRocksTableSinkAssignment),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StarRocksTableSinkAssignment {
-    txn_id: i64,
-    load_id: UniqueId,
-    frontend: Option<RuntimeEndpoint>,
-}
-
-impl StarRocksTableSinkAssignment {
-    pub const fn new(txn_id: i64, load_id: UniqueId, frontend: Option<RuntimeEndpoint>) -> Self {
-        Self {
-            txn_id,
-            load_id,
-            frontend,
-        }
-    }
-
-    pub const fn txn_id(&self) -> i64 {
-        self.txn_id
-    }
-
-    pub const fn load_id(&self) -> UniqueId {
-        self.load_id
-    }
-
-    pub const fn frontend(&self) -> Option<&RuntimeEndpoint> {
-        self.frontend.as_ref()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -325,18 +295,14 @@ mod tests {
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::scan_range::{FileFormat, FileScanRange, ScanRange, ScanRangeParams};
+    use crate::runtime::scan_range::{FileFormat, ScanRange, ScanRangeParams};
 
     use super::*;
 
-    /// A simple, connector-agnostic `BoundScanRanges` for exercising the
-    /// instance-assignment carrier (variant content is irrelevant here — the
-    /// carrier no longer validates it; `ScanSource::bind` does, at materialize).
+    /// A simple connector-neutral assignment carrier for exercising instance
+    /// binding without exposing provider file range values.
     fn bound_ranges() -> BoundScanRanges {
-        BoundScanRanges::File {
-            ranges: Vec::new(),
-            has_more: false,
-        }
+        BoundScanRanges::None
     }
 
     #[test]
@@ -368,15 +334,12 @@ mod tests {
         let assignment = assignments.get(&node_id).expect("assignment at map key");
         assert!(matches!(assignment.ranges(), BoundScanRanges::None));
 
-        let file_node = FragmentNodeId::new(23);
-        let assignments = ScanAssignments::try_new(BTreeMap::from([(file_node, bound_ranges())]))
+        let second_node = FragmentNodeId::new(23);
+        let assignments = ScanAssignments::try_new(BTreeMap::from([(second_node, bound_ranges())]))
             .expect("carrier");
         assert!(matches!(
-            assignments.get(&file_node).expect("assignment").ranges(),
-            BoundScanRanges::File {
-                has_more: false,
-                ..
-            }
+            assignments.get(&second_node).expect("assignment").ranges(),
+            BoundScanRanges::None
         ));
     }
 

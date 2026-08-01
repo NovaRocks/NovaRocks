@@ -23,7 +23,6 @@ use crate::common::config::{
 };
 use crate::common::types::UniqueId;
 use crate::exec::spill::QuerySpillManager;
-use crate::runtime::fragment::io::LoadTrackingLogSink;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
@@ -38,7 +37,6 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) backend_num: Option<i32>,
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
     pub(crate) native_runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
-    pub(crate) load_tracking_sink: Option<Arc<dyn LoadTrackingLogSink>>,
     pub(crate) connector_staged_report_collector:
         Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
 }
@@ -81,7 +79,6 @@ pub(crate) fn build_runtime_state(
             spill_manager,
         )
         .with_native_runtime_filter_context(inputs.native_runtime_filter_context)
-        .with_load_tracking_sink(inputs.load_tracking_sink)
         .with_connector_staged_report_collector(inputs.connector_staged_report_collector),
     ))
 }

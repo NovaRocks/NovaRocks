@@ -23,13 +23,11 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::connector::starrocks::sink::plan::StarRocksTableSinkProgram;
+use crate::exec::change_op::ChangeStreamBranchKind;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
-use crate::exec::operators::DataStreamPartitionType;
 use crate::runtime::connector_write_report::ConnectorStagedReportCollector;
-use crate::sql::common::ChangeStreamBranchKind;
 use novarocks_spi::connector::{
     ConnectorExecutionBinding, ConnectorOpenWriterRequest, StatisticsMetricRequest,
 };
@@ -42,7 +40,6 @@ pub enum FragmentSinkProgram {
     DataStream(DataStreamSinkProgram),
     MultiCastDataStream(MultiCastDataStreamSinkProgram),
     SplitDataStream(SplitDataStreamSinkProgram),
-    StarRocksTable(StarRocksTableSinkProgram),
     ConnectorWrite(ConnectorWriteSinkProgram),
 }
 
@@ -53,9 +50,6 @@ impl FragmentSinkProgram {
             Self::DataStream(program) => program.validate(),
             Self::MultiCastDataStream(program) => program.validate(),
             Self::SplitDataStream(program) => program.validate(),
-            Self::StarRocksTable(program) => program
-                .validate()
-                .map_err(|error| ExecPlanBuildError::new(ExecPlanInvariant::Sink, error)),
             Self::ConnectorWrite(program) => program.validate(),
         }
     }
@@ -67,6 +61,34 @@ impl FragmentSinkProgram {
             Self::ConnectorWrite(program) => Some(program.report_collector()),
             _ => None,
         }
+    }
+}
+
+/// Construction-time exchange partitioning contract. The implementation lives
+/// in the private operator module, but decoders construct this neutral value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataStreamPartitionType {
+    Unpartitioned,
+    Random,
+    HashPartitioned,
+    BucketShuffleHashPartitioned,
+}
+
+impl DataStreamPartitionType {
+    pub(crate) const fn display_name(self) -> &'static str {
+        match self {
+            Self::Unpartitioned => "UNPARTITIONED",
+            Self::Random => "RANDOM",
+            Self::HashPartitioned => "HASH_PARTITIONED",
+            Self::BucketShuffleHashPartitioned => "BUCKET_SHUFFLE_HASH_PARTITIONED",
+        }
+    }
+
+    pub const fn requires_exprs(self) -> bool {
+        matches!(
+            self,
+            Self::HashPartitioned | Self::BucketShuffleHashPartitioned
+        )
     }
 }
 
@@ -708,7 +730,7 @@ mod tests {
     use crate::exec::fragment::program::{
         FragmentSinkAssignmentKind, FragmentSinkAssignmentRequirement, FragmentSinkSpec,
     };
-    use crate::exec::operators::DataStreamPartitionType;
+    use crate::exec::fragment::sink::DataStreamPartitionType;
 
     #[test]
     fn static_data_stream_program_contains_no_destinations() {

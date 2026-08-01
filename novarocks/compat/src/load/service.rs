@@ -35,9 +35,10 @@ use crate::thrift::plan_nodes::TFileFormatType;
 use crate::thrift::status::TStatus;
 use crate::thrift::status_code::TStatusCode;
 use crate::thrift::types::{self, TPartialUpdateMode, TUniqueId};
-use novarocks::runtime::fragment::io::SyncFragmentExecutor;
 use novarocks::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
 use novarocks::runtime::{backend_id, sink_commit};
+
+use crate::fragment::SyncFragmentExecutor;
 
 use super::registry::CompatLoadRegistry;
 

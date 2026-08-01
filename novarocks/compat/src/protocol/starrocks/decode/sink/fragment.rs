@@ -236,7 +236,7 @@ fn split_inputs_from_compat(
 }
 
 struct CompatChangeStreamRouterBranchInput {
-    branch_kind: novarocks::sql::common::ChangeStreamBranchKind,
+    branch_kind: novarocks::exec::change_op::ChangeStreamBranchKind,
     stream_sink: DataStreamSinkFactoryInput,
 }
 
@@ -738,35 +738,10 @@ pub(crate) fn decode_fragment_sink(
             Ok(decoded)
         }
         data_sinks::TDataSinkType::OLAP_TABLE_SINK => {
-            let olap_sink_path = sink_path.clone().field("olap_table_sink");
-            let olap_sink = sink.olap_table_sink.as_ref().ok_or_else(|| {
-                StarRocksFragmentDecodeError::missing(
-                    olap_sink_path.clone(),
-                    "OLAP_TABLE_SINK missing olap_table_sink payload",
-                )
-            })?;
-            let draft_plan = ExecPlan {
-                arena: arena.clone(),
-                root: lowered.node.clone(),
-            };
-            let (program, assignment) =
-                crate::protocol::starrocks::decode::sink::starrocks::lower_starrocks_table_sink(
-                    olap_sink,
-                    fragment.output_exprs.as_deref(),
-                    Some(&draft_plan),
-                    Some(&lowered.layout),
-                    last_query_id,
-                    session_time_zone,
-                    Some(external_dependencies),
-                    olap_sink_path.clone(),
-                    fragment_path.clone().field("output_exprs"),
-                )
-                .map_err(|error| error.into_fragment(olap_sink_path.clone()))?;
-            decoded_compat_sink(
-                FragmentSinkProgram::StarRocksTable(program),
-                FragmentSinkAssignment::StarRocksTable(assignment),
-                sink_path,
-            )
+            Err(StarRocksFragmentDecodeError::unsupported(
+                sink_path.field("type"),
+                "OLAP_TABLE_SINK is retired; StarRocks table execution is not part of the fragment kernel",
+            ))
         }
         other => Err(StarRocksFragmentDecodeError::unsupported(
             sink_path.field("type"),
@@ -780,8 +755,8 @@ pub(crate) fn decode_fragment_sink(
 
 fn branch_kind_from_thrift(
     value: data_sinks::TIcebergChangeStreamRouterBranchKind,
-) -> Result<novarocks::sql::common::ChangeStreamBranchKind, String> {
-    use novarocks::sql::common::ChangeStreamBranchKind;
+) -> Result<novarocks::exec::change_op::ChangeStreamBranchKind, String> {
+    use novarocks::exec::change_op::ChangeStreamBranchKind;
 
     match value {
         data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV => {

@@ -22,7 +22,7 @@ use crate::common::config;
 use crate::common::types::UniqueId;
 use crate::exec::spill::{QuerySpillManager, SpillConfig};
 use crate::novarocks_logging::debug;
-use crate::runtime::fragment::io::LoadTrackingLogSink;
+use crate::runtime::fragment::io::load_tracking::LoadTrackingLogSink;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_context::QueryId;

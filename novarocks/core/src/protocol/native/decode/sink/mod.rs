@@ -24,12 +24,12 @@ use super::error::NativeFragmentLeafDecodeError;
 use super::node::NativePlanDecodeContext;
 use crate::common::ids::SlotId;
 use crate::exec::expr::ExprArena;
+use crate::exec::fragment::sink::DataStreamPartitionType;
 use crate::exec::fragment::sink::{
     ConnectorWriteSinkProgram, DataStreamSinkBranchProgram, FragmentSinkProgram,
     MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     build_change_stream_split_predicate,
 };
-use crate::exec::operators::DataStreamPartitionType;
 use crate::proto::{common, expr, novarocks, plan};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};

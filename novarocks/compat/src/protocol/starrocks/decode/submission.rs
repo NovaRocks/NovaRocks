@@ -376,47 +376,6 @@ fn query_profile_arena_mut(
             FragmentExprArenaOwner::ChangeStreamRouter,
             novarocks::exec::fragment::sink::FragmentSinkProgram::SplitDataStream(program),
         ) => program.arena_mut(),
-        (
-            FragmentExprArenaOwner::StarRocksOutputProjection,
-            novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
-        ) => {
-            let projection = program.output_projection.as_mut().ok_or_else(|| {
-                query_profile_patch_target_error(owner, "output projection is missing")
-            })?;
-            Arc::make_mut(&mut projection.arena)
-        }
-        (
-            FragmentExprArenaOwner::StarRocksPartition,
-            novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
-        ) => {
-            let partition = program
-                .descriptor
-                .partition
-                .partition_exprs
-                .as_mut()
-                .ok_or_else(|| {
-                    query_profile_patch_target_error(owner, "partition expressions are missing")
-                })?;
-            &mut Arc::make_mut(partition).arena
-        }
-        (
-            FragmentExprArenaOwner::StarRocksIndexPredicate { index },
-            novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
-        ) => {
-            let predicate = program
-                .descriptor
-                .schema
-                .indexes
-                .get_mut(index)
-                .and_then(|index| index.where_clause.as_mut())
-                .ok_or_else(|| {
-                    query_profile_patch_target_error(
-                        owner,
-                        format!("index predicate {index} is missing"),
-                    )
-                })?;
-            Arc::make_mut(&mut predicate.arena)
-        }
         _ => {
             return Err(query_profile_patch_target_error(
                 owner,
@@ -1363,6 +1322,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any())]
     fn starrocks_program_with_owned_arenas() -> (FragmentProgram, [novarocks::exec::expr::ExprId; 3])
     {
         let mut output_arena = ExprArena::default();
@@ -1663,6 +1623,7 @@ mod tests {
         assert_resolved_profile(&submission.program().plan().arena, filter.predicate);
     }
 
+    #[cfg(any())]
     #[test]
     fn starrocks_query_profile_owner_routing_targets_exact_retained_arena() {
         let (mut program, [output_id, partition_id, index_id]) =

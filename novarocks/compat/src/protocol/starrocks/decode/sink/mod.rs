@@ -17,10 +17,9 @@
 
 pub(crate) mod fragment;
 pub(crate) mod iceberg;
-pub(crate) mod starrocks;
 
 use crate::thrift::partitions;
-use novarocks::exec::operators::DataStreamPartitionType;
+use novarocks::exec::fragment::sink::DataStreamPartitionType;
 
 pub(crate) fn decode_data_stream_partition_type(
     partition_type: partitions::TPartitionType,

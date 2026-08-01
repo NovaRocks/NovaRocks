@@ -24,6 +24,7 @@ mod lookup_io;
 mod result_io;
 mod service;
 mod statistic_result;
+mod sync;
 
 pub(crate) use dependency::lake_meta_storage_resolver;
 pub(crate) use event_io::compat_fragment_event_sink;
@@ -31,3 +32,4 @@ pub(crate) use io::brpc_exchange_transmitter;
 pub(crate) use lookup_io::brpc_fragment_lookup_client;
 pub(crate) use result_io::compat_result_writer;
 pub use service::CompatFragmentService;
+pub(crate) use sync::SyncFragmentExecutor;

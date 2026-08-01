@@ -14,13 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
-use crate::connector::file_execution::FileScanRange;
-use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
@@ -93,29 +90,6 @@ impl ScanMorsel {
             ),
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::Empty => "empty".to_string(),
-        }
-    }
-
-    /// Returns legacy file metadata. Connector splits never expose provider
-    /// file details to core execution.
-    pub fn file_range(&self) -> Option<FileScanRange> {
-        match self {
-            Self::FileRange {
-                path,
-                file_len,
-                offset,
-                length,
-                scan_range_id,
-                external_datacache,
-            } => Some(FileScanRange {
-                path: path.clone(),
-                file_len: *file_len,
-                offset: *offset,
-                length: *length,
-                scan_range_id: *scan_range_id,
-                external_datacache: external_datacache.clone(),
-            }),
-            _ => None,
         }
     }
 
@@ -369,11 +343,6 @@ pub enum BoundScanRanges {
     None,
     /// Schema scans carry only the per-instance assignment gate.
     SchemaSelection { should_scan: bool },
-    /// File-based (HDFS / Iceberg data) ranges.
-    File {
-        ranges: Vec<FileScanRange>,
-        has_more: bool,
-    },
 }
 
 /// Static, proto-free description of a scan source that materializes a
@@ -395,14 +364,6 @@ pub trait ScanSource: Send + Sync {
 #[cfg(test)]
 const _: fn(&dyn ScanSource) = |_scan_source: &dyn ScanSource| {};
 
-/// Metadata needed to re-scan a lake tablet for late materialization lookups.
-#[derive(Clone, Debug)]
-pub struct LakeGlmScanInfo {
-    pub ranges: Vec<StarRocksScanRange>,
-    pub properties: BTreeMap<String, String>,
-    pub lake_schema_meta: Option<LakeScanSchemaMeta>,
-}
-
 #[derive(Clone)]
 pub struct ScanNode {
     source: Arc<dyn ScanSource>,
@@ -419,7 +380,6 @@ pub struct ScanNode {
     row_position: Option<RowPositionSpec>,
     connector_row_position_lookup: Option<ConnectorRowPositionLookup>,
     lake_row_position: Option<LakeRowPositionSpec>,
-    lake_glm_info: Option<LakeGlmScanInfo>,
 }
 
 /// Test-only static source that binds to a fixed, pre-built op regardless of
@@ -449,7 +409,6 @@ impl ScanNode {
             row_position: None,
             connector_row_position_lookup: None,
             lake_row_position: None,
-            lake_glm_info: None,
         }
     }
 
@@ -518,11 +477,6 @@ impl ScanNode {
         self
     }
 
-    pub fn with_lake_glm_info(mut self, info: Option<LakeGlmScanInfo>) -> Self {
-        self.lake_glm_info = info;
-        self
-    }
-
     pub fn node_id(&self) -> Option<i32> {
         self.node_id
     }
@@ -580,10 +534,6 @@ impl ScanNode {
     pub fn lake_row_position(&self) -> Option<&LakeRowPositionSpec> {
         self.lake_row_position.as_ref()
     }
-
-    pub fn lake_glm_info(&self) -> Option<&LakeGlmScanInfo> {
-        self.lake_glm_info.as_ref()
-    }
 }
 
 impl std::fmt::Debug for ScanNode {
@@ -628,6 +578,5 @@ mod tests {
             morsel.connector_row_position(),
             Some(&ConnectorRowPosition { scan_range_id: 5 })
         );
-        assert!(morsel.file_range().is_none());
     }
 }

@@ -158,7 +158,6 @@ pub enum FragmentSinkKind {
     DataStream,
     MultiCastDataStream,
     SplitDataStream,
-    StarRocksTable,
     ConnectorWrite,
 }
 
@@ -166,7 +165,6 @@ pub enum FragmentSinkKind {
 pub enum FragmentSinkAssignmentKind {
     StreamDestinations,
     DestinationGroups(NonZeroUsize),
-    StarRocksTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,10 +211,6 @@ impl FragmentSinkSpec {
                     Required(DestinationGroups(count)),
                 )
             }
-            FragmentSinkProgram::StarRocksTable(_) => (
-                FragmentSinkKind::StarRocksTable,
-                Required(FragmentSinkAssignmentKind::StarRocksTable),
-            ),
             FragmentSinkProgram::ConnectorWrite(_) => (FragmentSinkKind::ConnectorWrite, None),
         };
         Ok(Self {
@@ -366,6 +360,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprId};
+    use crate::exec::fragment::sink::DataStreamPartitionType;
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
         MultiCastDataStreamSinkProgram,
@@ -373,7 +368,6 @@ mod tests {
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    use crate::exec::operators::DataStreamPartitionType;
 
     use super::*;
 

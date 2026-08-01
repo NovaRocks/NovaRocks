@@ -35,7 +35,6 @@ use novarocks::connector::starrocks::plan_compat_starrocks_read_source;
 use novarocks::exec::expr::{ExprArena, ExprNode};
 use novarocks::exec::fragment::program::ScanAssignmentKind;
 use novarocks::exec::node::project::ProjectNode;
-use novarocks::exec::node::scan::LakeGlmScanInfo;
 use novarocks::exec::node::scan::ScanNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::exec::row_position::{
@@ -230,6 +229,13 @@ pub(crate) fn lower_lake_scan_node(
             ));
         }
     };
+
+    if lake_row_position_spec.is_some() {
+        return Err(format!(
+            "LAKE_SCAN_NODE node_id={} late materialization is retired",
+            node.node_id
+        ));
+    }
 
     if lake_row_position_spec.is_some() {
         // Rebuild scan_layout with virtual cols removed
@@ -506,14 +512,6 @@ pub(crate) fn lower_lake_scan_node(
         topn_filter_column_map,
     };
 
-    let lake_row_position_spec_active = lake_row_position_spec.is_some();
-
-    let lake_glm_info = lake_row_position_spec.as_ref().map(|_| LakeGlmScanInfo {
-        ranges: cfg.ranges.clone(),
-        properties: cfg.properties.clone(),
-        lake_schema_meta: cfg.lake_schema_meta.clone(),
-    });
-
     let source = plan_compat_starrocks_read_source(query_id, node.node_id, cfg, query_opts)
         .map_err(|error| error.to_string())?;
     scan_ranges.capture(
@@ -526,8 +524,7 @@ pub(crate) fn lower_lake_scan_node(
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
         .with_accept_empty_scan_ranges(true)
-        .with_lake_row_position(lake_row_position_spec)
-        .with_lake_glm_info(lake_glm_info);
+        .with_lake_row_position(lake_row_position_spec);
     let scan_lowered = Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),
@@ -537,7 +534,7 @@ pub(crate) fn lower_lake_scan_node(
 
     // Skip the dict-expansion projection if there's nothing to remap,
     // or if lake GLM virtual cols were removed (that difference is not dict-related).
-    if dict_int_to_string.is_empty() || lake_row_position_spec_active {
+    if dict_int_to_string.is_empty() {
         return Ok(scan_lowered);
     }
 

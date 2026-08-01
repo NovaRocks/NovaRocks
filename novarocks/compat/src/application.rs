@@ -10,15 +10,14 @@ use axum::Router;
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::connector::starrocks::ports::LakeStorageDependencies;
-use novarocks::runtime::fragment::io::SyncFragmentExecutor;
 
 use crate::backend_service::{self, BackendServiceHandle};
 use crate::brpc;
 use crate::control::FrontendControlState;
 use crate::disk_report::{DiskReportSender, DiskReportWorker};
 use crate::fragment::{
-    CompatFragmentService, brpc_exchange_transmitter, brpc_fragment_lookup_client,
-    compat_result_writer, lake_meta_storage_resolver,
+    CompatFragmentService, SyncFragmentExecutor, brpc_exchange_transmitter,
+    brpc_fragment_lookup_client, compat_result_writer, lake_meta_storage_resolver,
 };
 use crate::frontend_rpc;
 use crate::heartbeat_service::{self, HeartbeatServer};
@@ -293,7 +292,6 @@ impl CompatApplicationHost {
             compat_result_writer(),
             Arc::clone(&report_service),
             Arc::clone(&load_registry),
-            tracking.clone(),
             lake_meta_storage_resolver(
                 Arc::clone(&starlet_metadata_provider),
                 Arc::clone(&storage_metadata_provider),

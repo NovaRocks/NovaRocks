@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::thrift::{metrics, runtime_profile};
-use novarocks::runtime::fragment::io::FragmentReportRegistration;
 use novarocks::runtime::mem_tracker::MemTracker;
 use novarocks::runtime::profile::{
     CounterAggregateType, CounterMergeType, CounterMinMaxType, CounterStrategy, ProfileCounter,
     ProfileNode, ProfileUnit, Profiler, RuntimeProfileTree, merge_pipeline_profiles,
 };
 use novarocks::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+
+use super::FragmentReportRegistration;
 
 pub(crate) fn build_profile_tree(
     registration: &FragmentReportRegistration,

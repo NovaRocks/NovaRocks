@@ -26,7 +26,6 @@ use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::exec::node::scan::ConnectorRowPositionLookup;
 use crate::exec::node::scan::IncrementalScanRange;
-use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::scan::ScanOp;
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::row_position::RowPositionDescriptor;
@@ -202,7 +201,6 @@ pub(crate) struct QueryContext {
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
     pub(crate) connector_glm_contexts: HashMap<SlotId, ConnectorRowPositionLookup>,
-    pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
     starrocks_preparing_admissions: usize,
@@ -400,7 +398,6 @@ impl QueryContext {
             row_pos_descs: HashMap::new(),
             lookup_fetchers: HashMap::new(),
             connector_glm_contexts: HashMap::new(),
-            lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
             mem_tracker,
             starrocks_preparing_admissions: 0,
@@ -640,14 +637,6 @@ impl QueryContext {
             Arc::clone(&lookup.binding),
             lookup.splits.get(&scan_range_id)?.clone(),
         ))
-    }
-
-    pub(crate) fn register_lake_glm(&mut self, row_source_slot: SlotId, info: LakeGlmScanInfo) {
-        self.lake_glm_contexts.insert(row_source_slot, info);
-    }
-
-    pub(crate) fn lake_glm_info(&self, row_source_slot: SlotId) -> Option<&LakeGlmScanInfo> {
-        self.lake_glm_contexts.get(&row_source_slot)
     }
 
     pub(crate) fn mem_tracker(&self) -> Arc<MemTracker> {
@@ -2633,31 +2622,6 @@ impl QueryContextManager {
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
             .and_then(|ctx| ctx.row_pos_desc(tuple_id))
-    }
-
-    pub(crate) fn register_lake_glm(
-        &self,
-        query_id: QueryId,
-        row_source_slot: SlotId,
-        info: LakeGlmScanInfo,
-    ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| {
-            ctx.register_lake_glm(row_source_slot, info);
-            Ok(())
-        })
-    }
-
-    pub(crate) fn lake_glm_info(
-        &self,
-        query_id: QueryId,
-        row_source_slot: SlotId,
-    ) -> Option<LakeGlmScanInfo> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.lake_glm_info(row_source_slot).map(Clone::clone))
     }
 
     /// Returns the query tracker for lifecycle verification and neutral runtime observers.

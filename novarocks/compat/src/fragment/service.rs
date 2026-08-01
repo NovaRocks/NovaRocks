@@ -37,8 +37,7 @@ use novarocks::cache::CacheOptions;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::exchange;
 use novarocks::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentReportRegistration,
-    FragmentResultWriter, FragmentTerminalReport, LoadTrackingLogSink, SyncFragmentExecutor,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
 use novarocks::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
@@ -65,7 +64,9 @@ use crate::fragment::admission::{
 };
 use crate::fragment::dependency::{lake_meta_storage_resolver, resolve_dependencies};
 use crate::load::CompatLoadRegistry;
-use crate::report::CompatReportService;
+use crate::report::{CompatReportService, FragmentReportRegistration, FragmentTerminalReport};
+
+use super::sync::SyncFragmentExecutor;
 
 pub struct CompatFragmentService {
     queries: StarRocksFragmentQueryRuntime,
@@ -78,7 +79,6 @@ pub struct CompatFragmentService {
     event_sink: Arc<dyn FragmentEventSink>,
     report_service: Arc<CompatReportService>,
     load_registry: Arc<CompatLoadRegistry>,
-    load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
     lake_meta_resolver: Arc<dyn LakeMetaStorageResolver>,
     table_schema_provider:
         Option<Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>>,
@@ -126,7 +126,6 @@ impl CompatFragmentService {
             result_writer,
             report_service,
             load_registry,
-            Arc::new(crate::load::LoadTrackingStore::default()),
         )
     }
 
@@ -137,7 +136,6 @@ impl CompatFragmentService {
         result_writer: Arc<dyn FragmentResultWriter>,
         report_service: Arc<CompatReportService>,
         load_registry: Arc<CompatLoadRegistry>,
-        load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
     ) -> Self {
         let starlet_metadata_provider = crate::starlet_metadata::starlet_metadata_provider();
         let storage_metadata_provider = crate::storage_wire::storage_metadata_provider();
@@ -148,7 +146,6 @@ impl CompatFragmentService {
             result_writer,
             report_service,
             load_registry,
-            load_tracking_sink,
             lake_meta_storage_resolver(
                 starlet_metadata_provider.clone(),
                 storage_metadata_provider.clone(),
@@ -168,7 +165,6 @@ impl CompatFragmentService {
         result_writer: Arc<dyn FragmentResultWriter>,
         report_service: Arc<CompatReportService>,
         load_registry: Arc<CompatLoadRegistry>,
-        load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
         lake_meta_resolver: Arc<dyn LakeMetaStorageResolver>,
         table_schema_provider: Option<
             Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>,
@@ -195,7 +191,6 @@ impl CompatFragmentService {
             event_sink: crate::fragment::compat_fragment_event_sink(Arc::clone(&report_service)),
             report_service,
             load_registry,
-            load_tracking_sink,
             lake_meta_resolver,
             table_schema_provider,
             schema_load_provider,
@@ -1158,18 +1153,15 @@ fn launch_prepared_fragments(
         if prepared.submission.uses_split_data_stream_sink() {
             eprintln!("compat_fragment_sink sink=SPLIT_DATA_STREAM_SINK stage=materialized");
         }
-        let prepare_context = prepared
-            .metadata
-            .into_prepare_context(
-                profiler.clone(),
-                Some(Arc::clone(&fragment_mem_tracker)),
-                Arc::clone(&service.exchange_transmitter),
-                Arc::clone(&service.lookup_client),
-                Arc::clone(&service.result_writer),
-                Arc::clone(&service.event_sink),
-                finst_id,
-            )
-            .with_load_tracking_sink(Arc::clone(&service.load_tracking_sink));
+        let prepare_context = prepared.metadata.into_prepare_context(
+            profiler.clone(),
+            Some(Arc::clone(&fragment_mem_tracker)),
+            Arc::clone(&service.exchange_transmitter),
+            Arc::clone(&service.lookup_client),
+            Arc::clone(&service.result_writer),
+            Arc::clone(&service.event_sink),
+            finst_id,
+        );
         let dormant = match prepare_fragment(prepared.submission, prepare_context) {
             Ok(dormant) => dormant,
             Err(error) => {
@@ -2184,18 +2176,15 @@ fn execute_plan_fragment_sync_with(
         handoff.cache_options(),
     )?;
     let fragment_mem_tracker = admission.fragment_mem_tracker(finst_id);
-    let prepare_context = prepared
-        .metadata
-        .into_prepare_context(
-            None,
-            Some(Arc::clone(&fragment_mem_tracker)),
-            Arc::clone(&service.exchange_transmitter),
-            Arc::clone(&service.lookup_client),
-            Arc::clone(&service.result_writer),
-            Arc::clone(&service.event_sink),
-            finst_id,
-        )
-        .with_load_tracking_sink(Arc::clone(&service.load_tracking_sink));
+    let prepare_context = prepared.metadata.into_prepare_context(
+        None,
+        Some(Arc::clone(&fragment_mem_tracker)),
+        Arc::clone(&service.exchange_transmitter),
+        Arc::clone(&service.lookup_client),
+        Arc::clone(&service.result_writer),
+        Arc::clone(&service.event_sink),
+        finst_id,
+    );
     let dormant = prepare_fragment(prepared.submission, prepare_context)
         .map_err(|error| error.to_string())?;
     let start_gate = Arc::new(BatchStartGate::default());
@@ -2280,13 +2269,13 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
+    use crate::fragment::SyncFragmentExecutor;
     use crate::protocol::starrocks::thrift_codec::{
         thrift_binary_deserialize, thrift_binary_serialize,
     };
     use crate::thrift::{
         data_sinks, descriptors, internal_service, partitions, plan_nodes, planner, types,
     };
-    use novarocks::runtime::fragment::io::SyncFragmentExecutor;
     use novarocks_types::QueryId;
     use novarocks_types::UniqueId;
 

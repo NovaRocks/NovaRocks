@@ -417,217 +417,223 @@ pub fn execute_lake_lookup_request(
     tuple_id: i32,
     request_columns: HashMap<SlotId, ArrayRef>,
 ) -> Result<Vec<(SlotId, ArrayRef)>, String> {
-    let mgr = query_context_manager();
-    let row_pos_desc = mgr
-        .row_pos_desc(query_id, tuple_id)
-        .ok_or_else(|| format!("row position descriptor missing for tuple_id={}", tuple_id))?;
-    let snapshot = mgr
-        .descriptor_snapshot(query_id)
-        .ok_or_else(|| "descriptor snapshot missing for lake lookup".to_string())?;
-    let lookup_slots = snapshot.lookup_output_slots(tuple_id, &row_pos_desc);
-    if lookup_slots.is_empty() {
-        return Ok(Vec::new());
-    }
-    let slot_meta = lookup_slot_meta(&snapshot, tuple_id, &lookup_slots)?;
-
-    // fetch_ref_slots for LAKE: [tablet_id_slot, rss_id_slot, row_id_slot]
-    let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
-    if fetch_ref_slots.len() != 3 {
-        return Err(format!(
-            "lake row position expects 3 fetch_ref_slots, got {}",
-            fetch_ref_slots.len()
-        ));
-    }
-    let rss_id_slot = fetch_ref_slots[1];
-    let row_id_slot = fetch_ref_slots[2];
-
-    let rss_id_col = request_columns
-        .get(&rss_id_slot)
-        .ok_or_else(|| format!("missing rss_id column {}", rss_id_slot))?;
-    let row_id_col = request_columns
-        .get(&row_id_slot)
-        .ok_or_else(|| format!("missing row_id column {}", row_id_slot))?;
-
-    let rss_ids = rss_id_col
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| "rss_id column must be Int32".to_string())?;
-    let row_ids = row_id_col
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "row_id column must be Int64".to_string())?;
-
-    let request_len = rss_ids.len();
-    if row_ids.len() != request_len {
-        return Err(format!(
-            "lake row position rss_id and row_id columns have different lengths: {} vs {}",
-            request_len,
-            row_ids.len()
-        ));
-    }
-    if request_len == 0 {
-        let mut out = Vec::new();
-        for slot in lookup_slots {
-            let meta = slot_meta
-                .get(&slot)
-                .ok_or_else(|| format!("missing slot meta for slot {}", slot))?;
-            let empty = new_empty_array(meta.field.data_type());
-            out.push((slot, empty));
+    #[cfg(any())]
+    {
+        let mgr = query_context_manager();
+        let row_pos_desc = mgr
+            .row_pos_desc(query_id, tuple_id)
+            .ok_or_else(|| format!("row position descriptor missing for tuple_id={}", tuple_id))?;
+        let snapshot = mgr
+            .descriptor_snapshot(query_id)
+            .ok_or_else(|| "descriptor snapshot missing for lake lookup".to_string())?;
+        let lookup_slots = snapshot.lookup_output_slots(tuple_id, &row_pos_desc);
+        if lookup_slots.is_empty() {
+            return Ok(Vec::new());
         }
-        return Ok(out);
-    }
+        let slot_meta = lookup_slot_meta(&snapshot, tuple_id, &lookup_slots)?;
 
-    // Get the LakeGlmScanInfo registered during scan
-    let lake_info = mgr
-        .lake_glm_info(query_id, row_pos_desc.row_source_slot)
-        .ok_or_else(|| "missing lake_glm_info for lookup".to_string())?;
-
-    // Group requests by rss_id (= range_index)
-    // rss_id_to_positions: range_idx -> {row_id -> VecDeque<output_position>}
-    let mut rss_id_to_positions: HashMap<i32, HashMap<i64, VecDeque<usize>>> = HashMap::new();
-    for idx in 0..request_len {
-        let rss_id = rss_ids.value(idx);
-        let row_id = row_ids.value(idx);
-        rss_id_to_positions
-            .entry(rss_id)
-            .or_default()
-            .entry(row_id)
-            .or_default()
-            .push_back(idx);
-    }
-
-    // Build the lookup output ChunkSchema
-    let lookup_chunk_schema = Arc::new(ChunkSchema::try_new(
-        lookup_slots
-            .iter()
-            .copied()
-            .map(|slot_id| {
-                let meta = slot_meta
-                    .get(&slot_id)
-                    .ok_or_else(|| format!("missing slot meta for slot {}", slot_id))?;
-                Ok(ChunkSlotSchema::new_with_field(
-                    slot_id,
-                    meta.field.clone(),
-                    None,
-                    meta.unique_id,
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-    )?);
-
-    let mut column_chunks: HashMap<SlotId, Vec<ArrayRef>> = HashMap::new();
-    let mut response_positions: Vec<usize> = Vec::with_capacity(request_len);
-
-    for (rss_id, mut positions_map) in rss_id_to_positions {
-        let range_idx =
-            usize::try_from(rss_id).map_err(|_| format!("rss_id {} is out of range", rss_id))?;
-        let range = lake_info.ranges.get(range_idx).cloned().ok_or_else(|| {
-            format!(
-                "rss_id {} out of range (lake_glm_info has {} ranges)",
-                rss_id,
-                lake_info.ranges.len()
-            )
-        })?;
-
-        // Build a StarRocksScanConfig for just this one tablet
-        let lookup_cfg = StarRocksScanConfig {
-            db_name: None,
-            table_name: None,
-            properties: lake_info.properties.clone(),
-            ranges: vec![range.clone()],
-            has_more: false,
-            required_chunk_schema: lookup_chunk_schema.clone(),
-            output_chunk_schema: lookup_chunk_schema.clone(),
-            query_global_dicts: std::collections::HashMap::new(),
-            limit: None,
-            batch_size: Some(4096),
-            query_timeout: None,
-            mem_limit: None,
-            profile_label: Some(format!("lake_glm_lookup_rss_id={}", rss_id)),
-            min_max_predicates: Vec::new(),
-            lake_schema_meta: lake_info.lake_schema_meta.clone(),
-            deferred_lake_resolution: None,
-            topn_filter_column_map: std::collections::HashMap::new(),
-        };
-
-        let iter = read_starrocks_batches(lookup_cfg)?;
-
-        let mut row_offset: i64 = 0;
-        for next in iter {
-            let chunk = next?;
-            let row_count = chunk.len();
-            if row_count == 0 {
-                continue;
-            }
-            let mut indices = Vec::new();
-            let mut positions = Vec::new();
-            for row_idx in 0..row_count {
-                let row_id = row_offset + row_idx as i64;
-                if let Some(queue) = positions_map.get_mut(&row_id) {
-                    while let Some(pos) = queue.pop_front() {
-                        indices.push(row_idx as u32);
-                        positions.push(pos);
-                    }
-                }
-            }
-            row_offset = row_offset.saturating_add(row_count as i64);
-            if indices.is_empty() {
-                continue;
-            }
-            let indices_array = UInt32Array::from(indices);
-            for slot in lookup_slots.iter() {
-                let column = chunk.column_by_slot_id(*slot)?;
-                let taken =
-                    take(column.as_ref(), &indices_array, None).map_err(|e| e.to_string())?;
-                column_chunks.entry(*slot).or_default().push(taken);
-            }
-            response_positions.extend(positions);
-        }
-
-        for (row_id, queue) in positions_map {
-            if !queue.is_empty() {
-                return Err(format!(
-                    "lake lookup failed to materialize row_id {} in rss_id={} ({} pending)",
-                    row_id,
-                    rss_id,
-                    queue.len()
-                ));
-            }
-        }
-    }
-
-    if response_positions.len() != request_len {
-        return Err(format!(
-            "lake lookup response size mismatch: expected {} got {}",
-            request_len,
-            response_positions.len()
-        ));
-    }
-
-    let mut response_indices = vec![u32::MAX; request_len];
-    for (resp_idx, req_pos) in response_positions.iter().enumerate() {
-        if response_indices[*req_pos] != u32::MAX {
+        // fetch_ref_slots for LAKE: [tablet_id_slot, rss_id_slot, row_id_slot]
+        let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
+        if fetch_ref_slots.len() != 3 {
             return Err(format!(
-                "duplicate lake lookup response position {}",
-                req_pos
+                "lake row position expects 3 fetch_ref_slots, got {}",
+                fetch_ref_slots.len()
             ));
         }
-        response_indices[*req_pos] = resp_idx as u32;
-    }
-    if response_indices.contains(&u32::MAX) {
-        return Err("lake lookup response missing positions".to_string());
-    }
-    let response_indices_array = UInt32Array::from(response_indices);
+        let rss_id_slot = fetch_ref_slots[1];
+        let row_id_slot = fetch_ref_slots[2];
 
-    let mut out = Vec::new();
-    for slot in lookup_slots {
-        let chunks = column_chunks
-            .get(&slot)
-            .ok_or_else(|| format!("missing lake lookup column {}", slot))?;
-        let chunk_refs: Vec<&dyn arrow::array::Array> = chunks.iter().map(|c| c.as_ref()).collect();
-        let full = concat(&chunk_refs).map_err(|e| e.to_string())?;
-        let ordered = take(&full, &response_indices_array, None).map_err(|e| e.to_string())?;
-        out.push((slot, ordered));
+        let rss_id_col = request_columns
+            .get(&rss_id_slot)
+            .ok_or_else(|| format!("missing rss_id column {}", rss_id_slot))?;
+        let row_id_col = request_columns
+            .get(&row_id_slot)
+            .ok_or_else(|| format!("missing row_id column {}", row_id_slot))?;
+
+        let rss_ids = rss_id_col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| "rss_id column must be Int32".to_string())?;
+        let row_ids = row_id_col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| "row_id column must be Int64".to_string())?;
+
+        let request_len = rss_ids.len();
+        if row_ids.len() != request_len {
+            return Err(format!(
+                "lake row position rss_id and row_id columns have different lengths: {} vs {}",
+                request_len,
+                row_ids.len()
+            ));
+        }
+        if request_len == 0 {
+            let mut out = Vec::new();
+            for slot in lookup_slots {
+                let meta = slot_meta
+                    .get(&slot)
+                    .ok_or_else(|| format!("missing slot meta for slot {}", slot))?;
+                let empty = new_empty_array(meta.field.data_type());
+                out.push((slot, empty));
+            }
+            return Ok(out);
+        }
+
+        // Get the LakeGlmScanInfo registered during scan
+        let lake_info = mgr
+            .lake_glm_info(query_id, row_pos_desc.row_source_slot)
+            .ok_or_else(|| "missing lake_glm_info for lookup".to_string())?;
+
+        // Group requests by rss_id (= range_index)
+        // rss_id_to_positions: range_idx -> {row_id -> VecDeque<output_position>}
+        let mut rss_id_to_positions: HashMap<i32, HashMap<i64, VecDeque<usize>>> = HashMap::new();
+        for idx in 0..request_len {
+            let rss_id = rss_ids.value(idx);
+            let row_id = row_ids.value(idx);
+            rss_id_to_positions
+                .entry(rss_id)
+                .or_default()
+                .entry(row_id)
+                .or_default()
+                .push_back(idx);
+        }
+
+        // Build the lookup output ChunkSchema
+        let lookup_chunk_schema = Arc::new(ChunkSchema::try_new(
+            lookup_slots
+                .iter()
+                .copied()
+                .map(|slot_id| {
+                    let meta = slot_meta
+                        .get(&slot_id)
+                        .ok_or_else(|| format!("missing slot meta for slot {}", slot_id))?;
+                    Ok(ChunkSlotSchema::new_with_field(
+                        slot_id,
+                        meta.field.clone(),
+                        None,
+                        meta.unique_id,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )?);
+
+        let mut column_chunks: HashMap<SlotId, Vec<ArrayRef>> = HashMap::new();
+        let mut response_positions: Vec<usize> = Vec::with_capacity(request_len);
+
+        for (rss_id, mut positions_map) in rss_id_to_positions {
+            let range_idx = usize::try_from(rss_id)
+                .map_err(|_| format!("rss_id {} is out of range", rss_id))?;
+            let range = lake_info.ranges.get(range_idx).cloned().ok_or_else(|| {
+                format!(
+                    "rss_id {} out of range (lake_glm_info has {} ranges)",
+                    rss_id,
+                    lake_info.ranges.len()
+                )
+            })?;
+
+            // Build a StarRocksScanConfig for just this one tablet
+            let lookup_cfg = StarRocksScanConfig {
+                db_name: None,
+                table_name: None,
+                properties: lake_info.properties.clone(),
+                ranges: vec![range.clone()],
+                has_more: false,
+                required_chunk_schema: lookup_chunk_schema.clone(),
+                output_chunk_schema: lookup_chunk_schema.clone(),
+                query_global_dicts: std::collections::HashMap::new(),
+                limit: None,
+                batch_size: Some(4096),
+                query_timeout: None,
+                mem_limit: None,
+                profile_label: Some(format!("lake_glm_lookup_rss_id={}", rss_id)),
+                min_max_predicates: Vec::new(),
+                lake_schema_meta: lake_info.lake_schema_meta.clone(),
+                deferred_lake_resolution: None,
+                topn_filter_column_map: std::collections::HashMap::new(),
+            };
+
+            let iter = read_starrocks_batches(lookup_cfg)?;
+
+            let mut row_offset: i64 = 0;
+            for next in iter {
+                let chunk = next?;
+                let row_count = chunk.len();
+                if row_count == 0 {
+                    continue;
+                }
+                let mut indices = Vec::new();
+                let mut positions = Vec::new();
+                for row_idx in 0..row_count {
+                    let row_id = row_offset + row_idx as i64;
+                    if let Some(queue) = positions_map.get_mut(&row_id) {
+                        while let Some(pos) = queue.pop_front() {
+                            indices.push(row_idx as u32);
+                            positions.push(pos);
+                        }
+                    }
+                }
+                row_offset = row_offset.saturating_add(row_count as i64);
+                if indices.is_empty() {
+                    continue;
+                }
+                let indices_array = UInt32Array::from(indices);
+                for slot in lookup_slots.iter() {
+                    let column = chunk.column_by_slot_id(*slot)?;
+                    let taken =
+                        take(column.as_ref(), &indices_array, None).map_err(|e| e.to_string())?;
+                    column_chunks.entry(*slot).or_default().push(taken);
+                }
+                response_positions.extend(positions);
+            }
+
+            for (row_id, queue) in positions_map {
+                if !queue.is_empty() {
+                    return Err(format!(
+                        "lake lookup failed to materialize row_id {} in rss_id={} ({} pending)",
+                        row_id,
+                        rss_id,
+                        queue.len()
+                    ));
+                }
+            }
+        }
+
+        if response_positions.len() != request_len {
+            return Err(format!(
+                "lake lookup response size mismatch: expected {} got {}",
+                request_len,
+                response_positions.len()
+            ));
+        }
+
+        let mut response_indices = vec![u32::MAX; request_len];
+        for (resp_idx, req_pos) in response_positions.iter().enumerate() {
+            if response_indices[*req_pos] != u32::MAX {
+                return Err(format!(
+                    "duplicate lake lookup response position {}",
+                    req_pos
+                ));
+            }
+            response_indices[*req_pos] = resp_idx as u32;
+        }
+        if response_indices.contains(&u32::MAX) {
+            return Err("lake lookup response missing positions".to_string());
+        }
+        let response_indices_array = UInt32Array::from(response_indices);
+
+        let mut out = Vec::new();
+        for slot in lookup_slots {
+            let chunks = column_chunks
+                .get(&slot)
+                .ok_or_else(|| format!("missing lake lookup column {}", slot))?;
+            let chunk_refs: Vec<&dyn arrow::array::Array> =
+                chunks.iter().map(|c| c.as_ref()).collect();
+            let full = concat(&chunk_refs).map_err(|e| e.to_string())?;
+            let ordered = take(&full, &response_indices_array, None).map_err(|e| e.to_string())?;
+            out.push((slot, ordered));
+        }
+        Ok(out)
     }
-    Ok(out)
+
+    Err("lake late-materialization lookup is retired".to_string())
 }

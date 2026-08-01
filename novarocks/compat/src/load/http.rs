@@ -142,7 +142,7 @@ mod tests {
     #[derive(Debug)]
     struct UnusedSyncExecutor;
 
-    impl novarocks::runtime::fragment::io::SyncFragmentExecutor for UnusedSyncExecutor {
+    impl crate::fragment::SyncFragmentExecutor for UnusedSyncExecutor {
         fn execute_encoded(&self, _payload: &[u8]) -> Result<novarocks_types::UniqueId, String> {
             Err("unexpected fragment execution".to_string())
         }

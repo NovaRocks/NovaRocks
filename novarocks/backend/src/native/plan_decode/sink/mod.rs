@@ -24,12 +24,12 @@ use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::ExprArena;
+use novarocks::exec::fragment::sink::DataStreamPartitionType;
 use novarocks::exec::fragment::sink::{
     ConnectorWriteSinkProgram, DataStreamSinkBranchProgram, FragmentSinkProgram,
     MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     build_change_stream_split_predicate,
 };
-use novarocks::exec::operators::DataStreamPartitionType;
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
@@ -874,18 +874,18 @@ fn decode_router_output_slots(
 
 fn decode_change_stream_branch_kind(
     value: i32,
-) -> Result<novarocks::sql::common::ChangeStreamBranchKind, String> {
+) -> Result<novarocks::exec::change_op::ChangeStreamBranchKind, String> {
     match plan::ChangeStreamBranchKind::try_from(value)
         .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
     {
         plan::ChangeStreamBranchKind::DeleteDv => {
-            Ok(novarocks::sql::common::ChangeStreamBranchKind::DeleteDv)
+            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::DeleteDv)
         }
         plan::ChangeStreamBranchKind::ReuseData => {
-            Ok(novarocks::sql::common::ChangeStreamBranchKind::ReuseData)
+            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::ReuseData)
         }
         plan::ChangeStreamBranchKind::FreshData => {
-            Ok(novarocks::sql::common::ChangeStreamBranchKind::FreshData)
+            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::FreshData)
         }
         plan::ChangeStreamBranchKind::Unspecified => {
             Err("native ChangeStreamBranchKind is unspecified".to_string())

@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use novarocks::runtime::fragment::io::LoadTrackingLogSink;
 use novarocks_types::QueryId;
 
 const MAX_TRACKING_QUERIES: usize = 1024;
@@ -91,12 +90,6 @@ impl LoadTrackingStore {
 
     pub(crate) fn clear(&self) {
         self.mu.lock().expect("tracking log store lock").clear();
-    }
-}
-
-impl LoadTrackingLogSink for LoadTrackingStore {
-    fn append(&self, query_id: QueryId, logs: Vec<String>) {
-        let _ = self.append_logs(query_id, logs);
     }
 }
 

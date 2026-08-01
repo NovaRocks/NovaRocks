@@ -140,7 +140,6 @@ mod tests {
     use std::sync::Arc;
 
     use crate::common::types::UniqueId;
-    use crate::connector::file_execution::FileScanRange;
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::{
         FragmentContractVersion, FragmentNodeId, FragmentProgram, FragmentProgramOptions,
@@ -163,20 +162,15 @@ mod tests {
 
     use super::materialize_scan_bindings;
 
-    /// Static source that binds `File` ranges into an op emitting one morsel
-    /// per range; any other variant is rejected (as a real connector source
-    /// would). This lets the tests assert that the op materialized at launch
-    /// reflects the *instance's* ranges, not any node-baked state.
+    /// Static source used to ensure materialization reads instance assignments.
     struct CountingFileSource;
 
     impl ScanSource for CountingFileSource {
         fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
             match ranges {
-                BoundScanRanges::File { ranges, .. } => Ok(Arc::new(CountingFileOp {
-                    morsels: ranges.len(),
-                })),
+                BoundScanRanges::None => Ok(Arc::new(CountingFileOp { morsels: 1 })),
                 other => Err(format!(
-                    "CountingFileSource expects File ranges, got {other:?}"
+                    "CountingFileSource expects no ranges, got {other:?}"
                 )),
             }
         }
@@ -213,22 +207,8 @@ mod tests {
         }
     }
 
-    fn test_file_range(index: usize) -> FileScanRange {
-        FileScanRange {
-            path: format!("s3://bucket/file-{index}.parquet"),
-            file_len: 16,
-            offset: 0,
-            length: 16,
-            scan_range_id: index as i32,
-            external_datacache: None,
-        }
-    }
-
-    fn file_ranges(count: usize) -> BoundScanRanges {
-        BoundScanRanges::File {
-            ranges: (0..count).map(test_file_range).collect(),
-            has_more: false,
-        }
+    fn file_ranges(_count: usize) -> BoundScanRanges {
+        BoundScanRanges::None
     }
 
     const SCAN_NODE_ID: i32 = 7;

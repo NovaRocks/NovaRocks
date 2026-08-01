@@ -32,6 +32,7 @@ use crate::common::ids::SlotId;
 use crate::common::types::{UniqueId, format_uuid};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::fragment::sink::DataStreamPartitionType;
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::fragment::io::exchange::{ExchangeFrame, ExchangeFrameTransmitter};
@@ -1014,32 +1015,6 @@ mod data_stream_sink_hash_partition {
 
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DataStreamPartitionType {
-    Unpartitioned,
-    Random,
-    HashPartitioned,
-    BucketShuffleHashPartitioned,
-}
-
-impl DataStreamPartitionType {
-    fn display_name(self) -> &'static str {
-        match self {
-            Self::Unpartitioned => "UNPARTITIONED",
-            Self::Random => "RANDOM",
-            Self::HashPartitioned => "HASH_PARTITIONED",
-            Self::BucketShuffleHashPartitioned => "BUCKET_SHUFFLE_HASH_PARTITIONED",
-        }
-    }
-
-    pub fn requires_exprs(self) -> bool {
-        matches!(
-            self,
-            Self::HashPartitioned | Self::BucketShuffleHashPartitioned
-        )
-    }
-}
 
 #[derive(Clone)]
 pub struct DataStreamSinkFactoryInput {

@@ -15,42 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub const CHANGE_OP_DELETE: i32 = -1;
-pub const CHANGE_OP_INSERT: i32 = 1;
-pub const DATA_ROUTE_REUSE: i32 = 1;
-pub const DATA_ROUTE_FRESH: i32 = 2;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ChangeStreamBranchKind {
-    DeleteDv,
-    ReuseData,
-    FreshData,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ChangeStreamRouteKey {
-    pub(crate) change_op: i32,
-    pub(crate) data_route: Option<i32>,
-}
-
-impl ChangeStreamBranchKind {
-    pub(crate) fn route_key(self) -> ChangeStreamRouteKey {
-        match self {
-            Self::DeleteDv => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_DELETE,
-                data_route: None,
-            },
-            Self::ReuseData => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_INSERT,
-                data_route: Some(DATA_ROUTE_REUSE),
-            },
-            Self::FreshData => ChangeStreamRouteKey {
-                change_op: CHANGE_OP_INSERT,
-                data_route: Some(DATA_ROUTE_FRESH),
-            },
-        }
-    }
-}
+pub(crate) use crate::exec::change_op::{
+    CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind, ChangeStreamRouteKey,
+    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+};
 
 #[cfg(test)]
 mod tests {

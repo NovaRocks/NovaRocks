@@ -22,6 +22,41 @@ use arrow::datatypes::{DataType, Field};
 pub const CHANGE_OP_COLUMN: &str = "__change_op";
 pub const CHANGE_OP_INSERT: i8 = 1;
 pub const CHANGE_OP_DELETE: i8 = -1;
+pub const DATA_ROUTE_REUSE: i32 = 1;
+pub const DATA_ROUTE_FRESH: i32 = 2;
+
+/// Execution-owned branch semantics for change-stream writers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChangeStreamBranchKind {
+    DeleteDv,
+    ReuseData,
+    FreshData,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChangeStreamRouteKey {
+    pub(crate) change_op: i32,
+    pub(crate) data_route: Option<i32>,
+}
+
+impl ChangeStreamBranchKind {
+    pub(crate) fn route_key(self) -> ChangeStreamRouteKey {
+        match self {
+            Self::DeleteDv => ChangeStreamRouteKey {
+                change_op: CHANGE_OP_DELETE as i32,
+                data_route: None,
+            },
+            Self::ReuseData => ChangeStreamRouteKey {
+                change_op: CHANGE_OP_INSERT as i32,
+                data_route: Some(DATA_ROUTE_REUSE),
+            },
+            Self::FreshData => ChangeStreamRouteKey {
+                change_op: CHANGE_OP_INSERT as i32,
+                data_route: Some(DATA_ROUTE_FRESH),
+            },
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeOp {
