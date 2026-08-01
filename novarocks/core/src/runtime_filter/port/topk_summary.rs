@@ -34,16 +34,16 @@ const TOPK_REPLAY_DOMAIN: &[u8] = b"novarocks.runtime-filter.top-k-summary-repla
 const TOPK_REPLAY_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct TopKSummaryContractDigest([u8; 32]);
+pub struct TopKSummaryContractDigest([u8; 32]);
 
 impl TopKSummaryContractDigest {
-    pub(crate) const fn bytes(self) -> [u8; 32] {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TopKSummaryError {
+pub enum TopKSummaryError {
     InvalidOrderContract(OrderContractError),
     KIndexOverflow,
     TooManyCandidates,
@@ -52,14 +52,14 @@ pub(crate) enum TopKSummaryError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeTopKSummaryContract {
+pub struct RuntimeTopKSummaryContract {
     order: Arc<RuntimeOrderContract>,
     k: NonZeroU32,
     digest: TopKSummaryContractDigest,
 }
 
 impl RuntimeTopKSummaryContract {
-    pub(crate) fn try_from_plan(
+    pub fn try_from_plan(
         order: &OrderContract,
         requirement: TopKSummaryRequirement,
     ) -> Result<Self, TopKSummaryError> {
@@ -86,7 +86,7 @@ impl RuntimeTopKSummaryContract {
         self.k
     }
 
-    pub(crate) const fn digest(&self) -> TopKSummaryContractDigest {
+    pub const fn digest(&self) -> TopKSummaryContractDigest {
         self.digest
     }
 }

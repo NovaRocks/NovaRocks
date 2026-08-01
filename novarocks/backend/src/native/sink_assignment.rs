@@ -18,25 +18,12 @@
 //! Backend-owned native sink-assignment DTO decoding.
 
 use novarocks::common::types::UniqueId;
-use novarocks::protocol::native_fragment_assembly_port::NativeFragmentSinkAssignmentDecoder;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
 use novarocks_protocol::{novarocks as proto, plan};
 
-pub(crate) struct BackendNativeFragmentSinkAssignmentDecoder;
-
-impl NativeFragmentSinkAssignmentDecoder for BackendNativeFragmentSinkAssignmentDecoder {
-    fn decode_sink_assignment(
-        &self,
-        sink: &plan::DataSink,
-        instance: &proto::InstanceParams,
-    ) -> Result<FragmentSinkAssignment, ProtocolError> {
-        decode_fragment_sink_assignment(sink, instance)
-    }
-}
-
-fn decode_fragment_sink_assignment(
+pub(crate) fn decode_fragment_sink_assignment(
     sink: &plan::DataSink,
     instance: &proto::InstanceParams,
 ) -> Result<FragmentSinkAssignment, ProtocolError> {
@@ -188,24 +175,23 @@ fn invalid_value(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendNativeFragmentSinkAssignmentDecoder, NativeFragmentSinkAssignmentDecoder};
+    use super::decode_fragment_sink_assignment;
     use novarocks_protocol::{novarocks as proto, plan};
 
     #[test]
     fn stream_destination_missing_id_preserves_error_text() {
-        let error = BackendNativeFragmentSinkAssignmentDecoder
-            .decode_sink_assignment(
-                &plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::DataStream(
-                        plan::DataStreamSink::default(),
-                    )),
-                },
-                &proto::InstanceParams {
-                    destinations: vec![proto::Destination::default()],
-                    ..Default::default()
-                },
-            )
-            .expect_err("destination id is required");
+        let error = decode_fragment_sink_assignment(
+            &plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(
+                    plan::DataStreamSink::default(),
+                )),
+            },
+            &proto::InstanceParams {
+                destinations: vec![proto::Destination::default()],
+                ..Default::default()
+            },
+        )
+        .expect_err("destination id is required");
         assert_eq!(
             error.to_string(),
             "native protocol error at instance_params.destinations[0].finst_id (missing field): native Destination requires finst_id"
@@ -214,21 +200,20 @@ mod tests {
 
     #[test]
     fn multicast_destination_missing_id_preserves_error_text() {
-        let error = BackendNativeFragmentSinkAssignmentDecoder
-            .decode_sink_assignment(
-                &plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::MultiCastDataStream(
-                        plan::MultiCastDataStreamSink {
-                            destinations: vec![plan::StreamDestinationList {
-                                destinations: vec![plan::StreamDestination::default()],
-                            }],
-                            ..Default::default()
-                        },
-                    )),
-                },
-                &proto::InstanceParams::default(),
-            )
-            .expect_err("stream destination id is required");
+        let error = decode_fragment_sink_assignment(
+            &plan::DataSink {
+                kind: Some(plan::data_sink::Kind::MultiCastDataStream(
+                    plan::MultiCastDataStreamSink {
+                        destinations: vec![plan::StreamDestinationList {
+                            destinations: vec![plan::StreamDestination::default()],
+                        }],
+                        ..Default::default()
+                    },
+                )),
+            },
+            &proto::InstanceParams::default(),
+        )
+        .expect_err("stream destination id is required");
         assert_eq!(
             error.to_string(),
             "native protocol error at plan_fragment.sink.multi_cast_data_stream.destinations[0].destinations[0].finst_id (missing field): native stream destination requires finst_id"

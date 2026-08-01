@@ -29,7 +29,7 @@ use novarocks_spi::connector::{
 use crate::proto::novarocks::{
     EnsureConnectorExecutionBindingRequest, RetireConnectorExecutionBindingRequest,
 };
-use crate::protocol::native::decode::decode_query_execution_id;
+use crate::protocol::decode_native_query_execution_id;
 use crate::query_execution::lifecycle::QueryExecutionId;
 
 const CONNECTOR_BINDING_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,7 +43,7 @@ pub(crate) fn decode_ensure_request(
             "connector execution binding request is missing execution_id",
         )
     })?;
-    let execution_id = decode_query_execution_id(execution_id).map_err(|error| {
+    let execution_id = decode_native_query_execution_id(execution_id).map_err(|error| {
         ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
     })?;
     let provider_id = ConnectorProviderId::parse(&request.provider_id)?;

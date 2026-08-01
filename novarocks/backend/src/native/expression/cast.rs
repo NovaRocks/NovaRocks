@@ -24,7 +24,7 @@ use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::FieldPath;
 use novarocks_protocol::{common, expr};
 
-use novarocks::protocol::native_fragment_assembly_port::NativeExpressionInputLayout;
+use super::NativeExpressionInputLayout;
 
 pub(crate) fn lower_cast(
     cast: &expr::CastExpr,

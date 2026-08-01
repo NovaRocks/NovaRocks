@@ -777,7 +777,10 @@ mod tests {
         )
     }
 
-    fn spec(contract: &RuntimeOrderContract, limit: u32) -> AggregateTopNRuntimeFilterProducerBinding {
+    fn spec(
+        contract: &RuntimeOrderContract,
+        limit: u32,
+    ) -> AggregateTopNRuntimeFilterProducerBinding {
         AggregateTopNRuntimeFilterProducerBinding {
             binding_id: 11,
             channel_id: 12,
@@ -833,7 +836,9 @@ mod tests {
         .expect("valid producer factory")
     }
 
-    fn bindings(spec: &AggregateTopNRuntimeFilterProducerBinding) -> Vec<AggregateTopNBoundaryBinding> {
+    fn bindings(
+        spec: &AggregateTopNRuntimeFilterProducerBinding,
+    ) -> Vec<AggregateTopNBoundaryBinding> {
         build_topn_boundary_bindings(std::slice::from_ref(spec)).expect("boundary bindings")
     }
 

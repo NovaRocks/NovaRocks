@@ -103,7 +103,9 @@ impl AggregateRuntimeFilterSpec {
             .iter()
             .any(|producer| producer.contribution_kinds.is_empty())
         {
-            return Err("runtime-filter aggregate producer requires contribution kinds".to_string());
+            return Err(
+                "runtime-filter aggregate producer requires contribution kinds".to_string(),
+            );
         }
         Ok(Self { topn_producers })
     }
@@ -123,7 +125,9 @@ impl AggregateTopNRuntimeFilterProducerBinding {
         completion_requirement: CompletionRequirement,
     ) -> Result<Self, String> {
         if contribution_kinds.is_empty() {
-            return Err("runtime-filter aggregate producer requires contribution kinds".to_string());
+            return Err(
+                "runtime-filter aggregate producer requires contribution kinds".to_string(),
+            );
         }
         Ok(Self {
             binding_id,

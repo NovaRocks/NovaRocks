@@ -699,9 +699,7 @@ fn decode_contract(
                         ));
                     }
                 };
-                keys.push(RuntimeOrderKey::new(
-                    data_type, direction, null_order,
-                ));
+                keys.push(RuntimeOrderKey::new(data_type, direction, null_order));
             }
             if keys[0].data_type() != expression_type {
                 return Err(super::NativeFragmentDecodeError::inconsistent(

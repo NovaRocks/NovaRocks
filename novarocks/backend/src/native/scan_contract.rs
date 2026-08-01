@@ -20,22 +20,16 @@
 use std::collections::BTreeMap;
 
 use novarocks::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind, ScanSourceContract};
-use novarocks::protocol::native_fragment_assembly_port::NativeScanSourceContractDecoder;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_protocol::plan;
 
-pub(crate) struct BackendNativeScanSourceContractDecoder;
-
-impl NativeScanSourceContractDecoder for BackendNativeScanSourceContractDecoder {
-    fn decode_scan_source_contracts(
-        &self,
-        root: &plan::DistributedNode,
-        path: FieldPath,
-    ) -> Result<BTreeMap<FragmentNodeId, ScanSourceContract>, ProtocolError> {
-        let mut assignments = BTreeMap::new();
-        visit(root, path, &mut assignments)?;
-        Ok(assignments)
-    }
+pub(crate) fn decode_scan_source_contracts(
+    root: &plan::DistributedNode,
+    path: FieldPath,
+) -> Result<BTreeMap<FragmentNodeId, ScanSourceContract>, ProtocolError> {
+    let mut assignments = BTreeMap::new();
+    visit(root, path, &mut assignments)?;
+    Ok(assignments)
 }
 
 fn visit(
@@ -113,7 +107,7 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendNativeScanSourceContractDecoder, NativeScanSourceContractDecoder};
+    use super::decode_scan_source_contracts;
     use novarocks::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
     use novarocks::protocol::FieldPath;
     use novarocks_protocol::plan;
@@ -140,9 +134,9 @@ mod tests {
             ..Default::default()
         };
 
-        let contracts = BackendNativeScanSourceContractDecoder
-            .decode_scan_source_contracts(&root, FieldPath::root("plan_fragment").field("root"))
-            .expect("decode scan contract");
+        let contracts =
+            decode_scan_source_contracts(&root, FieldPath::root("plan_fragment").field("root"))
+                .expect("decode scan contract");
 
         assert_eq!(
             contracts
@@ -166,9 +160,9 @@ mod tests {
             ..Default::default()
         };
 
-        let error = BackendNativeScanSourceContractDecoder
-            .decode_scan_source_contracts(&root, FieldPath::root("plan_fragment").field("root"))
-            .expect_err("missing source must fail");
+        let error =
+            decode_scan_source_contracts(&root, FieldPath::root("plan_fragment").field("root"))
+                .expect_err("missing source must fail");
 
         assert_eq!(
             error.to_string(),

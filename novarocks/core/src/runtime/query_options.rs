@@ -110,6 +110,10 @@ impl QueryOptions {
         self.batch_size
     }
 
+    pub const fn pipeline_dop(&self) -> Option<i32> {
+        self.pipeline_dop
+    }
+
     pub const fn query_timeout(&self) -> Option<i32> {
         self.query_timeout
     }
@@ -140,6 +144,26 @@ impl QueryOptions {
 
     pub const fn group_concat_max_len(&self) -> Option<i64> {
         self.group_concat_max_len
+    }
+
+    pub const fn runtime_filter_scan_wait_time_ms(&self) -> Option<i64> {
+        self.runtime_filter_scan_wait_time_ms
+    }
+
+    pub const fn runtime_filter_wait_timeout_ms(&self) -> Option<i32> {
+        self.runtime_filter_wait_timeout_ms
+    }
+
+    pub const fn enable_join_runtime_bitset_filter(&self) -> Option<bool> {
+        self.enable_join_runtime_bitset_filter
+    }
+
+    pub const fn enable_parquet_reader_page_index(&self) -> bool {
+        self.enable_parquet_reader_page_index
+    }
+
+    pub const fn cache(&self) -> &QueryCacheOptions {
+        &self.cache
     }
 
     pub fn spill(&self) -> Option<&SpillConfig> {

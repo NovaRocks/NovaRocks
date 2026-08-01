@@ -612,13 +612,13 @@ mod tests {
         WindowFunctionSpec, WindowType,
     };
     use crate::exec::node::join::{
-        JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
-        JoinRuntimeFilterProducerBinding,
+        JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution,
+        JoinRuntimeFilterProducerBinding, JoinType,
     };
     use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
     use crate::exec::node::runtime_filter::{
-        RuntimeFilterConsumerNode, RuntimeFilterConsumerBinding,
-        RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
+        RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode, RuntimeFilterExecutionContract,
+        RuntimeFilterExecutionReduction,
     };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};

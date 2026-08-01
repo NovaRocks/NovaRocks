@@ -360,6 +360,16 @@ fn metadata_budget_and_context(
     query_id: Option<QueryId>,
     query_options: &QueryOptions,
 ) -> Result<(ConnectorBatchBudget, ConnectorRequestContext), ConnectorError> {
+    metadata_budget_and_context_with_cancellation(
+        query_options,
+        Arc::new(IcebergMetadataQueryCancellation { query_id }),
+    )
+}
+
+fn metadata_budget_and_context_with_cancellation(
+    query_options: &QueryOptions,
+    cancellation: Arc<dyn ConnectorCancellation>,
+) -> Result<(ConnectorBatchBudget, ConnectorRequestContext), ConnectorError> {
     let rows = query_options
         .batch_size
         .and_then(|value| usize::try_from(value).ok())
@@ -373,20 +383,39 @@ fn metadata_budget_and_context(
     let (_, query_expire) = query_expire_durations(Some(query_options));
     let context = ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
-        Arc::new(IcebergMetadataQueryCancellation { query_id }),
+        cancellation,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )?;
     Ok((batch, context))
 }
 
-pub(crate) fn plan_native_iceberg_metadata_read_source(
+pub fn plan_native_iceberg_metadata_read_source(
     query_id: Option<QueryId>,
     node_id: i32,
     config: IcebergMetadataScanConfig,
     query_options: &QueryOptions,
 ) -> Result<Arc<dyn ScanSource>, ConnectorError> {
-    let (batch, context) = metadata_budget_and_context(query_id, query_options)?;
+    plan_native_iceberg_metadata_read_source_with_cancellation(
+        query_id,
+        node_id,
+        config,
+        query_options,
+        Arc::new(IcebergMetadataQueryCancellation { query_id }),
+    )
+}
+
+/// Build a native metadata scan source using Backend-supplied cancellation.
+/// The decoder retains no route to the query-context manager.
+pub fn plan_native_iceberg_metadata_read_source_with_cancellation(
+    query_id: Option<QueryId>,
+    node_id: i32,
+    config: IcebergMetadataScanConfig,
+    query_options: &QueryOptions,
+    cancellation: Arc<dyn ConnectorCancellation>,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let (batch, context) =
+        metadata_budget_and_context_with_cancellation(query_options, cancellation)?;
     let query_label = query_id
         .map(|query_id| query_id.to_string())
         .unwrap_or_else(|| "unidentified".to_string());

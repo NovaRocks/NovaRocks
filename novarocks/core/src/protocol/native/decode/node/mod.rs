@@ -52,18 +52,20 @@ use super::runtime_filter::{
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprArena;
 use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-use crate::exec::node::aggregate::{AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding};
+use crate::exec::node::aggregate::{
+    AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding,
+};
 use crate::exec::node::join::{JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::runtime_filter::{
-    RuntimeFilterConsumerNode, RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
+    RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode, RuntimeFilterExecutionContract,
     RuntimeFilterExecutionReduction,
 };
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
-use crate::protocol::native_fragment_assembly_port::{
+use crate::protocol::native::test_assembly::{
     NativeExpressionDecoder, NativeExpressionInputLayout, NativeOutputLayout,
     NativeOutputLayoutDecoder,
 };

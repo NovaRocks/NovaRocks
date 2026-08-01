@@ -43,20 +43,20 @@ model_id!(PlanFragmentId, u32);
 model_id!(PlanNodeId, i32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ComparatorDigest([u8; 32]);
+pub struct ComparatorDigest([u8; 32]);
 
 impl ComparatorDigest {
-    pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+    pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub(crate) const fn get(self) -> [u8; 32] {
+    pub const fn get(self) -> [u8; 32] {
         self.0
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RuntimeFilterLogicalDomain {
+pub enum RuntimeFilterLogicalDomain {
     Membership {
         value_type: DataType,
         null_semantics: NullSemantics,
@@ -83,14 +83,14 @@ pub enum NullOrder {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OrderKeyContract {
+pub struct OrderKeyContract {
     pub data_type: DataType,
     pub direction: SortDirection,
     pub null_order: NullOrder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OrderContract {
+pub struct OrderContract {
     pub keys: Vec<OrderKeyContract>,
     pub inclusive: bool,
     pub comparator_digest: ComparatorDigest,
@@ -112,27 +112,27 @@ pub(crate) enum RuntimeFilterLifecycle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct TopKSummaryRequirement(NonZeroU32);
+pub struct TopKSummaryRequirement(NonZeroU32);
 
 impl TopKSummaryRequirement {
-    pub(crate) fn try_new(k: u32) -> Option<Self> {
+    pub fn try_new(k: u32) -> Option<Self> {
         NonZeroU32::new(k).map(Self)
     }
 
-    pub(crate) const fn k(self) -> NonZeroU32 {
+    pub const fn k(self) -> NonZeroU32 {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ReductionRequirement {
+pub enum ReductionRequirement {
     SetUnion,
     TightenOrderedBound,
     MergeTopKSummary(TopKSummaryRequirement),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum CompletionFenceKind {
+pub enum CompletionFenceKind {
     CommittedDomainFrozen,
 }
 

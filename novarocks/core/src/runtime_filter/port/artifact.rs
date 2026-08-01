@@ -79,7 +79,7 @@ impl HashContractDigest {
         Self(bytes)
     }
 
-    pub(crate) const fn bytes(self) -> [u8; 32] {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 }
@@ -88,7 +88,7 @@ impl HashContractDigest {
 pub(crate) struct ConsumerProfileId([u8; 32]);
 
 impl ConsumerProfileId {
-    pub(crate) const fn bytes(self) -> [u8; 32] {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 
@@ -99,7 +99,7 @@ impl ConsumerProfileId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ArtifactSchemaDigest([u8; 32]);
+pub struct ArtifactSchemaDigest([u8; 32]);
 
 impl ArtifactSchemaDigest {
     pub(crate) const fn from_canonical_bytes(bytes: [u8; 32]) -> Self {
@@ -113,13 +113,13 @@ impl ArtifactSchemaDigest {
         Ok(ArtifactMembershipSchema::new(data_type, null_semantics)?.digest())
     }
 
-    pub(crate) const fn bytes(self) -> [u8; 32] {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ArtifactMembershipSchema {
+pub struct ArtifactMembershipSchema {
     data_type: DataType,
     null_semantics: NullSemantics,
     canonical_bytes: Arc<[u8]>,
@@ -127,7 +127,7 @@ pub(crate) struct ArtifactMembershipSchema {
 }
 
 impl ArtifactMembershipSchema {
-    pub(crate) fn new(
+    pub fn new(
         data_type: &DataType,
         null_semantics: NullSemantics,
     ) -> Result<Self, ArtifactContractError> {
@@ -148,7 +148,7 @@ impl ArtifactMembershipSchema {
         })
     }
 
-    pub(crate) fn view(
+    pub fn view(
         canonical: &[u8],
     ) -> Result<ArtifactMembershipSchemaView<'_>, ArtifactContractError> {
         const DOMAIN: &[u8] = b"novarocks.runtime-filter.artifact-schema";
@@ -206,19 +206,19 @@ impl ArtifactMembershipSchema {
         })
     }
 
-    pub(crate) const fn data_type(&self) -> &DataType {
+    pub const fn data_type(&self) -> &DataType {
         &self.data_type
     }
 
-    pub(crate) const fn null_semantics(&self) -> NullSemantics {
+    pub const fn null_semantics(&self) -> NullSemantics {
         self.null_semantics
     }
 
-    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+    pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
 
-    pub(crate) const fn digest(&self) -> ArtifactSchemaDigest {
+    pub const fn digest(&self) -> ArtifactSchemaDigest {
         self.digest
     }
 }
@@ -231,7 +231,7 @@ enum ArtifactMembershipTypeContract<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ArtifactMembershipSchemaView<'a> {
+pub struct ArtifactMembershipSchemaView<'a> {
     payload_tag: u8,
     type_contract: ArtifactMembershipTypeContract<'a>,
     null_semantics: NullSemantics,
@@ -259,11 +259,11 @@ impl<'a> ArtifactMembershipSchemaView<'a> {
         }
     }
 
-    pub(crate) const fn null_semantics(self) -> NullSemantics {
+    pub const fn null_semantics(self) -> NullSemantics {
         self.null_semantics
     }
 
-    pub(crate) const fn digest(self) -> ArtifactSchemaDigest {
+    pub const fn digest(self) -> ArtifactSchemaDigest {
         self.digest
     }
 }
@@ -360,7 +360,7 @@ pub(crate) struct ConsumerArtifactProfile {
 }
 
 impl ConsumerArtifactProfile {
-    pub(crate) fn new(
+    pub fn new(
         accepted_kinds: BTreeSet<ArtifactKind>,
         bloom_hash_contract: Option<HashContractDigest>,
     ) -> Result<Self, ArtifactContractError> {
@@ -450,7 +450,7 @@ impl ConsumerArtifactProfile {
         self.order_contract_digest
     }
 
-    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+    pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
 
@@ -466,7 +466,7 @@ impl ConsumerArtifactProfile {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArtifactContractError {
+pub enum ArtifactContractError {
     EmptyProfile,
     BloomHashContractMismatch,
     RangeOrderContractMismatch,
@@ -501,7 +501,7 @@ impl Error for ArtifactContractError {}
 pub(crate) struct ArtifactSemanticDigest([u8; 32]);
 
 impl ArtifactSemanticDigest {
-    pub(crate) const fn bytes(self) -> [u8; 32] {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 }
@@ -582,7 +582,7 @@ impl RangeArtifactResidentLayout {
 }
 
 impl RangeArtifactData {
-    pub(crate) fn new(
+    pub fn new(
         contract: Arc<RuntimeOrderContract>,
         bound: OrderedTuple,
         logical_version: LogicalVersion,
@@ -793,7 +793,7 @@ impl ResidentMembershipIndex {
         }
     }
 
-    pub(crate) fn view(&self) -> ResidentMembershipIndexView<'_> {
+    pub fn view(&self) -> ResidentMembershipIndexView<'_> {
         match &self.layout {
             ResidentMembershipIndexLayout::EmptyDomain => ResidentMembershipIndexView::EmptyDomain,
             ResidentMembershipIndexLayout::Fixed {
@@ -1195,7 +1195,7 @@ impl PhysicalArtifact {
     pub(crate) const fn contains_null(&self) -> bool {
         self.contains_null
     }
-    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+    pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
     pub(crate) const fn canonical_digest(&self) -> [u8; 32] {
@@ -1328,7 +1328,7 @@ impl ArtifactBundle {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
-    pub(crate) fn new(
+    pub fn new(
         channel_id: ChannelId,
         version: LogicalVersion,
         profile: &ConsumerArtifactProfile,

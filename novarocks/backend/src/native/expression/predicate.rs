@@ -26,7 +26,7 @@ use novarocks::protocol::FieldPath;
 use novarocks_protocol::expr;
 use novarocks_types::comparison_common_type;
 
-use novarocks::protocol::native_fragment_assembly_port::NativeExpressionInputLayout;
+use super::NativeExpressionInputLayout;
 
 pub(crate) fn lower_is_null(
     is_null: &expr::IsNullExpr,

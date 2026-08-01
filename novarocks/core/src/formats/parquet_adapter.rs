@@ -52,7 +52,7 @@ use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::scan::RuntimeFilterContext;
 use novarocks_fs::DataCacheContext;
 pub use variant_pruning::VariantPathPruningPredicate;
-pub(crate) use variant_read::{
+pub use variant_read::{
     collapse_variant_struct_to_largebinary, convert_variant_columns, is_variant_struct_data_type,
     materialize_variant_path_columns,
 };

@@ -37,7 +37,9 @@ pub const STARROCKS_WIRE_INTERNAL_CATALOG_NAME: &str = "default_catalog";
 pub(crate) use object_store_profile::ObjectStoreProfile;
 pub(crate) use scan::build_native_object_store_profile_from_properties;
 pub use scan::plan_compat_starrocks_read_source;
-pub(crate) use scan::plan_native_starrocks_read_source;
 pub use scan::{
     LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange, StarRocksSchemaColumnHint,
+};
+pub use scan::{
+    plan_native_starrocks_read_source, plan_native_starrocks_read_source_with_cancellation,
 };

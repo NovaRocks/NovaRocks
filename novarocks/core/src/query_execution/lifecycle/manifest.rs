@@ -285,7 +285,8 @@ impl RuntimeFilterContribution {
         Ok(digest.finalize().into())
     }
 
-    #[cfg(feature = "query-execution-contract-test-support")]
+    /// Construct an empty lifecycle contribution for an owner-level contract
+    /// fixture. This contains no fragment DTO decoding or runtime installation.
     pub fn empty_for_contract_test(
         execution_id: QueryExecutionId,
         participant_id: u32,

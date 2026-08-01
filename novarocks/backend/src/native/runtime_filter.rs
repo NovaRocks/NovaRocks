@@ -20,22 +20,10 @@
 use std::collections::BTreeSet;
 
 use novarocks::exec::fragment::program::{RuntimeFilterContract, RuntimeFilterId};
-use novarocks::protocol::native_fragment_assembly_port::NativeRuntimeFilterContractDecoder;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_protocol::plan;
 
-pub(crate) struct BackendNativeRuntimeFilterContractDecoder;
-
-impl NativeRuntimeFilterContractDecoder for BackendNativeRuntimeFilterContractDecoder {
-    fn decode_runtime_filter_contract(
-        &self,
-        fragment: &plan::PlanFragment,
-    ) -> Result<RuntimeFilterContract, ProtocolError> {
-        decode_runtime_filter_contract(fragment)
-    }
-}
-
-fn decode_runtime_filter_contract(
+pub(crate) fn decode_runtime_filter_contract(
     fragment: &plan::PlanFragment,
 ) -> Result<RuntimeFilterContract, ProtocolError> {
     let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
@@ -83,13 +71,12 @@ fn decode_runtime_filter_contract(
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendNativeRuntimeFilterContractDecoder, NativeRuntimeFilterContractDecoder};
+    use super::decode_runtime_filter_contract;
     use novarocks_protocol::plan;
 
     #[test]
     fn missing_runtime_filter_binding_table_preserves_error_text() {
-        let error = BackendNativeRuntimeFilterContractDecoder
-            .decode_runtime_filter_contract(&plan::PlanFragment::default())
+        let error = decode_runtime_filter_contract(&plan::PlanFragment::default())
             .expect_err("binding table is required");
         assert_eq!(
             error.to_string(),

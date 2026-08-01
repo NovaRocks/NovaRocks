@@ -60,7 +60,7 @@ pub struct StarRocksScanRange {
 }
 
 impl StarRocksScanRange {
-    pub(crate) fn new(tablet_id: i64, partition_id: i64, version: i64) -> Self {
+    pub fn new(tablet_id: i64, partition_id: i64, version: i64) -> Self {
         Self {
             tablet_id,
             partition_id: Some(partition_id),
@@ -77,7 +77,7 @@ pub struct StarRocksSchemaColumnHint {
 }
 
 impl StarRocksSchemaColumnHint {
-    pub(crate) fn new(name: String, unique_id: i32, default_value: Option<String>) -> Self {
+    pub fn new(name: String, unique_id: i32, default_value: Option<String>) -> Self {
         Self {
             name,
             unique_id,
@@ -149,7 +149,7 @@ impl std::fmt::Debug for DeferredLakeScanResolution {
 }
 
 impl DeferredLakeScanResolution {
-    pub(crate) fn new(
+    pub fn new(
         query_id: Option<crate::runtime::query_context::QueryId>,
         table: LakeTableIdentity,
         tablets: Vec<LakeScanTabletRef>,
@@ -167,7 +167,7 @@ impl DeferredLakeScanResolution {
 }
 
 impl LakeScanSchemaMeta {
-    pub(crate) fn with_embedded_schema(
+    pub fn with_embedded_schema(
         db_id: i64,
         table_id: i64,
         schema_id: i64,
@@ -430,6 +430,16 @@ fn starrocks_read_budget_and_context(
     query_id: Option<QueryId>,
     query_options: &QueryOptions,
 ) -> Result<(ConnectorBatchBudget, ConnectorRequestContext), ConnectorError> {
+    starrocks_read_budget_and_context_with_cancellation(
+        query_options,
+        Arc::new(StarRocksQueryCancellation { query_id }),
+    )
+}
+
+fn starrocks_read_budget_and_context_with_cancellation(
+    query_options: &QueryOptions,
+    cancellation: Arc<dyn ConnectorCancellation>,
+) -> Result<(ConnectorBatchBudget, ConnectorRequestContext), ConnectorError> {
     let rows = query_options
         .batch_size
         .and_then(|value| usize::try_from(value).ok())
@@ -443,7 +453,7 @@ fn starrocks_read_budget_and_context(
     let (_, query_expire) = query_expire_durations(Some(query_options));
     let context = ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
-        Arc::new(StarRocksQueryCancellation { query_id }),
+        cancellation,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )?;
@@ -465,13 +475,32 @@ pub fn plan_compat_starrocks_read_source(
     )
 }
 
-pub(crate) fn plan_native_starrocks_read_source(
+pub fn plan_native_starrocks_read_source(
     query_id: Option<QueryId>,
     node_id: i32,
     config: StarRocksScanConfig,
     query_options: &QueryOptions,
 ) -> Result<Arc<dyn ScanSource>, ConnectorError> {
-    let (batch, context) = starrocks_read_budget_and_context(query_id, query_options)?;
+    plan_native_starrocks_read_source_with_cancellation(
+        query_id,
+        node_id,
+        config,
+        query_options,
+        Arc::new(StarRocksQueryCancellation { query_id }),
+    )
+}
+
+/// Build a native scan source using the cancellation capability supplied by
+/// the Backend decoder. The helper never consults query runtime state.
+pub fn plan_native_starrocks_read_source_with_cancellation(
+    query_id: Option<QueryId>,
+    node_id: i32,
+    config: StarRocksScanConfig,
+    query_options: &QueryOptions,
+    cancellation: Arc<dyn ConnectorCancellation>,
+) -> Result<Arc<dyn ScanSource>, ConnectorError> {
+    let (batch, context) =
+        starrocks_read_budget_and_context_with_cancellation(query_options, cancellation)?;
     let instance_query_id = query_id
         .map(|query_id| query_id.to_string())
         .unwrap_or_else(|| "unidentified".to_string());

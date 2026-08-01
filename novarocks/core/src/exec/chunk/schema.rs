@@ -77,8 +77,7 @@ impl ChunkFieldSchema {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn logical_type(&self) -> Option<LogicalType> {
+    pub fn logical_type(&self) -> Option<LogicalType> {
         self.logical_type
     }
 
@@ -300,7 +299,7 @@ impl ChunkSchema {
         Self::try_new_with_schema_metadata(slots, HashMap::new())
     }
 
-    pub(crate) fn try_new_with_schema_metadata(
+    pub fn try_new_with_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
         metadata: HashMap<String, String>,
     ) -> Result<Self, String> {

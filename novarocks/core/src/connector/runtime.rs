@@ -44,7 +44,11 @@ pub(crate) struct ConnectorBatchReaderIter {
     finished: bool,
 }
 
-pub(crate) trait ConnectorBatchTransform: Send + Sync {
+/// Backend-supplied, execution-domain batch projection applied after a
+/// connector reader yields a batch and before Core materializes it as a
+/// `Chunk`. It intentionally exposes neither connector registry nor query
+/// runtime state.
+pub trait ConnectorBatchTransform: Send + Sync {
     fn transform(
         &self,
         batch: arrow::record_batch::RecordBatch,
@@ -773,7 +777,7 @@ impl ConnectorReadScanSource {
         )
     }
 
-    pub(crate) fn new_scheduled_execution_with_batch_transform(
+    pub fn new_scheduled_execution_with_batch_transform(
         binding: Arc<ConnectorExecutionBinding>,
         scheduled: Vec<ConnectorScheduledSplit>,
         request: ConnectorOpenReaderRequest,

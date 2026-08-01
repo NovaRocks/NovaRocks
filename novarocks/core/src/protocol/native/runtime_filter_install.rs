@@ -106,13 +106,6 @@ fn inconsistent(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
     codec_error(path, ProtocolErrorKind::InconsistentFields, detail)
 }
 
-fn native_decode_error(error: super::decode::NativeFragmentDecodeError) -> ProtocolError {
-    error
-        .protocol()
-        .cloned()
-        .unwrap_or_else(|| invalid(FieldPath::root("runtime_filter_install"), error.to_string()))
-}
-
 fn reject_zero(raw: u64, path: FieldPath, identity: &'static str) -> CodecResult<()> {
     if raw == 0 {
         Err(invalid(path, format!("{identity} must be nonzero")))
@@ -599,8 +592,7 @@ fn decode_core_channel(
         logical.contract.as_ref(),
         wire.reduction.as_ref(),
         path.clone(),
-    )
-    .map_err(native_decode_error)?;
+    )?;
     let lifecycle = match filter::RuntimeFilterLifecycle::try_from(wire.lifecycle) {
         Ok(filter::RuntimeFilterLifecycle::CompleteOnce) => RuntimeFilterLifecycle::CompleteOnce,
         Ok(filter::RuntimeFilterLifecycle::MonotonicUpdates) => {
@@ -628,8 +620,7 @@ fn decode_core_channel(
             .clone()
             .field("allowed_contribution_kinds")
             .index(index);
-        let contribution = decode_runtime_filter_contribution_kind(raw, item_path.clone())
-            .map_err(native_decode_error)?;
+        let contribution = decode_runtime_filter_contribution_kind(raw, item_path.clone())?;
         if !contributions.insert(contribution) {
             return Err(duplicate(item_path, "duplicate contribution kind"));
         }
@@ -643,8 +634,7 @@ fn decode_core_channel(
     let completion = decode_runtime_filter_completion(
         wire.completion_requirement,
         path.clone().field("completion_requirement"),
-    )
-    .map_err(native_decode_error)?;
+    )?;
     let policy_wire = wire
         .policy
         .as_ref()
@@ -1040,13 +1030,11 @@ fn decode_consumer(
     let activation = decode_runtime_filter_activation(
         wire.activation.as_ref(),
         path.clone().field("activation"),
-    )
-    .map_err(native_decode_error)?;
+    )?;
     let mut capabilities = BTreeSet::new();
     for (index, raw) in wire.capabilities.iter().copied().enumerate() {
         let item_path = path.clone().field("capabilities").index(index);
-        let capability = decode_runtime_filter_capability(raw, item_path.clone())
-            .map_err(native_decode_error)?;
+        let capability = decode_runtime_filter_capability(raw, item_path.clone())?;
         if !capabilities.insert(capability) {
             return Err(duplicate(item_path, "duplicate consumer capability"));
         }

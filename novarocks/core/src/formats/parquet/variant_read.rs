@@ -49,7 +49,7 @@ fn is_binary_like(dt: &DataType) -> bool {
 /// True when `data_type` is a parquet variant struct layout we can collapse:
 /// a `metadata` binary child plus at least one of `value` (binary) /
 /// `typed_value` (shredded subtree). Any other child name disqualifies.
-pub(crate) fn is_variant_struct_data_type(data_type: &DataType) -> bool {
+pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {
     let DataType::Struct(fields) = data_type else {
         return false;
     };
@@ -98,7 +98,7 @@ fn binary_value_at_any(arr: &ArrayRef, row: usize) -> Result<Option<&[u8]>, Stri
 /// layouts produce identical engine-visible rows. Corrupt rows (missing
 /// metadata or value bytes on a non-null row) are a hard error — never a
 /// silent variant-null.
-pub(crate) fn collapse_variant_struct_to_largebinary(
+pub fn collapse_variant_struct_to_largebinary(
     source_array: &ArrayRef,
     column_name: &str,
 ) -> Result<ArrayRef, String> {
@@ -173,7 +173,7 @@ pub(crate) fn collapse_variant_struct_to_largebinary(
 /// Replace every VARIANT-typed slot whose column arrived as a parquet
 /// variant struct with the engine-internal LargeBinary form. Non-variant
 /// slots and already-LargeBinary variant slots pass through untouched.
-pub(crate) fn convert_variant_columns(
+pub fn convert_variant_columns(
     slot_kinds: &[ParquetSlotKind],
     batch: RecordBatch,
 ) -> Result<RecordBatch, String> {
@@ -445,7 +445,7 @@ fn materialize_single_variant_path(
 /// plus synthetic `VariantPathSpec::output_slot_id` slots. Hidden source read
 /// slots are omitted unless the caller includes them explicitly in
 /// `output_slot_ids`.
-pub(crate) fn materialize_variant_path_columns(
+pub fn materialize_variant_path_columns(
     batch: RecordBatch,
     read_slot_ids: &[SlotId],
     output_slot_ids: &[SlotId],

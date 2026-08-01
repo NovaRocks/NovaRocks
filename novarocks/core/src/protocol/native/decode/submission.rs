@@ -29,11 +29,11 @@ use crate::exec::fragment::program::{
 use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
-use crate::protocol::native_fragment_assembly_port::{
+use crate::protocol::native::test_assembly::{
     NativeExchangeContractDecoder, NativeExpressionDecoder, NativeFragmentEnvelopeDecoder,
     NativeFragmentInstanceInput, NativeFragmentSinkAssignmentDecoder,
-    NativeFragmentSubmissionValidator, NativeOutputLayoutDecoder,
-    RuntimeFilterExecutionContractDecoder, NativeScanSourceContractDecoder,
+    NativeFragmentSubmissionValidator, NativeOutputLayoutDecoder, NativeScanSourceContractDecoder,
+    RuntimeFilterExecutionContractDecoder,
 };
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};

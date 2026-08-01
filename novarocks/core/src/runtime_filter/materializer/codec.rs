@@ -1630,9 +1630,7 @@ fn decode_order_contract(
             2 => NullOrder::Last,
             _ => return Err(ArtifactCodecError::NonCanonicalPayload),
         };
-        keys.push(RuntimeOrderKey::new(
-            data_type, direction, null_order,
-        ));
+        keys.push(RuntimeOrderKey::new(data_type, direction, null_order));
     }
     let comparator_digest = ComparatorDigest::new(reader.read_array::<32>()?);
     if !reader.is_empty() {

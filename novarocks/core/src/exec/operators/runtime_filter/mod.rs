@@ -1083,9 +1083,7 @@ fn join_profile() -> Result<ConsumerArtifactProfile, String> {
     .map_err(|error| format!("invalid native Join runtime-filter profile: {error:?}"))
 }
 
-fn validate_unique_consumer_bindings(
-    specs: &[RuntimeFilterConsumerBinding],
-) -> Result<(), String> {
+fn validate_unique_consumer_bindings(specs: &[RuntimeFilterConsumerBinding]) -> Result<(), String> {
     let mut bindings = BTreeSet::new();
     for spec in specs {
         if !bindings.insert(spec.binding_id) {
@@ -1586,7 +1584,8 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::runtime_filter::{
-        RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
+        RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
+        RuntimeFilterExecutionReduction,
     };
     use crate::exec::operators::runtime_filter::tests_support::{
         chunk, membership_bundle, membership_bundle_with_version,
@@ -1777,10 +1776,7 @@ mod tests {
 
     fn live_fixture(
         outcomes: impl IntoIterator<Item = LivePollOutcome>,
-    ) -> (
-        RuntimeFilterConsumerSet,
-        Arc<ScriptedLiveSubscription>,
-    ) {
+    ) -> (RuntimeFilterConsumerSet, Arc<ScriptedLiveSubscription>) {
         let mut arena = ExprArena::default();
         let spec = live_spec(&mut arena);
         let subscription = Arc::new(ScriptedLiveSubscription::new(outcomes));
@@ -2128,7 +2124,7 @@ mod tests {
     fn native_join_loopback_build_probe_applies_membership_artifact() {
         use crate::exec::chunk::{Chunk, ChunkSchema};
         use crate::exec::node::join::{
-            JoinDistributionMode, JoinType, JoinRuntimeFilterProducerBinding,
+            JoinDistributionMode, JoinRuntimeFilterProducerBinding, JoinType,
         };
         use crate::exec::operators::hashjoin::HashJoinBuildSinkFactory;
         use crate::exec::operators::hashjoin::build_state::JoinBuildSinkState;
@@ -2393,10 +2389,9 @@ mod tests {
     fn native_consumer_rejects_duplicate_binding_before_subscribe() {
         let mut arena = ExprArena::default();
         let spec = consumer_spec(&mut arena);
-        let error =
-            RuntimeFilterConsumerSet::from_plan(&[spec.clone(), spec], Arc::new(arena))
-                .err()
-                .expect("duplicate binding must fail");
+        let error = RuntimeFilterConsumerSet::from_plan(&[spec.clone(), spec], Arc::new(arena))
+            .err()
+            .expect("duplicate binding must fail");
         assert!(error.contains("duplicate"));
     }
 
@@ -2729,7 +2724,8 @@ mod native_ordered_live_consumer_tests {
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::runtime_filter::{
-        RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
+        RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
+        RuntimeFilterExecutionReduction,
     };
     use crate::runtime::runtime_state::RuntimeState;
     use crate::runtime_filter::exec::ordered_range_predicate::tests_support::{bundle, contract};
@@ -3158,7 +3154,8 @@ pub(crate) mod tests_support {
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::runtime_filter::{
-        RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
+        RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
+        RuntimeFilterExecutionReduction,
     };
     use crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet;
     use crate::runtime_filter::materializer::codec::{

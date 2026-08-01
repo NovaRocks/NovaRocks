@@ -22,10 +22,16 @@ use std::sync::Arc;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 pub use crate::runtime_filter::model::contract::{
-    ArtifactCapability, CompletionRequirement, ConsumerActivation, ContributionKind,
-    LateApplyGranularity, NullOrder, SortDirection,
+    ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
+    ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder, NullSemantics,
+    OrderContract, OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain,
+    SortDirection, TopKSummaryRequirement,
 };
-pub use crate::runtime_filter::port::ordered_bound::RuntimeOrderKey;
+pub use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+pub use crate::runtime_filter::port::ordered_bound::{
+    RuntimeOrderContract, RuntimeOrderKey, comparator_digest_for_plan,
+};
+pub use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterExecutionContract {
@@ -140,9 +146,10 @@ impl RuntimeFilterConsumerBinding {
         reduction: RuntimeFilterExecutionReduction,
     ) -> Result<Self, String> {
         let expected_capabilities = match &contract {
-            RuntimeFilterExecutionContract::Membership { .. } => {
-                BTreeSet::from([ArtifactCapability::Membership, ArtifactCapability::EmptyDomain])
-            }
+            RuntimeFilterExecutionContract::Membership { .. } => BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
             RuntimeFilterExecutionContract::Ordered { .. } => {
                 BTreeSet::from([ArtifactCapability::OrderedRange])
             }
@@ -220,30 +227,31 @@ mod tests {
         assert_eq!(producer.contract, consumer.contract);
         assert_eq!(producer.reduction, consumer.reduction);
 
-        let aggregate_producer = crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding {
-            binding_id: 5,
-            channel_id: 6,
-            group_key_expr_id: expr_id,
-            group_key_ordinal: 0,
-            limit: std::num::NonZeroU32::new(7).expect("nonzero limit"),
-            contribution_kinds: BTreeSet::from([
-                ContributionKind::OrderedBoundUpdate,
-                ContributionKind::ProducerClosed,
-            ]),
-            completion_requirement: CompletionRequirement::ProducerClosed,
-            contract: RuntimeFilterExecutionContract::Ordered {
-                keys: Arc::from([
-                    crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::new(
-                        DataType::Int64,
-                        crate::runtime_filter::model::contract::SortDirection::Ascending,
-                        crate::runtime_filter::model::contract::NullOrder::Last,
-                    ),
+        let aggregate_producer =
+            crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding {
+                binding_id: 5,
+                channel_id: 6,
+                group_key_expr_id: expr_id,
+                group_key_ordinal: 0,
+                limit: std::num::NonZeroU32::new(7).expect("nonzero limit"),
+                contribution_kinds: BTreeSet::from([
+                    ContributionKind::OrderedBoundUpdate,
+                    ContributionKind::ProducerClosed,
                 ]),
-                comparator_digest: [3; 32],
-                order_contract_digest: [4; 32],
-            },
-            reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
-        };
+                completion_requirement: CompletionRequirement::ProducerClosed,
+                contract: RuntimeFilterExecutionContract::Ordered {
+                    keys: Arc::from([
+                        crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::new(
+                            DataType::Int64,
+                            crate::runtime_filter::model::contract::SortDirection::Ascending,
+                            crate::runtime_filter::model::contract::NullOrder::Last,
+                        ),
+                    ]),
+                    comparator_digest: [3; 32],
+                    order_contract_digest: [4; 32],
+                },
+                reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            };
         assert_eq!(aggregate_producer.group_key_expr_id, expr_id);
         assert_eq!(aggregate_producer.limit.get(), 7);
         assert_eq!(

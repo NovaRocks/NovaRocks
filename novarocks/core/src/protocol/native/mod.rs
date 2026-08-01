@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) mod decode;
 pub(crate) mod encode;
 pub(crate) mod query_options_contract;
 pub(crate) mod runtime_filter_contract_codec;
 mod runtime_filter_install;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub(crate) mod test_assembly;
 pub(crate) mod type_encode;
 pub(crate) mod type_mapping;
 

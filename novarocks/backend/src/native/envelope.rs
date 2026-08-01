@@ -17,36 +17,29 @@
 
 //! Backend-owned native fragment envelope validation.
 
-use novarocks::protocol::native_fragment_assembly_port::NativeFragmentEnvelopeDecoder;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_protocol::plan;
 
-pub(crate) struct BackendNativeFragmentEnvelopeDecoder;
+pub(crate) fn require_root(
+    fragment: &plan::PlanFragment,
+) -> Result<&plan::DistributedNode, ProtocolError> {
+    fragment.root.as_ref().ok_or_else(|| {
+        error(
+            FieldPath::root("plan_fragment").field("root"),
+            "native PlanFragment requires root",
+        )
+    })
+}
 
-impl NativeFragmentEnvelopeDecoder for BackendNativeFragmentEnvelopeDecoder {
-    fn require_root<'a>(
-        &self,
-        fragment: &'a plan::PlanFragment,
-    ) -> Result<&'a plan::DistributedNode, ProtocolError> {
-        fragment.root.as_ref().ok_or_else(|| {
-            error(
-                FieldPath::root("plan_fragment").field("root"),
-                "native PlanFragment requires root",
-            )
-        })
-    }
-
-    fn require_sink<'a>(
-        &self,
-        fragment: &'a plan::PlanFragment,
-    ) -> Result<&'a plan::DataSink, ProtocolError> {
-        fragment.sink.as_ref().ok_or_else(|| {
-            error(
-                FieldPath::root("plan_fragment").field("sink"),
-                "native PlanFragment requires sink",
-            )
-        })
-    }
+pub(crate) fn require_sink(
+    fragment: &plan::PlanFragment,
+) -> Result<&plan::DataSink, ProtocolError> {
+    fragment.sink.as_ref().ok_or_else(|| {
+        error(
+            FieldPath::root("plan_fragment").field("sink"),
+            "native PlanFragment requires sink",
+        )
+    })
 }
 
 fn error(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
@@ -60,14 +53,12 @@ fn error(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendNativeFragmentEnvelopeDecoder, NativeFragmentEnvelopeDecoder};
+    use super::{require_root, require_sink};
     use novarocks_protocol::plan;
 
     #[test]
     fn preserves_missing_root_error() {
-        let error = BackendNativeFragmentEnvelopeDecoder
-            .require_root(&plan::PlanFragment::default())
-            .expect_err("root is required");
+        let error = require_root(&plan::PlanFragment::default()).expect_err("root is required");
         assert_eq!(
             error.to_string(),
             "native protocol error at plan_fragment.root (missing field): native PlanFragment requires root"
@@ -76,9 +67,7 @@ mod tests {
 
     #[test]
     fn preserves_missing_sink_error() {
-        let error = BackendNativeFragmentEnvelopeDecoder
-            .require_sink(&plan::PlanFragment::default())
-            .expect_err("sink is required");
+        let error = require_sink(&plan::PlanFragment::default()).expect_err("sink is required");
         assert_eq!(
             error.to_string(),
             "native protocol error at plan_fragment.sink (missing field): native PlanFragment requires sink"

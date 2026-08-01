@@ -1203,12 +1203,11 @@ mod tests {
             ));
         let arena = Arc::new(arena);
         let blocking_consumers =
-            crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet::
-                from_bound_for_test(
-                    vec![blocking_spec],
-                    Arc::clone(&arena),
-                    vec![blocking_subscription],
-                );
+            crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet::from_bound_for_test(
+                vec![blocking_spec],
+                Arc::clone(&arena),
+                vec![blocking_subscription],
+            );
         blocking_consumers
             .acquire_configured()
             .expect("acquire empty-domain blocking filter");

@@ -20,25 +20,12 @@
 use std::collections::BTreeMap;
 
 use novarocks::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
-use novarocks::protocol::native_fragment_assembly_port::NativeExchangeContractDecoder;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_protocol::plan;
 
 use super::layout::chunk_schema_from_output_columns;
 
-pub(crate) struct BackendNativeExchangeContractDecoder;
-
-impl NativeExchangeContractDecoder for BackendNativeExchangeContractDecoder {
-    fn decode_exchange_contracts(
-        &self,
-        root: &plan::DistributedNode,
-        path: FieldPath,
-    ) -> Result<BTreeMap<FragmentNodeId, ExchangeInputContract>, ProtocolError> {
-        decode_exchange_contracts(root, path)
-    }
-}
-
-fn decode_exchange_contracts(
+pub(crate) fn decode_exchange_contracts(
     root: &plan::DistributedNode,
     path: FieldPath,
 ) -> Result<BTreeMap<FragmentNodeId, ExchangeInputContract>, ProtocolError> {
@@ -87,7 +74,7 @@ fn decode_exchange_contracts(
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendNativeExchangeContractDecoder, NativeExchangeContractDecoder};
+    use super::decode_exchange_contracts;
     use novarocks::protocol::FieldPath;
     use novarocks_protocol::{common, plan};
 
@@ -126,9 +113,9 @@ mod tests {
     fn decodes_exchange_schema_without_core_decoder() {
         let root = exchange_node(7, vec![int_column(3, "id")]);
 
-        let contracts = BackendNativeExchangeContractDecoder
-            .decode_exchange_contracts(&root, FieldPath::root("plan_fragment").field("root"))
-            .expect("decode exchange contract");
+        let contracts =
+            decode_exchange_contracts(&root, FieldPath::root("plan_fragment").field("root"))
+                .expect("decode exchange contract");
 
         let schema = contracts
             .get(&novarocks::exec::fragment::program::FragmentNodeId::new(7))
@@ -153,9 +140,9 @@ mod tests {
             }],
         );
 
-        let error = BackendNativeExchangeContractDecoder
-            .decode_exchange_contracts(&root, FieldPath::root("plan_fragment").field("root"))
-            .expect_err("missing output type must fail");
+        let error =
+            decode_exchange_contracts(&root, FieldPath::root("plan_fragment").field("root"))
+                .expect_err("missing output type must fail");
 
         assert_eq!(
             error.to_string(),

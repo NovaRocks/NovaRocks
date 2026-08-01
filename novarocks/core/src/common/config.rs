@@ -53,7 +53,9 @@ pub(crate) fn debug_emit_grpc_fragment_marker() -> bool {
         || sql_test_fragment_failure_harness_enabled()
 }
 
-pub(crate) fn debug_emit_connector_reader_marker() -> bool {
+/// Returns whether execution should emit connector-reader evidence markers.
+/// Backend native plan decoding uses this without accessing runtime state.
+pub fn debug_emit_connector_reader_marker() -> bool {
     novarocks_app_config()
         .ok()
         .map(|c| c.debug.emit_connector_reader_marker())

@@ -19,10 +19,6 @@
 
 use arrow::datatypes::DataType;
 
-use novarocks::protocol::native_fragment_assembly_port::{
-    NativeExpressionDecoder, NativeExpressionInputLayout,
-};
-
 use self::error::NativeExpressionDecodeError;
 use super::type_decode::{decode_field_type, decode_type};
 use novarocks::common::ids::SlotId;
@@ -44,6 +40,43 @@ mod nested;
 mod predicate;
 mod unary;
 
+/// Immutable input-slot layout used solely by Backend native expression
+/// decoding. It carries no runtime or connector state.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NativeExpressionInputLayout {
+    slots: Vec<SlotId>,
+}
+
+impl NativeExpressionInputLayout {
+    pub(crate) fn from_slot_ids(slots: impl IntoIterator<Item = SlotId>) -> Self {
+        let mut layout = Self::default();
+        for slot in slots {
+            if !layout.slots.contains(&slot) {
+                layout.slots.push(slot);
+            }
+        }
+        layout
+    }
+
+    pub(crate) fn resolve_column_id(
+        &self,
+        column_id: u32,
+        path: FieldPath,
+    ) -> Result<SlotId, novarocks::protocol::ProtocolError> {
+        let slot = SlotId::new(column_id);
+        if self.slots.contains(&slot) {
+            Ok(slot)
+        } else {
+            Err(novarocks::protocol::ProtocolError::new(
+                novarocks::protocol::ProtocolFamily::Native,
+                path.field("column_id"),
+                novarocks::protocol::ProtocolErrorKind::InvalidValue,
+                format!("ColumnRef column_id={column_id} not found in input layout"),
+            ))
+        }
+    }
+}
+
 pub(crate) use min_max::extract_min_max_predicates;
 
 #[allow(dead_code)]
@@ -55,7 +88,7 @@ pub(crate) fn decode_expr(
     decode_expr_at(e, FieldPath::root("expr"), arena, input_layout)
 }
 
-pub(super) fn decode_expr_at(
+pub(crate) fn decode_expr_at(
     e: &expr::Expr,
     path: FieldPath,
     arena: &mut ExprArena,
@@ -884,22 +917,5 @@ pub(crate) mod tests {
             let err = decode_expr(&expr, &mut arena, &layout).unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
-    }
-}
-
-/// Backend concrete expression decoder used by the native fragment assembler.
-#[derive(Default)]
-pub(crate) struct BackendNativeExpressionDecoder;
-
-impl NativeExpressionDecoder for BackendNativeExpressionDecoder {
-    fn decode_expression(
-        &self,
-        expression: &expr::Expr,
-        path: FieldPath,
-        arena: &mut ExprArena,
-        input: &NativeExpressionInputLayout,
-    ) -> Result<ExprId, novarocks::protocol::ProtocolError> {
-        decode_expr_at(expression, path, arena, input)
-            .map_err(NativeExpressionDecodeError::into_protocol)
     }
 }

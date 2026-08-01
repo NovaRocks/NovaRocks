@@ -201,7 +201,7 @@ mod tests {
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
     use crate::exec::expr::ExprArena;
-    use crate::protocol::native_fragment_assembly_port::{
+    use crate::protocol::native::test_assembly::{
         NativeExpressionDecoder, NativeExpressionInputLayout,
     };
     use crate::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};

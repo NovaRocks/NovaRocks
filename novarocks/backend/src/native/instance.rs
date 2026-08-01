@@ -23,12 +23,12 @@ use std::num::NonZeroUsize;
 
 use novarocks::common::types::UniqueId;
 use novarocks::exec::fragment::program::FragmentNodeId;
-use novarocks::protocol::native_fragment_assembly_port::NativeFragmentInstanceInput;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks::runtime::query_context::QueryId;
+use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
@@ -37,6 +37,44 @@ use novarocks::runtime::scan_range::{
 use novarocks_protocol::{common, novarocks as proto};
 
 use super::ingress::NativeFragmentIngressError;
+
+/// Backend-decoded execution values from `InstanceParams`.
+#[derive(Debug)]
+pub(crate) struct NativeFragmentInstanceInput {
+    pub(crate) query_id: QueryId,
+    pub(crate) fragment_instance_id: FragmentInstanceId,
+    pub(crate) backend_num: BackendNum,
+    pub(crate) query_options: QueryOptions,
+    pub(crate) pipeline_dop: NonZeroUsize,
+    pub(crate) raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
+    pub(crate) exchange_inputs: ExchangeInputAssignments,
+    pub(crate) typed_result_sink: bool,
+}
+
+impl NativeFragmentInstanceInput {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        query_id: QueryId,
+        fragment_instance_id: FragmentInstanceId,
+        backend_num: BackendNum,
+        query_options: QueryOptions,
+        pipeline_dop: NonZeroUsize,
+        raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
+        exchange_inputs: ExchangeInputAssignments,
+        typed_result_sink: bool,
+    ) -> Self {
+        Self {
+            query_id,
+            fragment_instance_id,
+            backend_num,
+            query_options,
+            pipeline_dop,
+            raw_scan_ranges,
+            exchange_inputs,
+            typed_result_sink,
+        }
+    }
+}
 
 pub(crate) fn decode_instance_params(
     src: &proto::InstanceParams,

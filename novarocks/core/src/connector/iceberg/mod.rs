@@ -62,10 +62,13 @@ pub(crate) mod write_execution;
 pub(crate) mod write_service;
 
 pub use metadata::plan_compat_iceberg_metadata_read_source;
-pub(crate) use metadata::plan_native_iceberg_metadata_read_source;
 pub use metadata::{
     IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanRange,
     IcebergMetadataTableType,
+};
+pub use metadata::{
+    plan_native_iceberg_metadata_read_source,
+    plan_native_iceberg_metadata_read_source_with_cancellation,
 };
 pub use provider::{
     COMPAT_ICEBERG_INSTANCE_ID, build_compat_delta_read_splits, build_compat_read_splits,

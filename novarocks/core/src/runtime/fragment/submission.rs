@@ -1921,13 +1921,11 @@ mod tests {
             ExecPlan {
                 arena: ExprArena::default(),
                 root: ExecNode {
-                    kind: ExecNodeKind::RuntimeFilterConsumer(
-                        RuntimeFilterConsumerNode {
-                            input: Box::new(scan_node(Some(10))),
-                            owner_node_id: 30,
-                            bindings: Vec::new(),
-                        },
-                    ),
+                    kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode {
+                        input: Box::new(scan_node(Some(10))),
+                        owner_node_id: 30,
+                        bindings: Vec::new(),
+                    }),
                 },
             },
             result_sink(),

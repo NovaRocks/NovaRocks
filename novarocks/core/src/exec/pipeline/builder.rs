@@ -2140,8 +2140,8 @@ mod tests {
     };
     use crate::exec::node::lookup::LookUpNode;
     use crate::exec::node::runtime_filter::{
-        RuntimeFilterConsumerNode, RuntimeFilterConsumerBinding,
-        RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
+        RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode, RuntimeFilterExecutionContract,
+        RuntimeFilterExecutionReduction,
     };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};

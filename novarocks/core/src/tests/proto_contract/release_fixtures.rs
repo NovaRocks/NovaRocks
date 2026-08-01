@@ -20,9 +20,6 @@ use std::collections::HashMap;
 use prost::Message;
 
 use crate::proto::{common, expr, filter, novarocks, plan};
-use crate::protocol::native::decode::{
-    decode_destinations, decode_query_options, decode_scan_range_params,
-};
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
@@ -614,34 +611,32 @@ fn release_stage_fragments_request_fixture_decodes() {
         "StageFragmentsRequest fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
     );
 
-    let query_options = decode_query_options(
+    let query_options = crate::protocol::decode_native_query_options(
         params
             .query_options
             .as_ref()
             .expect("StageFragmentsRequest fixture query_options"),
     )
-    .expect("StageFragmentsRequest fixture query_options boundary");
-    assert_eq!(query_options.exec_mem_limit, Some(512 << 20));
-    assert_eq!(query_options.pipeline_dop, Some(8));
-    assert_eq!(query_options.runtime_filter_scan_wait_time_ms, Some(1500));
-    assert_eq!(query_options.runtime_filter_wait_timeout_ms, Some(3000));
+    .expect("StageFragmentsRequest fixture query_options DTO");
+    assert_eq!(query_options.exec_mem_limit(), Some(512 << 20));
+    assert_eq!(query_options.pipeline_dop(), Some(8));
+    assert_eq!(query_options.runtime_filter_scan_wait_time_ms(), Some(1500));
+    assert_eq!(query_options.runtime_filter_wait_timeout_ms(), Some(3000));
 
-    let destinations = decode_destinations(&params.destinations)
-        .expect("StageFragmentsRequest fixture destinations boundary");
-    assert_eq!(destinations.len(), 1);
-    assert_eq!(destinations[0].endpoint().as_host_port(), "10.0.0.8:8060");
-
-    let decoded_scan_range = decode_scan_range_params(
+    let destination = params
+        .destinations
+        .first()
+        .expect("StageFragmentsRequest fixture destination");
+    assert_eq!(destination.endpoint, "10.0.0.8:8060");
+    assert!(destination.finst_id.is_some());
+    assert!(
         params.per_node_scan_ranges[&11]
             .ranges
             .first()
-            .expect("StageFragmentsRequest fixture per_node_scan_ranges[11].ranges[0]"),
-    )
-    .expect("StageFragmentsRequest fixture scan range boundary");
-    assert!(matches!(
-        decoded_scan_range.range,
-        crate::runtime::scan_range::ScanRange::File(_)
-    ));
+            .and_then(|range| range.range.as_ref())
+            .and_then(|range| range.kind.as_ref())
+            .is_some_and(|kind| matches!(kind, novarocks::scan_range::Kind::File(_)))
+    );
 }
 
 #[test]

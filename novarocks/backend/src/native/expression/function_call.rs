@@ -25,7 +25,7 @@ use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::FieldPath;
 use novarocks_protocol::expr;
 
-use novarocks::protocol::native_fragment_assembly_port::NativeExpressionInputLayout;
+use super::NativeExpressionInputLayout;
 
 pub(crate) fn lower_function_call(
     call: &expr::FunctionCall,

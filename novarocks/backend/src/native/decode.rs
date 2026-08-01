@@ -36,16 +36,9 @@ use novarocks::runtime::query_context::QueryId;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 
-use super::envelope::BackendNativeFragmentEnvelopeDecoder;
-use super::exchange::BackendNativeExchangeContractDecoder;
-use super::expression::BackendNativeExpressionDecoder;
 use super::ingress::NativeFragmentIngressError;
 use super::instance::decode_instance_params;
-use super::layout::BackendNativeOutputLayoutDecoder;
-use super::runtime_filter::BackendNativeRuntimeFilterContractDecoder;
-use super::scan_contract::BackendNativeScanSourceContractDecoder;
-use super::sink_assignment::BackendNativeFragmentSinkAssignmentDecoder;
-use super::submission_validation::BackendNativeFragmentSubmissionValidator;
+use super::plan_decode::submission::decode_fragment_submission;
 
 pub(crate) struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
@@ -107,6 +100,7 @@ impl NativeFragmentRequest {
             instance_params,
             connectors,
             Arc::new(MissingExecutionResolver),
+            Arc::new(NeverCancelled),
         )
     }
 
@@ -116,22 +110,16 @@ impl NativeFragmentRequest {
         instance_params: proto::InstanceParams,
         connectors: Arc<ConnectorRegistry>,
         execution_resolver: Arc<dyn ConnectorExecutionResolver>,
+        connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
     ) -> Result<Self, NativeFragmentIngressError> {
         let instance = decode_instance_params(&instance_params)?;
-        let decoded = novarocks::protocol::native_fragment_assembly_port::assemble_fragment_submission_for_backend(
+        let decoded = decode_fragment_submission(
             &fragment,
             instance,
             &instance_params,
-            &BackendNativeFragmentEnvelopeDecoder,
-            &BackendNativeFragmentSubmissionValidator,
-            &BackendNativeFragmentSinkAssignmentDecoder,
-            Arc::new(BackendNativeExpressionDecoder),
-            Arc::new(BackendNativeOutputLayoutDecoder),
-            &BackendNativeScanSourceContractDecoder,
-            &BackendNativeExchangeContractDecoder,
-            &BackendNativeRuntimeFilterContractDecoder,
             connectors,
             execution_resolver,
+            connector_cancellation,
         )
         .map_err(NativeFragmentIngressError::new)?;
         let (submission, backend_num) = decoded.into_parts();
@@ -207,6 +195,14 @@ impl ConnectorExecutionResolver for MissingExecutionResolver {
             novarocks_spi::connector::ConnectorErrorKind::Unavailable,
             "native ConnectorReadSource execution resolver is not configured",
         ))
+    }
+}
+
+struct NeverCancelled;
+
+impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
     }
 }
 

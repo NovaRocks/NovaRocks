@@ -245,6 +245,8 @@ impl NativeFragmentService {
                 fragment.instance_params().clone(),
                 Arc::clone(&self.connector_registry),
                 Arc::new(self.execution_host.resolver_for(execution_id)),
+                self.queries
+                    .connector_cancellation_for_execution(execution_id),
             )?;
             self.stage_one(request, Arc::clone(&gate))?;
         }
@@ -390,10 +392,7 @@ impl NativeFragmentService {
 
 #[cfg(test)]
 impl NativeFragmentService {
-    fn submit(
-        &self,
-        request: novarocks::service::native_fragment_ingress::NativeFragmentRequest,
-    ) -> Result<(), NativeFragmentIngressError> {
+    fn submit(&self, request: NativeFragmentRequest) -> Result<(), NativeFragmentIngressError> {
         let query_id = request.query_id();
         let execution_id = request.execution_id();
         let fragment_instance_id = request.fragment_instance_id();
@@ -722,7 +721,6 @@ mod tests {
     };
     use novarocks::runtime::fragment::{DormantFragmentHandle, FragmentOutcome, prepare_fragment};
     use novarocks::runtime::query_context::QueryId;
-    use novarocks::service::native_fragment_ingress::NativeFragmentRequest;
     use novarocks_protocol as proto;
 
     use crate::fragment::control::{FragmentControlHandle, FragmentControlRegistry};
@@ -732,8 +730,8 @@ mod tests {
     use crate::native::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 
     use super::{
-        NativeFragmentLifecycleEvent, NativeFragmentService, RunningFragmentControl,
-        consume_terminal_fact, test_lifecycle_registry,
+        NativeFragmentLifecycleEvent, NativeFragmentRequest, NativeFragmentService,
+        RunningFragmentControl, consume_terminal_fact, test_lifecycle_registry,
     };
 
     static SERVICE_TEST_LOCK: Mutex<()> = Mutex::new(());
