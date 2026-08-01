@@ -17,13 +17,13 @@
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMutationOperationId, ConnectorProviderId,
-    ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
-    ConnectorTableHandle, ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, StatisticsDataVersion, StatisticsEvidenceRevision,
-    StatisticsMetric, StatisticsMetricRequest,
+    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationOperationId,
+    ConnectorProviderId, ConnectorRefreshPublicationGuard, ConnectorRequestContext,
+    ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, ExternalMutationEvidence,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -90,6 +90,31 @@ fn connector_ids_reject_values_past_their_contract_limits() {
             .expect_err("instance IDs over 128 bytes must fail")
             .kind(),
         ConnectorErrorKind::InvalidRequest
+    );
+}
+
+#[test]
+fn committed_version_is_bounded_and_redacted() {
+    let version =
+        ConnectorCommittedVersion::try_new(Bytes::from_static(b"provider-private"), Some(42))
+            .expect("bounded committed version");
+    version.validate().expect("stable committed version digest");
+    assert_eq!(version.snapshot_id(), Some(42));
+    assert!(!format!("{version:?}").contains("provider-private"));
+    assert_eq!(
+        ConnectorCommittedVersion::try_new(Bytes::new(), Some(0))
+            .expect_err("zero snapshot ID is invalid")
+            .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+    assert_eq!(
+        ConnectorCommittedVersion::try_new(
+            Bytes::from(vec![0; MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES + 1]),
+            None,
+        )
+        .expect_err("oversized version must fail")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
     );
 }
 

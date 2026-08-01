@@ -37,7 +37,7 @@ use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteIntent,
+    ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
     ConnectorWriteOperationId, ConnectorWritePlanningRequest,
 };
 
@@ -526,6 +526,19 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         Err(DistributedQueryError::new(
             DistributedQueryErrorKind::Rejected,
             "distributed query coordinator has no connector write operation service",
+        ))
+    }
+
+    /// Seal a distributed writer against a lease acquired by the application
+    /// from the exact control generation used during planning.
+    fn begin_write_operation_with_lease(
+        &self,
+        _registration: ConnectorWriteOperationRegistration,
+        _lease: ConnectorWriteLease,
+    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "distributed query coordinator does not accept caller-retained connector write leases",
         ))
     }
 

@@ -91,7 +91,7 @@ impl WriteExecutionOutcome {
         (self.result, self.commit, self.abort)
     }
 
-    pub(crate) fn into_parts_with_connector(
+    pub fn into_parts_with_connector(
         self,
     ) -> (
         QueryResult,

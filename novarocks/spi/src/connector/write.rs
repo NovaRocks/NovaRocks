@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorMutationFailure,
     ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
@@ -747,6 +747,7 @@ impl ConnectorStagedReportFrame {
 pub struct ConnectorWriteReceipt {
     payload: Bytes,
     digest: [u8; 32],
+    committed_version: Option<ConnectorCommittedVersion>,
 }
 
 impl ConnectorWriteReceipt {
@@ -755,7 +756,18 @@ impl ConnectorWriteReceipt {
         Ok(Self {
             digest: sha256(&payload),
             payload,
+            committed_version: None,
         })
+    }
+
+    pub fn try_new_with_committed_version(
+        payload: Bytes,
+        committed_version: ConnectorCommittedVersion,
+    ) -> Result<Self, ConnectorError> {
+        let mut receipt = Self::try_new(payload)?;
+        committed_version.validate()?;
+        receipt.committed_version = Some(committed_version);
+        Ok(receipt)
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
@@ -766,6 +778,9 @@ impl ConnectorWriteReceipt {
                 "connector write receipt digest does not match its payload",
             ));
         }
+        if let Some(version) = &self.committed_version {
+            version.validate()?;
+        }
         Ok(())
     }
 
@@ -774,6 +789,9 @@ impl ConnectorWriteReceipt {
     }
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+    pub fn committed_version(&self) -> Option<&ConnectorCommittedVersion> {
+        self.committed_version.as_ref()
     }
 }
 

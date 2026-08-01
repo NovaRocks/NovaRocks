@@ -259,7 +259,7 @@ impl ConnectorWriteOperationSession {
         }
     }
 
-    pub(crate) fn commit(
+    pub fn commit(
         &self,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
@@ -289,7 +289,7 @@ impl ConnectorWriteOperationSession {
             })
     }
 
-    pub(crate) fn abort(
+    pub fn abort(
         &self,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
@@ -318,7 +318,7 @@ impl ConnectorWriteOperationSession {
         self.inner.lease.control().abort(request)
     }
 
-    pub(crate) fn reconcile(
+    pub fn reconcile(
         &self,
         evidence: ExternalMutationEvidence,
         context: novarocks_spi::connector::ConnectorRequestContext,

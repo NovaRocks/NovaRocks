@@ -34,6 +34,80 @@ use super::{
 /// Largest provider-owned reconciliation payload accepted by the control plane.
 pub const MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES: usize = 64 * 1024;
 
+/// Bounded provider-produced commit fact that an application owner may persist
+/// and pass back to the provider without understanding its payload.
+/// Design: ADR-0023 (docs/adr/ADR-0023-frontend-mv-refresh-lifecycle.md)
+///
+/// `snapshot_id` is deliberately optional: snapshot-oriented providers can
+/// expose the existing typed fact needed by MV bookkeeping, while other
+/// providers keep the version entirely opaque.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConnectorCommittedVersion {
+    payload: Bytes,
+    digest: [u8; 32],
+    snapshot_id: Option<i64>,
+}
+
+impl ConnectorCommittedVersion {
+    pub fn try_new(payload: Bytes, snapshot_id: Option<i64>) -> Result<Self, ConnectorError> {
+        if payload.len() > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector committed version exceeds the evidence limit",
+            ));
+        }
+        if snapshot_id.is_some_and(|value| value <= 0) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector committed snapshot ID must be positive",
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"novarocks.connector-committed-version.v1\\0");
+        hasher.update(snapshot_id.unwrap_or_default().to_be_bytes());
+        hasher.update(payload.as_ref());
+        Ok(Self {
+            digest: hasher.finalize().into(),
+            payload,
+            snapshot_id,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        let expected = Self::try_new(self.payload.clone(), self.snapshot_id)?;
+        if expected.digest != self.digest {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector committed version digest does not match its payload",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub const fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
+}
+
+impl fmt::Debug for ConnectorCommittedVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectorCommittedVersion")
+            .field("payload_len", &self.payload.len())
+            .field("digest", &self.digest)
+            .field("snapshot_id", &self.snapshot_id)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectorMutationOperationId(Uuid);
 
@@ -529,6 +603,7 @@ pub struct ConnectorCatalogMutationReceipt {
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     provider_version: Option<Bytes>,
+    committed_version: Option<ConnectorCommittedVersion>,
 }
 
 impl ConnectorCatalogMutationReceipt {
@@ -554,7 +629,30 @@ impl ConnectorCatalogMutationReceipt {
             operation_id,
             operation_kind: operation_kind.into(),
             provider_version,
+            committed_version: None,
         })
+    }
+
+    pub fn try_new_with_committed_version(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        operation_id: ConnectorMutationOperationId,
+        operation_kind: impl Into<Arc<str>>,
+        provider_version: Option<Bytes>,
+        committed_version: Option<ConnectorCommittedVersion>,
+    ) -> Result<Self, ConnectorError> {
+        let mut receipt = Self::try_new(
+            descriptor,
+            incarnation,
+            operation_id,
+            operation_kind,
+            provider_version,
+        )?;
+        if let Some(version) = &committed_version {
+            version.validate()?;
+        }
+        receipt.committed_version = committed_version;
+        Ok(receipt)
     }
 
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
@@ -572,6 +670,10 @@ impl ConnectorCatalogMutationReceipt {
     pub fn provider_version(&self) -> Option<&Bytes> {
         self.provider_version.as_ref()
     }
+
+    pub fn committed_version(&self) -> Option<&ConnectorCommittedVersion> {
+        self.committed_version.as_ref()
+    }
 }
 
 impl fmt::Debug for ConnectorCatalogMutationReceipt {
@@ -586,6 +688,7 @@ impl fmt::Debug for ConnectorCatalogMutationReceipt {
                 "provider_version_len",
                 &self.provider_version.as_ref().map(Bytes::len),
             )
+            .field("committed_version", &self.committed_version)
             .finish()
     }
 }

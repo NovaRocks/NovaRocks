@@ -31,9 +31,9 @@ use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use serde::{Deserialize, Serialize};
 
 use novarocks_spi::connector::{
-    CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorExecutionBindingKey, ConnectorStagedReport,
-    ConnectorStagedReportSummary, ConnectorWriteReceipt, ConnectorWriterHandle,
-    ConnectorWriterIdentity, ConnectorWriterTerminalState,
+    CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCommittedVersion, ConnectorExecutionBindingKey,
+    ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorWriteReceipt,
+    ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
 };
 
 use super::commit::DeletionVector;
@@ -1368,7 +1368,10 @@ pub(crate) fn decode_write_receipt(payload: &[u8]) -> Result<i64, String> {
 }
 
 pub(crate) fn connector_write_receipt(snapshot_id: i64) -> Result<ConnectorWriteReceipt, String> {
-    ConnectorWriteReceipt::try_new(encode_write_receipt(snapshot_id)?)
+    let payload = encode_write_receipt(snapshot_id)?;
+    let committed_version = ConnectorCommittedVersion::try_new(payload.clone(), Some(snapshot_id))
+        .map_err(|error| format!("build Iceberg connector committed version failed: {error}"))?;
+    ConnectorWriteReceipt::try_new_with_committed_version(payload, committed_version)
         .map_err(|error| format!("build Iceberg connector write receipt failed: {error}"))
 }
 

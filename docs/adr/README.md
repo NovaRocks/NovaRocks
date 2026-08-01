@@ -136,6 +136,12 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
 
+### frontend-mv
+
+领域哲学：Frontend 拥有当前 MV refresh attempt 的 application state、durable ledger、query orchestration 与用户结果；SQL、provider 和 Backend 各自只承担其真实职责。commit truth使用typed provider evidence，不从错误文本猜测，不通过双journal或aggregate facade掩盖owner。
+
+- ADR-0023 — MV refresh 为什么由Frontend拥有 lifecycle，并以 provider-neutral committed version 保持receipt隔离（active）
+
 #### 历史
 
 - ADR-0019 — INSERT application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（superseded by ADR-0021）
