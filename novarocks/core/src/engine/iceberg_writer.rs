@@ -100,6 +100,35 @@ pub(crate) enum IcebergWriteMode {
     DynamicPartitionOverwrite,
 }
 
+/// Provider-owned identity and snapshot facts for a prepared Iceberg write.
+///
+/// The application layer may preallocate the opaque operation identity, but it
+/// never interprets or constructs Iceberg commit state. In particular, MV
+/// refresh uses this to make the staged writer, snapshot marker, and durable
+/// frontend ledger refer to one attempt before any external action starts.
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergWritePreparationOptions {
+    pub(crate) operation_id: ConnectorWriteOperationId,
+    pub(crate) snapshot_properties: BTreeMap<String, String>,
+}
+
+impl IcebergWritePreparationOptions {
+    pub(crate) fn new(operation_id: ConnectorWriteOperationId) -> Self {
+        Self {
+            operation_id,
+            snapshot_properties: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn with_snapshot_properties(
+        mut self,
+        snapshot_properties: BTreeMap<String, String>,
+    ) -> Self {
+        self.snapshot_properties = snapshot_properties;
+        self
+    }
+}
+
 /// Core Iceberg write preparation shared by the frontend INSERT adapter,
 /// CTAS, and mutation flows. Construction validates and plans the write but
 /// never starts a distributed writer or external metadata commit.
@@ -114,6 +143,35 @@ pub(crate) fn prepare_iceberg_write(
     target_ref: &str,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PreparedIcebergWrite, String> {
+    prepare_iceberg_write_with_options(
+        state,
+        target,
+        resolved,
+        insert_columns,
+        source,
+        overwrite_mode,
+        target_ref,
+        execution,
+        connector_context,
+        IcebergWritePreparationOptions::new(ConnectorWriteOperationId::new()),
+    )
+}
+
+/// Prepare an Iceberg write with an application-preallocated operation
+/// identity. This still performs no writer execution or catalog mutation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_iceberg_write_with_options(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    insert_columns: &[String],
+    source: &IcebergWriteInput,
+    overwrite_mode: IcebergWriteMode,
+    target_ref: &str,
+    execution: Option<QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    options: IcebergWritePreparationOptions,
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
@@ -185,6 +243,7 @@ pub(crate) fn prepare_iceberg_write(
         table_ident,
         execution,
         connector_context,
+        options,
     )
 }
 
@@ -203,6 +262,7 @@ fn prepare_iceberg_distributed_write(
     table_ident: TableIdent,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    options: IcebergWritePreparationOptions,
 ) -> Result<PreparedIcebergWrite, String> {
     let metadata = table.metadata();
     let (query, sink_spec) =
@@ -243,9 +303,9 @@ fn prepare_iceberg_distributed_write(
         cleanup_path_mapper: abort_cleanup.path_mapper,
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
+        snapshot_properties: options.snapshot_properties.clone(),
     });
-    let connector_operation_id = ConnectorWriteOperationId::new();
+    let connector_operation_id = options.operation_id;
     let connector_write = register_insert_connector_write(
         state,
         target,
@@ -280,7 +340,7 @@ fn prepare_iceberg_distributed_write(
             base_snapshot_id,
             base_snapshot_map: BTreeMap::new(),
             target_ref: target_ref.to_string(),
-            snapshot_properties: BTreeMap::new(),
+            snapshot_properties: options.snapshot_properties,
         },
         validation: IcebergWriteValidationPolicy {
             require_v3_for_branch: target_ref != "main",
