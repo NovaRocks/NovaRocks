@@ -52,8 +52,14 @@ pub(crate) struct StorageColumn {
     pub(crate) unique_id: i32,
     pub(crate) name: String,
     pub(crate) physical_type: String,
+    pub(crate) is_key: bool,
+    pub(crate) aggregation: Option<String>,
     pub(crate) nullable: bool,
     pub(crate) default_value: Option<Vec<u8>>,
+    pub(crate) precision: Option<i32>,
+    pub(crate) scale: Option<i32>,
+    pub(crate) length: Option<i32>,
+    pub(crate) children: Vec<StorageColumn>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -248,27 +254,7 @@ fn decode_schema(value: TabletSchemaPb) -> Result<StorageSchema, ConnectorError>
     let columns = value
         .column
         .into_iter()
-        .map(|column| {
-            let unique_id = column
-                .unique_id
-                .ok_or_else(|| corrupt("StarRocks column is missing unique ID"))?;
-            let name = column
-                .name
-                .ok_or_else(|| corrupt("StarRocks column is missing name"))?;
-            let physical_type = column
-                .r#type
-                .ok_or_else(|| corrupt("StarRocks column is missing type"))?;
-            if unique_id <= 0 || name.trim().is_empty() || physical_type.trim().is_empty() {
-                return Err(corrupt("StarRocks column has invalid immutable facts"));
-            }
-            Ok(StorageColumn {
-                unique_id,
-                name,
-                physical_type,
-                nullable: column.is_nullable.unwrap_or(false),
-                default_value: column.default_value,
-            })
-        })
+        .map(decode_column)
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     if columns.is_empty() {
         return Err(corrupt("StarRocks tablet schema has no columns"));
@@ -277,6 +263,38 @@ fn decode_schema(value: TabletSchemaPb) -> Result<StorageSchema, ConnectorError>
         id: value.id,
         model,
         columns,
+    })
+}
+
+fn decode_column(column: ColumnPb) -> Result<StorageColumn, ConnectorError> {
+    let unique_id = column
+        .unique_id
+        .ok_or_else(|| corrupt("StarRocks column is missing unique ID"))?;
+    let name = column
+        .name
+        .ok_or_else(|| corrupt("StarRocks column is missing name"))?;
+    let physical_type = column
+        .r#type
+        .ok_or_else(|| corrupt("StarRocks column is missing type"))?;
+    if unique_id <= 0 || name.trim().is_empty() || physical_type.trim().is_empty() {
+        return Err(corrupt("StarRocks column has invalid immutable facts"));
+    }
+    Ok(StorageColumn {
+        unique_id,
+        name,
+        physical_type,
+        is_key: column.is_key.unwrap_or(false),
+        aggregation: column.aggregation,
+        nullable: column.is_nullable.unwrap_or(false),
+        default_value: column.default_value,
+        precision: column.precision,
+        scale: column.frac,
+        length: column.length,
+        children: column
+            .children_columns
+            .into_iter()
+            .map(decode_column)
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -448,8 +466,9 @@ fn message_field(
             _ => return Err(unsupported("unknown field in StarRocks tablet schema")),
         },
         Column => match field {
-            1 | 6 => scalar(0, wire),
-            2 | 3 | 7 => scalar(2, wire),
+            1 | 4 | 6 | 8 | 9 | 10 => scalar(0, wire),
+            2 | 3 | 5 | 7 => scalar(2, wire),
+            17 => nested(2, wire, Column),
             _ => return Err(unsupported("unknown field in StarRocks tablet column")),
         },
         Rowset => match field {
@@ -630,8 +649,14 @@ mod tests {
                 unique_id: Some(1),
                 name: Some("id".into()),
                 r#type: Some("BIGINT".into()),
+                is_key: Some(true),
+                aggregation: Some("SUM".into()),
                 is_nullable: Some(false),
                 default_value: None,
+                precision: None,
+                frac: None,
+                length: None,
+                children_columns: vec![],
             }],
             id: Some(7),
         }
@@ -659,6 +684,11 @@ mod tests {
         let bytes = tablet().encode_to_vec();
         let decoded = decode_standalone_metadata(&bytes, 9, 3).unwrap();
         assert_eq!(decoded.schema.columns[0].name, "id");
+        assert!(decoded.schema.columns[0].is_key);
+        assert_eq!(
+            decoded.schema.columns[0].aggregation.as_deref(),
+            Some("SUM")
+        );
         assert_eq!(decoded.rowsets[0].segments, ["rs_0.dat"]);
     }
     #[test]
