@@ -115,6 +115,7 @@ fn default_array(
         }
         return Ok(arrow::array::new_null_array(data_type, rows));
     }
+    let text = strip_wrapping_quotes(text);
     match data_type {
         DataType::Int8 => Ok(Arc::new(Int8Array::from(vec![
             Some(
@@ -152,10 +153,40 @@ fn default_array(
             });
             rows
         ]))),
+        DataType::Float32 => Ok(Arc::new(Float32Array::from(vec![
+            Some(
+                text.parse::<f32>()
+                    .map_err(|_| corrupt("invalid StarRocks FLOAT default"))?,
+            );
+            rows
+        ]))),
+        DataType::Float64 => Ok(Arc::new(Float64Array::from(vec![
+            Some(
+                text.parse::<f64>()
+                    .map_err(|_| corrupt("invalid StarRocks DOUBLE default"))?,
+            );
+            rows
+        ]))),
         DataType::Utf8 => Ok(Arc::new(StringArray::from(vec![Some(text); rows]))),
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::with_capacity(rows, rows.saturating_mul(text.len()));
+            for _ in 0..rows {
+                builder.append_value(text.as_bytes());
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         _ => Err(unsupported(
             "StarRocks default literal type is not implemented",
         )),
+    }
+}
+
+fn strip_wrapping_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') && bytes[0] == bytes[bytes.len() - 1] {
+        &value[1..value.len() - 1]
+    } else {
+        value
     }
 }
 
@@ -508,7 +539,7 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{BinaryArray, Float32Array, Float64Array, Int64Array};
     use arrow::datatypes::{Field, Schema};
     use bytes::Bytes;
     use crc32c::crc32c;
@@ -767,6 +798,60 @@ mod tests {
                 .null_count(),
             2
         );
+    }
+
+    #[test]
+    fn materializes_quoted_float_and_binary_historical_defaults() {
+        let float = StarRocksDirectColumnBinding::try_new(
+            0,
+            2,
+            "ratio",
+            "FLOAT",
+            false,
+            Some(Bytes::from_static(b"'1.25'")),
+        )
+        .unwrap();
+        let double = StarRocksDirectColumnBinding::try_new(
+            1,
+            3,
+            "score",
+            "DOUBLE",
+            false,
+            Some(Bytes::from_static(b"2.5")),
+        )
+        .unwrap();
+        let binary = StarRocksDirectColumnBinding::try_new(
+            2,
+            4,
+            "payload",
+            "VARBINARY",
+            false,
+            Some(Bytes::from_static(b"'raw'")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            default_array(&float, &DataType::Float32, 2)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values(),
+            &[1.25, 1.25]
+        );
+        assert_eq!(
+            default_array(&double, &DataType::Float64, 2)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .values(),
+            &[2.5, 2.5]
+        );
+        let binary = default_array(&binary, &DataType::Binary, 2).unwrap();
+        let binary = binary.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(binary.value(0), b"raw");
+        assert_eq!(binary.value(1), b"raw");
     }
 
     #[test]
