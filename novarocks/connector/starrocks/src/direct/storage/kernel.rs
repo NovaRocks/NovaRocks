@@ -497,7 +497,15 @@ fn decode_single_data_page(
                 values, null_flags,
             )?)))
         }
-        (StarRocksLogicalType::Binary | StarRocksLogicalType::VarBinary, DataType::Binary) => {
+        (
+            StarRocksLogicalType::Binary
+            | StarRocksLogicalType::VarBinary
+            | StarRocksLogicalType::Object
+            | StarRocksLogicalType::Hll
+            | StarRocksLogicalType::Percentile
+            | StarRocksLogicalType::Json,
+            DataType::Binary,
+        ) => {
             if encoding == StarRocksPageEncoding::Rle {
                 return Err(unsupported(
                     "StarRocks variable-width RLE pages are not supported",

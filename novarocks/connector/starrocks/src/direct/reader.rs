@@ -119,7 +119,9 @@ fn expected_arrow_type(physical: &str) -> Result<DataType, ConnectorError> {
             DataType::Timestamp(TimeUnit::Microsecond, None)
         }
         "CHAR" | "VARCHAR" | "STRING" => DataType::Utf8,
-        "BINARY" | "VARBINARY" => DataType::Binary,
+        "BINARY" | "VARBINARY" | "OBJECT" | "HLL" | "PERCENTILE" | "JSON" | "VARIANT" => {
+            DataType::Binary
+        }
         unsupported => {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -369,5 +371,6 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::InvalidRequest
         );
+        assert_eq!(expected_arrow_type("JSON").unwrap(), DataType::Binary);
     }
 }
