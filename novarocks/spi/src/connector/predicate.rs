@@ -241,13 +241,13 @@ fn validate_predicate_kind(
                 "connector static predicate literal type differs from its column type",
             ));
         }
-        if let Some(variable_bytes) = literal.variable_payload_bytes() {
-            if variable_bytes > MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::ResourceExhausted,
-                    "connector static predicate variable literal exceeds the hard limit",
-                ));
-            }
+        if let Some(variable_bytes) = literal.variable_payload_bytes()
+            && variable_bytes > MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector static predicate variable literal exceeds the hard limit",
+            ));
         }
         *total_payload = total_payload.saturating_add(literal.payload_bytes());
         if *total_payload > MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES {

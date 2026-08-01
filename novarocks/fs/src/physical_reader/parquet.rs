@@ -627,7 +627,7 @@ fn page_selection(
                 .page_locations();
             explicit_page_ranges(row_group_index, row_count, page_locations, selected_pages)?
         } else {
-            vec![0..row_count]
+            std::iter::once(0..row_count).collect::<Vec<_>>()
         };
 
         for range in ranges {

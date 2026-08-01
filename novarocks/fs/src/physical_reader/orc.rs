@@ -135,7 +135,7 @@ fn projection_mask(
                 .collect::<Vec<_>>();
             if let Some(missing) = names
                 .iter()
-                .find(|name| !available.iter().any(|value| *value == name.as_str()))
+                .find(|name| !available.contains(&name.as_str()))
             {
                 return Err(FileError::invalid(format!(
                     "ORC projection column does not exist: {missing}"
