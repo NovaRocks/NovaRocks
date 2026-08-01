@@ -599,6 +599,10 @@ mod tests {
     };
     use novarocks::runtime::query_options::QueryOptions;
     use novarocks::service::grpc_client::NovaRocksGrpcRemoteClient;
+    use novarocks_connector_starrocks::{
+        StarRocksDirectReaderFactory, StarRocksExecutionBindings, StarRocksExecutionInstaller,
+        StarRocksLocalBindingRef, StarRocksLocalExecutionBinding,
+    };
     use novarocks_protocol::common::UniqueId;
     use novarocks_protocol::novarocks::{
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
@@ -606,11 +610,13 @@ mod tests {
     };
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorErrorKind, ConnectorExecutionDeclaration,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorProviderId, ConnectorRequestContext,
+        ConnectorExecutionResolver, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorRequestContext,
     };
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
+
+    use crate::connector::ConnectorExecutionHost;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -619,6 +625,24 @@ mod tests {
     impl ConnectorCancellation for NeverCancelled {
         fn is_cancelled(&self) -> bool {
             false
+        }
+    }
+
+    struct FixtureDirectFactory;
+
+    impl StarRocksDirectReaderFactory for FixtureDirectFactory {
+        fn open_direct_reader(
+            &self,
+            _: novarocks_connector_starrocks::StarRocksDirectSplit,
+            _: novarocks_spi::connector::ConnectorOpenReaderRequest,
+        ) -> Result<
+            Box<dyn novarocks_spi::connector::ConnectorBatchReader>,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Err(novarocks_spi::connector::ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "fixture direct reader is not opened by this lifecycle test",
+            ))
         }
     }
 
@@ -722,6 +746,54 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::Unavailable
         );
+    }
+
+    #[test]
+    fn starrocks_execution_host_direct_read_leases_and_retires_configured_binding() {
+        let host = ConnectorExecutionHost::new();
+        let mut bindings = StarRocksExecutionBindings::new();
+        bindings.insert(
+            StarRocksLocalBindingRef::parse("fixture").expect("binding"),
+            StarRocksLocalExecutionBinding {
+                rpc: None,
+                direct: Some(Arc::new(FixtureDirectFactory)),
+            },
+        );
+        host.register_installer(Arc::new(StarRocksExecutionInstaller::new(bindings)))
+            .expect("register StarRocks direct installer");
+        let query = QueryExecutionId::new(
+            QueryId::new(0x5352_4332, 1),
+            AttemptId::new(1).expect("attempt"),
+        )
+        .expect("query");
+        let declaration = ConnectorExecutionDeclaration::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("starrocks").expect("provider ID"),
+                instance_id: ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID"),
+            },
+            ConnectorInstanceIncarnation::from_bytes([8; 16]),
+            Bytes::from_static(br#"{"version":1,"contract_version":1,"local_binding":"fixture"}"#),
+        )
+        .expect("declaration");
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            4096,
+        )
+        .expect("context");
+
+        host.ensure(query, &declaration, &context).expect("ensure");
+        let key = declaration.binding_key();
+        assert!(host.resolver_for(query).resolve(&key).is_ok());
+        host.retire(&key).expect("retire");
+        assert!(host.resolver_for(query).resolve(&key).is_ok());
+        host.release_query(query).expect("release");
+        let error = match host.resolver_for(query).resolve(&key) {
+            Ok(_) => panic!("released query cannot resolve"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
     }
 
     #[test]

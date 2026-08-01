@@ -32,12 +32,12 @@ mod generated {
     tonic::include_proto!("starrocks.storage");
 }
 
-use generated::{
-    BundleTabletMetadataPb, DeletePredicatePb, DelvecPagePb, RowsetMetadataPb, TabletMetadataPb,
-    TabletSchemaPb,
-};
 #[cfg(test)]
-use generated::{ColumnPb, PagePointerPb};
+use generated::PagePointerPb;
+use generated::{
+    BundleTabletMetadataPb, ColumnPb, DeletePredicatePb, DelvecPagePb, RowsetMetadataPb,
+    TabletMetadataPb, TabletSchemaPb,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StorageModel {
