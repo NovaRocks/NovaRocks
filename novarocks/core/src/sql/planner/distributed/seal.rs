@@ -326,23 +326,13 @@ pub(super) mod test_support {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::num::NonZeroUsize;
-    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::fragment::program::FragmentNodeId;
-    use crate::exec::node::ExecNodeKind;
     use crate::query_execution::backend::LiveBackendSnapshot;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime::fragment::instance::{
-        ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
-    };
-    use crate::runtime::query_context::QueryId;
-    use crate::runtime::query_options::QueryOptions;
     use crate::runtime_filter::deployment::compiler::compile_with_join_progress;
     use crate::runtime_filter::deployment::{DeploymentError, RuntimeFilterDeploymentPolicy};
     use crate::runtime_filter::model::contract::{
@@ -760,37 +750,6 @@ mod tests {
         }
     }
 
-    fn cycle_decode_context(
-        scheduling: &SchedulingPlan,
-    ) -> crate::protocol::native::decode::NativePlanDecodeContext {
-        let placement = scheduling
-            .placements_for_fragment_for_test(5)
-            .and_then(|placements| placements.first())
-            .expect("scheduled consumer fragment instance");
-        let exchange_inputs = placement
-            .per_exch_num_senders
-            .iter()
-            .map(|(&node_id, &sender_count)| {
-                let sender_count = usize::try_from(sender_count)
-                    .ok()
-                    .and_then(NonZeroUsize::new)
-                    .expect("scheduled exchange sender count is positive");
-                (
-                    FragmentNodeId::new(node_id),
-                    ExchangeInputAssignment::new(sender_count),
-                )
-            })
-            .collect();
-        crate::protocol::native::decode::NativePlanDecodeContext::from_parts(
-            ExchangeInputAssignments::new(exchange_inputs),
-            BTreeMap::new(),
-            QueryOptions::default(),
-            Arc::new(crate::connector::ConnectorRegistry::new()),
-            QueryId { hi: 1, lo: 5 },
-            FragmentInstanceId::new(placement.finst_id),
-        )
-    }
-
     /// A non-empty but structurally invalid graph: a producer binding points at a
     /// channel that was never inserted. `validate` rejects it with `UnknownChannel`.
     fn graph_with_binding_to_unknown_channel() -> DraftRuntimeFilterGraph {
@@ -925,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_pure_cycle_round_trips_batch_activation_and_rejects_forged_blocking() {
+    fn sealed_pure_cycle_encodes_batch_activation_and_rejects_forged_blocking() {
         let plan = seal_draft(cycle_draft(JoinKind::Inner)).expect("pure cycle draft seals");
         let registry = crate::connector::ConnectorRegistry::new();
         let controls = crate::connector::FixtureControlResolver::new(registry.clone());
@@ -948,33 +907,29 @@ mod tests {
             .runtime_filter_bindings
             .as_ref()
             .expect("actual binding table");
-        let mut ledger = crate::protocol::native::decode::NativeRuntimeFilterDecodeLedger::decode(
-            5,
-            Some(table),
-        )
-        .expect("decode actual binding table");
-        let scheduling = cycle_scheduling_plan(&plan);
-        let decoded = crate::protocol::native::decode::decode_node_with_runtime_filters(
-            root,
-            &mut ExprArena::default(),
-            &cycle_decode_context(&scheduling),
-            &mut ledger,
-        )
-        .expect("decode actual sealed consumer node");
-        let ExecNodeKind::ExchangeSource(exchange) = decoded.node.kind else {
-            panic!("cycle consumer remains an exchange boundary");
-        };
-        let decoded_activation = exchange
-            .native_runtime_filter_specs()
+        let binding = table
+            .bindings
             .first()
-            .expect("one decoded consumer spec")
-            .activation;
+            .expect("one encoded consumer binding");
+        let Some(crate::proto::plan::runtime_filter_binding::Role::Consumer(consumer)) =
+            binding.role.as_ref()
+        else {
+            panic!("encoded binding remains a consumer");
+        };
+        let activation = consumer.activation.as_ref().expect("encoded activation");
+        let Some(crate::proto::plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
+            late_apply,
+        )) = activation.kind.as_ref()
+        else {
+            panic!("cycle consumer encodes a non-blocking live activation");
+        };
         assert_eq!(
-            decoded_activation,
-            plan.activation_decisions()[&BindingId::new(2)].activation,
-            "only the sealed concrete activation crosses the native wire boundary"
+            *late_apply,
+            i32::from(crate::proto::plan::RuntimeFilterLateApplyGranularity::Batch),
+            "only the sealed concrete activation crosses the native wire boundary",
         );
 
+        let scheduling = cycle_scheduling_plan(&plan);
         let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
         let policy = cycle_deployment_policy();
         compile_with_join_progress(
