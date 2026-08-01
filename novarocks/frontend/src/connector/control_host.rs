@@ -820,8 +820,8 @@ mod tests {
         novarocks_spi::connector::ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
             Arc::new(NeverCancelled),
-            1024,
-            4096,
+            16 * 1024 * 1024,
+            64 * 1024 * 1024,
         )
         .expect("context")
     }
