@@ -661,6 +661,35 @@ impl PreparedIcebergWrite {
         self.executor.run_coordinated_write(&self.spec)
     }
 
+    /// Convert a validated Iceberg write into SQL's inert distributed-write
+    /// handoff. This registers no writer attempt and executes no query; the
+    /// connector control service has already retained the provider-private
+    /// committer under the operation identity carried by the resulting plan.
+    ///
+    /// Frontend application owners use this form when they must persist their
+    /// intent and retain an exact connector lease before submitting native
+    /// fragments. The legacy runner continues to call `run_coordinated_write`
+    /// through the same prepared inputs.
+    pub(crate) fn into_prepared_distributed_write(
+        self,
+    ) -> Result<crate::sql::mv_refresh::PreparedDistributedWriteRequest, String> {
+        let Self { executor, .. } = self;
+        crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
+            &executor.state,
+            Some(&executor.target.catalog),
+            &executor.target.namespace,
+            &executor.query,
+            executor.sink_spec,
+            None,
+            None,
+            executor.execution.as_ref(),
+            &executor.connector_context,
+            Some(crate::sql::mv_refresh::DistributedConnectorWrite::Begin(
+                executor.connector_write,
+            )),
+        )
+    }
+
     pub(crate) fn commit(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
