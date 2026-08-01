@@ -159,18 +159,134 @@ use crate::runtime::global_async_runtime::data_block_on;
 use crate::sql::analysis::ProjectItem;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::mv_refresh::{
+    MvRefreshFinalizeFacts, MvRefreshPreparationRequest, MvRefreshPreparationService,
+    PreparedMvRefresh, PreparedMvRefreshWork,
+};
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, IcebergPartitionFieldExpr, ObjectName, RefreshMaterializedViewStmt,
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_spi::connector::{
+    ConnectorControlResolver, ConnectorExecutionBindingKey, ConnectorInstanceId,
+};
 
 pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
      its previous behavior (drop target + delete definition + recreate empty target) \
      was misleading and non-atomic. To recover from a broken contract or corrupted \
      target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
      REFRESH MATERIALIZED VIEW <name>; manually.";
+
+/// SQL-owned bridge for refresh planning.  It owns only analysis and immutable
+/// facts; all durable intent, ref mutations, and writer execution are handed
+/// to the frontend as `PreparedMvRefresh`.
+pub(crate) struct StandaloneMvRefreshPreparationService<'a> {
+    state: &'a Arc<StandaloneState>,
+    current_catalog: Option<&'a str>,
+    current_database: &'a str,
+    statement: &'a RefreshMaterializedViewStmt,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+}
+
+impl<'a> StandaloneMvRefreshPreparationService<'a> {
+    pub(crate) fn new(
+        state: &'a Arc<StandaloneState>,
+        current_catalog: Option<&'a str>,
+        current_database: &'a str,
+        statement: &'a RefreshMaterializedViewStmt,
+        connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            state,
+            current_catalog,
+            current_database,
+            statement,
+            connector_context,
+        }
+    }
+}
+
+impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
+    fn prepare_step(
+        &self,
+        request: MvRefreshPreparationRequest,
+    ) -> Result<PreparedMvRefresh, String> {
+        request.validate()?;
+        if request.statement != crate::sql::mv_refresh::MvRefreshStatement::from(self.statement) {
+            return Err(
+                "MV refresh preparation statement does not match the admitted SQL request"
+                    .to_string(),
+            );
+        }
+        let plan = plan_iceberg_mv_refresh_with_connector_context(
+            self.state,
+            self.current_catalog,
+            self.current_database,
+            self.statement,
+            request.target.clone(),
+            self.connector_context,
+        )
+        .map_err(|error| error.to_string())?;
+        let catalog = plan
+            .contract
+            .target
+            .catalog
+            .as_deref()
+            .ok_or_else(|| "Iceberg MV refresh target has no connector catalog".to_string())?;
+        let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+        let lease = self
+            .state
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|error| error.to_string())?;
+        let observed_binding = ConnectorExecutionBindingKey {
+            instance_id: lease.binding().descriptor().instance_id.clone(),
+            incarnation: lease.binding().incarnation(),
+        };
+        let base_table_uuids = plan
+            .contract
+            .base_refs
+            .iter()
+            .map(|base| {
+                load_current_iceberg_base_table(self.state, base)
+                    .map(|loaded| (base.fqn(), loaded.table.metadata().uuid().to_string()))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let expected_target_snapshot_id = match &plan.contract.state_baseline {
+            RefreshStateBaseline::SnapshotBacked {
+                target_snapshot_id, ..
+            } => *target_snapshot_id,
+            RefreshStateBaseline::Pinless => None,
+        };
+        let work = match plan.contract.decision {
+            ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
+            ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
+            ExecutableRefreshDecision::FirstRefresh | ExecutableRefreshDecision::Incremental => {
+                return Err(
+                    "MV refresh data-producing SQL preparation is not yet extracted for this shape"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(PreparedMvRefresh {
+            statement: request.statement,
+            attempt: request.attempt,
+            observed_binding,
+            finalize: MvRefreshFinalizeFacts {
+                mv_id: plan.contract.mv_id.ok_or_else(|| {
+                    "Iceberg MV refresh plan has no persisted materialized-view ID".to_string()
+                })?,
+                target: plan.contract.target,
+                base_snapshots: plan.contract.snapshot_pins,
+                base_table_uuids,
+                expected_target_snapshot_id,
+            },
+            work,
+        })
+    }
+}
 
 fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
     if full {

@@ -186,9 +186,9 @@ mod tests {
                 full: false,
             },
             target: MvTarget {
-                catalog: "iceberg".to_string(),
-                namespace: "db".to_string(),
-                table: "mv".to_string(),
+                catalog: Some("iceberg".to_string()),
+                database: "db".to_string(),
+                name: "mv".to_string(),
             },
             attempt: MvRefreshAttemptIdentity {
                 refresh_id: 7,
