@@ -93,11 +93,7 @@ pub(crate) fn decode_data_page(
                 }
                 Some(flags)
             }
-            0 => {
-                return Err(unsupported(
-                    "StarRocks bitshuffle nullable page bitmap is not implemented",
-                ));
-            }
+            0 => Some(decode_bitshuffle_null_flags(nullmap, num_values)?),
             _ => {
                 return Err(unsupported(
                     "unknown StarRocks nullable page bitmap encoding",
@@ -111,6 +107,83 @@ pub(crate) fn decode_data_page(
         nullmap_size,
         null_flags,
     })
+}
+
+/// Decode StarRocks' bitshuffle+LZ4 nullable bitmap. The bitmap is a
+/// byte-per-row vector, padded to eight rows by the storage encoder.
+fn decode_bitshuffle_null_flags(payload: &[u8], values: usize) -> Result<Vec<u8>, ConnectorError> {
+    let padded = (values + 7) & !7;
+    let mut output = vec![0_u8; padded];
+    let mut input_offset = 0usize;
+    let mut output_offset = 0usize;
+    const BLOCK: usize = 8192;
+    while output_offset < padded {
+        let elements = (padded - output_offset).min(BLOCK);
+        let header_end = input_offset
+            .checked_add(4)
+            .ok_or_else(|| corrupt("StarRocks bitshuffle bitmap header overflows"))?;
+        if header_end > payload.len() {
+            return Err(corrupt("truncated StarRocks bitshuffle bitmap header"));
+        }
+        let compressed_len = u32::from_be_bytes(
+            payload[input_offset..header_end]
+                .try_into()
+                .map_err(|_| corrupt("invalid StarRocks bitshuffle bitmap header"))?,
+        ) as usize;
+        input_offset = header_end;
+        let end = input_offset
+            .checked_add(compressed_len)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| corrupt("StarRocks bitshuffle bitmap range is invalid"))?;
+        let mut shuffled = vec![0_u8; elements];
+        let decoded = lz4_flex::block::decompress_into(&payload[input_offset..end], &mut shuffled)
+            .map_err(|_| corrupt("cannot decompress StarRocks bitshuffle nullable bitmap"))?;
+        if decoded != elements {
+            return Err(corrupt(
+                "StarRocks bitshuffle nullable bitmap size is invalid",
+            ));
+        }
+        bitunshuffle_one_byte(
+            &shuffled,
+            &mut output[output_offset..output_offset + elements],
+        )?;
+        input_offset = end;
+        output_offset += elements;
+    }
+    if input_offset != payload.len() || output[..values].iter().any(|flag| *flag > 1) {
+        return Err(corrupt("StarRocks bitshuffle nullable bitmap is invalid"));
+    }
+    Ok(output[..values].to_vec())
+}
+
+fn bitunshuffle_one_byte(input: &[u8], output: &mut [u8]) -> Result<(), ConnectorError> {
+    if input.len() != output.len() || !input.len().is_multiple_of(8) {
+        return Err(corrupt(
+            "StarRocks bitshuffle bitmap dimensions are invalid",
+        ));
+    }
+    for (input_block, output_block) in input.chunks_exact(8).zip(output.chunks_exact_mut(8)) {
+        let mut matrix = u64::from_le_bytes(
+            input_block
+                .try_into()
+                .map_err(|_| corrupt("invalid StarRocks bitshuffle bitmap matrix"))?,
+        );
+        matrix = transpose_bit_matrix(matrix);
+        for (index, output) in output_block.iter_mut().enumerate() {
+            *output = ((matrix >> (index * 8)) & 0xff) as u8;
+        }
+    }
+    Ok(())
+}
+
+fn transpose_bit_matrix(mut value: u64) -> u64 {
+    let mut temporary = (value ^ (value >> 7)) & 0x00AA00AA00AA00AA_u64;
+    value ^= temporary ^ (temporary << 7);
+    temporary = (value ^ (value >> 14)) & 0x0000CCCC0000CCCC_u64;
+    value ^= temporary ^ (temporary << 14);
+    temporary = (value ^ (value >> 28)) & 0x00000000F0F0F0F0_u64;
+    value ^= temporary ^ (temporary << 28);
+    value
 }
 
 /// Slice an exact page range from a segment object.  The direct reader never
@@ -482,6 +555,23 @@ mod tests {
         let decoded = decode_data_page("segment.dat", &body, StarRocksCompression::None).unwrap();
         assert_eq!(decoded.null_flags, Some(vec![0, 1]));
         assert_eq!(decoded.nullmap_size, nullmap.len());
+    }
+
+    #[test]
+    fn decodes_bitshuffle_nullable_bitmap() {
+        let compressed = lz4_flex::block::compress(&[0_u8; 8]);
+        let mut payload = (compressed.len() as u32).to_be_bytes().to_vec();
+        payload.extend_from_slice(&compressed);
+        assert_eq!(
+            decode_bitshuffle_null_flags(&payload, 3).unwrap(),
+            vec![0, 0, 0]
+        );
+        assert_eq!(
+            decode_bitshuffle_null_flags(&payload[..3], 3)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::CorruptData
+        );
     }
 
     #[test]
