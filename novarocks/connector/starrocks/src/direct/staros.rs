@@ -98,6 +98,14 @@ impl StarRocksDirectIoRuntime {
     pub fn new(handle: Handle) -> Self {
         Self { handle }
     }
+
+    pub(crate) fn block_on<F, T>(&self, future: F) -> Result<T, ConnectorError>
+    where
+        F: Future<Output = Result<T, ConnectorError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        block_on_runtime(&self.handle, future)
+    }
 }
 
 #[derive(Clone)]

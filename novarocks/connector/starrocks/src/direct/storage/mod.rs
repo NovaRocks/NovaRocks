@@ -26,6 +26,7 @@
 
 mod kernel;
 mod page;
+mod remote;
 mod segment;
 mod wire;
 
@@ -522,10 +523,7 @@ impl DirectStorageConnectorReader {
 impl ConnectorBatchReader for DirectStorageConnectorReader {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
         if self.closed {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "StarRocks storage reader is closed",
-            ));
+            return Ok(None);
         }
         ensure_active(&self.context)?;
         self.reader.next_batch()
@@ -564,10 +562,7 @@ impl fmt::Debug for StarRocksStorageFixtureReader {
 impl DirectStorageReader for StarRocksStorageFixtureReader {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
         if self.closed {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "StarRocks storage reader is closed",
-            ));
+            return Ok(None);
         }
         ensure_active(&self.context)?;
         let batch = self.chunks.pop_front();
@@ -918,10 +913,7 @@ mod tests {
             )
             .unwrap();
         reader.close().unwrap();
-        assert_eq!(
-            reader.next_batch().unwrap_err().kind(),
-            ConnectorErrorKind::InvalidRequest
-        );
+        assert!(reader.next_batch().unwrap().is_none());
     }
 
     #[test]
