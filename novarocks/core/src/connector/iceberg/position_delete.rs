@@ -40,8 +40,8 @@ use novarocks_fs::{FileProjection, FileReadRange, FsAccessHandle};
 /// The only two column names a position-delete Parquet file is allowed to
 /// have (equality-delete files carry a different schema and are rejected in
 /// lowering).
-const FILE_PATH_COLUMN: &str = "file_path";
-const POS_COLUMN: &str = "pos";
+pub(crate) const FILE_PATH_COLUMN: &str = "file_path";
+pub(crate) const POS_COLUMN: &str = "pos";
 
 /// Load every position-delete Parquet file in `specs`, keep only the rows
 /// whose `file_path` equals `data_file_path`, and collect the matching `pos`

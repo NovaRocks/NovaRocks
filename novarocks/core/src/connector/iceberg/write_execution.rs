@@ -24,9 +24,11 @@
 //! equivalence adapters are implemented.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, Int64Array, StringArray, UInt32Array};
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
     ConnectorBatchWriter, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
@@ -628,11 +630,12 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
                     )
                 })?;
             let path = self.next_path(&partition);
+            let storage_batch = position_delete_storage_batch(&part_batch)?;
             let written = write_parquet_file(
                 &path,
                 self.object_store_s3.as_ref(),
-                part_batch.schema(),
-                &part_batch,
+                storage_batch.schema(),
+                &storage_batch,
                 self.handle.compression,
             )
             .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
@@ -1070,6 +1073,74 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteBatchWriter {
     }
 }
 
+/// The execution plan uses `_file`/`_pos` as internal row-identity columns,
+/// while Iceberg position-delete Parquet files have the standardized
+/// `file_path`/`pos` schema.  Keep that translation at the writer boundary so
+/// an internal construction detail never becomes persisted table data.
+fn position_delete_storage_batch(batch: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    let input_schema = batch.schema();
+    if input_schema.fields().len() != 2 {
+        return Err(error(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg position-delete storage batch requires exactly two columns",
+        ));
+    }
+    let fields = input_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            Arc::new(field.as_ref().clone().with_name(match index {
+                0 => super::position_delete::FILE_PATH_COLUMN,
+                1 => super::position_delete::POS_COLUMN,
+                _ => unreachable!("position-delete schema arity was checked"),
+            }))
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        input_schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|arrow_error| {
+        error(
+            ConnectorErrorKind::Internal,
+            format!("build Iceberg position-delete storage batch failed: {arrow_error}"),
+        )
+    })
+}
+
 fn error(kind: ConnectorErrorKind, message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(kind, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::position_delete_storage_batch;
+
+    #[test]
+    fn position_delete_storage_batch_uses_iceberg_column_names() {
+        let input = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("_file", DataType::Utf8, false),
+                Field::new("_pos", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["s3://warehouse/t/data.parquet"])),
+                Arc::new(Int64Array::from(vec![4])),
+            ],
+        )
+        .expect("internal position-delete batch");
+
+        let stored = position_delete_storage_batch(&input).expect("storage batch");
+
+        assert_eq!(stored.schema().field(0).name(), "file_path");
+        assert_eq!(stored.schema().field(1).name(), "pos");
+        assert_eq!(stored.column(0).as_ref(), input.column(0).as_ref());
+        assert_eq!(stored.column(1).as_ref(), input.column(1).as_ref());
+    }
 }
