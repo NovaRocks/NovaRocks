@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
 };
@@ -102,7 +102,11 @@ fn validate_split_schema(
 }
 
 fn expected_arrow_type(physical: &str) -> Result<DataType, ConnectorError> {
-    let result = match physical.trim().to_ascii_uppercase().as_str() {
+    let physical = physical.trim().to_ascii_uppercase();
+    if let Some(decimal) = parse_decimal_type(&physical)? {
+        return Ok(decimal);
+    }
+    let result = match physical.as_str() {
         "BOOLEAN" => DataType::Boolean,
         "TINYINT" => DataType::Int8,
         "SMALLINT" => DataType::Int16,
@@ -110,6 +114,10 @@ fn expected_arrow_type(physical: &str) -> Result<DataType, ConnectorError> {
         "BIGINT" => DataType::Int64,
         "FLOAT" => DataType::Float32,
         "DOUBLE" => DataType::Float64,
+        "DATE" | "DATE_V2" => DataType::Date32,
+        "DATETIME" | "DATETIME_V2" | "TIMESTAMP" => {
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        }
         "CHAR" | "VARCHAR" | "STRING" => DataType::Utf8,
         "BINARY" | "VARBINARY" => DataType::Binary,
         unsupported => {
@@ -120,6 +128,65 @@ fn expected_arrow_type(physical: &str) -> Result<DataType, ConnectorError> {
         }
     };
     Ok(result)
+}
+
+fn parse_decimal_type(physical: &str) -> Result<Option<DataType>, ConnectorError> {
+    let Some((kind, parameters)) = physical.split_once('(') else {
+        return Ok(None);
+    };
+    let kind = kind.trim();
+    if !matches!(
+        kind,
+        "DECIMAL" | "DECIMALV2" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128"
+    ) {
+        return Ok(None);
+    }
+    let parameters = parameters.strip_suffix(')').ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "invalid StarRocks direct DECIMAL physical type",
+        )
+    })?;
+    let mut values = parameters.split(',').map(str::trim);
+    let precision = values
+        .next()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| *value > 0 && *value <= 38)
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "invalid StarRocks direct DECIMAL precision",
+            )
+        })?;
+    let max_precision = match kind {
+        "DECIMAL32" => 9,
+        "DECIMAL64" => 18,
+        "DECIMAL" | "DECIMALV2" | "DECIMAL128" => 38,
+        _ => unreachable!("decimal kind was validated above"),
+    };
+    if precision > max_precision {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "StarRocks direct DECIMAL precision exceeds its physical type",
+        ));
+    }
+    let scale = values
+        .next()
+        .and_then(|value| value.parse::<i8>().ok())
+        .filter(|value| *value >= 0 && *value <= precision as i8)
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "invalid StarRocks direct DECIMAL scale",
+            )
+        })?;
+    if values.next().is_some() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "invalid StarRocks direct DECIMAL physical type",
+        ));
+    }
+    Ok(Some(DataType::Decimal128(precision, scale)))
 }
 
 #[cfg(test)]
@@ -283,5 +350,24 @@ mod tests {
         assert!(reader.next_batch().unwrap().is_none());
         reader.close().unwrap();
         reader.close().unwrap();
+    }
+
+    #[test]
+    fn physical_scalar_types_include_temporal_and_decimal_contracts() {
+        assert_eq!(expected_arrow_type("DATE").unwrap(), DataType::Date32);
+        assert_eq!(
+            expected_arrow_type("datetime_v2").unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            expected_arrow_type("DECIMAL128(38, 9)").unwrap(),
+            DataType::Decimal128(38, 9)
+        );
+        assert_eq!(
+            expected_arrow_type("DECIMAL64(19, 4)")
+                .expect_err("DECIMAL64 cannot exceed its Arrow precision ceiling")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
     }
 }

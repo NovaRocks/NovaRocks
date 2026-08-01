@@ -24,11 +24,12 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, StringArray,
+    ArrayRef, BinaryBuilder, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow::compute::concat;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -43,6 +44,11 @@ use super::segment::{
     StarRocksLogicalType, StarRocksPageEncoding, StarRocksPagePointer, StarRocksSegmentColumnMeta,
     StarRocksSegmentFooter,
 };
+
+const STARROCKS_UNIX_EPOCH_JULIAN: i64 = 2_440_588;
+const STARROCKS_DATETIME_TIME_BITS: u32 = 40;
+const STARROCKS_DATETIME_TIME_MASK: u64 = (1_u64 << STARROCKS_DATETIME_TIME_BITS) - 1;
+const STARROCKS_MICROS_PER_DAY: i64 = 86_400_000_000;
 
 /// Decode one fully loaded immutable segment. The caller must obtain the exact
 /// frozen segment object through the startup-local storage binding.
@@ -421,6 +427,55 @@ fn decode_single_data_page(
         (StarRocksLogicalType::Double, DataType::Float64) => {
             fixed_f64(body, encoding, page.num_values, null_flags)
         }
+        (StarRocksLogicalType::Date, DataType::Date32) => {
+            let values = decode_fixed_values(body, encoding, page.num_values, 4, 32)?
+                .chunks_exact(4)
+                .map(|value| i32::from_le_bytes(value.try_into().expect("fixed date size")))
+                .map(decode_starrocks_date)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Arc::new(Date32Array::from(apply_nulls(
+                values, null_flags,
+            )?)))
+        }
+        (StarRocksLogicalType::DateTime, DataType::Timestamp(TimeUnit::Microsecond, None)) => {
+            let values = decode_fixed_values(body, encoding, page.num_values, 8, 64)?
+                .chunks_exact(8)
+                .map(|value| i64::from_le_bytes(value.try_into().expect("fixed datetime size")))
+                .map(decode_starrocks_datetime)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Arc::new(TimestampMicrosecondArray::from(apply_nulls(
+                values, null_flags,
+            )?)))
+        }
+        (StarRocksLogicalType::Decimal32, DataType::Decimal128(precision, scale)) => fixed_decimal(
+            body,
+            encoding,
+            page.num_values,
+            4,
+            *precision,
+            *scale,
+            null_flags,
+        ),
+        (StarRocksLogicalType::Decimal64, DataType::Decimal128(precision, scale)) => fixed_decimal(
+            body,
+            encoding,
+            page.num_values,
+            8,
+            *precision,
+            *scale,
+            null_flags,
+        ),
+        (StarRocksLogicalType::Decimal128, DataType::Decimal128(precision, scale)) => {
+            fixed_decimal(
+                body,
+                encoding,
+                page.num_values,
+                16,
+                *precision,
+                *scale,
+                null_flags,
+            )
+        }
         (StarRocksLogicalType::Char | StarRocksLogicalType::Varchar, DataType::Utf8) => {
             if encoding == StarRocksPageEncoding::Rle {
                 return Err(unsupported(
@@ -467,6 +522,61 @@ fn decode_single_data_page(
             "StarRocks direct physical type does not match a supported Arrow scalar type",
         )),
     }
+}
+
+fn decode_starrocks_date(value: i32) -> Result<i32, ConnectorError> {
+    i64::from(value)
+        .checked_sub(STARROCKS_UNIX_EPOCH_JULIAN)
+        .and_then(|days| i32::try_from(days).ok())
+        .ok_or_else(|| corrupt("StarRocks direct DATE is outside Arrow Date32 range"))
+}
+
+fn decode_starrocks_datetime(value: i64) -> Result<i64, ConnectorError> {
+    let value =
+        u64::try_from(value).map_err(|_| corrupt("StarRocks direct DATETIME is negative"))?;
+    let julian = value >> STARROCKS_DATETIME_TIME_BITS;
+    let micros_of_day = value & STARROCKS_DATETIME_TIME_MASK;
+    if micros_of_day >= STARROCKS_MICROS_PER_DAY as u64 {
+        return Err(corrupt("StarRocks direct DATETIME has invalid time-of-day"));
+    }
+    let days = i64::try_from(julian)
+        .ok()
+        .and_then(|julian| julian.checked_sub(STARROCKS_UNIX_EPOCH_JULIAN))
+        .ok_or_else(|| corrupt("StarRocks direct DATETIME Julian day is invalid"))?;
+    days.checked_mul(STARROCKS_MICROS_PER_DAY)
+        .and_then(|base| base.checked_add(micros_of_day as i64))
+        .ok_or_else(|| corrupt("StarRocks direct DATETIME overflows Arrow timestamp"))
+}
+
+fn fixed_decimal(
+    body: &[u8],
+    encoding: StarRocksPageEncoding,
+    values: usize,
+    width: usize,
+    precision: u8,
+    scale: i8,
+    null_flags: Option<&[u8]>,
+) -> Result<ArrayRef, ConnectorError> {
+    let bytes = decode_fixed_values(body, encoding, values, width, width * 8)?;
+    let values = bytes
+        .chunks_exact(width)
+        .map(|value| match width {
+            4 => Ok(i128::from(i32::from_le_bytes(
+                value.try_into().expect("fixed decimal32 size"),
+            ))),
+            8 => Ok(i128::from(i64::from_le_bytes(
+                value.try_into().expect("fixed decimal64 size"),
+            ))),
+            16 => Ok(i128::from_le_bytes(
+                value.try_into().expect("fixed decimal128 size"),
+            )),
+            _ => Err(corrupt("StarRocks direct DECIMAL has an invalid width")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let array = Decimal128Array::from(apply_nulls(values, null_flags)?)
+        .with_precision_and_scale(precision, scale)
+        .map_err(|_| corrupt("StarRocks direct DECIMAL exceeds its frozen precision"))?;
+    Ok(Arc::new(array))
 }
 
 fn fixed_i8(
@@ -1007,6 +1117,17 @@ mod tests {
                 .unwrap()
                 .values(),
             &[7, 9, 11, 13]
+        );
+    }
+
+    #[test]
+    fn converts_starrocks_temporal_storage_scalars() {
+        assert_eq!(decode_starrocks_date(2_440_588).unwrap(), 0);
+        let encoded = (2_440_588_i64 << STARROCKS_DATETIME_TIME_BITS) | 123;
+        assert_eq!(decode_starrocks_datetime(encoded).unwrap(), 123);
+        assert!(
+            decode_starrocks_datetime(1_i64 << STARROCKS_DATETIME_TIME_BITS | 86_400_000_000)
+                .is_err()
         );
     }
 
