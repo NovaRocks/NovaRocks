@@ -21,7 +21,6 @@
 //! segment requiring an unimplemented index or encoding fails the
 //! attempt rather than selecting an RPC reader or looking for another tablet.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -59,11 +58,6 @@ pub(crate) fn decode_plain_segment(
             "StarRocks direct output schema and bindings differ",
         ));
     }
-    let by_id = footer
-        .columns
-        .iter()
-        .filter_map(|column| column.unique_id.map(|id| (id as i32, column)))
-        .collect::<BTreeMap<_, _>>();
     let mut arrays = Vec::with_capacity(bindings.len());
     for (output_index, binding) in bindings.iter().enumerate() {
         if binding.output_index != output_index {
@@ -78,24 +72,43 @@ pub(crate) fn decode_plain_segment(
                 "StarRocks direct output field differs from frozen mapping",
             ));
         }
-        if let Some(column) = by_id.get(&binding.unique_id) {
-            arrays.push(decode_column(
-                segment_path,
-                segment,
-                column,
-                field.data_type(),
-                footer.num_rows as usize,
-            )?);
-        } else {
-            arrays.push(default_array(
-                binding,
-                field.data_type(),
-                footer.num_rows as usize,
-            )?);
-        }
+        arrays.push(decode_frozen_column(
+            segment_path,
+            segment,
+            footer,
+            binding,
+            field.data_type(),
+        )?);
     }
     RecordBatch::try_new(output_schema, arrays)
         .map_err(|_| corrupt("StarRocks direct Arrow batch does not match frozen schema"))
+}
+
+/// Decode one physical column from an already frozen segment.  This is used
+/// only for provider-private storage metadata semantics such as delete
+/// predicates; the public reader always returns the frozen output projection.
+pub(crate) fn decode_frozen_column(
+    segment_path: &str,
+    segment: &[u8],
+    footer: &StarRocksSegmentFooter,
+    binding: &StarRocksDirectColumnBinding,
+    output_type: &DataType,
+) -> Result<ArrayRef, ConnectorError> {
+    let column = footer
+        .columns
+        .iter()
+        .find(|column| column.unique_id == u32::try_from(binding.unique_id).ok());
+    if let Some(column) = column {
+        decode_column(
+            segment_path,
+            segment,
+            column,
+            output_type,
+            footer.num_rows as usize,
+        )
+    } else {
+        default_array(binding, output_type, footer.num_rows as usize)
+    }
 }
 
 fn default_array(
@@ -736,6 +749,25 @@ mod tests {
         assert_eq!(
             batch
                 .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[7, 9]
+        );
+    }
+
+    #[test]
+    fn decodes_frozen_auxiliary_column_for_storage_metadata_semantics() {
+        let bytes = segment(&[7, 9]);
+        let footer = super::super::segment::decode_segment_footer("seg", &bytes).unwrap();
+        let binding =
+            StarRocksDirectColumnBinding::try_new(0, 1, "predicate_id", "BIGINT", false, None)
+                .unwrap();
+        let values =
+            decode_frozen_column("seg", &bytes, &footer, &binding, &DataType::Int64).unwrap();
+        assert_eq!(
+            values
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap()

@@ -26,7 +26,7 @@ use arrow::array::{
     Int32Array, Int64Array, StringArray,
 };
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use novarocks_fs::{
@@ -42,10 +42,11 @@ use roaring::RoaringBitmap;
 use crate::direct::reader::StarRocksDirectStorageResolver;
 use crate::direct::staros::{StarOsV1ObjectStoreResolver, StarRocksDirectIoRuntime};
 use crate::direct::{
-    StarRocksDirectMetadataLayout, StarRocksDirectSplit, StarRocksSharedDataDirectReaderFactory,
+    StarRocksDirectColumnBinding, StarRocksDirectMetadataLayout, StarRocksDirectSplit,
+    StarRocksSharedDataDirectReaderFactory,
 };
 
-use super::kernel::decode_plain_segment;
+use super::kernel::{decode_frozen_column, decode_plain_segment};
 use super::segment::decode_segment_footer;
 use super::wire::{
     StorageDeletePredicate, StorageModel, StorageRowset, StorageSchema, StorageTabletMetadata,
@@ -169,11 +170,26 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                     request.expected_schema.clone(),
                     split.columns(),
                 )?;
-                for predicate in metadata.rowsets[rowset_index..]
+                let predicates = metadata.rowsets[rowset_index..]
                     .iter()
                     .filter_map(|rowset| rowset.delete_predicate.as_ref())
-                {
-                    batch = apply_storage_delete_predicate(&batch, predicate)?;
+                    .collect::<Vec<_>>();
+                if !predicates.is_empty() {
+                    let mut predicate_batch = augment_predicate_batch(
+                        &batch,
+                        &segment_path,
+                        &segment,
+                        &footer,
+                        &metadata,
+                        rowset,
+                        &predicates,
+                    )?;
+                    for predicate in predicates {
+                        predicate_batch =
+                            apply_storage_delete_predicate(&predicate_batch, predicate)?;
+                    }
+                    batch =
+                        project_frozen_output(&predicate_batch, request.expected_schema.clone())?;
                 }
                 if let Some((deleted, bytes, cache_hit)) =
                     self.load_delvec(split, &access, &metadata, rowset, index, &request.context)?
@@ -480,6 +496,124 @@ fn apply_storage_delete_predicate(
     );
     filter_record_batch(batch, &keep)
         .map_err(|_| corrupt("failed to apply StarRocks direct storage delete predicate"))
+}
+
+fn augment_predicate_batch(
+    batch: &RecordBatch,
+    segment_path: &str,
+    segment: &[u8],
+    footer: &super::segment::StarRocksSegmentFooter,
+    metadata: &StorageTabletMetadata,
+    rowset: &StorageRowset,
+    predicates: &[&StorageDeletePredicate],
+) -> Result<RecordBatch, ConnectorError> {
+    let mut columns = batch.columns().to_vec();
+    let mut fields = batch.schema().fields().to_vec();
+    let source_schema = metadata
+        .rowset_to_schema
+        .get(&rowset.id)
+        .map(|schema_id| {
+            metadata.historical_schemas.get(schema_id).ok_or_else(|| {
+                corrupt("StarRocks rowset predicate schema is missing from frozen metadata")
+            })
+        })
+        .transpose()?
+        .unwrap_or(&metadata.schema);
+    let required = predicates
+        .iter()
+        .flat_map(|predicate| {
+            predicate
+                .in_predicates
+                .iter()
+                .map(|term| term.column_name.as_str())
+                .chain(
+                    predicate
+                        .binary_predicates
+                        .iter()
+                        .map(|term| term.column_name.as_str()),
+                )
+                .chain(
+                    predicate
+                        .is_null_predicates
+                        .iter()
+                        .map(|term| term.column_name.as_str()),
+                )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for name in required {
+        if batch.column_by_name(name).is_some() {
+            continue;
+        }
+        let current = metadata
+            .schema
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .ok_or_else(|| {
+                unsupported(
+                    "StarRocks direct storage delete predicate references an unknown column",
+                )
+            })?;
+        let source = source_schema
+            .columns
+            .iter()
+            .find(|column| column.unique_id == current.unique_id);
+        let physical_type = source
+            .map(|column| column.physical_type.as_str())
+            .unwrap_or(current.physical_type.as_str());
+        let data_type = storage_arrow_type(physical_type)?;
+        let binding = StarRocksDirectColumnBinding::try_new(
+            0,
+            current.unique_id,
+            current.name.clone(),
+            physical_type,
+            source
+                .map(|column| column.nullable)
+                .unwrap_or(current.nullable),
+            current.default_value.clone().map(Bytes::from),
+        )?;
+        let column = decode_frozen_column(segment_path, segment, footer, &binding, &data_type)?;
+        if column.len() != batch.num_rows() {
+            return Err(corrupt(
+                "StarRocks direct storage predicate column row count differs from output",
+            ));
+        }
+        fields.push(Arc::new(Field::new(name, data_type, binding.nullable)));
+        columns.push(column);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|_| corrupt("StarRocks direct storage predicate batch is invalid"))
+}
+
+fn project_frozen_output(
+    batch: &RecordBatch,
+    schema: Arc<Schema>,
+) -> Result<RecordBatch, ConnectorError> {
+    if batch.num_columns() < schema.fields().len() {
+        return Err(corrupt(
+            "StarRocks direct storage predicate batch loses a frozen output column",
+        ));
+    }
+    let output_columns = schema.fields().len();
+    RecordBatch::try_new(schema, batch.columns()[..output_columns].to_vec())
+        .map_err(|_| corrupt("StarRocks direct storage predicate projection is invalid"))
+}
+
+fn storage_arrow_type(physical_type: &str) -> Result<DataType, ConnectorError> {
+    match physical_type.trim().to_ascii_uppercase().as_str() {
+        "TINYINT" => Ok(DataType::Int8),
+        "SMALLINT" => Ok(DataType::Int16),
+        "INT" => Ok(DataType::Int32),
+        "BIGINT" => Ok(DataType::Int64),
+        "FLOAT" => Ok(DataType::Float32),
+        "DOUBLE" => Ok(DataType::Float64),
+        "BOOLEAN" => Ok(DataType::Boolean),
+        "CHAR" | "VARCHAR" => Ok(DataType::Utf8),
+        "BINARY" | "VARBINARY" => Ok(DataType::Binary),
+        _ => Err(unsupported(
+            "StarRocks direct storage delete predicate physical type is unsupported",
+        )),
+    }
 }
 
 fn predicate_matches_row(
