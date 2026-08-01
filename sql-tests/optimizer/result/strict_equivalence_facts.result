@@ -10,9 +10,9 @@ RUNTIME FILTER GRAPH
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-10:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=2}
-  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) bcast_verdict=feasible stats={rows=2}
-    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) bcast_verdict=feasible stats={rows=2}
+10:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=2025}
+  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) bcast_verdict=feasible stats={rows=2025}
+    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) bcast_verdict=feasible stats={rows=2025}
       3:PROJECT [a1, a2, payload] stats={rows=2025}
         2:PROJECT [strict_eq_a.a1 AS a1, strict_eq_a.a2 AS a2, strict_eq_a.payload AS payload] stats={rows=2025}
           1:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_a stats={rows=2025}
@@ -57,9 +57,9 @@ RUNTIME FILTER GRAPH
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-10:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=2}
-  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) bcast_verdict=feasible stats={rows=2}
-    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) bcast_verdict=feasible stats={rows=2}
+10:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=2025}
+  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) bcast_verdict=feasible stats={rows=2025}
+    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) bcast_verdict=feasible stats={rows=2025}
       3:PROJECT [a1, a2, payload] stats={rows=2025}
         2:PROJECT [strict_eq_a.a1 AS a1, strict_eq_a.a2 AS a2, strict_eq_a.payload AS payload] stats={rows=2025}
           1:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_a stats={rows=2025}

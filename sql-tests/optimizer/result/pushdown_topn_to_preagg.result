@@ -3,8 +3,7 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-13:PROJECT [city, sum(sales)] stats={rows=10}
-  12:MERGING-EXCHANGE stats={rows=10}
+12:MERGING-EXCHANGE stats={rows=10}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -12,55 +11,55 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 12
     PARTITION: UNPARTITIONED
 11:LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
-  10:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=10}
-    aggregations: sum(sales)
-    9:HASH EXCHANGE stats={rows=10}
-PLAN FRAGMENT 2
-  OUTPUT EXPRS: *
-  PARTITION: UNPARTITIONED
-  STREAM DATA SINK
-    EXCHANGE ID: 9
-    PARTITION: HASH_PARTITIONED (city)
-8:LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
-  7:HASH AGGREGATE (LOCAL, group by: [city]) stats={rows=2000}
-    aggregations: sum(sales)
-    6:PROJECT [city, sales] stats={rows=200000}
-      5:UNION ALL stats={rows=200000}
-        2:PROJECT [city, sales] stats={rows=100000}
-          1:SCAN db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg stats={rows=100000}
-               TABLE: db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg
-               columns: city, sales
-               min-max stats
-        4:PROJECT [city, sales] stats={rows=100000}
-          3:SCAN db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg stats={rows=100000}
-               TABLE: db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg
-               columns: city, sales
-               min-max stats
-
--- query 8
-Explain String
-PLAN FRAGMENT 0
-  OUTPUT EXPRS: *
-  PARTITION: UNPARTITIONED
-12:PROJECT [city, sum(sales)] stats={rows=10}
-  11:MERGING-EXCHANGE stats={rows=10}
-PLAN FRAGMENT 1
-  OUTPUT EXPRS: *
-  PARTITION: UNPARTITIONED
-  STREAM DATA SINK
-    EXCHANGE ID: 11
-    PARTITION: UNPARTITIONED
-10:LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
-  9:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=2000}
-    aggregations: sum(sales)
-    8:HASH EXCHANGE stats={rows=2000}
+  10:PROJECT [city, sum(sales)] stats={rows=10}
+    9:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=10}
+      aggregations: sum(sales)
+      8:HASH EXCHANGE stats={rows=10}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 8
     PARTITION: HASH_PARTITIONED (city)
-7:HASH AGGREGATE (LOCAL, group by: [city]) stats={rows=2000}
+7:HASH AGGREGATE (LOCAL, group by: [city]) stats={rows=10}
+  aggregations: sum(sales)
+  6:PROJECT [city, sales] stats={rows=200000}
+    5:UNION ALL stats={rows=200000}
+      2:PROJECT [city, sales] stats={rows=100000}
+        1:SCAN db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg stats={rows=100000}
+             TABLE: db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg
+             columns: city, sales
+             min-max stats
+      4:PROJECT [city, sales] stats={rows=100000}
+        3:SCAN db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg stats={rows=100000}
+             TABLE: db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg
+             columns: city, sales
+             min-max stats
+
+-- query 8
+Explain String
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+12:MERGING-EXCHANGE stats={rows=10}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
+  10:PROJECT [city, sum(sales)] stats={rows=10}
+    9:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=10}
+      aggregations: sum(sales)
+      8:HASH EXCHANGE stats={rows=10}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: HASH_PARTITIONED (city)
+7:HASH AGGREGATE (LOCAL, group by: [city]) stats={rows=10}
   aggregations: sum(sales)
   6:PROJECT [city, sales] stats={rows=200000}
     5:UNION ALL stats={rows=200000}
@@ -80,25 +79,25 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-12:PROJECT [city, sum(sales) AS s] stats={rows=10}
-  11:MERGING-EXCHANGE stats={rows=10}
+12:MERGING-EXCHANGE stats={rows=10}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 11
+    EXCHANGE ID: 12
     PARTITION: UNPARTITIONED
-10:LOCAL TOP-N (limit=10, offset=0) [sum(sales) DESC NULLS LAST] stats={rows=10}
-  9:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=2000}
-    aggregations: sum(sales)
-    8:HASH EXCHANGE stats={rows=2000}
+11:LOCAL TOP-N (limit=10, offset=0) [s DESC NULLS LAST] stats={rows=10}
+  10:PROJECT [city, sum(sales) AS s] stats={rows=10}
+    9:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=10}
+      aggregations: sum(sales)
+      8:HASH EXCHANGE stats={rows=10}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 8
     PARTITION: HASH_PARTITIONED (city)
-7:HASH AGGREGATE (LOCAL, group by: [city]) stats={rows=2000}
+7:HASH AGGREGATE (LOCAL, group by: [city]) stats={rows=10}
   aggregations: sum(sales)
   6:PROJECT [city, sales] stats={rows=200000}
     5:UNION ALL stats={rows=200000}
@@ -118,26 +117,35 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-10:PROJECT [city, sales, sum(sales) AS s] stats={rows=10}
-  9:TOP-N (limit=10) [city ASC NULLS FIRST] stats={rows=10}
-    8:HASH AGGREGATE (SINGLE, group by: [city, sales]) stats={rows=200000}
-      aggregations: sum(sales)
-      7:GATHER stats={rows=200000}
+12:PROJECT [city, sales, sum(sales) AS s] stats={rows=10}
+  11:MERGING-EXCHANGE stats={rows=10}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 7
+    EXCHANGE ID: 11
     PARTITION: UNPARTITIONED
-6:PROJECT [city, sales] stats={rows=200000}
-  5:UNION ALL stats={rows=200000}
-    2:PROJECT [city, sales] stats={rows=100000}
-      1:SCAN db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg stats={rows=100000}
-           TABLE: db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg
-           columns: city, sales
-           min-max stats
-    4:PROJECT [city, sales] stats={rows=100000}
-      3:SCAN db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg stats={rows=100000}
-           TABLE: db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg
-           columns: city, sales
-           min-max stats
+10:LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
+  9:HASH AGGREGATE (GLOBAL, group by: [city, sales]) stats={rows=32}
+    aggregations: sum(sales)
+    8:HASH EXCHANGE stats={rows=32}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: HASH_PARTITIONED (city, sales)
+7:HASH AGGREGATE (LOCAL, group by: [city, sales]) stats={rows=32}
+  aggregations: sum(sales)
+  6:PROJECT [city, sales] stats={rows=200000}
+    5:UNION ALL stats={rows=200000}
+      2:PROJECT [city, sales] stats={rows=100000}
+        1:SCAN db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg stats={rows=100000}
+             TABLE: db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg
+             columns: city, sales
+             min-max stats
+      4:PROJECT [city, sales] stats={rows=100000}
+        3:SCAN db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg stats={rows=100000}
+             TABLE: db_sqlt_b47c40e2e5524d91.t_pushdown_topn_preagg
+             columns: city, sales
+             min-max stats

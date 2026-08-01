@@ -6,29 +6,29 @@ RUNTIME FILTER GRAPH
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-11:PROJECT [a.k AS k, sum(a.v)] stats={rows=50}
-  10:PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=50}
-    9:HASH AGGREGATE (SINGLE, group by: [a.k]) stats={rows=50}
+11:PROJECT [a.k AS k, sum(a.v)] stats={rows=10}
+  10:PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=10}
+    9:HASH AGGREGATE (SINGLE, group by: [a.k]) stats={rows=10}
       aggregations: sum(sum(a.v))
-      8:GATHER stats={rows=100}
+      8:GATHER stats={rows=125}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 8
     PARTITION: UNPARTITIONED
-7:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [b.k = a.k]) stats={rows=100}
+7:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [b.k = a.k]) stats={rows=125}
   2:HASH EXCHANGE stats={rows=50}
-  6:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
+  6:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
     aggregations: sum(a.v)
-    5:HASH EXCHANGE stats={rows=100}
+    5:HASH EXCHANGE stats={rows=10}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 5
     PARTITION: HASH_PARTITIONED (k)
-4:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=100}
+4:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=10}
   aggregations: sum(a.v)
   3:SCAN db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a (alias=a) stats={rows=20000}
        TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a

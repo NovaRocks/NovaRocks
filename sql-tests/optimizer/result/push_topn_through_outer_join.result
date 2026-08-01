@@ -5,7 +5,7 @@ PLAN FRAGMENT 0
   PARTITION: UNPARTITIONED
 8:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=5}
   7:TOP-N (limit=5) [l.score ASC NULLS FIRST] stats={rows=5}
-    6:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=5}
+    6:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=1000}
       3:MERGING-EXCHANGE stats={rows=5}
       5:GATHER stats={rows=1000}
 PLAN FRAGMENT 1
@@ -47,8 +47,8 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 8
     PARTITION: UNPARTITIONED
 7:LOCAL TOP-N (limit=5, offset=0) [r.payload DESC NULLS LAST] stats={rows=5}
-  6:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=1000}
-    5:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [l.id = r.id]) stats={rows=1000}
+  6:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=100000}
+    5:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [l.id = r.id]) stats={rows=100000}
       2:HASH EXCHANGE stats={rows=100000}
       4:HASH EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 2
@@ -151,8 +151,8 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 7
     PARTITION: UNPARTITIONED
 6:LOCAL TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
-  5:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=900}
-    4:HASH JOIN (BROADCAST, INNER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=900}
+  5:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=90000}
+    4:HASH JOIN (BROADCAST, INNER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=90000}
       1:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=90000}
            TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
            columns: id, score
