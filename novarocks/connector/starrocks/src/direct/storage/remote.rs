@@ -18,7 +18,7 @@
 //! Startup-local object-store adapter for frozen direct read splits.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -51,6 +51,7 @@ pub struct StarRocksSharedDataStorageResolver {
     staros: StarOsV1ObjectStoreResolver,
     fs: FsAccessResolver,
     runtime: StarRocksDirectIoRuntime,
+    cache: Mutex<BTreeMap<DirectStorageCacheKey, Bytes>>,
 }
 
 impl StarRocksSharedDataStorageResolver {
@@ -63,6 +64,7 @@ impl StarRocksSharedDataStorageResolver {
             staros,
             fs,
             runtime,
+            cache: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -93,7 +95,13 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
             ));
         }
         let metadata_path = join_frozen_path(split.tablet_root(), split.metadata_relative_path())?;
-        let metadata_bytes = self.read_exact(&access, &metadata_path, &request.context)?;
+        let (metadata_bytes, metadata_cache_hit) = self.read_cached(
+            split,
+            &access,
+            &metadata_path,
+            FileReadRange::WholeFile,
+            &request.context,
+        )?;
         let metadata = match split.metadata_layout() {
             StarRocksDirectMetadataLayout::Standalone => decode_standalone_metadata(
                 &metadata_bytes,
@@ -107,8 +115,12 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
         validate_metadata(split, &metadata)?;
 
         let mut chunks = VecDeque::new();
-        let mut bytes_read = metadata_bytes.len() as u64;
-        let mut read_requests = 1u64;
+        let mut bytes_read = (!metadata_cache_hit)
+            .then_some(metadata_bytes.len() as u64)
+            .unwrap_or(0);
+        let mut read_requests = u64::from(!metadata_cache_hit);
+        let mut cache_hits = u64::from(metadata_cache_hit);
+        let mut cache_misses = u64::from(!metadata_cache_hit);
         for rowset in &metadata.rowsets {
             ensure_active(&request.context)?;
             if rowset.delete_predicate.is_some() {
@@ -118,17 +130,18 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
             }
             for (index, relative_path) in rowset.segments.iter().enumerate() {
                 let segment_path = join_frozen_path(split.tablet_root(), relative_path)?;
-                let segment = if let Some(offset) = rowset.bundle_offsets.get(index) {
+                let range = if let Some(offset) = rowset.bundle_offsets.get(index) {
                     let offset = u64::try_from(*offset)
                         .map_err(|_| corrupt("StarRocks bundle segment offset is invalid"))?;
                     let size = *rowset.segment_sizes.get(index).ok_or_else(|| {
                         corrupt("StarRocks bundle segment is missing its frozen size")
                     })?;
-                    let range = FileReadRange::bounded(offset, size).map_err(map_file_error)?;
-                    self.read_range(&access, &segment_path, range, &request.context)?
+                    FileReadRange::bounded(offset, size).map_err(map_file_error)?
                 } else {
-                    self.read_exact(&access, &segment_path, &request.context)?
+                    FileReadRange::WholeFile
                 };
+                let (segment, cache_hit) =
+                    self.read_cached(split, &access, &segment_path, range, &request.context)?;
                 if let Some(expected_size) = rowset.segment_sizes.get(index)
                     && *expected_size != segment.len() as u64
                 {
@@ -136,8 +149,13 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                         "StarRocks frozen segment size differs from storage metadata",
                     ));
                 }
-                bytes_read = bytes_read.saturating_add(segment.len() as u64);
-                read_requests = read_requests.saturating_add(1);
+                if cache_hit {
+                    cache_hits = cache_hits.saturating_add(1);
+                } else {
+                    cache_misses = cache_misses.saturating_add(1);
+                    bytes_read = bytes_read.saturating_add(segment.len() as u64);
+                    read_requests = read_requests.saturating_add(1);
+                }
                 let footer = decode_segment_footer(&segment_path, &segment)?;
                 let batch = decode_plain_segment(
                     &segment_path,
@@ -156,6 +174,8 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                 metrics: ConnectorReaderMetricsSnapshot {
                     bytes_read,
                     read_requests,
+                    cache_hits,
+                    cache_misses,
                     ..ConnectorReaderMetricsSnapshot::default()
                 },
             }),
@@ -165,13 +185,41 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
 }
 
 impl StarRocksSharedDataStorageResolver {
-    fn read_exact(
+    fn read_cached(
         &self,
+        split: &StarRocksDirectSplit,
         access: &FsAccessHandle,
         location: &str,
+        range: FileReadRange,
         context: &ConnectorRequestContext,
-    ) -> Result<Bytes, ConnectorError> {
-        self.read_range(access, location, FileReadRange::WholeFile, context)
+    ) -> Result<(Bytes, bool), ConnectorError> {
+        let key = DirectStorageCacheKey::new(split, location, range);
+        if let Some(bytes) = self
+            .cache
+            .lock()
+            .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "StarRocks direct cache lock poisoned",
+                )
+            })?
+            .get(&key)
+            .cloned()
+        {
+            return Ok((bytes, true));
+        }
+        let bytes = self.read_range(access, location, range, context)?;
+        let mut cache = self.cache.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "StarRocks direct cache lock poisoned",
+            )
+        })?;
+        if cache.len() >= 128 {
+            let _ = cache.pop_first();
+        }
+        cache.insert(key, bytes.clone());
+        Ok((bytes, false))
     }
 
     fn read_range(
@@ -188,6 +236,40 @@ impl StarRocksSharedDataStorageResolver {
         let context = (*context).clone();
         self.runtime
             .block_on(async move { read_file(file, range, context).await })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DirectStorageCacheKey {
+    owner: Arc<str>,
+    incarnation: [u8; 16],
+    storage_identity: Arc<str>,
+    tablet_id: i64,
+    tablet_version: i64,
+    schema_version: Bytes,
+    data_version: Bytes,
+    output_schema_digest: [u8; 32],
+    location: Arc<str>,
+    range: (u64, u64, bool),
+}
+
+impl DirectStorageCacheKey {
+    fn new(split: &StarRocksDirectSplit, location: &str, range: FileReadRange) -> Self {
+        Self {
+            owner: Arc::clone(&split.owner),
+            incarnation: split.incarnation,
+            storage_identity: Arc::from(split.storage_identity()),
+            tablet_id: split.tablet_id(),
+            tablet_version: split.tablet_version(),
+            schema_version: split.schema_version.clone(),
+            data_version: split.data_version.clone(),
+            output_schema_digest: split.output_schema_digest,
+            location: Arc::from(location),
+            range: match range {
+                FileReadRange::WholeFile => (0, 0, true),
+                FileReadRange::Bounded { offset, length } => (offset, length, false),
+            },
+        }
     }
 }
 
