@@ -173,6 +173,7 @@ fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
     let ledger = frontend_ledger();
     let refresh = repository
         .begin_frontend_refresh_intent(BeginFrontendMvRefreshIntentRequest {
+            refresh_id: 9001,
             mv_id: definition.mv_id,
             target_catalog: "ice".to_string(),
             target_namespace: "sales".to_string(),
@@ -187,6 +188,10 @@ fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
     assert_eq!(
         refresh.operation_id, None,
         "v3 must not create legacy operation rows"
+    );
+    assert_eq!(
+        refresh.refresh_id, 9001,
+        "v3 keeps the preallocated identity"
     );
     assert_eq!(
         refresh.lifecycle_owner,

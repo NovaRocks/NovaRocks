@@ -76,6 +76,10 @@ pub struct StateStoreMvRepository {
 /// StateStore record is the single journal for current attempts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeginFrontendMvRefreshIntentRequest {
+    /// Stable, caller-preallocated identity for this attempt. The frontend
+    /// needs it before intent persistence because the provider-visible
+    /// staging ref and commit marker are derived from the same identity.
+    pub refresh_id: i64,
     pub mv_id: i64,
     pub target_catalog: String,
     pub target_namespace: String,
@@ -1258,7 +1262,6 @@ impl StateStoreMvRepository {
         request.ledger.validate().map_err(invalid)?;
         self.require_definition_async(request.mv_id).await?;
         let operation_id = Uuid::now_v7();
-        let page_size = self.store.limits().max_page_size;
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -1276,7 +1279,7 @@ impl StateStoreMvRepository {
                             request.mv_id
                         )));
                     }
-                    let refresh_id = allocate_refresh_id(transaction, page_size).await?;
+                    let refresh_id = request.refresh_id;
                     definition.refresh_in_progress = true;
                     definition.active_refresh_id = Some(refresh_id);
                     definition.refresh_target_snapshots = request.base_snapshots.clone();
@@ -2893,7 +2896,8 @@ fn validate_iceberg_refresh_request(
 fn validate_frontend_refresh_request(
     request: &BeginFrontendMvRefreshIntentRequest,
 ) -> Result<(), MvRepositoryError> {
-    if request.mv_id <= 0
+    if request.refresh_id <= 0
+        || request.mv_id <= 0
         || request.target_catalog.is_empty()
         || request.target_namespace.is_empty()
         || request.target_table.is_empty()
@@ -2901,7 +2905,7 @@ fn validate_frontend_refresh_request(
         || request.marker_token.is_empty()
     {
         return Err(invalid(
-            "frontend MV refresh request requires non-empty identifiers and a positive MV ID",
+            "frontend MV refresh request requires non-empty identifiers and positive refresh and MV IDs",
         ));
     }
     if !request.ledger.actions.is_empty() {
