@@ -473,7 +473,7 @@ fn replace_values_chunk(
         ExecNodeKind::Analytic(value) => {
             replace_values_chunk(&mut value.input, target_node_id, chunk)
         }
-        ExecNodeKind::NativeRuntimeFilterConsumer(value) => {
+        ExecNodeKind::RuntimeFilterConsumer(value) => {
             replace_values_chunk(value.input_mut(), target_node_id, chunk)
         }
         ExecNodeKind::Join(value) => {
@@ -919,7 +919,7 @@ fn collect_exchange_contracts(
                     visit(input, contracts)?;
                 }
             }
-            ExecNodeKind::NativeRuntimeFilterConsumer(value) => visit(value.input(), contracts)?,
+            ExecNodeKind::RuntimeFilterConsumer(value) => visit(value.input(), contracts)?,
             ExecNodeKind::Values(_) | ExecNodeKind::Scan(_) | ExecNodeKind::LookUp(_) => {}
         }
         Ok(())
@@ -1020,7 +1020,7 @@ fn collect_row_position_descriptors(
                 collect_row_position_descriptors(input, output)?;
             }
         }
-        ExecNodeKind::NativeRuntimeFilterConsumer(value) => {
+        ExecNodeKind::RuntimeFilterConsumer(value) => {
             collect_row_position_descriptors(value.input(), output)?
         }
         ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::Scan(_) => {}
