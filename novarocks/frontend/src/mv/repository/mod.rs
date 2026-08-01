@@ -1352,7 +1352,7 @@ impl StateStoreMvRepository {
                         invalid_state_store("frontend-owned MV refresh has no v3 ledger")
                     })?;
                     let expected_operation_id = frontend_action_operation_id(ledger, &action.phase);
-                    if action.operation_id != expected_operation_id {
+                    if action.operation_id.as_slice() != expected_operation_id {
                         return Err(conflict_state_store(format!(
                             "mv refresh {refresh_id} action does not use its preallocated operation ID"
                         )));
@@ -2923,10 +2923,10 @@ fn validate_frontend_refresh_action(
     Ok(())
 }
 
-fn frontend_action_operation_id(
-    ledger: &FrontendMvRefreshLedger,
+fn frontend_action_operation_id<'a>(
+    ledger: &'a FrontendMvRefreshLedger,
     phase: &FrontendMvRefreshActionPhase,
-) -> &Vec<u8> {
+) -> &'a [u8] {
     match phase {
         FrontendMvRefreshActionPhase::StagingCreate => &ledger.staging_create_operation_id,
         FrontendMvRefreshActionPhase::Write => &ledger.write_operation_id,
