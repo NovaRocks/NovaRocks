@@ -21,8 +21,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::BooleanArray;
+use arrow::array::{
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, StringArray,
+};
 use arrow::compute::filter_record_batch;
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use novarocks_fs::{
@@ -44,8 +48,8 @@ use crate::direct::{
 use super::kernel::decode_plain_segment;
 use super::segment::decode_segment_footer;
 use super::wire::{
-    StorageModel, StorageRowset, StorageSchema, StorageTabletMetadata, decode_bundle_metadata,
-    decode_standalone_metadata,
+    StorageDeletePredicate, StorageModel, StorageRowset, StorageSchema, StorageTabletMetadata,
+    decode_bundle_metadata, decode_standalone_metadata,
 };
 use super::{DirectStorageConnectorReader, DirectStorageReader, slice_batch};
 
@@ -119,19 +123,16 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
         validate_metadata(split, &metadata)?;
 
         let mut chunks = VecDeque::new();
-        let mut bytes_read = (!metadata_cache_hit)
-            .then_some(metadata_bytes.len() as u64)
-            .unwrap_or(0);
+        let mut bytes_read = if metadata_cache_hit {
+            0
+        } else {
+            metadata_bytes.len() as u64
+        };
         let mut read_requests = u64::from(!metadata_cache_hit);
         let mut cache_hits = u64::from(metadata_cache_hit);
         let mut cache_misses = u64::from(!metadata_cache_hit);
-        for rowset in &metadata.rowsets {
+        for (rowset_index, rowset) in metadata.rowsets.iter().enumerate() {
             ensure_active(&request.context)?;
-            if rowset.delete_predicate.is_some() {
-                return Err(unsupported(
-                    "StarRocks direct storage delete predicates are not implemented",
-                ));
-            }
             for (index, relative_path) in rowset.segments.iter().enumerate() {
                 let segment_path = join_frozen_path(split.tablet_root(), relative_path)?;
                 let range = if let Some(offset) = rowset.bundle_offsets.get(index) {
@@ -168,6 +169,12 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                     request.expected_schema.clone(),
                     split.columns(),
                 )?;
+                for predicate in metadata.rowsets[rowset_index..]
+                    .iter()
+                    .filter_map(|rowset| rowset.delete_predicate.as_ref())
+                {
+                    batch = apply_storage_delete_predicate(&batch, predicate)?;
+                }
                 if let Some((deleted, bytes, cache_hit)) =
                     self.load_delvec(split, &access, &metadata, rowset, index, &request.context)?
                 {
@@ -457,6 +464,306 @@ fn crc32c_unmask(masked: u32) -> u32 {
     masked.wrapping_sub(CRC32C_MASK_DELTA).rotate_right(17)
 }
 
+fn apply_storage_delete_predicate(
+    batch: &RecordBatch,
+    predicate: &StorageDeletePredicate,
+) -> Result<RecordBatch, ConnectorError> {
+    if !predicate.sub_predicates.is_empty() {
+        return Err(unsupported(
+            "StarRocks direct storage delete predicate text clauses are unsupported",
+        ));
+    }
+    let keep = BooleanArray::from_iter(
+        (0..batch.num_rows())
+            .map(|row| predicate_matches_row(batch, predicate, row).map(|deleted| Some(!deleted)))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    filter_record_batch(batch, &keep)
+        .map_err(|_| corrupt("failed to apply StarRocks direct storage delete predicate"))
+}
+
+fn predicate_matches_row(
+    batch: &RecordBatch,
+    predicate: &StorageDeletePredicate,
+    row: usize,
+) -> Result<bool, ConnectorError> {
+    for term in &predicate.in_predicates {
+        let values = term
+            .values
+            .iter()
+            .map(|value| normalized_literal(value))
+            .collect::<Vec<_>>();
+        if !matches_column_value(
+            batch,
+            &term.column_name,
+            row,
+            if term.is_not_in {
+                DeleteOp::NotIn
+            } else {
+                DeleteOp::In
+            },
+            &values,
+        )? {
+            return Ok(false);
+        }
+    }
+    for term in &predicate.binary_predicates {
+        let op = DeleteOp::parse(&term.op)?;
+        if !matches_column_value(
+            batch,
+            &term.column_name,
+            row,
+            op,
+            &[normalized_literal(&term.value)],
+        )? {
+            return Ok(false);
+        }
+    }
+    for term in &predicate.is_null_predicates {
+        let op = if term.is_not_null {
+            DeleteOp::IsNotNull
+        } else {
+            DeleteOp::IsNull
+        };
+        if !matches_column_value(batch, &term.column_name, row, op, &[])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Copy)]
+enum DeleteOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    In,
+    NotIn,
+    IsNull,
+    IsNotNull,
+}
+
+impl DeleteOp {
+    fn parse(value: &str) -> Result<Self, ConnectorError> {
+        match value.trim() {
+            "=" => Ok(Self::Eq),
+            "!=" => Ok(Self::Ne),
+            "<" | "<<" => Ok(Self::Lt),
+            "<=" => Ok(Self::Le),
+            ">" | ">>" => Ok(Self::Gt),
+            ">=" => Ok(Self::Ge),
+            _ => Err(unsupported(
+                "StarRocks direct storage delete predicate operator is unsupported",
+            )),
+        }
+    }
+}
+
+fn matches_column_value(
+    batch: &RecordBatch,
+    name: &str,
+    row: usize,
+    op: DeleteOp,
+    values: &[String],
+) -> Result<bool, ConnectorError> {
+    let array = batch.column_by_name(name).ok_or_else(|| {
+        unsupported("StarRocks direct storage delete predicate requires a non-projected column")
+    })?;
+    if array.is_null(row) {
+        return Ok(matches!(op, DeleteOp::IsNull));
+    }
+    if matches!(op, DeleteOp::IsNull) {
+        return Ok(false);
+    }
+    if matches!(op, DeleteOp::IsNotNull) {
+        return Ok(true);
+    }
+    match array.data_type() {
+        DataType::Int8 => typed_scalar(
+            array,
+            op,
+            values,
+            |array| {
+                array
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .map(|array| array.value(row))
+            },
+            |value| value.parse::<i8>(),
+        ),
+        DataType::Int16 => typed_scalar(
+            array,
+            op,
+            values,
+            |array| {
+                array
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .map(|array| array.value(row))
+            },
+            |value| value.parse::<i16>(),
+        ),
+        DataType::Int32 => typed_scalar(
+            array,
+            op,
+            values,
+            |array| {
+                array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .map(|array| array.value(row))
+            },
+            |value| value.parse::<i32>(),
+        ),
+        DataType::Int64 => typed_scalar(
+            array,
+            op,
+            values,
+            |array| {
+                array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .map(|array| array.value(row))
+            },
+            |value| value.parse::<i64>(),
+        ),
+        DataType::Float32 => typed_scalar(
+            array,
+            op,
+            values,
+            |array| {
+                array
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .map(|array| array.value(row))
+            },
+            |value| value.parse::<f32>(),
+        ),
+        DataType::Float64 => typed_scalar(
+            array,
+            op,
+            values,
+            |array| {
+                array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .map(|array| array.value(row))
+            },
+            |value| value.parse::<f64>(),
+        ),
+        DataType::Boolean => typed_scalar(
+            array,
+            op,
+            values,
+            |array| {
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .map(|array| array.value(row))
+            },
+            |value| match value.to_ascii_lowercase().as_str() {
+                "1" | "true" => Ok(true),
+                "0" | "false" => Ok(false),
+                _ => Err(()),
+            },
+        ),
+        DataType::Utf8 => match_bytes(array, row, op, values),
+        DataType::Binary => match_bytes(array, row, op, values),
+        _ => Err(unsupported(
+            "StarRocks direct storage delete predicate type is unsupported",
+        )),
+    }
+}
+
+fn typed_scalar<T, E>(
+    array: &dyn Array,
+    op: DeleteOp,
+    raw: &[String],
+    value: impl FnOnce(&dyn Array) -> Option<T>,
+    parse: impl Fn(&str) -> Result<T, E>,
+) -> Result<bool, ConnectorError>
+where
+    T: Copy + PartialEq + PartialOrd,
+{
+    let values = raw
+        .iter()
+        .map(|value| {
+            parse(value).map_err(|_| {
+                corrupt("StarRocks direct storage delete predicate literal is invalid")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let value = value(array)
+        .ok_or_else(|| corrupt("StarRocks direct storage delete predicate Arrow type mismatch"))?;
+    Ok(compare(value, op, &values))
+}
+
+fn match_bytes(
+    array: &dyn Array,
+    row: usize,
+    op: DeleteOp,
+    raw: &[String],
+) -> Result<bool, ConnectorError> {
+    let value = if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        array.value(row).as_bytes()
+    } else if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
+        array.value(row)
+    } else {
+        return Err(corrupt(
+            "StarRocks direct storage delete predicate Arrow type mismatch",
+        ));
+    };
+    Ok(compare_bytes(
+        value,
+        op,
+        &raw.iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn compare<T: Copy + PartialEq + PartialOrd>(value: T, op: DeleteOp, values: &[T]) -> bool {
+    match op {
+        DeleteOp::Eq => values.first() == Some(&value),
+        DeleteOp::Ne => values.first().is_some_and(|other| value != *other),
+        DeleteOp::Lt => values.first().is_some_and(|other| value < *other),
+        DeleteOp::Le => values.first().is_some_and(|other| value <= *other),
+        DeleteOp::Gt => values.first().is_some_and(|other| value > *other),
+        DeleteOp::Ge => values.first().is_some_and(|other| value >= *other),
+        DeleteOp::In => values.contains(&value),
+        DeleteOp::NotIn => !values.contains(&value),
+        DeleteOp::IsNull | DeleteOp::IsNotNull => false,
+    }
+}
+
+fn compare_bytes(value: &[u8], op: DeleteOp, values: &[Vec<u8>]) -> bool {
+    let first = values.first().map(Vec::as_slice);
+    match op {
+        DeleteOp::Eq => first == Some(value),
+        DeleteOp::Ne => first.is_some_and(|other| value != other),
+        DeleteOp::Lt => first.is_some_and(|other| value < other),
+        DeleteOp::Le => first.is_some_and(|other| value <= other),
+        DeleteOp::Gt => first.is_some_and(|other| value > other),
+        DeleteOp::Ge => first.is_some_and(|other| value >= other),
+        DeleteOp::In => values.iter().any(|other| value == other),
+        DeleteOp::NotIn => values.iter().all(|other| value != other),
+        DeleteOp::IsNull | DeleteOp::IsNotNull => false,
+    }
+}
+
+fn normalized_literal(value: &str) -> String {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') && bytes[0] == bytes[bytes.len() - 1] {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn validate_current_schema(
     split: &StarRocksDirectSplit,
     schema: &StorageSchema,
@@ -601,8 +908,10 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
 mod tests {
     use super::*;
     use crate::direct::StarRocksDirectColumnBinding;
-    use crate::direct::storage::wire::StorageColumn;
-    use arrow::array::Int64Array;
+    use crate::direct::storage::wire::{
+        StorageBinaryPredicate, StorageColumn, StorageInPredicate, StorageIsNullPredicate,
+    };
+    use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn schema(columns: Vec<StorageColumn>) -> StorageSchema {
@@ -718,6 +1027,91 @@ mod tests {
         assert_eq!(
             decode_delvec_bitmap(&encoded).unwrap_err().kind(),
             ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn applies_storage_delete_predicate_as_a_conjunction_to_frozen_output() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("state", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    Some("old"),
+                    Some("old"),
+                    Some("new"),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let predicate = StorageDeletePredicate {
+            sub_predicates: Vec::new(),
+            in_predicates: vec![StorageInPredicate {
+                column_name: "id".to_string(),
+                is_not_in: false,
+                values: vec!["2".to_string(), "3".to_string()],
+            }],
+            binary_predicates: vec![StorageBinaryPredicate {
+                column_name: "state".to_string(),
+                op: "=".to_string(),
+                value: "'old'".to_string(),
+            }],
+            is_null_predicates: Vec::new(),
+        };
+
+        let filtered = apply_storage_delete_predicate(&batch, &predicate).unwrap();
+        assert_eq!(
+            filtered
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[1, 3, 4]
+        );
+        let null_predicate = StorageDeletePredicate {
+            sub_predicates: Vec::new(),
+            in_predicates: Vec::new(),
+            binary_predicates: Vec::new(),
+            is_null_predicates: vec![StorageIsNullPredicate {
+                column_name: "state".to_string(),
+                is_not_null: false,
+            }],
+        };
+        assert_eq!(
+            apply_storage_delete_predicate(&batch, &null_predicate)
+                .unwrap()
+                .num_rows(),
+            3
+        );
+    }
+
+    #[test]
+    fn rejects_delete_predicates_that_cannot_be_evaluated_from_frozen_output() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        let predicate = StorageDeletePredicate {
+            sub_predicates: Vec::new(),
+            in_predicates: vec![StorageInPredicate {
+                column_name: "hidden".to_string(),
+                is_not_in: false,
+                values: vec!["1".to_string()],
+            }],
+            binary_predicates: Vec::new(),
+            is_null_predicates: Vec::new(),
+        };
+        assert_eq!(
+            apply_storage_delete_predicate(&batch, &predicate)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
         );
     }
 }

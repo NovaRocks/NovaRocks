@@ -276,7 +276,7 @@ impl StarRocksStorageBundle {
         if bundle_id.is_empty()
             || bundle_id.len() > MAX_STORAGE_TEXT_BYTES
             || rowset_ids.is_empty()
-            || rowset_ids.iter().any(|id| *id == 0)
+            || rowset_ids.contains(&0)
             || rowset_ids.iter().collect::<BTreeSet<_>>().len() != rowset_ids.len()
         {
             return Err(invalid("invalid StarRocks storage bundle"));

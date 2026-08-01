@@ -28,6 +28,7 @@ use prost::Message;
 
 const BUNDLE_FOOTER_BYTES: usize = 8;
 
+#[allow(clippy::enum_variant_names)]
 mod generated {
     tonic::include_proto!("starrocks.storage");
 }
@@ -484,6 +485,7 @@ fn validate_message(mut input: &[u8], kind: MessageKind) -> Result<(), Connector
     Ok(())
 }
 
+#[allow(clippy::let_and_return)]
 fn message_field(
     kind: MessageKind,
     field: u32,
@@ -536,7 +538,7 @@ fn message_field(
             }
         },
         BinaryPredicate => match field {
-            1 | 2 | 3 => scalar(2, wire),
+            1..=3 => scalar(2, wire),
             _ => {
                 return Err(unsupported(
                     "unknown field in StarRocks binary delete predicate",
@@ -562,7 +564,7 @@ fn message_field(
             }
         },
         DelvecPage => match field {
-            1 | 2 | 3 | 4 | 5 => scalar(0, wire),
+            1..=5 => scalar(0, wire),
             _ => return Err(unsupported("unknown field in StarRocks delete-vector page")),
         },
         DelvecFile => match field {
