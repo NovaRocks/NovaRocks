@@ -231,6 +231,13 @@ impl FrontendApplicationHost {
                 return Err(host.cleanup_open_error(error).await);
             }
         }
+        // The coordinator owns the immutable execution and connector-control
+        // context consumed by frontend application services. Install it before
+        // constructing those services so MV refresh never observes an
+        // all-in-one-only direct execution fallback.
+        if let Err(error) = host.open_coordinator(execution) {
+            return Err(host.cleanup_open_error(error).await);
+        }
         match host.state_store() {
             Some(store) => {
                 match StateStoreMvRepository::open(store, tokio::runtime::Handle::current()).await {
@@ -258,9 +265,6 @@ impl FrontendApplicationHost {
                     novarocks::mv::application::UnavailableMvApplicationService,
                 ));
             }
-        }
-        if let Err(error) = host.open_coordinator(execution) {
-            return Err(host.cleanup_open_error(error).await);
         }
         if let Err(error) = host.topology().start_heartbeat_manager().map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::ClusterBackendOpen, error)
