@@ -288,6 +288,167 @@ pub(crate) fn decode_binary_plain_values(
     Ok(output)
 }
 
+/// Decode the hybrid RLE/bit-packed fixed-width page body used by StarRocks.
+/// The output is normalized to little-endian fixed-width storage values.
+pub(crate) fn decode_fixed_rle_values(
+    body: &[u8],
+    expected_values: usize,
+    value_size: usize,
+    bit_width: usize,
+) -> Result<Vec<u8>, ConnectorError> {
+    if body.len() < 4 || value_size == 0 || bit_width == 0 || bit_width > 128 {
+        return Err(corrupt("invalid StarRocks fixed RLE page body"));
+    }
+    let values = u32::from_le_bytes(
+        body[..4]
+            .try_into()
+            .map_err(|_| corrupt("invalid StarRocks RLE value count"))?,
+    ) as usize;
+    if values != expected_values {
+        return Err(corrupt(
+            "StarRocks RLE value count differs from page footer",
+        ));
+    }
+    let mut reader = RleBitReader::new(&body[4..]);
+    let mut remaining = values;
+    let mut output = Vec::with_capacity(
+        values
+            .checked_mul(value_size)
+            .ok_or_else(|| corrupt("StarRocks RLE output size overflows"))?,
+    );
+    while remaining > 0 {
+        let indicator = reader
+            .read_varint()
+            .ok_or_else(|| corrupt("truncated StarRocks RLE run header"))?;
+        if indicator == 0 {
+            return Err(corrupt("StarRocks RLE run has zero length"));
+        }
+        if indicator & 1 == 0 {
+            let count = (indicator >> 1) as usize;
+            if count == 0 || count > remaining {
+                return Err(corrupt("StarRocks RLE repeated run length is invalid"));
+            }
+            let value = reader
+                .read_aligned_bits(bit_width)
+                .ok_or_else(|| corrupt("truncated StarRocks RLE repeated value"))?;
+            append_rle_value(&mut output, value, value_size, bit_width)?;
+            let value = output[output.len() - value_size..].to_vec();
+            for _ in 1..count {
+                output.extend_from_slice(&value);
+            }
+            remaining -= count;
+            continue;
+        }
+        let count = ((indicator >> 1) as usize)
+            .checked_mul(8)
+            .ok_or_else(|| corrupt("StarRocks RLE literal run length overflows"))?;
+        if count == 0 {
+            return Err(corrupt("StarRocks RLE literal run has zero length"));
+        }
+        let emit = count.min(remaining);
+        for _ in 0..emit {
+            let value = reader
+                .read_bits(bit_width)
+                .ok_or_else(|| corrupt("truncated StarRocks RLE literal value"))?;
+            append_rle_value(&mut output, value, value_size, bit_width)?;
+        }
+        let skip = count - emit;
+        if skip > 0
+            && !reader.skip_bits(
+                skip.checked_mul(bit_width)
+                    .ok_or_else(|| corrupt("StarRocks RLE literal skip overflows"))?,
+            )
+        {
+            return Err(corrupt("truncated StarRocks RLE literal padding"));
+        }
+        remaining -= emit;
+    }
+    Ok(output)
+}
+
+fn append_rle_value(
+    output: &mut Vec<u8>,
+    value: u128,
+    value_size: usize,
+    bit_width: usize,
+) -> Result<(), ConnectorError> {
+    if bit_width == 1 && value > 1 {
+        return Err(corrupt("invalid StarRocks BOOLEAN RLE value"));
+    }
+    for index in 0..value_size {
+        output.push(((value >> (index * 8)) & 0xff) as u8);
+    }
+    Ok(())
+}
+
+struct RleBitReader<'a> {
+    bytes: &'a [u8],
+    bit_offset: usize,
+}
+
+impl<'a> RleBitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            bit_offset: 0,
+        }
+    }
+
+    fn read_varint(&mut self) -> Option<u32> {
+        let mut value = 0u32;
+        for shift in (0..35).step_by(7) {
+            let byte = self.read_aligned_byte()?;
+            value |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn read_aligned_bits(&mut self, width: usize) -> Option<u128> {
+        self.align();
+        self.read_bits(width)
+    }
+
+    fn read_bits(&mut self, width: usize) -> Option<u128> {
+        let end = self.bit_offset.checked_add(width)?;
+        if end > self.bytes.len().checked_mul(8)? {
+            return None;
+        }
+        let mut value = 0u128;
+        for bit in 0..width {
+            let absolute = self.bit_offset + bit;
+            value |= u128::from((self.bytes[absolute / 8] >> (absolute % 8)) & 1) << bit;
+        }
+        self.bit_offset = end;
+        Some(value)
+    }
+
+    fn skip_bits(&mut self, width: usize) -> bool {
+        let Some(end) = self.bit_offset.checked_add(width) else {
+            return false;
+        };
+        if end > self.bytes.len().saturating_mul(8) {
+            return false;
+        }
+        self.bit_offset = end;
+        true
+    }
+
+    fn read_aligned_byte(&mut self) -> Option<u8> {
+        self.align();
+        let index = self.bit_offset / 8;
+        let byte = *self.bytes.get(index)?;
+        self.bit_offset = self.bit_offset.checked_add(8)?;
+        Some(byte)
+    }
+
+    fn align(&mut self) {
+        self.bit_offset = (self.bit_offset + 7) & !7;
+    }
+}
+
 struct DecodedPage {
     footer: PageFooterPb,
     body: Vec<u8>,
@@ -571,6 +732,25 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn decodes_fixed_rle_repeated_and_literal_runs() {
+        let mut repeated = 3u32.to_le_bytes().to_vec();
+        repeated.push(6); // repeated run of three values
+        repeated.extend_from_slice(&7i64.to_le_bytes());
+        assert_eq!(
+            decode_fixed_rle_values(&repeated, 3, 8, 64).unwrap(),
+            [7i64.to_le_bytes(), 7i64.to_le_bytes(), 7i64.to_le_bytes()].concat()
+        );
+
+        let mut literal = 3u32.to_le_bytes().to_vec();
+        literal.push(3); // one eight-value literal group, of which only three are emitted
+        literal.extend_from_slice(&[0b0000_0101]);
+        assert_eq!(
+            decode_fixed_rle_values(&literal, 3, 1, 1).unwrap(),
+            vec![1, 0, 1]
         );
     }
 

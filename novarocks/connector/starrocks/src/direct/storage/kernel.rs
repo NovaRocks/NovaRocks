@@ -35,7 +35,8 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use crate::direct::StarRocksDirectColumnBinding;
 
 use super::page::{
-    decode_binary_plain_values, decode_data_page, decode_fixed_plain_values, page_slice,
+    decode_binary_plain_values, decode_data_page, decode_fixed_plain_values,
+    decode_fixed_rle_values, page_slice,
 };
 use super::segment::{
     StarRocksLogicalType, StarRocksPageEncoding, StarRocksSegmentColumnMeta, StarRocksSegmentFooter,
@@ -94,7 +95,13 @@ fn decode_column(
     column: &StarRocksSegmentColumnMeta,
     output_type: &DataType,
 ) -> Result<ArrayRef, ConnectorError> {
-    if column.encoding != Some(StarRocksPageEncoding::Plain) {
+    let encoding = column
+        .encoding
+        .ok_or_else(|| corrupt("StarRocks direct segment is missing a page encoding"))?;
+    if !matches!(
+        encoding,
+        StarRocksPageEncoding::Plain | StarRocksPageEncoding::Rle
+    ) {
         return Err(unsupported(
             "StarRocks direct segment encoding is not implemented",
         ));
@@ -130,7 +137,7 @@ fn decode_column(
     let null_flags = page.null_flags.as_deref();
     match (column.logical_type, output_type) {
         (StarRocksLogicalType::Boolean, DataType::Boolean) => {
-            let values = decode_fixed_plain_values(body, page.num_values, 1)?;
+            let values = decode_fixed_values(body, encoding, page.num_values, 1, 1)?;
             let values = values
                 .into_iter()
                 .map(|value| match value {
@@ -144,24 +151,29 @@ fn decode_column(
             )?)))
         }
         (StarRocksLogicalType::TinyInt, DataType::Int8) => {
-            fixed_i8(body, page.num_values, null_flags)
+            fixed_i8(body, encoding, page.num_values, null_flags)
         }
         (StarRocksLogicalType::SmallInt, DataType::Int16) => {
-            fixed_i16(body, page.num_values, null_flags)
+            fixed_i16(body, encoding, page.num_values, null_flags)
         }
         (StarRocksLogicalType::Int, DataType::Int32) => {
-            fixed_i32(body, page.num_values, null_flags)
+            fixed_i32(body, encoding, page.num_values, null_flags)
         }
         (StarRocksLogicalType::BigInt, DataType::Int64) => {
-            fixed_i64(body, page.num_values, null_flags)
+            fixed_i64(body, encoding, page.num_values, null_flags)
         }
         (StarRocksLogicalType::Float, DataType::Float32) => {
-            fixed_f32(body, page.num_values, null_flags)
+            fixed_f32(body, encoding, page.num_values, null_flags)
         }
         (StarRocksLogicalType::Double, DataType::Float64) => {
-            fixed_f64(body, page.num_values, null_flags)
+            fixed_f64(body, encoding, page.num_values, null_flags)
         }
         (StarRocksLogicalType::Char | StarRocksLogicalType::Varchar, DataType::Utf8) => {
+            if encoding != StarRocksPageEncoding::Plain {
+                return Err(unsupported(
+                    "StarRocks variable-width RLE pages are not supported",
+                ));
+            }
             let values = decode_binary_plain_values(body, page.num_values)?
                 .into_iter()
                 .map(|value| {
@@ -174,6 +186,11 @@ fn decode_column(
             )?)))
         }
         (StarRocksLogicalType::Binary | StarRocksLogicalType::VarBinary, DataType::Binary) => {
+            if encoding != StarRocksPageEncoding::Plain {
+                return Err(unsupported(
+                    "StarRocks variable-width RLE pages are not supported",
+                ));
+            }
             let values = apply_nulls(
                 decode_binary_plain_values(body, page.num_values)?,
                 null_flags,
@@ -195,11 +212,12 @@ fn decode_column(
 
 fn fixed_i8(
     body: &[u8],
+    encoding: StarRocksPageEncoding,
     values: usize,
     null_flags: Option<&[u8]>,
 ) -> Result<ArrayRef, ConnectorError> {
     Ok(Arc::new(Int8Array::from(apply_nulls(
-        decode_fixed_plain_values(body, values, 1)?
+        decode_fixed_values(body, encoding, values, 1, 8)?
             .into_iter()
             .map(|value| value as i8)
             .collect::<Vec<_>>(),
@@ -211,10 +229,11 @@ macro_rules! fixed_values {
     ($name:ident, $array:ident, $type:ty, $size:expr) => {
         fn $name(
             body: &[u8],
+            encoding: StarRocksPageEncoding,
             values: usize,
             null_flags: Option<&[u8]>,
         ) -> Result<ArrayRef, ConnectorError> {
-            let decoded = decode_fixed_plain_values(body, values, $size)?;
+            let decoded = decode_fixed_values(body, encoding, values, $size, $size * 8)?;
             let output = decoded
                 .chunks_exact($size)
                 .map(|value| <$type>::from_le_bytes(value.try_into().expect("fixed chunk size")))
@@ -229,6 +248,22 @@ fixed_values!(fixed_i32, Int32Array, i32, 4);
 fixed_values!(fixed_i64, Int64Array, i64, 8);
 fixed_values!(fixed_f32, Float32Array, f32, 4);
 fixed_values!(fixed_f64, Float64Array, f64, 8);
+
+fn decode_fixed_values(
+    body: &[u8],
+    encoding: StarRocksPageEncoding,
+    values: usize,
+    value_size: usize,
+    bit_width: usize,
+) -> Result<Vec<u8>, ConnectorError> {
+    match encoding {
+        StarRocksPageEncoding::Plain => decode_fixed_plain_values(body, values, value_size),
+        StarRocksPageEncoding::Rle => decode_fixed_rle_values(body, values, value_size, bit_width),
+        StarRocksPageEncoding::Dictionary | StarRocksPageEncoding::BitShuffle => Err(unsupported(
+            "StarRocks direct fixed-width page encoding is not supported",
+        )),
+    }
+}
 
 fn apply_nulls<T>(
     values: Vec<T>,
