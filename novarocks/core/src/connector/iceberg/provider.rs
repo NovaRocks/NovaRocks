@@ -4495,6 +4495,11 @@ fn map_iceberg_error(error: String) -> ConnectorError {
         // (and ordinary CREATE) into an internal error before dispatch.
         || normalized.contains("unknown table")
         || normalized.contains("no metadata files")
+        // The local Hadoop catalog uses this normalized absence error when
+        // probing a table's metadata directory.  Catalog mutations perform
+        // that probe before CREATE TABLE, so it must retain NotFound semantics
+        // rather than being surfaced as an internal failure.
+        || normalized.contains("unknown table:")
     {
         ConnectorErrorKind::NotFound
     } else if normalized.contains("format-version 3")
@@ -4600,6 +4605,12 @@ mod tests {
             max_total_payload_bytes,
         )
         .expect("connector request context")
+    }
+
+    #[test]
+    fn local_unknown_table_error_is_not_found() {
+        let error = map_iceberg_error("unknown table: analytics.orders".to_string());
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
     }
 
     fn mutation_provider_without_catalog() -> IcebergControlProvider {

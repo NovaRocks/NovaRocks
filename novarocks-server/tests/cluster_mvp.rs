@@ -85,8 +85,8 @@ fn write_config(name: &str, content: &str) -> NamedTempFile {
 struct ProcessGuard {
     child: Child,
     stdout_rx: mpsc::Receiver<String>,
-    stderr: Option<std::process::ChildStderr>,
     _stdout_thread: std::thread::JoinHandle<()>,
+    _stderr_thread: std::thread::JoinHandle<()>,
 }
 
 impl ProcessGuard {
@@ -100,10 +100,22 @@ impl ProcessGuard {
             .spawn()
             .expect("spawn novarocks");
         let stdout = child.stdout.take().expect("child stdout");
-        let stderr = child.stderr.take();
+        let stderr = child.stderr.take().expect("child stderr pipe");
         let (tx, rx) = mpsc::channel();
+        let stdout_tx = tx.clone();
         let stdout_thread = std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if stdout_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 let Ok(line) = line else {
                     break;
@@ -116,8 +128,8 @@ impl ProcessGuard {
         Self {
             child,
             stdout_rx: rx,
-            stderr,
             _stdout_thread: stdout_thread,
+            _stderr_thread: stderr_thread,
         }
     }
 
@@ -162,11 +174,7 @@ impl ProcessGuard {
     }
 
     fn read_stderr(&mut self) -> String {
-        let mut stderr = String::new();
-        if let Some(mut pipe) = self.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
-        stderr
+        self.stdout_rx.try_iter().collect::<Vec<_>>().join("\n")
     }
 
     fn wait_for_output_contains(&mut self, marker: &str, timeout: Duration) {
@@ -2187,7 +2195,7 @@ fn cross_process_three_be_statistics_service() {
     let _guard = lock_cluster_mvp();
     let fixture_dir =
         tempfile::tempdir_in(runtime_dir()).expect("create statistics fixture directory");
-    let cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
         &fixture_dir.path().join("frontend-state.sqlite"),
         &fixture_dir.path().join("frontend-metadata.sqlite"),
         "statistics-service",
@@ -2207,28 +2215,68 @@ fn cross_process_three_be_statistics_service() {
         .expect("create statistics database");
     conn.query_drop("CREATE TABLE feh5_stats.t (k INT)")
         .expect("create statistics table");
-    conn.query_drop("INSERT INTO feh5_stats.t VALUES (1), (2), (3)")
-        .expect("insert statistics rows");
+    for value in 1..=3 {
+        conn.query_drop(format!("INSERT INTO feh5_stats.t VALUES ({value})"))
+            .expect("insert one statistics data file");
+    }
     conn.query_drop("ANALYZE TABLE feh5_stats.t")
         .expect("analyze statistics table");
 
-    let stats: Vec<(i64, i64)> = conn
-        .query(
-            "SELECT row_count, hll_cardinality(ndv) \
-             FROM _statistics_.column_statistics \
-             WHERE table_name = 'feh5_stats.t' AND column_name = 'k'",
-        )
-        .expect("query collected statistics");
-    assert_eq!(stats, vec![(3, 3)]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let jobs: Vec<Row> = conn.query("SHOW ANALYZE JOBS").expect("show analyze jobs");
+        let states = jobs
+            .iter()
+            .filter_map(|row| row.get::<String, _>(2))
+            .collect::<Vec<_>>();
+        if states.iter().any(|state| state == "SUCCEEDED") {
+            break;
+        }
+        assert!(
+            !states
+                .iter()
+                .any(|state| state == "FAILED" || state == "CANCELLED"),
+            "ANALYZE must not reach a failed terminal state: {jobs:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for durable ANALYZE completion: {jobs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_STATISTICS_FRAGMENT_COLLECTED",
+        Duration::from_secs(10),
+    );
+
+    let stats: Vec<(String, Option<String>, String)> = conn
+        .query("SHOW TABLE STATS feh5_stats.t")
+        .expect("show collected statistics");
+    assert!(
+        stats.iter().any(|(metric, value, status)| {
+            metric == "row_count" && value.as_deref() == Some("3") && status == "AVAILABLE"
+        }),
+        "SHOW TABLE STATS must expose the collected row count: {stats:?}"
+    );
+    assert!(
+        stats.iter().any(|(metric, value, status)| {
+            metric == "theta_ndv:k" && value.as_deref() == Some("3") && status == "AVAILABLE"
+        }),
+        "SHOW TABLE STATS must expose the collected Theta NDV: {stats:?}"
+    );
 
     let explain: Vec<String> = conn
         .query("EXPLAIN COSTS SELECT * FROM feh5_stats.t")
         .expect("explain with collected statistics");
     assert!(
-        explain
-            .iter()
-            .any(|line| line.contains("ndv=3") && line.contains("stats={rows=3")),
-        "EXPLAIN COSTS must consume frontend row-count and NDV statistics: {explain:?}"
+        explain.iter().any(|line| line.contains("TABLE STATS")
+            && line.contains("rows=3")
+            && line.contains("source=IcebergPuffin")),
+        "EXPLAIN COSTS must consume the published full table evidence: {explain:?}"
+    );
+    assert!(
+        explain.iter().any(|line| line.contains("ndv=?")),
+        "Theta NDV is approximate and must not be exposed as an exact optimizer cardinality: {explain:?}"
     );
     assert_exact_live_backends(&mut conn, 3);
 }
