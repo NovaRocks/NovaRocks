@@ -55,7 +55,7 @@ use novarocks::novarocks_logging::{debug, warn};
 use novarocks::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot, IcebergTableLocationMap,
 };
-use novarocks::runtime::query_context::query_context_manager;
+use novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime;
 use novarocks::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
 use novarocks_spi::connector::{
@@ -63,16 +63,6 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 use novarocks_types::QueryId;
-
-struct CompatIcebergQueryCancellation {
-    query_id: QueryId,
-}
-
-impl ConnectorCancellation for CompatIcebergQueryCancellation {
-    fn is_cancelled(&self) -> bool {
-        query_context_manager().is_query_canceled(self.query_id)
-    }
-}
 
 fn compat_iceberg_file_from_wire(
     node_id: i32,
@@ -179,7 +169,7 @@ fn plan_compat_iceberg_data_read_source(
     let (_, query_expire) = query_expire_durations(Some(query_options));
     let context = ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
-        Arc::new(CompatIcebergQueryCancellation { query_id }),
+        StarRocksFragmentQueryRuntime::new().connector_cancellation(query_id),
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )

@@ -339,11 +339,7 @@ where
         scan_assignments,
         instance_parts.exchange_inputs,
         sink_assignment,
-        FragmentRuntimeOptions::new(
-            instance_parts.query_options,
-            None,
-            instance_parts.typed_result_sink,
-        ),
+        FragmentRuntimeOptions::new(instance_parts.query_options, instance_parts.typed_result_sink),
         instance_parts.pipeline_dop,
         instance_parts.backend_num,
     );

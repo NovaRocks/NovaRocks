@@ -25,6 +25,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use novarocks_spi::connector::ConnectorCancellation;
+use novarocks_types::QueryId;
+
 use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
@@ -32,14 +35,27 @@ use crate::exec::row_position::RowPositionDescriptor;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::query_context::{
-    FragmentFinishReportDecision, LookupFetcherLifecycle, QueryCleanupLease, QueryContextManager,
-    QueryExecutionKey, QueryId, StarRocksQueryGeneration, StarRocksQueryHandoff,
+    FragmentFinishReportDecision, QueryContextManager, QueryExecutionKey, StarRocksQueryGeneration,
+    StarRocksQueryHandoff,
     query_context_manager,
 };
+
+pub use crate::runtime::query_context::{LookupFetcherLifecycle, QueryCleanupLease};
 
 #[derive(Clone)]
 pub struct StarRocksFragmentQueryRuntime {
     manager: Arc<QueryContextManager>,
+}
+
+struct StarRocksConnectorCancellation {
+    manager: Arc<QueryContextManager>,
+    query_id: QueryId,
+}
+
+impl ConnectorCancellation for StarRocksConnectorCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.manager.is_query_canceled(self.query_id)
+    }
 }
 
 impl StarRocksFragmentQueryRuntime {
@@ -47,6 +63,15 @@ impl StarRocksFragmentQueryRuntime {
         Self {
             manager: query_context_manager(),
         }
+    }
+
+    /// Returns the read-only cancellation capability needed by compat-owned
+    /// connector decode. The query manager itself never crosses this facade.
+    pub fn connector_cancellation(&self, query_id: QueryId) -> Arc<dyn ConnectorCancellation> {
+        Arc::new(StarRocksConnectorCancellation {
+            manager: Arc::clone(&self.manager),
+            query_id,
+        })
     }
 
     #[cfg(test)]

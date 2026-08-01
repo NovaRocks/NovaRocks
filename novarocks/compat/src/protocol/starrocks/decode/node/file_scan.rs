@@ -70,3 +70,27 @@ pub(crate) fn lower_file_scan_node(
         "FILE_SCAN_NODE is retired; broker file execution is not part of the fragment kernel",
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks::protocol::ProtocolErrorKind;
+
+    #[test]
+    fn broker_file_node_is_rejected_at_the_wire_field() {
+        let mut node = plan_nodes::TPlanNode::default();
+        node.node_type = plan_nodes::TPlanNodeType::FILE_SCAN_NODE;
+        let error = decode_broker_file_program_facts(
+            &[node],
+            &BTreeMap::new(),
+            &mut ExprArena::default(),
+            FieldPath::root("exec_plan_fragment").field("plan").field("nodes"),
+            FieldPath::root("exec_plan_fragment").field("params"),
+        )
+        .expect_err("retired FILE_SCAN_NODE must fail");
+        assert_eq!(
+            error.protocol().expect("protocol error").kind(),
+            ProtocolErrorKind::Unsupported
+        );
+    }
+}

@@ -411,7 +411,7 @@ mod tests {
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             sink_assignment,
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::new(1).expect("non-zero DOP"),
             BackendNum::try_new(0).expect("backend number"),
         )

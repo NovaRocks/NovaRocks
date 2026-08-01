@@ -109,7 +109,7 @@ mod tests {
             ScanAssignments::default(),
             exchange_inputs,
             FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::new(1).expect("non-zero DOP"),
             BackendNum::try_new(1).expect("backend number"),
         )

@@ -24,7 +24,7 @@ use crate::exec::fragment::error::{
 };
 use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId};
 use crate::exec::node::scan::BoundScanRanges;
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 
@@ -178,29 +178,22 @@ pub enum FragmentSinkAssignment {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FragmentRuntimeOptions {
     query_options: QueryOptions,
-    report_endpoint: Option<RuntimeEndpoint>,
     typed_result_sink: bool,
 }
 
 impl FragmentRuntimeOptions {
     pub fn new(
         query_options: QueryOptions,
-        report_endpoint: Option<RuntimeEndpoint>,
         typed_result_sink: bool,
     ) -> Self {
         Self {
             query_options,
-            report_endpoint,
             typed_result_sink,
         }
     }
 
     pub fn query_options(&self) -> &QueryOptions {
         &self.query_options
-    }
-
-    pub fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
-        self.report_endpoint.as_ref()
     }
 
     pub const fn typed_result_sink(&self) -> bool {
@@ -432,12 +425,7 @@ mod tests {
             exchange_node,
             ExchangeInputAssignment::new(NonZeroUsize::new(2).expect("sender count")),
         )]));
-        let report_endpoint = RuntimeEndpoint::new("127.0.0.1", 8060).expect("endpoint");
-        let runtime_options = FragmentRuntimeOptions::new(
-            QueryOptions::default(),
-            Some(report_endpoint.clone()),
-            true,
-        );
+        let runtime_options = FragmentRuntimeOptions::new(QueryOptions::default(), true);
         let spec = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             QueryId::new(13, 17),
@@ -476,10 +464,6 @@ mod tests {
             spec.runtime_options()
                 .query_options()
                 .eq(&QueryOptions::default())
-        );
-        assert_eq!(
-            spec.runtime_options().report_endpoint(),
-            Some(&report_endpoint)
         );
         assert!(spec.runtime_options().typed_result_sink());
         assert_eq!(spec.pipeline_dop().get(), 4);

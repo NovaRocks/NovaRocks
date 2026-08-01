@@ -24,6 +24,7 @@ use crate::protocol::starrocks::decode::layout::{
 };
 use crate::protocol::starrocks::decode::node::decode::build_scan_query_global_dicts;
 use crate::protocol::starrocks::decode::node::{Lowered, QueryGlobalDictMap, ScanRangeCarrier};
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::connector::starrocks::STARROCKS_WIRE_INTERNAL_CATALOG_NAME;
@@ -46,7 +47,51 @@ use novarocks::novarocks_connectors::{
 use novarocks::novarocks_logging::debug;
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::ScanRange;
+use novarocks::protocol::FieldPath;
 use novarocks_types::QueryId;
+
+/// Reject the retired Lake late-materialization request before lowerers build
+/// provider-specific state. The row-position virtual columns are the request's
+/// existing wire representation, so retain their plan-node field path.
+pub(crate) fn reject_lake_late_materialization(
+    node: &plan_nodes::TPlanNode,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
+    tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    node_path: FieldPath,
+) -> Result<(), StarRocksFragmentDecodeError> {
+    let Some(lake) = node.lake_scan_node.as_ref() else {
+        return Ok(());
+    };
+    let slots = layout_hints
+        .get(&lake.tuple_id)
+        .filter(|slots| !slots.is_empty())
+        .or_else(|| tuple_slots.get(&lake.tuple_id));
+    let Some(slots) = slots else {
+        return Ok(());
+    };
+    let descriptors = desc_tbl
+        .and_then(|table| table.slot_descriptors.as_deref())
+        .unwrap_or(&[]);
+    if slots.iter().any(|slot_id| {
+        descriptors
+            .iter()
+            .find(|slot| slot.parent == Some(lake.tuple_id) && slot.id == Some(*slot_id))
+            .map(slot_display_name_from_desc)
+            .is_some_and(|name| {
+                is_lake_source_id(&name)
+                    || is_lake_tablet_id(&name)
+                    || is_lake_rss_id(&name)
+                    || is_lake_row_id(&name)
+            })
+    }) {
+        return Err(StarRocksFragmentDecodeError::unsupported(
+            node_path.field("row_tuples"),
+            "LAKE_SCAN_NODE late materialization is retired; row-position virtual columns are not part of the fragment kernel",
+        ));
+    }
+    Ok(())
+}
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
 ///

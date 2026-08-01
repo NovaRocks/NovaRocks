@@ -853,7 +853,7 @@ mod tests {
             scans,
             exchanges,
             sink,
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::new(1).expect("pipeline DOP"),
             BackendNum::try_new(0).expect("backend number"),
         )

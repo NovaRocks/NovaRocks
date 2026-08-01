@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::thrift::descriptors;
 use novarocks::runtime::endpoint::RuntimeEndpoint;
-use novarocks::runtime::query_context::QueryCleanupLease;
+use novarocks::runtime::starrocks_fragment_query::QueryCleanupLease;
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 

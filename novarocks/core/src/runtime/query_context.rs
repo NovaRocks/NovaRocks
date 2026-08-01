@@ -739,7 +739,7 @@ struct QueryContextManagerInner {
     incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
 }
 
-pub struct QueryContextManager {
+pub(crate) struct QueryContextManager {
     inner: Mutex<QueryContextManagerInner>,
     stopped: AtomicBool,
 }
@@ -3779,7 +3779,7 @@ mod lookup_lifecycle_tests {
 
 static QUERY_CONTEXT_MANAGER: OnceLock<Arc<QueryContextManager>> = OnceLock::new();
 
-pub fn query_context_manager() -> Arc<QueryContextManager> {
+pub(crate) fn query_context_manager() -> Arc<QueryContextManager> {
     QUERY_CONTEXT_MANAGER
         .get_or_init(QueryContextManager::new)
         .clone()

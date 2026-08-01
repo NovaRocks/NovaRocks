@@ -137,7 +137,7 @@ pub(crate) fn decode_fragment_submission(
         scan_assignments,
         instance.exchange_inputs,
         sink_assignment,
-        FragmentRuntimeOptions::new(instance.query_options, None, instance.typed_result_sink),
+        FragmentRuntimeOptions::new(instance.query_options, instance.typed_result_sink),
         instance.pipeline_dop,
         instance.backend_num,
     );

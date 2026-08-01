@@ -41,8 +41,9 @@ use novarocks::runtime::fragment::io::{
     FragmentEventSink, FragmentResultWriter, ResultPresentation, ResultProjection, ResultWriteSpec,
 };
 use novarocks::runtime::fragment::submission::FragmentSubmission;
-use novarocks::runtime::query_context::LookupFetcherLifecycle;
-use novarocks::runtime::query_context::query_context_manager;
+use novarocks::runtime::starrocks_fragment_query::{
+    LookupFetcherLifecycle, StarRocksFragmentQueryRuntime,
+};
 use novarocks::runtime::query_options::query_expire_durations;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
@@ -96,16 +97,6 @@ pub(crate) struct StarRocksDecodeInput<'a> {
     pub compat_iceberg_execution:
         Option<&'a std::sync::Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
     pub(crate) compat_connector_writer: Option<novarocks_spi::connector::ConnectorWriterIdentity>,
-}
-
-struct CompatConnectorWriteCancellation {
-    query_id: RuntimeQueryId,
-}
-
-impl ConnectorCancellation for CompatConnectorWriteCancellation {
-    fn is_cancelled(&self) -> bool {
-        query_context_manager().is_query_canceled(self.query_id)
-    }
 }
 
 #[derive(Debug)]
@@ -602,9 +593,8 @@ fn decode_draft_parts(
             let (_, query_expire) = query_expire_durations(Some(&instance.query_options));
             ConnectorRequestContext::try_new(
                 Instant::now() + query_expire,
-                Arc::new(CompatConnectorWriteCancellation {
-                    query_id: instance.query_id,
-                }),
+                StarRocksFragmentQueryRuntime::new()
+                    .connector_cancellation(instance.query_id),
                 MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )
@@ -698,11 +688,7 @@ fn decode_draft_parts(
         scan_assignments,
         exchange_assignments,
         assignment,
-        FragmentRuntimeOptions::new(
-            instance.query_options,
-            instance.report_endpoint,
-            instance.typed_result_sink,
-        ),
+        FragmentRuntimeOptions::new(instance.query_options, instance.typed_result_sink),
         instance.pipeline_dop,
         instance.backend_num,
     );
@@ -1073,7 +1059,6 @@ mod tests {
     use novarocks::exec::node::ExecNodeKind;
     use novarocks::runtime::endpoint::FragmentDestination;
     use novarocks::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
-    use novarocks::runtime::query_context::query_context_manager;
     use novarocks::runtime::result_buffer::{self, TryFetchResult};
     use novarocks::runtime::runtime_filter_observability::{
         QueryKey, RuntimeFilterLifecycleRegistry,
@@ -1322,114 +1307,6 @@ mod tests {
         ));
     }
 
-    #[cfg(any())]
-    fn starrocks_program_with_owned_arenas() -> (FragmentProgram, [novarocks::exec::expr::ExprId; 3])
-    {
-        let mut output_arena = ExprArena::default();
-        let output_id = output_arena.push_typed(
-            ExprNode::Literal(LiteralValue::Utf8(String::new())),
-            arrow::datatypes::DataType::Utf8,
-        );
-        let mut partition_arena = ExprArena::default();
-        let partition_id = partition_arena.push_typed(
-            ExprNode::Literal(LiteralValue::Utf8(String::new())),
-            arrow::datatypes::DataType::Utf8,
-        );
-        let mut index_arena = ExprArena::default();
-        let index_id = index_arena.push_typed(
-            ExprNode::Literal(LiteralValue::Utf8(String::new())),
-            arrow::datatypes::DataType::Utf8,
-        );
-        let tablet_schema = StarRocksTabletSchema::try_new(
-            Some(10),
-            Some(StarRocksKeysType::Primary),
-            vec![StarRocksColumnSchema {
-                unique_id: 1,
-                name: Some("k".to_string()),
-                r#type: "BIGINT".to_string(),
-                is_key: Some(true),
-                is_nullable: Some(false),
-                ..StarRocksColumnSchema::default()
-            }],
-        )
-        .expect("tablet schema");
-        let table = StarRocksTableSinkProgram {
-            name: "OLAP_TABLE_SINK".to_string(),
-            descriptor: StarRocksTableSinkDescriptor {
-                db_id: 1,
-                table_id: 2,
-                db_name: Some("db".to_string()),
-                table_name: Some("tbl".to_string()),
-                keys_type: StarRocksKeysType::Primary,
-                is_lake_table: true,
-                dynamic_overwrite: false,
-                partial_update_mode: PartialUpdateWriteMode::Row,
-                merge_condition: None,
-                null_expr_in_auto_increment: false,
-                miss_auto_increment_column: false,
-                schema: SinkSchemaDescriptor {
-                    slot_descs: Vec::new(),
-                    indexes: vec![SinkIndexDescriptor {
-                        index_id: 10,
-                        schema_id: 10,
-                        column_names: vec!["k".to_string()],
-                        tablet_schema,
-                        column_to_expr_value: HashMap::new(),
-                        is_shadow: false,
-                        where_clause: Some(SinkPredicatePlan {
-                            arena: Arc::new(index_arena),
-                            expr_id: index_id,
-                        }),
-                    }],
-                },
-                partition: SinkPartitionDescriptor {
-                    enable_automatic_partition: false,
-                    partition_columns: Vec::new(),
-                    distributed_columns: Vec::new(),
-                    partition_exprs: Some(Arc::new(PartitionExprPlan {
-                        arena: partition_arena,
-                        expr_ids: vec![partition_id],
-                    })),
-                    partitions: Vec::new(),
-                },
-                location: SinkLocationDescriptor {
-                    tablets: Vec::new(),
-                },
-                nodes: SinkNodesDescriptor { nodes: Vec::new() },
-                frontend_provider: None,
-                starlet_metadata_provider: None,
-                storage_metadata_provider: None,
-            },
-            output_projection: Some(SinkOutputProjectionPlan {
-                arena: Arc::new(output_arena),
-                expr_ids: vec![output_id],
-                output_slot_ids: Vec::new(),
-                output_field_names: Vec::new(),
-            }),
-            output_expr_slot_name_map: HashMap::new(),
-            output_expr_slot_ids: Vec::new(),
-            literal_partition_values: None,
-        };
-        let program = FragmentProgram::new(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: ExecNode {
-                    kind: ExecNodeKind::Values(novarocks::exec::node::values::ValuesNode {
-                        chunk: novarocks::exec::chunk::Chunk::default(),
-                        node_id: 99,
-                    }),
-                },
-            },
-            FragmentSinkSpec::try_new(FragmentSinkProgram::StarRocksTable(table))
-                .expect("StarRocks sink program"),
-            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            RuntimeFilterContract::default(),
-        );
-        (program, [output_id, partition_id, index_id])
-    }
-
     fn params(query: UniqueId, finst: UniqueId) -> internal_service::TPlanFragmentExecParams {
         internal_service::TPlanFragmentExecParams::new(
             types::TUniqueId {
@@ -1621,70 +1498,6 @@ mod tests {
             panic!("root conjunct must lower to a filter");
         };
         assert_resolved_profile(&submission.program().plan().arena, filter.predicate);
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn starrocks_query_profile_owner_routing_targets_exact_retained_arena() {
-        let (mut program, [output_id, partition_id, index_id]) =
-            starrocks_program_with_owned_arenas();
-        for (owner, expr_id, value) in [
-            (
-                FragmentExprArenaOwner::StarRocksOutputProjection,
-                output_id,
-                "output-profile",
-            ),
-            (
-                FragmentExprArenaOwner::StarRocksPartition,
-                partition_id,
-                "partition-profile",
-            ),
-            (
-                FragmentExprArenaOwner::StarRocksIndexPredicate { index: 0 },
-                index_id,
-                "index-profile",
-            ),
-        ] {
-            query_profile_arena_mut(&mut program, owner)
-                .expect("owner must resolve its exact retained arena")
-                .replace_literal(expr_id, LiteralValue::Utf8(value.to_string()))
-                .expect("owned literal patch");
-        }
-        assert!(
-            query_profile_arena_mut(
-                &mut program,
-                FragmentExprArenaOwner::StarRocksIndexPredicate { index: 1 },
-            )
-            .is_err()
-        );
-        assert!(query_profile_arena_mut(&mut program, FragmentExprArenaOwner::DataStream).is_err());
-
-        let FragmentSinkProgram::StarRocksTable(table) = program.sink().program() else {
-            panic!("fixture must retain a StarRocks table sink");
-        };
-        let output = table.output_projection.as_ref().expect("output projection");
-        assert!(matches!(
-            output.arena.node(output_id),
-            Some(ExprNode::Literal(LiteralValue::Utf8(value))) if value == "output-profile"
-        ));
-        let partition = table
-            .descriptor
-            .partition
-            .partition_exprs
-            .as_ref()
-            .expect("partition expressions");
-        assert!(matches!(
-            partition.arena.node(partition_id),
-            Some(ExprNode::Literal(LiteralValue::Utf8(value))) if value == "partition-profile"
-        ));
-        let predicate = table.descriptor.schema.indexes[0]
-            .where_clause
-            .as_ref()
-            .expect("index predicate");
-        assert!(matches!(
-            predicate.arena.node(index_id),
-            Some(ExprNode::Literal(LiteralValue::Utf8(value))) if value == "index-profile"
-        ));
     }
 
     #[test]
@@ -2192,10 +2005,7 @@ mod tests {
         };
         let rf_key = QueryKey::from_hi_lo(query.high(), query.low());
 
-        assert!(query_context_manager().query_mem_tracker(query).is_none());
         assert!(prepare_fragment_submission(decode_input(&fragment, &params)).is_err());
-        assert!(query_context_manager().query_mem_tracker(query).is_none());
-        assert!(query_context_manager().query_id_by_finst(finst).is_none());
         assert!(matches!(
             result_buffer::try_fetch(finst),
             TryFetchResult::Error(_)

@@ -659,7 +659,7 @@ mod tests {
                 ExchangeInputAssignment::new(expected_senders),
             )])),
             FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(query_options, None, false),
+            FragmentRuntimeOptions::new(query_options, false),
             NonZeroUsize::new(1).expect("one driver"),
             BackendNum::try_new(1).expect("backend number"),
         );
@@ -690,7 +690,7 @@ mod tests {
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::new(1).expect("one driver"),
             BackendNum::try_new(1).expect("backend number"),
         );
@@ -791,7 +791,7 @@ mod tests {
                 destinations: vec![destination],
                 sender_id: Some(11),
             },
-            FragmentRuntimeOptions::new(query_options, None, false),
+            FragmentRuntimeOptions::new(query_options, false),
             NonZeroUsize::new(1).expect("one driver"),
             BackendNum::try_new(backend_num).expect("backend number"),
         );

@@ -45,11 +45,10 @@ use novarocks::runtime::fragment::{
 };
 use novarocks::runtime::mem_tracker::MemTracker;
 use novarocks::runtime::profile::{ProfileUnit, Profiler};
-use novarocks::runtime::query_context::LookupFetcherLifecycle;
 use novarocks::runtime::query_options::query_expire_durations;
 use novarocks::runtime::starrocks_fragment_query::{
-    StarRocksFragmentExecution, StarRocksFragmentHandoff, StarRocksFragmentPreStartHandoff,
-    StarRocksFragmentQueryRuntime,
+    LookupFetcherLifecycle, StarRocksFragmentExecution, StarRocksFragmentHandoff,
+    StarRocksFragmentPreStartHandoff, StarRocksFragmentQueryRuntime,
 };
 use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,

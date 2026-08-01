@@ -169,7 +169,7 @@ pub(crate) use hash_join::lower_hash_join_node;
 pub(crate) use hdfs_scan::lower_hdfs_scan_node;
 pub(crate) use iceberg_delta_scan::lower_iceberg_delta_scan_node;
 pub(crate) use lake_meta_scan::{LakeMetaValuesPatch, lower_lake_meta_scan_node};
-pub(crate) use lake_scan::lower_lake_scan_node;
+pub(crate) use lake_scan::{lower_lake_scan_node, reject_lake_late_materialization};
 pub(crate) use lookup::{lower_lookup_node, lower_row_pos_descs};
 pub(crate) use nestloop_join::lower_nestloop_join_node;
 pub(crate) use project::lower_project_node;
@@ -697,6 +697,13 @@ fn lower_node_with_children_typed(
                 )?
             }
             t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => {
+                reject_lake_late_materialization(
+                    node,
+                    desc_tbl,
+                    tuple_slots,
+                    layout_hints,
+                    node_path.clone(),
+                )?;
                 lower_lake_scan_node(
                     node,
                     desc_tbl,

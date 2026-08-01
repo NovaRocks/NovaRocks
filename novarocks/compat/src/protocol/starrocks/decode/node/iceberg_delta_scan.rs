@@ -46,7 +46,7 @@ use novarocks::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledS
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use novarocks::exec::node::scan::BoundScanRanges;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::runtime::query_context::query_context_manager;
+use novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime;
 use novarocks::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorExecutionBinding,
@@ -54,16 +54,6 @@ use novarocks_spi::connector::{
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 use novarocks_types::QueryId;
-
-struct CompatIcebergDeltaCancellation {
-    query_id: QueryId,
-}
-
-impl ConnectorCancellation for CompatIcebergDeltaCancellation {
-    fn is_cancelled(&self) -> bool {
-        query_context_manager().is_query_canceled(self.query_id)
-    }
-}
 
 /// Lower an `ICEBERG_DELTA_SCAN_NODE` into an `ExecNode` of kind
 /// `IcebergDeltaScan`. The node must carry a typed refresh/codegen-time
@@ -135,7 +125,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let (_, query_expire) = query_expire_durations(Some(query_options));
     let context = ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
-        Arc::new(CompatIcebergDeltaCancellation { query_id }),
+        StarRocksFragmentQueryRuntime::new().connector_cancellation(query_id),
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
