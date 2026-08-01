@@ -17,7 +17,7 @@
 
 //! Provider-private read-only view of StarRocks lake metadata protobufs.
 //!
-//! This deliberately contains no transaction, compaction, write, or replica
+//! This deliberately contains no transaction, compaction, write, or placement
 //! records. The tags match StarRocks' persisted `lake_types.proto` and
 //! `tablet_schema.proto`; the DTOs stay private to this connector.
 

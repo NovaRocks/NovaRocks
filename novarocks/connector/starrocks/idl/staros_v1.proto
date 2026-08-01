@@ -111,7 +111,6 @@ message GetShardRequest {
     string service_id = 1;
     repeated uint64 shard_id = 2;
     uint64 worker_group_id = 3;
-    bool no_wait_replica_allocation = 4;
 }
 
 message GetShardResponse {

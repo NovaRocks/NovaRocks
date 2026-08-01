@@ -279,7 +279,6 @@ impl StarOsV1Rpc for TonicStarOsV1Rpc {
                     service_id: routing.service_id().to_string(),
                     shard_id: tablet_ids,
                     worker_group_id: routing.worker_group_id(),
-                    no_wait_replica_allocation: false,
                 },
                 &context,
             )?;
