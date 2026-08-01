@@ -23,6 +23,10 @@
 
 mod codec;
 mod planning;
+mod reader;
+mod staros;
+
+pub(crate) mod storage;
 
 pub use planning::{
     StarRocksDirectColumnBinding, StarRocksDirectLocation, StarRocksDirectLocationSource,
@@ -30,5 +34,11 @@ pub use planning::{
     StarRocksDirectTabletPlanningSource, StarRocksSharedDataDirectPlanner,
     StarRocksStorageBindingRef,
 };
+pub use reader::{StarRocksDirectStorageResolver, StarRocksSharedDataDirectReaderFactory};
+pub use staros::{
+    StarOsV1Client, StarOsV1LocationSource, StarOsV1ObjectStoreResolver,
+    StarOsV1Routing as StarRocksStarManagerRouting, StarRocksDirectIoRuntime,
+};
+pub type StarRocksStarOsClient = StarOsV1Client;
 
 pub(crate) use codec::{DirectOuterFacts, decode_direct_split, encode_direct_split};

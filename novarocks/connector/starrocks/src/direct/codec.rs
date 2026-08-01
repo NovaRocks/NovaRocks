@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::ConnectorError;
+#[cfg(test)]
+use novarocks_spi::connector::ConnectorErrorKind;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

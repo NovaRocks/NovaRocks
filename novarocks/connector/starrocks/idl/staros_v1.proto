@@ -1,0 +1,135 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package staros;
+
+// This is the provider-private read-only subset of the StarOS V1 contract.
+// Message names and field numbers intentionally match the upstream wire.
+
+enum StatusCode {
+    OK = 0;
+    INVALID_ARGUMENT = 1;
+    NOT_EXIST = 2;
+    ALREADY_EXIST = 3;
+    NOT_ALLOWED = 4;
+    UNKNOWN = 5;
+    GRPC = 6;
+    JOURNAL = 7;
+    IO = 8;
+    NOT_LEADER = 9;
+    NOT_IMPLEMENTED = 10;
+    FAILED_PRECONDITION = 11;
+    INTERNAL = 12;
+    SHUT_DOWN = 13;
+    WORKER_NOT_HEALTHY = 14;
+}
+
+message StarStatus {
+    StatusCode status_code = 1;
+    string error_msg = 2;
+    bytes extra_info = 3;
+}
+
+enum FileStoreType {
+    INVALID = 0;
+    S3 = 1;
+    HDFS = 2;
+    AZBLOB = 3;
+    ADLS2 = 4;
+    GS = 5;
+}
+
+message AwsDefaultCredentialInfo {}
+
+message AwsSimpleCredentialInfo {
+    string access_key = 1;
+    string access_key_secret = 2;
+    bool encrypted = 3;
+}
+
+message AwsInstanceProfileCredentialInfo {}
+
+message AwsAssumeIamRoleCredentialInfo {
+    string iam_role_arn = 1;
+    string external_id = 2;
+}
+
+message AwsCredentialInfo {
+    oneof credential {
+        AwsDefaultCredentialInfo default_credential = 1;
+        AwsSimpleCredentialInfo simple_credential = 2;
+        AwsInstanceProfileCredentialInfo profile_credential = 3;
+        AwsAssumeIamRoleCredentialInfo assume_role_credential = 4;
+    }
+}
+
+message S3FileStoreInfo {
+    string bucket = 1;
+    string region = 2;
+    string endpoint = 3;
+    AwsCredentialInfo credential = 4;
+    string path_prefix = 5;
+    bool partitioned_prefix_enabled = 6;
+    uint32 num_partitioned_prefix = 7;
+    uint32 path_style_access = 8;
+}
+
+message FileStoreInfo {
+    FileStoreType fs_type = 1;
+    string fs_key = 2;
+    S3FileStoreInfo s3_fs_info = 3;
+    string fs_name = 6;
+}
+
+message FilePathInfo {
+    FileStoreInfo fs_info = 1;
+    string full_path = 2;
+}
+
+message ShardInfo {
+    uint64 shard_id = 3;
+    FilePathInfo file_path = 5;
+}
+
+message GetShardRequest {
+    string service_id = 1;
+    repeated uint64 shard_id = 2;
+    uint64 worker_group_id = 3;
+    bool no_wait_replica_allocation = 4;
+}
+
+message GetShardResponse {
+    StarStatus status = 1;
+    repeated ShardInfo shard_info = 2;
+}
+
+message ListFileStoreRequest {
+    string service_id = 1;
+    FileStoreType fs_type = 2;
+}
+
+message ListFileStoreResponse {
+    StarStatus status = 1;
+    repeated FileStoreInfo fs_infos = 2;
+}
+
+service StarManager {
+    rpc GetShard(GetShardRequest) returns (GetShardResponse) {}
+    rpc ListFileStore(ListFileStoreRequest) returns (ListFileStoreResponse) {}
+}

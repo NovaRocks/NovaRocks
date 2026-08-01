@@ -34,9 +34,11 @@ pub use control::{
     StarRocksRpcSplitPlanner,
 };
 pub use direct::{
-    StarRocksDirectColumnBinding, StarRocksDirectLocation, StarRocksDirectLocationSource,
-    StarRocksDirectMetadataLayout, StarRocksDirectSplit, StarRocksDirectTabletDescriptor,
+    StarRocksDirectColumnBinding, StarRocksDirectIoRuntime, StarRocksDirectLocation,
+    StarRocksDirectLocationSource, StarRocksDirectMetadataLayout, StarRocksDirectSplit,
+    StarRocksDirectStorageResolver, StarRocksDirectTabletDescriptor,
     StarRocksDirectTabletPlanningSource, StarRocksSharedDataDirectPlanner,
+    StarRocksSharedDataDirectReaderFactory, StarRocksStarManagerRouting, StarRocksStarOsClient,
     StarRocksStorageBindingRef,
 };
 pub use domain::{
