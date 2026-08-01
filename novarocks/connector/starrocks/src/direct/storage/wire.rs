@@ -33,9 +33,11 @@ mod generated {
 }
 
 use generated::{
-    BundleTabletMetadataPb, ColumnPb, DeletePredicatePb, DelvecPagePb, PagePointerPb,
-    RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
+    BundleTabletMetadataPb, DeletePredicatePb, DelvecPagePb, RowsetMetadataPb, TabletMetadataPb,
+    TabletSchemaPb,
 };
+#[cfg(test)]
+use generated::{ColumnPb, PagePointerPb};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StorageModel {
@@ -123,6 +125,7 @@ pub(crate) fn decode_standalone_metadata(
     tablet_id: i64,
     version: i64,
 ) -> Result<StorageTabletMetadata, ConnectorError> {
+    validate_tablet_metadata_wire(bytes)?;
     let raw = TabletMetadataPb::decode(bytes)
         .map_err(|_| corrupt("invalid StarRocks tablet metadata protobuf"))?;
     decode_tablet_metadata(raw, tablet_id, version)
@@ -150,6 +153,7 @@ pub(crate) fn decode_bundle_metadata(
         return Err(corrupt("invalid StarRocks bundle metadata size"));
     }
     let bundle_start = footer - metadata_size;
+    validate_bundle_metadata_wire(&bytes[bundle_start..footer])?;
     let bundle = BundleTabletMetadataPb::decode(&bytes[bundle_start..footer])
         .map_err(|_| corrupt("invalid StarRocks bundle metadata protobuf"))?;
     let page = bundle
@@ -358,6 +362,257 @@ fn decode_delvec_page(value: DelvecPagePb) -> Result<StorageDelvecPage, Connecto
     })
 }
 
+// Generated Prost types intentionally ignore fields they do not know.  That
+// is correct for an application protocol but unsafe for a persisted-storage
+// snapshot reader: an unrecognised field or enum can change read semantics.
+// Validate every read-reachable message before decoding it into the generated
+// private DTOs.  The validator never includes encoded values in diagnostics.
+fn validate_tablet_metadata_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    validate_message(bytes, MessageKind::TabletMetadata)
+}
+
+fn validate_bundle_metadata_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    validate_message(bytes, MessageKind::BundleTabletMetadata)
+}
+
+#[derive(Clone, Copy)]
+enum MessageKind {
+    TabletMetadata,
+    TabletSchema,
+    Column,
+    Rowset,
+    DeletePredicate,
+    InPredicate,
+    BinaryPredicate,
+    IsNullPredicate,
+    DelvecMetadata,
+    DelvecPage,
+    BundleTabletMetadata,
+    PagePointer,
+    MapInt64Schema,
+    MapU32Int64,
+    MapU32Delvec,
+    MapInt64Int64,
+    MapInt64PagePointer,
+}
+
+fn validate_message(mut input: &[u8], kind: MessageKind) -> Result<(), ConnectorError> {
+    while !input.is_empty() {
+        let key = read_varint(&mut input)?;
+        let field = u32::try_from(key >> 3)
+            .map_err(|_| corrupt("StarRocks storage protobuf field number overflows"))?;
+        let wire = (key & 7) as u8;
+        if field == 0 {
+            return Err(corrupt("StarRocks storage protobuf uses field number zero"));
+        }
+        let nested = message_field(kind, field, wire)?;
+        let payload = consume_field(&mut input, wire)?;
+        if let Some(nested) = nested {
+            if wire != 2 {
+                return Err(corrupt(
+                    "StarRocks storage nested protobuf has invalid wire type",
+                ));
+            }
+            validate_message(payload, nested)?;
+        }
+        if matches!(kind, MessageKind::TabletSchema) && field == 1 {
+            let value = decode_scalar_varint(payload, wire)?;
+            if !matches!(value, 0 | 1 | 2 | 10) {
+                return Err(unsupported("unknown StarRocks tablet key model enum"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn message_field(
+    kind: MessageKind,
+    field: u32,
+    wire: u8,
+) -> Result<Option<MessageKind>, ConnectorError> {
+    use MessageKind::*;
+    let expected = match kind {
+        TabletMetadata => match field {
+            1 | 2 => scalar(0, wire),
+            3 => nested(2, wire, TabletSchema),
+            4 => nested(2, wire, Rowset),
+            7 => nested(2, wire, DelvecMetadata),
+            17 => nested(2, wire, MapInt64Schema),
+            18 => nested(2, wire, MapU32Int64),
+            _ => return Err(unsupported("unknown field in StarRocks tablet metadata")),
+        },
+        TabletSchema => match field {
+            1 => scalar(0, wire),
+            2 => nested(2, wire, Column),
+            50 => scalar(0, wire),
+            _ => return Err(unsupported("unknown field in StarRocks tablet schema")),
+        },
+        Column => match field {
+            1 | 6 => scalar(0, wire),
+            2 | 3 | 7 => scalar(2, wire),
+            _ => return Err(unsupported("unknown field in StarRocks tablet column")),
+        },
+        Rowset => match field {
+            1 | 4 => scalar(0, wire),
+            3 | 8 => scalar(2, wire),
+            14 => scalar(0, wire),
+            6 => nested(2, wire, DeletePredicate),
+            _ => return Err(unsupported("unknown field in StarRocks rowset metadata")),
+        },
+        DeletePredicate => match field {
+            2 => scalar(2, wire),
+            3 => nested(2, wire, InPredicate),
+            4 => nested(2, wire, BinaryPredicate),
+            5 => nested(2, wire, IsNullPredicate),
+            _ => return Err(unsupported("unknown field in StarRocks delete predicate")),
+        },
+        InPredicate => match field {
+            1 | 3 => scalar(2, wire),
+            2 => scalar(0, wire),
+            _ => {
+                return Err(unsupported(
+                    "unknown field in StarRocks IN delete predicate",
+                ));
+            }
+        },
+        BinaryPredicate => match field {
+            1 | 2 | 3 => scalar(2, wire),
+            _ => {
+                return Err(unsupported(
+                    "unknown field in StarRocks binary delete predicate",
+                ));
+            }
+        },
+        IsNullPredicate => match field {
+            1 => scalar(2, wire),
+            2 => scalar(0, wire),
+            _ => {
+                return Err(unsupported(
+                    "unknown field in StarRocks null delete predicate",
+                ));
+            }
+        },
+        DelvecMetadata => match field {
+            2 => nested(2, wire, MapU32Delvec),
+            _ => {
+                return Err(unsupported(
+                    "unknown field in StarRocks delete-vector metadata",
+                ));
+            }
+        },
+        DelvecPage => match field {
+            1 | 2 | 3 | 4 => scalar(0, wire),
+            _ => return Err(unsupported("unknown field in StarRocks delete-vector page")),
+        },
+        BundleTabletMetadata => match field {
+            1 => nested(2, wire, MapInt64Int64),
+            2 => nested(2, wire, MapInt64Schema),
+            3 => nested(2, wire, MapInt64PagePointer),
+            _ => return Err(unsupported("unknown field in StarRocks bundle metadata")),
+        },
+        PagePointer => match field {
+            1 | 2 => scalar(0, wire),
+            _ => return Err(unsupported("unknown field in StarRocks page pointer")),
+        },
+        MapInt64Schema => match field {
+            1 => scalar(0, wire),
+            2 => nested(2, wire, TabletSchema),
+            _ => return Err(unsupported("unknown field in StarRocks metadata map")),
+        },
+        MapU32Int64 | MapInt64Int64 => match field {
+            1 | 2 => scalar(0, wire),
+            _ => return Err(unsupported("unknown field in StarRocks metadata map")),
+        },
+        MapU32Delvec => match field {
+            1 => scalar(0, wire),
+            2 => nested(2, wire, DelvecPage),
+            _ => return Err(unsupported("unknown field in StarRocks metadata map")),
+        },
+        MapInt64PagePointer => match field {
+            1 => scalar(0, wire),
+            2 => nested(2, wire, PagePointer),
+            _ => return Err(unsupported("unknown field in StarRocks metadata map")),
+        },
+    };
+    expected
+}
+
+fn scalar(expected_wire: u8, actual_wire: u8) -> Result<Option<MessageKind>, ConnectorError> {
+    if expected_wire != actual_wire {
+        return Err(corrupt(
+            "StarRocks storage protobuf field has invalid wire type",
+        ));
+    }
+    Ok(None)
+}
+
+fn nested(
+    expected_wire: u8,
+    actual_wire: u8,
+    kind: MessageKind,
+) -> Result<Option<MessageKind>, ConnectorError> {
+    if expected_wire != actual_wire {
+        return Err(corrupt(
+            "StarRocks storage protobuf nested field has invalid wire type",
+        ));
+    }
+    Ok(Some(kind))
+}
+
+fn consume_field<'a>(input: &mut &'a [u8], wire: u8) -> Result<&'a [u8], ConnectorError> {
+    match wire {
+        0 => {
+            let begin = *input;
+            let _ = read_varint(input)?;
+            Ok(&begin[..begin.len() - input.len()])
+        }
+        1 => take(input, 8),
+        2 => {
+            let size = usize::try_from(read_varint(input)?)
+                .map_err(|_| corrupt("StarRocks storage protobuf length overflows"))?;
+            take(input, size)
+        }
+        5 => take(input, 4),
+        _ => Err(corrupt("StarRocks storage protobuf has invalid wire type")),
+    }
+}
+
+fn decode_scalar_varint(payload: &[u8], wire: u8) -> Result<u64, ConnectorError> {
+    if wire != 0 {
+        return Err(corrupt("StarRocks storage enum has invalid wire type"));
+    }
+    let mut payload = payload;
+    let value = read_varint(&mut payload)?;
+    if !payload.is_empty() {
+        return Err(corrupt("StarRocks storage enum payload is malformed"));
+    }
+    Ok(value)
+}
+
+fn read_varint(input: &mut &[u8]) -> Result<u64, ConnectorError> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *input
+            .first()
+            .ok_or_else(|| corrupt("truncated StarRocks storage protobuf varint"))?;
+        *input = &input[1..];
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(corrupt("overflowing StarRocks storage protobuf varint"))
+}
+
+fn take<'a>(input: &mut &'a [u8], size: usize) -> Result<&'a [u8], ConnectorError> {
+    if size > input.len() {
+        return Err(corrupt("truncated StarRocks storage protobuf field"));
+    }
+    let (value, remaining) = input.split_at(size);
+    *input = remaining;
+    Ok(value)
+}
+
 fn corrupt(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message)
 }
@@ -413,6 +668,27 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn metadata_rejects_unknown_wire_field_and_key_model_enum() {
+        let mut unknown_field = tablet().encode_to_vec();
+        unknown_field.extend_from_slice(&[0x28, 1]); // field 5, varint
+        assert_eq!(
+            decode_standalone_metadata(&unknown_field, 9, 3)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+
+        let mut unknown_enum = tablet();
+        unknown_enum.schema.as_mut().unwrap().keys_type = Some(99);
+        assert_eq!(
+            decode_standalone_metadata(&unknown_enum.encode_to_vec(), 9, 3)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
         );
     }
     #[test]

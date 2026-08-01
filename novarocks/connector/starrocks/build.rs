@@ -30,9 +30,14 @@ fn main() {
         env::set_var("PROTOC", protoc);
     }
 
+    let descriptor_path = PathBuf::from(
+        env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR for connector codegen"),
+    )
+    .join("starrocks-storage-v1-descriptor.bin");
     tonic_build::configure()
         .build_client(true)
         .build_server(false)
+        .file_descriptor_set_path(descriptor_path)
         .compile_protos(
             &[PathBuf::from(STAROS_IDL), PathBuf::from(STORAGE_IDL)],
             &[PathBuf::from(
