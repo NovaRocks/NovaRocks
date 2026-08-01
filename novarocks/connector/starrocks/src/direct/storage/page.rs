@@ -241,6 +241,13 @@ pub(crate) fn decode_binary_plain_values(
     body: &[u8],
     expected_values: usize,
 ) -> Result<Vec<Vec<u8>>, ConnectorError> {
+    decode_binary_plain_values_inner(body, Some(expected_values))
+}
+
+fn decode_binary_plain_values_inner(
+    body: &[u8],
+    expected_values: Option<usize>,
+) -> Result<Vec<Vec<u8>>, ConnectorError> {
     if body.len() < 4 {
         return Err(corrupt("invalid StarRocks binary PLAIN page body"));
     }
@@ -249,7 +256,7 @@ pub(crate) fn decode_binary_plain_values(
             .try_into()
             .map_err(|_| corrupt("invalid StarRocks binary PLAIN value count"))?,
     ) as usize;
-    if values != expected_values {
+    if expected_values.is_some_and(|expected| values != expected) {
         return Err(corrupt(
             "StarRocks binary PLAIN value count differs from page footer",
         ));
@@ -286,6 +293,49 @@ pub(crate) fn decode_binary_plain_values(
         output.push(body[start..end].to_vec());
     }
     Ok(output)
+}
+
+/// Decode a dictionary page, whose body itself uses binary PLAIN layout.
+pub(crate) fn decode_binary_dictionary_page(
+    segment_path: &str,
+    page_bytes: &[u8],
+    compression: StarRocksCompression,
+) -> Result<Vec<Vec<u8>>, ConnectorError> {
+    let decoded = decode_page(segment_path, page_bytes, compression)?;
+    if decoded.footer.r#type != Some(PAGE_TYPE_DICTIONARY) {
+        return Err(corrupt(
+            "StarRocks dictionary page has an invalid page type",
+        ));
+    }
+    decode_binary_plain_values_inner(&decoded.body, None)
+}
+
+/// Decode a variable-width DICT data page that stores its values as a PLAIN
+/// binary payload. Bitshuffle dictionary codes remain a distinct format and
+/// fail explicitly until the data-page bitshuffle decoder is installed.
+pub(crate) fn decode_binary_dictionary_values(
+    body: &[u8],
+    expected_values: usize,
+    dictionary: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, ConnectorError> {
+    if body.len() < 4 {
+        return Err(corrupt("invalid StarRocks dictionary data page body"));
+    }
+    let mode = i32::from_le_bytes(
+        body[..4]
+            .try_into()
+            .map_err(|_| corrupt("invalid StarRocks dictionary data page mode"))?,
+    );
+    match mode {
+        2 => decode_binary_plain_values(&body[4..], expected_values),
+        5 => {
+            let _ = dictionary;
+            Err(unsupported(
+                "StarRocks bitshuffle dictionary codes are not implemented",
+            ))
+        }
+        _ => Err(unsupported("unknown StarRocks dictionary data page mode")),
+    }
 }
 
 /// Decode the hybrid RLE/bit-packed fixed-width page body used by StarRocks.
@@ -751,6 +801,33 @@ mod tests {
         assert_eq!(
             decode_fixed_rle_values(&literal, 3, 1, 1).unwrap(),
             vec![1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn decodes_binary_dictionary_page_and_plain_mode_data() {
+        let dictionary_body = vec![b'a', b'b', b'c', 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0];
+        let footer = PageFooterPb {
+            r#type: Some(PAGE_TYPE_DICTIONARY),
+            uncompressed_size: Some(dictionary_body.len() as u32),
+            data_page_footer: None,
+            index_page_footer: None,
+        }
+        .encode_to_vec();
+        let mut page = dictionary_body.clone();
+        page.extend_from_slice(&footer);
+        page.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        page.extend_from_slice(&crc32c(&page).to_le_bytes());
+        let dictionary =
+            decode_binary_dictionary_page("segment.dat", &page, StarRocksCompression::None)
+                .unwrap();
+        assert_eq!(dictionary, vec![b"a".to_vec(), b"bc".to_vec()]);
+
+        let mut data = 2i32.to_le_bytes().to_vec();
+        data.extend_from_slice(&dictionary_body);
+        assert_eq!(
+            decode_binary_dictionary_values(&data, 2, &dictionary).unwrap(),
+            dictionary
         );
     }
 

@@ -35,8 +35,8 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use crate::direct::StarRocksDirectColumnBinding;
 
 use super::page::{
-    decode_binary_plain_values, decode_data_page, decode_fixed_plain_values,
-    decode_fixed_rle_values, page_slice,
+    decode_binary_dictionary_page, decode_binary_dictionary_values, decode_binary_plain_values,
+    decode_data_page, decode_fixed_plain_values, decode_fixed_rle_values, page_slice,
 };
 use super::segment::{
     StarRocksLogicalType, StarRocksPageEncoding, StarRocksSegmentColumnMeta, StarRocksSegmentFooter,
@@ -100,7 +100,9 @@ fn decode_column(
         .ok_or_else(|| corrupt("StarRocks direct segment is missing a page encoding"))?;
     if !matches!(
         encoding,
-        StarRocksPageEncoding::Plain | StarRocksPageEncoding::Rle
+        StarRocksPageEncoding::Plain
+            | StarRocksPageEncoding::Rle
+            | StarRocksPageEncoding::Dictionary
     ) {
         return Err(unsupported(
             "StarRocks direct segment encoding is not implemented",
@@ -135,6 +137,21 @@ fn decode_column(
     }
     let body = &page.body[..page.body.len() - page.nullmap_size];
     let null_flags = page.null_flags.as_deref();
+    let dictionary = if encoding == StarRocksPageEncoding::Dictionary {
+        let pointer = column.dictionary_page.as_ref().ok_or_else(|| {
+            corrupt("StarRocks dictionary-encoded segment is missing its dictionary page")
+        })?;
+        let bytes = page_slice(segment_path, segment, pointer)?;
+        Some(decode_binary_dictionary_page(
+            segment_path,
+            bytes,
+            column
+                .compression
+                .unwrap_or(super::segment::StarRocksCompression::None),
+        )?)
+    } else {
+        None
+    };
     match (column.logical_type, output_type) {
         (StarRocksLogicalType::Boolean, DataType::Boolean) => {
             let values = decode_fixed_values(body, encoding, page.num_values, 1, 1)?;
@@ -169,32 +186,38 @@ fn decode_column(
             fixed_f64(body, encoding, page.num_values, null_flags)
         }
         (StarRocksLogicalType::Char | StarRocksLogicalType::Varchar, DataType::Utf8) => {
-            if encoding != StarRocksPageEncoding::Plain {
+            if encoding == StarRocksPageEncoding::Rle {
                 return Err(unsupported(
                     "StarRocks variable-width RLE pages are not supported",
                 ));
             }
-            let values = decode_binary_plain_values(body, page.num_values)?
-                .into_iter()
-                .map(|value| {
-                    String::from_utf8(value)
-                        .map_err(|_| corrupt("invalid UTF-8 StarRocks VARCHAR value"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let values = if let Some(dictionary) = dictionary.as_deref() {
+                decode_binary_dictionary_values(body, page.num_values, dictionary)?
+            } else {
+                decode_binary_plain_values(body, page.num_values)?
+            }
+            .into_iter()
+            .map(|value| {
+                String::from_utf8(value)
+                    .map_err(|_| corrupt("invalid UTF-8 StarRocks VARCHAR value"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
             Ok(Arc::new(StringArray::from(apply_nulls(
                 values, null_flags,
             )?)))
         }
         (StarRocksLogicalType::Binary | StarRocksLogicalType::VarBinary, DataType::Binary) => {
-            if encoding != StarRocksPageEncoding::Plain {
+            if encoding == StarRocksPageEncoding::Rle {
                 return Err(unsupported(
                     "StarRocks variable-width RLE pages are not supported",
                 ));
             }
-            let values = apply_nulls(
-                decode_binary_plain_values(body, page.num_values)?,
-                null_flags,
-            )?;
+            let values = if let Some(dictionary) = dictionary.as_deref() {
+                decode_binary_dictionary_values(body, page.num_values, dictionary)?
+            } else {
+                decode_binary_plain_values(body, page.num_values)?
+            };
+            let values = apply_nulls(values, null_flags)?;
             let mut builder = BinaryBuilder::new();
             for value in values {
                 match value {
