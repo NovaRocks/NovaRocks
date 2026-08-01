@@ -3333,6 +3333,7 @@ dependencies = [
  "arrow",
  "base64 0.22.1",
  "bytes",
+ "crc32c",
  "novarocks-fs",
  "novarocks-spi",
  "prost 0.13.5",

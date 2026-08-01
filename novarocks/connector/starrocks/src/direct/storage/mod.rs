@@ -24,6 +24,8 @@
 
 #![allow(dead_code)] // Fixture-only domain variants document the read closure.
 
+mod segment;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
