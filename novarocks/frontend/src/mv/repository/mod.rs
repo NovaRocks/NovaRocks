@@ -88,6 +88,11 @@ pub struct BeginFrontendMvRefreshIntentRequest {
     pub expected_main_snapshot_id: Option<i64>,
     pub base_snapshots: BTreeMap<String, i64>,
     pub marker_token: String,
+    /// Data-producing attempts preallocate all external action records before
+    /// the first provider call. Metadata-only and no-op attempts keep this
+    /// false so the durable v3 ledger does not invent a writer, fragment, or
+    /// staging phase that never existed.
+    pub prepare_external_actions: bool,
     pub ledger: FrontendMvRefreshLedger,
 }
 
@@ -1258,7 +1263,9 @@ impl StateStoreMvRepository {
         mut request: BeginFrontendMvRefreshIntentRequest,
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
         validate_frontend_refresh_request(&request)?;
-        request.ledger.actions = frontend_prepared_actions(&request.ledger);
+        if request.prepare_external_actions {
+            request.ledger.actions = frontend_prepared_actions(&request.ledger);
+        }
         request.ledger.validate().map_err(invalid)?;
         self.require_definition_async(request.mv_id).await?;
         let operation_id = Uuid::now_v7();

@@ -182,6 +182,7 @@ fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
             expected_main_snapshot_id: Some(7),
             base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
             marker_token: "marker".to_string(),
+            prepare_external_actions: true,
             ledger: ledger.clone(),
         })
         .expect("persist frontend intent");
@@ -303,6 +304,41 @@ fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
             .frontend_ledger
             .expect("v3 ledger")
             .cleanup_pending
+    );
+}
+
+#[test]
+fn frontend_noop_refresh_persists_no_synthetic_external_actions() {
+    let (_temp, _runtime, _host, repository) = repository();
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_frontend_noop_v3"),
+        )
+        .expect("create definition");
+    let refresh = repository
+        .begin_frontend_refresh_intent(BeginFrontendMvRefreshIntentRequest {
+            refresh_id: 9002,
+            mv_id: definition.mv_id,
+            target_catalog: "ice".to_string(),
+            target_namespace: "sales".to_string(),
+            target_table: "daily_frontend_noop_v3".to_string(),
+            staging_branch: "__nova_mv_2".to_string(),
+            expected_main_snapshot_id: Some(7),
+            base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
+            marker_token: "marker".to_string(),
+            prepare_external_actions: false,
+            ledger: frontend_ledger(),
+        })
+        .expect("persist no-op frontend intent");
+
+    assert!(
+        refresh
+            .frontend_ledger
+            .expect("v3 ledger")
+            .actions
+            .is_empty(),
+        "a no-op attempt must not invent staging or writer phases"
     );
 }
 

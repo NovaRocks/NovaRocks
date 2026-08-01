@@ -4795,13 +4795,34 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
             &maintenance_execution
         }
     };
-    execute_distributed_write_with_execution(
-        &state.query_execution,
+    let request = prepare_planned_iceberg_change_stream_write(
         prepared,
         native_bundle,
         query_opts,
         execution,
         connector_write.map(DistributedConnectorWrite::Begin),
+    )?
+    .into_bound_request(&state.query_execution)?;
+    execute_bound_distributed_write_request(&state.query_execution, request)
+}
+
+/// Convert an already planned change-stream writer into SQL's inert native
+/// write handoff.  The caller supplies the admitted execution context and
+/// retains responsibility for binding the exact connector write lease before
+/// submitting the request.
+pub(crate) fn prepare_planned_iceberg_change_stream_write(
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    query_opts: Option<QueryOptions>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_write: Option<DistributedConnectorWrite>,
+) -> Result<PreparedDistributedWriteRequest, String> {
+    prepare_distributed_write_request_with_execution(
+        prepared,
+        native_bundle,
+        query_opts,
+        execution,
+        connector_write,
     )
 }
 
