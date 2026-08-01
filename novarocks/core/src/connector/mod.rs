@@ -19,7 +19,7 @@ pub(crate) mod data_mutation;
 pub mod file_execution;
 pub mod iceberg;
 pub mod metadata_maintenance;
-pub(crate) mod mutation;
+pub mod mutation;
 pub mod runtime;
 pub(crate) mod scan_model;
 pub mod schema;

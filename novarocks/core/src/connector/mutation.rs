@@ -29,17 +29,17 @@ use novarocks_spi::connector::{
 use crate::common::engine_error::EngineError;
 
 #[derive(Clone, Debug)]
-pub(crate) struct CompletedCatalogMutation {
-    pub(crate) effect: ExternalMutationEffect,
-    pub(crate) receipt: ConnectorCatalogMutationReceipt,
-    pub(crate) finalization: ExternalMutationFinalization,
+pub struct CompletedCatalogMutation {
+    pub effect: ExternalMutationEffect,
+    pub receipt: ConnectorCatalogMutationReceipt,
+    pub finalization: ExternalMutationFinalization,
 }
 
 /// Provider outcome after the application has performed its one permitted
 /// authoritative reconciliation. Consumers that own durable state machines
 /// must use this instead of inferring commit state from an EngineError string.
 #[derive(Clone, Debug)]
-pub(crate) enum ResolvedCatalogMutation {
+pub enum ResolvedCatalogMutation {
     KnownCommitted(CompletedCatalogMutation),
     KnownUncommitted {
         failure: ConnectorMutationFailure,
@@ -60,7 +60,7 @@ pub(crate) enum ResolvedCatalogMutation {
 /// What the application can prove about dispatch when the SPI boundary itself
 /// fails. It must not be inferred from a provider error string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MutationDispatchState {
+pub enum MutationDispatchState {
     ConfirmedNotDispatched,
     PossiblyDispatched,
 }
@@ -153,6 +153,41 @@ pub(crate) fn resolve_catalog_mutation_with_lease(
         }
     };
     resolve_outcome(&lease, outcome, context)
+}
+
+/// Execute one catalog mutation through an already retained exact-generation
+/// lease. `CommitUnknown` is reconciled at most once through that same lease;
+/// callers receive the typed three-state result and must never replay the
+/// mutation.
+///
+/// This is the frontend application's narrow mutation boundary. It accepts no
+/// registry and therefore cannot accidentally reacquire a newer current
+/// connector generation after SQL preparation.
+pub fn resolve_catalog_mutation_with_lease(
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    operation_id: ConnectorMutationOperationId,
+    operation: ConnectorCatalogMutationOperation,
+    context: ConnectorRequestContext,
+) -> ResolvedCatalogMutation {
+    let request = ConnectorCatalogMutationRequest {
+        operation_id,
+        target: ConnectorExecutionBindingKey {
+            instance_id: lease.descriptor().instance_id.clone(),
+            incarnation: lease.incarnation(),
+        },
+        operation,
+        context: context.clone(),
+    };
+    let outcome = match lease.execute(request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return ResolvedCatalogMutation::ContractFailure {
+                error,
+                dispatch: MutationDispatchState::PossiblyDispatched,
+            };
+        }
+    };
+    resolve_outcome(lease, outcome, context)
 }
 
 fn resolve_outcome(
