@@ -28,6 +28,7 @@ use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, StringArray,
 };
+use arrow::compute::concat;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
@@ -35,11 +36,13 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use crate::direct::StarRocksDirectColumnBinding;
 
 use super::page::{
-    decode_binary_dictionary_page, decode_binary_dictionary_values, decode_binary_plain_values,
-    decode_data_page, decode_fixed_plain_values, decode_fixed_rle_values, page_slice,
+    StarRocksIndexPageNodeType, decode_binary_dictionary_page, decode_binary_dictionary_values,
+    decode_binary_plain_values, decode_data_page, decode_fixed_plain_values,
+    decode_fixed_rle_values, decode_index_page, page_slice,
 };
 use super::segment::{
-    StarRocksLogicalType, StarRocksPageEncoding, StarRocksSegmentColumnMeta, StarRocksSegmentFooter,
+    StarRocksLogicalType, StarRocksPageEncoding, StarRocksPagePointer, StarRocksSegmentColumnMeta,
+    StarRocksSegmentFooter,
 };
 
 /// Decode one fully loaded immutable segment. The caller must obtain the exact
@@ -83,6 +86,7 @@ pub(crate) fn decode_plain_segment(
             segment,
             column,
             field.data_type(),
+            footer.num_rows as usize,
         )?);
     }
     RecordBatch::try_new(output_schema, arrays)
@@ -94,6 +98,127 @@ fn decode_column(
     segment: &[u8],
     column: &StarRocksSegmentColumnMeta,
     output_type: &DataType,
+    expected_rows: usize,
+) -> Result<ArrayRef, ConnectorError> {
+    let pages = resolve_data_pages(segment_path, segment, column, expected_rows)?;
+    let arrays = pages
+        .iter()
+        .map(|page| {
+            decode_single_data_page(
+                segment_path,
+                segment,
+                column,
+                output_type,
+                &page.pointer,
+                page.num_values,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if arrays.len() == 1 {
+        return Ok(Arc::clone(&arrays[0]));
+    }
+    let arrays = arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+    concat(&arrays).map_err(|_| corrupt("cannot concatenate StarRocks direct data pages"))
+}
+
+#[derive(Clone)]
+struct DataPageReference {
+    pointer: StarRocksPagePointer,
+    num_values: usize,
+}
+
+fn resolve_data_pages(
+    segment_path: &str,
+    segment: &[u8],
+    column: &StarRocksSegmentColumnMeta,
+    expected_rows: usize,
+) -> Result<Vec<DataPageReference>, ConnectorError> {
+    if expected_rows == 0 {
+        return Err(corrupt("StarRocks direct segment has zero rows"));
+    }
+    let root = column
+        .ordinal_index_page
+        .as_ref()
+        .ok_or_else(|| corrupt("StarRocks direct segment is missing its ordinal index"))?;
+    if column.ordinal_index_is_data_page {
+        return Ok(vec![DataPageReference {
+            pointer: root.clone(),
+            num_values: expected_rows,
+        }]);
+    }
+    let entries = resolve_ordinal_leaf_entries(segment_path, segment, root, 0)?;
+    let mut pages = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let first = decode_ordinal_key(&entry.0)?;
+        let next = if let Some(next) = entries.get(index + 1) {
+            decode_ordinal_key(&next.0)?
+        } else {
+            expected_rows as u64
+        };
+        if first >= next || next > expected_rows as u64 {
+            return Err(corrupt("StarRocks ordinal index entries are invalid"));
+        }
+        pages.push(DataPageReference {
+            pointer: entry.1.clone(),
+            num_values: usize::try_from(next - first)
+                .map_err(|_| corrupt("StarRocks ordinal page value count is out of range"))?,
+        });
+    }
+    if pages.is_empty() || pages.iter().map(|page| page.num_values).sum::<usize>() != expected_rows
+    {
+        return Err(corrupt(
+            "StarRocks ordinal index does not cover the frozen segment rows",
+        ));
+    }
+    Ok(pages)
+}
+
+fn resolve_ordinal_leaf_entries(
+    segment_path: &str,
+    segment: &[u8],
+    pointer: &StarRocksPagePointer,
+    depth: usize,
+) -> Result<Vec<(Vec<u8>, StarRocksPagePointer)>, ConnectorError> {
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH {
+        return Err(corrupt("StarRocks ordinal index exceeds maximum depth"));
+    }
+    let page = decode_index_page(segment_path, page_slice(segment_path, segment, pointer)?)?;
+    match page.node_type {
+        StarRocksIndexPageNodeType::Leaf => Ok(page
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.pointer))
+            .collect()),
+        StarRocksIndexPageNodeType::Internal => {
+            let mut entries = Vec::new();
+            for entry in page.entries {
+                entries.extend(resolve_ordinal_leaf_entries(
+                    segment_path,
+                    segment,
+                    &entry.pointer,
+                    depth + 1,
+                )?);
+            }
+            Ok(entries)
+        }
+    }
+}
+
+fn decode_ordinal_key(key: &[u8]) -> Result<u64, ConnectorError> {
+    let raw: [u8; 8] = key
+        .try_into()
+        .map_err(|_| corrupt("StarRocks ordinal index key is not an unsigned bigint"))?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn decode_single_data_page(
+    segment_path: &str,
+    segment: &[u8],
+    column: &StarRocksSegmentColumnMeta,
+    output_type: &DataType,
+    pointer: &StarRocksPagePointer,
+    expected_values: usize,
 ) -> Result<ArrayRef, ConnectorError> {
     let encoding = column
         .encoding
@@ -108,15 +233,6 @@ fn decode_column(
             "StarRocks direct segment encoding is not implemented",
         ));
     }
-    if !column.ordinal_index_is_data_page {
-        return Err(unsupported(
-            "StarRocks direct segment requires an unsupported multi-page ordinal index",
-        ));
-    }
-    let pointer = column
-        .ordinal_index_page
-        .as_ref()
-        .ok_or_else(|| corrupt("StarRocks direct segment is missing an ordinal data page"))?;
     let bytes = page_slice(segment_path, segment, pointer)?;
     let page = decode_data_page(
         segment_path,
@@ -125,6 +241,11 @@ fn decode_column(
             .compression
             .unwrap_or(super::segment::StarRocksCompression::None),
     )?;
+    if page.num_values != expected_values {
+        return Err(corrupt(
+            "StarRocks data page value count differs from its ordinal index",
+        ));
+    }
     if output_type.is_null() {
         return Err(unsupported(
             "StarRocks NULL-only output columns are not supported",
@@ -331,11 +452,20 @@ mod tests {
         uncompressed_size: Option<u32>,
         #[prost(message, optional, tag = "7")]
         data: Option<DataFooter>,
+        #[prost(message, optional, tag = "8")]
+        index: Option<IndexFooter>,
     }
     #[derive(Clone, PartialEq, Message)]
     struct DataFooter {
         #[prost(uint64, optional, tag = "2")]
         num_values: Option<u64>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct IndexFooter {
+        #[prost(uint32, optional, tag = "1")]
+        entries: Option<u32>,
+        #[prost(int32, optional, tag = "2")]
+        node_type: Option<i32>,
     }
     #[derive(Clone, PartialEq, Message)]
     struct Footer {
@@ -399,6 +529,7 @@ mod tests {
             data: Some(DataFooter {
                 num_values: Some(values.len() as u64),
             }),
+            index: None,
         }
         .encode_to_vec();
         page.extend_from_slice(&page_footer);
@@ -446,6 +577,7 @@ mod tests {
             data: Some(DataFooter {
                 num_values: Some(count as u64),
             }),
+            index: None,
         }
         .encode_to_vec();
         page.extend_from_slice(&page_footer);
@@ -527,6 +659,110 @@ mod tests {
                 .unwrap()
                 .values(),
             &[7, 7, 7]
+        );
+    }
+
+    #[test]
+    fn decodes_frozen_multi_page_ordinal_index_to_arrow() {
+        fn finish_page(mut body: Vec<u8>, footer: PageFooter) -> Vec<u8> {
+            let footer = footer.encode_to_vec();
+            body.extend_from_slice(&footer);
+            body.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+            body.extend_from_slice(&crc32c(&body).to_le_bytes());
+            body
+        }
+        fn data_page(values: &[i64]) -> Vec<u8> {
+            let mut body = (values.len() as u32).to_le_bytes().to_vec();
+            for value in values {
+                body.extend_from_slice(&value.to_le_bytes());
+            }
+            finish_page(
+                body.clone(),
+                PageFooter {
+                    page_type: Some(1),
+                    uncompressed_size: Some(body.len() as u32),
+                    data: Some(DataFooter {
+                        num_values: Some(values.len() as u64),
+                    }),
+                    index: None,
+                },
+            )
+        }
+
+        let first = data_page(&[7, 9]);
+        let second = data_page(&[11, 13]);
+        let mut index_body = Vec::new();
+        for (ordinal, offset, size) in [
+            (0_u64, 0_u64, first.len() as u32),
+            (2_u64, first.len() as u64, second.len() as u32),
+        ] {
+            index_body.push(8);
+            index_body.extend_from_slice(&ordinal.to_be_bytes());
+            index_body.push(offset as u8);
+            index_body.push(size as u8);
+        }
+        let index = finish_page(
+            index_body.clone(),
+            PageFooter {
+                page_type: Some(2),
+                uncompressed_size: Some(index_body.len() as u32),
+                data: None,
+                index: Some(IndexFooter {
+                    entries: Some(2),
+                    node_type: Some(1),
+                }),
+            },
+        );
+        let index_offset = (first.len() + second.len()) as u64;
+        let footer = Footer {
+            version: Some(1),
+            columns: vec![Column {
+                unique_id: Some(1),
+                logical_type: Some(7),
+                encoding: Some(2),
+                compression: Some(0),
+                nullable: Some(false),
+                indexes: vec![Index {
+                    index_type: Some(1),
+                    ordinal: Some(Ordinal {
+                        root: Some(Btree {
+                            page: Some(Pointer {
+                                offset: Some(index_offset),
+                                size: Some(index.len() as u32),
+                            }),
+                            root_is_data: Some(false),
+                        }),
+                    }),
+                }],
+            }],
+            num_rows: Some(4),
+        }
+        .encode_to_vec();
+        let mut bytes = first;
+        bytes.extend_from_slice(&second);
+        bytes.extend_from_slice(&index);
+        bytes.extend_from_slice(&footer);
+        bytes.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32c(&footer).to_le_bytes());
+        bytes.extend_from_slice(b"D0R1");
+        let footer = super::super::segment::decode_segment_footer("seg", &bytes).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = decode_plain_segment(
+            "seg",
+            &bytes,
+            &footer,
+            schema,
+            &[StarRocksDirectColumnBinding::try_new(0, 1, "id", "BIGINT", false, None).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[7, 9, 11, 13]
         );
     }
 

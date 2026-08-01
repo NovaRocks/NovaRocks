@@ -33,7 +33,8 @@ use super::segment::{StarRocksCompression, StarRocksPagePointer};
 
 const PAGE_TRAILER_SIZE: usize = 8;
 const PAGE_TYPE_DATA: i32 = 1;
-const PAGE_TYPE_DICTIONARY: i32 = 2;
+const PAGE_TYPE_INDEX: i32 = 2;
+const PAGE_TYPE_DICTIONARY: i32 = 3;
 const DATA_PAGE_FORMAT_V2: u32 = 2;
 
 /// A validated data page body.  This is crate-private so neither the raw page
@@ -44,6 +45,24 @@ pub(crate) struct StarRocksDecodedDataPage {
     pub(crate) num_values: usize,
     pub(crate) nullmap_size: usize,
     pub(crate) null_flags: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StarRocksIndexPageNodeType {
+    Leaf,
+    Internal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksIndexPageEntry {
+    pub(crate) key: Vec<u8>,
+    pub(crate) pointer: StarRocksPagePointer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksDecodedIndexPage {
+    pub(crate) node_type: StarRocksIndexPageNodeType,
+    pub(crate) entries: Vec<StarRocksIndexPageEntry>,
 }
 
 /// Decode one exact page range, validate its checksum/footer, and materialize
@@ -107,6 +126,57 @@ pub(crate) fn decode_data_page(
         nullmap_size,
         null_flags,
     })
+}
+
+/// Decode an ordinal-index page. Index pages are always uncompressed in the
+/// storage V1 snapshot and contain `key_len + key + page_pointer` entries.
+pub(crate) fn decode_index_page(
+    segment_path: &str,
+    page_bytes: &[u8],
+) -> Result<StarRocksDecodedIndexPage, ConnectorError> {
+    let decoded = decode_page(segment_path, page_bytes, StarRocksCompression::None)?;
+    if decoded.footer.r#type != Some(PAGE_TYPE_INDEX) {
+        return Err(unsupported("StarRocks page is not an ordinal index page"));
+    }
+    let footer = decoded
+        .footer
+        .index_page_footer
+        .ok_or_else(|| corrupt("StarRocks index page is missing its index footer"))?;
+    let node_type = match footer.r#type {
+        Some(1) => StarRocksIndexPageNodeType::Leaf,
+        Some(2) => StarRocksIndexPageNodeType::Internal,
+        _ => return Err(unsupported("unsupported StarRocks ordinal index node type")),
+    };
+    let count = usize::try_from(
+        footer
+            .num_entries
+            .ok_or_else(|| corrupt("StarRocks index page is missing entry count"))?,
+    )
+    .map_err(|_| corrupt("StarRocks ordinal index entry count is out of range"))?;
+    if count == 0 {
+        return Err(corrupt("StarRocks ordinal index has no entries"));
+    }
+    let mut input = decoded.body.as_slice();
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key_size = usize::try_from(read_varint(&mut input)?)
+            .map_err(|_| corrupt("StarRocks ordinal index key size is out of range"))?;
+        let key = take_bytes(&mut input, key_size)?.to_vec();
+        let offset = read_varint(&mut input)?;
+        let size = u32::try_from(read_varint(&mut input)?)
+            .map_err(|_| corrupt("StarRocks ordinal index page size is out of range"))?;
+        if size == 0 {
+            return Err(corrupt("StarRocks ordinal index has a zero-sized page"));
+        }
+        entries.push(StarRocksIndexPageEntry {
+            key,
+            pointer: StarRocksPagePointer { offset, size },
+        });
+    }
+    if !input.is_empty() {
+        return Err(corrupt("StarRocks ordinal index page has trailing bytes"));
+    }
+    Ok(StarRocksDecodedIndexPage { node_type, entries })
 }
 
 /// Decode StarRocks' bitshuffle+LZ4 nullable bitmap. The bitmap is a
@@ -572,7 +642,7 @@ fn decode_page(
 
 fn validate_page_footer(footer: &PageFooterPb) -> Result<(), ConnectorError> {
     match footer.r#type {
-        Some(PAGE_TYPE_DATA) | Some(PAGE_TYPE_DICTIONARY) => Ok(()),
+        Some(PAGE_TYPE_DATA) | Some(PAGE_TYPE_INDEX) | Some(PAGE_TYPE_DICTIONARY) => Ok(()),
         Some(_) => Err(unsupported("unsupported StarRocks page type")),
         None => Err(corrupt("StarRocks page footer is missing page type")),
     }
