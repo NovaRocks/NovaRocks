@@ -3337,6 +3337,7 @@ dependencies = [
  "lz4_flex 0.11.5",
  "novarocks-fs",
  "novarocks-spi",
+ "parquet",
  "prost 0.13.5",
  "protoc-bin-vendored",
  "roaring 0.10.12",

@@ -37,6 +37,7 @@ use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot, ConnectorRequestContext,
 };
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringBitmap;
 
 use crate::direct::reader::StarRocksDirectStorageResolver;
@@ -137,7 +138,13 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
             ensure_active(&request.context)?;
             for (index, relative_path) in rowset.segments.iter().enumerate() {
                 let segment_path = join_frozen_path(split.tablet_root(), relative_path)?;
+                let is_parquet = relative_path.to_ascii_lowercase().ends_with(".parquet");
                 let range = if let Some(offset) = rowset.bundle_offsets.get(index) {
+                    if is_parquet {
+                        return Err(unsupported(
+                            "StarRocks direct embedded bundle Parquet segments are unsupported",
+                        ));
+                    }
                     let offset = u64::try_from(*offset)
                         .map_err(|_| corrupt("StarRocks bundle segment offset is invalid"))?;
                     let size = *rowset.segment_sizes.get(index).ok_or_else(|| {
@@ -163,6 +170,23 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                     bytes_read = bytes_read.saturating_add(segment.len() as u64);
                     read_requests = read_requests.saturating_add(1);
                 }
+                if is_parquet {
+                    if !predicates_for_rowset(&metadata, rowset_index).is_empty()
+                        || metadata
+                            .delvecs
+                            .contains_key(&rowset.id.saturating_add(index as u32))
+                    {
+                        return Err(unsupported(
+                            "StarRocks direct Parquet rowsets with storage deletes are unsupported",
+                        ));
+                    }
+                    decoded_batches.extend(decode_frozen_parquet_segment(
+                        &segment_path,
+                        &segment,
+                        request.expected_schema.clone(),
+                    )?);
+                    continue;
+                }
                 let footer = decode_segment_footer(&segment_path, &segment)?;
                 let mut batch = decode_plain_segment(
                     &segment_path,
@@ -171,10 +195,7 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                     request.expected_schema.clone(),
                     split.columns(),
                 )?;
-                let predicates = metadata.rowsets[rowset_index..]
-                    .iter()
-                    .filter_map(|rowset| rowset.delete_predicate.as_ref())
-                    .collect::<Vec<_>>();
+                let predicates = predicates_for_rowset(&metadata, rowset_index);
                 if !predicates.is_empty() {
                     let mut predicate_batch = augment_predicate_batch(
                         &batch,
@@ -453,6 +474,57 @@ fn validate_metadata(
         ));
     }
     Ok(())
+}
+
+fn predicates_for_rowset(
+    metadata: &StorageTabletMetadata,
+    rowset_index: usize,
+) -> Vec<&StorageDeletePredicate> {
+    metadata.rowsets[rowset_index..]
+        .iter()
+        .filter_map(|rowset| rowset.delete_predicate.as_ref())
+        .collect()
+}
+
+fn decode_frozen_parquet_segment(
+    _segment_path: &str,
+    bytes: &Bytes,
+    output_schema: Arc<Schema>,
+) -> Result<Vec<RecordBatch>, ConnectorError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+        .map_err(|_| corrupt("StarRocks direct Parquet segment is malformed"))?;
+    let source_schema = builder.schema().clone();
+    let reader = builder
+        .build()
+        .map_err(|_| corrupt("StarRocks direct Parquet segment reader cannot be built"))?;
+    let mut projection = Vec::with_capacity(output_schema.fields().len());
+    for field in output_schema.fields() {
+        let index = source_schema.index_of(field.name()).map_err(|_| {
+            corrupt("StarRocks direct Parquet segment omits a frozen output column")
+        })?;
+        let source = source_schema.field(index);
+        if source.data_type() != field.data_type() || source.is_nullable() != field.is_nullable() {
+            return Err(corrupt(
+                "StarRocks direct Parquet segment schema differs from frozen output schema",
+            ));
+        }
+        projection.push(index);
+    }
+    let mut batches = Vec::new();
+    for batch in reader {
+        let batch =
+            batch.map_err(|_| corrupt("StarRocks direct Parquet segment cannot be decoded"))?;
+        let columns = projection
+            .iter()
+            .map(|index| batch.column(*index).clone())
+            .collect::<Vec<_>>();
+        batches.push(
+            RecordBatch::try_new(Arc::clone(&output_schema), columns).map_err(|_| {
+                corrupt("StarRocks direct Parquet batch does not match frozen output schema")
+            })?,
+        );
+    }
+    Ok(batches)
 }
 
 fn decode_delvec_bitmap(payload: &[u8]) -> Result<RoaringBitmap, ConnectorError> {
@@ -1134,6 +1206,31 @@ mod tests {
     };
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::io::Cursor;
+
+    #[test]
+    fn decodes_bundle_parquet_segment_with_exact_frozen_projection() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![7_i64, 8]))],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(Cursor::new(&mut bytes), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let batches = decode_frozen_parquet_segment(
+            "data/bundle.parquet",
+            &Bytes::from(bytes),
+            batch.schema(),
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+    }
 
     fn schema(columns: Vec<StorageColumn>) -> StorageSchema {
         StorageSchema {
