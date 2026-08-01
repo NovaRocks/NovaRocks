@@ -273,6 +273,16 @@ pub trait MvRepository: Send + Sync {
         outcome: RefreshExternalOutcome,
     ) -> Result<(), MvRepositoryError>;
     fn finalize_refresh(&self, request: MvRefreshFinalizeRequest) -> Result<(), MvRepositoryError>;
+    /// Atomically finalize a frontend-owned refresh that deliberately has no
+    /// external phases (`NoOp` or `MetadataOnly`).  This is separate from the
+    /// historical publish-based finalizer so callers cannot invent a staging
+    /// or publication record merely to advance metadata.
+    fn finalize_frontend_refresh_without_external_actions(
+        &self,
+        _request: MvRefreshFinalizeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
     fn finalize_refresh_with_partitions(
         &self,
         request: FinalizeMvRefreshWithPartitionsRequest,

@@ -75,6 +75,24 @@ pub struct MvRefreshAttemptIdentity {
     pub staging_drop_operation_id: [u8; 16],
 }
 
+/// All values SQL needs to prepare one refresh step.  The application owner
+/// allocates the attempt identity before entering SQL so every generated
+/// native write template is tied to the ledger intent that will be persisted
+/// after exact-generation admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshPreparationRequest {
+    pub statement: MvRefreshStatement,
+    pub target: MvTarget,
+    pub attempt: MvRefreshAttemptIdentity,
+}
+
+impl MvRefreshPreparationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        self.statement.validate_supported()?;
+        self.attempt.validate()
+    }
+}
+
 impl MvRefreshAttemptIdentity {
     pub fn validate(&self) -> Result<(), String> {
         if self.refresh_id <= 0 || self.staging_branch.is_empty() || self.marker_token.is_empty() {
@@ -115,8 +133,7 @@ pub struct PreparedMvRefresh {
 pub trait MvRefreshPreparationService: Send + Sync {
     fn prepare_step(
         &self,
-        statement: &MvRefreshStatement,
-        target: &MvTarget,
+        request: MvRefreshPreparationRequest,
     ) -> Result<PreparedMvRefresh, String>;
 }
 
@@ -124,7 +141,9 @@ pub trait MvRefreshPreparationService: Send + Sync {
 mod tests {
     use novarocks_spi::connector::ConnectorWriteOperationId;
 
-    use super::{MvRefreshAttemptIdentity, MvRefreshStatement};
+    use crate::mv::model::MvTarget;
+
+    use super::{MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshStatement};
 
     #[test]
     fn full_refresh_remains_an_explicitly_unsupported_request() {
@@ -157,5 +176,40 @@ mod tests {
             ..valid
         };
         assert!(missing_marker.validate().is_err());
+    }
+
+    #[test]
+    fn preparation_request_keeps_full_rejection_and_attempt_identity_together() {
+        let request = MvRefreshPreparationRequest {
+            statement: MvRefreshStatement {
+                name_parts: vec!["mv".to_string()],
+                full: false,
+            },
+            target: MvTarget {
+                catalog: "iceberg".to_string(),
+                namespace: "db".to_string(),
+                table: "mv".to_string(),
+            },
+            attempt: MvRefreshAttemptIdentity {
+                refresh_id: 7,
+                request_id: [1; 16],
+                staging_branch: "__nova_mv_7".to_string(),
+                marker_token: "marker".to_string(),
+                staging_create_operation_id: [2; 16],
+                write_operation_id: ConnectorWriteOperationId::from_bytes([3; 16]),
+                publication_operation_id: [4; 16],
+                staging_drop_operation_id: [5; 16],
+            },
+        };
+        request.validate().expect("complete request");
+
+        let full = MvRefreshPreparationRequest {
+            statement: MvRefreshStatement {
+                full: true,
+                ..request.statement
+            },
+            ..request
+        };
+        assert!(full.validate().is_err());
     }
 }

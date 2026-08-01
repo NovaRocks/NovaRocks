@@ -257,7 +257,7 @@ fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
                 FrontendMvRefreshActionPhase::Write,
                 FrontendMvRefreshActionState::KnownCommitted,
                 ledger.write_operation_id.clone(),
-                Some(write_version),
+                Some(write_version.clone()),
             ),
         )
         .expect("record write");
@@ -268,7 +268,7 @@ fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
                 FrontendMvRefreshActionPhase::Publication,
                 FrontendMvRefreshActionState::KnownCommitted,
                 ledger.publication_operation_id.clone(),
-                None,
+                Some(write_version),
             ),
         )
         .expect("record guarded publication");
@@ -277,6 +277,7 @@ fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
         .expect("load published refresh")
         .expect("published refresh exists");
     assert_eq!(published.state, MvRefreshState::PublishCommitted);
+    assert_eq!(published.published_snapshot_id, Some(10));
     assert!(
         published
             .frontend_ledger
@@ -339,6 +340,31 @@ fn frontend_noop_refresh_persists_no_synthetic_external_actions() {
             .actions
             .is_empty(),
         "a no-op attempt must not invent staging or writer phases"
+    );
+    repository
+        .finalize_frontend_refresh_without_external_actions(MvRefreshFinalizeRequest {
+            refresh_id: refresh.refresh_id,
+            rows: 0,
+            base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
+            base_table_uuids: BTreeMap::from([(
+                "ice.sales.orders".to_string(),
+                "uuid".to_string(),
+            )]),
+            target_snapshot_id: Some(7),
+        })
+        .expect("finalize no-op frontend refresh");
+    let finalized = repository
+        .load_refresh(refresh.refresh_id)
+        .expect("load finalized no-op")
+        .expect("no-op refresh exists");
+    assert_eq!(finalized.state, MvRefreshState::Finalized);
+    assert_eq!(
+        repository
+            .load_by_id(definition.mv_id)
+            .expect("load definition")
+            .expect("definition exists")
+            .active_refresh_id,
+        None
     );
 }
 

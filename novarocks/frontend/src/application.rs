@@ -245,7 +245,11 @@ impl FrontendApplicationHost {
                         let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
                             repository;
                         host.mv_application_service =
-                            Some(Arc::new(FrontendMvService::new(Arc::clone(&repository))));
+                            Some(Arc::new(FrontendMvService::with_refresh_dependencies(
+                                Arc::clone(&repository),
+                                host.query_execution_service(),
+                                host.connector_control_registry(),
+                            )));
                         host.mv_repository = Some(repository);
                     }
                     Err(error) => {

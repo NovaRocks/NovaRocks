@@ -1401,6 +1401,18 @@ impl StateStoreMvRepository {
                             FrontendMvRefreshActionState::KnownCommitted,
                         ) => {
                             refresh.state = MvRefreshState::PublishCommitted;
+                            // The provider-neutral committed version carries
+                            // the optional typed snapshot fact needed by the
+                            // repository's atomic finalize check.  Its opaque
+                            // payload remains only in the v3 ledger.
+                            refresh.published_snapshot_id = action
+                                .committed_version
+                                .as_ref()
+                                .and_then(|version| version.snapshot_id);
+                            refresh.external_outcome = Some(RefreshExternalOutcome {
+                                target_snapshot_id: refresh.published_snapshot_id,
+                                commit_id: "frontend-v3-publication".to_string(),
+                            });
                             ledger.cleanup_pending = true;
                         }
                         (
@@ -1606,6 +1618,33 @@ impl StateStoreMvRepository {
                 let request = request.clone();
                 Box::pin(async move {
                     finalize_refresh_transaction(transaction, operation_id, request).await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn finalize_frontend_refresh_without_external_actions_async(
+        &self,
+        request: MvRefreshFinalizeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        self.require_refresh_async(request.refresh_id).await?;
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "finalize frontend MV refresh without external actions",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    finalize_frontend_refresh_without_external_actions_transaction(
+                        transaction,
+                        operation_id,
+                        request,
+                    )
+                    .await
                 })
             },
         )
@@ -2237,6 +2276,12 @@ impl MvRepository for StateStoreMvRepository {
     fn finalize_refresh(&self, request: MvRefreshFinalizeRequest) -> Result<(), MvRepositoryError> {
         self.blocking(self.finalize_refresh_async(request))
     }
+    fn finalize_frontend_refresh_without_external_actions(
+        &self,
+        request: MvRefreshFinalizeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.finalize_frontend_refresh_without_external_actions_async(request))
+    }
     fn finalize_refresh_with_partitions(
         &self,
         request: FinalizeMvRefreshWithPartitionsRequest,
@@ -2774,6 +2819,60 @@ async fn finalize_refresh_transaction(
             request.refresh_id, request.target_snapshot_id, persisted_snapshot
         )));
     }
+    let (definition_record, mut definition) =
+        load_definition_transaction(transaction, refresh.mv_id).await?;
+    if definition.active_refresh_id != Some(request.refresh_id) {
+        return Err(conflict_state_store(format!(
+            "mv definition {} active refresh is {:?}, expected {}",
+            refresh.mv_id, definition.active_refresh_id, request.refresh_id
+        )));
+    }
+    definition.last_refresh_rows = Some(request.rows);
+    definition.last_refresh_snapshots = request.base_snapshots;
+    definition.last_refresh_table_uuids = request.base_table_uuids;
+    definition.last_refreshed_iceberg_snapshot_id = request.target_snapshot_id;
+    definition.refresh_in_progress = false;
+    definition.active_refresh_id = None;
+    definition.refresh_target_snapshots.clear();
+    refresh.state = MvRefreshState::Finalized;
+    put_definition_transaction(
+        transaction,
+        operation_id,
+        &definition,
+        Precondition::Version(definition_record.version),
+    )
+    .await?;
+    put_refresh_transaction(
+        transaction,
+        operation_id,
+        &refresh,
+        Precondition::Version(refresh_record.version),
+    )
+    .await
+}
+
+async fn finalize_frontend_refresh_without_external_actions_transaction(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
+    request: MvRefreshFinalizeRequest,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    let (refresh_record, mut refresh) =
+        load_refresh_transaction(transaction, request.refresh_id).await?;
+    if refresh.state == MvRefreshState::Finalized {
+        return Ok(());
+    }
+    if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent
+        || refresh
+            .frontend_ledger
+            .as_ref()
+            .is_none_or(|ledger| !ledger.actions.is_empty())
+    {
+        return Err(conflict_state_store(format!(
+            "mv refresh {} is not a frontend no-external-action attempt",
+            request.refresh_id
+        )));
+    }
+    expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
     let (definition_record, mut definition) =
         load_definition_transaction(transaction, refresh.mv_id).await?;
     if definition.active_refresh_id != Some(request.refresh_id) {

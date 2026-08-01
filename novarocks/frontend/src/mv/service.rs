@@ -22,8 +22,11 @@ use novarocks::mv::application::{
     MvStatementResult,
 };
 use novarocks::mv::repository::MvRepository;
+use novarocks::query_execution::service::QueryExecutionService;
+use novarocks::sql::mv_refresh::PreparedMvRefresh;
+use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
-use super::create;
+use super::{create, refresh};
 
 /// Frontend-owned application service for materialized-view statements.
 ///
@@ -31,11 +34,29 @@ use super::create;
 /// deliberately return `None` so their existing core routes remain active.
 pub struct FrontendMvService {
     repository: Arc<dyn MvRepository>,
+    refresh: Option<refresh::FrontendMvRefreshDependencies>,
 }
 
 impl FrontendMvService {
     pub fn new(repository: Arc<dyn MvRepository>) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            refresh: None,
+        }
+    }
+
+    pub fn with_refresh_dependencies(
+        repository: Arc<dyn MvRepository>,
+        query_execution: QueryExecutionService,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+    ) -> Self {
+        Self {
+            repository,
+            refresh: Some(refresh::FrontendMvRefreshDependencies {
+                query_execution,
+                connector_control,
+            }),
+        }
     }
 }
 
@@ -53,5 +74,24 @@ impl MvApplicationService for FrontendMvService {
             }
             MvApplicationStatement::Unhandled => Ok(None),
         }
+    }
+
+    fn execute_prepared_refresh(
+        &self,
+        refresh_plan: PreparedMvRefresh,
+        connector_context: ConnectorRequestContext,
+    ) -> Result<MvStatementResult, MvApplicationError> {
+        let dependencies = self.refresh.as_ref().ok_or_else(|| {
+            MvApplicationError::new(
+                novarocks::mv::application::MvApplicationErrorKind::Unavailable,
+                "frontend MV refresh dependencies are not installed",
+            )
+        })?;
+        refresh::execute(
+            self.repository.as_ref(),
+            dependencies,
+            refresh_plan,
+            connector_context,
+        )
     }
 }

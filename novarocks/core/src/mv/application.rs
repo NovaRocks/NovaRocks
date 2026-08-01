@@ -25,6 +25,7 @@ use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
 use crate::runtime::query_result::QueryResult;
+use crate::sql::mv_refresh::PreparedMvRefresh;
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
 };
@@ -290,6 +291,21 @@ pub trait MvApplicationService: Send + Sync {
         statement: &MvApplicationStatement,
         context: MvRequestContext<'_>,
     ) -> Result<Option<MvStatementResult>, MvApplicationError>;
+
+    /// Execute a fully SQL-prepared refresh attempt.  This deliberately sits
+    /// beside the CREATE-only `MvEngine` port: refresh owns distributed
+    /// execution, external publication, and durable intent in the frontend,
+    /// not in a widened engine backend.
+    fn execute_prepared_refresh(
+        &self,
+        _refresh: PreparedMvRefresh,
+        _connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<MvStatementResult, MvApplicationError> {
+        Err(MvApplicationError::new(
+            MvApplicationErrorKind::Unavailable,
+            "frontend MV refresh lifecycle is unavailable",
+        ))
+    }
 }
 
 pub trait MvEngine: Send + Sync {

@@ -16,6 +16,7 @@
 // under the License.
 
 mod create;
+mod refresh;
 pub mod repository;
 mod service;
 
