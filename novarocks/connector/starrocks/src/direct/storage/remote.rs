@@ -116,14 +116,27 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                     "StarRocks direct storage delete predicates are not implemented",
                 ));
             }
-            if !rowset.bundle_offsets.is_empty() {
-                return Err(unsupported(
-                    "StarRocks direct bundled segment reads are not implemented",
-                ));
-            }
             for (index, relative_path) in rowset.segments.iter().enumerate() {
                 let segment_path = join_frozen_path(split.tablet_root(), relative_path)?;
-                let segment = self.read_exact(&access, &segment_path, &request.context)?;
+                let object = self.read_exact(&access, &segment_path, &request.context)?;
+                let segment = if let Some(offset) = rowset.bundle_offsets.get(index) {
+                    let offset = usize::try_from(*offset)
+                        .map_err(|_| corrupt("StarRocks bundle segment offset is invalid"))?;
+                    let size = *rowset.segment_sizes.get(index).ok_or_else(|| {
+                        corrupt("StarRocks bundle segment is missing its frozen size")
+                    })?;
+                    let size = usize::try_from(size)
+                        .map_err(|_| corrupt("StarRocks bundle segment size is invalid"))?;
+                    let end = offset
+                        .checked_add(size)
+                        .filter(|end| *end <= object.len())
+                        .ok_or_else(|| {
+                            corrupt("StarRocks bundle segment range exceeds its object")
+                        })?;
+                    Bytes::copy_from_slice(&object[offset..end])
+                } else {
+                    object
+                };
                 if let Some(expected_size) = rowset.segment_sizes.get(index)
                     && *expected_size != segment.len() as u64
                 {
