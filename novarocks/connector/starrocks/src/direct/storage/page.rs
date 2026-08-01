@@ -43,6 +43,7 @@ pub(crate) struct StarRocksDecodedDataPage {
     pub(crate) body: Vec<u8>,
     pub(crate) num_values: usize,
     pub(crate) nullmap_size: usize,
+    pub(crate) null_flags: Option<Vec<u8>>,
 }
 
 /// Decode one exact page range, validate its checksum/footer, and materialize
@@ -78,10 +79,37 @@ pub(crate) fn decode_data_page(
             "StarRocks nullable data page format is not supported",
         ));
     }
+    let null_flags = if nullmap_size == 0 {
+        None
+    } else {
+        let nullmap = &decoded.body[decoded.body.len() - nullmap_size..];
+        match data.null_encoding.unwrap_or(0) {
+            1 => {
+                let mut flags = vec![0_u8; num_values];
+                let decoded_size = lz4_flex::block::decompress_into(nullmap, &mut flags)
+                    .map_err(|_| corrupt("cannot decompress StarRocks nullable page bitmap"))?;
+                if decoded_size != num_values || flags.iter().any(|flag| *flag > 1) {
+                    return Err(corrupt("StarRocks nullable page bitmap is invalid"));
+                }
+                Some(flags)
+            }
+            0 => {
+                return Err(unsupported(
+                    "StarRocks bitshuffle nullable page bitmap is not implemented",
+                ));
+            }
+            _ => {
+                return Err(unsupported(
+                    "unknown StarRocks nullable page bitmap encoding",
+                ));
+            }
+        }
+    };
     Ok(StarRocksDecodedDataPage {
         body: decoded.body,
         num_values,
         nullmap_size,
+        null_flags,
     })
 }
 
@@ -426,6 +454,34 @@ mod tests {
             decode_binary_plain_values(&binary, 2).unwrap(),
             vec![b"a".to_vec(), b"bc".to_vec()]
         );
+    }
+
+    #[test]
+    fn decodes_lz4_nullable_data_page_flags() {
+        let mut body = 2u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&10i64.to_le_bytes());
+        body.extend_from_slice(&99i64.to_le_bytes());
+        let nullmap = lz4_flex::block::compress(&[0, 1]);
+        body.extend_from_slice(&nullmap);
+        let footer = PageFooterPb {
+            r#type: Some(PAGE_TYPE_DATA),
+            uncompressed_size: Some(body.len() as u32),
+            data_page_footer: Some(DataPageFooterPb {
+                first_ordinal: Some(0),
+                num_values: Some(2),
+                nullmap_size: Some(nullmap.len() as u32),
+                format_version: Some(DATA_PAGE_FORMAT_V2),
+                null_encoding: Some(1),
+            }),
+            index_page_footer: None,
+        }
+        .encode_to_vec();
+        body.extend_from_slice(&footer);
+        body.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        body.extend_from_slice(&crc32c(&body).to_le_bytes());
+        let decoded = decode_data_page("segment.dat", &body, StarRocksCompression::None).unwrap();
+        assert_eq!(decoded.null_flags, Some(vec![0, 1]));
+        assert_eq!(decoded.nullmap_size, nullmap.len());
     }
 
     #[test]

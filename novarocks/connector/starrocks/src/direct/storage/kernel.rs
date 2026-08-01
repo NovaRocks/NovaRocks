@@ -18,14 +18,14 @@
 //! Arrow-only scalar segment kernel for frozen StarRocks direct splits.
 //!
 //! This deliberately starts with a strict, single-data-page PLAIN closure. A
-//! segment requiring an unimplemented index, encoding, or null map fails the
+//! segment requiring an unimplemented index or encoding fails the
 //! attempt rather than selecting an RPC reader or looking for another tablet.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    ArrayRef, BinaryBuilder, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, StringArray,
 };
 use arrow::datatypes::{DataType, SchemaRef};
@@ -116,12 +116,18 @@ fn decode_column(
             .compression
             .unwrap_or(super::segment::StarRocksCompression::None),
     )?;
-    if page.nullmap_size != 0 || column.nullable || output_type.is_null() {
+    if output_type.is_null() {
         return Err(unsupported(
-            "StarRocks direct nullable scalar column decoding is not implemented",
+            "StarRocks NULL-only output columns are not supported",
         ));
     }
-    let body = &page.body;
+    if page.null_flags.is_some() && !column.nullable {
+        return Err(corrupt(
+            "StarRocks non-nullable column has a nullable data page",
+        ));
+    }
+    let body = &page.body[..page.body.len() - page.nullmap_size];
+    let null_flags = page.null_flags.as_deref();
     match (column.logical_type, output_type) {
         (StarRocksLogicalType::Boolean, DataType::Boolean) => {
             let values = decode_fixed_plain_values(body, page.num_values, 1)?;
@@ -133,14 +139,28 @@ fn decode_column(
                     _ => Err(corrupt("invalid StarRocks BOOLEAN PLAIN value")),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Arc::new(BooleanArray::from(values)))
+            Ok(Arc::new(BooleanArray::from(apply_nulls(
+                values, null_flags,
+            )?)))
         }
-        (StarRocksLogicalType::TinyInt, DataType::Int8) => fixed_i8(body, page.num_values),
-        (StarRocksLogicalType::SmallInt, DataType::Int16) => fixed_i16(body, page.num_values),
-        (StarRocksLogicalType::Int, DataType::Int32) => fixed_i32(body, page.num_values),
-        (StarRocksLogicalType::BigInt, DataType::Int64) => fixed_i64(body, page.num_values),
-        (StarRocksLogicalType::Float, DataType::Float32) => fixed_f32(body, page.num_values),
-        (StarRocksLogicalType::Double, DataType::Float64) => fixed_f64(body, page.num_values),
+        (StarRocksLogicalType::TinyInt, DataType::Int8) => {
+            fixed_i8(body, page.num_values, null_flags)
+        }
+        (StarRocksLogicalType::SmallInt, DataType::Int16) => {
+            fixed_i16(body, page.num_values, null_flags)
+        }
+        (StarRocksLogicalType::Int, DataType::Int32) => {
+            fixed_i32(body, page.num_values, null_flags)
+        }
+        (StarRocksLogicalType::BigInt, DataType::Int64) => {
+            fixed_i64(body, page.num_values, null_flags)
+        }
+        (StarRocksLogicalType::Float, DataType::Float32) => {
+            fixed_f32(body, page.num_values, null_flags)
+        }
+        (StarRocksLogicalType::Double, DataType::Float64) => {
+            fixed_f64(body, page.num_values, null_flags)
+        }
         (StarRocksLogicalType::Char | StarRocksLogicalType::Varchar, DataType::Utf8) => {
             let values = decode_binary_plain_values(body, page.num_values)?
                 .into_iter()
@@ -149,12 +169,23 @@ fn decode_column(
                         .map_err(|_| corrupt("invalid UTF-8 StarRocks VARCHAR value"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Arc::new(StringArray::from(values)))
+            Ok(Arc::new(StringArray::from(apply_nulls(
+                values, null_flags,
+            )?)))
         }
         (StarRocksLogicalType::Binary | StarRocksLogicalType::VarBinary, DataType::Binary) => {
-            Ok(Arc::new(BinaryArray::from_iter_values(
+            let values = apply_nulls(
                 decode_binary_plain_values(body, page.num_values)?,
-            )))
+                null_flags,
+            )?;
+            let mut builder = BinaryBuilder::new();
+            for value in values {
+                match value {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
         }
         _ => Err(unsupported(
             "StarRocks direct physical type does not match a supported Arrow scalar type",
@@ -162,24 +193,33 @@ fn decode_column(
     }
 }
 
-fn fixed_i8(body: &[u8], values: usize) -> Result<ArrayRef, ConnectorError> {
-    Ok(Arc::new(Int8Array::from(
+fn fixed_i8(
+    body: &[u8],
+    values: usize,
+    null_flags: Option<&[u8]>,
+) -> Result<ArrayRef, ConnectorError> {
+    Ok(Arc::new(Int8Array::from(apply_nulls(
         decode_fixed_plain_values(body, values, 1)?
             .into_iter()
             .map(|value| value as i8)
             .collect::<Vec<_>>(),
-    )))
+        null_flags,
+    )?)))
 }
 
 macro_rules! fixed_values {
     ($name:ident, $array:ident, $type:ty, $size:expr) => {
-        fn $name(body: &[u8], values: usize) -> Result<ArrayRef, ConnectorError> {
+        fn $name(
+            body: &[u8],
+            values: usize,
+            null_flags: Option<&[u8]>,
+        ) -> Result<ArrayRef, ConnectorError> {
             let decoded = decode_fixed_plain_values(body, values, $size)?;
             let output = decoded
                 .chunks_exact($size)
                 .map(|value| <$type>::from_le_bytes(value.try_into().expect("fixed chunk size")))
                 .collect::<Vec<_>>();
-            Ok(Arc::new($array::from(output)))
+            Ok(Arc::new($array::from(apply_nulls(output, null_flags)?)))
         }
     };
 }
@@ -189,6 +229,25 @@ fixed_values!(fixed_i32, Int32Array, i32, 4);
 fixed_values!(fixed_i64, Int64Array, i64, 8);
 fixed_values!(fixed_f32, Float32Array, f32, 4);
 fixed_values!(fixed_f64, Float64Array, f64, 8);
+
+fn apply_nulls<T>(
+    values: Vec<T>,
+    null_flags: Option<&[u8]>,
+) -> Result<Vec<Option<T>>, ConnectorError> {
+    let Some(null_flags) = null_flags else {
+        return Ok(values.into_iter().map(Some).collect());
+    };
+    if null_flags.len() != values.len() || null_flags.iter().any(|flag| *flag > 1) {
+        return Err(corrupt(
+            "StarRocks nullable page bitmap does not match page values",
+        ));
+    }
+    Ok(values
+        .into_iter()
+        .zip(null_flags)
+        .map(|(value, flag)| (*flag == 0).then_some(value))
+        .collect())
+}
 
 fn corrupt(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message)
@@ -344,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_nullable_page_without_another_reader() {
+    fn allows_nullable_output_when_the_page_has_no_null_values() {
         let bytes = segment(&[7]);
         let mut footer = super::super::segment::decode_segment_footer("seg", &bytes).unwrap();
         footer.columns[0].nullable = true;
@@ -360,9 +419,21 @@ mod tests {
                         .unwrap()
                 ],
             )
-            .unwrap_err()
-            .kind(),
-            ConnectorErrorKind::Unsupported
+            .unwrap()
+            .num_rows(),
+            1
+        );
+    }
+
+    #[test]
+    fn applies_nullable_page_flags_to_arrow_values() {
+        assert_eq!(
+            apply_nulls(vec![7_i64, 9], Some(&[0, 1])).unwrap(),
+            vec![Some(7), None]
+        );
+        assert_eq!(
+            apply_nulls(vec![7_i64], Some(&[2])).unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
         );
     }
 }
