@@ -71,3 +71,24 @@ pub(crate) fn parse_drop_statement(parser: &mut Parser<'_>) -> Result<DropResult
         Err("expected TABLE, DATABASE, or CATALOG after DROP".into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::parser::dialect::StarRocksDialect;
+
+    #[test]
+    fn drop_database_if_exists_force_preserves_both_modifiers() {
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql("DROP DATABASE IF EXISTS `stale_db` FORCE")
+            .expect("parser");
+
+        let DropResult::Database(statement) = parse_drop_statement(&mut parser).expect("drop")
+        else {
+            panic!("expected DROP DATABASE");
+        };
+        assert!(statement.if_exists);
+        assert!(statement.force);
+    }
+}

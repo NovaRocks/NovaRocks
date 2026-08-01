@@ -36,17 +36,18 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorControlBinding,
-    ConnectorDataType, ConnectorDefaultValue, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorExecutionInstaller, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReadSelector, ConnectorRefreshPublicationGuard, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
+    ConnectorDataType, ConnectorDefaultValue, ConnectorDropTableDataDisposition, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionInstaller,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
+    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector,
+    ConnectorRefreshPublicationGuard, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorSplit, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
+    ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
     ConnectorStaticPredicateLiteral, ConnectorStatistics, ConnectorTableHandle,
     ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy,
     CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
@@ -1481,7 +1482,11 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         Err(error) => Err(error),
                     }
                 }
-                ConnectorCatalogMutationOperation::DropTable { table, policy, .. } => {
+                ConnectorCatalogMutationOperation::DropTable {
+                    table,
+                    policy,
+                    data_disposition,
+                } => {
                     if table.instance_id != self.instance_id {
                         return Err(ConnectorError::new(
                             ConnectorErrorKind::InvalidRequest,
@@ -1497,7 +1502,23 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                             .map(|loaded| loaded.is_some());
                     match existing {
                         Ok(false) if policy == DropPolicy::NoOpIfMissing => {
-                            Ok(ExternalMutationEffect::NoOp)
+                            if data_disposition == ConnectorDropTableDataDisposition::Purge {
+                                super::catalog::registry::purge_orphan_s3_table_prefix(
+                                    &entry,
+                                    &table.namespace,
+                                    &table.table,
+                                )
+                                .map(|purged| {
+                                    if purged {
+                                        ExternalMutationEffect::Applied
+                                    } else {
+                                        ExternalMutationEffect::NoOp
+                                    }
+                                })
+                                .map_err(map_iceberg_error)
+                            } else {
+                                Ok(ExternalMutationEffect::NoOp)
+                            }
                         }
                         Ok(false) => Err(ConnectorError::new(
                             ConnectorErrorKind::NotFound,

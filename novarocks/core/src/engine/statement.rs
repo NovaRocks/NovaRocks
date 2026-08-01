@@ -1055,7 +1055,11 @@ pub(crate) fn execute_drop_database_statement(
                         namespace: Arc::from(target.namespace.as_str()),
                         table: Arc::from(table.as_str()),
                     },
-                    policy: DropPolicy::FailIfMissing,
+                    // FORCE expands a namespace delete from a non-transactional
+                    // listing. A child may disappear before its mutation starts,
+                    // so every child delete is idempotent; the final namespace
+                    // mutation retains the statement-level IF EXISTS contract.
+                    policy: DropPolicy::NoOpIfMissing,
                     data_disposition: ConnectorDropTableDataDisposition::Purge,
                 },
                 connector_context.clone(),

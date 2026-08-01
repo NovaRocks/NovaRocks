@@ -896,6 +896,21 @@ pub(crate) fn drop_table(
     }
 }
 
+pub(crate) fn purge_orphan_s3_table_prefix(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+) -> Result<bool, String> {
+    let ns_name = normalize_identifier(namespace_name)?;
+    let tbl_name = normalize_identifier(table_name)?;
+    entry.invalidate_table_cache(&ns_name, &tbl_name);
+    if entry.s3_config.is_none() || entry.warehouse_uri.trim().is_empty() {
+        return Ok(false);
+    }
+    drop_s3_table_prefix(entry, &ns_name, &tbl_name)?;
+    Ok(true)
+}
+
 fn drop_s3_table_prefix(
     entry: &IcebergCatalogEntry,
     ns_name: &str,
