@@ -683,4 +683,47 @@ mod tests {
         assert_eq!(reader.next_batch().unwrap().unwrap().num_rows(), 1);
         assert_eq!(direct_calls.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn separate_backend_local_bindings_do_not_share_direct_clients() {
+        let binding = direct_control();
+        let (declaration, split, schema) = planned_read(&binding);
+        let be_one_calls = Arc::new(AtomicUsize::new(0));
+        let be_two_calls = Arc::new(AtomicUsize::new(0));
+        let installer = |calls: Arc<AtomicUsize>| {
+            let mut bindings = StarRocksExecutionBindings::new();
+            bindings.insert(
+                StarRocksLocalBindingRef::parse("test").unwrap(),
+                StarRocksLocalExecutionBinding {
+                    rpc: None,
+                    direct: Some(Arc::new(ReadyDirectFactory(calls))),
+                },
+            );
+            StarRocksExecutionInstaller::new(bindings)
+        };
+        let open = |installer: StarRocksExecutionInstaller, schema: arrow::datatypes::SchemaRef| {
+            let installed = installer.install(&declaration, &context()).unwrap();
+            installed
+                .read()
+                .unwrap()
+                .open_reader(
+                    &split,
+                    ConnectorOpenReaderRequest {
+                        expected_schema: schema,
+                        batch: ConnectorBatchBudget {
+                            max_rows: NonZeroUsize::new(32).unwrap(),
+                            max_bytes: NonZeroUsize::new(4096).unwrap(),
+                        },
+                        context: context(),
+                    },
+                )
+                .unwrap()
+        };
+        let _reader = open(installer(Arc::clone(&be_one_calls)), Arc::clone(&schema));
+        assert_eq!(be_one_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(be_two_calls.load(Ordering::SeqCst), 0);
+        let _reader = open(installer(Arc::clone(&be_two_calls)), schema);
+        assert_eq!(be_one_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(be_two_calls.load(Ordering::SeqCst), 1);
+    }
 }
