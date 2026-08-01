@@ -48,8 +48,9 @@ message DeletePredicatePB {
   repeated BinaryPredicatePB binary_predicates = 4;
   repeated IsNullPredicatePB is_null_predicates = 5;
 }
-message DelvecPagePB { optional int64 version = 1; optional uint64 offset = 2; optional uint64 size = 3; optional uint32 crc32c = 4; }
-message DelvecMetadataPB { map<uint32, DelvecPagePB> delvecs = 2; }
+message FileMetaPB { optional string name = 1; optional int64 size = 2; }
+message DelvecPagePB { optional int64 version = 1; optional uint64 offset = 2; optional uint64 size = 3; optional uint32 crc32c = 4; optional int64 crc32c_gen_version = 5; }
+message DelvecMetadataPB { map<int64, FileMetaPB> version_to_file = 1; map<uint32, DelvecPagePB> delvecs = 2; }
 message RowsetMetadataPB {
   optional uint32 id = 1;
   repeated string segments = 3;

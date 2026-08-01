@@ -32,12 +32,12 @@ mod generated {
     tonic::include_proto!("starrocks.storage");
 }
 
-#[cfg(test)]
-use generated::PagePointerPb;
 use generated::{
-    BundleTabletMetadataPb, ColumnPb, DeletePredicatePb, DelvecPagePb, RowsetMetadataPb,
-    TabletMetadataPb, TabletSchemaPb,
+    BundleTabletMetadataPb, ColumnPb, DeletePredicatePb, DelvecPagePb, FileMetaPb,
+    RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
 };
+#[cfg(test)]
+use generated::{DelvecMetadataPb, PagePointerPb};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StorageModel {
@@ -103,6 +103,13 @@ pub(crate) struct StorageDelvecPage {
     pub(crate) offset: u64,
     pub(crate) size: u64,
     pub(crate) crc32c: Option<u32>,
+    pub(crate) crc32c_gen_version: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StorageDelvecFile {
+    pub(crate) name: String,
+    pub(crate) size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,6 +131,7 @@ pub(crate) struct StorageTabletMetadata {
     pub(crate) historical_schemas: BTreeMap<i64, StorageSchema>,
     pub(crate) rowset_to_schema: BTreeMap<u32, i64>,
     pub(crate) delvecs: BTreeMap<u32, StorageDelvecPage>,
+    pub(crate) delvec_files: BTreeMap<i64, StorageDelvecFile>,
 }
 
 pub(crate) fn decode_standalone_metadata(
@@ -223,6 +231,25 @@ fn decode_tablet_metadata(
         .into_iter()
         .map(decode_rowset)
         .collect::<Result<Vec<_>, _>>()?;
+    let (delvec_files, delvecs) = value
+        .delvec_meta
+        .map(|meta| {
+            let files = meta
+                .version_to_file
+                .into_iter()
+                .map(|(version, file)| {
+                    decode_delvec_file(version, file).map(|file| (version, file))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let pages = meta
+                .delvecs
+                .into_iter()
+                .map(|(segment, page)| decode_delvec_page(page).map(|page| (segment, page)))
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            Ok::<_, ConnectorError>((files, pages))
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(StorageTabletMetadata {
         id: tablet_id,
         version,
@@ -230,16 +257,8 @@ fn decode_tablet_metadata(
         rowsets,
         historical_schemas,
         rowset_to_schema: value.rowset_to_schema.into_iter().collect(),
-        delvecs: value
-            .delvec_meta
-            .map(|meta| {
-                meta.delvecs
-                    .into_iter()
-                    .map(|(segment, page)| decode_delvec_page(page).map(|page| (segment, page)))
-                    .collect()
-            })
-            .transpose()?
-            .unwrap_or_default(),
+        delvecs,
+        delvec_files,
     })
 }
 
@@ -377,6 +396,26 @@ fn decode_delvec_page(value: DelvecPagePb) -> Result<StorageDelvecPage, Connecto
         offset: value.offset.unwrap_or(0),
         size,
         crc32c: value.crc32c,
+        crc32c_gen_version: value.crc32c_gen_version,
+    })
+}
+
+fn decode_delvec_file(
+    version: i64,
+    value: FileMetaPb,
+) -> Result<StorageDelvecFile, ConnectorError> {
+    let name = value
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| corrupt("StarRocks delete-vector file is missing its name"))?;
+    if version <= 0 || value.size.is_some_and(|size| size < 0) {
+        return Err(corrupt(
+            "StarRocks delete-vector file has invalid frozen facts",
+        ));
+    }
+    Ok(StorageDelvecFile {
+        name,
+        size: value.size.map(|size| size as u64),
     })
 }
 
@@ -405,11 +444,13 @@ enum MessageKind {
     IsNullPredicate,
     DelvecMetadata,
     DelvecPage,
+    DelvecFile,
     BundleTabletMetadata,
     PagePointer,
     MapInt64Schema,
     MapU32Int64,
     MapU32Delvec,
+    MapInt64DelvecFile,
     MapInt64Int64,
     MapInt64PagePointer,
 }
@@ -512,6 +553,7 @@ fn message_field(
             }
         },
         DelvecMetadata => match field {
+            1 => nested(2, wire, MapInt64DelvecFile),
             2 => nested(2, wire, MapU32Delvec),
             _ => {
                 return Err(unsupported(
@@ -520,8 +562,13 @@ fn message_field(
             }
         },
         DelvecPage => match field {
-            1 | 2 | 3 | 4 => scalar(0, wire),
+            1 | 2 | 3 | 4 | 5 => scalar(0, wire),
             _ => return Err(unsupported("unknown field in StarRocks delete-vector page")),
+        },
+        DelvecFile => match field {
+            1 => scalar(2, wire),
+            2 => scalar(0, wire),
+            _ => return Err(unsupported("unknown field in StarRocks delete-vector file")),
         },
         BundleTabletMetadata => match field {
             1 => nested(2, wire, MapInt64Int64),
@@ -545,6 +592,11 @@ fn message_field(
         MapU32Delvec => match field {
             1 => scalar(0, wire),
             2 => nested(2, wire, DelvecPage),
+            _ => return Err(unsupported("unknown field in StarRocks metadata map")),
+        },
+        MapInt64DelvecFile => match field {
+            1 => scalar(0, wire),
+            2 => nested(2, wire, DelvecFile),
             _ => return Err(unsupported("unknown field in StarRocks metadata map")),
         },
         MapInt64PagePointer => match field {
@@ -690,6 +742,44 @@ mod tests {
             Some("SUM")
         );
         assert_eq!(decoded.rowsets[0].segments, ["rs_0.dat"]);
+    }
+
+    #[test]
+    fn standalone_metadata_decodes_primary_delvec_file_mapping() {
+        let mut value = tablet();
+        let mut delvec = DelvecMetadataPb {
+            version_to_file: Default::default(),
+            delvecs: Default::default(),
+        };
+        delvec.version_to_file.insert(
+            7,
+            FileMetaPb {
+                name: Some("0000000000000007.delvec".into()),
+                size: Some(32),
+            },
+        );
+        delvec.delvecs.insert(
+            4,
+            DelvecPagePb {
+                version: Some(7),
+                offset: Some(4),
+                size: Some(12),
+                crc32c: Some(9),
+                crc32c_gen_version: Some(7),
+            },
+        );
+        value.delvec_meta = Some(delvec);
+
+        let metadata = decode_standalone_metadata(&value.encode_to_vec(), 9, 3).unwrap();
+        assert_eq!(
+            metadata.delvec_files.get(&7).unwrap().name,
+            "0000000000000007.delvec"
+        );
+        assert_eq!(metadata.delvec_files.get(&7).unwrap().size, Some(32));
+        assert_eq!(
+            metadata.delvecs.get(&4).unwrap().crc32c_gen_version,
+            Some(7)
+        );
     }
     #[test]
     fn standalone_metadata_rejects_frozen_identity_mismatch() {

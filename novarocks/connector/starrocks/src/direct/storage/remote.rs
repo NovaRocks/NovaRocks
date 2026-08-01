@@ -18,8 +18,11 @@
 //! Startup-local object-store adapter for frozen direct read splits.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
+use arrow::array::BooleanArray;
+use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use novarocks_fs::{
@@ -30,6 +33,7 @@ use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot, ConnectorRequestContext,
 };
+use roaring::RoaringBitmap;
 
 use crate::direct::reader::StarRocksDirectStorageResolver;
 use crate::direct::staros::{StarOsV1ObjectStoreResolver, StarRocksDirectIoRuntime};
@@ -40,7 +44,7 @@ use crate::direct::{
 use super::kernel::decode_plain_segment;
 use super::segment::decode_segment_footer;
 use super::wire::{
-    StorageModel, StorageSchema, StorageTabletMetadata, decode_bundle_metadata,
+    StorageModel, StorageRowset, StorageSchema, StorageTabletMetadata, decode_bundle_metadata,
     decode_standalone_metadata,
 };
 use super::{DirectStorageConnectorReader, DirectStorageReader, slice_batch};
@@ -157,13 +161,25 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
                     read_requests = read_requests.saturating_add(1);
                 }
                 let footer = decode_segment_footer(&segment_path, &segment)?;
-                let batch = decode_plain_segment(
+                let mut batch = decode_plain_segment(
                     &segment_path,
                     &segment,
                     &footer,
                     request.expected_schema.clone(),
                     split.columns(),
                 )?;
+                if let Some((deleted, bytes, cache_hit)) =
+                    self.load_delvec(split, &access, &metadata, rowset, index, &request.context)?
+                {
+                    if cache_hit {
+                        cache_hits = cache_hits.saturating_add(1);
+                    } else {
+                        cache_misses = cache_misses.saturating_add(1);
+                        bytes_read = bytes_read.saturating_add(bytes as u64);
+                        read_requests = read_requests.saturating_add(1);
+                    }
+                    batch = apply_delvec(&batch, &deleted)?;
+                }
                 chunks.extend(slice_batch(&batch, request.batch)?);
             }
         }
@@ -185,6 +201,59 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
 }
 
 impl StarRocksSharedDataStorageResolver {
+    fn load_delvec(
+        &self,
+        split: &StarRocksDirectSplit,
+        access: &FsAccessHandle,
+        metadata: &StorageTabletMetadata,
+        rowset: &StorageRowset,
+        segment_index: usize,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<(RoaringBitmap, usize, bool)>, ConnectorError> {
+        let segment_index = u32::try_from(segment_index)
+            .map_err(|_| corrupt("StarRocks direct segment index overflows delete-vector ID"))?;
+        let segment_id = rowset
+            .id
+            .checked_add(segment_index)
+            .ok_or_else(|| corrupt("StarRocks direct delete-vector segment ID overflows"))?;
+        let Some(page) = metadata.delvecs.get(&segment_id) else {
+            return Ok(None);
+        };
+        let file = metadata.delvec_files.get(&page.version).ok_or_else(|| {
+            corrupt("StarRocks direct delete-vector page has no frozen file mapping")
+        })?;
+        let end = page
+            .offset
+            .checked_add(page.size)
+            .ok_or_else(|| corrupt("StarRocks direct delete-vector range overflows"))?;
+        if file.size.is_some_and(|size| end > size) {
+            return Err(corrupt(
+                "StarRocks direct delete-vector range exceeds its frozen file size",
+            ));
+        }
+        let path = join_frozen_path(
+            split.tablet_root(),
+            &format!("data/{}", file.name.trim_start_matches('/')),
+        )?;
+        let range = FileReadRange::bounded(page.offset, page.size).map_err(map_file_error)?;
+        let (payload, cache_hit) = self.read_cached(split, access, &path, range, context)?;
+        if payload.len() as u64 != page.size {
+            return Err(corrupt(
+                "StarRocks direct delete-vector payload differs from its frozen size",
+            ));
+        }
+        if let Some(masked) = page.crc32c
+            && page.crc32c_gen_version == Some(page.version)
+            && crc32c::crc32c(&payload) != crc32c_unmask(masked)
+        {
+            return Err(corrupt(
+                "StarRocks direct delete-vector checksum differs from frozen metadata",
+            ));
+        }
+        let bitmap = decode_delvec_bitmap(&payload)?;
+        Ok(Some((bitmap, payload.len(), cache_hit)))
+    }
+
     fn read_cached(
         &self,
         split: &StarRocksDirectSplit,
@@ -307,14 +376,21 @@ fn validate_metadata(
             "StarRocks storage metadata identity differs from frozen split",
         ));
     }
-    if metadata.schema.model != StorageModel::Duplicate {
+    if !matches!(
+        metadata.schema.model,
+        StorageModel::Duplicate | StorageModel::Primary
+    ) {
         return Err(unsupported(
-            "StarRocks direct key-model merge reader is not implemented",
+            "StarRocks direct aggregate and unique key-model merge readers are not implemented",
         ));
     }
-    if !metadata.delvecs.is_empty() {
-        return Err(unsupported(
-            "StarRocks direct delete-vector reader is not implemented",
+    if metadata
+        .delvecs
+        .values()
+        .any(|page| !metadata.delvec_files.contains_key(&page.version))
+    {
+        return Err(corrupt(
+            "StarRocks storage delete-vector page has no frozen file mapping",
         ));
     }
     validate_current_schema(split, &metadata.schema)?;
@@ -331,6 +407,54 @@ fn validate_metadata(
         ));
     }
     Ok(())
+}
+
+fn decode_delvec_bitmap(payload: &[u8]) -> Result<RoaringBitmap, ConnectorError> {
+    const DELVEC_FORMAT_V1: u8 = 1;
+    let Some((&format, encoded)) = payload.split_first() else {
+        return Err(corrupt("StarRocks direct delete-vector payload is empty"));
+    };
+    if format != DELVEC_FORMAT_V1 {
+        return Err(unsupported(
+            "StarRocks direct delete-vector payload version is unsupported",
+        ));
+    }
+    if encoded.is_empty() {
+        return Ok(RoaringBitmap::new());
+    }
+    let mut cursor = Cursor::new(encoded);
+    let bitmap = RoaringBitmap::deserialize_from(&mut cursor)
+        .map_err(|_| corrupt("StarRocks direct delete-vector payload is malformed"))?;
+    if cursor.position() != encoded.len() as u64 {
+        return Err(corrupt(
+            "StarRocks direct delete-vector payload has trailing bytes",
+        ));
+    }
+    Ok(bitmap)
+}
+
+fn apply_delvec(
+    batch: &RecordBatch,
+    deleted: &RoaringBitmap,
+) -> Result<RecordBatch, ConnectorError> {
+    if deleted.is_empty() {
+        return Ok(batch.clone());
+    }
+    if batch.num_rows() > u32::MAX as usize {
+        return Err(corrupt(
+            "StarRocks direct segment has too many rows for its delete-vector format",
+        ));
+    }
+    let keep = BooleanArray::from_iter(
+        (0..batch.num_rows()).map(|row| Some(!deleted.contains(row as u32))),
+    );
+    filter_record_batch(batch, &keep)
+        .map_err(|_| corrupt("failed to apply StarRocks direct delete-vector"))
+}
+
+fn crc32c_unmask(masked: u32) -> u32 {
+    const CRC32C_MASK_DELTA: u32 = 0xa282_ead8;
+    masked.wrapping_sub(CRC32C_MASK_DELTA).rotate_right(17)
 }
 
 fn validate_current_schema(
@@ -478,6 +602,8 @@ mod tests {
     use super::*;
     use crate::direct::StarRocksDirectColumnBinding;
     use crate::direct::storage::wire::StorageColumn;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
 
     fn schema(columns: Vec<StorageColumn>) -> StorageSchema {
         StorageSchema {
@@ -548,5 +674,50 @@ mod tests {
         previous.default_value = Some(b"old_default".to_vec());
 
         validate_historical_schema(&[binding], &schema(vec![previous])).unwrap();
+    }
+
+    #[test]
+    fn decodes_and_applies_frozen_primary_delete_vector() {
+        let mut encoded = vec![1_u8];
+        let bitmap = RoaringBitmap::from_iter([1_u32, 3]);
+        bitmap.serialize_into(&mut encoded).unwrap();
+        let bitmap = decode_delvec_bitmap(&encoded).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+
+        let filtered = apply_delvec(&batch, &bitmap).unwrap();
+        assert_eq!(
+            filtered
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[1, 3, 5]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_trailing_direct_delete_vector_bytes() {
+        assert_eq!(
+            decode_delvec_bitmap(&[]).unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        assert_eq!(
+            decode_delvec_bitmap(&[2]).unwrap_err().kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        let mut encoded = vec![1_u8];
+        RoaringBitmap::from_iter([1_u32])
+            .serialize_into(&mut encoded)
+            .unwrap();
+        encoded.push(0);
+        assert_eq!(
+            decode_delvec_bitmap(&encoded).unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
     }
 }

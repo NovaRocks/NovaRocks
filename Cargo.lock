@@ -3339,6 +3339,7 @@ dependencies = [
  "novarocks-spi",
  "prost 0.13.5",
  "protoc-bin-vendored",
+ "roaring 0.10.12",
  "serde",
  "serde_json",
  "sha2",
