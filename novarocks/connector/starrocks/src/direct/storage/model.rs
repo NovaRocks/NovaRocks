@@ -19,10 +19,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Date32Array, Decimal128Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray,
 };
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -184,6 +185,13 @@ enum Cell {
     F32(f32),
     F64(f64),
     Bool(bool),
+    Date32(i32),
+    TimestampMicros(i64),
+    Decimal128 {
+        value: i128,
+        precision: u8,
+        scale: i8,
+    },
     Text(String),
     Binary(Vec<u8>),
 }
@@ -246,6 +254,29 @@ fn cell_from_batch(batch: &RecordBatch, name: &str, row: usize) -> Result<Cell, 
                 .ok_or_else(mismatch)?
                 .value(row),
         )),
+        DataType::Date32 => Ok(Cell::Date32(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(mismatch)?
+                .value(row),
+        )),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Cell::TimestampMicros(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(mismatch)?
+                .value(row),
+        )),
+        DataType::Decimal128(precision, scale) => Ok(Cell::Decimal128 {
+            value: array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(mismatch)?
+                .value(row),
+            precision: *precision,
+            scale: *scale,
+        }),
         DataType::Utf8 => Ok(Cell::Text(
             array
                 .as_any()
@@ -312,8 +343,26 @@ fn encode_cell(cell: &Cell, output: &mut Vec<u8>) {
             output.push(7);
             output.push(u8::from(*value));
         }
-        Cell::Text(value) => encode_bytes(8, value.as_bytes(), output),
-        Cell::Binary(value) => encode_bytes(9, value, output),
+        Cell::Date32(value) => {
+            output.push(8);
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        Cell::TimestampMicros(value) => {
+            output.push(9);
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        Cell::Decimal128 {
+            value,
+            precision,
+            scale,
+        } => {
+            output.push(10);
+            output.push(*precision);
+            output.extend_from_slice(&scale.to_be_bytes());
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        Cell::Text(value) => encode_bytes(11, value.as_bytes(), output),
+        Cell::Binary(value) => encode_bytes(12, value, output),
     }
 }
 
@@ -344,6 +393,25 @@ fn add_cells(left: &Cell, right: &Cell) -> Result<Cell, ConnectorError> {
             .ok_or_else(|| corrupt("StarRocks direct aggregate SUM overflows")),
         (Cell::F32(a), Cell::F32(b)) => Ok(Cell::F32(*a + *b)),
         (Cell::F64(a), Cell::F64(b)) => Ok(Cell::F64(*a + *b)),
+        (
+            Cell::Decimal128 {
+                value: a,
+                precision,
+                scale,
+            },
+            Cell::Decimal128 {
+                value: b,
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) if precision == right_precision && scale == right_scale => a
+            .checked_add(*b)
+            .map(|value| Cell::Decimal128 {
+                value,
+                precision: *precision,
+                scale: *scale,
+            })
+            .ok_or_else(|| corrupt("StarRocks direct aggregate DECIMAL SUM overflows")),
         _ => Err(corrupt(
             "StarRocks direct aggregate SUM has incompatible column types",
         )),
@@ -383,6 +451,20 @@ fn compare_cells(left: &Cell, right: &Cell) -> Result<std::cmp::Ordering, Connec
             .partial_cmp(b)
             .ok_or_else(|| corrupt("StarRocks direct aggregate ordering does not support NaN")),
         (Cell::Bool(a), Cell::Bool(b)) => cmp!(a, b),
+        (Cell::Date32(a), Cell::Date32(b)) => cmp!(a, b),
+        (Cell::TimestampMicros(a), Cell::TimestampMicros(b)) => cmp!(a, b),
+        (
+            Cell::Decimal128 {
+                value: a,
+                precision,
+                scale,
+            },
+            Cell::Decimal128 {
+                value: b,
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) if precision == right_precision && scale == right_scale => cmp!(a, b),
         (Cell::Text(a), Cell::Text(b)) => cmp!(a, b),
         (Cell::Binary(a), Cell::Binary(b)) => cmp!(a, b),
         _ => Err(corrupt(
@@ -421,6 +503,34 @@ fn build_array<'a>(
         DataType::Float32 => primitive!(F32, Float32Array, f32),
         DataType::Float64 => primitive!(F64, Float64Array, f64),
         DataType::Boolean => primitive!(Bool, BooleanArray, bool),
+        DataType::Date32 => primitive!(Date32, Date32Array, i32),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            primitive!(TimestampMicros, TimestampMicrosecondArray, i64)
+        }
+        DataType::Decimal128(precision, scale) => {
+            let mut out = Vec::with_capacity(values.len());
+            for cell in values {
+                match cell {
+                    Cell::Null => out.push(None),
+                    Cell::Decimal128 {
+                        value,
+                        precision: actual_precision,
+                        scale: actual_scale,
+                    } if *actual_precision == precision && *actual_scale == scale => {
+                        out.push(Some(*value))
+                    }
+                    _ => {
+                        return Err(corrupt(
+                            "StarRocks direct key-model output cell type differs from Arrow schema",
+                        ));
+                    }
+                }
+            }
+            let array = Decimal128Array::from(out)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|_| corrupt("StarRocks direct key-model DECIMAL exceeds precision"))?;
+            Ok(Arc::new(array))
+        }
         DataType::Utf8 => {
             let mut out = Vec::new();
             for cell in values {
@@ -555,6 +665,44 @@ mod tests {
                 .unwrap()
                 .values(),
             &[40, 20]
+        );
+    }
+
+    #[test]
+    fn aggregate_keys_merge_decimal_values_with_frozen_scale() {
+        let output = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Decimal128(10, 2), false),
+        ]));
+        let batch = |values: &[i128]| {
+            RecordBatch::try_new(
+                Arc::clone(&output),
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64; values.len()])),
+                    Arc::new(
+                        Decimal128Array::from(values.to_vec())
+                            .with_precision_and_scale(10, 2)
+                            .unwrap(),
+                    ),
+                ],
+            )
+            .unwrap()
+        };
+        let merged = merge_key_model_batches(
+            StorageModel::Aggregate,
+            &schema(StorageModel::Aggregate, Some("SUM")),
+            Arc::clone(&output),
+            &[batch(&[125]), batch(&[75])],
+        )
+        .unwrap();
+        assert_eq!(
+            merged
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            200
         );
     }
 
