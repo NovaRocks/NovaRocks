@@ -19,9 +19,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 const STAROS_IDL: &str = "idl/staros_v1.proto";
+const STORAGE_IDL: &str = "idl/storage_v1.proto";
 
 fn main() {
     println!("cargo:rerun-if-changed={STAROS_IDL}");
+    println!("cargo:rerun-if-changed={STORAGE_IDL}");
 
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc path");
     unsafe {
@@ -32,7 +34,7 @@ fn main() {
         .build_client(true)
         .build_server(false)
         .compile_protos(
-            &[PathBuf::from(STAROS_IDL)],
+            &[PathBuf::from(STAROS_IDL), PathBuf::from(STORAGE_IDL)],
             &[PathBuf::from(
                 Path::new(STAROS_IDL)
                     .parent()

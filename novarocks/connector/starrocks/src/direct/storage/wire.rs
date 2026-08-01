@@ -28,6 +28,15 @@ use prost::Message;
 
 const BUNDLE_FOOTER_BYTES: usize = 8;
 
+mod generated {
+    tonic::include_proto!("starrocks.storage");
+}
+
+use generated::{
+    BundleTabletMetadataPb, ColumnPb, DeletePredicatePb, DelvecPagePb, PagePointerPb,
+    RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StorageModel {
     Duplicate,
@@ -233,7 +242,7 @@ fn decode_schema(value: TabletSchemaPb) -> Result<StorageSchema, ConnectorError>
         _ => return Err(unsupported("unsupported StarRocks tablet key model")),
     };
     let columns = value
-        .columns
+        .column
         .into_iter()
         .map(|column| {
             let unique_id = column
@@ -277,12 +286,14 @@ fn decode_rowset(value: RowsetMetadataPb) -> Result<StorageRowset, ConnectorErro
     if num_rows < 0 || value.segments.iter().any(|name| name.trim().is_empty()) {
         return Err(corrupt("StarRocks rowset has invalid immutable facts"));
     }
-    if !value.segment_sizes.is_empty() && value.segment_sizes.len() != value.segments.len() {
+    if !value.segment_size.is_empty() && value.segment_size.len() != value.segments.len() {
         return Err(corrupt(
             "StarRocks rowset segment sizes do not match segments",
         ));
     }
-    if !value.bundle_offsets.is_empty() && value.bundle_offsets.len() != value.segments.len() {
+    if !value.bundle_file_offsets.is_empty()
+        && value.bundle_file_offsets.len() != value.segments.len()
+    {
         return Err(corrupt(
             "StarRocks rowset bundle offsets do not match segments",
         ));
@@ -290,8 +301,8 @@ fn decode_rowset(value: RowsetMetadataPb) -> Result<StorageRowset, ConnectorErro
     Ok(StorageRowset {
         id,
         segments: value.segments,
-        segment_sizes: value.segment_sizes,
-        bundle_offsets: value.bundle_offsets,
+        segment_sizes: value.segment_size,
+        bundle_offsets: value.bundle_file_offsets,
         num_rows,
         delete_predicate: value.delete_predicate.map(decode_delete_predicate),
     })
@@ -354,136 +365,13 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unsupported, message)
 }
 
-#[derive(Clone, PartialEq, Message)]
-struct TabletMetadataPb {
-    #[prost(int64, optional, tag = "1")]
-    id: Option<i64>,
-    #[prost(int64, optional, tag = "2")]
-    version: Option<i64>,
-    #[prost(message, optional, tag = "3")]
-    schema: Option<TabletSchemaPb>,
-    #[prost(message, repeated, tag = "4")]
-    rowsets: Vec<RowsetMetadataPb>,
-    #[prost(message, optional, tag = "7")]
-    delvec_meta: Option<DelvecMetadataPb>,
-    #[prost(map = "int64, message", tag = "17")]
-    historical_schemas: std::collections::HashMap<i64, TabletSchemaPb>,
-    #[prost(map = "uint32, int64", tag = "18")]
-    rowset_to_schema: std::collections::HashMap<u32, i64>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct TabletSchemaPb {
-    #[prost(int32, optional, tag = "1")]
-    keys_type: Option<i32>,
-    #[prost(message, repeated, tag = "2")]
-    columns: Vec<ColumnPb>,
-    #[prost(int64, optional, tag = "50")]
-    id: Option<i64>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct ColumnPb {
-    #[prost(int32, optional, tag = "1")]
-    unique_id: Option<i32>,
-    #[prost(string, optional, tag = "2")]
-    name: Option<String>,
-    #[prost(string, optional, tag = "3")]
-    r#type: Option<String>,
-    #[prost(bool, optional, tag = "6")]
-    is_nullable: Option<bool>,
-    #[prost(bytes, optional, tag = "7")]
-    default_value: Option<Vec<u8>>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct RowsetMetadataPb {
-    #[prost(uint32, optional, tag = "1")]
-    id: Option<u32>,
-    #[prost(string, repeated, tag = "3")]
-    segments: Vec<String>,
-    #[prost(int64, optional, tag = "4")]
-    num_rows: Option<i64>,
-    #[prost(message, optional, tag = "6")]
-    delete_predicate: Option<DeletePredicatePb>,
-    #[prost(uint64, repeated, tag = "8")]
-    segment_sizes: Vec<u64>,
-    #[prost(int64, repeated, tag = "14")]
-    bundle_offsets: Vec<i64>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct DeletePredicatePb {
-    #[prost(string, repeated, tag = "2")]
-    sub_predicates: Vec<String>,
-    #[prost(message, repeated, tag = "3")]
-    in_predicates: Vec<InPredicatePb>,
-    #[prost(message, repeated, tag = "4")]
-    binary_predicates: Vec<BinaryPredicatePb>,
-    #[prost(message, repeated, tag = "5")]
-    is_null_predicates: Vec<IsNullPredicatePb>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct InPredicatePb {
-    #[prost(string, optional, tag = "1")]
-    column_name: Option<String>,
-    #[prost(bool, optional, tag = "2")]
-    is_not_in: Option<bool>,
-    #[prost(string, repeated, tag = "3")]
-    values: Vec<String>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct BinaryPredicatePb {
-    #[prost(string, optional, tag = "1")]
-    column_name: Option<String>,
-    #[prost(string, optional, tag = "2")]
-    op: Option<String>,
-    #[prost(string, optional, tag = "3")]
-    value: Option<String>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct IsNullPredicatePb {
-    #[prost(string, optional, tag = "1")]
-    column_name: Option<String>,
-    #[prost(bool, optional, tag = "2")]
-    is_not_null: Option<bool>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct DelvecMetadataPb {
-    #[prost(map = "uint32, message", tag = "2")]
-    delvecs: std::collections::HashMap<u32, DelvecPagePb>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct DelvecPagePb {
-    #[prost(int64, optional, tag = "1")]
-    version: Option<i64>,
-    #[prost(uint64, optional, tag = "2")]
-    offset: Option<u64>,
-    #[prost(uint64, optional, tag = "3")]
-    size: Option<u64>,
-    #[prost(uint32, optional, tag = "4")]
-    crc32c: Option<u32>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct PagePointerPb {
-    #[prost(uint64, optional, tag = "1")]
-    offset: Option<u64>,
-    #[prost(uint32, optional, tag = "2")]
-    size: Option<u32>,
-}
-#[derive(Clone, PartialEq, Message)]
-struct BundleTabletMetadataPb {
-    #[prost(map = "int64, int64", tag = "1")]
-    tablet_to_schema: std::collections::HashMap<i64, i64>,
-    #[prost(map = "int64, message", tag = "2")]
-    schemas: std::collections::HashMap<i64, TabletSchemaPb>,
-    #[prost(map = "int64, message", tag = "3")]
-    tablet_meta_pages: std::collections::HashMap<i64, PagePointerPb>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     fn schema() -> TabletSchemaPb {
         TabletSchemaPb {
             keys_type: Some(0),
-            columns: vec![ColumnPb {
+            column: vec![ColumnPb {
                 unique_id: Some(1),
                 name: Some("id".into()),
                 r#type: Some("BIGINT".into()),
@@ -503,8 +391,8 @@ mod tests {
                 segments: vec!["rs_0.dat".into()],
                 num_rows: Some(2),
                 delete_predicate: None,
-                segment_sizes: vec![],
-                bundle_offsets: vec![],
+                segment_size: vec![],
+                bundle_file_offsets: vec![],
             }],
             delvec_meta: None,
             historical_schemas: Default::default(),
