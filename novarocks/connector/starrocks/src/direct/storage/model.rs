@@ -154,11 +154,10 @@ fn merge_row(
             continue;
         }
         let incoming = cell_from_batch(batch, &spec.name, row)?;
-        merge_cell(
-            &mut state[index],
-            incoming,
-            spec.op.expect("non-key has merge operation"),
-        )?;
+        let operation = spec.op.ok_or_else(|| {
+            corrupt("StarRocks direct key-model non-key column is missing its merge operation")
+        })?;
+        merge_cell(&mut state[index], incoming, operation)?;
     }
     Ok(())
 }
