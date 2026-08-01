@@ -1,0 +1,368 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Arrow-only scalar segment kernel for frozen StarRocks direct splits.
+//!
+//! This deliberately starts with a strict, single-data-page PLAIN closure. A
+//! segment requiring an unimplemented index, encoding, or null map fails the
+//! attempt rather than selecting an RPC reader or looking for another tablet.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, StringArray,
+};
+use arrow::datatypes::{DataType, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+use crate::direct::StarRocksDirectColumnBinding;
+
+use super::page::{
+    decode_binary_plain_values, decode_data_page, decode_fixed_plain_values, page_slice,
+};
+use super::segment::{
+    StarRocksLogicalType, StarRocksPageEncoding, StarRocksSegmentColumnMeta, StarRocksSegmentFooter,
+};
+
+/// Decode one fully loaded immutable segment. The caller must obtain the exact
+/// frozen segment object through the startup-local storage binding.
+pub(crate) fn decode_plain_segment(
+    segment_path: &str,
+    segment: &[u8],
+    footer: &StarRocksSegmentFooter,
+    output_schema: SchemaRef,
+    bindings: &[StarRocksDirectColumnBinding],
+) -> Result<RecordBatch, ConnectorError> {
+    if output_schema.fields().len() != bindings.len() {
+        return Err(corrupt(
+            "StarRocks direct output schema and bindings differ",
+        ));
+    }
+    let by_id = footer
+        .columns
+        .iter()
+        .filter_map(|column| column.unique_id.map(|id| (id as i32, column)))
+        .collect::<BTreeMap<_, _>>();
+    let mut arrays = Vec::with_capacity(bindings.len());
+    for (output_index, binding) in bindings.iter().enumerate() {
+        if binding.output_index != output_index {
+            return Err(corrupt("StarRocks direct output mapping is not contiguous"));
+        }
+        let field = output_schema
+            .fields()
+            .get(output_index)
+            .ok_or_else(|| corrupt("StarRocks direct output field is missing"))?;
+        if field.name() != binding.name.as_ref() || field.is_nullable() != binding.nullable {
+            return Err(corrupt(
+                "StarRocks direct output field differs from frozen mapping",
+            ));
+        }
+        let column = by_id
+            .get(&binding.unique_id)
+            .ok_or_else(|| corrupt("StarRocks direct segment omits a frozen physical column"))?;
+        arrays.push(decode_column(
+            segment_path,
+            segment,
+            column,
+            field.data_type(),
+        )?);
+    }
+    RecordBatch::try_new(output_schema, arrays)
+        .map_err(|_| corrupt("StarRocks direct Arrow batch does not match frozen schema"))
+}
+
+fn decode_column(
+    segment_path: &str,
+    segment: &[u8],
+    column: &StarRocksSegmentColumnMeta,
+    output_type: &DataType,
+) -> Result<ArrayRef, ConnectorError> {
+    if column.encoding != Some(StarRocksPageEncoding::Plain) {
+        return Err(unsupported(
+            "StarRocks direct segment encoding is not implemented",
+        ));
+    }
+    if !column.ordinal_index_is_data_page {
+        return Err(unsupported(
+            "StarRocks direct segment requires an unsupported multi-page ordinal index",
+        ));
+    }
+    let pointer = column
+        .ordinal_index_page
+        .as_ref()
+        .ok_or_else(|| corrupt("StarRocks direct segment is missing an ordinal data page"))?;
+    let bytes = page_slice(segment_path, segment, pointer)?;
+    let page = decode_data_page(
+        segment_path,
+        bytes,
+        column
+            .compression
+            .unwrap_or(super::segment::StarRocksCompression::None),
+    )?;
+    if page.nullmap_size != 0 || column.nullable || output_type.is_null() {
+        return Err(unsupported(
+            "StarRocks direct nullable scalar column decoding is not implemented",
+        ));
+    }
+    let body = &page.body;
+    match (column.logical_type, output_type) {
+        (StarRocksLogicalType::Boolean, DataType::Boolean) => {
+            let values = decode_fixed_plain_values(body, page.num_values, 1)?;
+            let values = values
+                .into_iter()
+                .map(|value| match value {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(corrupt("invalid StarRocks BOOLEAN PLAIN value")),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Arc::new(BooleanArray::from(values)))
+        }
+        (StarRocksLogicalType::TinyInt, DataType::Int8) => fixed_i8(body, page.num_values),
+        (StarRocksLogicalType::SmallInt, DataType::Int16) => fixed_i16(body, page.num_values),
+        (StarRocksLogicalType::Int, DataType::Int32) => fixed_i32(body, page.num_values),
+        (StarRocksLogicalType::BigInt, DataType::Int64) => fixed_i64(body, page.num_values),
+        (StarRocksLogicalType::Float, DataType::Float32) => fixed_f32(body, page.num_values),
+        (StarRocksLogicalType::Double, DataType::Float64) => fixed_f64(body, page.num_values),
+        (StarRocksLogicalType::Char | StarRocksLogicalType::Varchar, DataType::Utf8) => {
+            let values = decode_binary_plain_values(body, page.num_values)?
+                .into_iter()
+                .map(|value| {
+                    String::from_utf8(value)
+                        .map_err(|_| corrupt("invalid UTF-8 StarRocks VARCHAR value"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Arc::new(StringArray::from(values)))
+        }
+        (StarRocksLogicalType::Binary | StarRocksLogicalType::VarBinary, DataType::Binary) => {
+            Ok(Arc::new(BinaryArray::from_iter_values(
+                decode_binary_plain_values(body, page.num_values)?,
+            )))
+        }
+        _ => Err(unsupported(
+            "StarRocks direct physical type does not match a supported Arrow scalar type",
+        )),
+    }
+}
+
+fn fixed_i8(body: &[u8], values: usize) -> Result<ArrayRef, ConnectorError> {
+    Ok(Arc::new(Int8Array::from(
+        decode_fixed_plain_values(body, values, 1)?
+            .into_iter()
+            .map(|value| value as i8)
+            .collect::<Vec<_>>(),
+    )))
+}
+
+macro_rules! fixed_values {
+    ($name:ident, $array:ident, $type:ty, $size:expr) => {
+        fn $name(body: &[u8], values: usize) -> Result<ArrayRef, ConnectorError> {
+            let decoded = decode_fixed_plain_values(body, values, $size)?;
+            let output = decoded
+                .chunks_exact($size)
+                .map(|value| <$type>::from_le_bytes(value.try_into().expect("fixed chunk size")))
+                .collect::<Vec<_>>();
+            Ok(Arc::new($array::from(output)))
+        }
+    };
+}
+
+fixed_values!(fixed_i16, Int16Array, i16, 2);
+fixed_values!(fixed_i32, Int32Array, i32, 4);
+fixed_values!(fixed_i64, Int64Array, i64, 8);
+fixed_values!(fixed_f32, Float32Array, f32, 4);
+fixed_values!(fixed_f64, Float64Array, f64, 8);
+
+fn corrupt(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::CorruptData, message)
+}
+
+fn unsupported(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unsupported, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{Field, Schema};
+    use crc32c::crc32c;
+    use prost::Message;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct PageFooter {
+        #[prost(int32, optional, tag = "1")]
+        page_type: Option<i32>,
+        #[prost(uint32, optional, tag = "2")]
+        uncompressed_size: Option<u32>,
+        #[prost(message, optional, tag = "7")]
+        data: Option<DataFooter>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct DataFooter {
+        #[prost(uint64, optional, tag = "2")]
+        num_values: Option<u64>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Footer {
+        #[prost(uint32, optional, tag = "1")]
+        version: Option<u32>,
+        #[prost(message, repeated, tag = "2")]
+        columns: Vec<Column>,
+        #[prost(uint32, optional, tag = "3")]
+        num_rows: Option<u32>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Column {
+        #[prost(uint32, optional, tag = "2")]
+        unique_id: Option<u32>,
+        #[prost(int32, optional, tag = "3")]
+        logical_type: Option<i32>,
+        #[prost(int32, optional, tag = "5")]
+        encoding: Option<i32>,
+        #[prost(int32, optional, tag = "6")]
+        compression: Option<i32>,
+        #[prost(bool, optional, tag = "7")]
+        nullable: Option<bool>,
+        #[prost(message, repeated, tag = "8")]
+        indexes: Vec<Index>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Index {
+        #[prost(int32, optional, tag = "1")]
+        index_type: Option<i32>,
+        #[prost(message, optional, tag = "7")]
+        ordinal: Option<Ordinal>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Ordinal {
+        #[prost(message, optional, tag = "1")]
+        root: Option<Btree>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Btree {
+        #[prost(message, optional, tag = "1")]
+        page: Option<Pointer>,
+        #[prost(bool, optional, tag = "2")]
+        root_is_data: Option<bool>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Pointer {
+        #[prost(uint64, optional, tag = "1")]
+        offset: Option<u64>,
+        #[prost(uint32, optional, tag = "2")]
+        size: Option<u32>,
+    }
+
+    fn segment(values: &[i64]) -> Vec<u8> {
+        let mut page = (values.len() as u32).to_le_bytes().to_vec();
+        for value in values {
+            page.extend_from_slice(&value.to_le_bytes());
+        }
+        let page_footer = PageFooter {
+            page_type: Some(1),
+            uncompressed_size: Some(page.len() as u32),
+            data: Some(DataFooter {
+                num_values: Some(values.len() as u64),
+            }),
+        }
+        .encode_to_vec();
+        page.extend_from_slice(&page_footer);
+        page.extend_from_slice(&(page_footer.len() as u32).to_le_bytes());
+        page.extend_from_slice(&crc32c(&page).to_le_bytes());
+        let footer = Footer {
+            version: Some(1),
+            columns: vec![Column {
+                unique_id: Some(1),
+                logical_type: Some(7),
+                encoding: Some(2),
+                compression: Some(0),
+                nullable: Some(false),
+                indexes: vec![Index {
+                    index_type: Some(1),
+                    ordinal: Some(Ordinal {
+                        root: Some(Btree {
+                            page: Some(Pointer {
+                                offset: Some(0),
+                                size: Some(page.len() as u32),
+                            }),
+                            root_is_data: Some(true),
+                        }),
+                    }),
+                }],
+            }],
+            num_rows: Some(values.len() as u32),
+        }
+        .encode_to_vec();
+        let mut segment = page;
+        segment.extend_from_slice(&footer);
+        segment.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        segment.extend_from_slice(&crc32c(&footer).to_le_bytes());
+        segment.extend_from_slice(b"D0R1");
+        segment
+    }
+
+    #[test]
+    fn decodes_frozen_plain_segment_to_arrow() {
+        let bytes = segment(&[7, 9]);
+        let footer = super::super::segment::decode_segment_footer("seg", &bytes).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = decode_plain_segment(
+            "seg",
+            &bytes,
+            &footer,
+            schema,
+            &[StarRocksDirectColumnBinding::try_new(0, 1, "id", "BIGINT", false, None).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[7, 9]
+        );
+    }
+
+    #[test]
+    fn refuses_nullable_page_without_another_reader() {
+        let bytes = segment(&[7]);
+        let mut footer = super::super::segment::decode_segment_footer("seg", &bytes).unwrap();
+        footer.columns[0].nullable = true;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        assert_eq!(
+            decode_plain_segment(
+                "seg",
+                &bytes,
+                &footer,
+                schema,
+                &[
+                    StarRocksDirectColumnBinding::try_new(0, 1, "id", "BIGINT", true, None)
+                        .unwrap()
+                ],
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+    }
+}
