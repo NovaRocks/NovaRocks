@@ -729,15 +729,12 @@ mod tests {
         ));
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId {
-                hi: finst_id.hi - 2,
-                lo: finst_id.lo - 2,
-            },
+            QueryId::new(finst_id.high() - 2, finst_id.low() - 2),
             FragmentInstanceId::new(finst_id),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::new(1).expect("one driver"),
             BackendNum::try_new(1).expect("backend number"),
         );
@@ -820,10 +817,7 @@ mod tests {
 
     #[test]
     fn statistics_sink_attaches_one_partial_to_the_terminal_fact_without_result_io() {
-        let finst_id = UniqueId {
-            hi: 72_051,
-            lo: 72_052,
-        };
+        let finst_id = UniqueId::new(72_051, 72_052);
         let running = prepare_fragment(
             statistics_submission(finst_id),
             FragmentPrepareContext::default(),
