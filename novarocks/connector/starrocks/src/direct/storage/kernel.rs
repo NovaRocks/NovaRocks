@@ -116,6 +116,20 @@ fn default_array(
         return Ok(arrow::array::new_null_array(data_type, rows));
     }
     match data_type {
+        DataType::Int8 => Ok(Arc::new(Int8Array::from(vec![
+            Some(
+                text.parse::<i8>()
+                    .map_err(|_| corrupt("invalid StarRocks TINYINT default"))?,
+            );
+            rows
+        ]))),
+        DataType::Int16 => Ok(Arc::new(Int16Array::from(vec![
+            Some(
+                text.parse::<i16>()
+                    .map_err(|_| corrupt("invalid StarRocks SMALLINT default"))?,
+            );
+            rows
+        ]))),
         DataType::Int64 => Ok(Arc::new(Int64Array::from(vec![
             Some(
                 text.parse::<i64>()
