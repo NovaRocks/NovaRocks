@@ -334,6 +334,12 @@ impl DistributedQueryOutcome {
         }
     }
 
+    /// Consume the outcome as a distributed write terminal result.
+    ///
+    /// Frontend-owned application lifecycles use the returned typed connector
+    /// completion to decide commit, abort, or authoritative reconciliation on
+    /// their retained exact lease. They never need a Core transaction helper
+    /// (or provider-specific receipt decoder) to make that decision.
     pub fn into_write(self) -> Result<WriteExecutionOutcome, DistributedQueryError> {
         match self {
             Self::Write(outcome) => Ok(outcome),

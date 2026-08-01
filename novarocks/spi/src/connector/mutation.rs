@@ -489,7 +489,11 @@ pub enum ConnectorRefAction {
     FastForwardBranch {
         source_branch: Arc<str>,
         target_branch: Arc<str>,
-        source_snapshot_id: i64,
+        /// Provider-produced version of the staged write. Application owners
+        /// persist and forward this fact without decoding it; the provider
+        /// verifies that it still names the source branch snapshot before the
+        /// guarded CAS publication.
+        committed_version: ConnectorCommittedVersion,
         expected_target_snapshot_id: Option<i64>,
         guard: ConnectorRefreshPublicationGuard,
     },

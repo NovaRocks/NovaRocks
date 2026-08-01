@@ -9668,6 +9668,27 @@ fn publish_iceberg_mv_refresh(
             };
         }
     };
+    // Legacy Core refresh still constructs its provider-owned write receipt
+    // locally. Publication itself nevertheless receives the same opaque
+    // committed-version carrier that the frontend lifecycle will retain; the
+    // Iceberg provider is the only consumer that decodes it.
+    let committed_version =
+        match crate::connector::iceberg::write_contract::connector_write_receipt(
+            staging_snapshot_id,
+        )
+        .and_then(|receipt| {
+            receipt.committed_version().cloned().ok_or_else(|| {
+                "Iceberg write receipt unexpectedly omitted a committed version".to_string()
+            })
+        }) {
+            Ok(version) => version,
+            Err(message) => {
+                return IcebergMvPublicationResolution::ContractFailure {
+                    message,
+                    possibly_dispatched: false,
+                };
+            }
+        };
     match crate::connector::mutation::resolve_catalog_mutation(
         state.connector_control.as_ref(),
         &instance_id,
@@ -9680,7 +9701,7 @@ fn publish_iceberg_mv_refresh(
             action: novarocks_spi::connector::ConnectorRefAction::FastForwardBranch {
                 source_branch: Arc::from(staging_branch),
                 target_branch: Arc::from("main"),
-                source_snapshot_id: staging_snapshot_id,
+                committed_version,
                 expected_target_snapshot_id: expected_main_snapshot_id,
                 guard,
             },

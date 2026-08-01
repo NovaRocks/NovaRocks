@@ -36,19 +36,19 @@ use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCatalogMutation,
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-    ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorControlBinding,
-    ConnectorDataType, ConnectorDefaultValue, ConnectorDropTableDataDisposition, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionInstaller,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
-    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector,
-    ConnectorRefreshPublicationGuard, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorSplit, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
-    ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
+    ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorCommittedVersion,
+    ConnectorControlBinding, ConnectorDataType, ConnectorDefaultValue,
+    ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionDistribution, ConnectorExecutionInstaller, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
+    ConnectorReadExecution, ConnectorReadSelector, ConnectorRefreshPublicationGuard, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
     ConnectorStaticPredicateLiteral, ConnectorStatistics, ConnectorTableHandle,
     ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy,
     CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
@@ -1036,9 +1036,14 @@ impl IcebergControlProvider {
                     ConnectorRefAction::Drop { name, .. } => (name.to_string(), None),
                     ConnectorRefAction::FastForwardBranch {
                         target_branch,
-                        source_snapshot_id,
+                        committed_version,
                         ..
-                    } => (target_branch.to_string(), Some(*source_snapshot_id)),
+                    } => (
+                        target_branch.to_string(),
+                        Some(source_snapshot_id_from_committed_version(
+                            committed_version,
+                        )?),
+                    ),
                 };
                 IcebergMutationEvidenceTarget::Ref {
                     namespace: table.namespace.to_string(),
@@ -1320,7 +1325,7 @@ impl IcebergControlProvider {
         let novarocks_spi::connector::ConnectorRefAction::FastForwardBranch {
             source_branch,
             target_branch,
-            source_snapshot_id,
+            committed_version,
             expected_target_snapshot_id,
             guard,
         } = action
@@ -1336,6 +1341,11 @@ impl IcebergControlProvider {
                 "ref mutation belongs to another connector instance",
             )));
         }
+        let source_snapshot_id = match source_snapshot_id_from_committed_version(committed_version)
+        {
+            Ok(snapshot_id) => snapshot_id,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
         let prepared = (|| -> Result<_, ConnectorError> {
             if source_branch.eq_ignore_ascii_case("main")
                 || !target_branch.eq_ignore_ascii_case("main")
@@ -1358,7 +1368,7 @@ impl IcebergControlProvider {
                 table,
                 source_branch,
                 target_branch,
-                *source_snapshot_id,
+                source_snapshot_id,
                 *expected_target_snapshot_id,
                 guard,
                 &loaded,
@@ -1369,7 +1379,7 @@ impl IcebergControlProvider {
                 loaded.table.metadata(),
                 source_branch,
                 target_branch,
-                *source_snapshot_id,
+                source_snapshot_id,
                 *expected_target_snapshot_id,
                 guard,
             )?;
@@ -1430,8 +1440,7 @@ impl IcebergControlProvider {
             )
         }) {
             Ok(finalized)
-                if finalized.table.metadata().current_snapshot_id()
-                    == Some(*source_snapshot_id) =>
+                if finalized.table.metadata().current_snapshot_id() == Some(source_snapshot_id) =>
             {
                 Ok(ExternalMutationOutcome::KnownCommitted {
                     effect: ExternalMutationEffect::Applied,
@@ -2218,6 +2227,35 @@ fn snapshot_matches_publication_guard(
             .get(super::commit::MV_REFRESH_TOKEN_PROP)
             .map(String::as_str)
             == Some(guard.token())
+}
+
+/// Decode the provider-private write version only inside the Iceberg control
+/// provider. The frontend persists this value opaquely and cannot substitute a
+/// bare snapshot ID for it at publication time.
+fn source_snapshot_id_from_committed_version(
+    committed_version: &ConnectorCommittedVersion,
+) -> Result<i64, ConnectorError> {
+    committed_version.validate()?;
+    let snapshot_id = committed_version.snapshot_id().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg guarded publication requires a snapshot-bearing committed version",
+        )
+    })?;
+    let decoded = super::write_contract::decode_write_receipt(committed_version.payload())
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode Iceberg committed version for guarded publication: {error}"),
+            )
+        })?;
+    if decoded != snapshot_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg committed version snapshot fact does not match its opaque payload",
+        ));
+    }
+    Ok(snapshot_id)
 }
 
 fn build_guarded_fast_forward_commit(
