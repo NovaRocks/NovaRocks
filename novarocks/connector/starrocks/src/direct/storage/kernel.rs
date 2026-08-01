@@ -78,19 +78,71 @@ pub(crate) fn decode_plain_segment(
                 "StarRocks direct output field differs from frozen mapping",
             ));
         }
-        let column = by_id
-            .get(&binding.unique_id)
-            .ok_or_else(|| corrupt("StarRocks direct segment omits a frozen physical column"))?;
-        arrays.push(decode_column(
-            segment_path,
-            segment,
-            column,
-            field.data_type(),
-            footer.num_rows as usize,
-        )?);
+        if let Some(column) = by_id.get(&binding.unique_id) {
+            arrays.push(decode_column(
+                segment_path,
+                segment,
+                column,
+                field.data_type(),
+                footer.num_rows as usize,
+            )?);
+        } else {
+            arrays.push(default_array(
+                binding,
+                field.data_type(),
+                footer.num_rows as usize,
+            )?);
+        }
     }
     RecordBatch::try_new(output_schema, arrays)
         .map_err(|_| corrupt("StarRocks direct Arrow batch does not match frozen schema"))
+}
+
+fn default_array(
+    binding: &StarRocksDirectColumnBinding,
+    data_type: &DataType,
+    rows: usize,
+) -> Result<ArrayRef, ConnectorError> {
+    let default = binding.default_value.as_deref().ok_or_else(|| {
+        corrupt("StarRocks historical segment omits a frozen column without a default")
+    })?;
+    let text = std::str::from_utf8(default)
+        .map_err(|_| corrupt("StarRocks column default is not UTF-8"))?
+        .trim();
+    if text.eq_ignore_ascii_case("null") {
+        if !binding.nullable {
+            return Err(corrupt("StarRocks non-nullable column has a NULL default"));
+        }
+        return Ok(arrow::array::new_null_array(data_type, rows));
+    }
+    match data_type {
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(vec![
+            Some(
+                text.parse::<i64>()
+                    .map_err(|_| corrupt("invalid StarRocks BIGINT default"))?,
+            );
+            rows
+        ]))),
+        DataType::Int32 => Ok(Arc::new(Int32Array::from(vec![
+            Some(
+                text.parse::<i32>()
+                    .map_err(|_| corrupt("invalid StarRocks INT default"))?,
+            );
+            rows
+        ]))),
+        DataType::Boolean => Ok(Arc::new(BooleanArray::from(vec![
+            Some(match text {
+                "0" | "false" | "FALSE" => false,
+                "1" | "true" | "TRUE" => true,
+                _ => return Err(corrupt("invalid StarRocks BOOLEAN default")),
+            });
+            rows
+        ]))),
+        DataType::Utf8 => Ok(Arc::new(StringArray::from(vec![Some(text); rows]))),
+        _ => Err(unsupported(
+            "StarRocks default literal type is not implemented",
+        )),
+    }
 }
 
 fn decode_column(
