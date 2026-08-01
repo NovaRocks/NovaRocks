@@ -3333,6 +3333,7 @@ dependencies = [
  "arrow",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "crc32c",
  "lz4_flex 0.11.5",
  "novarocks-fs",

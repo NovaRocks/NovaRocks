@@ -31,6 +31,7 @@ use arrow::array::{
 use arrow::compute::concat;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::direct::StarRocksDirectColumnBinding;
@@ -199,10 +200,76 @@ fn default_array(
             }
             Ok(Arc::new(builder.finish()))
         }
+        DataType::Date32 => Ok(Arc::new(Date32Array::from(vec![
+            Some(parse_date_default(
+                text
+            )?,);
+            rows
+        ]))),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Ok(Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(
+                    parse_timestamp_default(text)?,
+                );
+                rows
+            ])))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = vec![Some(parse_decimal_default(text, *precision, *scale)?); rows];
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|_| corrupt("StarRocks DECIMAL default exceeds frozen precision"))?;
+            Ok(Arc::new(array))
+        }
         _ => Err(unsupported(
             "StarRocks default literal type is not implemented",
         )),
     }
+}
+
+fn parse_date_default(text: &str) -> Result<i32, ConnectorError> {
+    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map(|date| date.num_days_from_ce() - 719_163)
+        .map_err(|_| corrupt("invalid StarRocks DATE default"))
+}
+
+fn parse_timestamp_default(text: &str) -> Result<i64, ConnectorError> {
+    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
+        .map(|timestamp| timestamp.and_utc().timestamp_micros())
+        .map_err(|_| corrupt("invalid StarRocks DATETIME default"))
+}
+
+fn parse_decimal_default(text: &str, precision: u8, scale: i8) -> Result<i128, ConnectorError> {
+    let (negative, text) = match text.strip_prefix('-') {
+        Some(value) => (true, value),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > scale as usize
+    {
+        return Err(corrupt("invalid StarRocks DECIMAL default"));
+    }
+    let mut digits = String::with_capacity(whole.len() + scale as usize);
+    digits.push_str(whole);
+    digits.push_str(fraction);
+    for _ in fraction.len()..scale as usize {
+        digits.push('0');
+    }
+    let value = digits
+        .parse::<i128>()
+        .map_err(|_| corrupt("invalid StarRocks DECIMAL default"))?;
+    let value = if negative { -value } else { value };
+    let significant = digits.trim_start_matches('0').len().max(1);
+    if significant > precision as usize {
+        return Err(corrupt(
+            "StarRocks DECIMAL default exceeds frozen precision",
+        ));
+    }
+    Ok(value)
 }
 
 fn strip_wrapping_quotes(value: &str) -> &str {
@@ -675,7 +742,10 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BinaryArray, Float32Array, Float64Array, Int64Array};
+    use arrow::array::{
+        BinaryArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int64Array,
+        TimestampMicrosecondArray,
+    };
     use arrow::datatypes::{Field, Schema};
     use bytes::Bytes;
     use crc32c::crc32c;
@@ -1022,6 +1092,52 @@ mod tests {
         let binary = binary.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(binary.value(0), b"raw");
         assert_eq!(binary.value(1), b"raw");
+    }
+
+    #[test]
+    fn materializes_temporal_and_decimal_historical_defaults() {
+        let binding = |value| {
+            StarRocksDirectColumnBinding::try_new(
+                0,
+                1,
+                "value",
+                "fixture",
+                false,
+                Some(Bytes::from_static(value)),
+            )
+            .unwrap()
+        };
+        let date = default_array(&binding(b"'1970-01-02'"), &DataType::Date32, 1).unwrap();
+        assert_eq!(
+            date.as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        let timestamp = default_array(
+            &binding(b"'1970-01-01 00:00:01.5'"),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            timestamp
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            1_500_000
+        );
+        let decimal = default_array(&binding(b"'-12.34'"), &DataType::Decimal128(8, 2), 1).unwrap();
+        assert_eq!(
+            decimal
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            -1234
+        );
     }
 
     #[test]
