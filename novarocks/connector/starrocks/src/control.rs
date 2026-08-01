@@ -38,6 +38,7 @@ use crate::codec::{
     Base64Bytes, CODEC_VERSION, decode_schema_ipc, decode_v1, encode_schema_ipc, encode_v1,
     freeze_digest, schema_digest,
 };
+use crate::direct::DirectOuterFacts;
 use crate::domain::{
     StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksFreezeDigest,
     StarRocksReadAttemptId, StarRocksResolvedTable, StarRocksSelectedStrategy,
@@ -492,8 +493,12 @@ impl ConnectorScanPlanning for Provider {
         self.active(&request.context)?;
         let (attempt, digest, frozen) = self.decode_scan(scan)?;
         let input = StarRocksSplitPlanningInput {
+            owner: self.descriptor.instance_id.clone(),
+            incarnation: self.incarnation,
             attempt,
+            freeze: digest,
             strategy: frozen.strategy,
+            topology: frozen.topology,
             namespace: Arc::from(frozen.namespace.as_str()),
             table: Arc::from(frozen.table.as_str()),
             schema_version: frozen.schema_version.0.clone(),
@@ -630,6 +635,35 @@ pub(crate) fn split_output_schema_digest(split: &SplitPayload) -> &[u8] {
 }
 pub(crate) fn split_strategy(split: &SplitPayload) -> StarRocksSelectedStrategy {
     split.frozen.strategy
+}
+
+pub(crate) fn direct_outer_facts(split: &SplitPayload) -> Result<DirectOuterFacts, ConnectorError> {
+    let incarnation: [u8; 16] = split
+        .frozen
+        .incarnation
+        .0
+        .as_ref()
+        .try_into()
+        .map_err(|_| invalid("StarRocks split incarnation must be 16 bytes"))?;
+    let digest = digest_from_bytes(&split.digest)?;
+    let output_schema_digest: [u8; 32] = split
+        .frozen
+        .output_schema_digest
+        .0
+        .as_ref()
+        .try_into()
+        .map_err(|_| invalid("StarRocks split output schema digest must be 32 bytes"))?;
+    Ok(DirectOuterFacts {
+        owner: Arc::from(split.frozen.owner.as_str()),
+        incarnation,
+        attempt: split.attempt,
+        freeze: digest,
+        topology: split.frozen.topology,
+        strategy: split.frozen.strategy,
+        schema_version: split.frozen.schema_version.0.clone(),
+        data_version: split.frozen.data_version.0.clone(),
+        output_schema_digest,
+    })
 }
 
 pub(crate) fn validate_split_generation(

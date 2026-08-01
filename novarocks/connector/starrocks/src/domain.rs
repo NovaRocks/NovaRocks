@@ -286,8 +286,12 @@ pub struct StarRocksStrategySplit {
 
 #[derive(Clone)]
 pub struct StarRocksSplitPlanningInput {
+    pub owner: ConnectorInstanceId,
+    pub incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
     pub attempt: StarRocksReadAttemptId,
+    pub freeze: StarRocksFreezeDigest,
     pub strategy: StarRocksSelectedStrategy,
+    pub topology: StarRocksTopology,
     pub namespace: Arc<str>,
     pub table: Arc<str>,
     pub schema_version: Bytes,
