@@ -5974,8 +5974,10 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
 
     crate::connector::validate_request_context(connector_context)
         .map_err(RefreshError::pre_commit)?;
-    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)
-        .map_err(RefreshError::pre_commit)?;
+    // Preparation only observes the currently admitted catalog and MV facts.
+    // Historical v1/v2 recovery stays in the legacy execution adapter; a
+    // current frontend-owned attempt must never perform recovery before its
+    // durable v3 intent exists.
     let mv_definition =
         load_iceberg_mv_definition_by_target(state, &iceberg_target).map_err(RefreshError::user)?;
     let (_, _, target_loaded) =
