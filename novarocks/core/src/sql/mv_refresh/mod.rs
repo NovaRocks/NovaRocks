@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use novarocks_spi::connector::ConnectorExecutionBindingKey;
+use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
 
 use crate::mv::model::MvTarget;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
@@ -59,6 +59,34 @@ pub struct MvRefreshFinalizeFacts {
     pub expected_target_snapshot_id: Option<i64>,
 }
 
+/// Frontend-preallocated identities that SQL embeds into an inert refresh
+/// preparation.  Generation acquisition and intent persistence remain
+/// frontend work; SQL uses these values only to stamp provider planning and
+/// the native write artifact consistently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshAttemptIdentity {
+    pub refresh_id: i64,
+    pub request_id: [u8; 16],
+    pub staging_branch: String,
+    pub marker_token: String,
+    pub staging_create_operation_id: [u8; 16],
+    pub write_operation_id: ConnectorWriteOperationId,
+    pub publication_operation_id: [u8; 16],
+    pub staging_drop_operation_id: [u8; 16],
+}
+
+impl MvRefreshAttemptIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.refresh_id <= 0 || self.staging_branch.is_empty() || self.marker_token.is_empty() {
+            return Err(
+                "MV refresh preparation requires a positive identity and non-empty staging marker"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The semantic class of a side-effect-free refresh preparation.
 pub enum PreparedMvRefreshWork {
     /// No source data exists. There is neither a writer nor a staging ref.
@@ -77,6 +105,7 @@ pub enum PreparedMvRefreshWork {
 /// never a repository, catalog client, provider codec, or local executor.
 pub struct PreparedMvRefresh {
     pub statement: MvRefreshStatement,
+    pub attempt: MvRefreshAttemptIdentity,
     pub observed_binding: ConnectorExecutionBindingKey,
     pub finalize: MvRefreshFinalizeFacts,
     pub work: PreparedMvRefreshWork,
@@ -93,7 +122,9 @@ pub trait MvRefreshPreparationService: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::MvRefreshStatement;
+    use novarocks_spi::connector::ConnectorWriteOperationId;
+
+    use super::{MvRefreshAttemptIdentity, MvRefreshStatement};
 
     #[test]
     fn full_refresh_remains_an_explicitly_unsupported_request() {
@@ -105,5 +136,26 @@ mod tests {
         .expect_err("FULL must not silently downgrade");
 
         assert_eq!(error, "REFRESH MATERIALIZED VIEW FULL is not supported");
+    }
+
+    #[test]
+    fn preparation_requires_a_frontend_preallocated_attempt_identity() {
+        let valid = MvRefreshAttemptIdentity {
+            refresh_id: 7,
+            request_id: [1; 16],
+            staging_branch: "__nova_mv_7".to_string(),
+            marker_token: "marker".to_string(),
+            staging_create_operation_id: [2; 16],
+            write_operation_id: ConnectorWriteOperationId::from_bytes([3; 16]),
+            publication_operation_id: [4; 16],
+            staging_drop_operation_id: [5; 16],
+        };
+        valid.validate().expect("complete attempt identity");
+
+        let missing_marker = MvRefreshAttemptIdentity {
+            marker_token: String::new(),
+            ..valid
+        };
+        assert!(missing_marker.validate().is_err());
     }
 }
