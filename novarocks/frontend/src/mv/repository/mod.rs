@@ -71,30 +71,7 @@ pub struct StateStoreMvRepository {
     runner_metrics: StateStoreMetrics,
 }
 
-/// Frontend-only command for creating a v3 refresh attempt. `operation_id`
-/// intentionally has no legacy operation-repository counterpart: the v3
-/// StateStore record is the single journal for current attempts.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BeginFrontendMvRefreshIntentRequest {
-    /// Stable, caller-preallocated identity for this attempt. The frontend
-    /// needs it before intent persistence because the provider-visible
-    /// staging ref and commit marker are derived from the same identity.
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub target_catalog: String,
-    pub target_namespace: String,
-    pub target_table: String,
-    pub staging_branch: String,
-    pub expected_main_snapshot_id: Option<i64>,
-    pub base_snapshots: BTreeMap<String, i64>,
-    pub marker_token: String,
-    /// Data-producing attempts preallocate all external action records before
-    /// the first provider call. Metadata-only and no-op attempts keep this
-    /// false so the durable v3 ledger does not invent a writer, fragment, or
-    /// staging phase that never existed.
-    pub prepare_external_actions: bool,
-    pub ledger: FrontendMvRefreshLedger,
-}
+pub use novarocks::mv::repository::BeginFrontendMvRefreshIntentRequest;
 
 impl StateStoreMvRepository {
     pub async fn open(
@@ -2079,21 +2056,6 @@ impl StateStoreMvRepository {
         )
         .await
     }
-
-    pub fn begin_frontend_refresh_intent(
-        &self,
-        request: BeginFrontendMvRefreshIntentRequest,
-    ) -> Result<StoredMvRefresh, MvRepositoryError> {
-        self.blocking(self.begin_frontend_refresh_intent_async(request))
-    }
-
-    pub fn record_frontend_refresh_action(
-        &self,
-        refresh_id: i64,
-        action: FrontendMvRefreshAction,
-    ) -> Result<(), MvRepositoryError> {
-        self.blocking(self.record_frontend_refresh_action_async(refresh_id, action))
-    }
 }
 
 impl MvRepository for StateStoreMvRepository {
@@ -2236,6 +2198,19 @@ impl MvRepository for StateStoreMvRepository {
         request: BeginIcebergMvRefreshRequest,
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
         self.blocking(self.begin_iceberg_refresh_intent_async(request))
+    }
+    fn begin_frontend_refresh_intent(
+        &self,
+        request: BeginFrontendMvRefreshIntentRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        self.blocking(self.begin_frontend_refresh_intent_async(request))
+    }
+    fn record_frontend_refresh_action(
+        &self,
+        refresh_id: i64,
+        action: FrontendMvRefreshAction,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.record_frontend_refresh_action_async(refresh_id, action))
     }
     fn record_staging_commit(
         &self,
