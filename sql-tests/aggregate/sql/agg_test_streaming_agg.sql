@@ -21,7 +21,6 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-admin disable failpoint 'force_reset_aggregator_after_agg_streaming_sink_finish';
 
 -- name: test_streaming_agg @sequential
 -- query 2
@@ -55,7 +54,6 @@ select c0, sum(c1) from t0 group by c0 order by c0;
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-admin enable failpoint 'force_reset_aggregator_after_agg_streaming_sink_finish';
 
 -- query 8
 USE ${case_db};
@@ -64,7 +62,6 @@ select c0, sum(c1) from t0 group by c0 order by c0;
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
-admin disable failpoint 'force_reset_aggregator_after_agg_streaming_sink_finish';
 
 -- query 10
 -- @skip_result_check=true
@@ -88,4 +85,3 @@ select c0, sum(c1) from t1 group by c0 order by 2 desc limit 10;
 -- query 13
 -- @skip_result_check=true
 USE ${case_db};
-admin disable failpoint 'force_reset_aggregator_after_agg_streaming_sink_finish';

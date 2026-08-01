@@ -353,7 +353,12 @@ impl FragmentCutBuilder {
         match (topn.phase, topn.is_split) {
             (TopNPhase::Final, true) => self.emit_stream_exchange(
                 child_plan,
-                node.output_columns.clone(),
+                // A split TopN can sit below a join after a transformation
+                // pushed it into the preserved side. Its parent-visible
+                // layout may then include columns which the child fragment
+                // cannot produce. The stream source must always use the
+                // child's physical producer contract.
+                child_plan.output_columns.clone(),
                 DataPartition::unpartitioned(),
                 FragmentStreamKind::Gather,
                 ExchangeFlavor::TopNSplit {

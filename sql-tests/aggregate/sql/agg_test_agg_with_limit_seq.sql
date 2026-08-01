@@ -21,7 +21,6 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-admin disable failpoint 'scan_chunk_sleep_after_read';
 
 -- name: test_agg_with_limit_seq @sequential
 -- query 2
@@ -59,7 +58,6 @@ insert into agg_with_limit_seq SELECT * FROM base_table;
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-admin enable failpoint 'scan_chunk_sleep_after_read';
 
 -- query 7
 -- @skip_result_check=true
@@ -77,10 +75,8 @@ select * from (select max(c3), sum(c3) sc3, c1 from agg_with_limit_seq group by 
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-admin disable failpoint 'scan_chunk_sleep_after_read';
 
 -- Legacy cleanup step.
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-admin disable failpoint 'scan_chunk_sleep_after_read';

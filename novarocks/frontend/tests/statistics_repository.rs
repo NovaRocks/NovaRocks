@@ -196,6 +196,30 @@ async fn records_are_versioned_durable_and_identical_analyze_requests_remain_dis
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_creates_retry_sqlite_snapshot_conflicts_with_stable_identities() {
+    let (_temp, _store, repository) = fixture().await;
+    let first_repository = repository.clone();
+    let second_repository = repository.clone();
+    let (first, second) = tokio::join!(
+        first_repository.create(request("concurrent_orders", 10)),
+        second_repository.create(request("concurrent_orders", 11)),
+    );
+    let first = first.expect("first concurrent create");
+    let second = second.expect("second concurrent create");
+
+    assert_ne!(first.job_id, second.job_id);
+    assert_ne!(first.operation_id, second.operation_id);
+    assert_eq!(
+        repository
+            .list_by_state(StatisticsJobState::Submitted)
+            .await
+            .expect("list submitted jobs")
+            .len(),
+        2
+    );
+}
+
 struct SucceedingStatisticsExecutor {
     collected: AtomicUsize,
     published: AtomicUsize,

@@ -4562,6 +4562,7 @@ fn map_iceberg_error(error: String) -> ConnectorError {
         || normalized.contains("format-version is reserved")
         || normalized.contains("iceberg internal metadata key")
         || normalized.contains("novarocks.* namespace is reserved")
+        || normalized.contains("variant columns cannot appear in the partition spec")
     {
         // These are local Iceberg semantic rejections, before any catalog
         // commit can have been dispatched.  Keeping them out of the unknown
@@ -4658,6 +4659,22 @@ mod tests {
     fn local_unknown_table_error_is_not_found() {
         let error = map_iceberg_error("unknown table: analytics.orders".to_string());
         assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    }
+
+    #[test]
+    fn local_schema_and_property_validation_errors_are_invalid_requests() {
+        for message in [
+            "ADD COLUMN parent path must point to a STRUCT (LIST element is not a STRUCT)",
+            "decimal precision must strictly increase (current decimal(20,2), new decimal(20,2))",
+            "ALTER TABLE TBLPROPERTIES rejected reserved key(s): `current-schema-id`: Iceberg internal metadata key, not user-settable",
+            "ALTER TABLE TBLPROPERTIES rejected reserved key(s): `novarocks.x`: novarocks.* namespace is reserved for engine-owned properties",
+        ] {
+            assert_eq!(
+                map_iceberg_error(message.to_string()).kind(),
+                ConnectorErrorKind::InvalidRequest,
+                "{message}"
+            );
+        }
     }
 
     fn data_file_with_column_null_count(

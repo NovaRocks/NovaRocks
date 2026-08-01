@@ -3253,6 +3253,57 @@ fn build_distributed_plan_topn_final_split_creates_topn_exchange() {
 }
 
 #[test]
+fn build_distributed_plan_topn_final_split_uses_child_producer_columns() {
+    let child = scan_node(1, "left_key");
+    let topn = PhysicalPlanNode {
+        kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+            items: vec![sort_item(column_ref_expr(
+                1,
+                "left_key",
+                DataType::Int64,
+                false,
+            ))],
+            limit: Some(4),
+            offset: Some(0),
+            phase: TopNPhase::Final,
+            is_split: true,
+        }),
+        children: vec![child],
+        // This models a TopN pushed under an outer join: the enclosing
+        // expression can still expose a right-side column, but the child
+        // fragment only produces the preserved-side key.
+        output_columns: vec![
+            output_col(1, "left_key", DataType::Int64, false),
+            output_col(2, "right_payload", DataType::Utf8, true),
+        ],
+        stats: stats_with_row_count_and_cost(4.0),
+        probe_runtime_filters: vec![],
+    };
+
+    let dp = build_distributed_plan(&topn).expect("build_distributed_plan");
+    let root_fragment = dp
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
+        .expect("root fragment");
+    let DistributedNodeKind::Exchange(receiver) = &root_fragment.root.payload else {
+        panic!("expected TopNSplit exchange root");
+    };
+    let child_fragment = dp
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.fragment_id == receiver.source_fragment_id)
+        .expect("child fragment");
+
+    assert_eq!(child_fragment.output_columns.len(), 1);
+    assert_eq!(
+        child_fragment.output_columns[0].column_id,
+        ColumnId::new_for_test(1)
+    );
+    assert_eq!(dp.edges()[0].output_slot_ids, vec![1]);
+}
+
+#[test]
 fn build_distributed_plan_limit_over_sort_collapses_into_local_sort() {
     let scan = scan_node(1, "k");
     let sort_stats = stats_with_cost();

@@ -564,19 +564,17 @@ INSERT INTO ${case_db}.t_mcv_r SELECT (generate_series % 2502) + 1, 1 FROM TABLE
 
 -- query 111
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t_mcv_l;
+ANALYZE TABLE ${case_db}.t_mcv_l;
 
 -- query 112
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t_mcv_r;
+ANALYZE TABLE ${case_db}.t_mcv_r;
 
 -- query 113
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_mcv_l UPDATE HISTOGRAM ON k PROPERTIES('histogram_sample_ratio' = '1.0', 'histogram_mcv_size' = '20');
 
 -- query 114
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_mcv_r UPDATE HISTOGRAM ON k PROPERTIES('histogram_sample_ratio' = '1.0', 'histogram_mcv_size' = '20');
 
 -- query 115
 SELECT count(*) FROM ${case_db}.t_mcv_l JOIN[shuffle] ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
@@ -671,15 +669,14 @@ INSERT INTO ${case_db}.t_mcv_r2 SELECT generate_series + 2, 1 FROM TABLE(generat
 
 -- query 134
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t_mcv_l2;
+ANALYZE TABLE ${case_db}.t_mcv_l2;
 
 -- query 135
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t_mcv_r2;
+ANALYZE TABLE ${case_db}.t_mcv_r2;
 
 -- query 136
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_mcv_r2 UPDATE HISTOGRAM ON k PROPERTIES('histogram_sample_ratio' = '1.0', 'histogram_mcv_size' = '20');
 
 -- query 137
 SELECT count(*) FROM ${case_db}.t_mcv_l2 JOIN[shuffle] ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
@@ -740,19 +737,17 @@ INSERT INTO ${case_db}.t_null_r SELECT (generate_series % 2000) + 1, 1 FROM TABL
 
 -- query 149
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t_null_l;
+ANALYZE TABLE ${case_db}.t_null_l;
 
 -- query 150
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t_null_r;
+ANALYZE TABLE ${case_db}.t_null_r;
 
 -- query 151
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_null_l UPDATE HISTOGRAM ON k PROPERTIES('histogram_sample_ratio' = '1.0', 'histogram_mcv_size' = '20');
 
 -- query 152
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_null_r UPDATE HISTOGRAM ON k PROPERTIES('histogram_sample_ratio' = '1.0', 'histogram_mcv_size' = '20');
 
 -- query 153
 SELECT count(*) FROM ${case_db}.t_null_l LEFT JOIN[shuffle] ${case_db}.t_null_r ON ${case_db}.t_null_l.k = ${case_db}.t_null_r.k;

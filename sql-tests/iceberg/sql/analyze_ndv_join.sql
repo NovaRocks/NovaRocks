@@ -16,10 +16,10 @@
 -- under the License.
 
 -- @tags=iceberg,statistics,ndv
--- Verify ANALYZE writes Puffin NDV so the optimizer uses the real-NDV
--- denominator estimate instead of the many-to-many fallback for an iceberg
--- join. Same-session ANALYZE-then-EXPLAIN relies on ANALYZE invalidating the
--- table-metadata cache.
+-- Verify ANALYZE publishes the native Puffin statistics artifact and refreshes
+-- the same-session statistics view. Theta NDV is deliberately not promoted to
+-- an exact optimizer denominator, so this join must retain the bounded
+-- many-to-many fallback rather than treating a sketch as authoritative NDV.
 
 -- @skip_result_check=true
 CREATE DATABASE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0};
@@ -45,11 +45,10 @@ ANALYZE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0};
 -- @skip_result_check=true
 ANALYZE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0};
 
--- With real NDV the inner-join estimate uses |l|*|r|/max(ndv_l,ndv_r), which is
--- far below the many-to-many fallback (|l|*|r|*0.25). Assert the optimizer does
--- NOT produce the many-to-many blow-up for this same-scale join.
+-- The exact Theta mapping is intentionally unavailable. The fallback is
+-- |l|*|r|*0.25 = 162000 and must stay explicit and bounded.
 -- @explain_contains=HASH JOIN
--- @explain_not_contains=stats={rows=162000}
+-- @explain_contains=stats={rows=162000}
 EXPLAIN VERBOSE SELECT l.k
 FROM iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0} l
 JOIN iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0} r ON l.k = r.k;

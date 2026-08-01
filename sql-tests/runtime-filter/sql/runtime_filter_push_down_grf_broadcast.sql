@@ -84,11 +84,11 @@ INSERT INTO ${case_db}.t2 (c0, c1, c2) VALUES
 
 -- ANALYZE to give FE stats for GRF decisions (result contains dynamic db name, skip check)
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t0;
+ANALYZE TABLE ${case_db}.t0;
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t1;
+ANALYZE TABLE ${case_db}.t1;
 -- @skip_result_check=true
-ANALYZE FULL TABLE ${case_db}.t2;
+ANALYZE TABLE ${case_db}.t2;
 
 -- INNER JOIN[broadcast] pair
 set enable_global_runtime_filter='false';

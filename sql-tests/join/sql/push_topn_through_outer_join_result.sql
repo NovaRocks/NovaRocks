@@ -37,7 +37,10 @@ ANALYZE TABLE ${case_db}.topn_outer_result_right;
 
 SET disable_optimizer_rules = '';
 
--- @explain_contains=HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=4}
+-- The unified statistics path deliberately does not relabel approximate Theta
+-- sketches as exact NDV. With NDV unavailable, the join uses its bounded
+-- fallback estimate while the pushed TopN still caps the final output at four.
+-- @explain_contains=HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=993}
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_result_left l
 LEFT JOIN ${case_db}.topn_outer_result_right r ON l.id = r.id

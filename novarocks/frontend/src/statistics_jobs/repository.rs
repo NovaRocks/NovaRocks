@@ -42,6 +42,10 @@ const MAX_METRIC_NAMES: usize = 128;
 const MAX_METRIC_NAME_BYTES: usize = 256;
 const MAX_TARGET_COMPONENT_BYTES: usize = 1024;
 const MAX_PUBLICATION_EVIDENCE_WIRE_BYTES: usize = MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES + 1024;
+// A create has unique job and state-index keys, so a SQLite snapshot conflict
+// is never a semantic duplicate. Retry the same durable identity instead of
+// exposing storage contention as an ANALYZE failure.
+const CREATE_CONFLICT_RETRY_LIMIT: usize = 8;
 
 /// A worker passes this closure to atomically validate its coordination fence
 /// before a durable job mutation. The repository deliberately has no lease
@@ -150,26 +154,40 @@ impl StatisticsJobRepository {
             updated_at_ms: request.submitted_at_ms,
             completed_at_ms: None,
         };
-        let mut transaction = self.begin_write("create frontend statistics job").await?;
-        validate_fence(fence, transaction.as_mut()).await?;
-        transaction
-            .put(
-                job_key(job_id)?,
-                encode_json(&stored, "statistics job")?,
-                Precondition::Absent,
-            )
-            .await
-            .map_err(store_error)?;
-        transaction
-            .put(
-                state_key(StatisticsJobState::Submitted, job_id)?,
-                index_value(job_id)?,
-                Precondition::Absent,
-            )
-            .await
-            .map_err(store_error)?;
-        self.commit_or_recover(transaction, "create frontend statistics job", &stored)
-            .await
+        for retry in 0..=CREATE_CONFLICT_RETRY_LIMIT {
+            let mut transaction = self.begin_write("create frontend statistics job").await?;
+            validate_fence(fence, transaction.as_mut()).await?;
+            transaction
+                .put(
+                    job_key(job_id)?,
+                    encode_json(&stored, "statistics job")?,
+                    Precondition::Absent,
+                )
+                .await
+                .map_err(store_error)?;
+            transaction
+                .put(
+                    state_key(StatisticsJobState::Submitted, job_id)?,
+                    index_value(job_id)?,
+                    Precondition::Absent,
+                )
+                .await
+                .map_err(store_error)?;
+            match self
+                .commit_or_recover(transaction, "create frontend statistics job", &stored)
+                .await
+            {
+                Ok(job) => return Ok(job),
+                Err(error)
+                    if error.kind() == StatisticsJobRepositoryErrorKind::Conflict
+                        && retry < CREATE_CONFLICT_RETRY_LIMIT =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("statistics create retry loop always returns")
     }
 
     pub async fn get(&self, job_id: Uuid) -> RepositoryResult<Option<StatisticsJob>> {
