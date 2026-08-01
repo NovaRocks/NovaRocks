@@ -30,6 +30,8 @@ mod remote;
 mod segment;
 mod wire;
 
+pub use remote::StarRocksSharedDataStorageResolver;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;

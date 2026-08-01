@@ -38,8 +38,8 @@ pub use direct::{
     StarRocksDirectLocationSource, StarRocksDirectMetadataLayout, StarRocksDirectSplit,
     StarRocksDirectStorageResolver, StarRocksDirectTabletDescriptor,
     StarRocksDirectTabletPlanningSource, StarRocksSharedDataDirectPlanner,
-    StarRocksSharedDataDirectReaderFactory, StarRocksStarManagerRouting, StarRocksStarOsClient,
-    StarRocksStorageBindingRef,
+    StarRocksSharedDataDirectReaderFactory, StarRocksSharedDataStorageResolver,
+    StarRocksStarManagerRouting, StarRocksStarOsClient, StarRocksStorageBindingRef,
 };
 pub use domain::{
     StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksFreezeDigest,
