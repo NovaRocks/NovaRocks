@@ -2944,6 +2944,14 @@ impl StatisticsReader for IcebergControlProvider {
                 "Iceberg table changed while its statistics evidence was loading",
             ));
         }
+        // A manifest summary is authoritative only when it describes every
+        // live data file and no delete file can change the visible row set.
+        // `read_pinned_table_statistics` deliberately exposes only data-file
+        // metrics to the optimizer, so retain the raw file set here to prove
+        // that this is an append-only snapshot before upgrading its evidence.
+        let manifest_files = extract_data_files_with_stats_at(&loaded.table, snapshot_id)
+            .map_err(map_iceberg_error)?;
+        let manifest_is_complete = manifest_evidence_is_complete(&base.row_count, &manifest_files);
         let evidence_path = metadata
             .statistics_for_snapshot(snapshot_id)
             .map(|statistics| statistics.statistics_path.as_str())
@@ -2954,12 +2962,7 @@ impl StatisticsReader for IcebergControlProvider {
             let state = match metric {
                 StatisticsMetric::RowCount => metric_state_u64(&base.row_count),
                 StatisticsMetric::NullCount { column } => {
-                    StatisticsMetricState::Missing(StatisticsMissing {
-                        kind: StatisticsMissingKind::IncompleteEvidence,
-                        message: Arc::from(format!(
-                            "Iceberg manifest statistics expose null fraction, not an exact null count for `{column}`"
-                        )),
-                    })
+                    manifest_null_count(&manifest_files, column)
                 }
                 StatisticsMetric::Minimum { column } => base
                     .columns
@@ -2994,12 +2997,19 @@ impl StatisticsReader for IcebergControlProvider {
         Ok(StatisticsEvidence {
             data_version: expected_data_version,
             evidence_revision,
-            // Manifest-side estimates cannot prove complete exact evidence in
-            // the presence of deletes or incomplete per-file metrics. Native
-            // collection may later publish Full+Exact evidence; optimizer
-            // consumers must otherwise fall back instead of upgrading this.
-            coverage: StatisticsCoverage::Subset,
-            accuracy: StatisticsAccuracy::Approximate,
+            // Do not infer exactness from a manifest in the presence of
+            // deletes. For an append-only snapshot, the manifest list is the
+            // complete visible data-file set and its record counts are exact.
+            coverage: if manifest_is_complete {
+                StatisticsCoverage::Full
+            } else {
+                StatisticsCoverage::Subset
+            },
+            accuracy: if manifest_is_complete {
+                StatisticsAccuracy::Exact
+            } else {
+                StatisticsAccuracy::Approximate
+            },
             interval: None,
             provenance: StatisticsProvenance::Manifest,
             metrics,
@@ -3424,6 +3434,43 @@ fn metric_state_f64(value: &StatValue<f64>) -> StatisticsMetricState {
         }
         StatValue::Missing { reason } => metric_missing(reason),
     }
+}
+
+/// Return a null count only when every live data file reports one. This keeps
+/// the manifest fast path exact without reconstructing a count from a lossy
+/// floating-point null fraction.
+fn manifest_null_count(
+    files: &[super::catalog::registry::DataFileWithStats],
+    column: &str,
+) -> StatisticsMetricState {
+    let total = files.iter().try_fold(0_u64, |total, file| {
+        let count = file
+            .column_stats
+            .as_ref()?
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))?
+            .1
+            .null_count?;
+        let count = u64::try_from(count).ok()?;
+        total.checked_add(count)
+    });
+    match total {
+        Some(total) => StatisticsMetricState::Available(StatisticsMetricValue::U64(total)),
+        None => StatisticsMetricState::Missing(StatisticsMissing {
+            kind: StatisticsMissingKind::IncompleteEvidence,
+            message: Arc::from(format!(
+                "Iceberg manifest does not report an exact null count for `{column}`"
+            )),
+        }),
+    }
+}
+
+fn manifest_evidence_is_complete(
+    row_count: &StatValue<u64>,
+    files: &[super::catalog::registry::DataFileWithStats],
+) -> bool {
+    matches!(row_count, StatValue::Known { .. })
+        && files.iter().all(|file| file.delete_files.is_empty())
 }
 
 fn missing_column(column: &str) -> StatisticsMetricState {
@@ -4611,6 +4658,103 @@ mod tests {
     fn local_unknown_table_error_is_not_found() {
         let error = map_iceberg_error("unknown table: analytics.orders".to_string());
         assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    }
+
+    fn data_file_with_column_null_count(
+        column: &str,
+        null_count: Option<i64>,
+    ) -> crate::connector::iceberg::catalog::registry::DataFileWithStats {
+        crate::connector::iceberg::catalog::registry::DataFileWithStats {
+            path: "file:///tmp/table/data.parquet".to_string(),
+            size: 12,
+            record_count: Some(4),
+            column_stats: Some(HashMap::from([(
+                column.to_string(),
+                crate::connector::iceberg::scan_model::IcebergColumnStats {
+                    null_count,
+                    value_count: Some(4),
+                    column_size: Some(32),
+                    lower_bound: None,
+                    upper_bound: None,
+                },
+            )])),
+            partition_spec_id: None,
+            partition_key: None,
+            partition_values: None,
+            manifest_path: None,
+            partition_field_values: Vec::new(),
+            first_row_id: None,
+            data_sequence_number: None,
+            delete_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn manifest_null_count_requires_complete_per_file_evidence() {
+        let files = vec![
+            data_file_with_column_null_count("value", Some(1)),
+            data_file_with_column_null_count("VALUE", Some(2)),
+        ];
+        assert!(matches!(
+            manifest_null_count(&files, "value"),
+            StatisticsMetricState::Available(StatisticsMetricValue::U64(3))
+        ));
+
+        let incomplete = vec![
+            data_file_with_column_null_count("value", Some(1)),
+            data_file_with_column_null_count("value", None),
+        ];
+        assert!(matches!(
+            manifest_null_count(&incomplete, "value"),
+            StatisticsMetricState::Missing(StatisticsMissing {
+                kind: StatisticsMissingKind::IncompleteEvidence,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn manifest_evidence_requires_known_rows_and_no_delete_files() {
+        let files = vec![data_file_with_column_null_count("value", Some(0))];
+        assert!(manifest_evidence_is_complete(
+            &StatValue::known(
+                4,
+                crate::sql::optimizer::statistics::Confidence::Exact,
+                crate::sql::optimizer::stats_input::StatsSource::IcebergManifest,
+            ),
+            &files
+        ));
+        assert!(!manifest_evidence_is_complete(
+            &StatValue::missing(StatsMissingReason::ManifestMissingRowCount),
+            &files
+        ));
+
+        let mut files_with_delete = files;
+        files_with_delete[0].delete_files.push(
+            crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
+                path: "file:///tmp/table/delete.parquet".to_string(),
+                file_format:
+                    crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
+                file_content:
+                    crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position,
+                length: Some(4),
+                content_offset: None,
+                content_size_in_bytes: None,
+                sequence_number: None,
+                partition_spec_id: None,
+                partition_key: None,
+                equality_column_names: Vec::new(),
+                equality_field_ids: Vec::new(),
+            },
+        );
+        assert!(!manifest_evidence_is_complete(
+            &StatValue::known(
+                4,
+                crate::sql::optimizer::statistics::Confidence::Exact,
+                crate::sql::optimizer::stats_input::StatsSource::IcebergManifest,
+            ),
+            &files_with_delete
+        ));
     }
 
     fn mutation_provider_without_catalog() -> IcebergControlProvider {
