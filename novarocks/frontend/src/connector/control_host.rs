@@ -638,21 +638,28 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_connector_starrocks::{
-        StarRocksConnectorConfig, StarRocksControlGeneration, StarRocksDirectSplitPlanner,
+        StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksControlGeneration,
+        StarRocksDirectColumnBinding, StarRocksDirectLocation, StarRocksDirectLocationSource,
+        StarRocksDirectMetadataLayout, StarRocksDirectSplitPlanner,
+        StarRocksDirectTabletDescriptor, StarRocksDirectTabletPlanningSource,
         StarRocksMetadataSource, StarRocksReadPolicy, StarRocksResolvedTable,
-        StarRocksRpcSplitPlanner, StarRocksRpcTransport, StarRocksSplitPlanningInput,
-        StarRocksStrategySplit,
+        StarRocksRpcSplitPlanner, StarRocksRpcTransport, StarRocksSharedDataDirectPlanner,
+        StarRocksSplitPlanningInput, StarRocksStorageBindingRef, StarRocksStrategySplit,
     };
     use novarocks_spi::connector::{
-        ConnectorBeginScanRequest, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-        ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-        ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan,
-        ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest,
-        ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
+        ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorExecutionDeclaration,
+        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
+        ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+        ConnectorProviderId, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+        ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableIdentity,
+        ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
     };
 
     use super::*;
@@ -696,7 +703,21 @@ mod tests {
             _: &str,
             _: &novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<StarRocksResolvedTable, ConnectorError> {
-            Err(unsupported())
+            StarRocksResolvedTable::try_new(
+                "db",
+                "table",
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                novarocks_connector_starrocks::StarRocksTopology::SharedData,
+                Bytes::from_static(b"schema-v1"),
+                Bytes::from_static(b"data-v1"),
+                StarRocksCapabilitySnapshot {
+                    api_contract_version: 1,
+                    rpc_transports: Default::default(),
+                    rpc_ready: false,
+                    direct_contract_version: Some(1),
+                    direct_ready: true,
+                },
+            )
         }
     }
 
@@ -722,6 +743,42 @@ mod tests {
         }
     }
 
+    struct DirectTablets;
+    impl StarRocksDirectTabletPlanningSource for DirectTablets {
+        fn plan_tablets(
+            &self,
+            _: &StarRocksSplitPlanningInput,
+            _: &ConnectorSplitPlanningRequest,
+        ) -> Result<Vec<StarRocksDirectTabletDescriptor>, ConnectorError> {
+            Ok(vec![StarRocksDirectTabletDescriptor::try_new(
+                1,
+                1,
+                1,
+                StarRocksDirectMetadataLayout::Standalone,
+                "meta/1.meta",
+                vec![StarRocksDirectColumnBinding::try_new(
+                    0, 1, "id", "BIGINT", false, None,
+                )?],
+                None,
+            )?])
+        }
+    }
+    struct DirectLocations;
+    impl StarRocksDirectLocationSource for DirectLocations {
+        fn resolve_locations(
+            &self,
+            _: &[i64],
+            _: &ConnectorSplitPlanningRequest,
+        ) -> Result<Vec<StarRocksDirectLocation>, ConnectorError> {
+            Ok(vec![StarRocksDirectLocation::try_new(
+                1,
+                "s3://bucket/tablet/1",
+                StarRocksStorageBindingRef::parse("fixture")?,
+                "fixture",
+            )?])
+        }
+    }
+
     fn starrocks_binding() -> ConnectorControlBinding {
         let config = StarRocksConnectorConfig::new(
             ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID"),
@@ -737,6 +794,26 @@ mod tests {
             Arc::new(StarRocksFixturePlanner),
         )
         .expect("StarRocks control binding")
+    }
+
+    fn starrocks_direct_binding() -> ConnectorControlBinding {
+        let config = StarRocksConnectorConfig::new(
+            ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID"),
+            StarRocksReadPolicy::Direct,
+            StarRocksRpcTransport::BrpcChunk,
+            novarocks_connector_starrocks::StarRocksLocalBindingRef::parse("fixture")
+                .expect("binding"),
+        );
+        StarRocksControlGeneration::try_new(
+            config,
+            Arc::new(StarRocksFixtureSource),
+            Arc::new(StarRocksFixturePlanner),
+            Arc::new(StarRocksSharedDataDirectPlanner::new(
+                Arc::new(DirectTablets),
+                Arc::new(DirectLocations),
+            )),
+        )
+        .expect("StarRocks direct control binding")
     }
 
     fn starrocks_context() -> novarocks_spi::connector::ConnectorRequestContext {
@@ -948,6 +1025,66 @@ mod tests {
                 .incarnation(),
             first_incarnation
         );
+    }
+
+    #[test]
+    fn starrocks_control_host_direct_read_plans_a_frozen_fixture_split() {
+        let host = ConnectorControlHost::new();
+        let binding = starrocks_direct_binding();
+        let instance = binding.descriptor().instance_id.clone();
+        host.register(binding).expect("register direct generation");
+        let lease = host
+            .acquire_current(&instance)
+            .expect("direct planning lease");
+        let context = starrocks_context();
+        let table = lease
+            .binding()
+            .metadata()
+            .load_table(ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: instance.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("table"),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            })
+            .expect("load fixture table");
+        let scan = lease
+            .binding()
+            .planning()
+            .begin_scan(
+                &table.table,
+                ConnectorBeginScanRequest {
+                    projection: vec![],
+                    static_predicates: vec![],
+                    selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+                    limit: None,
+                    batch: ConnectorBatchBudget {
+                        max_rows: NonZeroUsize::new(16).unwrap(),
+                        max_bytes: NonZeroUsize::new(4096).unwrap(),
+                    },
+                    context: context.clone(),
+                },
+            )
+            .expect("freeze direct scan");
+        let splits = lease
+            .binding()
+            .planning()
+            .plan_splits(
+                &scan.handle,
+                ConnectorSplitPlanningRequest {
+                    target_parallelism: NonZeroUsize::new(1).unwrap(),
+                    max_split_bytes: None,
+                    context,
+                },
+            )
+            .expect("plan direct split");
+        assert_eq!(splits.splits.len(), 1);
+        host.retire_current(&instance)
+            .expect("retire direct generation");
+        drop(lease);
+        assert_eq!(host.take_ready_retires().expect("ready retire").len(), 1);
     }
 
     fn unsupported() -> ConnectorError {

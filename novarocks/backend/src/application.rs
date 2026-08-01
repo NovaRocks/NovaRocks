@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn starrocks_execution_host_composition_recognizes_the_provider_but_requires_a_local_binding() {
+    fn starrocks_execution_host_direct_read_production_binding_is_unavailable() {
         let services = compose_backend_application_services(&NovaRocksConfig::default())
             .expect("compose backend application services");
         let query = QueryExecutionId::new(
