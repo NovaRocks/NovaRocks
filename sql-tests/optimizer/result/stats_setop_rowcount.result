@@ -20,15 +20,15 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-8:HASH AGGREGATE (GLOBAL, group by: [k]) stats={rows=160}
-  7:HASH EXCHANGE stats={rows=160}
+8:HASH AGGREGATE (GLOBAL, group by: [k]) stats={rows=10}
+  7:HASH EXCHANGE stats={rows=10}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 7
     PARTITION: HASH_PARTITIONED (k)
-6:HASH AGGREGATE (LOCAL, group by: [k]) stats={rows=160}
+6:HASH AGGREGATE (LOCAL, group by: [k]) stats={rows=10}
   5:UNION ALL stats={rows=1600}
     2:PROJECT [k] stats={rows=1000}
       1:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
