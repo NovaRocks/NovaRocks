@@ -193,6 +193,7 @@ pub(crate) fn decode_segment_footer(
     if crc32c(footer_bytes) != expected_checksum {
         return Err(corrupt("StarRocks segment footer checksum mismatch"));
     }
+    validate_footer_wire(footer_bytes)?;
     let footer = SegmentFooterPbLite::decode(footer_bytes)
         .map_err(|_| corrupt("invalid StarRocks segment footer protobuf"))?;
     let version = footer.version.unwrap_or(SUPPORTED_FOOTER_VERSION);
@@ -217,6 +218,126 @@ pub(crate) fn decode_segment_footer(
         num_rows,
         columns,
     })
+}
+
+/// Prost intentionally retains unknown protobuf fields for forward
+/// compatibility. Persisted direct-read metadata cannot use that behavior:
+/// this V1 storage snapshot must fail closed when a read-reachable footer
+/// changes, rather than silently interpreting a newer segment as an older one.
+fn validate_footer_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    validate_message(bytes, |field, wire, value| match field {
+        1 | 3 => require_wire(wire, 0),
+        2 => validate_column_wire(require_message(wire, value)?),
+        _ => Err(unsupported("unsupported StarRocks segment footer field")),
+    })
+}
+
+fn validate_column_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    validate_message(bytes, |field, wire, value| match field {
+        1 | 2 | 3 | 5 | 6 | 7 | 11 => require_wire(wire, 0),
+        8 => validate_column_index_wire(require_message(wire, value)?),
+        9 => validate_page_pointer_wire(require_message(wire, value)?),
+        10 => validate_column_wire(require_message(wire, value)?),
+        _ => Err(unsupported("unsupported StarRocks segment column field")),
+    })
+}
+
+fn validate_column_index_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    validate_message(bytes, |field, wire, value| match field {
+        1 => require_wire(wire, 0),
+        7 => validate_ordinal_index_wire(require_message(wire, value)?),
+        _ => Err(unsupported("unsupported StarRocks segment index field")),
+    })
+}
+
+fn validate_ordinal_index_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    validate_message(bytes, |field, wire, value| match field {
+        1 => validate_btree_meta_wire(require_message(wire, value)?),
+        _ => Err(unsupported("unsupported StarRocks ordinal index field")),
+    })
+}
+
+fn validate_btree_meta_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    validate_message(bytes, |field, wire, value| match field {
+        1 => validate_page_pointer_wire(require_message(wire, value)?),
+        2 => require_wire(wire, 0),
+        _ => Err(unsupported("unsupported StarRocks B-tree metadata field")),
+    })
+}
+
+fn validate_page_pointer_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    validate_message(bytes, |field, wire, _| match field {
+        1 | 2 => require_wire(wire, 0),
+        _ => Err(unsupported("unsupported StarRocks page pointer field")),
+    })
+}
+
+fn validate_message(
+    mut bytes: &[u8],
+    mut field: impl FnMut(u32, u8, &[u8]) -> Result<(), ConnectorError>,
+) -> Result<(), ConnectorError> {
+    while !bytes.is_empty() {
+        let key = read_varint(&mut bytes)?;
+        let number = u32::try_from(key >> 3)
+            .map_err(|_| corrupt("StarRocks protobuf field number is out of range"))?;
+        let wire = (key & 0x7) as u8;
+        if number == 0 {
+            return Err(corrupt("StarRocks protobuf field number is zero"));
+        }
+        let value = match wire {
+            0 => {
+                let start = bytes;
+                let _ = read_varint(&mut bytes)?;
+                &start[..start.len() - bytes.len()]
+            }
+            2 => {
+                let length = usize::try_from(read_varint(&mut bytes)?)
+                    .map_err(|_| corrupt("StarRocks protobuf length is out of range"))?;
+                if length > bytes.len() {
+                    return Err(corrupt(
+                        "truncated StarRocks protobuf length-delimited field",
+                    ));
+                }
+                let (value, remaining) = bytes.split_at(length);
+                bytes = remaining;
+                value
+            }
+            _ => return Err(corrupt("unsupported StarRocks protobuf wire type")),
+        };
+        field(number, wire, value)?;
+    }
+    Ok(())
+}
+
+fn require_wire(actual: u8, expected: u8) -> Result<(), ConnectorError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(corrupt("StarRocks protobuf field has an invalid wire type"))
+    }
+}
+
+fn require_message(wire: u8, value: &[u8]) -> Result<&[u8], ConnectorError> {
+    require_wire(wire, 2)?;
+    Ok(value)
+}
+
+fn read_varint(bytes: &mut &[u8]) -> Result<u64, ConnectorError> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let Some((&byte, rest)) = bytes.split_first() else {
+            return Err(corrupt("truncated StarRocks protobuf varint"));
+        };
+        *bytes = rest;
+        if shift == 63 && byte > 1 {
+            return Err(corrupt("StarRocks protobuf varint overflows"));
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(corrupt("StarRocks protobuf varint overflows"))
 }
 
 fn decode_column(value: &ColumnMetaPbLite) -> Result<StarRocksSegmentColumnMeta, ConnectorError> {
@@ -457,6 +578,28 @@ mod tests {
         };
         let footer = footer.encode_to_vec();
         let mut segment = Vec::new();
+        segment.extend_from_slice(&footer);
+        segment.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        segment.extend_from_slice(&crc32c(&footer).to_le_bytes());
+        segment.extend_from_slice(SEGMENT_MAGIC);
+
+        assert_eq!(
+            decode_segment_footer("segment.dat", &segment)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_footer_fields_before_prost_decode() {
+        let mut segment = valid_footer_bytes();
+        let trailer = segment.len() - FOOTER_TRAILER_SIZE;
+        let footer_start = trailer
+            - u32::from_le_bytes(segment[trailer..trailer + 4].try_into().unwrap()) as usize;
+        let mut footer = segment[footer_start..trailer].to_vec();
+        footer.extend_from_slice(&[0x20, 0x01]); // Unknown footer field 4, varint 1.
+        segment.truncate(footer_start);
         segment.extend_from_slice(&footer);
         segment.extend_from_slice(&(footer.len() as u32).to_le_bytes());
         segment.extend_from_slice(&crc32c(&footer).to_le_bytes());
