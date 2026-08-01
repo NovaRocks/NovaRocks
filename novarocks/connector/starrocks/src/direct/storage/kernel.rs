@@ -496,6 +496,7 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
     use arrow::datatypes::{Field, Schema};
+    use bytes::Bytes;
     use crc32c::crc32c;
     use prost::Message;
 
@@ -714,6 +715,43 @@ mod tests {
                 .unwrap()
                 .values(),
             &[7, 7, 7]
+        );
+    }
+
+    #[test]
+    fn materializes_historical_column_defaults() {
+        let binding = StarRocksDirectColumnBinding::try_new(
+            1,
+            2,
+            "added",
+            "INT",
+            false,
+            Some(Bytes::from_static(b"17")),
+        )
+        .unwrap();
+        let values = default_array(&binding, &DataType::Int32, 2).unwrap();
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[17, 17]
+        );
+        let nullable = StarRocksDirectColumnBinding::try_new(
+            1,
+            3,
+            "nullable",
+            "VARCHAR",
+            true,
+            Some(Bytes::from_static(b"NULL")),
+        )
+        .unwrap();
+        assert_eq!(
+            default_array(&nullable, &DataType::Utf8, 2)
+                .unwrap()
+                .null_count(),
+            2
         );
     }
 
