@@ -55,13 +55,14 @@ use novarocks::novarocks_logging::{debug, warn};
 use novarocks::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot, IcebergTableLocationMap,
 };
-use novarocks::runtime::query_context::{QueryId, query_context_manager};
+use novarocks::runtime::query_context::query_context_manager;
 use novarocks::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
     ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
+use novarocks_types::QueryId;
 
 struct CompatIcebergQueryCancellation {
     query_id: QueryId,
@@ -779,7 +780,7 @@ pub(crate) fn lower_hdfs_scan_node(
     query_global_dict_map: &QueryGlobalDictMap,
     mut out_layout: Layout,
     decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
-    query_id: Option<novarocks::runtime::query_context::QueryId>,
+    query_id: Option<novarocks_types::QueryId>,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(

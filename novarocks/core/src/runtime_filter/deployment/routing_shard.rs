@@ -472,10 +472,7 @@ mod tests {
     }
 
     fn finst(raw: i64) -> UniqueId {
-        UniqueId {
-            hi: raw,
-            lo: raw + 100,
-        }
+        UniqueId::new(raw, raw + 100)
     }
 
     fn backends() -> LiveBackendSnapshot {

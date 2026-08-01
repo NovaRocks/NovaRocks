@@ -765,7 +765,7 @@ impl PipelineDriver {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.event_sink
                 .record(FragmentEvent::Progress(FragmentProgress::new(
-                    UniqueId { hi, lo },
+                    UniqueId::new(hi, lo),
                     0,
                     0,
                     0,

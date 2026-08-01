@@ -107,7 +107,7 @@ impl FragmentLiveObservation {
         elapsed_ms: u64,
         profile: Option<RuntimeProfileTree>,
     ) -> Result<Self, QueryLifecycleError> {
-        if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
+        if fragment_instance_id.high() == 0 && fragment_instance_id.low() == 0 {
             return Err(QueryLifecycleError::invalid_manifest(
                 "fragment observation instance id must be nonzero",
             ));
@@ -1167,8 +1167,8 @@ pub fn encode_query_terminal_snapshot(
             };
             novarocks::QueryTerminalFragmentSnapshot {
                 fragment_instance_id: Some(common::UniqueId {
-                    hi: fragment.fragment_instance_id().hi,
-                    lo: fragment.fragment_instance_id().lo,
+                    hi: fragment.fragment_instance_id().high(),
+                    lo: fragment.fragment_instance_id().low(),
                 }),
                 backend_num: fragment.backend_num(),
                 outcome,
@@ -1290,10 +1290,7 @@ pub fn decode_query_terminal_snapshot(
                 .transpose()
                 .map_err(QueryLifecycleError::invalid_manifest)?;
             super::terminal::FragmentTerminalSnapshot::new(
-                crate::common::types::UniqueId {
-                    hi: id.hi,
-                    lo: id.lo,
-                },
+                novarocks_types::UniqueId::new(id.hi, id.lo),
                 fragment.backend_num,
                 outcome,
                 sink,
@@ -1454,8 +1451,8 @@ fn decode_required_execution_id(
 
 fn encode_unique_id(id: UniqueId) -> common::UniqueId {
     common::UniqueId {
-        hi: id.hi,
-        lo: id.lo,
+        hi: id.high(),
+        lo: id.low(),
     }
 }
 
@@ -1465,10 +1462,7 @@ fn decode_unique_id(id: &common::UniqueId) -> Result<UniqueId, QueryLifecycleErr
             "unique id must be nonzero",
         ));
     }
-    Ok(UniqueId {
-        hi: id.hi,
-        lo: id.lo,
-    })
+    Ok(UniqueId::new(id.hi, id.lo))
 }
 
 fn encode_endpoint(endpoint: &QueryControlEndpoint) -> novarocks::QueryControlEndpoint {
@@ -1562,7 +1556,10 @@ fn encode_runtime_filter_contribution(
     contribution: &RuntimeFilterContribution,
 ) -> Result<novarocks::RuntimeFilterContribution, QueryLifecycleError> {
     let envelope = crate::protocol::native::encode_participant_install(
-        execution_id.query_id().into_unique_id(),
+        UniqueId::new(
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+        ),
         contribution.lifecycle(),
         contribution.install(),
     )
@@ -1770,7 +1767,7 @@ mod tests {
         profile.counter_set("RowsRead", ProfileUnit::Unit, 7);
         let sink = SinkCommitReportSnapshot::default();
         let fragment = crate::query_execution::lifecycle::FragmentTerminalSnapshot::new(
-            crate::common::types::UniqueId { hi: 7, lo: 9 },
+            novarocks_types::UniqueId::new(7, 9),
             3,
             crate::query_execution::lifecycle::FragmentTerminalOutcome::Succeeded,
             sink,
@@ -1813,7 +1810,7 @@ mod tests {
             execution_id(),
             crate::query_execution::lifecycle::ParticipantManifestDigest::new([9; 32]),
             observation_backend(),
-            crate::common::types::UniqueId { hi: 7, lo: 9 },
+            novarocks_types::UniqueId::new(7, 9),
             1,
             11,
             7,
@@ -1841,7 +1838,7 @@ mod tests {
             execution_id(),
             crate::query_execution::lifecycle::ParticipantManifestDigest::new([8; 32]),
             observation_backend(),
-            crate::common::types::UniqueId { hi: 1, lo: 2 },
+            novarocks_types::UniqueId::new(1, 2),
             u64::MAX,
             1,
             2,
@@ -1865,7 +1862,7 @@ mod tests {
                 execution_id(),
                 digest,
                 observation_backend(),
-                crate::common::types::UniqueId { hi: 0, lo: 0 },
+                novarocks_types::UniqueId::new(0, 0),
                 1,
                 0,
                 0,
@@ -1879,7 +1876,7 @@ mod tests {
                 execution_id(),
                 digest,
                 observation_backend(),
-                crate::common::types::UniqueId { hi: 1, lo: 2 },
+                novarocks_types::UniqueId::new(1, 2),
                 0,
                 0,
                 0,
@@ -1893,10 +1890,9 @@ mod tests {
             execution_id: Some(super::encode_execution_id(execution_id())),
             init_digest: digest.as_bytes().to_vec(),
             backend: Some(super::encode_backend_identity(&observation_backend())),
-            fragment_instance_id: Some(super::encode_unique_id(crate::common::types::UniqueId {
-                hi: 1,
-                lo: 2,
-            })),
+            fragment_instance_id: Some(super::encode_unique_id(novarocks_types::UniqueId::new(
+                1, 2,
+            ))),
             sequence: 1,
             profile: Some(crate::proto::novarocks::RuntimeProfileTree::default()),
             ..Default::default()

@@ -49,8 +49,8 @@ fn exchange_frame_transmitter_preserves_sequence_eos_and_payload() {
     let transmitter = RecordingTransmitter::default();
     let frame = ExchangeFrame {
         destination: RuntimeEndpoint::new("be-2", 9060).expect("valid destination"),
-        destination_fragment_instance_id: UniqueId { hi: 1, lo: 2 },
-        sender_fragment_instance_id: UniqueId { hi: 3, lo: 4 },
+        destination_fragment_instance_id: UniqueId::new(1, 2),
+        sender_fragment_instance_id: UniqueId::new(3, 4),
         destination_node_id: 17,
         sender_id: 9,
         backend_number: 2,
@@ -104,7 +104,7 @@ fn noop_fragment_event_sink_never_changes_execution_control_flow() {
     let sink = NoopFragmentEventSink;
 
     sink.record(FragmentEvent::Progress(FragmentProgress::new(
-        UniqueId { hi: 7, lo: 8 },
+        UniqueId::new(7, 8),
         620,
         580,
         1000,

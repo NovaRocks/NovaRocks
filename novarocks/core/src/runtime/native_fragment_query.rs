@@ -118,7 +118,8 @@ impl NativeFragmentQueryRuntime {
             .ok_or_else(|| "QueryContext missing mem_tracker".to_string())?;
         let fragment_label = format!(
             "fragment_{:x}_{:x}",
-            fragment_instance_id.hi, fragment_instance_id.lo
+            fragment_instance_id.high(),
+            fragment_instance_id.low()
         );
         let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
         let resources = NativeFragmentAdmissionResources {
@@ -184,7 +185,8 @@ impl NativeFragmentQueryRuntime {
             .ok_or_else(|| "QueryContext missing mem_tracker".to_string())?;
         let fragment_label = format!(
             "fragment_{:x}_{:x}",
-            fragment_instance_id.hi, fragment_instance_id.lo
+            fragment_instance_id.high(),
+            fragment_instance_id.low()
         );
         let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
         Ok(NativeFragmentAdmissionResources {
@@ -354,8 +356,8 @@ mod tests {
             manager: manager.clone(),
         };
         let query_id = QueryId::new(91_001, 91_002);
-        let first = UniqueId { hi: 91_003, lo: 1 };
-        let second = UniqueId { hi: 91_003, lo: 2 };
+        let first = UniqueId::new(91_003, 1);
+        let second = UniqueId::new(91_003, 2);
 
         let first_registration = runtime
             .register_fragment(

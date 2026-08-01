@@ -260,7 +260,7 @@ fn decode_connector_write_sink_program(
     })?;
     let fragment_instance_id = unique_id_bytes(wire_finst.hi, wire_finst.lo);
     let context_finst = context.fragment_instance_id().get();
-    if fragment_instance_id != unique_id_bytes(context_finst.hi, context_finst.lo) {
+    if fragment_instance_id != unique_id_bytes(context_finst.high(), context_finst.low()) {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "handle",
@@ -285,7 +285,7 @@ fn decode_connector_write_sink_program(
             "connector writer handle requires native query identity",
         )
     })?;
-    if execution_id.query_id() != unique_id_bytes(query_id.hi(), query_id.lo()) {
+    if execution_id.query_id() != unique_id_bytes(query_id.high(), query_id.low()) {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "handle",
@@ -968,10 +968,7 @@ fn decode_stream_destination_list(
                 )
             })?;
             Ok(FragmentDestination::new(
-                crate::common::types::UniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                },
+                novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
                     super::NativeFragmentDecodeError::invalid_value(
                         destination_path.field("endpoint"),
@@ -1024,7 +1021,7 @@ mod tests {
         assert_eq!(sender_id, None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 1);
-        assert_eq!(groups[0][0].finst_id().lo, expected_lo);
+        assert_eq!(groups[0][0].finst_id().low(), expected_lo);
     }
 
     #[test]

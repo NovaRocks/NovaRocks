@@ -19,8 +19,8 @@
 
 use std::ffi::c_void;
 
-use novarocks::common::types::UniqueId;
 use novarocks::novarocks_logging::error;
+use novarocks_types::UniqueId;
 
 use super::service::CompatFragmentService;
 
@@ -94,10 +94,7 @@ pub unsafe extern "C" fn novarocks_rs_cancel(
         return 2;
     }
     let service = unsafe { &*fragment_service_context.cast::<CompatFragmentService>() };
-    let finst_id = UniqueId {
-        hi: finst_id_hi,
-        lo: finst_id_lo,
-    };
+    let finst_id = UniqueId::new(finst_id_hi, finst_id_lo);
     service.cancel_fragment(finst_id);
     0
 }

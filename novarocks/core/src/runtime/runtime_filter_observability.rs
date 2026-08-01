@@ -570,10 +570,7 @@ mod tests {
 
     fn channel_identity(query: QueryKey) -> RuntimeFilterEventIdentity {
         RuntimeFilterEventIdentity::new(
-            UniqueId {
-                hi: query.hi,
-                lo: query.lo,
-            },
+            UniqueId::new(query.hi, query.lo),
             RuntimeFilterParticipantId::new(3),
             ChannelId::new(4),
             DeploymentEpoch::new(5),
@@ -614,7 +611,7 @@ mod tests {
         let identity = RouteEventIdentity::new(
             channel_identity(query),
             BindingId::new(6),
-            UniqueId { hi: 7, lo: 8 },
+            UniqueId::new(7, 8),
             RouteEdgeId::new(9),
         );
         let event = RuntimeFilterEvent::LoopbackDelivered {
@@ -639,11 +636,7 @@ mod tests {
             common.participant_id(),
             common.channel_id(),
             common.epoch(),
-            ProducerStreamId::new(
-                BindingId::new(6),
-                UniqueId { hi: 7, lo: 8 },
-                PartitionId::new(9),
-            ),
+            ProducerStreamId::new(BindingId::new(6), UniqueId::new(7, 8), PartitionId::new(9)),
             ProducerSequence::new(10),
         );
         let events = vec![
@@ -677,11 +670,7 @@ mod tests {
             common.participant_id(),
             common.channel_id(),
             common.epoch(),
-            ProducerStreamId::new(
-                BindingId::new(6),
-                UniqueId { hi: 7, lo: 8 },
-                PartitionId::new(9),
-            ),
+            ProducerStreamId::new(BindingId::new(6), UniqueId::new(7, 8), PartitionId::new(9)),
             ProducerSequence::new(10),
         );
         let events = vec![
@@ -718,8 +707,7 @@ mod tests {
             ConsumerProfileId::for_test([6; 32]),
             LogicalVersion::new(7),
         );
-        let consumer =
-            ConsumerEventIdentity::new(common, BindingId::new(8), UniqueId { hi: 9, lo: 10 });
+        let consumer = ConsumerEventIdentity::new(common, BindingId::new(8), UniqueId::new(9, 10));
         let materialization_events = vec![
             RuntimeFilterEvent::MaterializationStarted {
                 identity: materialization,

@@ -41,7 +41,7 @@ use novarocks::connector::starrocks::lake_meta::{
 use novarocks::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use novarocks::exec::node::values::ValuesNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::runtime::query_context::QueryId;
+use novarocks_types::QueryId;
 use novarocks_types::largeint;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn binary_and_compact_serialization_round_trip_generated_thrift_values() {
-        let value = crate::thrift::types::TUniqueId::new(17, 29);
+        let value = crate::thrift::types::TUniqueId { hi: 17, lo: 29 };
 
         let binary = thrift_binary_serialize(&value).expect("binary encode");
         assert_eq!(

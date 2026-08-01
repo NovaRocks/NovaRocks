@@ -20,9 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::thrift::descriptors;
-use novarocks::common::types::UniqueId;
 use novarocks::runtime::endpoint::RuntimeEndpoint;
-use novarocks::runtime::query_context::{QueryCleanupLease, QueryId};
+use novarocks::runtime::query_context::QueryCleanupLease;
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 use crate::fragment::dependency::DependencyResolutionError;
 
@@ -423,11 +424,11 @@ fn descriptor_is_empty(descriptor: &descriptors::TDescriptorTable) -> bool {
 mod tests {
     use std::sync::mpsc;
 
-    use novarocks::runtime::query_context::QueryId;
+    use novarocks_types::QueryId;
 
     use super::{DescriptorTransportCache, PrelaunchRegistry};
     use crate::thrift::descriptors;
-    use novarocks::common::types::UniqueId;
+    use novarocks_types::UniqueId;
 
     fn descriptor(tuple_id: i32) -> descriptors::TDescriptorTable {
         descriptors::TDescriptorTable::new(
@@ -553,7 +554,7 @@ mod tests {
     fn duplicate_prelaunch_is_rejected_and_batch_handoff_clears_every_entry() {
         let registry = std::sync::Arc::new(PrelaunchRegistry::default());
         let query_id = QueryId::new(8, 9);
-        let finst_ids = [UniqueId { hi: 10, lo: 11 }, UniqueId { hi: 12, lo: 13 }];
+        let finst_ids = [UniqueId::new(10, 11), UniqueId::new(12, 13)];
         let guard = registry
             .install(query_id, 1, finst_ids)
             .expect("install batch prelaunch");
@@ -566,7 +567,7 @@ mod tests {
     #[test]
     fn cancelled_prelaunch_handoff_publishes_nothing() {
         let registry = std::sync::Arc::new(PrelaunchRegistry::default());
-        let finst_id = UniqueId { hi: 5, lo: 6 };
+        let finst_id = UniqueId::new(5, 6);
         let guard = registry
             .install(QueryId::new(7, 8), 1, [finst_id])
             .expect("install");
@@ -578,7 +579,7 @@ mod tests {
     #[test]
     fn runtime_cancel_barrier_blocks_reused_finst_install() {
         let registry = std::sync::Arc::new(PrelaunchRegistry::default());
-        let finst_id = UniqueId { hi: 9, lo: 10 };
+        let finst_id = UniqueId::new(9, 10);
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let cancel_registry = std::sync::Arc::clone(&registry);

@@ -178,7 +178,8 @@ impl StarRocksFragmentAdmission {
         MemTracker::new_child(
             format!(
                 "fragment_{:x}_{:x}",
-                fragment_instance_id.hi, fragment_instance_id.lo
+                fragment_instance_id.high(),
+                fragment_instance_id.low()
             ),
             &self.query_mem_tracker,
         )
@@ -368,15 +369,9 @@ mod tests {
         let manager = QueryContextManager::new_for_test();
         let runtime = StarRocksFragmentQueryRuntime::from_manager_for_test(Arc::clone(&manager));
         let started_query = QueryId::new(91_001, 91_002);
-        let started_finst = UniqueId {
-            hi: 91_003,
-            lo: 91_004,
-        };
+        let started_finst = UniqueId::new(91_003, 91_004);
         let rollback_query = QueryId::new(91_005, 91_006);
-        let rollback_finst = UniqueId {
-            hi: 91_007,
-            lo: 91_008,
-        };
+        let rollback_finst = UniqueId::new(91_007, 91_008);
 
         let started = runtime
             .commit_handoff(handoff(started_query, 1, started_finst), || None)

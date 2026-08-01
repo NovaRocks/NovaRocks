@@ -2252,7 +2252,7 @@ mod tests {
         use crate::runtime::query_context::QueryContextManager;
 
         let manager = QueryContextManager::new_for_test();
-        let query_id = crate::runtime::query_context::QueryId { hi: 70, lo: 9_201 };
+        let query_id = novarocks_types::QueryId::new(70, 9_201);
         let lifecycle = RuntimeFilterQueryLifecycleOptions {
             delivery_expire: Duration::from_secs(11),
             query_expire: Duration::from_secs(29),
@@ -2286,7 +2286,7 @@ mod tests {
         let context = manager
             .runtime_filter_context_for_native_execution(
                 query_id,
-                crate::common::types::UniqueId { hi: 70, lo: 40 },
+                novarocks_types::UniqueId::new(70, 40),
             )
             .expect("strict native runtime-filter context");
         (manager, context)
@@ -2400,8 +2400,8 @@ mod tests {
         let (manager, _) = installed_native_consumer_context();
         let context = manager
             .runtime_filter_context_for_native_execution(
-                crate::runtime::query_context::QueryId { hi: 70, lo: 9_201 },
-                crate::common::types::UniqueId { hi: 70, lo: 30 },
+                novarocks_types::QueryId::new(70, 9_201),
+                novarocks_types::UniqueId::new(70, 30),
             )
             .expect("producer runtime-filter context");
         (manager, context)
@@ -2676,9 +2676,9 @@ mod tests {
         };
 
         let manager = QueryContextManager::new_for_test();
-        let query_id = QueryId { hi: 70, lo: 9_301 };
-        let producer_instance = crate::common::types::UniqueId { hi: 70, lo: 30 };
-        let consumer_instance = crate::common::types::UniqueId { hi: 70, lo: 40 };
+        let query_id = QueryId::new(70, 9_301);
+        let producer_instance = novarocks_types::UniqueId::new(70, 30);
+        let consumer_instance = novarocks_types::UniqueId::new(70, 40);
         let lifecycle = RuntimeFilterQueryLifecycleOptions {
             delivery_expire: Duration::from_secs(11),
             query_expire: Duration::from_secs(29),
@@ -2985,7 +2985,7 @@ mod tests {
         let subscription = service
             .subscribe(
                 BindingId::new(4),
-                crate::common::types::UniqueId { hi: 70, lo: 40 },
+                novarocks_types::UniqueId::new(70, 40),
                 SubscriptionKind::BlockingSnapshot,
             )
             .expect("installed local consumer subscription")
@@ -3002,7 +3002,7 @@ mod tests {
         assert!(
             service.core_producer_handle_exists_for_test(
                 BindingId::new(3),
-                crate::common::types::UniqueId { hi: 70, lo: 30 },
+                novarocks_types::UniqueId::new(70, 30),
             ),
             "every real native build sink must bind the installed producer"
         );

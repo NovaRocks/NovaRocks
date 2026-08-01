@@ -646,8 +646,8 @@ fn completion_set_digest(
     canonical.update(COMPLETION_SET_VERSION.to_be_bytes());
     canonical.update(contract_digest);
     canonical.update(binding_id.get().to_be_bytes());
-    canonical.update(fragment_instance_id.hi.to_be_bytes());
-    canonical.update(fragment_instance_id.lo.to_be_bytes());
+    canonical.update(fragment_instance_id.high().to_be_bytes());
+    canonical.update(fragment_instance_id.low().to_be_bytes());
     canonical.update(partition_count.to_be_bytes());
     canonical.finalize().into()
 }
@@ -678,8 +678,8 @@ fn issuance_permit_digest(
     canonical.update(ISSUANCE_PERMIT_VERSION.to_be_bytes());
     canonical.update(frozen_set_digest);
     canonical.update(stream.binding_id().get().to_be_bytes());
-    canonical.update(stream.fragment_instance_id().hi.to_be_bytes());
-    canonical.update(stream.fragment_instance_id().lo.to_be_bytes());
+    canonical.update(stream.fragment_instance_id().high().to_be_bytes());
+    canonical.update(stream.fragment_instance_id().low().to_be_bytes());
     canonical.update(stream.partition_id().get().to_be_bytes());
     canonical.update(domain_fingerprint);
     canonical.finalize().into()
@@ -762,7 +762,7 @@ mod tests {
     }
 
     const BINDING: BindingId = BindingId::new(7);
-    const INSTANCE: UniqueId = UniqueId { hi: 8, lo: 9 };
+    const INSTANCE: UniqueId = UniqueId::new(8, 9);
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum AdapterCall {
@@ -865,7 +865,7 @@ mod tests {
             ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NullSafeEqual).unwrap();
         Arc::new(
             RuntimeCompletionFenceContract::try_from_install(
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 DeploymentEpoch::new(3),
                 ChannelId::new(4),
                 CompletionFenceKind::CommittedDomainFrozen,
@@ -1092,12 +1092,12 @@ mod tests {
             .unwrap();
         let _first = fixture
             .service
-            .open_final_aggregate_producer(BindingId::new(10), UniqueId { hi: 70, lo: 10 }, 1)
+            .open_final_aggregate_producer(BindingId::new(10), UniqueId::new(70, 10), 1)
             .unwrap();
 
         let error = fixture
             .service
-            .open_final_aggregate_producer(BindingId::new(10), UniqueId { hi: 70, lo: 10 }, 1)
+            .open_final_aggregate_producer(BindingId::new(10), UniqueId::new(70, 10), 1)
             .unwrap_err();
 
         assert_eq!(
@@ -1149,7 +1149,7 @@ mod tests {
         let events = Arc::new(RecordingEvents::default());
         let memory = Arc::new(AcceptingMemory);
         let service = Arc::new(super::super::RuntimeFilterService::new_with_dependencies(
-            UniqueId { hi: 0, lo: 0 },
+            UniqueId::new(0, 0),
             Arc::new(FixedClock(Instant::now())),
             events.clone(),
             memory,
@@ -1160,18 +1160,18 @@ mod tests {
         let live = service
             .subscribe(
                 BindingId::new(30),
-                UniqueId { hi: 70, lo: 10 },
+                UniqueId::new(70, 10),
                 SubscriptionKind::NonBlockingLive,
             )
             .unwrap()
             .into_live()
             .unwrap();
         let session = service
-            .open_final_aggregate_producer(BindingId::new(10), UniqueId { hi: 70, lo: 10 }, 3)
+            .open_final_aggregate_producer(BindingId::new(10), UniqueId::new(70, 10), 3)
             .unwrap();
         service.inject_final_domain_submit_failure_for_test(
             BindingId::new(10),
-            UniqueId { hi: 70, lo: 10 },
+            UniqueId::new(70, 10),
             PartitionId::new(1),
             ProducerSequence::new(0),
         );

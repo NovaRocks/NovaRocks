@@ -213,7 +213,7 @@ impl ContributionRouteIdentity {
                 "producer binding id",
             ));
         }
-        if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
+        if fragment_instance_id.high() == 0 && fragment_instance_id.low() == 0 {
             return Err(RuntimeFilterTransportError::zero_identity(
                 "fragment instance id",
             ));
@@ -265,7 +265,7 @@ impl ProducerInstanceRouteIdentity {
                 "producer binding id",
             ));
         }
-        if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
+        if fragment_instance_id.high() == 0 && fragment_instance_id.low() == 0 {
             return Err(RuntimeFilterTransportError::zero_identity(
                 "fragment instance id",
             ));
@@ -449,7 +449,7 @@ impl RuntimeFilterEnvelope {
         schema_digest: &[u8],
         payload: Vec<u8>,
     ) -> Result<Self, RuntimeFilterTransportError> {
-        if query_id.hi == 0 && query_id.lo == 0 {
+        if query_id.high() == 0 && query_id.low() == 0 {
             return Err(RuntimeFilterTransportError::zero_identity("query id"));
         }
         if channel_id.get() == 0 {
@@ -666,7 +666,7 @@ mod tests {
         RuntimeFilterRouteIdentity::contribution(
             ContributionRouteIdentity::try_new(
                 BindingId::new(4),
-                UniqueId { hi: 5, lo: 6 },
+                UniqueId::new(5, 6),
                 PartitionId::new(7),
                 ProducerSequence::new(8),
             )
@@ -694,7 +694,7 @@ mod tests {
             .then_some(RuntimeFilterAcceptStatus::Accepted);
         RuntimeFilterEnvelope::try_new(
             kind,
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
             ChannelId::new(3),
             DeploymentEpoch::new(4),
             route_identity,
@@ -744,7 +744,7 @@ mod tests {
         for (kind, route_identity, payload) in cases {
             let envelope = envelope(kind, route_identity.clone(), payload);
             assert_eq!(envelope.kind(), kind);
-            assert_eq!(envelope.query_id(), UniqueId { hi: 1, lo: 2 });
+            assert_eq!(envelope.query_id(), UniqueId::new(1, 2));
             assert_eq!(envelope.channel_id(), ChannelId::new(3));
             assert_eq!(envelope.deployment_epoch(), DeploymentEpoch::new(4));
             assert_eq!(envelope.route_identity(), &route_identity);
@@ -755,10 +755,7 @@ mod tests {
         let contribution = contribution_route();
         let contribution = contribution.as_contribution().unwrap();
         assert_eq!(contribution.producer_binding_id(), BindingId::new(4));
-        assert_eq!(
-            contribution.fragment_instance_id(),
-            UniqueId { hi: 5, lo: 6 }
-        );
+        assert_eq!(contribution.fragment_instance_id(), UniqueId::new(5, 6));
         assert_eq!(contribution.partition_id(), PartitionId::new(7));
         assert_eq!(contribution.sequence(), ProducerSequence::new(8));
 
@@ -770,7 +767,7 @@ mod tests {
 
     #[test]
     fn unique_ids_reject_only_the_all_zero_value() {
-        for query_id in [UniqueId { hi: 0, lo: 29 }, UniqueId { hi: 31, lo: 0 }] {
+        for query_id in [UniqueId::new(0, 29), UniqueId::new(31, 0)] {
             let envelope = RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::Contribution,
                 query_id,
@@ -786,7 +783,7 @@ mod tests {
             assert_eq!(envelope.query_id(), query_id);
         }
 
-        for fragment_instance_id in [UniqueId { hi: 0, lo: 37 }, UniqueId { hi: 41, lo: 0 }] {
+        for fragment_instance_id in [UniqueId::new(0, 37), UniqueId::new(41, 0)] {
             let identity = ContributionRouteIdentity::try_new(
                 BindingId::new(4),
                 fragment_instance_id,
@@ -803,7 +800,7 @@ mod tests {
         let route_identity = RuntimeFilterRouteIdentity::contribution(
             ContributionRouteIdentity::try_new(
                 BindingId::new(4),
-                UniqueId { hi: 5, lo: 6 },
+                UniqueId::new(5, 6),
                 PartitionId::new(0),
                 ProducerSequence::new(0),
             )
@@ -835,13 +832,13 @@ mod tests {
         for result in [
             ContributionRouteIdentity::try_new(
                 BindingId::new(0),
-                UniqueId { hi: 5, lo: 6 },
+                UniqueId::new(5, 6),
                 PartitionId::new(7),
                 ProducerSequence::new(8),
             ),
             ContributionRouteIdentity::try_new(
                 BindingId::new(4),
-                UniqueId { hi: 0, lo: 0 },
+                UniqueId::new(0, 0),
                 PartitionId::new(7),
                 ProducerSequence::new(8),
             ),
@@ -875,7 +872,7 @@ mod tests {
 
         assert!(
             common(
-                UniqueId { hi: 0, lo: 0 },
+                UniqueId::new(0, 0),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 &[11; 32],
@@ -884,7 +881,7 @@ mod tests {
         );
         assert!(
             common(
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(0),
                 DeploymentEpoch::new(4),
                 &[11; 32],
@@ -893,7 +890,7 @@ mod tests {
         );
         assert!(
             common(
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(0),
                 &[11; 32],
@@ -902,7 +899,7 @@ mod tests {
         );
         assert!(
             common(
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 &[11; 31],
@@ -911,7 +908,7 @@ mod tests {
         );
         assert!(
             common(
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 &[11; 33],
@@ -957,7 +954,7 @@ mod tests {
             assert!(
                 RuntimeFilterEnvelope::try_new(
                     kind,
-                    UniqueId { hi: 1, lo: 2 },
+                    UniqueId::new(1, 2),
                     ChannelId::new(3),
                     DeploymentEpoch::new(4),
                     route_identity,
@@ -973,7 +970,7 @@ mod tests {
         assert!(
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::Ack,
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 delivery_route(),
@@ -1034,7 +1031,7 @@ mod tests {
             assert!(
                 RuntimeFilterEnvelope::try_new(
                     kind,
-                    UniqueId { hi: 1, lo: 2 },
+                    UniqueId::new(1, 2),
                     ChannelId::new(3),
                     DeploymentEpoch::new(4),
                     route_identity,
@@ -1069,7 +1066,7 @@ mod tests {
             let build = |producer_open| {
                 RuntimeFilterEnvelope::try_new(
                     kind,
-                    UniqueId { hi: 1, lo: 2 },
+                    UniqueId::new(1, 2),
                     ChannelId::new(3),
                     DeploymentEpoch::new(4),
                     contribution_route(),
@@ -1118,7 +1115,7 @@ mod tests {
             assert!(
                 RuntimeFilterEnvelope::try_new(
                     kind,
-                    UniqueId { hi: 1, lo: 2 },
+                    UniqueId::new(1, 2),
                     ChannelId::new(3),
                     DeploymentEpoch::new(4),
                     route_identity,
@@ -1139,7 +1136,7 @@ mod tests {
         let build = |payload| {
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::ProducerClosed,
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 contribution_route(),
@@ -1160,7 +1157,7 @@ mod tests {
     fn delivery_terminal_kinds_enforce_identity_and_payload_contracts() {
         let completed = RuntimeFilterEnvelope::try_new(
             RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
             ChannelId::new(3),
             DeploymentEpoch::new(4),
             delivery_route(),
@@ -1175,7 +1172,7 @@ mod tests {
         assert!(
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 delivery_route(),
@@ -1189,7 +1186,7 @@ mod tests {
         assert!(
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::DegradedLogical,
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 delivery_route(),
@@ -1203,7 +1200,7 @@ mod tests {
         assert!(
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::DegradedLogical,
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 contribution_route(),
@@ -1226,7 +1223,7 @@ mod tests {
             for route_identity in [contribution_route(), delivery_route()] {
                 let ack = RuntimeFilterEnvelope::try_new(
                     RuntimeFilterEnvelopeKind::Ack,
-                    UniqueId { hi: 1, lo: 2 },
+                    UniqueId::new(1, 2),
                     ChannelId::new(3),
                     DeploymentEpoch::new(4),
                     route_identity.clone(),
@@ -1248,7 +1245,7 @@ mod tests {
         for route_identity in [contribution_route(), delivery_route()] {
             let error = RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::Ack,
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 route_identity,
@@ -1295,7 +1292,7 @@ mod tests {
         ] {
             let error = RuntimeFilterEnvelope::try_new(
                 kind,
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 route_identity,
@@ -1415,11 +1412,10 @@ mod tests {
     #[test]
     fn producer_unavailable_uses_producer_instance_identity() {
         let identity =
-            ProducerInstanceRouteIdentity::try_new(BindingId::new(7), UniqueId { hi: 8, lo: 9 })
-                .unwrap();
+            ProducerInstanceRouteIdentity::try_new(BindingId::new(7), UniqueId::new(8, 9)).unwrap();
         let envelope = RuntimeFilterEnvelope::try_new(
             RuntimeFilterEnvelopeKind::ProducerUnavailable,
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
             ChannelId::new(3),
             DeploymentEpoch::new(4),
             RuntimeFilterRouteIdentity::producer_instance(identity.clone()),
@@ -1438,7 +1434,7 @@ mod tests {
         assert!(
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::ProducerUnavailable,
-                UniqueId { hi: 1, lo: 2 },
+                UniqueId::new(1, 2),
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 delivery_route(),

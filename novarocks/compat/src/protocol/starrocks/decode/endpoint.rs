@@ -18,9 +18,9 @@
 use crate::protocol::starrocks::compat::endpoint::destination_address_with_field;
 use crate::thrift::data_sinks::TPlanFragmentDestination;
 use crate::thrift::types::TNetworkAddress;
-use novarocks::common::types::UniqueId;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_types::UniqueId;
 
 use super::StarRocksFragmentDecodeError;
 
@@ -66,10 +66,10 @@ pub(crate) fn decode_fragment_destination(
         decode_runtime_endpoint(address, path.clone().field(address_field))?
     };
     Ok(FragmentDestination::new(
-        UniqueId {
-            hi: destination.fragment_instance_id.hi,
-            lo: destination.fragment_instance_id.lo,
-        },
+        UniqueId::new(
+            destination.fragment_instance_id.hi,
+            destination.fragment_instance_id.lo,
+        ),
         endpoint,
     ))
 }

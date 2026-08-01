@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::thrift::types::TUniqueId;
-use novarocks::common::types::UniqueId;
+use novarocks_types::UniqueId;
 
 #[derive(Debug, Default)]
 pub(crate) struct CompatLoadRegistry {
@@ -32,23 +32,14 @@ impl CompatLoadRegistry {
         self.stream_load_file_paths
             .lock()
             .expect("stream load file path lock")
-            .insert(
-                UniqueId {
-                    hi: load_id.hi,
-                    lo: load_id.lo,
-                },
-                path.to_path_buf(),
-            );
+            .insert(UniqueId::new(load_id.hi, load_id.lo), path.to_path_buf());
     }
 
     pub(crate) fn resolve_stream_load_file_path(&self, load_id: &TUniqueId) -> Option<String> {
         self.stream_load_file_paths
             .lock()
             .expect("stream load file path lock")
-            .get(&UniqueId {
-                hi: load_id.hi,
-                lo: load_id.lo,
-            })
+            .get(&UniqueId::new(load_id.hi, load_id.lo))
             .map(|path| path.to_string_lossy().to_string())
     }
 
@@ -56,10 +47,7 @@ impl CompatLoadRegistry {
         self.stream_load_file_paths
             .lock()
             .expect("stream load file path lock")
-            .remove(&UniqueId {
-                hi: load_id.hi,
-                lo: load_id.lo,
-            });
+            .remove(&UniqueId::new(load_id.hi, load_id.lo));
     }
 
     pub(crate) fn clear(&self) {

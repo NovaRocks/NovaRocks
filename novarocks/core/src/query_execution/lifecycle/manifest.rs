@@ -274,7 +274,10 @@ impl RuntimeFilterContribution {
         install: &RuntimeFilterParticipantInstall,
     ) -> Result<[u8; 32], QueryLifecycleError> {
         let envelope = crate::protocol::native::encode_participant_install(
-            execution_id.query_id().into_unique_id(),
+            UniqueId::new(
+                execution_id.query_id().high(),
+                execution_id.query_id().low(),
+            ),
             lifecycle,
             install,
         )
@@ -520,7 +523,7 @@ where
 }
 
 const fn is_missing_unique_id(id: UniqueId) -> bool {
-    id.hi == 0 && id.lo == 0
+    id.high() == 0 && id.low() == 0
 }
 
 #[cfg(test)]
@@ -565,7 +568,7 @@ mod tests {
             execution_id(),
             backend(),
             [ParticipantRole::RuntimeFilterService],
-            [UniqueId { hi: 7, lo: 9 }],
+            [UniqueId::new(7, 9)],
             ParticipantQueryOptions::new(QueryOptions::default()),
             1_000,
             [],
@@ -580,7 +583,7 @@ mod tests {
 
     #[test]
     fn participant_manifest_validation_rejects_duplicate_fragments() {
-        let duplicate = UniqueId { hi: 7, lo: 9 };
+        let duplicate = UniqueId::new(7, 9);
         let error = ParticipantManifest::new(
             execution_id(),
             backend(),

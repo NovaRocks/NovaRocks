@@ -94,9 +94,9 @@ const WITNESS_B: CoverageWitnessId = CoverageWitnessId::new(102);
 const PRODUCER_FRAGMENT_A: PlanFragmentId = PlanFragmentId::new(1);
 const PRODUCER_FRAGMENT_B: PlanFragmentId = PlanFragmentId::new(2);
 const CONSUMER_FRAGMENT: PlanFragmentId = PlanFragmentId::new(3);
-const INSTANCE_A: UniqueId = UniqueId { hi: 94, lo: 10 };
-const INSTANCE_B: UniqueId = UniqueId { hi: 94, lo: 20 };
-const CONSUMER_INSTANCE: UniqueId = UniqueId { hi: 94, lo: 30 };
+const INSTANCE_A: UniqueId = UniqueId::new(94, 10);
+const INSTANCE_B: UniqueId = UniqueId::new(94, 20);
+const CONSUMER_INSTANCE: UniqueId = UniqueId::new(94, 30);
 const PARTICIPANT: RuntimeFilterParticipantId = RuntimeFilterParticipantId::new(1);
 
 fn fixture_backend_idx() -> usize {
@@ -476,7 +476,7 @@ fn install_service_with_memory(
     memory: Arc<dyn RuntimeFilterMemoryAccount>,
 ) -> Arc<RuntimeFilterService> {
     let service = Arc::new(RuntimeFilterService::new_with_dependencies(
-        UniqueId { hi: 94, lo: 0 },
+        UniqueId::new(94, 0),
         Arc::new(DeterministicClock(Instant::now())),
         Arc::new(RecordingEvents::default()),
         memory,

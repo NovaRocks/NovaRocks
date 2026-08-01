@@ -19,12 +19,13 @@ use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks::UniqueId;
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
-    DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent, QueryId,
+    DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryTerminalSnapshot};
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 type QueryKey = (i64, i64);
 
@@ -707,7 +708,7 @@ mod tests {
         )
         .expect("backend identity");
         let fragment = FragmentTerminalSnapshot::new(
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
             7,
             FragmentTerminalOutcome::Succeeded,
             SinkCommitReportSnapshot::default(),

@@ -35,7 +35,6 @@ use crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type;
 use crate::schema_wire::build_sink_tablet_schema;
 use crate::thrift::{data_sinks, descriptors, exprs, types};
 use novarocks::common::ids::SlotId;
-use novarocks::common::types::UniqueId;
 use novarocks::connector::starrocks::lake::context::PartialUpdateWriteMode;
 use novarocks::connector::starrocks::schema::StarRocksKeysType;
 use novarocks::connector::starrocks::sink::partition_key::{PartitionExprPlan, PartitionKeyValue};
@@ -49,6 +48,7 @@ use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::{ExecNodeKind, ExecPlan};
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::fragment::instance::StarRocksTableSinkAssignment;
+use novarocks_types::UniqueId;
 
 const LOAD_OP_COLUMN: &str = "__op";
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
@@ -199,10 +199,7 @@ pub(crate) fn lower_starrocks_table_sink(
     program.validate()?;
     let assignment = StarRocksTableSinkAssignment::new(
         sink.txn_id,
-        UniqueId {
-            hi: sink.load_id.hi,
-            lo: sink.load_id.lo,
-        },
+        UniqueId::new(sink.load_id.hi, sink.load_id.lo),
         frontend,
     );
     Ok((program, assignment))
@@ -1643,7 +1640,7 @@ mod tests {
         );
 
         data_sinks::TOlapTableSink::new(
-            types::TUniqueId::new(101, 103),
+            types::TUniqueId { hi: 101, lo: 103 },
             97,
             1,
             2,
@@ -1776,7 +1773,7 @@ mod tests {
 
         assert_eq!(assignment.txn_id(), 97);
         assert_eq!(
-            (assignment.load_id().hi, assignment.load_id().lo),
+            (assignment.load_id().high(), assignment.load_id().low()),
             (101, 103)
         );
         assert_eq!(assignment.frontend(), Some(&frontend));

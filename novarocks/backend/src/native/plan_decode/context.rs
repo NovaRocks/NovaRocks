@@ -31,11 +31,11 @@ use novarocks::runtime::exchange::ExchangeKey;
 use novarocks::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
-use novarocks::runtime::query_context::QueryId;
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_protocol::{common, expr};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
+use novarocks_types::QueryId;
 
 use crate::native::plan_decode::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use crate::native::plan_decode::layout::Layout;
@@ -68,10 +68,7 @@ impl Default for NativePlanDecodeContext {
             execution_resolver: None,
             connector_cancellation: None,
             query_id: None,
-            fragment_instance_id: FragmentInstanceId::new(novarocks::common::types::UniqueId {
-                hi: 0,
-                lo: 0,
-            }),
+            fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
         }
     }
 }
@@ -218,8 +215,8 @@ impl NativePlanDecodeContext {
         let fragment_instance_id = self.fragment_instance_id.get();
         Ok((
             ExchangeKey {
-                finst_id_hi: fragment_instance_id.hi,
-                finst_id_lo: fragment_instance_id.lo,
+                finst_id_hi: fragment_instance_id.high(),
+                finst_id_lo: fragment_instance_id.low(),
                 node_id,
             },
             assignment.sender_count().get(),
@@ -229,10 +226,10 @@ impl NativePlanDecodeContext {
     #[cfg(test)]
     pub(crate) fn with_exchange_sender_count(mut self, key: ExchangeKey, count: usize) -> Self {
         let count = std::num::NonZeroUsize::new(count).expect("test sender count must be positive");
-        self.fragment_instance_id = FragmentInstanceId::new(novarocks::common::types::UniqueId {
-            hi: key.finst_id_hi,
-            lo: key.finst_id_lo,
-        });
+        self.fragment_instance_id = FragmentInstanceId::new(novarocks_types::UniqueId::new(
+            key.finst_id_hi,
+            key.finst_id_lo,
+        ));
         self.exchange_inputs = ExchangeInputAssignments::new(BTreeMap::from([(
             FragmentNodeId::new(key.node_id),
             ExchangeInputAssignment::new(count),

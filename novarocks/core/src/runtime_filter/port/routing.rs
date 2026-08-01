@@ -818,7 +818,7 @@ mod tests {
                 RuntimeFilterRouteRole::Aggregator,
             ]),
             BTreeMap::from([(
-                (BindingId::new(10), UniqueId { hi: 1, lo: 2 }),
+                (BindingId::new(10), UniqueId::new(1, 2)),
                 RuntimeFilterParticipantId::new(2),
             )]),
             inbound_edges,
@@ -856,7 +856,7 @@ mod tests {
             ChannelId::new(1),
             BTreeSet::from([RuntimeFilterRouteRole::Producer(BindingId::new(10))]),
             BTreeMap::from([(
-                (BindingId::new(10), UniqueId { hi: 1, lo: 2 }),
+                (BindingId::new(10), UniqueId::new(1, 2)),
                 RuntimeFilterParticipantId::new(2),
             )]),
             Vec::new(),
@@ -878,7 +878,7 @@ mod tests {
         let channel = shard.channel(ChannelId::new(1)).unwrap();
         assert_eq!(channel.local_roles().len(), 1);
         assert_eq!(
-            channel.producer_participant(BindingId::new(10), UniqueId { hi: 1, lo: 2 }),
+            channel.producer_participant(BindingId::new(10), UniqueId::new(1, 2)),
             Some(RuntimeFilterParticipantId::new(2))
         );
         assert_eq!(channel.outbound_edges(), &[edge]);

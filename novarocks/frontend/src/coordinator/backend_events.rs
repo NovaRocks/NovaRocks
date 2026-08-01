@@ -20,7 +20,7 @@ use std::sync::Arc;
 use novarocks::query_execution::backend::{
     BackendQueryEvent, BackendQueryEventSink, LiveBackendTarget,
 };
-use novarocks::query_execution::contract::QueryId;
+use novarocks_types::QueryId;
 
 use super::query_registry::FrontendQueryRegistry;
 

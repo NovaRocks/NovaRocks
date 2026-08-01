@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn event_identity_keeps_query_participant_channel_epoch_and_route_coordinates() {
         let common = RuntimeFilterEventIdentity::new(
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
             RuntimeFilterParticipantId::new(3),
             ChannelId::new(4),
             DeploymentEpoch::new(5),
@@ -454,7 +454,7 @@ mod tests {
         let route = RouteEventIdentity::new(
             common,
             BindingId::new(6),
-            UniqueId { hi: 7, lo: 8 },
+            UniqueId::new(7, 8),
             RouteEdgeId::new(9),
         );
         let event = RuntimeFilterEvent::LoopbackDelivered {
@@ -467,7 +467,7 @@ mod tests {
         };
         assert_eq!(identity.common(), common);
         assert_eq!(identity.consumer_binding_id().get(), 6);
-        assert_eq!(identity.fragment_instance_id(), UniqueId { hi: 7, lo: 8 });
+        assert_eq!(identity.fragment_instance_id(), UniqueId::new(7, 8));
         assert_eq!(identity.route_edge_id().get(), 9);
         assert_eq!(version, LogicalVersion::FIRST);
     }

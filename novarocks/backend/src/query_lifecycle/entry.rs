@@ -19,12 +19,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use novarocks::UniqueId;
 use novarocks::query_execution::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
     ParticipantManifest, ParticipantManifestDigest, QueryControlEvent, QueryInitOutcome,
     QueryTerminationReason, StageDigest,
 };
+use novarocks_types::UniqueId;
 
 use super::stage::StartGate;
 

@@ -500,10 +500,7 @@ mod tests {
     }
 
     fn finst(raw: i64) -> UniqueId {
-        UniqueId {
-            hi: raw,
-            lo: raw + 100,
-        }
+        UniqueId::new(raw, raw + 100)
     }
 
     fn consumer_route_ids(consumer: &ConsumerDeployment) -> BTreeSet<RouteEdgeId> {
@@ -1132,7 +1129,7 @@ mod tests {
         let channel_specs = BTreeMap::from([(ChannelId::new(5), projected)]);
         let instances = BTreeMap::from([(
             (ChannelId::new(5), BindingId::new(10), participant),
-            BTreeSet::from([UniqueId { hi: 1, lo: 2 }]),
+            BTreeSet::from([UniqueId::new(1, 2)]),
         )]);
 
         let views = project_install_views(
@@ -1155,7 +1152,7 @@ mod tests {
     #[test]
     fn loopback_projection_passes_be_side_validate_view() {
         let part = RuntimeFilterParticipantId::new(1);
-        let finst = UniqueId { hi: 1, lo: 2 };
+        let finst = UniqueId::new(1, 2);
         let mut cg = ChannelRoleGraph::empty(ChannelId::new(5));
         cg.producers
             .insert(part, BTreeSet::from([BindingId::new(10)]));
@@ -1218,7 +1215,7 @@ mod tests {
     fn consumer_without_authorized_inbound_route_is_rejected() {
         let producer_participant = RuntimeFilterParticipantId::new(1);
         let consumer_participant = RuntimeFilterParticipantId::new(2);
-        let finst = UniqueId { hi: 1, lo: 2 };
+        let finst = UniqueId::new(1, 2);
 
         let mut cg = ChannelRoleGraph::empty(ChannelId::new(5));
         cg.producers

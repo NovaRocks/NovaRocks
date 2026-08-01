@@ -45,9 +45,9 @@ use novarocks::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange,
 };
 use novarocks::novarocks_logging::debug;
-use novarocks::runtime::query_context::QueryId;
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::ScanRange;
+use novarocks_types::QueryId;
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
 ///
@@ -491,10 +491,10 @@ pub(crate) fn lower_lake_scan_node(
             table_id,
             schema_id,
             fe_addr: external_dependencies.and_then(|draft| draft.frontend_endpoint().cloned()),
-            query_id: Some(novarocks::common::types::UniqueId {
-                hi: query_id.hi(),
-                lo: query_id.lo(),
-            }),
+            query_id: Some(novarocks_types::UniqueId::new(
+                query_id.high(),
+                query_id.low(),
+            )),
             native_tablet_schema: None,
             native_column_hints: None,
             table_schema_provider: external_dependencies

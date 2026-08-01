@@ -421,8 +421,9 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 #[cfg(test)]
 mod tests {
     use super::{FrontendBackendSnapshot, FrontendFragmentScheduler};
-    use novarocks::query_execution::contract::{DistributedQueryErrorKind, QueryId};
+    use novarocks::query_execution::contract::DistributedQueryErrorKind;
     use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_types::QueryId;
 
     fn execution_id(attempt: u64) -> QueryExecutionId {
         QueryExecutionId::new(

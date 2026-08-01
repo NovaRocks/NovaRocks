@@ -96,9 +96,9 @@ impl NativeRuntimeFilterExecutionContext {
         let service = super::tests::installed_ordered_service_fixture();
         let context = Self::new(
             service,
-            UniqueId { hi: 70, lo: 0 },
+            UniqueId::new(70, 0),
             DeploymentEpoch::new(9),
-            UniqueId { hi: 70, lo: 2 },
+            UniqueId::new(70, 2),
         );
         let resolved = context
             .resolve_consumer(

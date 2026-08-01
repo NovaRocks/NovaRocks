@@ -554,10 +554,10 @@ mod tests {
     }
 
     fn write_commit_with_writer_without_files() -> WriteCommitInput {
-        let write_id = UniqueId { hi: 10, lo: 20 };
+        let write_id = UniqueId::new(10, 20);
         let writer_key = WriterKey {
             query_id: write_id,
-            fragment_instance_id: UniqueId { hi: 101, lo: 201 },
+            fragment_instance_id: UniqueId::new(101, 201),
             backend_num: 0,
         };
         WriteCommitInput {

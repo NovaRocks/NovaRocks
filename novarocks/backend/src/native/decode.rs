@@ -26,15 +26,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks::cache::CacheOptions;
-use novarocks::common::types::UniqueId;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
-use novarocks::query_execution::contract::QueryId as ExecutionQueryId;
 use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks::runtime::fragment::submission::FragmentSubmission;
-use novarocks::runtime::query_context::QueryId;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
+use novarocks_types::QueryId as ExecutionQueryId;
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 use super::ingress::NativeFragmentIngressError;
 use super::instance::decode_instance_params;
@@ -123,8 +123,8 @@ impl NativeFragmentRequest {
         )
         .map_err(NativeFragmentIngressError::new)?;
         let (submission, backend_num) = decoded.into_parts();
-        if execution_id.query_id().high() != submission.instance().query_id().hi()
-            || execution_id.query_id().low() != submission.instance().query_id().lo()
+        if execution_id.query_id().high() != submission.instance().query_id().high()
+            || execution_id.query_id().low() != submission.instance().query_id().low()
         {
             return Err(NativeFragmentIngressError::new(
                 "native fragment execution_id query_id does not match instance_params query_id",

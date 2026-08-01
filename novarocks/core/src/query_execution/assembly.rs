@@ -323,8 +323,8 @@ fn patch_native_connector_write_sink_in_place(
 
 fn unique_id_bytes(value: crate::common::types::UniqueId) -> [u8; 16] {
     let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&value.hi.to_be_bytes());
-    bytes[8..].copy_from_slice(&value.lo.to_be_bytes());
+    bytes[..8].copy_from_slice(&value.high().to_be_bytes());
+    bytes[8..].copy_from_slice(&value.low().to_be_bytes());
     bytes
 }
 
@@ -794,8 +794,8 @@ fn native_stream_destination(
 ) -> crate::proto::plan::StreamDestination {
     crate::proto::plan::StreamDestination {
         finst_id: Some(crate::proto::common::UniqueId {
-            hi: src.finst_id().hi,
-            lo: src.finst_id().lo,
+            hi: src.finst_id().high(),
+            lo: src.finst_id().low(),
         }),
         endpoint: src.endpoint().as_host_port(),
     }
@@ -963,10 +963,7 @@ mod tests {
         FragmentInstancePlacement {
             fragment_id,
             instance_index: 0,
-            finst_id: UniqueId {
-                hi: 92_000,
-                lo: instance_lo,
-            },
+            finst_id: UniqueId::new(92_000, instance_lo),
             backend_idx: 0,
             endpoint: RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
@@ -1101,7 +1098,7 @@ mod tests {
 
     #[test]
     fn patches_only_the_exact_placement_to_a_generic_connector_writer() {
-        let finst_id = UniqueId { hi: 41, lo: 77 };
+        let finst_id = UniqueId::new(41, 77);
         let handle = connector_writer_handle(9, finst_id);
         let mut fragment = connector_writer_template_fragment(9);
 
@@ -1128,14 +1125,9 @@ mod tests {
 
         let mut wrong = connector_writer_template_fragment(9);
         let before = wrong.clone();
-        let error = patch_native_connector_write_sink(
-            &mut wrong,
-            9,
-            UniqueId { hi: 41, lo: 78 },
-            0,
-            &handle,
-        )
-        .expect_err("wrong fragment instance must fail closed");
+        let error =
+            patch_native_connector_write_sink(&mut wrong, 9, UniqueId::new(41, 78), 0, &handle)
+                .expect_err("wrong fragment instance must fail closed");
         assert!(
             error.contains("does not match scheduled placement"),
             "{error}"
@@ -1148,7 +1140,7 @@ mod tests {
         let empty = SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(3, Vec::new()), (7, vec![placement(7, 7)])]),
-            root_finst_id: UniqueId { hi: 92_000, lo: 7 },
+            root_finst_id: UniqueId::new(92_000, 7),
             root_backend_idx: 0,
         };
         assert!(
@@ -1160,7 +1152,7 @@ mod tests {
         let drift = SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(7, vec![placement(8, 7)])]),
-            root_finst_id: UniqueId { hi: 92_000, lo: 7 },
+            root_finst_id: UniqueId::new(92_000, 7),
             root_backend_idx: 0,
         };
         let error =
@@ -1238,7 +1230,7 @@ mod tests {
             ..Default::default()
         };
         let destination = FragmentDestination::new(
-            UniqueId { hi: 98_000, lo: 1 },
+            UniqueId::new(98_000, 1),
             RuntimeEndpoint::new("10.0.0.20", 9010).unwrap(),
         );
         patch_native_cte_multicast_sink(

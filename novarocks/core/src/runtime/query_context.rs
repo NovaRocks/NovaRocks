@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
-use crate::common::types::UniqueId;
 use crate::exec::node::scan::ConnectorRowPositionLookup;
 use crate::exec::node::scan::IncrementalScanRange;
 use crate::exec::node::scan::LakeGlmScanInfo;
@@ -45,26 +44,9 @@ use crate::runtime_filter::port::producer::{InstallContractErrorKind, InstallOut
 use crate::runtime_filter::service::{
     NativeRuntimeFilterExecutionContext, ReliableTransportPolicy, RuntimeFilterService,
 };
+use novarocks_types::UniqueId;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct QueryId {
-    pub(crate) hi: i64,
-    pub(crate) lo: i64,
-}
-
-impl QueryId {
-    pub const fn new(hi: i64, lo: i64) -> Self {
-        Self { hi, lo }
-    }
-
-    pub const fn hi(self) -> i64 {
-        self.hi
-    }
-
-    pub const fn lo(self) -> i64 {
-        self.lo
-    }
-}
+pub(crate) use novarocks_types::QueryId;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StarRocksQueryGeneration(NonZeroU64);
@@ -195,13 +177,6 @@ mod query_cleanup_lease_tests {
         });
         drop(lease);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
-    }
-}
-
-impl fmt::Display for QueryId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let uuid = crate::common::types::format_uuid(self.hi, self.lo);
-        f.write_str(&uuid)
     }
 }
 
@@ -403,7 +378,7 @@ impl QueryContext {
     ) -> Self {
         let now = Instant::now();
         let process = mem_tracker::process_mem_tracker();
-        let query_label = format!("query_{:x}_{:x}", query_id.hi, query_id.lo);
+        let query_label = format!("query_{:x}_{:x}", query_id.high(), query_id.low());
         let mem_tracker = MemTracker::new_child(query_label, &process);
         let runtime_filter_service = new_runtime_filter_service(query_id, &mem_tracker);
         Self {
@@ -707,16 +682,13 @@ fn new_runtime_filter_service(
     query_id: QueryId,
     mem_tracker: &Arc<MemTracker>,
 ) -> Arc<RuntimeFilterService> {
-    let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+    let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
     let event_sink = Arc::new(RegistryRuntimeFilterEventSink::new(
         RuntimeFilterLifecycleRegistry::global(),
         query_key,
     ));
     Arc::new(RuntimeFilterService::new_for_query(
-        UniqueId {
-            hi: query_id.hi,
-            lo: query_id.lo,
-        },
+        UniqueId::new(query_id.high(), query_id.low()),
         event_sink,
         mem_tracker,
     ))
@@ -2460,7 +2432,7 @@ impl QueryContextManager {
             .chain(guard.second_chance.keys())
             .copied()
             .collect::<Vec<_>>();
-        query_ids.sort_by_key(|query_id| (query_id.hi, query_id.lo));
+        query_ids.sort_by_key(|query_id| (query_id.high(), query_id.low()));
         query_ids.dedup();
         query_ids
     }
@@ -2499,10 +2471,7 @@ impl QueryContextManager {
         }
         Ok(NativeRuntimeFilterExecutionContext::new(
             context.runtime_filter_service(),
-            UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            },
+            UniqueId::new(query_id.high(), query_id.low()),
             claim.install.epoch(),
             fragment_instance_id,
         ))
@@ -2546,10 +2515,7 @@ impl QueryContextManager {
         }
         Ok(NativeRuntimeFilterExecutionContext::new(
             context.runtime_filter_service(),
-            UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            },
+            UniqueId::new(query_id.high(), query_id.low()),
             claim.install.epoch(),
             fragment_instance_id,
         ))
@@ -3439,12 +3405,12 @@ impl QueryContextManager {
             Some(_) => {
                 let finsts = result.finsts;
                 for id in &finsts {
-                    crate::runtime::exchange::cancel_fragment(id.hi, id.lo);
+                    crate::runtime::exchange::cancel_fragment(id.high(), id.low());
                 }
                 finsts
             }
             None => {
-                crate::runtime::exchange::cancel_fragment(finst_id.hi, finst_id.lo);
+                crate::runtime::exchange::cancel_fragment(finst_id.high(), finst_id.low());
                 vec![finst_id]
             }
         }
@@ -3571,7 +3537,7 @@ impl QueryContextManager {
 
 fn remove_runtime_filter_lifecycle(query_id: QueryId) {
     RuntimeFilterLifecycleRegistry::global()
-        .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
+        .remove_query(QueryKey::from_hi_lo(query_id.high(), query_id.low()));
 }
 
 fn map_runtime_filter_install_error(
@@ -3604,10 +3570,7 @@ mod fragment_cancellation_boundary_tests {
     fn query_cancellation_returns_routes_without_aborting_fragment_local_completion() {
         let manager = QueryContextManager::new_for_test();
         let query_id = QueryId::new(86_101, 86_102);
-        let finst_id = UniqueId {
-            hi: 86_103,
-            lo: 86_104,
-        };
+        let finst_id = UniqueId::new(86_103, 86_104);
         let completion = FragmentCompletion::new(1);
         manager.register_finst(finst_id, query_id);
 
@@ -3647,18 +3610,9 @@ mod generation_race_tests {
     #[test]
     fn cancel_resolution_is_atomic_with_old_generation_drain_and_reuse() {
         let manager = test_manager();
-        let query_id = QueryId {
-            hi: 86_001,
-            lo: 86_002,
-        };
-        let old_finst = UniqueId {
-            hi: 86_003,
-            lo: 86_004,
-        };
-        let new_finst = UniqueId {
-            hi: 86_005,
-            lo: 86_006,
-        };
+        let query_id = QueryId::new(86_001, 86_002);
+        let old_finst = UniqueId::new(86_003, 86_004);
+        let new_finst = UniqueId::new(86_005, 86_006);
         let old_execution = QueryExecutionKey::starrocks(
             query_id,
             StarRocksQueryGeneration::new(1).expect("old generation"),
@@ -3753,7 +3707,7 @@ mod lookup_lifecycle_tests {
     #[test]
     fn lookup_context_survives_all_fragments_until_last_fetcher_closes() {
         let manager = test_manager();
-        let query_id = QueryId { hi: 901, lo: 902 };
+        let query_id = QueryId::new(901, 902);
         for _ in 0..2 {
             manager
                 .get_or_register(
@@ -3800,7 +3754,7 @@ mod lookup_lifecycle_tests {
     #[test]
     fn duplicate_fragment_registration_does_not_double_lookup_fetchers() {
         let manager = test_manager();
-        let query_id = QueryId { hi: 911, lo: 912 };
+        let query_id = QueryId::new(911, 912);
         manager
             .get_or_register(
                 query_id,
@@ -3833,7 +3787,7 @@ mod lookup_lifecycle_tests {
     #[test]
     fn unknown_lookup_fetcher_count_keeps_context_until_bounded_expiry() {
         let manager = test_manager();
-        let query_id = QueryId { hi: 921, lo: 922 };
+        let query_id = QueryId::new(921, 922);
         manager
             .get_or_register(query_id, false, Duration::ZERO, Duration::from_secs(5))
             .expect("query context");
@@ -3887,17 +3841,17 @@ mod sender_error_tests {
     #[test]
     fn mapped_finst_cancels_all_query_finsts_and_receivers() {
         let mgr = test_manager();
-        let qid = QueryId { hi: 11, lo: 22 };
-        let finst_a = UniqueId { hi: 101, lo: 201 };
-        let finst_b = UniqueId { hi: 102, lo: 202 };
+        let qid = QueryId::new(11, 22);
+        let finst_a = UniqueId::new(101, 201);
+        let finst_b = UniqueId::new(102, 202);
         let key_a = ExchangeKey {
-            finst_id_hi: finst_a.hi,
-            finst_id_lo: finst_a.lo,
+            finst_id_hi: finst_a.high(),
+            finst_id_lo: finst_a.low(),
             node_id: 301,
         };
         let key_b = ExchangeKey {
-            finst_id_hi: finst_b.hi,
-            finst_id_lo: finst_b.lo,
+            finst_id_hi: finst_b.high(),
+            finst_id_lo: finst_b.low(),
             node_id: 302,
         };
 
@@ -3912,7 +3866,7 @@ mod sender_error_tests {
         assert!(snapshot_receiver_state(key_b).is_some());
 
         let mut finsts = mgr.propagate_sender_error(finst_a, "connection refused".into());
-        finsts.sort_by_key(|id| (id.hi, id.lo));
+        finsts.sort_by_key(|id| (id.high(), id.low()));
 
         assert_eq!(finsts, vec![finst_a, finst_b]);
         assert!(mgr.is_query_canceled(qid));
@@ -3923,10 +3877,10 @@ mod sender_error_tests {
     #[test]
     fn unmapped_finst_cancels_its_own_receiver_only() {
         let mgr = test_manager();
-        let finst = UniqueId { hi: 201, lo: 202 };
+        let finst = UniqueId::new(201, 202);
         let key = ExchangeKey {
-            finst_id_hi: finst.hi,
-            finst_id_lo: finst.lo,
+            finst_id_hi: finst.high(),
+            finst_id_lo: finst.low(),
             node_id: 401,
         };
 
@@ -3963,11 +3917,8 @@ mod runtime_filter_lifecycle_cleanup_tests {
     #[test]
     fn finish_fragment_removes_runtime_filter_lifecycle_when_query_is_dead() {
         let mgr = test_manager();
-        let query_id = QueryId {
-            hi: 4_101,
-            lo: 4_102,
-        };
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_id = QueryId::new(4_101, 4_102);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
         registry.recorder(query_key).planned(7);
@@ -3996,12 +3947,9 @@ mod runtime_filter_lifecycle_cleanup_tests {
     #[test]
     fn pre_start_registration_rollback_preserves_other_fragment_and_query_cleanup() {
         let mgr = test_manager();
-        let query_id = QueryId {
-            hi: 4_131,
-            lo: 4_132,
-        };
-        let first = UniqueId { hi: 4_133, lo: 1 };
-        let second = UniqueId { hi: 4_133, lo: 2 };
+        let query_id = QueryId::new(4_131, 4_132);
+        let first = UniqueId::new(4_133, 1);
+        let second = UniqueId::new(4_133, 2);
 
         mgr.ensure_native_context(
             query_id,
@@ -4039,17 +3987,14 @@ mod runtime_filter_lifecycle_cleanup_tests {
         assert_eq!(mgr.fragment_counts_for_test(query_id), None);
         assert_eq!(mgr.query_id_by_finst(first), None);
         RuntimeFilterLifecycleRegistry::global()
-            .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
+            .remove_query(QueryKey::from_hi_lo(query_id.high(), query_id.low()));
     }
 
     #[test]
     fn finish_fragment_for_report_claims_runtime_filter_export_once_before_cleanup() {
         let mgr = test_manager();
-        let query_id = QueryId {
-            hi: 4_151,
-            lo: 4_152,
-        };
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_id = QueryId::new(4_151, 4_152);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
         registry.recorder(query_key).planned(7);
@@ -4095,11 +4040,8 @@ mod runtime_filter_lifecycle_cleanup_tests {
     #[test]
     fn report_cleanup_preserves_lifecycle_for_recreated_context() {
         let mgr = test_manager();
-        let query_id = QueryId {
-            hi: 4_181,
-            lo: 4_182,
-        };
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_id = QueryId::new(4_181, 4_182);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
 
@@ -4141,11 +4083,8 @@ mod runtime_filter_lifecycle_cleanup_tests {
     #[test]
     fn clean_expired_removes_runtime_filter_lifecycle_for_second_chance_query() {
         let mgr = test_manager();
-        let query_id = QueryId {
-            hi: 4_201,
-            lo: 4_202,
-        };
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_id = QueryId::new(4_201, 4_202);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
         registry.recorder(query_key).planned(7);
@@ -4184,10 +4123,10 @@ mod incremental_scan_domain_tests {
     #[test]
     fn pending_incremental_ranges_store_domain_values_and_registered_slot_contract() {
         let manager = manager();
-        let finst_id = UniqueId { hi: 91, lo: 92 };
+        let finst_id = UniqueId::new(91, 92);
         manager.register_finsts_with_incremental_contracts(
             [(finst_id, HashMap::from([(41, Some(SlotId::new(7)))]))],
-            QueryId { hi: 81, lo: 82 },
+            QueryId::new(81, 82),
         );
 
         assert_eq!(
@@ -4217,10 +4156,10 @@ mod incremental_scan_domain_tests {
     #[test]
     fn incremental_slot_lookup_rejects_unknown_node_without_pending_side_effect() {
         let manager = manager();
-        let finst_id = UniqueId { hi: 93, lo: 94 };
+        let finst_id = UniqueId::new(93, 94);
         manager.register_finsts_with_incremental_contracts(
             [(finst_id, HashMap::from([(41, None)]))],
-            QueryId { hi: 83, lo: 84 },
+            QueryId::new(83, 84),
         );
 
         let error = manager
@@ -4255,7 +4194,7 @@ mod row_position_descriptor_tests {
     #[test]
     fn row_position_registration_is_idempotent_and_merges_distinct_tuples() {
         let mut context = QueryContext::new(
-            QueryId { hi: 71, lo: 72 },
+            QueryId::new(71, 72),
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
         );
@@ -4279,7 +4218,7 @@ mod row_position_descriptor_tests {
     #[test]
     fn row_position_registration_rejects_conflicting_tuple_metadata() {
         let mut context = QueryContext::new(
-            QueryId { hi: 73, lo: 74 },
+            QueryId::new(73, 74),
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
         );
@@ -4337,11 +4276,11 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
     }
 
     pub(super) fn query_id(lo: i64) -> QueryId {
-        QueryId { hi: 70, lo }
+        QueryId::new(70, lo)
     }
 
     fn uid(lo: i64) -> UniqueId {
-        UniqueId { hi: 70, lo }
+        UniqueId::new(70, lo)
     }
 
     pub(crate) fn participant_install() -> RuntimeFilterParticipantInstall {
@@ -4518,7 +4457,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
             let mut guard = manager.inner.lock().expect("query manager");
             let context = guard.active.get_mut(&query_id).expect("active query");
             let service = Arc::new(RuntimeFilterService::new_for_query(
-                uid(query_id.lo),
+                uid(query_id.low()),
                 sink,
                 &context.mem_tracker,
             ));
@@ -4941,7 +4880,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
     #[test]
     fn empty_query_service_creates_no_channel_or_event() {
         let query_id = query_id(3);
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
         let context = QueryContext::new(query_id, Duration::ZERO, Duration::ZERO);
@@ -5047,7 +4986,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
     fn clean_expired_shuts_down_expired_claim_only_active_context_after_releasing_manager_lock() {
         let manager = test_manager();
         let query_id = query_id(72);
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
         manager
@@ -5143,7 +5082,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
     fn concurrent_native_fragment_recreates_context_while_expired_claim_shuts_down() {
         let manager = test_manager();
         let query_id = query_id(75);
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
         manager
@@ -5166,7 +5105,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
             let context = guard.active.get_mut(&query_id).expect("claim-only query");
             context.query_deadline = Instant::now() - Duration::from_millis(1);
             let service = Arc::new(RuntimeFilterService::new_for_query(
-                uid(query_id.lo),
+                uid(query_id.low()),
                 sink,
                 &context.mem_tracker,
             ));
@@ -5210,7 +5149,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
     fn clean_expired_preserves_lifecycle_recreated_while_old_context_shuts_down() {
         let manager = test_manager();
         let query_id = query_id(71);
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
         register(&manager, query_id);
@@ -5225,7 +5164,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
             let mut guard = manager.inner.lock().expect("query manager");
             let context = guard.active.get_mut(&query_id).expect("active query");
             let old_service = Arc::new(RuntimeFilterService::new_for_query(
-                uid(query_id.lo),
+                uid(query_id.low()),
                 sink,
                 &context.mem_tracker,
             ));
@@ -5478,7 +5417,7 @@ mod tests {
         }
 
         fn query_id(lo: i64) -> QueryId {
-            QueryId { hi: 97, lo }
+            QueryId::new(97, lo)
         }
 
         fn route() -> RuntimeFilterRemoteRoute {
@@ -5494,7 +5433,7 @@ mod tests {
         fn identity() -> TransportRouteEventIdentity {
             TransportRouteEventIdentity::new(
                 RuntimeFilterEventIdentity::new(
-                    UniqueId { hi: 97, lo: 1 },
+                    UniqueId::new(97, 1),
                     RuntimeFilterParticipantId::new(14),
                     ChannelId::new(15),
                     DeploymentEpoch::new(16),
@@ -5518,10 +5457,7 @@ mod tests {
                 )
                 .expect("native context");
             let service = Arc::new(RuntimeFilterService::new_for_lifecycle_test(
-                UniqueId {
-                    hi: query_id.hi,
-                    lo: query_id.lo,
-                },
+                UniqueId::new(query_id.high(), query_id.low()),
                 Arc::new(ManualClock(Mutex::new(started))),
                 Arc::new(NoopEvents),
                 Arc::new(NoopMemory),
@@ -5792,7 +5728,7 @@ mod tests {
         fn native_execution_getter_returns_the_query_owned_installed_service() {
             let manager = QueryContextManager::new_for_test();
             let query = query_id(9_101);
-            let finst = UniqueId { hi: 70, lo: 30 };
+            let finst = UniqueId::new(70, 30);
             manager
                 .ensure_native_context(
                     query,
@@ -5814,13 +5750,7 @@ mod tests {
                 .expect("strict native execution context");
 
             assert!(Arc::ptr_eq(native.service(), &query_owned));
-            assert_eq!(
-                native.query_id(),
-                UniqueId {
-                    hi: query.hi,
-                    lo: query.lo
-                }
-            );
+            assert_eq!(native.query_id(), UniqueId::new(query.high(), query.low()));
             assert_eq!(native.epoch(), DeploymentEpoch::new(6));
             assert_eq!(native.fragment_instance_id(), finst);
         }
@@ -5829,7 +5759,7 @@ mod tests {
         fn native_execution_getter_rejects_missing_install_cancelled_and_wrong_query() {
             let manager = QueryContextManager::new_for_test();
             let query = query_id(9_102);
-            let finst = UniqueId { hi: 70, lo: 30 };
+            let finst = UniqueId::new(70, 30);
             manager
                 .ensure_native_context(
                     query,
@@ -5881,7 +5811,7 @@ mod tests {
             }
 
             let error = manager
-                .runtime_filter_context_for_native_execution(query, UniqueId { hi: 70, lo: 30 })
+                .runtime_filter_context_for_native_execution(query, UniqueId::new(70, 30))
                 .expect_err("installing deployment is not executable");
             assert!(error.contains("Installing"), "{error}");
         }
@@ -6978,8 +6908,8 @@ mod tests {
         fn abort_query_terminalizes_deployment_and_preserves_finst_result() {
             let manager = QueryContextManager::new_for_test();
             let query = query_id(9_232);
-            let finst_a = UniqueId { hi: 9_233, lo: 1 };
-            let finst_b = UniqueId { hi: 9_233, lo: 2 };
+            let finst_a = UniqueId::new(9_233, 1);
+            let finst_b = UniqueId::new(9_233, 2);
             manager
                 .install_runtime_filter_deployment(query, lifecycle(), participant_install())
                 .expect("install");
@@ -6997,7 +6927,7 @@ mod tests {
         fn cancel_query_execution_terminalizes_matching_deployment_and_preserves_finst_result() {
             let manager = QueryContextManager::new_for_test();
             let query = query_id(9_234);
-            let finst = UniqueId { hi: 9_235, lo: 1 };
+            let finst = UniqueId::new(9_235, 1);
             manager
                 .install_runtime_filter_deployment(query, lifecycle(), participant_install())
                 .expect("install");
@@ -7017,8 +6947,8 @@ mod tests {
         fn cancel_finst_observer_terminalizes_deployment_and_preserves_query_result() {
             let manager = QueryContextManager::new_for_test();
             let query = query_id(9_236);
-            let finst_a = UniqueId { hi: 9_237, lo: 1 };
-            let finst_b = UniqueId { hi: 9_237, lo: 2 };
+            let finst_a = UniqueId::new(9_237, 1);
+            let finst_b = UniqueId::new(9_237, 2);
             manager
                 .install_runtime_filter_deployment(query, lifecycle(), participant_install())
                 .expect("install");

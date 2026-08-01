@@ -637,9 +637,8 @@ mod tests {
         let producer_binding_id = BindingId::new(2);
         let consumer_binding_id = BindingId::new(3);
         let witness_id = CoverageWitnessId::new(4);
-        let producer_instances =
-            BTreeSet::from([UniqueId { hi: 10, lo: 11 }, UniqueId { hi: 12, lo: 13 }]);
-        let consumer_instances = BTreeSet::from([UniqueId { hi: 14, lo: 15 }]);
+        let producer_instances = BTreeSet::from([UniqueId::new(10, 11), UniqueId::new(12, 13)]);
+        let consumer_instances = BTreeSet::from([UniqueId::new(14, 15)]);
 
         let deployment = RuntimeFilterChannelDeployment::new(
             channel_id,

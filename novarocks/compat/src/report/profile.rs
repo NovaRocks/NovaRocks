@@ -31,7 +31,10 @@ fn build_merged_profile(
     let merged = merge_pipeline_profiles(profiler);
     if include_runtime_filters {
         RuntimeFilterLifecycleRegistry::global().export_to_profile(
-            QueryKey::from_hi_lo(registration.query_id().hi(), registration.query_id().lo()),
+            QueryKey::from_hi_lo(
+                registration.query_id().high(),
+                registration.query_id().low(),
+            ),
             &merged,
         );
     }

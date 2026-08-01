@@ -149,13 +149,10 @@ mod tests {
 
     #[test]
     fn contribution_identity_keeps_stable_runtime_coordinates() {
-        let stream = ProducerStreamId::new(
-            BindingId::new(4),
-            UniqueId { hi: 5, lo: 6 },
-            PartitionId::new(7),
-        );
+        let stream =
+            ProducerStreamId::new(BindingId::new(4), UniqueId::new(5, 6), PartitionId::new(7));
         let identity = ContributionIdentity::new(
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
             RuntimeFilterParticipantId::new(3),
             ChannelId::new(8),
             DeploymentEpoch::new(9),
@@ -163,7 +160,7 @@ mod tests {
             ProducerSequence::new(10),
         );
 
-        assert_eq!(identity.query_id(), UniqueId { hi: 1, lo: 2 });
+        assert_eq!(identity.query_id(), UniqueId::new(1, 2));
         assert_eq!(identity.participant_id().get(), 3);
         assert_eq!(identity.channel_id().get(), 8);
         assert_eq!(identity.epoch().get(), 9);

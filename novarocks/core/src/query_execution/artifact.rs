@@ -915,7 +915,7 @@ fn derive_fragment_instance_id(
     if hi == 0 && lo == 0 {
         lo = 1;
     }
-    Ok(UniqueId { hi, lo })
+    Ok(UniqueId::new(hi, lo))
 }
 
 #[cfg(feature = "query-execution-contract-test-support")]
@@ -1403,7 +1403,7 @@ fn assemble_native_execution(
         )));
     }
 
-    let query_id = context.query_id.into_unique_id();
+    let query_id = UniqueId::new(context.query_id.high(), context.query_id.low());
     let root_fragment_id = schedule.root_fragment_id;
     let root = prepared
         .fragment(root_fragment_id)
@@ -1689,8 +1689,8 @@ fn assemble_native_execution(
 
 fn connector_writer_unique_id_bytes(value: UniqueId) -> [u8; 16] {
     let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&value.hi.to_be_bytes());
-    bytes[8..].copy_from_slice(&value.lo.to_be_bytes());
+    bytes[..8].copy_from_slice(&value.high().to_be_bytes());
+    bytes[8..].copy_from_slice(&value.low().to_be_bytes());
     bytes
 }
 
@@ -1974,7 +1974,7 @@ mod tests {
     #[test]
     fn connector_write_attachment_rejects_duplicate_and_mismatched_placements() {
         let execution = write_execution();
-        let schedule = write_schedule(UniqueId { hi: 3, lo: 30 });
+        let schedule = write_schedule(UniqueId::new(3, 30));
         let mut slot = None;
         attach_connector_write_plan(
             &mut slot,
@@ -1992,7 +1992,7 @@ mod tests {
         .expect_err("a query may carry only one write attachment");
         assert!(duplicate.message().contains("already has"));
 
-        let mismatched = write_schedule(UniqueId { hi: 3, lo: 31 });
+        let mismatched = write_schedule(UniqueId::new(3, 31));
         let mut mismatched_slot = None;
         let mismatch = attach_connector_write_plan(
             &mut mismatched_slot,
@@ -2040,21 +2040,21 @@ mod tests {
                 (
                     10,
                     vec![
-                        placement(10, 0, UniqueId { hi: 9, lo: 1 }, 0),
-                        placement(10, 1, UniqueId { hi: 1, lo: 1 }, 1),
+                        placement(10, 0, UniqueId::new(9, 1), 0),
+                        placement(10, 1, UniqueId::new(1, 1), 1),
                     ],
                 ),
                 (
                     20,
                     vec![
-                        placement(20, 0, UniqueId { hi: 8, lo: 1 }, 0),
-                        placement(20, 1, UniqueId { hi: 2, lo: 1 }, 1),
+                        placement(20, 0, UniqueId::new(8, 1), 0),
+                        placement(20, 1, UniqueId::new(2, 1), 1),
                     ],
                 ),
-                (30, vec![placement(30, 0, UniqueId { hi: 7, lo: 1 }, 0)]),
-                (40, vec![placement(40, 0, UniqueId { hi: 6, lo: 1 }, 1)]),
+                (30, vec![placement(30, 0, UniqueId::new(7, 1), 0)]),
+                (40, vec![placement(40, 0, UniqueId::new(6, 1), 1)]),
             ]),
-            root_finst_id: UniqueId { hi: 6, lo: 1 },
+            root_finst_id: UniqueId::new(6, 1),
             root_backend_idx: 1,
         };
         let edges = vec![stream_edge(30, 40, 400), stream_edge(10, 20, 200)];
@@ -2072,46 +2072,16 @@ mod tests {
         let projection = build_fragment_lifecycle_projection(&schedule, &edges, live_backends)
             .expect("valid lifecycle projection");
         let expected = vec![
-            ExchangeRouteManifest::new(
-                UniqueId { hi: 1, lo: 1 },
-                UniqueId { hi: 2, lo: 1 },
-                200,
-                1,
-                2,
-            )
-            .expect("valid route"),
-            ExchangeRouteManifest::new(
-                UniqueId { hi: 1, lo: 1 },
-                UniqueId { hi: 8, lo: 1 },
-                200,
-                1,
-                2,
-            )
-            .expect("valid route"),
-            ExchangeRouteManifest::new(
-                UniqueId { hi: 7, lo: 1 },
-                UniqueId { hi: 6, lo: 1 },
-                400,
-                0,
-                1,
-            )
-            .expect("valid route"),
-            ExchangeRouteManifest::new(
-                UniqueId { hi: 9, lo: 1 },
-                UniqueId { hi: 2, lo: 1 },
-                200,
-                0,
-                2,
-            )
-            .expect("valid route"),
-            ExchangeRouteManifest::new(
-                UniqueId { hi: 9, lo: 1 },
-                UniqueId { hi: 8, lo: 1 },
-                200,
-                0,
-                2,
-            )
-            .expect("valid route"),
+            ExchangeRouteManifest::new(UniqueId::new(1, 1), UniqueId::new(2, 1), 200, 1, 2)
+                .expect("valid route"),
+            ExchangeRouteManifest::new(UniqueId::new(1, 1), UniqueId::new(8, 1), 200, 1, 2)
+                .expect("valid route"),
+            ExchangeRouteManifest::new(UniqueId::new(7, 1), UniqueId::new(6, 1), 400, 0, 1)
+                .expect("valid route"),
+            ExchangeRouteManifest::new(UniqueId::new(9, 1), UniqueId::new(2, 1), 200, 0, 2)
+                .expect("valid route"),
+            ExchangeRouteManifest::new(UniqueId::new(9, 1), UniqueId::new(8, 1), 200, 0, 2)
+                .expect("valid route"),
         ];
 
         assert_eq!(projection.exchange_routes, expected);

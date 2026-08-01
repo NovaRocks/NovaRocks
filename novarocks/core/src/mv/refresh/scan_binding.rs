@@ -506,7 +506,7 @@ mod tests {
                 metadata.current_schema().clone(),
                 metadata.default_partition_spec().clone(),
                 format!("{}/data/_staging/test-overwrite", metadata.location()),
-                crate::common::types::UniqueId { hi: 0, lo: 107 },
+                novarocks_types::UniqueId::new(0, 107),
             )
             .with_table_metadata(metadata.clone()),
         );

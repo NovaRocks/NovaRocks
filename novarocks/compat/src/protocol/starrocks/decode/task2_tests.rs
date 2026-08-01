@@ -121,7 +121,7 @@ fn lake_meta_decode_declares_stable_storage_facts_without_resolving_storage() {
     use novarocks::connector::starrocks::lake_meta::{
         LakeMetaColumnKind, LakeMetaColumnRequest, LakeMetaStorageRequest, LakeMetaTabletRequest,
     };
-    use novarocks::runtime::query_context::QueryId;
+    use novarocks_types::QueryId;
 
     fn request() -> LakeMetaStorageRequest {
         LakeMetaStorageRequest::new(

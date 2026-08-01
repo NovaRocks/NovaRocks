@@ -298,7 +298,7 @@ mod tests {
         RuntimeFilterChannelRoutingView, RuntimeFilterRouteRole, RuntimeFilterRoutingShard,
     };
 
-    const QUERY: UniqueId = UniqueId { hi: 1, lo: 1 };
+    const QUERY: UniqueId = UniqueId::new(1, 1);
 
     fn pid(x: u32) -> RuntimeFilterParticipantId {
         RuntimeFilterParticipantId::new(x)

@@ -56,7 +56,7 @@ const PRODUCER_B: BindingId = BindingId::new(20);
 const CONSUMER: BindingId = BindingId::new(30);
 
 fn uid(lo: i64) -> UniqueId {
-    UniqueId { hi: 91, lo }
+    UniqueId::new(91, lo)
 }
 
 struct Clock(Instant);

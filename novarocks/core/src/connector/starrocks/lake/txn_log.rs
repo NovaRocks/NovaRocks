@@ -187,7 +187,7 @@ fn append_lake_txn_log_with_rowset_impl(
                 alter_metadata: None,
                 replication: None,
                 partition_id: Some(partition_id),
-                load_id: load_id.map(|id| (id.hi, id.lo)),
+                load_id: load_id.map(|id| (id.high(), id.low())),
             },
         };
         let write_routing = resolve_lake_batch_write_routing_with_slots(
@@ -442,7 +442,8 @@ fn append_lake_txn_log_with_rowset_impl(
             }
             num_delfile = i64::try_from(op_write.dels.len()).unwrap_or(i64::MAX);
         }
-        let label = load_id.map(|value| crate::common::types::format_uuid(value.hi, value.lo));
+        let label =
+            load_id.map(|value| crate::common::types::format_uuid(value.high(), value.low()));
         let finish_time_ms = unix_millis_now();
         schema::record_tablet_write_load_log(BeTabletWriteLoadLogRecord {
             backend_id,
@@ -461,8 +462,8 @@ fn append_lake_txn_log_with_rowset_impl(
         });
         schema::record_be_txn_active(BeTxnActiveRecord {
             backend_id,
-            load_id_hi: load_id.map(|value| value.hi),
-            load_id_lo: load_id.map(|value| value.lo),
+            load_id_hi: load_id.map(|value| value.high()),
+            load_id_lo: load_id.map(|value| value.low()),
             txn_id,
             partition_id,
             tablet_id: ctx.tablet_id,
@@ -545,7 +546,7 @@ fn append_full_upsert_through_storage_provider(
                     ..StorageWriteOperation::default()
                 }),
                 partition_id: Some(partition_id),
-                load_id: load_id.map(|id| (id.hi, id.lo)),
+                load_id: load_id.map(|id| (id.high(), id.low())),
                 ..StorageTransactionLog::default()
             });
         let data_file_name = build_txn_upsert_data_file_name(
@@ -698,7 +699,7 @@ fn record_storage_write_load_facts(
     let num_delfile = write
         .map(|write| i64::try_from(write.dels.len()).unwrap_or(i64::MAX))
         .unwrap_or(0);
-    let label = load_id.map(|value| crate::common::types::format_uuid(value.hi, value.lo));
+    let label = load_id.map(|value| crate::common::types::format_uuid(value.high(), value.low()));
     schema::record_tablet_write_load_log(BeTabletWriteLoadLogRecord {
         backend_id,
         begin_time_ms,
@@ -716,8 +717,8 @@ fn record_storage_write_load_facts(
     });
     schema::record_be_txn_active(BeTxnActiveRecord {
         backend_id,
-        load_id_hi: load_id.map(|value| value.hi),
-        load_id_lo: load_id.map(|value| value.lo),
+        load_id_hi: load_id.map(|value| value.high()),
+        load_id_lo: load_id.map(|value| value.low()),
         txn_id,
         partition_id,
         tablet_id: ctx.tablet_id,
@@ -824,7 +825,7 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
                 alter_metadata: None,
                 replication: None,
                 partition_id: Some(partition_id),
-                load_id: load_id.map(|id| (id.hi, id.lo)),
+                load_id: load_id.map(|id| (id.high(), id.low())),
             },
         };
         upsert_storage_write_rowset_in_txn_log(
@@ -4123,7 +4124,7 @@ fn upsert_storage_write_rowset_in_txn_log(
         ));
     }
     if let Some(load_id) = expected_load_id {
-        let expected = (load_id.hi, load_id.lo);
+        let expected = (load_id.high(), load_id.low());
         if let Some(actual) = txn_log.load_id
             && actual != expected
         {

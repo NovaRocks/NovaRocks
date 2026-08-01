@@ -183,7 +183,8 @@ impl EngineError {
             EngineErrorDetail::WriteCoordinatorGone { query_id } => {
                 format!(
                     "write coordinator not found for query {}/{}",
-                    query_id.hi, query_id.lo
+                    query_id.high(),
+                    query_id.low()
                 )
             }
             EngineErrorDetail::ProtocolDecode { message } => message.clone(),
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn write_coordinator_gone_maps_to_query_gone_report_status() {
-        let err = EngineError::write_coordinator_gone(UniqueId { hi: 11, lo: 22 });
+        let err = EngineError::write_coordinator_gone(UniqueId::new(11, 22));
         assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
         assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_QUERY_GONE);
         assert!(err.to_user_message().contains("11/22"));

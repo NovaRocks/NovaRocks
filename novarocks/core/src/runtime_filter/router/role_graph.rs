@@ -292,10 +292,7 @@ mod tests {
     }
 
     fn finst(raw: i64) -> UniqueId {
-        UniqueId {
-            hi: raw,
-            lo: raw + 100,
-        }
+        UniqueId::new(raw, raw + 100)
     }
 
     fn backends() -> LiveBackendSnapshot {
@@ -566,7 +563,7 @@ mod tests {
     #[test]
     fn contribution_authorization_is_independent_of_zero_based_stream_coordinates() {
         let identity = ContributionIdentity::new(
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
             pid(7),
             ChannelId::new(1),
             DeploymentEpoch::new(9),

@@ -677,20 +677,10 @@ mod tests {
         .expect("sealed operation session");
 
         session
-            .plan_manifest(&manifest(
-                operation_id,
-                cohort_id,
-                1,
-                UniqueId { hi: 1, lo: 11 },
-            ))
+            .plan_manifest(&manifest(operation_id, cohort_id, 1, UniqueId::new(1, 11)))
             .expect("first attempt");
         session
-            .plan_manifest(&manifest(
-                operation_id,
-                cohort_id,
-                2,
-                UniqueId { hi: 2, lo: 22 },
-            ))
+            .plan_manifest(&manifest(operation_id, cohort_id, 2, UniqueId::new(2, 22)))
             .expect("retry attempt");
         assert_eq!(plan_calls.load(Ordering::SeqCst), 2);
 
@@ -698,7 +688,7 @@ mod tests {
             operation_id,
             cohort_id,
             1,
-            UniqueId { hi: 3, lo: 33 },
+            UniqueId::new(3, 33),
         )) {
             Ok(_) => panic!("same attempt cannot change placement"),
             Err(error) => error,
@@ -749,7 +739,7 @@ mod tests {
             operation_id,
             unknown,
             1,
-            UniqueId { hi: 4, lo: 44 },
+            UniqueId::new(4, 44),
         )) {
             Ok(_) => panic!("unknown cohort cannot stage"),
             Err(error) => error,
@@ -761,15 +751,11 @@ mod tests {
             ConnectorWriteAbortOutcome::KnownUncommitted { .. }
         ));
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
-        let terminal_error = match session.plan_manifest(&manifest(
-            operation_id,
-            first,
-            2,
-            UniqueId { hi: 5, lo: 55 },
-        )) {
-            Ok(_) => panic!("terminal operation cannot stage"),
-            Err(error) => error,
-        };
+        let terminal_error =
+            match session.plan_manifest(&manifest(operation_id, first, 2, UniqueId::new(5, 55))) {
+                Ok(_) => panic!("terminal operation cannot stage"),
+                Err(error) => error,
+            };
         assert!(terminal_error.to_string().contains("terminal"));
         assert_eq!(plan_calls.load(Ordering::SeqCst), 0);
     }

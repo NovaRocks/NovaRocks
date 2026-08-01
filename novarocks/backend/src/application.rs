@@ -556,7 +556,6 @@ mod tests {
     };
     use novarocks::common::app_config::NovaRocksConfig;
     use novarocks::proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient;
-    use novarocks::query_execution::contract::QueryId;
     use novarocks::query_execution::lifecycle::contract::{
         decode_query_control_event, encode_abort_query_request, encode_query_control_attach,
         encode_query_control_command, encode_query_init_request,
@@ -574,6 +573,7 @@ mod tests {
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
         InitQueryRequest as ProtoInitQueryRequest,
     };
+    use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -613,10 +613,7 @@ mod tests {
                 )
                 .expect("valid backend identity"),
                 [ParticipantRole::FragmentExecutor],
-                [novarocks::UniqueId {
-                    hi: query_low,
-                    lo: 1,
-                }],
+                [novarocks_types::UniqueId::new(query_low, 1)],
                 ParticipantQueryOptions::new(QueryOptions::default()),
                 10_000,
                 [],

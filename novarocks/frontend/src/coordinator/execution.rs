@@ -34,7 +34,7 @@ use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
-    DistributedQueryRequest, ProfileTerminalBuilder, QueryId,
+    DistributedQueryRequest, ProfileTerminalBuilder,
 };
 use novarocks::query_execution::fragment_transport::{
     FetchOutcome, FragmentDispatcher, new_grpc_fragment_dispatcher,
@@ -46,6 +46,7 @@ use novarocks::query_execution::write::WriteTerminalBuilder;
 use novarocks::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 use novarocks_spi::connector::ConnectorWriteResolver;
+use novarocks_types::QueryId;
 
 use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};

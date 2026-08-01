@@ -10738,7 +10738,7 @@ async fn commit_iceberg_mv_target_files_with_ref(
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );
@@ -10862,7 +10862,7 @@ async fn commit_iceberg_mv_apply_with_ref(
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );

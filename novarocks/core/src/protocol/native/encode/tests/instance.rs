@@ -61,7 +61,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     let mut scan_ranges = BTreeMap::new();
     scan_ranges.insert(11, vec![scan_range]);
     let destination = crate::runtime::endpoint::FragmentDestination::new(
-        crate::common::types::UniqueId { hi: 3, lo: 4 },
+        novarocks_types::UniqueId::new(3, 4),
         crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.9", 8060)
             .expect("destination endpoint"),
     );
@@ -70,7 +70,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     let placement = crate::query_execution::schedule::FragmentInstancePlacement {
         fragment_id: 0,
         instance_index: 5,
-        finst_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
+        finst_id: novarocks_types::UniqueId::new(1, 2),
         backend_idx: 7,
         endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.7", 8060)
             .expect("placement endpoint"),
@@ -108,7 +108,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         ..Default::default()
     };
     let encoded = instance::encode_instance_params(
-        &crate::common::types::UniqueId { hi: 100, lo: 200 },
+        &novarocks_types::UniqueId::new(100, 200),
         &placement,
         &query_options,
         5,
@@ -178,7 +178,7 @@ fn instance_params_encoder_maps_starrocks_tablet_range() {
     let placement = crate::query_execution::schedule::FragmentInstancePlacement {
         fragment_id: 0,
         instance_index: 0,
-        finst_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
+        finst_id: novarocks_types::UniqueId::new(1, 2),
         backend_idx: 0,
         endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 8060)
             .expect("endpoint"),
@@ -199,7 +199,7 @@ fn instance_params_encoder_maps_starrocks_tablet_range() {
         ..Default::default()
     };
     let encoded = instance::encode_instance_params(
-        &crate::common::types::UniqueId { hi: 100, lo: 200 },
+        &novarocks_types::UniqueId::new(100, 200),
         &placement,
         &query_options,
         0,

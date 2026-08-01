@@ -691,17 +691,11 @@ fn decode_runtime_filter_contract(
 }
 
 fn unique_id_from_native(src: &crate::proto::common::UniqueId) -> UniqueId {
-    UniqueId {
-        hi: src.hi,
-        lo: src.lo,
-    }
+    UniqueId::new(src.hi, src.lo)
 }
 
 fn query_id_from_native(src: &crate::proto::common::UniqueId) -> QueryId {
-    QueryId {
-        hi: src.hi,
-        lo: src.lo,
-    }
+    QueryId::new(src.hi, src.lo)
 }
 
 #[cfg(test)]
@@ -766,12 +760,12 @@ mod tests {
     fn instance_params(query: UniqueId, finst: UniqueId) -> novarocks::InstanceParams {
         novarocks::InstanceParams {
             query_id: Some(common::UniqueId {
-                hi: query.hi,
-                lo: query.lo,
+                hi: query.high(),
+                lo: query.low(),
             }),
             fragment_instance_id: Some(common::UniqueId {
-                hi: finst.hi,
-                lo: finst.lo,
+                hi: finst.high(),
+                lo: finst.low(),
             }),
             backend_num: 3,
             query_options: Some(novarocks::QueryOptions {
@@ -805,15 +799,15 @@ mod tests {
 
     #[test]
     fn values_noop_decodes_to_validated_submission() {
-        let query = UniqueId { hi: 11, lo: 12 };
-        let finst = UniqueId { hi: 21, lo: 22 };
+        let query = UniqueId::new(11, 12);
+        let finst = UniqueId::new(21, 22);
 
         let decoded =
             decode_fragment_submission(&values_noop_fragment(), &instance_params(query, finst))
                 .expect("decode values/noop submission");
         let (submission, metadata) = decoded.into_parts();
 
-        assert_eq!(submission.instance().query_id(), QueryId { hi: 11, lo: 12 });
+        assert_eq!(submission.instance().query_id(), QueryId::new(11, 12));
         assert_eq!(submission.instance().fragment_instance_id().get(), finst);
         assert_eq!(submission.instance().backend_num().get(), 3);
         assert_eq!(metadata.backend_num(), 3);
@@ -833,7 +827,7 @@ mod tests {
         };
         let error = decode_fragment_submission(
             &fragment,
-            &instance_params(UniqueId { hi: 31, lo: 32 }, UniqueId { hi: 41, lo: 42 }),
+            &instance_params(UniqueId::new(31, 32), UniqueId::new(41, 42)),
         )
         .expect_err("missing root must fail");
 
@@ -844,7 +838,7 @@ mod tests {
 
     #[test]
     fn invalid_exchange_maps_are_checked_in_sorted_key_order() {
-        let mut params = instance_params(UniqueId { hi: 51, lo: 52 }, UniqueId { hi: 61, lo: 62 });
+        let mut params = instance_params(UniqueId::new(51, 52), UniqueId::new(61, 62));
         params.per_exch_num_senders.insert(9, 0);
         params.per_exch_num_senders.insert(3, -1);
 
@@ -860,8 +854,7 @@ mod tests {
 
     #[test]
     fn scan_range_errors_include_sorted_map_key_and_range_index() {
-        let mut params =
-            instance_params(UniqueId { hi: 131, lo: 132 }, UniqueId { hi: 141, lo: 142 });
+        let mut params = instance_params(UniqueId::new(131, 132), UniqueId::new(141, 142));
         params.per_node_scan_ranges.insert(
             11,
             novarocks::ScanRangeList {
@@ -891,7 +884,7 @@ mod tests {
 
         let error = decode_fragment_submission(
             &fragment,
-            &instance_params(UniqueId { hi: 91, lo: 92 }, UniqueId { hi: 101, lo: 102 }),
+            &instance_params(UniqueId::new(91, 92), UniqueId::new(101, 102)),
         )
         .expect_err("missing child payload must fail");
         let protocol = error.protocol().expect("protocol error");
@@ -919,7 +912,7 @@ mod tests {
 
         let error = decode_fragment_submission(
             &fragment,
-            &instance_params(UniqueId { hi: 111, lo: 112 }, UniqueId { hi: 121, lo: 122 }),
+            &instance_params(UniqueId::new(111, 112), UniqueId::new(121, 122)),
         )
         .expect_err("missing expression type must fail");
         let protocol = error.protocol().expect("protocol error");
@@ -957,7 +950,7 @@ mod tests {
 
         let error = decode_fragment_submission(
             &fragment,
-            &instance_params(UniqueId { hi: 211, lo: 212 }, UniqueId { hi: 221, lo: 222 }),
+            &instance_params(UniqueId::new(211, 212), UniqueId::new(221, 222)),
         )
         .expect_err("missing binary left operand must fail");
         let protocol = error.protocol().expect("protocol error");
@@ -984,7 +977,7 @@ mod tests {
 
         let error = decode_fragment_submission(
             &fragment,
-            &instance_params(UniqueId { hi: 231, lo: 232 }, UniqueId { hi: 241, lo: 242 }),
+            &instance_params(UniqueId::new(231, 232), UniqueId::new(241, 242)),
         )
         .expect_err("missing scan table must fail");
         let protocol = error.protocol().expect("protocol error");
@@ -1004,7 +997,7 @@ mod tests {
 
         let error = decode_fragment_submission(
             &fragment,
-            &instance_params(UniqueId { hi: 251, lo: 252 }, UniqueId { hi: 261, lo: 262 }),
+            &instance_params(UniqueId::new(251, 252), UniqueId::new(261, 262)),
         )
         .expect_err("false noop marker must fail");
         let protocol = error.protocol().expect("protocol error");
@@ -1014,8 +1007,7 @@ mod tests {
 
     #[test]
     fn submission_binding_errors_keep_binding_stage_identity() {
-        let mut params =
-            instance_params(UniqueId { hi: 151, lo: 152 }, UniqueId { hi: 161, lo: 162 });
+        let mut params = instance_params(UniqueId::new(151, 152), UniqueId::new(161, 162));
         params.per_exch_num_senders.insert(99, 1);
 
         let error = decode_fragment_submission(&values_noop_fragment(), &params)
@@ -1032,24 +1024,15 @@ mod tests {
     #[test]
     fn malformed_submission_has_zero_runtime_side_effects() {
         let unique = NEXT_TEST_ID.fetch_add(10, Ordering::Relaxed);
-        let query = UniqueId {
-            hi: unique,
-            lo: unique + 1,
-        };
-        let finst = UniqueId {
-            hi: unique + 2,
-            lo: unique + 3,
-        };
-        let query_id = QueryId {
-            hi: query.hi,
-            lo: query.lo,
-        };
+        let query = UniqueId::new(unique, unique + 1);
+        let finst = UniqueId::new(unique + 2, unique + 3);
+        let query_id = QueryId::new(query.high(), query.low());
         let exchange_key = ExchangeKey {
-            finst_id_hi: finst.hi,
-            finst_id_lo: finst.lo,
+            finst_id_hi: finst.high(),
+            finst_id_lo: finst.low(),
             node_id: 77,
         };
-        let rf_key = QueryKey::from_hi_lo(query.hi, query.lo);
+        let rf_key = QueryKey::from_hi_lo(query.high(), query.low());
         assert_runtime_state_absent(query_id, finst, exchange_key, rf_key);
 
         let malformed = plan::PlanFragment {

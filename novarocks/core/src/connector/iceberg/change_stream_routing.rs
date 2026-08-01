@@ -282,7 +282,7 @@ mod tests {
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             "file:///warehouse/db/t/staging".to_string(),
-            UniqueId { hi: 0, lo: 0 },
+            UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone())
     }

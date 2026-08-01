@@ -515,8 +515,8 @@ fn pending_key_fingerprint(key: PendingKey) -> [u8; 32] {
         } => {
             digest.update([2]);
             digest.update(binding_id.get().to_le_bytes());
-            digest.update(fragment_instance_id.hi.to_le_bytes());
-            digest.update(fragment_instance_id.lo.to_le_bytes());
+            digest.update(fragment_instance_id.high().to_le_bytes());
+            digest.update(fragment_instance_id.low().to_le_bytes());
             digest.update(partition_id.get().to_le_bytes());
             digest.update(sequence.get().to_le_bytes());
         }
@@ -526,8 +526,8 @@ fn pending_key_fingerprint(key: PendingKey) -> [u8; 32] {
         } => {
             digest.update([3]);
             digest.update(binding_id.get().to_le_bytes());
-            digest.update(fragment_instance_id.hi.to_le_bytes());
-            digest.update(fragment_instance_id.lo.to_le_bytes());
+            digest.update(fragment_instance_id.high().to_le_bytes());
+            digest.update(fragment_instance_id.low().to_le_bytes());
         }
     }
     digest.finalize().into()
@@ -570,8 +570,8 @@ fn envelope_fingerprint(envelope: &RuntimeFilterEnvelope) -> [u8; 32] {
     };
     let mut digest = Sha256::new();
     digest.update([kind_tag]);
-    digest.update(envelope.query_id().hi.to_le_bytes());
-    digest.update(envelope.query_id().lo.to_le_bytes());
+    digest.update(envelope.query_id().high().to_le_bytes());
+    digest.update(envelope.query_id().low().to_le_bytes());
     digest.update(envelope.channel_id().get().to_le_bytes());
     digest.update(envelope.deployment_epoch().get().to_le_bytes());
     match envelope.producer_open() {
@@ -1502,7 +1502,7 @@ mod tests {
     fn event_identity(edge: RouteEdgeId) -> TransportRouteEventIdentity {
         TransportRouteEventIdentity::new(
             RuntimeFilterEventIdentity::new(
-                UniqueId { hi: 1, lo: 1 },
+                UniqueId::new(1, 1),
                 RuntimeFilterParticipantId::new(7),
                 ChannelId::new(5),
                 DeploymentEpoch::new(9),
@@ -1777,13 +1777,13 @@ mod tests {
         Arc::new(
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::Contribution,
-                UniqueId { hi: 1, lo: 1 },
+                UniqueId::new(1, 1),
                 ChannelId::new(5),
                 DeploymentEpoch::new(9),
                 RuntimeFilterRouteIdentity::contribution(
                     ContributionRouteIdentity::try_new(
                         BindingId::new(91),
-                        UniqueId { hi: 92, lo: 93 },
+                        UniqueId::new(92, 93),
                         PartitionId::new(0),
                         ProducerSequence::new(sequence),
                     )
@@ -1802,13 +1802,13 @@ mod tests {
         Arc::new(
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::ProducerUnavailable,
-                UniqueId { hi: 1, lo: 1 },
+                UniqueId::new(1, 1),
                 ChannelId::new(5),
                 DeploymentEpoch::new(9),
                 RuntimeFilterRouteIdentity::producer_instance(
                     ProducerInstanceRouteIdentity::try_new(
                         BindingId::new(91),
-                        UniqueId { hi: 92, lo: 93 },
+                        UniqueId::new(92, 93),
                     )
                     .unwrap(),
                 ),
@@ -1825,13 +1825,13 @@ mod tests {
         Arc::new(
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::ProducerClosed,
-                UniqueId { hi: 1, lo: 1 },
+                UniqueId::new(1, 1),
                 ChannelId::new(5),
                 DeploymentEpoch::new(9),
                 RuntimeFilterRouteIdentity::contribution(
                     ContributionRouteIdentity::try_new(
                         BindingId::new(91),
-                        UniqueId { hi: 92, lo: 93 },
+                        UniqueId::new(92, 93),
                         PartitionId::new(0),
                         ProducerSequence::new(sequence),
                     )

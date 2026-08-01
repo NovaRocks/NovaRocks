@@ -619,19 +619,19 @@ mod tests {
         StarRocksTableSinkAssignment,
     };
     use crate::runtime::profile::RuntimeProfile;
-    use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use novarocks_types::QueryId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     use super::*;
 
     fn uid(hi: i64, lo: i64) -> UniqueId {
-        UniqueId { hi, lo }
+        UniqueId::new(hi, lo)
     }
 
     fn query_id(hi: i64, lo: i64) -> QueryId {
-        QueryId { hi, lo }
+        QueryId::new(hi, lo)
     }
 
     fn values_plan(node_id: i32) -> ExecPlan {
@@ -2101,11 +2101,11 @@ mod tests {
         let finst = uid(unique, unique + 2);
         let exchange_id = FragmentNodeId::new(41);
         let exchange_key = ExchangeKey {
-            finst_id_hi: finst.hi,
-            finst_id_lo: finst.lo,
+            finst_id_hi: finst.high(),
+            finst_id_lo: finst.low(),
             node_id: 41,
         };
-        let rf_key = QueryKey::from_hi_lo(query.hi, query.lo);
+        let rf_key = QueryKey::from_hi_lo(query.high(), query.low());
         let expected = schema(1, true);
         let program = program_with(
             ExecPlan {

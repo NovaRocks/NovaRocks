@@ -100,8 +100,8 @@ impl<'a> ScanRangeCarrier<'a> {
 }
 
 pub(crate) struct StarRocksPlanDecodeContext<'a> {
-    query_id: Option<novarocks::runtime::query_context::QueryId>,
-    fragment_instance_id: Option<novarocks::common::types::UniqueId>,
+    query_id: Option<novarocks_types::QueryId>,
+    fragment_instance_id: Option<novarocks_types::UniqueId>,
     scan_ranges: Option<ScanRangeCarrier<'a>>,
     broker_file_program_facts: Option<&'a BTreeMap<i32, BrokerFileProgramFacts>>,
     lake_scan_program_facts:
@@ -118,8 +118,8 @@ pub(crate) struct StarRocksPlanDecodeContext<'a> {
 impl<'a> StarRocksPlanDecodeContext<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        query_id: Option<novarocks::runtime::query_context::QueryId>,
-        fragment_instance_id: Option<novarocks::common::types::UniqueId>,
+        query_id: Option<novarocks_types::QueryId>,
+        fragment_instance_id: Option<novarocks_types::UniqueId>,
         scan_ranges: Option<ScanRangeCarrier<'a>>,
         broker_file_program_facts: Option<&'a BTreeMap<i32, BrokerFileProgramFacts>>,
         lake_scan_program_facts: Option<

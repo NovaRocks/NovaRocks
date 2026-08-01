@@ -65,7 +65,7 @@ pub fn build_txn_data_file_name(
     }
     let suffix = write_format_suffix(write_format);
     let load_id_seed = if let Some(load_id) = load_id {
-        format!("{}:{}", load_id.hi, load_id.lo)
+        format!("{}:{}", load_id.high(), load_id.low())
     } else {
         "none".to_string()
     };
@@ -192,7 +192,10 @@ pub fn txn_log_file_path_with_load_id(
         tablet_root_path,
         &format!(
             "{LOG_DIR}/{:016X}_{:016X}_{:016X}_{:016X}.log",
-            tablet_id as u64, txn_id as u64, load_id.hi as u64, load_id.lo as u64
+            tablet_id as u64,
+            txn_id as u64,
+            load_id.high() as u64,
+            load_id.low() as u64
         ),
     )
 }

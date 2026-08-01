@@ -24,6 +24,7 @@ use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use novarocks_types::UniqueId;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -741,10 +742,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         self.require_local_execution("FetchResult")?;
         let req = request.into_inner();
         let finst_id = match req.finst_id {
-            Some(id) => crate::UniqueId {
-                hi: id.hi,
-                lo: id.lo,
-            },
+            Some(id) => UniqueId::new(id.hi, id.lo),
             None => {
                 return Ok(tonic::Response::new(
                     proto::novarocks::FetchResultResponse {

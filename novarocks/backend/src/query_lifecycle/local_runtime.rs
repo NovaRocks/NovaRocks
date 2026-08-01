@@ -18,12 +18,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use novarocks::UniqueId;
 use novarocks::query_execution::lifecycle::{
     QueryExecutionId, QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminationReason,
     RuntimeFilterContribution,
 };
 use novarocks::runtime::native_query_lifecycle::NativeQueryLifecycleRuntime;
+use novarocks_types::UniqueId;
 
 use crate::ConnectorExecutionHost;
 use crate::fragment::control::FragmentControlRegistry;
@@ -93,8 +93,8 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
                     "NOVAROCKS_CANCEL_FINST query_hi={} query_lo={} finst_hi={} finst_lo={}",
                     execution_id.query_id().high(),
                     execution_id.query_id().low(),
-                    finst_id.hi,
-                    finst_id.lo
+                    finst_id.high(),
+                    finst_id.low()
                 );
             }
         }

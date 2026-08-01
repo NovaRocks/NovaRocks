@@ -1540,7 +1540,7 @@ mod tests {
 
     fn final_domain_contract(data_type: &DataType) -> RuntimeCompletionFenceContract {
         RuntimeCompletionFenceContract::try_from_install(
-            UniqueId { hi: 101, lo: 102 },
+            UniqueId::new(101, 102),
             DeploymentEpoch::new(103),
             ChannelId::new(104),
             CompletionFenceKind::CommittedDomainFrozen,
@@ -1620,7 +1620,7 @@ mod tests {
             ],
         );
         let final_contract = final_domain_contract(&DataType::Int64);
-        let final_stream = final_domain_stream(603, UniqueId { hi: 601, lo: 602 }, 604);
+        let final_stream = final_domain_stream(603, UniqueId::new(601, 602), 604);
         let final_sequence = ProducerSequence::new(605);
         let final_domain = RuntimeFilterContribution::FinalDomain(final_domain_shard(
             &final_contract,
@@ -1885,7 +1885,7 @@ mod tests {
         )
         .unwrap();
         let alternate_final = RuntimeCompletionFenceContract::try_from_install(
-            UniqueId { hi: 801, lo: 802 },
+            UniqueId::new(801, 802),
             DeploymentEpoch::new(803),
             ChannelId::new(804),
             CompletionFenceKind::CommittedDomainFrozen,
@@ -2132,7 +2132,7 @@ mod tests {
     fn final_domain_contract_mismatch_maps_to_schema_mismatch() {
         let fixtures = conformance_fixtures();
         let wrong_contract = RuntimeCompletionFenceContract::try_from_install(
-            UniqueId { hi: 701, lo: 702 },
+            UniqueId::new(701, 702),
             DeploymentEpoch::new(703),
             ChannelId::new(704),
             CompletionFenceKind::CommittedDomainFrozen,
@@ -3109,7 +3109,7 @@ mod tests {
     #[test]
     fn final_domain_round_trip_reconstructs_exact_fence_scope() {
         let contract = final_domain_contract(&DataType::Int64);
-        let instance = UniqueId { hi: 201, lo: 202 };
+        let instance = UniqueId::new(201, 202);
         let stream = final_domain_stream(203, instance, 204);
         let sequence = ProducerSequence::new(205);
         let (contribution, encoded) = encode_final_domain(
@@ -3141,10 +3141,7 @@ mod tests {
         let contract = final_domain_contract(&DataType::Int64);
         let stream = final_domain_stream(
             0xa1b2_c3d4,
-            UniqueId {
-                hi: 0x1122_3344_5566_7788,
-                lo: 0x2233_4455_6677_8899,
-            },
+            UniqueId::new(0x1122_3344_5566_7788, 0x2233_4455_6677_8899),
             0xb1c2_d3e4,
         );
         let sequence = ProducerSequence::new(0x3344_5566_7788_99aa);
@@ -3170,7 +3167,7 @@ mod tests {
     #[test]
     fn final_domain_rejects_fence_digest_binding_finst_partition_sequence_mismatch() {
         let contract = final_domain_contract(&DataType::Int64);
-        let instance = UniqueId { hi: 301, lo: 302 };
+        let instance = UniqueId::new(301, 302);
         let stream = final_domain_stream(303, instance, 304);
         let sequence = ProducerSequence::new(305);
         let (contribution, encoded) = encode_final_domain(
@@ -3182,7 +3179,7 @@ mod tests {
         let mismatched = [
             (final_domain_stream(999, instance, 304), sequence),
             (
-                final_domain_stream(303, UniqueId { hi: 999, lo: 302 }, 304),
+                final_domain_stream(303, UniqueId::new(999, 302), 304),
                 sequence,
             ),
             (final_domain_stream(303, instance, 999), sequence),
@@ -3237,7 +3234,7 @@ mod tests {
     fn final_domain_rejects_membership_schema_and_spliced_body_mismatch() {
         let contract = final_domain_contract(&DataType::Int64);
         let utf8_contract = final_domain_contract(&DataType::Utf8);
-        let stream = final_domain_stream(403, UniqueId { hi: 401, lo: 402 }, 404);
+        let stream = final_domain_stream(403, UniqueId::new(401, 402), 404);
         let sequence = ProducerSequence::new(405);
         let (contribution, encoded) = encode_final_domain(
             &contract,
@@ -3299,7 +3296,7 @@ mod tests {
 
     #[test]
     fn final_domain_keeps_invalid_schema_metadata_noncanonical() {
-        let stream = final_domain_stream(453, UniqueId { hi: 451, lo: 452 }, 454);
+        let stream = final_domain_stream(453, UniqueId::new(451, 452), 454);
         let sequence = ProducerSequence::new(455);
 
         let int_contract = final_domain_contract(&DataType::Int64);
@@ -3431,7 +3428,7 @@ mod tests {
             TimeUnit::Millisecond,
             Some(Arc::from("Asia/Shanghai")),
         ));
-        let stream = final_domain_stream(483, UniqueId { hi: 481, lo: 482 }, 484);
+        let stream = final_domain_stream(483, UniqueId::new(481, 482), 484);
         let sequence = ProducerSequence::new(485);
         let (_, encoded) = encode_final_domain(
             &contract,
@@ -3612,7 +3609,7 @@ mod tests {
     #[test]
     fn final_domain_exact_limit_succeeds_and_limit_minus_one_fails() {
         let contract = final_domain_contract(&DataType::Utf8);
-        let stream = final_domain_stream(503, UniqueId { hi: 501, lo: 502 }, 504);
+        let stream = final_domain_stream(503, UniqueId::new(501, 502), 504);
         let sequence = ProducerSequence::new(505);
         let contribution = RuntimeFilterContribution::FinalDomain(final_domain_shard(
             &contract,

@@ -86,10 +86,7 @@ struct QueryScopedRuntimeFilterEnvelopeIngress {
 
 impl RuntimeFilterEnvelopeIngress for QueryScopedRuntimeFilterEnvelopeIngress {
     fn accept(&self, envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
-        let query_id = QueryId {
-            hi: envelope.query_id().hi,
-            lo: envelope.query_id().lo,
-        };
+        let query_id = QueryId::new(envelope.query_id().high(), envelope.query_id().low());
         let Some(service) = self.manager.runtime_filter_service_for_ingress(query_id) else {
             return RuntimeFilterIngressResult::rejected(QUERY_UNAVAILABLE_REJECTION)
                 .expect("query-unavailable reason is non-empty");
@@ -213,8 +210,8 @@ mod tests {
 
     // The registered query the adapter looks up. Its `UniqueId` projection is the
     // envelope query id; `hi`/`lo` are arbitrary non-zero coordinates.
-    const QUERY: QueryId = QueryId { hi: 71, lo: 72 };
-    const QUERY_UID: UniqueId = UniqueId { hi: 71, lo: 72 };
+    const QUERY: QueryId = QueryId::new(71, 72);
+    const QUERY_UID: UniqueId = UniqueId::new(71, 72);
     // Loopback install coordinates (fixed epoch 9 / participant 3 mirror the
     // `runtime_filter::service` loopback-install fixture).
     const EPOCH: u64 = 9;
@@ -225,8 +222,8 @@ mod tests {
     // (`Artifact` / `Unavailable`) address this edge.
     const CONSUMER_ROUTE: u32 = 40;
     const WITNESS: u32 = 11;
-    const PRODUCER_FINST: UniqueId = UniqueId { hi: 1, lo: 2 };
-    const CONSUMER_FINST: UniqueId = UniqueId { hi: 1, lo: 3 };
+    const PRODUCER_FINST: UniqueId = UniqueId::new(1, 2);
+    const CONSUMER_FINST: UniqueId = UniqueId::new(1, 3);
 
     const QUERY_UNAVAILABLE_REASON: &str = "runtime filter ingress rejected [query-unavailable]: \
          runtime filter query is not active or in delivery grace";

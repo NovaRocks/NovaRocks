@@ -1,9 +1,9 @@
 use crate::thrift::frontend_service::TFrontendServiceSyncClient;
 use crate::thrift::types;
 use crate::thrift::{frontend_service, internal_service, status, status_code};
-use novarocks::common::types::format_uuid;
 use novarocks::connector::schema::SchemaScanContext;
 use novarocks::runtime::endpoint::RuntimeEndpoint;
+use novarocks_types::format_uuid;
 
 const FE_TIMEOUT_SECS: u64 = 5;
 

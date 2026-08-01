@@ -21,7 +21,6 @@ use std::num::NonZeroUsize;
 use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 use novarocks::cache::{ExternalDataCacheRangeOptions, datacache_block_cache_available};
 use novarocks::common::ids::SlotId;
-use novarocks::common::types::UniqueId;
 use novarocks::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind, ScanSourceContract};
 use novarocks::exec::node::scan::{
     HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange,
@@ -29,12 +28,13 @@ use novarocks::exec::node::scan::{
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks::runtime::fragment::instance::{BackendNum, FragmentInstanceId};
-use novarocks::runtime::query_context::QueryId;
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::{
     BrokerFileFormat, BrokerFileScanRange, DatacacheOptions, DeletionVectorDescriptor, FileFormat,
     FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat, ScanRangeParams,
 };
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 use super::{StarRocksFragmentDecodeError, decode_query_options, decode_runtime_endpoint};
 
@@ -425,10 +425,10 @@ pub(crate) fn decode_instance_parts(
         .transpose()?;
     Ok(DecodedStarRocksInstanceParts {
         query_id: QueryId::new(params.query_id.hi, params.query_id.lo),
-        fragment_instance_id: FragmentInstanceId::new(UniqueId {
-            hi: params.fragment_instance_id.hi,
-            lo: params.fragment_instance_id.lo,
-        }),
+        fragment_instance_id: FragmentInstanceId::new(UniqueId::new(
+            params.fragment_instance_id.hi,
+            params.fragment_instance_id.lo,
+        )),
         backend_num,
         query_options,
         pipeline_dop,
@@ -605,10 +605,7 @@ fn decode_scan_range_params(
                             )
                         })?;
                         facts
-                            .stream_load_path(UniqueId {
-                                hi: load_id.hi,
-                                lo: load_id.lo,
-                            })
+                            .stream_load_path(UniqueId::new(load_id.hi, load_id.lo))
                             .ok_or_else(|| {
                                 StarRocksFragmentDecodeError::missing(
                                     range_path.clone().field("load_id"),

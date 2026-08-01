@@ -19,12 +19,12 @@
 
 use std::fmt;
 
-use novarocks::common::types::UniqueId;
 use novarocks::query_execution::lifecycle::QueryExecutionId;
-use novarocks::runtime::query_context::QueryId;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
 };
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeFragmentCancelRequest {

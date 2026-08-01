@@ -200,8 +200,8 @@ impl ExchangeRegistration {
                 .get(node_id)
                 .expect("validated submission has every exchange assignment");
             let key = exchange::ExchangeKey {
-                finst_id_hi: finst_id.hi,
-                finst_id_lo: finst_id.lo,
+                finst_id_hi: finst_id.high(),
+                finst_id_lo: finst_id.low(),
                 node_id: node_id.get(),
             };
             if let Err(error) = exchange::try_register_expected_chunk_schema(

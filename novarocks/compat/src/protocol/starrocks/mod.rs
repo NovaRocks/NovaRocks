@@ -51,8 +51,8 @@ mod tests {
         per_driver: BTreeMap<i32, BTreeMap<i32, Vec<TScanRangeParams>>>,
     ) -> TPlanFragmentExecParams {
         TPlanFragmentExecParams::new(
-            TUniqueId::new(1, 2),
-            TUniqueId::new(3, 4),
+            TUniqueId { hi: 1, lo: 2 },
+            TUniqueId { hi: 3, lo: 4 },
             per_node_scan_ranges,
             BTreeMap::new(),
             None::<Vec<TPlanFragmentDestination>>,
@@ -124,7 +124,7 @@ mod tests {
         let current = TNetworkAddress::new("current-be".to_string(), 8060);
         let legacy = TNetworkAddress::new("legacy-be".to_string(), 9060);
         let destination = TPlanFragmentDestination::new(
-            TUniqueId::new(5, 6),
+            TUniqueId { hi: 5, lo: 6 },
             Some(legacy.clone()),
             Some(current),
             None::<i32>,
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(decoded.endpoint().host(), "current-be");
 
         let legacy_only = TPlanFragmentDestination::new(
-            TUniqueId::new(5, 6),
+            TUniqueId { hi: 5, lo: 6 },
             Some(legacy),
             None::<TNetworkAddress>,
             None::<i32>,
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(decoded.endpoint().host(), "legacy-be");
 
         let missing = TPlanFragmentDestination::new(
-            TUniqueId::new(5, 6),
+            TUniqueId { hi: 5, lo: 6 },
             None::<TNetworkAddress>,
             None::<TNetworkAddress>,
             None::<i32>,
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn legacy_endpoint_validation_reports_the_legacy_field_path() {
         let destination = TPlanFragmentDestination::new(
-            TUniqueId::new(5, 6),
+            TUniqueId { hi: 5, lo: 6 },
             Some(TNetworkAddress::new("legacy-be".to_string(), 0)),
             None::<TNetworkAddress>,
             None::<i32>,

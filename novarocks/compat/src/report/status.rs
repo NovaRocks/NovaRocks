@@ -1,15 +1,15 @@
 use std::collections::BTreeMap;
 
 use crate::thrift::{data_cache, frontend_service, runtime_profile, status, status_code, types};
-use novarocks::common::types::UniqueId;
 use novarocks::connector::iceberg::{
     CompatIcebergColumnStats, CompatIcebergDataFile, CompatIcebergFileContent,
     CompatIcebergPartitionValue, CompatIcebergSinkCommitInfo,
 };
 use novarocks::novarocks_logging::debug;
-use novarocks::runtime::query_context::QueryId;
 use novarocks::runtime::sink_commit;
 use novarocks_spi::connector::ConnectorStagedReport;
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 pub(crate) struct ExecStatusReportInput {
     pub(crate) finst_id: UniqueId,
@@ -113,14 +113,14 @@ pub(crate) fn build_report_params(
 
     frontend_service::TReportExecStatusParams::new(
         frontend_service::FrontendServiceVersion::V1,
-        Some(types::TUniqueId {
-            hi: input.query_id.hi(),
-            lo: input.query_id.lo(),
-        }),
+        Some(types::TUniqueId::new(
+            input.query_id.high(),
+            input.query_id.low(),
+        )),
         Some(input.backend_num),
         Some(types::TUniqueId {
-            hi: input.finst_id.hi,
-            lo: input.finst_id.lo,
+            hi: input.finst_id.high(),
+            lo: input.finst_id.low(),
         }),
         Some(status),
         Some(input.done),

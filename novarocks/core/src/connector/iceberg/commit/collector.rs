@@ -982,7 +982,7 @@ mod parity_tests {
             schema,
             Arc::new(iceberg::spec::PartitionSpec::unpartition_spec()),
             "file:///tmp/staging".to_string(),
-            UniqueId { hi: 0, lo: 0 },
+            UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata)
     }
@@ -1038,7 +1038,7 @@ mod parity_tests {
                 .expect("partition spec")
                 .clone(),
             "file:///tmp/staging".to_string(),
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
         )
         .with_table_metadata(metadata.clone());
         (collector, metadata, spec_id)
@@ -1195,7 +1195,7 @@ mod parity_tests {
             schema,
             spec,
             "file:///tmp/staging".to_string(),
-            UniqueId { hi: 0, lo: 0 },
+            UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone());
         let actual = collector
@@ -1241,7 +1241,7 @@ mod parity_tests {
             schema,
             spec,
             "file:///tmp/staging".to_string(),
-            UniqueId { hi: 0, lo: 0 },
+            UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone());
         let actual = collector
@@ -1383,7 +1383,7 @@ mod tests {
             schema,
             Arc::new(PartitionSpec::unpartition_spec()),
             "file:///tmp/staging".to_string(),
-            UniqueId { hi: 0, lo: 0 },
+            UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata)
     }
@@ -1686,7 +1686,7 @@ mod tests {
                 .expect("partition spec")
                 .clone(),
             "file:///tmp/staging".to_string(),
-            UniqueId { hi: 0, lo: 0 },
+            UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata)
     }
@@ -2004,7 +2004,7 @@ mod tests {
             schema,
             spec,
             "file:///tmp/staging".to_string(),
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         );
         collector.inject_delete_group(PositionDeleteGroup {
             referenced_data_file: "file:///tmp/data.parquet".to_string(),

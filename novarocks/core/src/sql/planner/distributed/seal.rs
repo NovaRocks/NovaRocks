@@ -710,10 +710,7 @@ mod tests {
                     vec![FragmentInstancePlacement {
                         fragment_id: fragment.fragment_id,
                         instance_index: 0,
-                        finst_id: UniqueId {
-                            hi: 1,
-                            lo: i64::from(fragment.fragment_id),
-                        },
+                        finst_id: UniqueId::new(1, i64::from(fragment.fragment_id)),
                         backend_idx: 0,
                         endpoint: endpoint.clone(),
                         scan_ranges: BTreeMap::new(),
@@ -734,10 +731,7 @@ mod tests {
         SchedulingPlan {
             root_fragment_id: plan.root_fragment_id(),
             by_fragment,
-            root_finst_id: UniqueId {
-                hi: 1,
-                lo: i64::from(plan.root_fragment_id()),
-            },
+            root_finst_id: UniqueId::new(1, i64::from(plan.root_fragment_id())),
             root_backend_idx: 0,
         }
     }

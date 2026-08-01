@@ -295,10 +295,7 @@ fn connector_execution_id(
 ) -> novarocks_spi::connector::ConnectorWriteExecutionId {
     let query_id = execution_id.query_id();
     novarocks_spi::connector::ConnectorWriteExecutionId::new(
-        unique_id_bytes(UniqueId {
-            hi: query_id.high(),
-            lo: query_id.low(),
-        }),
+        unique_id_bytes(UniqueId::new(query_id.high(), query_id.low())),
         execution_id.attempt_id().get(),
     )
 }
@@ -331,8 +328,8 @@ fn writer_manifest_digest(
 
 fn unique_id_bytes(value: UniqueId) -> [u8; 16] {
     let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&value.hi.to_be_bytes());
-    bytes[8..].copy_from_slice(&value.lo.to_be_bytes());
+    bytes[..8].copy_from_slice(&value.high().to_be_bytes());
+    bytes[8..].copy_from_slice(&value.low().to_be_bytes());
     bytes
 }
 
@@ -392,13 +389,13 @@ mod tests {
                 (
                     3,
                     vec![
-                        placement(3, 0, UniqueId { hi: 3, lo: 30 }, 8),
-                        placement(3, 1, UniqueId { hi: 3, lo: 31 }, 2),
+                        placement(3, 0, UniqueId::new(3, 30), 8),
+                        placement(3, 1, UniqueId::new(3, 31), 2),
                     ],
                 ),
-                (9, vec![placement(9, 0, UniqueId { hi: 9, lo: 90 }, 8)]),
+                (9, vec![placement(9, 0, UniqueId::new(9, 90), 8)]),
             ]),
-            root_finst_id: UniqueId { hi: 9, lo: 90 },
+            root_finst_id: UniqueId::new(9, 90),
             root_backend_idx: 8,
         };
         let operation_id = ConnectorWriteOperationId::from_bytes([7; 16]);
@@ -450,11 +447,8 @@ mod tests {
     fn manifest_rejects_missing_terminal_fragment_and_empty_writer_set() {
         let schedule = SchedulingPlan {
             root_fragment_id: 9,
-            by_fragment: BTreeMap::from([(
-                9,
-                vec![placement(9, 0, UniqueId { hi: 9, lo: 90 }, 8)],
-            )]),
-            root_finst_id: UniqueId { hi: 9, lo: 90 },
+            by_fragment: BTreeMap::from([(9, vec![placement(9, 0, UniqueId::new(9, 90), 8)])]),
+            root_finst_id: UniqueId::new(9, 90),
             root_backend_idx: 8,
         };
         let operation_id = ConnectorWriteOperationId::from_bytes([7; 16]);

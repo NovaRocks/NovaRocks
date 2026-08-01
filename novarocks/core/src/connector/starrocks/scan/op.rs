@@ -180,10 +180,7 @@ impl LakeScanSchemaMeta {
             table_id,
             schema_id,
             fe_addr: None,
-            query_id: query_id.map(|query_id| UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
+            query_id: query_id.map(|query_id| UniqueId::new(query_id.high(), query_id.low())),
             native_tablet_schema: Some(tablet_schema),
             native_column_hints: Some(column_hints),
             table_schema_provider: None,
@@ -890,7 +887,7 @@ mod tests {
     #[test]
     fn deferred_lake_scan_resolution_keeps_protocol_neutral_identity_and_tablets() {
         let input = DeferredLakeScanResolution::new(
-            Some(QueryId { hi: 1, lo: 2 }),
+            Some(QueryId::new(1, 2)),
             LakeTableIdentity {
                 catalog: "default_catalog".to_string(),
                 db_name: "db".to_string(),
@@ -907,7 +904,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(input.query_id, Some(QueryId { hi: 1, lo: 2 }));
+        assert_eq!(input.query_id, Some(QueryId::new(1, 2)));
         assert_eq!(input.table.cache_key(), "default_catalog:10:20:30");
         assert_eq!(input.tablets.len(), 1);
         assert_eq!(input.tablets[0].tablet_id, 300);

@@ -17,8 +17,8 @@
 //! Integration tests for the service control surface.
 
 use crate::common::{TestConfig, test_query_id, unique_query_id};
-use novarocks::common::types::UniqueId;
 use novarocks::service::fragment_control::cancel_runtime_fragment;
+use novarocks_types::UniqueId;
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -27,16 +27,16 @@ mod common;
 fn test_service_module_initialization() {
     // Test that service modules can be imported and used
     let query_id = test_query_id();
-    assert_eq!(query_id.hi, 1234567890);
-    assert_eq!(query_id.lo, 9876543210);
+    assert_eq!(query_id.high(), 1234567890);
+    assert_eq!(query_id.low(), 9876543210);
 }
 
 #[test]
 fn test_unique_id_creation() {
     // Test UniqueId creation and comparison
-    let id1 = UniqueId { hi: 1, lo: 2 };
-    let id2 = UniqueId { hi: 1, lo: 2 };
-    let id3 = UniqueId { hi: 1, lo: 3 };
+    let id1 = UniqueId::new(1, 2);
+    let id2 = UniqueId::new(1, 2);
+    let id3 = UniqueId::new(1, 3);
 
     assert_eq!(id1, id2);
     assert_ne!(id1, id3);

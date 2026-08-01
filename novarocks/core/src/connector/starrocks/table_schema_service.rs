@@ -232,7 +232,7 @@ fn build_flight_key(request: &TableSchemaRequest, isolated_retry: bool) -> Strin
             let query_id = request
                 .query_id
                 .as_ref()
-                .map(|id| format!("{}:{}", id.hi, id.lo))
+                .map(|id| format!("{}:{}", id.high(), id.low()))
                 .unwrap_or_else(|| "missing".to_string());
             format!(
                 "isolated-scan:{}:{}:{}:{}:{}",
@@ -370,7 +370,7 @@ mod tests {
             schema_id: 3,
             source: TableSchemaRequestSource::Scan,
             tablet_id: Some(4),
-            query_id: Some(crate::common::types::UniqueId { hi: 5, lo: 6 }),
+            query_id: Some(novarocks_types::UniqueId::new(5, 6)),
             txn_id: None,
         }
     }

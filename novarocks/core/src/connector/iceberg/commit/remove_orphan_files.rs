@@ -551,7 +551,7 @@ mod tests {
                     metadata.current_schema().clone(),
                     metadata.default_partition_spec().clone(),
                     format!("{table_location}/staging"),
-                    crate::common::types::UniqueId { hi: 0, lo: 0 },
+                    novarocks_types::UniqueId::new(0, 0),
                 )
                 .with_table_metadata(metadata.clone()),
             );

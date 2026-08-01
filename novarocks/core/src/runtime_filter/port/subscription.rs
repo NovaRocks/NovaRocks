@@ -222,9 +222,9 @@ mod tests {
 
     #[test]
     fn subscription_request_keeps_binding_and_fragment_instance_identity() {
-        let request = SubscriptionRequest::new(BindingId::new(3), UniqueId { hi: 4, lo: 5 });
+        let request = SubscriptionRequest::new(BindingId::new(3), UniqueId::new(4, 5));
 
         assert_eq!(request.binding_id().get(), 3);
-        assert_eq!(request.fragment_instance_id(), UniqueId { hi: 4, lo: 5 });
+        assert_eq!(request.fragment_instance_id(), UniqueId::new(4, 5));
     }
 }

@@ -1104,7 +1104,7 @@ pub(crate) fn handle_stream_load(
     let mut txn_id = 0_i64;
     let mut begin_ok = false;
     let mut file_lease: Option<StreamLoadFileLease> = None;
-    let mut finst_id: Option<novarocks::common::types::UniqueId> = None;
+    let mut finst_id: Option<novarocks_types::UniqueId> = None;
     let mut commit_infos: Vec<TabletCommitInfo> = Vec::new();
     let mut fail_infos: Vec<TabletFailInfo> = Vec::new();
     let mut final_error: Option<ApiError> = None;
@@ -1322,7 +1322,7 @@ pub(crate) fn handle_transaction_load(
         let (temp_path, read_ms) = write_request_body_to_temp_file(&body)?;
         let mut file_lease =
             StreamLoadFileLease::new(Arc::clone(&service.registry), temp_path.clone());
-        let mut finst_id: Option<novarocks::common::types::UniqueId> = None;
+        let mut finst_id: Option<novarocks_types::UniqueId> = None;
         let load_work = (|| -> Result<(), ApiError> {
             let load_id = random_unique_id();
             file_lease.register(load_id.clone());
@@ -1952,7 +1952,7 @@ mod file_lease_tests {
             .expect("create stream load lease test file")
             .write_all(b"payload")
             .expect("write stream load lease test file");
-        let load_id = TUniqueId::new(911, 912);
+        let load_id = TUniqueId { hi: 911, lo: 912 };
 
         let mut lease = StreamLoadFileLease::new(Arc::clone(&registry), path.clone());
         lease.register(load_id.clone());

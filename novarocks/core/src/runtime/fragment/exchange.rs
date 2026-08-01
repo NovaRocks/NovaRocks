@@ -36,8 +36,8 @@ pub(crate) fn materialize_exchange_bindings(
             .get(node_id)
             .expect("submission validation guarantees an exchange assignment per contract");
         let key = ExchangeKey {
-            finst_id_hi: finst.hi,
-            finst_id_lo: finst.lo,
+            finst_id_hi: finst.high(),
+            finst_id_lo: finst.low(),
             node_id: node_id.get(),
         };
         bindings.insert(
@@ -104,7 +104,7 @@ mod tests {
     ) -> FragmentInstanceSpec {
         FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId { hi: 1, lo: 2 },
+            QueryId::new(1, 2),
             FragmentInstanceId::new(fragment_instance_id),
             ScanAssignments::default(),
             exchange_inputs,
@@ -127,7 +127,7 @@ mod tests {
                 node_id,
                 ExchangeInputAssignment::new(NonZeroUsize::new(3).expect("non-zero sender count")),
             )])),
-            UniqueId { hi: 11, lo: 22 },
+            UniqueId::new(11, 22),
         );
 
         let bindings = materialize_exchange_bindings(&program, &instance);

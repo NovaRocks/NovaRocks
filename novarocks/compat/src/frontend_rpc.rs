@@ -1052,9 +1052,10 @@ impl TableSchemaProvider for CompatTableSchemaProvider {
                 }),
                 source: Some(source),
                 tablet_id: request.tablet_id,
-                query_id: request
-                    .query_id
-                    .map(|id| types::TUniqueId::new(id.hi, id.lo)),
+                query_id: request.query_id.map(|id| types::TUniqueId {
+                    hi: id.high(),
+                    lo: id.low(),
+                }),
                 txn_id: request.txn_id,
             }]),
         };

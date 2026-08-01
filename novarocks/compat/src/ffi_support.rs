@@ -23,12 +23,13 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use novarocks::FetchResult;
 use novarocks::common::failpoint::{self, FailPointMode};
 use novarocks::common::result_batch::ResultBatch;
 use novarocks::novarocks_logging::error;
-use novarocks::runtime::query_context::QueryId;
 use novarocks::service::internal_rpc;
-use novarocks::{FetchResult, UniqueId};
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 use prost::Message;
 
 mod proto {
@@ -50,7 +51,7 @@ const FETCH_TIMEOUT: i32 = 4;
 const FETCH_NOT_READY: i32 = 4;
 
 fn unique_id(hi: i64, lo: i64) -> UniqueId {
-    UniqueId { hi, lo }
+    UniqueId::new(hi, lo)
 }
 
 fn result_batch_to_thrift(
@@ -401,7 +402,7 @@ pub(crate) fn notify_fetch_ready(finst_id: UniqueId) {
         unsafe extern "C" {
             fn novarocks_compat_notify_fetch_ready(finst_id_hi: i64, finst_id_lo: i64);
         }
-        novarocks_compat_notify_fetch_ready(finst_id.hi, finst_id.lo);
+        novarocks_compat_notify_fetch_ready(finst_id.high(), finst_id.low());
     }
 }
 

@@ -295,7 +295,7 @@ pub(crate) fn execute_native_submission(
         sink,
         exchange_bindings,
         scan_bindings,
-        Some((fragment_instance_id.hi, fragment_instance_id.lo)),
+        Some((fragment_instance_id.high(), fragment_instance_id.low())),
         context.profiler,
         pipeline_dop,
         runtime_state,
@@ -357,8 +357,8 @@ mod tests {
         ));
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId { hi: 81, lo: 82 },
-            FragmentInstanceId::new(UniqueId { hi: 83, lo: 84 }),
+            QueryId::new(81, 82),
+            FragmentInstanceId::new(UniqueId::new(83, 84)),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             FragmentSinkAssignment::None,

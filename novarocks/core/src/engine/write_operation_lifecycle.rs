@@ -118,7 +118,7 @@ fn staged_artifacts_from_writer_outputs(
 }
 
 fn format_unique_id(id: &crate::common::types::UniqueId) -> String {
-    format!("{}/{}", id.hi, id.lo)
+    format!("{}/{}", id.high(), id.low())
 }
 
 fn operation_kind_for_commit_op_kind(kind: CommitOpKind) -> IcebergOperationKind {
@@ -192,10 +192,10 @@ pub(crate) mod test_support {
     };
 
     fn staging_writer_key() -> WriterKey {
-        let query_id = UniqueId { hi: 10, lo: 20 };
+        let query_id = UniqueId::new(10, 20);
         WriterKey {
             query_id,
-            fragment_instance_id: UniqueId { hi: 101, lo: 201 },
+            fragment_instance_id: UniqueId::new(101, 201),
             backend_num: 0,
         }
     }
@@ -216,7 +216,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn write_commit_with_data_file() -> WriteCommitInput {
-        let query_id = UniqueId { hi: 10, lo: 20 };
+        let query_id = UniqueId::new(10, 20);
         let writer_key = staging_writer_key();
         WriteCommitInput {
             write_id: query_id,
@@ -225,7 +225,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn write_abort_with_data_file() -> WriteAbortInput {
-        let query_id = UniqueId { hi: 10, lo: 20 };
+        let query_id = UniqueId::new(10, 20);
         let writer_key = staging_writer_key();
         WriteAbortInput {
             write_id: query_id,
@@ -258,7 +258,7 @@ mod tests {
     }
 
     fn id(hi: i64, lo: i64) -> UniqueId {
-        UniqueId { hi, lo }
+        UniqueId::new(hi, lo)
     }
 
     fn key(

@@ -499,7 +499,7 @@ mod tests {
     }
 
     fn finst() -> UniqueId {
-        UniqueId { hi: 1, lo: 1 }
+        UniqueId::new(1, 1)
     }
 
     fn exchange_task(
@@ -510,8 +510,8 @@ mod tests {
         ExchangeSendTask {
             frame: ExchangeFrame {
                 destination: RuntimeEndpoint::new("be-2", 9060).expect("destination"),
-                destination_fragment_instance_id: UniqueId { hi: 2, lo: 3 },
-                sender_fragment_instance_id: UniqueId { hi: 4, lo: 5 },
+                destination_fragment_instance_id: UniqueId::new(2, 3),
+                sender_fragment_instance_id: UniqueId::new(4, 5),
                 destination_node_id: 6,
                 sender_id: 7,
                 backend_number: 8,
@@ -552,11 +552,8 @@ mod tests {
         let frame = &frames[0];
         assert_eq!(frame.destination.host(), "be-2");
         assert_eq!(frame.destination.port(), 9060);
-        assert_eq!(
-            frame.destination_fragment_instance_id,
-            UniqueId { hi: 2, lo: 3 }
-        );
-        assert_eq!(frame.sender_fragment_instance_id, UniqueId { hi: 4, lo: 5 });
+        assert_eq!(frame.destination_fragment_instance_id, UniqueId::new(2, 3));
+        assert_eq!(frame.sender_fragment_instance_id, UniqueId::new(4, 5));
         assert_eq!(frame.destination_node_id, 6);
         assert_eq!(frame.sender_id, 7);
         assert_eq!(frame.backend_number, 8);

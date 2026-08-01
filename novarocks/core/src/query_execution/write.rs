@@ -590,10 +590,7 @@ fn connector_writer_identity_from_native(
     let fragment_instance_id = writer
         .fragment_instance_id
         .as_ref()
-        .map(|id| UniqueId {
-            hi: id.hi,
-            lo: id.lo,
-        })
+        .map(|id| UniqueId::new(id.hi, id.lo))
         .ok_or_else(|| {
             contract_violation("connector staged report writer is missing fragment instance id")
         })?;
@@ -790,10 +787,9 @@ fn validate_connector_frame_identity(
         || writer.operation_id.iter().all(|byte| *byte == 0)
         || writer.execution_query_id != wire_query_id
         || writer.execution_attempt_id == 0
-        || writer
-            .fragment_instance_id
-            .as_ref()
-            .is_none_or(|id| id.hi != fragment_instance_id.hi || id.lo != fragment_instance_id.lo)
+        || writer.fragment_instance_id.as_ref().is_none_or(|id| {
+            id.hi != fragment_instance_id.high() || id.lo != fragment_instance_id.low()
+        })
         || writer.backend_num != backend_num
         || writer.sink_ordinal != 0
         || writer.connector_incarnation.len() != 16
@@ -826,8 +822,8 @@ fn validate_connector_frame_identity(
 
 fn unique_id_to_be_bytes(id: UniqueId) -> [u8; 16] {
     let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&id.hi.to_be_bytes());
-    bytes[8..].copy_from_slice(&id.lo.to_be_bytes());
+    bytes[..8].copy_from_slice(&id.high().to_be_bytes());
+    bytes[8..].copy_from_slice(&id.low().to_be_bytes());
     bytes
 }
 
@@ -846,16 +842,16 @@ mod tests {
     use crate::query_execution::lifecycle::AttemptId;
 
     fn query_id() -> UniqueId {
-        UniqueId { hi: 7, lo: 11 }
+        UniqueId::new(7, 11)
     }
 
     fn fragment_instance_id() -> UniqueId {
-        UniqueId { hi: 13, lo: 17 }
+        UniqueId::new(13, 17)
     }
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
-            QueryId::new(query_id().hi, query_id().lo),
+            QueryId::new(query_id().high(), query_id().low()),
             AttemptId::new(23).expect("nonzero attempt"),
         )
         .expect("execution id")
@@ -875,8 +871,8 @@ mod tests {
                 execution_query_id: query_id_to_be_bytes(execution_id()).to_vec(),
                 execution_attempt_id: execution_id().attempt_id().get(),
                 fragment_instance_id: Some(common::UniqueId {
-                    hi: fragment_instance_id().hi,
-                    lo: fragment_instance_id().lo,
+                    hi: fragment_instance_id().high(),
+                    lo: fragment_instance_id().low(),
                 }),
                 fragment_id: 29,
                 backend_num: 31,
@@ -1042,7 +1038,7 @@ mod tests {
         let mut missing = generic_commit(vec![frame(b"report", 0, 1, b"report")]);
         let mut absent = writer_commit_input(Vec::new());
         absent.writer_id = 1;
-        absent.writer_key.fragment_instance_id = UniqueId { hi: 41, lo: 43 };
+        absent.writer_key.fragment_instance_id = UniqueId::new(41, 43);
         absent.writer_key.backend_num = 47;
         missing.writers.push(absent);
         let error = ConnectorWriteCommitInput::try_extract(&missing)
@@ -1090,7 +1086,7 @@ mod tests {
         second_writer.backend_num = 47;
         let mut second = writer_commit_input(vec![second_frame]);
         second.writer_id = 1;
-        second.writer_key.fragment_instance_id = UniqueId { hi: 41, lo: 43 };
+        second.writer_key.fragment_instance_id = UniqueId::new(41, 43);
         second.writer_key.backend_num = 47;
 
         let error = ConnectorWriteCommitInput::try_extract(&WriteCommitInput {

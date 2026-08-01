@@ -446,13 +446,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use novarocks::query_execution::contract::QueryId;
     use novarocks::query_execution::lifecycle::AttemptId;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
         ConnectorProviderId, ConnectorReadExecution,
     };
+    use novarocks_types::QueryId;
 
     use super::*;
 

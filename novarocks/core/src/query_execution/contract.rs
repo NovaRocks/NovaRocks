@@ -42,34 +42,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-
-/// Coordinator-neutral query identity.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct QueryId {
-    hi: i64,
-    lo: i64,
-}
-
-impl QueryId {
-    pub const fn new(hi: i64, lo: i64) -> Self {
-        Self { hi, lo }
-    }
-
-    pub const fn high(self) -> i64 {
-        self.hi
-    }
-
-    pub const fn low(self) -> i64 {
-        self.lo
-    }
-
-    pub(crate) const fn into_unique_id(self) -> crate::common::types::UniqueId {
-        crate::common::types::UniqueId {
-            hi: self.hi,
-            lo: self.lo,
-        }
-    }
-}
+pub(crate) use novarocks_types::QueryId;
 
 /// Query options resolved by core before ownership crosses into frontend.
 ///

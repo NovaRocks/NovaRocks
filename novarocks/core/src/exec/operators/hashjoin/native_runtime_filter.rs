@@ -833,9 +833,9 @@ mod tests {
 
     #[test]
     fn native_producer_close_gate_guard_removes_registry_key() {
-        let query_id = crate::common::types::UniqueId { hi: 81, lo: 82 };
+        let query_id = novarocks_types::UniqueId::new(81, 82);
         let binding_id = BindingId::new(83);
-        let finst_id = crate::common::types::UniqueId { hi: 84, lo: 85 };
+        let finst_id = novarocks_types::UniqueId::new(84, 85);
         let key = (query_id, binding_id, finst_id);
         let guard = install_native_producer_close_gate_for_test(query_id, binding_id, finst_id);
         assert!(

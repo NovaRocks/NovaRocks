@@ -259,7 +259,7 @@ mod tests {
     fn instance_with_scan(assignments: ScanAssignments, finst: UniqueId) -> FragmentInstanceSpec {
         FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId { hi: 1, lo: 2 },
+            QueryId::new(1, 2),
             FragmentInstanceId::new(finst),
             assignments,
             ExchangeInputAssignments::default(),
@@ -281,10 +281,7 @@ mod tests {
     #[test]
     fn materializes_op_from_instance_ranges() {
         let program = scan_program();
-        let instance = instance_with_scan(
-            scan_assignments(file_ranges(3)),
-            UniqueId { hi: 10, lo: 11 },
-        );
+        let instance = instance_with_scan(scan_assignments(file_ranges(3)), UniqueId::new(10, 11));
 
         let bindings = materialize_scan_bindings(&program, &instance).expect("materialize");
         let op = bindings.get(SCAN_NODE_ID).expect("bound op for scan node");
@@ -296,10 +293,8 @@ mod tests {
         // One shared program, two instances with different File range counts.
         let program = Arc::new(scan_program());
 
-        let instance_a =
-            instance_with_scan(scan_assignments(file_ranges(2)), UniqueId { hi: 20, lo: 1 });
-        let instance_b =
-            instance_with_scan(scan_assignments(file_ranges(5)), UniqueId { hi: 20, lo: 2 });
+        let instance_a = instance_with_scan(scan_assignments(file_ranges(2)), UniqueId::new(20, 1));
+        let instance_b = instance_with_scan(scan_assignments(file_ranges(5)), UniqueId::new(20, 2));
 
         let bindings_a = materialize_scan_bindings(&program, &instance_a).expect("materialize a");
         let bindings_b = materialize_scan_bindings(&program, &instance_b).expect("materialize b");
@@ -315,8 +310,7 @@ mod tests {
         // still works and reads only the static source, and the two Arcs above
         // point at distinct ops.
         assert!(!Arc::ptr_eq(&op_a, &op_b));
-        let instance_c =
-            instance_with_scan(scan_assignments(file_ranges(1)), UniqueId { hi: 20, lo: 3 });
+        let instance_c = instance_with_scan(scan_assignments(file_ranges(1)), UniqueId::new(20, 3));
         let bindings_c = materialize_scan_bindings(&program, &instance_c).expect("materialize c");
         assert_eq!(
             bindings_c
@@ -334,7 +328,7 @@ mod tests {
     fn missing_assignment_is_a_materialize_error() {
         let program = scan_program();
         // Instance with no scan assignment at all.
-        let instance = instance_with_scan(ScanAssignments::default(), UniqueId { hi: 30, lo: 1 });
+        let instance = instance_with_scan(ScanAssignments::default(), UniqueId::new(30, 1));
 
         let error = materialize_scan_bindings(&program, &instance)
             .expect_err("missing assignment must fail materialize");
@@ -353,7 +347,7 @@ mod tests {
         // The source expects File ranges; hand it a None assignment instead.
         let instance = instance_with_scan(
             scan_assignments(BoundScanRanges::None),
-            UniqueId { hi: 40, lo: 1 },
+            UniqueId::new(40, 1),
         );
 
         let error = materialize_scan_bindings(&program, &instance)

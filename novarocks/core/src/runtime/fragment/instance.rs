@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn fragment_instance_id_round_trips_unique_id() {
-        let raw = UniqueId { hi: 7, lo: 11 };
+        let raw = UniqueId::new(7, 11);
         assert_eq!(FragmentInstanceId::new(raw).get(), raw);
     }
 
@@ -477,8 +477,8 @@ mod tests {
         );
         let spec = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId { hi: 13, lo: 17 },
-            FragmentInstanceId::new(UniqueId { hi: 19, lo: 23 }),
+            QueryId::new(13, 17),
+            FragmentInstanceId::new(UniqueId::new(19, 23)),
             scans,
             exchanges,
             FragmentSinkAssignment::StreamDestinations {
@@ -491,11 +491,8 @@ mod tests {
         );
 
         assert_eq!(spec.contract_version(), FragmentContractVersion::CURRENT);
-        assert_eq!(spec.query_id(), QueryId { hi: 13, lo: 17 });
-        assert_eq!(
-            spec.fragment_instance_id().get(),
-            UniqueId { hi: 19, lo: 23 }
-        );
+        assert_eq!(spec.query_id(), QueryId::new(13, 17));
+        assert_eq!(spec.fragment_instance_id().get(), UniqueId::new(19, 23));
         assert!(spec.scan_assignments().get(&scan_node).is_some());
         assert_eq!(
             spec.exchange_inputs()

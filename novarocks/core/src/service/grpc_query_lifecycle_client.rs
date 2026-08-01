@@ -1042,10 +1042,7 @@ mod tests {
                 )
                 .expect("backend identity"),
                 [ParticipantRole::FragmentExecutor],
-                [crate::common::types::UniqueId {
-                    hi: query_low,
-                    lo: 1,
-                }],
+                [novarocks_types::UniqueId::new(query_low, 1)],
                 ParticipantQueryOptions::new(QueryOptions::default()),
                 10_000,
                 [],

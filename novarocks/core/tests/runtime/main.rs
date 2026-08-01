@@ -17,9 +17,9 @@
 //! Integration tests for runtime components (exchange, query context, etc.).
 
 use crate::common::{TestConfig, test_query_id};
-use novarocks::common::types::UniqueId;
 use novarocks::runtime::exchange::{self, ExchangeKey};
 use novarocks::runtime::profile::Profiler;
+use novarocks_types::UniqueId;
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -59,8 +59,8 @@ fn test_unique_id_in_runtime() {
     let query_id: UniqueId = test_query_id();
 
     // Verify UniqueId can be used
-    assert_eq!(query_id.hi, 1234567890);
-    assert_eq!(query_id.lo, 9876543210);
+    assert_eq!(query_id.high(), 1234567890);
+    assert_eq!(query_id.low(), 9876543210);
 }
 
 #[test]

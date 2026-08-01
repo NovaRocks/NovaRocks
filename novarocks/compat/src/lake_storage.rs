@@ -30,7 +30,6 @@ use crate::proto::starrocks::{
     TabletStatRequest, TabletStatResponse, TxnInfoPb, TxnLogPb, TxnTypePb, VacuumRequest,
     VacuumResponse, tablet_stat_response,
 };
-use novarocks::common::types::UniqueId;
 use novarocks::connector::starrocks::lake::service_domain::{
     AbortCompactionCommand, AbortTransactionCommand, CompactParallelConfig, CompactTabletsCommand,
     CompactionStat, DeleteDataCommand, DeleteTabletsCommand, DropLakeTableCommand,
@@ -47,6 +46,7 @@ use novarocks::connector::starrocks::lake::{
     execute_vacuum,
 };
 use novarocks::connector::starrocks::ports::LakeStorageDependencies;
+use novarocks_types::UniqueId;
 use prost::Message;
 
 use crate::storage_wire::{decode_delete_predicate, decode_schema_key, encode_transaction_log};
@@ -193,10 +193,7 @@ fn transaction_info(info: &TxnInfoPb) -> LakeTransactionInfo {
         load_ids: info
             .load_ids
             .iter()
-            .map(|id| UniqueId {
-                hi: id.hi,
-                lo: id.lo,
-            })
+            .map(|id| UniqueId::new(id.hi, id.lo))
             .collect(),
     }
 }
@@ -543,8 +540,8 @@ mod tests {
             command.transactions[0].transaction_type,
             LakeTransactionType::Unknown(77)
         );
-        assert_eq!(command.transactions[0].load_ids[0].hi, 1);
-        assert_eq!(command.transactions[0].load_ids[0].lo, -2);
+        assert_eq!(command.transactions[0].load_ids[0].high(), 1);
+        assert_eq!(command.transactions[0].load_ids[0].low(), -2);
         assert_eq!(
             command.resharding_tablet_infos[0]
                 .splitting

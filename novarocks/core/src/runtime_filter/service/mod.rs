@@ -3034,16 +3034,16 @@ pub(super) mod test_support {
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         };
-        let local_producer = UniqueId { hi: 1, lo: 3 };
-        let remote_producer = UniqueId { hi: 1, lo: 4 };
+        let local_producer = UniqueId::new(1, 3);
+        let remote_producer = UniqueId::new(1, 4);
         let scheduling = SchedulingPlan {
             root_fragment_id: 1,
             by_fragment: BTreeMap::from([
                 (
                     1,
                     vec![
-                        placement(1, 0, 2, UniqueId { hi: 1, lo: 1 }, "10.0.0.2:9060"),
-                        placement(1, 1, 11, UniqueId { hi: 1, lo: 2 }, "10.0.0.11:9060"),
+                        placement(1, 0, 2, UniqueId::new(1, 1), "10.0.0.2:9060"),
+                        placement(1, 1, 11, UniqueId::new(1, 2), "10.0.0.11:9060"),
                     ],
                 ),
                 (
@@ -3054,7 +3054,7 @@ pub(super) mod test_support {
                     ],
                 ),
             ]),
-            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_finst_id: UniqueId::new(1, 1),
             root_backend_idx: 2,
         };
         let edges = vec![FragmentEdge {
@@ -3599,7 +3599,7 @@ pub(crate) mod tests {
     }
 
     fn uid(lo: i64) -> UniqueId {
-        UniqueId { hi: 70, lo }
+        UniqueId::new(70, lo)
     }
 
     fn deployment(
@@ -4117,7 +4117,7 @@ pub(crate) mod tests {
     -> (RuntimeFilterParticipantInstall, BindingId, UniqueId) {
         let channel_id = ChannelId::new(5);
         let producer_binding = BindingId::new(10);
-        let remote_producer = UniqueId { hi: 1, lo: 4 };
+        let remote_producer = UniqueId::new(1, 4);
         // The shared fixture places this producer on backend index 7. Participant
         // identities are deliberately nonzero, so the compiler projects backend N
         // as participant N + 1 rather than preserving the backend index verbatim.
@@ -9878,7 +9878,7 @@ pub(crate) mod tests {
             None,
         )
         .unwrap();
-        let consumer_finst = UniqueId { hi: 1, lo: 1 };
+        let consumer_finst = UniqueId::new(1, 1);
         let mut consumers = template.consumers().clone();
         consumers.insert(
             consumer_binding,
@@ -9945,8 +9945,8 @@ pub(crate) mod tests {
             "the delivered artifact's source must be a remote participant"
         );
 
-        const QUERY: QueryId = QueryId { hi: 71, lo: 72 };
-        let query_uid = UniqueId { hi: 71, lo: 72 };
+        const QUERY: QueryId = QueryId::new(71, 72);
+        let query_uid = UniqueId::new(71, 72);
         let epoch = fixture.install.epoch();
 
         let manager = QueryContextManager::new_for_test();
@@ -11164,8 +11164,8 @@ pub(crate) mod tests {
         use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
 
         let fixture = compiler_consumer_delivery_fixture();
-        const QUERY: QueryId = QueryId { hi: 81, lo: 82 };
-        let query_uid = UniqueId { hi: 81, lo: 82 };
+        const QUERY: QueryId = QueryId::new(81, 82);
+        let query_uid = UniqueId::new(81, 82);
         let epoch = fixture.install.epoch();
 
         let manager = QueryContextManager::new_for_test();
@@ -11245,8 +11245,8 @@ pub(crate) mod tests {
         use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
 
         let fixture = compiler_consumer_delivery_fixture();
-        const QUERY: QueryId = QueryId { hi: 91, lo: 92 };
-        let query_uid = UniqueId { hi: 91, lo: 92 };
+        const QUERY: QueryId = QueryId::new(91, 92);
+        let query_uid = UniqueId::new(91, 92);
         let epoch = fixture.install.epoch();
 
         let manager = QueryContextManager::new_for_test();

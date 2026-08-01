@@ -481,8 +481,8 @@ mod tests {
     fn instance(sink_assignment: FragmentSinkAssignment) -> FragmentInstanceSpec {
         FragmentInstanceSpec::new_native(
             crate::exec::fragment::program::FragmentContractVersion::CURRENT,
-            QueryId { hi: 1, lo: 2 },
-            FragmentInstanceId::new(UniqueId { hi: 3, lo: 4 }),
+            QueryId::new(1, 2),
+            FragmentInstanceId::new(UniqueId::new(3, 4)),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             sink_assignment,
@@ -639,7 +639,7 @@ mod tests {
         let program = starrocks_table_program();
         let frontend = RuntimeEndpoint::new("frontend", 9020).expect("frontend");
         let assignment =
-            StarRocksTableSinkAssignment::new(97, UniqueId { hi: 101, lo: 103 }, Some(frontend));
+            StarRocksTableSinkAssignment::new(97, UniqueId::new(101, 103), Some(frontend));
 
         let input = starrocks_factory_input(&program, &assignment);
 
@@ -647,7 +647,10 @@ mod tests {
         assert_eq!((input.descriptor.db_id, input.descriptor.table_id), (1, 2));
         assert_eq!(input.descriptor.txn_id, 97);
         assert_eq!(
-            (input.descriptor.load_id.hi, input.descriptor.load_id.lo),
+            (
+                input.descriptor.load_id.high(),
+                input.descriptor.load_id.low()
+            ),
             (101, 103)
         );
         let frontend = input.descriptor.frontend.expect("frontend address");
@@ -727,7 +730,7 @@ mod tests {
         let factory = materialize_fragment_sink_components(
             &sink,
             &FragmentSinkAssignment::None,
-            UniqueId { hi: 3, lo: 4 },
+            UniqueId::new(3, 4),
             false,
             47,
             test_transmitter(),

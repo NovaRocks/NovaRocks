@@ -744,7 +744,7 @@ mod tests {
     fn stream(partition: u32) -> ProducerStreamId {
         ProducerStreamId::new(
             BindingId::new(1),
-            UniqueId { hi: 2, lo: 3 },
+            UniqueId::new(2, 3),
             PartitionId::new(partition),
         )
     }
@@ -902,7 +902,7 @@ mod tests {
             TopKCloseOutcome::Satisfied
         );
         assert_eq!(
-            empty.terminal_partition_count(BindingId::new(1), UniqueId { hi: 2, lo: 3 }),
+            empty.terminal_partition_count(BindingId::new(1), UniqueId::new(2, 3)),
             1
         );
     }
@@ -930,7 +930,7 @@ mod tests {
         reducer.commit_apply(projection);
         assert_eq!(reducer.estimated_retained_bytes(), Some(67));
         assert_eq!(
-            reducer.submitted_partition_count(BindingId::new(1), UniqueId { hi: 2, lo: 3 }),
+            reducer.submitted_partition_count(BindingId::new(1), UniqueId::new(2, 3)),
             1
         );
 

@@ -36,7 +36,7 @@ use super::tests::{
 };
 
 fn uid(lo: i64) -> crate::common::types::UniqueId {
-    crate::common::types::UniqueId { hi: 70, lo }
+    novarocks_types::UniqueId::new(70, lo)
 }
 
 fn live_handle(

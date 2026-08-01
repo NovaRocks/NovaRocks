@@ -17,6 +17,7 @@
 
 //! Named JSON formatting for compat-owned Thrift diagnostics.
 
+use novarocks_types::format_uuid;
 use thrift::protocol::{
     TFieldIdentifier, TListIdentifier, TMapIdentifier, TMessageIdentifier, TOutputProtocol,
     TSerializable, TSetIdentifier, TStructIdentifier,
@@ -26,7 +27,7 @@ fn maybe_unique_id_uuid(map: &serde_json::Map<String, serde_json::Value>) -> Opt
     if map.len() != 2 || !map.contains_key("hi") || !map.contains_key("lo") {
         return None;
     }
-    Some(novarocks::common::types::format_uuid(
+    Some(format_uuid(
         map.get("hi")?.as_i64()?,
         map.get("lo")?.as_i64()?,
     ))

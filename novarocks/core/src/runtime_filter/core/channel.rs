@@ -3575,7 +3575,7 @@ mod tests {
     }
 
     fn uid(lo: i64) -> UniqueId {
-        UniqueId { hi: 1, lo }
+        UniqueId::new(1, lo)
     }
 
     fn deployment_with_coverages(

@@ -70,8 +70,8 @@ pub(crate) fn encode_instance_params(
 
 fn encode_unique_id(src: &UniqueId) -> common::UniqueId {
     common::UniqueId {
-        hi: src.hi,
-        lo: src.lo,
+        hi: src.high(),
+        lo: src.low(),
     }
 }
 

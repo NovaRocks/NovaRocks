@@ -52,7 +52,7 @@ const CONSUMER: BindingId = BindingId::new(2);
 const PRODUCER_B: BindingId = BindingId::new(3);
 
 fn uid(lo: i64) -> UniqueId {
-    UniqueId { hi: 80, lo }
+    UniqueId::new(80, lo)
 }
 
 #[derive(Default)]

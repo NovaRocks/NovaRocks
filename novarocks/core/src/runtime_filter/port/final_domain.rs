@@ -107,8 +107,8 @@ impl RuntimeCompletionFenceContract {
         let mut canonical = Sha256::new();
         canonical.update(CONTRACT_DOMAIN);
         canonical.update(CONTRACT_VERSION.to_be_bytes());
-        canonical.update(query_id.hi.to_be_bytes());
-        canonical.update(query_id.lo.to_be_bytes());
+        canonical.update(query_id.high().to_be_bytes());
+        canonical.update(query_id.low().to_be_bytes());
         canonical.update(deployment_epoch.get().to_be_bytes());
         canonical.update(channel_id.get().to_be_bytes());
         canonical.update([fence_kind_tag(fence_kind)]);
@@ -277,8 +277,8 @@ fn authority_scope_digest(
     canonical.update(AUTHORITY_SCOPE_VERSION.to_be_bytes());
     canonical.update(contract_digest.bytes());
     canonical.update(binding_id.get().to_be_bytes());
-    canonical.update(fragment_instance_id.hi.to_be_bytes());
-    canonical.update(fragment_instance_id.lo.to_be_bytes());
+    canonical.update(fragment_instance_id.high().to_be_bytes());
+    canonical.update(fragment_instance_id.low().to_be_bytes());
     canonical.finalize().into()
 }
 
@@ -351,8 +351,8 @@ fn fence_digest(
     canonical.update(FENCE_VERSION.to_be_bytes());
     canonical.update(contract_digest.bytes());
     canonical.update(stream.binding_id().get().to_be_bytes());
-    canonical.update(stream.fragment_instance_id().hi.to_be_bytes());
-    canonical.update(stream.fragment_instance_id().lo.to_be_bytes());
+    canonical.update(stream.fragment_instance_id().high().to_be_bytes());
+    canonical.update(stream.fragment_instance_id().low().to_be_bytes());
     canonical.update(stream.partition_id().get().to_be_bytes());
     canonical.update(sequence.get().to_be_bytes());
     canonical.finalize().into()
@@ -513,8 +513,8 @@ mod tests {
 
     use super::*;
 
-    const QUERY_ID: UniqueId = UniqueId { hi: 11, lo: 12 };
-    const INSTANCE_ID: UniqueId = UniqueId { hi: 21, lo: 22 };
+    const QUERY_ID: UniqueId = UniqueId::new(11, 12);
+    const INSTANCE_ID: UniqueId = UniqueId::new(21, 22);
 
     fn schema(data_type: &DataType) -> ArtifactMembershipSchema {
         ArtifactMembershipSchema::new(data_type, NullSemantics::NullSafeEqual).unwrap()
@@ -575,8 +575,8 @@ mod tests {
         let mut expected = Sha256::new();
         expected.update(b"novarocks.runtime-filter.completion-fence-contract");
         expected.update(1_u16.to_be_bytes());
-        expected.update(QUERY_ID.hi.to_be_bytes());
-        expected.update(QUERY_ID.lo.to_be_bytes());
+        expected.update(QUERY_ID.high().to_be_bytes());
+        expected.update(QUERY_ID.low().to_be_bytes());
         expected.update(13_u64.to_be_bytes());
         expected.update(ChannelId::new(14).get().to_be_bytes());
         expected.update([1]);
@@ -589,7 +589,7 @@ mod tests {
         assert_ne!(
             contract.digest(),
             contract_for(
-                UniqueId { hi: 99, lo: 12 },
+                UniqueId::new(99, 12),
                 DeploymentEpoch::new(13),
                 ChannelId::new(14),
                 &membership_schema,
@@ -697,7 +697,7 @@ mod tests {
         );
         let wrong_instance = ProducerStreamId::new(
             BindingId::new(20),
-            UniqueId { hi: 99, lo: 22 },
+            UniqueId::new(99, 22),
             PartitionId::new(3),
         );
         assert_eq!(
@@ -770,7 +770,7 @@ mod tests {
         );
 
         let other_contract = contract_for(
-            UniqueId { hi: 90, lo: 91 },
+            UniqueId::new(90, 91),
             DeploymentEpoch::new(13),
             ChannelId::new(14),
             &schema(&DataType::Int64),
@@ -821,7 +821,7 @@ mod tests {
         );
         let wrong_instance = ProducerStreamId::new(
             BindingId::new(20),
-            UniqueId { hi: 99, lo: 22 },
+            UniqueId::new(99, 22),
             PartitionId::new(3),
         );
         assert_eq!(

@@ -992,7 +992,7 @@ mod tests {
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             format!("{table_location}/staging"),
-            UniqueId { hi: 7017, lo: 1 },
+            UniqueId::new(7017, 1),
         )
         .with_table_metadata(metadata);
         collector.inject_written_files(vec![first, second]);
@@ -1095,7 +1095,7 @@ mod tests {
     async fn commit_drains_writer_files_before_rejecting_coordinator_groups() {
         let fixture = empty_v3_iceberg_table().await;
         let metadata = fixture.table.metadata().clone();
-        let finst_id = UniqueId { hi: 7007, lo: 1 };
+        let finst_id = UniqueId::new(7007, 1);
         let collector = IcebergCommitCollector::new(
             CommitOpKind::RowDeltaDvFromFiles,
             fixture.table_ident.clone(),

@@ -38,7 +38,7 @@ pub(crate) fn lower_exchange_node(
     children: Vec<Lowered>,
     node: &plan_nodes::TPlanNode,
     desc_tbl: &descriptors::TDescriptorTable,
-    fragment_instance_id: Option<novarocks::common::types::UniqueId>,
+    fragment_instance_id: Option<novarocks_types::UniqueId>,
     per_exchange_count: Option<i32>,
     batch_sender_counts: &std::collections::HashMap<i32, usize>,
     arena: &mut ExprArena,

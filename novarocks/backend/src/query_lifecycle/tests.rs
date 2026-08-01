@@ -18,8 +18,6 @@
 use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use novarocks::UniqueId;
-use novarocks::query_execution::contract::QueryId;
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
     AttemptId, FragmentTerminalOutcome, ParticipantBackendIdentity, ParticipantManifest,
@@ -35,6 +33,8 @@ use novarocks::runtime::fragment::{
 };
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks_protocol::{common, novarocks as proto_novarocks, plan};
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 use prost::Message;
 
 use super::entry::QueryLifecyclePhase;
@@ -316,7 +316,7 @@ fn terminal_fallback_conflict_releases_bounded_delivery_record() {
         metrics,
         Arc::new(RejectedTerminalFallback),
     );
-    let fragment_instance_id = UniqueId { hi: 863, lo: 1 };
+    let fragment_instance_id = UniqueId::new(863, 1);
     let request = fragment_init_request_fixture(863, &[fragment_instance_id]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -566,8 +566,8 @@ fn stage_fragment(instance_id: UniqueId) -> StageFragment {
         plan::PlanFragment::default(),
         proto_novarocks::InstanceParams {
             fragment_instance_id: Some(common::UniqueId {
-                hi: instance_id.hi,
-                lo: instance_id.lo,
+                hi: instance_id.high(),
+                lo: instance_id.low(),
             }),
             ..Default::default()
         },
@@ -592,7 +592,7 @@ fn stage_request(
 
 #[test]
 fn stage_and_start_are_idempotent_after_control_ready() {
-    let expected = [UniqueId { hi: 8, lo: 1 }, UniqueId { hi: 8, lo: 2 }];
+    let expected = [UniqueId::new(8, 1), UniqueId::new(8, 2)];
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let request = fragment_init_request_fixture(1_801, &expected);
     assert_eq!(
@@ -642,7 +642,7 @@ fn stage_and_start_are_idempotent_after_control_ready() {
 
 #[test]
 fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
-    let expected = [UniqueId { hi: 9, lo: 1 }];
+    let expected = [UniqueId::new(9, 1)];
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let request = fragment_init_request_fixture(1_802, &expected);
     assert_eq!(
@@ -716,7 +716,7 @@ fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
 
 #[test]
 fn stage_resource_ledger_rejects_second_staged_bundle_and_releases_on_start() {
-    let expected = [UniqueId { hi: 13, lo: 1 }];
+    let expected = [UniqueId::new(13, 1)];
     let first = fragment_init_request_fixture(1_804, &expected);
     let second = fragment_init_request_fixture(1_805, &expected);
     let first_stage = stage_request(&first, 13, &expected);
@@ -769,7 +769,7 @@ fn stage_resource_ledger_rejects_second_staged_bundle_and_releases_on_start() {
 
 #[test]
 fn stage_builder_limit_is_held_until_commit_or_drop() {
-    let expected = [UniqueId { hi: 14, lo: 1 }];
+    let expected = [UniqueId::new(14, 1)];
     let first = fragment_init_request_fixture(1_806, &expected);
     let second = fragment_init_request_fixture(1_807, &expected);
     let mut config = registry_config(8);
@@ -890,7 +890,7 @@ fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
 #[test]
 fn query_lifecycle_observations_coalesce_without_consuming_correctness_capacity() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let fragment = UniqueId { hi: 81, lo: 82 };
+    let fragment = UniqueId::new(81, 82);
     let request = fragment_init_request_fixture(181, &[fragment]);
     let current_execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -931,7 +931,7 @@ fn query_lifecycle_observations_coalesce_without_consuming_correctness_capacity(
     ));
     assert!(!registry.publish_fragment_observation(
         current_execution_id,
-        UniqueId { hi: 90, lo: 91 },
+        UniqueId::new(90, 91),
         0,
         0,
         0,
@@ -1186,7 +1186,7 @@ fn query_lifecycle_initializing_to_terminating_publishes_metrics_immediately() {
 #[test]
 fn query_lifecycle_admission_requires_control_ready_and_commits_exactly_once() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let expected = UniqueId { hi: 71, lo: 1 };
+    let expected = UniqueId::new(71, 1);
     let request = fragment_init_request_fixture(71, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -1224,8 +1224,8 @@ fn query_lifecycle_admission_requires_control_ready_and_commits_exactly_once() {
 #[test]
 fn query_lifecycle_admission_rejects_outside_set_and_service_only_participant() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let expected = UniqueId { hi: 72, lo: 1 };
-    let unexpected = UniqueId { hi: 72, lo: 2 };
+    let expected = UniqueId::new(72, 1);
+    let unexpected = UniqueId::new(72, 2);
     let fragment_request = fragment_init_request_fixture(72, &[expected]);
     let fragment_execution = fragment_request.manifest().execution_id();
     assert_eq!(
@@ -1260,7 +1260,7 @@ fn query_lifecycle_admission_rejects_outside_set_and_service_only_participant() 
 #[test]
 fn query_lifecycle_admission_dropped_permit_rolls_back_in_flight() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let expected = UniqueId { hi: 74, lo: 1 };
+    let expected = UniqueId::new(74, 1);
     let request = fragment_init_request_fixture(74, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -1284,7 +1284,7 @@ fn query_lifecycle_admission_dropped_permit_rolls_back_in_flight() {
 #[test]
 fn query_lifecycle_admission_commit_does_not_hold_entry_while_waiting_for_registry() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let expected = UniqueId { hi: 741, lo: 1 };
+    let expected = UniqueId::new(741, 1);
     let request = fragment_init_request_fixture(741, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -1346,7 +1346,7 @@ fn query_lifecycle_admission_commit_does_not_hold_entry_while_waiting_for_regist
 #[test]
 fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let expected = UniqueId { hi: 75, lo: 1 };
+    let expected = UniqueId::new(75, 1);
     let request = fragment_init_request_fixture(75, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -1385,7 +1385,7 @@ fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
 fn fragment_failure_emits_query_local_failure() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);
-    let expected = UniqueId { hi: 76, lo: 1 };
+    let expected = UniqueId::new(76, 1);
     let request = fragment_init_request_fixture(76, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -1445,7 +1445,7 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
     let mut config = registry_config(8);
     config.terminal_drain_timeout = Duration::from_millis(1);
     let registry = registry_with_config(runtime, config);
-    let expected = UniqueId { hi: 76, lo: 2 };
+    let expected = UniqueId::new(76, 2);
     let request = fragment_init_request_fixture(76_002, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -1602,7 +1602,7 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
     );
-    let fragment_instance_id = UniqueId { hi: 811, lo: 1 };
+    let fragment_instance_id = UniqueId::new(811, 1);
     let first = fragment_init_request_fixture(811, &[fragment_instance_id]);
     let first_execution = first.manifest().execution_id();
     assert_eq!(
@@ -1686,7 +1686,7 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
     );
-    let fragment_instance_id = UniqueId { hi: 814, lo: 1 };
+    let fragment_instance_id = UniqueId::new(814, 1);
     let first = fragment_init_request_fixture(814, &[fragment_instance_id]);
     let first_execution = first.manifest().execution_id();
     assert_eq!(
@@ -1829,10 +1829,7 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
     clock.advance(Duration::from_millis(11));
     assert_eq!(
         registry
-            .init_query(fragment_init_request_fixture(
-                87,
-                &[UniqueId { hi: 87, lo: 1 }],
-            ))
+            .init_query(fragment_init_request_fixture(87, &[UniqueId::new(87, 1)],))
             .outcome(),
         QueryInitOutcome::Applied
     );
@@ -1853,7 +1850,7 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
     );
-    let fragment_instance_id = UniqueId { hi: 861, lo: 1 };
+    let fragment_instance_id = UniqueId::new(861, 1);
     let first = fragment_init_request_fixture(861, &[fragment_instance_id]);
     let first_execution = first.manifest().execution_id();
     assert_eq!(
@@ -1902,7 +1899,7 @@ fn query_lifecycle_pre_start_timeout_terminates_fragment_participant_without_acc
     let runtime = RecordingLocalRuntime::default();
     let clock = Arc::new(ManualClock::default());
     let registry = registry_with_clock(runtime.clone(), 8, Arc::clone(&clock));
-    let expected = UniqueId { hi: 90, lo: 1 };
+    let expected = UniqueId::new(90, 1);
     let request = fragment_init_request_fixture(90, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -1937,7 +1934,7 @@ fn query_lifecycle_pre_start_timeout_terminates_fragment_participant_without_acc
 fn query_lifecycle_pre_start_timeout_is_disarmed_by_first_accept_and_service_control_ready() {
     let clock = Arc::new(ManualClock::default());
     let registry = registry_with_clock(RecordingLocalRuntime::default(), 8, Arc::clone(&clock));
-    let expected = UniqueId { hi: 91, lo: 1 };
+    let expected = UniqueId::new(91, 1);
     let fragment_request = fragment_init_request_fixture(91, &[expected]);
     let fragment_execution = fragment_request.manifest().execution_id();
     assert_eq!(
@@ -1984,7 +1981,7 @@ fn query_lifecycle_heartbeat_timeout_terminates_control_attached_entry() {
     let runtime = RecordingLocalRuntime::default();
     let clock = Arc::new(ManualClock::default());
     let registry = registry_with_clock(runtime.clone(), 8, Arc::clone(&clock));
-    let expected = UniqueId { hi: 99, lo: 1 };
+    let expected = UniqueId::new(99, 1);
     let request = fragment_init_request_fixture(99, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -2015,7 +2012,7 @@ fn query_lifecycle_heartbeat_timeout_terminates_control_attached_entry() {
 #[test]
 fn query_lifecycle_registry_metrics_follow_state_rejection_and_termination() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let expected = UniqueId { hi: 93, lo: 1 };
+    let expected = UniqueId::new(93, 1);
     let request = fragment_init_request_fixture(93, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
@@ -2136,10 +2133,7 @@ fn query_lifecycle_registry_runtime_filter_install_failure_rolls_back_workspace(
     );
     assert_eq!(
         registry
-            .init_query(fragment_init_request_fixture(
-                97,
-                &[UniqueId { hi: 97, lo: 1 }],
-            ))
+            .init_query(fragment_init_request_fixture(97, &[UniqueId::new(97, 1)],))
             .outcome(),
         QueryInitOutcome::Applied
     );
@@ -2174,10 +2168,7 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
     assert_eq!(runtime.runtime_filter_abort_calls(), 1);
     assert_eq!(
         registry
-            .init_query(fragment_init_request_fixture(
-                962,
-                &[UniqueId { hi: 962, lo: 1 }],
-            ))
+            .init_query(fragment_init_request_fixture(962, &[UniqueId::new(962, 1)],))
             .outcome(),
         QueryInitOutcome::RejectedCapacity
     );
@@ -2192,10 +2183,7 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
     assert_eq!(runtime.runtime_filter_abort_calls(), 2);
     assert_eq!(
         registry
-            .init_query(fragment_init_request_fixture(
-                963,
-                &[UniqueId { hi: 963, lo: 1 }],
-            ))
+            .init_query(fragment_init_request_fixture(963, &[UniqueId::new(963, 1)],))
             .outcome(),
         QueryInitOutcome::Applied
     );

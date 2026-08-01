@@ -294,8 +294,8 @@ pub(crate) fn compile_install_plan(
 
 fn connector_writer_fragment_instance_bytes(value: crate::common::types::UniqueId) -> [u8; 16] {
     let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&value.hi.to_be_bytes());
-    bytes[8..].copy_from_slice(&value.lo.to_be_bytes());
+    bytes[..8].copy_from_slice(&value.high().to_be_bytes());
+    bytes[8..].copy_from_slice(&value.low().to_be_bytes());
     bytes
 }
 

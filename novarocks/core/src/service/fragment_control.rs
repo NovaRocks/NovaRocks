@@ -49,7 +49,7 @@ pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryC
         .iter()
         .map(|id| {
             let id = *id;
-            std::thread::spawn(move || exchange::cancel_fragment(id.hi, id.lo))
+            std::thread::spawn(move || exchange::cancel_fragment(id.high(), id.low()))
         })
         .collect();
     for h in cleanup {
@@ -68,17 +68,17 @@ mod tests {
 
     #[test]
     fn cancel_fans_out_to_query_fragment_peers() {
-        let query_id = QueryId { hi: 7011, lo: 7012 };
-        let finst_a = UniqueId { hi: 7013, lo: 7014 };
-        let finst_b = UniqueId { hi: 7015, lo: 7016 };
+        let query_id = QueryId::new(7011, 7012);
+        let finst_a = UniqueId::new(7013, 7014);
+        let finst_b = UniqueId::new(7015, 7016);
         let key_a = ExchangeKey {
-            finst_id_hi: finst_a.hi,
-            finst_id_lo: finst_a.lo,
+            finst_id_hi: finst_a.high(),
+            finst_id_lo: finst_a.low(),
             node_id: 51,
         };
         let key_b = ExchangeKey {
-            finst_id_hi: finst_b.hi,
-            finst_id_lo: finst_b.lo,
+            finst_id_hi: finst_b.high(),
+            finst_id_lo: finst_b.low(),
             node_id: 52,
         };
 

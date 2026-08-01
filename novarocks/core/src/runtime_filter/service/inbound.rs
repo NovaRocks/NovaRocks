@@ -608,10 +608,10 @@ mod tests {
     const WITNESS_B: u32 = 12;
     // The final-domain fence contract is derived from the service query id during install, so the
     // service and the shard we encode must agree on it.
-    const SERVICE_QID: UniqueId = UniqueId { hi: 7, lo: 7 };
-    const PRODUCER_FINST: UniqueId = UniqueId { hi: 1, lo: 2 };
-    const PRODUCER_B_FINST: UniqueId = UniqueId { hi: 1, lo: 4 };
-    const CONSUMER_FINST: UniqueId = UniqueId { hi: 1, lo: 3 };
+    const SERVICE_QID: UniqueId = UniqueId::new(7, 7);
+    const PRODUCER_FINST: UniqueId = UniqueId::new(1, 2);
+    const PRODUCER_B_FINST: UniqueId = UniqueId::new(1, 4);
+    const CONSUMER_FINST: UniqueId = UniqueId::new(1, 3);
     // MAGIC(4) + version(2) + kind(1) + flags(1) + schema digest(32) + body length(8).
     const FRAME_HEADER_LEN: usize = 48;
 
@@ -2103,7 +2103,7 @@ mod tests {
         let digest = installed_digest(&service, PRODUCER_BINDING);
         let error = err(service.dispatch_inbound_producer(closed_env(
             PRODUCER_BINDING,
-            UniqueId { hi: 9, lo: 9 },
+            UniqueId::new(9, 9),
             0,
             0,
             1,
@@ -2251,11 +2251,11 @@ mod tests {
 
     impl ThreeBackendIngressFixture {
         fn compile_and_install() -> Self {
-            let manager_query_id = QueryId { hi: 92, lo: 1 };
-            let transport_query_id = UniqueId { hi: 92, lo: 1 };
+            let manager_query_id = QueryId::new(92, 1);
+            let transport_query_id = UniqueId::new(92, 1);
             let channel_id = ChannelId::new(5);
             let remote_binding_id = BindingId::new(10);
-            let remote_finst = UniqueId { hi: 1, lo: 4 };
+            let remote_finst = UniqueId::new(1, 4);
 
             let plan = compiled_three_backend_all_of_plan();
             let deployment_epoch = plan.epoch;

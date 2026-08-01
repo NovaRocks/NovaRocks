@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use novarocks::UniqueId;
+use novarocks_types::UniqueId;
 
 pub(super) trait FragmentControlHandle: Send + Sync + 'static {
     fn cancel(&self, reason: &str);
@@ -307,7 +307,7 @@ impl Drop for FragmentControlToken {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use novarocks::UniqueId;
+    use novarocks_types::UniqueId;
 
     use super::{FragmentControlHandle, FragmentControlRegistry};
 
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn cancel_before_running_publish_reaches_the_handle() {
         let registry = Arc::new(FragmentControlRegistry::default());
-        let finst_id = UniqueId { hi: 41, lo: 42 };
+        let finst_id = UniqueId::new(41, 42);
         let reservation = registry
             .reserve(finst_id)
             .expect("first reservation succeeds");
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn duplicate_registration_fails_until_the_original_reservation_rolls_back() {
         let registry = Arc::new(FragmentControlRegistry::default());
-        let finst_id = UniqueId { hi: 51, lo: 52 };
+        let finst_id = UniqueId::new(51, 52);
         let reservation = registry
             .reserve(finst_id)
             .expect("first reservation succeeds");

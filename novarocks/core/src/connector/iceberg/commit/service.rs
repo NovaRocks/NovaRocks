@@ -287,7 +287,7 @@ mod tests {
             Arc::new(schema),
             Arc::new(partition_spec),
             "s3://bucket/db/tbl/data/_staging/abc".to_string(),
-            UniqueId { hi: 11, lo: 22 },
+            UniqueId::new(11, 22),
         )
     }
 

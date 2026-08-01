@@ -2618,7 +2618,7 @@ mod tests {
             table.metadata().current_schema().clone(),
             table.metadata().default_partition_spec().clone(),
             "file:///tmp/staging".to_string(),
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(table.metadata().clone());
         let committed =

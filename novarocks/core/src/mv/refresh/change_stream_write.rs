@@ -128,7 +128,7 @@ pub(crate) fn new_iceberg_mv_commit_collector(
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     )
@@ -193,10 +193,10 @@ mod tests {
     fn writer_key(query_id: UniqueId, writer_fragment_id: i32, backend_num: i32) -> WriterKey {
         WriterKey {
             query_id,
-            fragment_instance_id: UniqueId {
-                hi: 101,
-                lo: ((writer_fragment_id as i64) << 16) | backend_num as i64,
-            },
+            fragment_instance_id: UniqueId::new(
+                101,
+                ((writer_fragment_id as i64) << 16) | backend_num as i64,
+            ),
             backend_num,
         }
     }

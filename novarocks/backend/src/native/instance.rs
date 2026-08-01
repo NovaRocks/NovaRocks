@@ -21,13 +21,11 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
-use novarocks::common::types::UniqueId;
 use novarocks::exec::fragment::program::FragmentNodeId;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
-use novarocks::runtime::query_context::QueryId;
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
@@ -35,6 +33,8 @@ use novarocks::runtime::scan_range::{
     ScanRange, ScanRangeParams, StarRocksTabletScanRange,
 };
 use novarocks_protocol::{common, novarocks as proto};
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 use super::ingress::NativeFragmentIngressError;
 
@@ -391,10 +391,7 @@ fn out_of_range(path: FieldPath, detail: impl Into<String>) -> NativeFragmentIng
 }
 
 fn unique_id_from_native(src: &common::UniqueId) -> UniqueId {
-    UniqueId {
-        hi: src.hi,
-        lo: src.lo,
-    }
+    UniqueId::new(src.hi, src.lo)
 }
 
 fn query_id_from_native(src: &common::UniqueId) -> QueryId {

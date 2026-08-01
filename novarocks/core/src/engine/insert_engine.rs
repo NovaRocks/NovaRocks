@@ -544,7 +544,7 @@ mod tests {
             QueryExecutionResult {
                 query_result: QueryResult::empty(),
                 write_commit: Some(WriteCommitInput {
-                    write_id: UniqueId { hi: 1, lo: 2 },
+                    write_id: UniqueId::new(1, 2),
                     writers: Vec::new(),
                 }),
                 write_abort: None,
@@ -579,7 +579,7 @@ mod tests {
             QueryExecutionResult {
                 query_result: QueryResult::empty(),
                 write_commit: Some(WriteCommitInput {
-                    write_id: UniqueId { hi: 1, lo: 2 },
+                    write_id: UniqueId::new(1, 2),
                     writers: Vec::new(),
                 }),
                 write_abort: None,

@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn tablet_domain_records_deduplicate_by_tablet_and_backend() {
-        let finst_id = UniqueId { hi: 41, lo: 42 };
+        let finst_id = UniqueId::new(41, 42);
         unregister(finst_id);
 
         let commit = TabletCommitInfo {

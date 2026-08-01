@@ -132,11 +132,11 @@ impl RuntimeState {
             }
             let process = mem_tracker::process_mem_tracker();
             let query_label = query_id
-                .map(|id| format!("query_{:x}_{:x}", id.hi, id.lo))
+                .map(|id| format!("query_{:x}_{:x}", id.high(), id.low()))
                 .unwrap_or_else(|| "query_unknown".to_string());
             let query_tracker = MemTracker::new_child(query_label, &process);
             let fragment_label = fragment_instance_id
-                .map(|id| format!("fragment_{:x}_{:x}", id.hi, id.lo))
+                .map(|id| format!("fragment_{:x}_{:x}", id.high(), id.low()))
                 .unwrap_or_else(|| "fragment_unknown".to_string());
             Some(MemTracker::new_child(fragment_label, &query_tracker))
         });
@@ -458,8 +458,8 @@ mod tests {
 
     #[test]
     fn construction_does_not_register_sink_commit_side_effect() {
-        let query_id = QueryId { hi: 7001, lo: 7002 };
-        let finst_id = UniqueId { hi: 7003, lo: 7004 };
+        let query_id = QueryId::new(7001, 7002);
+        let finst_id = UniqueId::new(7003, 7004);
         sink_commit::unregister(finst_id);
 
         let _state = RuntimeState::new(
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn load_tracking_logs_require_explicit_sink_injection() {
-        let query_id = QueryId { hi: 7101, lo: 7102 };
+        let query_id = QueryId::new(7101, 7102);
         let sink = Arc::new(RecordingTrackingSink::default());
         let state = RuntimeState::new(None, None, Some(query_id), None, None, None, None, None)
             .with_load_tracking_sink(Some(sink.clone()));

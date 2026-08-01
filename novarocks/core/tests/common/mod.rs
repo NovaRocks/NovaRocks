@@ -24,9 +24,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
-use novarocks::common::types::UniqueId;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
+use novarocks_types::UniqueId;
 
 /// Test configuration for integration tests.
 pub struct TestConfig {
@@ -94,10 +94,7 @@ impl Default for TestConfig {
 
 /// Generate a test query ID.
 pub fn test_query_id() -> UniqueId {
-    UniqueId {
-        hi: 1234567890,
-        lo: 9876543210,
-    }
+    UniqueId::new(1234567890, 9876543210)
 }
 
 /// Generate a unique query ID based on test name.
@@ -109,10 +106,7 @@ pub fn unique_query_id(test_name: &str) -> UniqueId {
     test_name.hash(&mut hasher);
     let hash = hasher.finish();
 
-    UniqueId {
-        hi: hash as i64,
-        lo: (hash >> 32) as i64,
-    }
+    UniqueId::new(hash as i64, (hash >> 32) as i64)
 }
 
 /// Wait for a condition to become true, with timeout.

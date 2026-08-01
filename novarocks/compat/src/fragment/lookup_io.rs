@@ -89,8 +89,8 @@ fn remote_request(
 ) -> Result<novarocks::proto::filter::LookupRequest, FragmentIoError> {
     let mut output = novarocks::proto::filter::LookupRequest {
         query_id: Some(novarocks::proto::common::UniqueId {
-            hi: request.query_id().hi(),
-            lo: request.query_id().lo(),
+            hi: request.query_id().high(),
+            lo: request.query_id().low(),
         }),
         lookup_node_id: request.lookup_node_id(),
         request_tuple_id: request.tuple_id(),

@@ -409,7 +409,7 @@ mod tests {
         ContributionRouteIdentity, DeliveryRouteIdentity,
     };
 
-    const QID: UniqueId = UniqueId { hi: 5, lo: 6 };
+    const QID: UniqueId = UniqueId::new(5, 6);
 
     fn dedupe() -> IngressDedupe {
         IngressDedupe::new(QID)
@@ -418,7 +418,7 @@ mod tests {
     fn contribution(sequence: u64) -> ContributionRouteIdentity {
         ContributionRouteIdentity::try_new(
             BindingId::new(1),
-            UniqueId { hi: 1, lo: 2 },
+            UniqueId::new(1, 2),
             PartitionId::new(0),
             ProducerSequence::new(sequence),
         )
@@ -571,7 +571,7 @@ mod tests {
             TombstoneVerdict::Retired,
         );
 
-        let other = IngressDedupe::new(UniqueId { hi: 7, lo: 8 });
+        let other = IngressDedupe::new(UniqueId::new(7, 8));
         // The other query's dedupe never saw the retire; its epochs stay Live.
         assert_eq!(
             other.tombstone_verdict(DeploymentEpoch::new(9)),

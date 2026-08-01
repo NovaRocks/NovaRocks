@@ -19,10 +19,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks::UniqueId;
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
-use novarocks::query_execution::contract::{DistributedQueryIntent, QueryId};
+use novarocks::query_execution::contract::DistributedQueryIntent;
 use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
@@ -41,6 +40,8 @@ use novarocks::service::grpc_server::GrpcService;
 use novarocks::service::native_fragment_ingress::{
     NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
 };
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 use super::barrier::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, PreReadyAttemptGuard,
@@ -439,10 +440,7 @@ fn manifest(
     } else {
         (
             BTreeSet::from([ParticipantRole::FragmentExecutor]),
-            BTreeSet::from([UniqueId {
-                hi: 100,
-                lo: backend_idx as i64 + 1,
-            }]),
+            BTreeSet::from([UniqueId::new(100, backend_idx as i64 + 1)]),
             None,
         )
     };
@@ -611,7 +609,7 @@ fn frontend_fragment_observation_rejects_conflicts_and_wrong_participants() {
         manifest.execution_id(),
         participant.digest,
         manifest.backend().clone(),
-        UniqueId { hi: 999, lo: 999 },
+        UniqueId::new(999, 999),
         2,
         0,
         0,
@@ -1822,7 +1820,7 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
         execution_id,
         ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
         [ParticipantRole::FragmentExecutor],
-        [UniqueId { hi: 801, lo: 1 }],
+        [UniqueId::new(801, 1)],
         ParticipantQueryOptions::new(QueryOptions::default()),
         1_900_000_000_000,
         [],
@@ -1891,7 +1889,7 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
         query_execution_id(),
         ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
         [ParticipantRole::FragmentExecutor],
-        [UniqueId { hi: 802, lo: 1 }],
+        [UniqueId::new(802, 1)],
         ParticipantQueryOptions::new(QueryOptions::default()),
         1_900_000_000_000,
         [],
@@ -2226,10 +2224,7 @@ fn live_init_request(backend: LiveBackendTarget, finst_high: i64) -> QueryInitRe
             execution_id,
             ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
             [ParticipantRole::FragmentExecutor],
-            [UniqueId {
-                hi: finst_high,
-                lo: 1,
-            }],
+            [UniqueId::new(finst_high, 1)],
             ParticipantQueryOptions::new(QueryOptions::default()),
             1_900_000_000_000,
             [],

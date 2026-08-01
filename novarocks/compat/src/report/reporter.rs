@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::frontend_rpc;
 use crate::thrift::{frontend_service, status, status_code, types};
-use novarocks::UniqueId;
 use novarocks::common::config;
 use novarocks::novarocks_logging::{debug, warn};
-use novarocks::runtime::query_context::QueryId;
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 const NORMAL_REPORT_QUEUE_LIMIT: usize = 1_000;
 
@@ -355,8 +355,8 @@ mod tests {
 
     use super::{ExecStateReportTask, StarRocksReporter, is_query_gone_status};
     use crate::thrift::{status, status_code, types};
-    use novarocks::UniqueId;
-    use novarocks::runtime::query_context::QueryId;
+    use novarocks_types::QueryId;
+    use novarocks_types::UniqueId;
 
     use crate::report::status::{ExecStatusReportInput, build_report_params};
 
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn non_final_reports_dedupe_by_fragment_instance() {
         let reporter = StarRocksReporter::new(Arc::new(|_| {}));
-        let finst_id = UniqueId { hi: 1, lo: 2 };
+        let finst_id = UniqueId::new(1, 2);
         reporter
             .enqueue_non_final(task(finst_id))
             .expect("first progress report");

@@ -290,8 +290,8 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
         let request = FetchResultRequest {
             finst_id: Some(ProtoUniqueId {
-                hi: finst_id.hi,
-                lo: finst_id.lo,
+                hi: finst_id.high(),
+                lo: finst_id.low(),
             }),
             max_wait_ms,
         };
@@ -374,7 +374,7 @@ mod tests {
     use tonic::{Request, Response, Status, Streaming};
 
     fn make_finst_id(hi: i64, lo: i64) -> UniqueId {
-        UniqueId { hi, lo }
+        UniqueId::new(hi, lo)
     }
 
     #[derive(Clone)]

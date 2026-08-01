@@ -291,10 +291,7 @@ fn decode_file_pruning_value(
 }
 
 fn unique_id(src: &crate::proto::common::UniqueId) -> UniqueId {
-    UniqueId {
-        hi: src.hi,
-        lo: src.lo,
-    }
+    UniqueId::new(src.hi, src.lo)
 }
 
 #[cfg(test)]

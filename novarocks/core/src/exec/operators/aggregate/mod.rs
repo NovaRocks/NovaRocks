@@ -1742,7 +1742,7 @@ mod tests {
 
     const RF_BINDING: BindingId = BindingId::new(10);
     const RF_CHANNEL: ChannelId = ChannelId::new(1);
-    const RF_INSTANCE: UniqueId = UniqueId { hi: 70, lo: 10 };
+    const RF_INSTANCE: UniqueId = UniqueId::new(70, 10);
     const GROUP_SLOT: SlotId = SlotId::new(1);
 
     struct TestClock(Instant);
@@ -1832,7 +1832,7 @@ mod tests {
             ));
             let events = Arc::new(TestEvents::default());
             let service = Arc::new(RuntimeFilterService::new_for_lifecycle_test(
-                UniqueId { hi: 70, lo: 0 },
+                UniqueId::new(70, 0),
                 Arc::new(TestClock(Instant::now())),
                 events.clone(),
                 Arc::new(TestMemory::default()),

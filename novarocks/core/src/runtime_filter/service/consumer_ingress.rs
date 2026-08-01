@@ -467,11 +467,11 @@ mod tests {
     const RANGE_CONSUMER_BINDING: u32 = 31;
     const RANGE_ROUTE: u32 = 41;
     const WITNESS: u32 = 101;
-    const QID: UniqueId = UniqueId { hi: 70, lo: 7 };
+    const QID: UniqueId = UniqueId::new(70, 7);
     const ROOMY: usize = 1 << 20;
 
     fn uid(lo: i64) -> UniqueId {
-        UniqueId { hi: 70, lo }
+        UniqueId::new(70, lo)
     }
 
     fn producer_finst() -> UniqueId {

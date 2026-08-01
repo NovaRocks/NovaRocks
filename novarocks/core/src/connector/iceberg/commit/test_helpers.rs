@@ -138,7 +138,7 @@ where
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );
@@ -211,7 +211,7 @@ pub(crate) async fn v3_table_with_n_data_files(n: usize) -> IcebergTestFixture {
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             format!("{table_location}/staging"),
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );
@@ -269,7 +269,7 @@ pub(crate) async fn v3_table_with_multi_batch_appends(batches: &[usize]) -> Iceb
                 metadata.current_schema().clone(),
                 metadata.default_partition_spec().clone(),
                 format!("{table_location}/staging"),
-                crate::common::types::UniqueId { hi: 0, lo: 0 },
+                novarocks_types::UniqueId::new(0, 0),
             )
             .with_table_metadata(metadata.clone()),
         );
@@ -471,7 +471,7 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             format!("{table_location}/staging"),
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );
@@ -521,7 +521,7 @@ pub(crate) async fn run_overwrite_partitions_commit(
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );

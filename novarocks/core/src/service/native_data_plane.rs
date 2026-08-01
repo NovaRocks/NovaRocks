@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use novarocks_types::UniqueId;
+
 use crate::proto;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
@@ -84,10 +86,7 @@ impl NativeDataPlaneKernel {
                 Vec::new(),
             );
         };
-        let finst_id = crate::UniqueId {
-            hi: finst_id.hi,
-            lo: finst_id.lo,
-        };
+        let finst_id = UniqueId::new(finst_id.hi, finst_id.lo);
         let call_index = FETCH_RESULT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
         if crate::common::config::debug_fault_inject_fetch_not_ready_count()
             .is_some_and(|limit| call_index <= limit)

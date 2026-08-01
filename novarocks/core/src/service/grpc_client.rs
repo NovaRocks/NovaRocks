@@ -671,8 +671,8 @@ pub fn send_chunks(
     let host = dest_host.to_string();
     let port = dest_port;
     let req = proto::novarocks::ExchangeRequest {
-        finst_id_hi: finst_id.hi,
-        finst_id_lo: finst_id.lo,
+        finst_id_hi: finst_id.high(),
+        finst_id_lo: finst_id.low(),
         node_id,
         sender_id,
         be_number,

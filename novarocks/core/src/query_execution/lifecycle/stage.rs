@@ -116,8 +116,8 @@ impl StageDigest {
         );
         for fragment in ordered {
             let finst = fragment.fragment_instance_id();
-            hasher.update(finst.hi.to_be_bytes());
-            hasher.update(finst.lo.to_be_bytes());
+            hasher.update(finst.high().to_be_bytes());
+            hasher.update(finst.low().to_be_bytes());
             hash_message(&mut hasher, "novarocks.plan.PlanFragment", fragment.plan())?;
             hash_message(
                 &mut hasher,
@@ -752,10 +752,10 @@ fn fragment_instance_id(
             "stage fragment instance id must be nonzero",
         ));
     }
-    Ok(UniqueId {
-        hi: fragment_instance_id.hi,
-        lo: fragment_instance_id.lo,
-    })
+    Ok(UniqueId::new(
+        fragment_instance_id.hi,
+        fragment_instance_id.lo,
+    ))
 }
 
 #[cfg(test)]
@@ -828,8 +828,8 @@ mod tests {
             vec![fragment(9), fragment(3)],
         )
         .expect("valid batch");
-        assert_eq!(request.fragments()[0].fragment_instance_id().lo, 3);
-        assert_eq!(request.fragments()[1].fragment_instance_id().lo, 9);
+        assert_eq!(request.fragments()[0].fragment_instance_id().low(), 3);
+        assert_eq!(request.fragments()[1].fragment_instance_id().low(), 9);
 
         QueryStageRequest::new(
             execution_id(),

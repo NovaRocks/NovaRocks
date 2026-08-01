@@ -397,7 +397,7 @@ mod tests {
             Arc::new(
                 RuntimeFilterEnvelope::try_new(
                     RuntimeFilterEnvelopeKind::Artifact,
-                    UniqueId { hi: 11, lo: 12 },
+                    UniqueId::new(11, 12),
                     ChannelId::new(13),
                     DeploymentEpoch::new(14),
                     identity(edge, sequence),
@@ -461,7 +461,7 @@ mod tests {
         );
         let (seen_route, seen_envelope) = recv_seen(&mut seen_rx);
         assert_eq!(seen_route, route(40));
-        assert_eq!(seen_envelope.query_id(), UniqueId { hi: 11, lo: 12 });
+        assert_eq!(seen_envelope.query_id(), UniqueId::new(11, 12));
         assert_eq!(seen_envelope.channel_id(), ChannelId::new(13));
         assert_eq!(seen_envelope.deployment_epoch(), DeploymentEpoch::new(14));
         assert_eq!(seen_envelope.route_identity(), &expected_identity);

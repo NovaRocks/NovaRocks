@@ -9,10 +9,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::thrift::{data_cache, status as thrift_status, status_code, types};
-use novarocks::common::types::UniqueId;
 use novarocks::novarocks_logging::{debug, warn};
 use novarocks::runtime::fragment::io::{FragmentReportRegistration, FragmentTerminalReport};
 use novarocks::runtime::sink_commit;
+use novarocks_types::UniqueId;
 
 use reporter::{ExecStateReportTask, StarRocksReporter};
 use status::{ExecStatusReportInput, build_report_params};
@@ -262,7 +262,7 @@ fn thrift_status_from_error(error: Option<String>) -> thrift_status::TStatus {
 
 fn build_tracking_url(
     tracking: &LoadTrackingStore,
-    query_id: novarocks::runtime::query_context::QueryId,
+    query_id: novarocks_types::QueryId,
 ) -> Option<String> {
     if !tracking.has_tracking_log(query_id) {
         return None;
@@ -273,8 +273,8 @@ fn build_tracking_url(
     Some(format!(
         "http://{host}:{}/api/_load_tracking/{}/{}",
         config.server.http_port,
-        query_id.hi(),
-        query_id.lo()
+        query_id.high(),
+        query_id.low()
     ))
 }
 

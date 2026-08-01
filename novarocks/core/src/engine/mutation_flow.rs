@@ -1047,7 +1047,7 @@ fn execute_mor_update(
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );
@@ -1526,7 +1526,7 @@ fn execute_cow_update(
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );
@@ -2616,7 +2616,7 @@ pub(crate) fn execute_merge_statement(
                 metadata.current_schema().clone(),
                 metadata.default_partition_spec().clone(),
                 staging_dir,
-                crate::common::types::UniqueId { hi: 0, lo: 0 },
+                novarocks_types::UniqueId::new(0, 0),
             )
             .with_table_metadata(metadata.clone()),
         );
@@ -2768,7 +2768,7 @@ pub(crate) fn execute_merge_statement(
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );

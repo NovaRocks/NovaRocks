@@ -109,7 +109,7 @@ struct TerminalState {
 /// allowed to affect query completion or its primary failure.
 #[derive(Default)]
 struct FragmentObservationState {
-    latest: BTreeMap<(usize, novarocks::UniqueId), FragmentLiveObservation>,
+    latest: BTreeMap<(usize, novarocks_types::UniqueId), FragmentLiveObservation>,
     accepted: u64,
     idempotent: u64,
     stale: u64,
@@ -129,7 +129,7 @@ pub(super) enum FragmentObservationStoreOutcome {
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FragmentObservationSnapshot {
-    pub latest: BTreeMap<(usize, novarocks::UniqueId), FragmentLiveObservation>,
+    pub latest: BTreeMap<(usize, novarocks_types::UniqueId), FragmentLiveObservation>,
     pub accepted: u64,
     pub idempotent: u64,
     pub stale: u64,

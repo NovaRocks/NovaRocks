@@ -187,11 +187,11 @@ fn spawn_exec_fragment_native(
                 if id != finst_id || worker_readiness.is_ready() {
                     result_buffer::close_error(id, err_msg.clone());
                 }
-                exchange::cancel_fragment(id.hi, id.lo);
+                exchange::cancel_fragment(id.high(), id.low());
             }
         }
         mgr.finish_fragment(query_id);
-        exchange::remove_fragment(finst_id.hi, finst_id.lo);
+        exchange::remove_fragment(finst_id.high(), finst_id.low());
         mgr.unregister_finst(finst_id);
         if let Some(error) = pre_ready_failure {
             worker_readiness.fail_after_cleanup(error);
@@ -272,7 +272,7 @@ pub(crate) fn submit_exec_plan_fragment_native_with_manager(
         .query_mem_tracker(query_id)
         .ok_or_else(|| "QueryContext missing mem_tracker".to_string())?;
     mgr.get_or_register_native(query_id, false, delivery_expire, query_expire)?;
-    let fragment_label = format!("fragment_{:x}_{:x}", finst_id.hi, finst_id.lo);
+    let fragment_label = format!("fragment_{:x}_{:x}", finst_id.high(), finst_id.low());
     let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
     let enable_profile = query_opts.enable_profile;
     let profiler = if enable_profile {
@@ -352,8 +352,8 @@ mod tests {
 
     fn registration_snapshot(query_id: QueryId, finst_id: UniqueId) -> RuntimeRegistrationSnapshot {
         let exchange_key = crate::runtime::exchange::ExchangeKey {
-            finst_id_hi: finst_id.hi,
-            finst_id_lo: finst_id.lo,
+            finst_id_hi: finst_id.high(),
+            finst_id_lo: finst_id.low(),
             node_id: 404,
         };
         let result_buffer = match result_buffer::try_fetch(finst_id) {
@@ -366,8 +366,8 @@ mod tests {
             },
         };
         let query_key = crate::runtime::runtime_filter_observability::QueryKey::from_hi_lo(
-            query_id.hi,
-            query_id.lo,
+            query_id.high(),
+            query_id.low(),
         );
 
         RuntimeRegistrationSnapshot {
@@ -387,16 +387,10 @@ mod tests {
 
     #[test]
     fn native_profiler_uses_true_program_root_plan_node_id() {
-        let query_id = QueryId {
-            hi: 73_901,
-            lo: 73_902,
-        };
+        let query_id = QueryId::new(73_901, 73_902);
         let submission = values_submission_for_test(
             query_id,
-            UniqueId {
-                hi: query_id.hi + 1,
-                lo: query_id.lo + 1,
-            },
+            UniqueId::new(query_id.high() + 1, query_id.low() + 1),
             99,
             FragmentSinkProgram::Result,
         );
@@ -409,14 +403,8 @@ mod tests {
 
     #[test]
     fn pre_ready_worker_panic_returns_synchronously_after_cleanup() {
-        let query_id = QueryId {
-            hi: 74_101,
-            lo: 74_102,
-        };
-        let finst_id = UniqueId {
-            hi: 74_103,
-            lo: 74_104,
-        };
+        let query_id = QueryId::new(74_101, 74_102);
+        let finst_id = UniqueId::new(74_103, 74_104);
         crate::runtime::fragment::native_execution::install_test_pre_ready_panic(finst_id);
         let before = registration_snapshot(query_id, finst_id);
 
@@ -457,11 +445,8 @@ mod tests {
     #[test]
     fn conflicting_cache_preflight_after_strict_rf_context_does_not_register_fragment() {
         let manager = QueryContextManager::new_for_test();
-        let query_id = QueryId {
-            hi: 74_201,
-            lo: 74_202,
-        };
-        let finst_id = UniqueId { hi: 70, lo: 40 };
+        let query_id = QueryId::new(74_201, 74_202);
+        let finst_id = UniqueId::new(70, 40);
         let lifecycle = RuntimeFilterQueryLifecycleOptions {
             delivery_expire: Duration::from_secs(1),
             query_expire: Duration::from_secs(5),

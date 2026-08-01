@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn fragment_result_session_writes_twenty_plus_seventeen_rows_and_finishes_once() {
-        let finst_id = UniqueId { hi: 9901, lo: 9902 };
+        let finst_id = UniqueId::new(9901, 9902);
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
         let first_rows = (0..20)
             .map(|row| format!("row-{row}").into_bytes())
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn fragment_result_session_abort_is_idempotent_and_rejects_late_write() {
-        let finst_id = UniqueId { hi: 9903, lo: 9904 };
+        let finst_id = UniqueId::new(9903, 9904);
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
 
         assert_eq!(
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn publication_outcomes_distinguish_data_terminal_and_removed_state() {
-        let finst_id = UniqueId { hi: 9909, lo: 9910 };
+        let finst_id = UniqueId::new(9909, 9910);
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
 
         assert_eq!(
@@ -865,7 +865,7 @@ mod tests {
             ResultPublication::NoChange
         );
 
-        let rolled_back = UniqueId { hi: 9911, lo: 9912 };
+        let rolled_back = UniqueId::new(9911, 9912);
         let handle = ResultBufferWriteHandle::open(rolled_back, false, None).expect("open result");
         assert_eq!(
             handle.abort(ResultAbort::PrepareRollback),
@@ -876,7 +876,7 @@ mod tests {
 
     #[test]
     fn fragment_result_session_failure_preserves_execution_error() {
-        let finst_id = UniqueId { hi: 9907, lo: 9908 };
+        let finst_id = UniqueId::new(9907, 9908);
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
 
         assert_eq!(
@@ -897,7 +897,7 @@ mod tests {
 
     #[test]
     fn fragment_result_session_late_abort_preserves_finished_result() {
-        let finst_id = UniqueId { hi: 9905, lo: 9906 };
+        let finst_id = UniqueId::new(9905, 9906);
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
         handle
             .write_legacy(FetchResult {
@@ -923,7 +923,7 @@ mod tests {
 
     #[test]
     fn cancel_is_observable() {
-        let finst_id = UniqueId { hi: 42, lo: 7 };
+        let finst_id = UniqueId::new(42, 7);
         create_sender(finst_id);
         assert_eq!(cancel(finst_id), ResultPublication::TerminalReady);
 
@@ -935,7 +935,7 @@ mod tests {
 
     #[test]
     fn close_error_is_observable() {
-        let finst_id = UniqueId { hi: 1, lo: 2 };
+        let finst_id = UniqueId::new(1, 2);
         create_sender(finst_id);
         assert_eq!(
             close_error(finst_id, "boom".to_string()),
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn try_fetch_returns_batches_in_order_and_then_eos() {
-        let finst_id = UniqueId { hi: 7, lo: 9 };
+        let finst_id = UniqueId::new(7, 9);
         create_sender(finst_id);
         insert(
             finst_id,
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn not_ready_transitions_to_ready_after_insert() {
-        let finst_id = UniqueId { hi: 70, lo: 90 };
+        let finst_id = UniqueId::new(70, 90);
         create_sender(finst_id);
         assert!(matches!(try_fetch(finst_id), TryFetchResult::NotReady));
 
@@ -1022,8 +1022,8 @@ mod tests {
 
     #[test]
     fn fetch_wait_timeout_prefers_query_context() {
-        let query_id = QueryId { hi: 101, lo: 202 };
-        let finst_id = UniqueId { hi: 303, lo: 404 };
+        let query_id = QueryId::new(101, 202);
+        let finst_id = UniqueId::new(303, 404);
         let mgr = query_context_manager();
         mgr.ensure_native_context(
             query_id,
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn wait_fetch_with_zero_max_wait_returns_not_ready_immediately() {
-        let finst_id = UniqueId { hi: 601, lo: 602 };
+        let finst_id = UniqueId::new(601, 602);
         create_sender(finst_id);
         // Empty open buffer with max_wait_ms=0 must return NotReady instantly.
         assert!(matches!(wait_fetch(finst_id, 0), TryFetchResult::NotReady));
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[test]
     fn wait_fetch_returns_ready_after_delayed_insert() {
-        let finst_id = UniqueId { hi: 603, lo: 604 };
+        let finst_id = UniqueId::new(603, 604);
         create_sender(finst_id);
 
         // Insert from a background thread after 20 ms.
@@ -1075,7 +1075,7 @@ mod tests {
 
     #[test]
     fn typed_fetch_returns_payloads_in_order_and_then_eof() {
-        let finst_id = UniqueId { hi: 701, lo: 702 };
+        let finst_id = UniqueId::new(701, 702);
         create_typed_sender(finst_id);
         insert_typed(finst_id, vec![1, 2, 3]).expect("insert first typed payload");
         insert_typed(finst_id, vec![4, 5]).expect("insert second typed payload");
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn typed_sender_rejects_legacy_fetch() {
-        let finst_id = UniqueId { hi: 703, lo: 704 };
+        let finst_id = UniqueId::new(703, 704);
         create_typed_sender(finst_id);
         insert_typed(finst_id, vec![9]).expect("insert typed payload");
 
@@ -1119,7 +1119,7 @@ mod tests {
 
     #[test]
     fn legacy_sender_rejects_typed_fetch() {
-        let finst_id = UniqueId { hi: 705, lo: 706 };
+        let finst_id = UniqueId::new(705, 706);
         create_sender(finst_id);
         insert(
             finst_id,

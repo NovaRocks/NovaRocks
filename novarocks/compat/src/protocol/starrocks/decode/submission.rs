@@ -42,12 +42,13 @@ use novarocks::runtime::fragment::io::{
 };
 use novarocks::runtime::fragment::submission::FragmentSubmission;
 use novarocks::runtime::query_context::LookupFetcherLifecycle;
-use novarocks::runtime::query_context::{QueryId as RuntimeQueryId, query_context_manager};
+use novarocks::runtime::query_context::query_context_manager;
 use novarocks::runtime::query_options::query_expire_durations;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
+use novarocks_types::QueryId as RuntimeQueryId;
 
 use super::dependency::{
     FragmentExprArenaOwner, QueryProfilePatch, StarRocksExternalDependency,
@@ -194,7 +195,7 @@ impl StarRocksSubmissionMetadata {
 
     fn result_write_spec(
         &self,
-        fragment_instance_id: novarocks::common::types::UniqueId,
+        fragment_instance_id: novarocks_types::UniqueId,
     ) -> Option<ResultWriteSpec> {
         self.result_override
             .as_ref()
@@ -238,7 +239,7 @@ impl StarRocksSubmissionMetadata {
         lookup_client: std::sync::Arc<dyn novarocks::runtime::fragment::io::FragmentLookupClient>,
         result_writer: std::sync::Arc<dyn FragmentResultWriter>,
         event_sink: std::sync::Arc<dyn FragmentEventSink>,
-        fragment_instance_id: novarocks::common::types::UniqueId,
+        fragment_instance_id: novarocks_types::UniqueId,
     ) -> novarocks::runtime::fragment::FragmentPrepareContext {
         novarocks::runtime::fragment::FragmentPrepareContext::new_with_execution_overrides(
             profiler,
@@ -1107,18 +1108,19 @@ mod tests {
     use super::*;
     use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TStringLiteral};
     use crate::thrift::{data_sinks, partitions, plan_nodes};
-    use novarocks::common::types::UniqueId;
     use novarocks::exec::expr::{ExprNode, LiteralValue};
     use novarocks::exec::fragment::program::{FragmentSinkKind, FragmentSinkSpec};
     use novarocks::exec::fragment::sink::FragmentSinkProgram;
     use novarocks::exec::node::ExecNodeKind;
     use novarocks::runtime::endpoint::FragmentDestination;
     use novarocks::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
-    use novarocks::runtime::query_context::{QueryId, query_context_manager};
+    use novarocks::runtime::query_context::query_context_manager;
     use novarocks::runtime::result_buffer::{self, TryFetchResult};
     use novarocks::runtime::runtime_filter_observability::{
         QueryKey, RuntimeFilterLifecycleRegistry,
     };
+    use novarocks_types::QueryId;
+    use novarocks_types::UniqueId;
     use std::sync::LazyLock;
 
     use novarocks::connector::starrocks::lake::context::PartialUpdateWriteMode;
@@ -1470,8 +1472,14 @@ mod tests {
 
     fn params(query: UniqueId, finst: UniqueId) -> internal_service::TPlanFragmentExecParams {
         internal_service::TPlanFragmentExecParams::new(
-            types::TUniqueId::new(query.hi, query.lo),
-            types::TUniqueId::new(finst.hi, finst.lo),
+            types::TUniqueId {
+                hi: query.high(),
+                lo: query.low(),
+            },
+            types::TUniqueId {
+                hi: finst.high(),
+                lo: finst.low(),
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             None,
@@ -1521,8 +1529,8 @@ mod tests {
 
     #[test]
     fn values_noop_decodes_to_validated_starrocks_submission() {
-        let query = UniqueId { hi: 11, lo: 12 };
-        let finst = UniqueId { hi: 21, lo: 22 };
+        let query = UniqueId::new(11, 12);
+        let finst = UniqueId::new(21, 22);
         let fragment = values_noop_fragment();
         let params = params(query, finst);
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
@@ -1570,7 +1578,7 @@ mod tests {
 
         let mut fragment = values_noop_fragment();
         fragment.plan.as_mut().expect("plan").nodes = vec![lookup, fetch];
-        let mut params = params(UniqueId { hi: 43, lo: 44 }, UniqueId { hi: 45, lo: 46 });
+        let mut params = params(UniqueId::new(43, 44), UniqueId::new(45, 46));
         params.per_look_up_num_fetchers = Some(BTreeMap::from([(41, 3)]));
         let input = decode_input(&fragment, &params);
 
@@ -1594,7 +1602,7 @@ mod tests {
         sink.type_ = data_sinks::TDataSinkType::DATA_STREAM_SINK;
         sink.stream_sink = Some(profile_partitioned_stream_sink("query-7"));
         let fragment = fragment_with_sink(sink);
-        let params = params(UniqueId { hi: 81, lo: 82 }, UniqueId { hi: 83, lo: 84 });
+        let params = params(UniqueId::new(81, 82), UniqueId::new(83, 84));
 
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect("prepare profile-partitioned data stream");
@@ -1619,7 +1627,7 @@ mod tests {
         sink.type_ = data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK;
         sink.multi_cast_stream_sink = Some(multi_cast);
         let fragment = fragment_with_sink(sink);
-        let params = params(UniqueId { hi: 85, lo: 86 }, UniqueId { hi: 87, lo: 88 });
+        let params = params(UniqueId::new(85, 86), UniqueId::new(87, 88));
 
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect("prepare profile-partitioned multicast");
@@ -1641,7 +1649,7 @@ mod tests {
         let mut fragment = values_noop_fragment();
         let root = &mut fragment.plan.as_mut().expect("plan").nodes[0];
         root.conjuncts = Some(vec![get_query_profile_expr("query-7")]);
-        let params = params(UniqueId { hi: 89, lo: 90 }, UniqueId { hi: 91, lo: 92 });
+        let params = params(UniqueId::new(89, 90), UniqueId::new(91, 92));
 
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect("prepare plan-owned profile expression");
@@ -1720,11 +1728,11 @@ mod tests {
 
     #[test]
     fn instance_first_decode_owns_domain_destinations() {
-        let query = UniqueId { hi: 13, lo: 14 };
-        let finst = UniqueId { hi: 23, lo: 24 };
+        let query = UniqueId::new(13, 14);
+        let finst = UniqueId::new(23, 24);
         let mut params = params(query, finst);
         params.destinations = Some(vec![data_sinks::TPlanFragmentDestination::new(
-            types::TUniqueId::new(33, 34),
+            types::TUniqueId { hi: 33, lo: 34 },
             types::TNetworkAddress::new("127.0.0.1".to_string(), 8060),
             None,
             None,
@@ -2135,7 +2143,7 @@ mod tests {
     fn negative_child_count_reports_exact_node_field_path() {
         let mut fragment = values_noop_fragment();
         fragment.plan.as_mut().expect("plan").nodes[0].num_children = -1;
-        let params = params(UniqueId { hi: 35, lo: 36 }, UniqueId { hi: 45, lo: 46 });
+        let params = params(UniqueId::new(35, 36), UniqueId::new(45, 46));
         let error = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect_err("negative child count must fail");
         assert_eq!(
@@ -2157,7 +2165,7 @@ mod tests {
         child.node_id += 1;
         child.num_children = -1;
         plan.nodes.push(child);
-        let params = params(UniqueId { hi: 37, lo: 38 }, UniqueId { hi: 47, lo: 48 });
+        let params = params(UniqueId::new(37, 38), UniqueId::new(47, 48));
         let error = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect_err("negative child count must fail");
         assert_eq!(
@@ -2177,7 +2185,7 @@ mod tests {
         let mut trailing = plan.nodes[0].clone();
         trailing.node_id += 1;
         plan.nodes.push(trailing);
-        let params = params(UniqueId { hi: 39, lo: 40 }, UniqueId { hi: 49, lo: 50 });
+        let params = params(UniqueId::new(39, 40), UniqueId::new(49, 50));
         let error = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect_err("trailing flat node must fail");
         assert_eq!(
@@ -2195,7 +2203,7 @@ mod tests {
         let mut fragment = values_noop_fragment();
         fragment.plan = None;
         fragment.output_sink = None;
-        let params = params(UniqueId { hi: 31, lo: 32 }, UniqueId { hi: 41, lo: 42 });
+        let params = params(UniqueId::new(31, 32), UniqueId::new(41, 42));
         let error = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect_err("missing plan must fail");
         let protocol = error.protocol().expect("missing plan is a protocol error");
@@ -2212,22 +2220,16 @@ mod tests {
     #[test]
     fn malformed_starrocks_fragment_has_zero_runtime_side_effects() {
         let query = QueryId::new(51, 52);
-        let finst = UniqueId { hi: 61, lo: 62 };
+        let finst = UniqueId::new(61, 62);
         let mut fragment = values_noop_fragment();
         fragment.plan = None;
-        let params = params(
-            UniqueId {
-                hi: query.hi(),
-                lo: query.lo(),
-            },
-            finst,
-        );
+        let params = params(UniqueId::new(query.high(), query.low()), finst);
         let exchange_key = ExchangeKey {
-            finst_id_hi: finst.hi,
-            finst_id_lo: finst.lo,
+            finst_id_hi: finst.high(),
+            finst_id_lo: finst.low(),
             node_id: 11,
         };
-        let rf_key = QueryKey::from_hi_lo(query.hi(), query.lo());
+        let rf_key = QueryKey::from_hi_lo(query.high(), query.low());
 
         assert!(query_context_manager().query_mem_tracker(query).is_none());
         assert!(prepare_fragment_submission(decode_input(&fragment, &params)).is_err());

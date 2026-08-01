@@ -27,9 +27,9 @@ use novarocks::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
 };
 use novarocks::protocol::ProtocolErrorKind;
-use novarocks::runtime::query_context::QueryId;
 use novarocks::runtime::scan_range::{ScanRange, ScanRangeParams};
 use novarocks_protocol::plan;
+use novarocks_types::QueryId;
 
 fn invalid<T>(detail: String) -> Result<T, NativeFragmentLeafDecodeError> {
     Err(NativeFragmentLeafDecodeError::at_field(

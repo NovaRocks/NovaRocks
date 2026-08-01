@@ -536,27 +536,18 @@ fn retired_exchange_route_projection_binds_exact_instances_and_canonical_sender_
     assert_eq!(routes.len(), 2);
     assert_eq!(
         routes[0].source_fragment_instance_id(),
-        crate::common::types::UniqueId {
-            hi: -468_035_725_852_328_221,
-            lo: 6_732_931_633_094_041_032,
-        }
+        novarocks_types::UniqueId::new(-468_035_725_852_328_221, 6_732_931_633_094_041_032)
     );
     assert_eq!(
         routes[0].destination_fragment_instance_id(),
-        crate::common::types::UniqueId {
-            hi: 2_973_306_339_434_288_066,
-            lo: -8_117_117_705_014_581_208,
-        }
+        novarocks_types::UniqueId::new(2_973_306_339_434_288_066, -8_117_117_705_014_581_208)
     );
     assert_eq!(routes[0].destination_node_id(), 190);
     assert_eq!(routes[0].sender_ordinal(), 0);
     assert_eq!(routes[0].sender_count(), 2);
     assert_eq!(
         routes[1].source_fragment_instance_id(),
-        crate::common::types::UniqueId {
-            hi: 8_069_940_229_124_169_845,
-            lo: 713_546_644_952_921_691,
-        }
+        novarocks_types::UniqueId::new(8_069_940_229_124_169_845, 713_546_644_952_921_691)
     );
     assert_eq!(
         routes[1].destination_fragment_instance_id(),
@@ -775,7 +766,7 @@ fn statistics_theta_partials_union_without_exposing_a_sql_aggregate() {
 
 #[test]
 fn write_outcome_preserves_commit_or_abort() {
-    let write_id = crate::common::types::UniqueId { hi: 41, lo: 73 };
+    let write_id = novarocks_types::UniqueId::new(41, 73);
     let commit = WriteCommitInput {
         write_id,
         writers: Vec::new(),
@@ -877,7 +868,7 @@ fn result_outcome_preserves_query_result() {
 
 #[test]
 fn write_outcome_rejects_commit_and_abort_together() {
-    let write_id = crate::common::types::UniqueId { hi: 8, lo: 13 };
+    let write_id = novarocks_types::UniqueId::new(8, 13);
     let result = QueryOutcomeFactory::new(DistributedQueryIntent::Write).write(
         crate::runtime::query_result::QueryResult::empty(),
         Some(WriteCommitInput {

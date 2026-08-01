@@ -183,13 +183,13 @@ mod tests {
     use crate::protocol::starrocks::decode::{
         StarRocksExternalDependency, StarRocksResolvedDependencyValue,
     };
-    use novarocks::common::types::UniqueId;
     use novarocks::connector::starrocks::{
         lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest},
         ports::LakeMetaStorageResolver,
     };
     use novarocks::runtime::endpoint::RuntimeEndpoint;
-    use novarocks::runtime::query_context::QueryId;
+    use novarocks_types::QueryId;
+    use novarocks_types::UniqueId;
 
     use super::{DependencyResolutionError, resolve_dependencies, resolve_dependencies_with};
     use crate::fragment::admission::PrelaunchRegistry;
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn production_dependency_entrypoint_uses_explicit_lake_meta_port() {
-        let (_registry, token, _guard) = guarded_token(UniqueId { hi: 99, lo: 100 });
+        let (_registry, token, _guard) = guarded_token(UniqueId::new(99, 100));
         let resolver = RecordingLakeMetaResolver {
             calls: AtomicUsize::new(0),
         };
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn resolves_query_profile_and_lake_meta_dependencies() {
-        let finst_id = UniqueId { hi: 101, lo: 102 };
+        let finst_id = UniqueId::new(101, 102);
         let (_registry, token, _guard) = guarded_token(finst_id);
         let result = resolve_dependencies_with(
             &[query_profile_dependency(7), lake_meta_dependency(8)],
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn classifies_provider_failures() {
-        let (_registry, token, _guard) = guarded_token(UniqueId { hi: 103, lo: 104 });
+        let (_registry, token, _guard) = guarded_token(UniqueId::new(103, 104));
         let transport = resolve_dependencies_with(
             &[query_profile_dependency(9)],
             &token,
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn cancellation_before_and_after_wait_prevents_resolution() {
-        let finst_id = UniqueId { hi: 105, lo: 106 };
+        let finst_id = UniqueId::new(105, 106);
         let (registry, token, _guard) = guarded_token(finst_id);
         assert!(registry.cancel(finst_id));
         let calls = AtomicUsize::new(0);
@@ -345,7 +345,7 @@ mod tests {
             DependencyResolutionError::Cancelled { dependency_id: 11 }
         );
 
-        let finst_id = UniqueId { hi: 107, lo: 108 };
+        let finst_id = UniqueId::new(107, 108);
         let (registry, token, _guard) = guarded_token(finst_id);
         let after = resolve_dependencies_with(
             &[query_profile_dependency(12)],

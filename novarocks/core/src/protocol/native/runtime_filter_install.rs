@@ -115,22 +115,19 @@ fn reject_zero(raw: u64, path: FieldPath, identity: &'static str) -> CodecResult
 }
 
 fn encode_unique_id(value: UniqueId, path: FieldPath) -> CodecResult<common::UniqueId> {
-    if value.hi == 0 && value.lo == 0 {
+    if value.high() == 0 && value.low() == 0 {
         return Err(invalid(path, "unique id must be nonzero"));
     }
     Ok(common::UniqueId {
-        hi: value.hi,
-        lo: value.lo,
+        hi: value.high(),
+        lo: value.low(),
     })
 }
 
 fn decode_unique_id(value: Option<&common::UniqueId>, path: FieldPath) -> CodecResult<UniqueId> {
     let value = value.ok_or_else(|| missing(path.clone(), "unique id is required"))?;
-    let decoded = UniqueId {
-        hi: value.hi,
-        lo: value.lo,
-    };
-    if decoded.hi == 0 && decoded.lo == 0 {
+    let decoded = UniqueId::new(value.hi, value.lo);
+    if decoded.high() == 0 && decoded.low() == 0 {
         return Err(invalid(path, "unique id must be nonzero"));
     }
     Ok(decoded)
@@ -1652,7 +1649,7 @@ mod tests {
     };
     use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 
-    const QUERY: UniqueId = UniqueId { hi: 41, lo: 42 };
+    const QUERY: UniqueId = UniqueId::new(41, 42);
     const EPOCH: DeploymentEpoch = DeploymentEpoch::new(7);
 
     fn lifecycle_options() -> RuntimeFilterQueryLifecycleOptions {
@@ -1696,10 +1693,7 @@ mod tests {
         consumer_binding: Option<u32>,
         route_edge_ids: BTreeSet<RouteEdgeId>,
     ) -> RuntimeFilterChannelDeployment {
-        let producer_instance = UniqueId {
-            hi: i64::from(channel_id),
-            lo: 1,
-        };
+        let producer_instance = UniqueId::new(i64::from(channel_id), 1);
         let producers = BTreeMap::from([(
             BindingId::new(producer_binding),
             ProducerDeployment::new(
@@ -1724,10 +1718,7 @@ mod tests {
                         ]),
                         profile.clone(),
                         route_edge_ids.clone(),
-                        BTreeSet::from([UniqueId {
-                            hi: i64::from(channel_id),
-                            lo: 2,
-                        }]),
+                        BTreeSet::from([UniqueId::new(i64::from(channel_id), 2)]),
                     ),
                 )])
             })
@@ -1811,7 +1802,7 @@ mod tests {
                 RuntimeFilterRouteRole::Producer(producer),
                 RuntimeFilterRouteRole::Consumer(consumer),
             ]),
-            BTreeMap::from([((producer, UniqueId { hi: 10, lo: 1 }), participant)]),
+            BTreeMap::from([((producer, UniqueId::new(10, 1)), participant)]),
             vec![route.clone()],
             vec![route],
         )
@@ -2147,10 +2138,7 @@ mod tests {
                 BindingId::new(producer_binding),
                 ProducerDeployment::new(
                     CoverageWitnessId::new(channel_id),
-                    BTreeSet::from([UniqueId {
-                        hi: i64::from(channel_id),
-                        lo: 1,
-                    }]),
+                    BTreeSet::from([UniqueId::new(i64::from(channel_id), 1)]),
                 ),
             )]),
             BTreeMap::new(),
@@ -2164,7 +2152,7 @@ mod tests {
         let channel_id = ChannelId::new(20);
         let producer = BindingId::new(21);
         let consumer = BindingId::new(22);
-        let producer_instance = UniqueId { hi: 20, lo: 1 };
+        let producer_instance = UniqueId::new(20, 1);
         let inbound = edge(
             channel_id.get(),
             200,

@@ -150,7 +150,7 @@ mod tests {
         let parent = MemTracker::new_root("query");
         let events = Arc::new(Events::default());
         let service =
-            RuntimeFilterService::new_for_query(UniqueId { hi: 1, lo: 2 }, events.clone(), &parent);
+            RuntimeFilterService::new_for_query(UniqueId::new(1, 2), events.clone(), &parent);
         let empty = local_participant_install_for_test(RuntimeFilterInstallView::new(
             DeploymentEpoch::new(1),
             RuntimeFilterParticipantId::new(1),

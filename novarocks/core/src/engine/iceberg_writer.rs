@@ -223,7 +223,7 @@ fn prepare_iceberg_distributed_write(
             current_schema,
             default_partition_spec,
             staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
+            novarocks_types::UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );

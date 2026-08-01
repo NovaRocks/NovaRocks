@@ -36,8 +36,8 @@ pub(crate) fn encode_runtime_filter_envelope(
     proto::filter::RuntimeFilterEnvelope {
         kind: encode_kind(envelope.kind()) as i32,
         query_id: Some(proto::common::UniqueId {
-            hi: envelope.query_id().hi,
-            lo: envelope.query_id().lo,
+            hi: envelope.query_id().high(),
+            lo: envelope.query_id().low(),
         }),
         channel_id: envelope.channel_id().get(),
         deployment_epoch: envelope.deployment_epoch().get(),
@@ -107,10 +107,7 @@ pub(crate) fn handle_runtime_filter_envelope(
     let kind = decode_kind(kind)?;
     let query_id =
         query_id.ok_or_else(|| invalid_argument("runtime filter query id is missing"))?;
-    let query_id = UniqueId {
-        hi: query_id.hi,
-        lo: query_id.lo,
-    };
+    let query_id = UniqueId::new(query_id.hi, query_id.lo);
     let route_identity = route_identity
         .ok_or_else(|| invalid_argument("runtime filter route identity is missing"))?;
     let domain_route_identity = decode_route_identity(&route_identity)?;
@@ -235,8 +232,8 @@ fn encode_route_identity(
         Value::Contribution(proto::filter::RuntimeFilterContributionRouteIdentity {
             producer_binding_id: identity.producer_binding_id().get(),
             fragment_instance_id: Some(proto::common::UniqueId {
-                hi: identity.fragment_instance_id().hi,
-                lo: identity.fragment_instance_id().lo,
+                hi: identity.fragment_instance_id().high(),
+                lo: identity.fragment_instance_id().low(),
             }),
             partition_id: identity.partition_id().get(),
             sequence: identity.sequence().get(),
@@ -253,8 +250,8 @@ fn encode_route_identity(
         Value::ProducerInstance(proto::filter::RuntimeFilterProducerInstanceRouteIdentity {
             producer_binding_id: identity.producer_binding_id().get(),
             fragment_instance_id: Some(proto::common::UniqueId {
-                hi: identity.fragment_instance_id().hi,
-                lo: identity.fragment_instance_id().lo,
+                hi: identity.fragment_instance_id().high(),
+                lo: identity.fragment_instance_id().low(),
             }),
         })
     };
@@ -273,10 +270,7 @@ fn decode_route_identity(
             })?;
             let identity = ContributionRouteIdentity::try_new(
                 BindingId::new(identity.producer_binding_id),
-                UniqueId {
-                    hi: fragment_instance_id.hi,
-                    lo: fragment_instance_id.lo,
-                },
+                UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
                 PartitionId::new(identity.partition_id),
                 ProducerSequence::new(identity.sequence),
             )
@@ -297,10 +291,7 @@ fn decode_route_identity(
             })?;
             let identity = ProducerInstanceRouteIdentity::try_new(
                 BindingId::new(identity.producer_binding_id),
-                UniqueId {
-                    hi: fragment_instance_id.hi,
-                    lo: fragment_instance_id.lo,
-                },
+                UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
             )
             .map_err(transport_error)?;
             Ok(RuntimeFilterRouteIdentity::producer_instance(identity))
@@ -525,7 +516,7 @@ mod tests {
             assert_eq!(envelopes.len(), 1);
             let envelope = &envelopes[0];
             assert_eq!(envelope.kind(), domain_kind);
-            assert_eq!(envelope.query_id(), UniqueId { hi: 11, lo: 12 });
+            assert_eq!(envelope.query_id(), UniqueId::new(11, 12));
             assert_eq!(envelope.channel_id(), ChannelId::new(13));
             assert_eq!(envelope.deployment_epoch(), DeploymentEpoch::new(14));
             assert_eq!(envelope.schema_digest(), &[15; 32]);
@@ -540,7 +531,7 @@ mod tests {
                         .as_contribution()
                         .expect("contribution identity");
                     assert_eq!(identity.producer_binding_id(), BindingId::new(17));
-                    assert_eq!(identity.fragment_instance_id(), UniqueId { hi: 18, lo: 19 });
+                    assert_eq!(identity.fragment_instance_id(), UniqueId::new(18, 19));
                     assert_eq!(identity.partition_id(), PartitionId::new(20));
                     assert_eq!(identity.sequence(), ProducerSequence::new(21));
                 }
@@ -550,7 +541,7 @@ mod tests {
                         .as_producer_instance()
                         .expect("producer-instance identity");
                     assert_eq!(identity.producer_binding_id(), BindingId::new(17));
-                    assert_eq!(identity.fragment_instance_id(), UniqueId { hi: 18, lo: 19 });
+                    assert_eq!(identity.fragment_instance_id(), UniqueId::new(18, 19));
                 }
                 RuntimeFilterEnvelopeKind::Artifact
                 | RuntimeFilterEnvelopeKind::FinalArtifact
@@ -605,10 +596,10 @@ mod tests {
     #[test]
     fn partial_unique_ids_reach_ingress_as_exact_domain_values() {
         let cases = [
-            (UniqueId { hi: 0, lo: 29 }, UniqueId { hi: 18, lo: 19 }),
-            (UniqueId { hi: 31, lo: 0 }, UniqueId { hi: 18, lo: 19 }),
-            (UniqueId { hi: 11, lo: 12 }, UniqueId { hi: 0, lo: 37 }),
-            (UniqueId { hi: 11, lo: 12 }, UniqueId { hi: 41, lo: 0 }),
+            (UniqueId::new(0, 29), UniqueId::new(18, 19)),
+            (UniqueId::new(31, 0), UniqueId::new(18, 19)),
+            (UniqueId::new(11, 12), UniqueId::new(0, 37)),
+            (UniqueId::new(11, 12), UniqueId::new(41, 0)),
         ];
 
         for (query_id, fragment_instance_id) in cases {
@@ -616,8 +607,8 @@ mod tests {
             let mut request =
                 valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
             request.query_id = Some(proto::common::UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
+                hi: query_id.high(),
+                lo: query_id.low(),
             });
             let Some(proto::filter::runtime_filter_route_identity::Value::Contribution(identity)) =
                 request.route_identity.as_mut().unwrap().value.as_mut()
@@ -625,8 +616,8 @@ mod tests {
                 unreachable!()
             };
             identity.fragment_instance_id = Some(proto::common::UniqueId {
-                hi: fragment_instance_id.hi,
-                lo: fragment_instance_id.lo,
+                hi: fragment_instance_id.high(),
+                lo: fragment_instance_id.low(),
             });
 
             let response = handle_runtime_filter_envelope(ingress.clone(), request).unwrap();

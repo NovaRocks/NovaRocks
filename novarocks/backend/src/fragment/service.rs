@@ -326,7 +326,7 @@ impl NativeFragmentService {
         std::thread::Builder::new()
             .name(format!(
                 "native-fragment-{:x}-{:x}",
-                fragment_instance_id.hi, fragment_instance_id.lo
+                fragment_instance_id.high(), fragment_instance_id.low()
             ))
             .spawn(move || {
                 if gate.wait() != crate::query_lifecycle::stage::StartGateState::Released {
@@ -363,8 +363,8 @@ impl NativeFragmentService {
                         token,
                         execution_id.query_id().high(),
                         execution_id.query_id().low(),
-                        fragment_instance_id.hi,
-                        fragment_instance_id.lo
+                        fragment_instance_id.high(),
+                        fragment_instance_id.low()
                     );
                 }
                 consume_terminal_fact(
@@ -477,7 +477,7 @@ impl NativeFragmentService {
         std::thread::Builder::new()
             .name(format!(
                 "native-fragment-{:x}-{:x}",
-                fragment_instance_id.hi, fragment_instance_id.lo
+                fragment_instance_id.high(), fragment_instance_id.low()
             ))
             .spawn(move || {
                 if start_rx.recv().is_err() {
@@ -503,19 +503,19 @@ impl NativeFragmentService {
                             eprintln!(
                                 "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token={} query_hi={} query_lo={} finst_hi={} finst_lo={}",
                                 evidence_token,
-                                query_id.hi(),
-                                query_id.lo(),
-                                fragment_instance_id.hi,
-                                fragment_instance_id.lo
+                                query_id.high(),
+                                query_id.low(),
+                                fragment_instance_id.high(),
+                                fragment_instance_id.low()
                             );
                         }
                         Err(error) => {
                             eprintln!(
                                 "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_RELEASE_FAILED query_hi={} query_lo={} finst_hi={} finst_lo={} error={}",
-                                query_id.hi(),
-                                query_id.lo(),
-                                fragment_instance_id.hi,
-                                fragment_instance_id.lo,
+                                query_id.high(),
+                                query_id.low(),
+                                fragment_instance_id.high(),
+                                fragment_instance_id.low(),
                                 error
                             );
                         }
@@ -711,17 +711,17 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use novarocks::UniqueId;
     use novarocks::connector::ConnectorRegistry;
-    use novarocks::query_execution::contract::QueryId as ExecutionQueryId;
     use novarocks::query_execution::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
         ParticipantRole, QueryControlAttach, QueryControlAttachment, QueryControlEndpoint,
         QueryExecutionId, QueryInitOutcome, QueryInitRequest,
     };
     use novarocks::runtime::fragment::{DormantFragmentHandle, FragmentOutcome, prepare_fragment};
-    use novarocks::runtime::query_context::QueryId;
     use novarocks_protocol as proto;
+    use novarocks_types::QueryId as ExecutionQueryId;
+    use novarocks_types::QueryId;
+    use novarocks_types::UniqueId;
 
     use crate::fragment::control::{FragmentControlHandle, FragmentControlRegistry};
     use crate::fragment::failure_injection::{
@@ -755,14 +755,8 @@ mod tests {
         let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
         let service = NativeFragmentService::with_lifecycle_observer(|_| {});
         let query_id = QueryId::new(84_000, 84_001);
-        let requested = UniqueId {
-            hi: 84_002,
-            lo: 84_003,
-        };
-        let local_sibling = UniqueId {
-            hi: 84_004,
-            lo: 84_005,
-        };
+        let requested = UniqueId::new(84_002, 84_003);
+        let local_sibling = UniqueId::new(84_004, 84_005);
         let mut controls = Vec::new();
         let mut control_tokens = Vec::new();
         for finst in [requested, local_sibling] {
@@ -1145,14 +1139,8 @@ mod tests {
             2,
         );
         let query_id = QueryId::new(83_000, 83_001);
-        let first = UniqueId {
-            hi: 83_002,
-            lo: 83_003,
-        };
-        let second = UniqueId {
-            hi: 83_004,
-            lo: 83_005,
-        };
+        let first = UniqueId::new(83_002, 83_003);
+        let second = UniqueId::new(83_004, 83_005);
 
         let first_request = values_result_request(83_000, 83_002);
         make_control_ready(&service, &first_request, [first, second]);
@@ -1223,10 +1211,7 @@ mod tests {
         let query_id = request.query_id();
         let execution_id = request.execution_id();
         let failed_finst = request.fragment_instance_id();
-        let sibling_finst = UniqueId {
-            hi: 83_102,
-            lo: 83_103,
-        };
+        let sibling_finst = UniqueId::new(83_102, 83_103);
         let delivery_expire = Duration::from_secs(1);
         let query_expire = Duration::from_secs(5);
 

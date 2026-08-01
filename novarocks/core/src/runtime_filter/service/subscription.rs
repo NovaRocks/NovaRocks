@@ -784,7 +784,7 @@ mod tests {
 
     fn slot() -> LiveSubscriptionSlot {
         let common = RuntimeFilterEventIdentity::new(
-            crate::common::types::UniqueId { hi: 1, lo: 2 },
+            novarocks_types::UniqueId::new(1, 2),
             RuntimeFilterParticipantId::new(3),
             ChannelId::new(1),
             DeploymentEpoch::new(1),
@@ -793,7 +793,7 @@ mod tests {
             ConsumerEventIdentity::new(
                 common,
                 BindingId::new(2),
-                crate::common::types::UniqueId { hi: 4, lo: 5 },
+                novarocks_types::UniqueId::new(4, 5),
             ),
             Arc::new(NoopEvents::default()),
         )
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn acquire_observer_signals_registered_waiter_and_guard_removes_registry_key() {
-        let query_id = crate::common::types::UniqueId { hi: 91, lo: 92 };
+        let query_id = novarocks_types::UniqueId::new(91, 92);
         let binding_id = BindingId::new(93);
         let common = RuntimeFilterEventIdentity::new(
             query_id,
@@ -810,11 +810,7 @@ mod tests {
             DeploymentEpoch::new(1),
         );
         let slot = Arc::new(SubscriptionSlot::new(
-            ConsumerEventIdentity::new(
-                common,
-                binding_id,
-                crate::common::types::UniqueId { hi: 94, lo: 95 },
-            ),
+            ConsumerEventIdentity::new(common, binding_id, novarocks_types::UniqueId::new(94, 95)),
             Arc::new(NoopEvents::default()),
         ));
         let gate = install_native_acquire_gate_for_test(query_id, binding_id);
@@ -1139,7 +1135,7 @@ mod tests {
     #[test]
     fn live_poll_and_terminal_events_are_exhaustive_and_state_precedes_callback() {
         let common = RuntimeFilterEventIdentity::new(
-            crate::common::types::UniqueId { hi: 1, lo: 2 },
+            novarocks_types::UniqueId::new(1, 2),
             RuntimeFilterParticipantId::new(3),
             ChannelId::new(1),
             DeploymentEpoch::new(1),
@@ -1149,7 +1145,7 @@ mod tests {
             ConsumerEventIdentity::new(
                 common,
                 BindingId::new(2),
-                crate::common::types::UniqueId { hi: 4, lo: 5 },
+                novarocks_types::UniqueId::new(4, 5),
             ),
             events.clone(),
         ));

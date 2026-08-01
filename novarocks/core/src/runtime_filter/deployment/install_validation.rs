@@ -1212,7 +1212,7 @@ mod tests {
             MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(10),
-                ProducerDeployment::new(witness, BTreeSet::from([UniqueId { hi: 1, lo: 10 }])),
+                ProducerDeployment::new(witness, BTreeSet::from([UniqueId::new(1, 10)])),
             )]),
             BTreeMap::from([(
                 BindingId::new(20),
@@ -1223,7 +1223,7 @@ mod tests {
                         ArtifactCapability::EmptyDomain,
                     ]),
                     BTreeSet::from([RouteEdgeId::new(30)]),
-                    BTreeSet::from([UniqueId { hi: 1, lo: 20 }]),
+                    BTreeSet::from([UniqueId::new(1, 20)]),
                 ),
             )]),
         )

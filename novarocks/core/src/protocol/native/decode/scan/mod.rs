@@ -416,7 +416,7 @@ mod tests {
         ));
         let context = NativePlanDecodeContext::default()
             .with_execution_resolver(connector_read_resolver("test.native"))
-            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 9 });
+            .with_query_id(novarocks_types::QueryId::new(7, 9));
         let decoded = decode_node(&node, &mut ExprArena::default(), &context)
             .expect("decode ConnectorReadSource");
         let ExecNodeKind::Scan(scan) = decoded.node.kind else {
@@ -476,7 +476,7 @@ mod tests {
                 "test.native",
                 Arc::clone(&recorded),
             ))
-            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 12 });
+            .with_query_id(novarocks_types::QueryId::new(7, 12));
         let decoded = decode_node(&node, &mut ExprArena::default(), &context)
             .expect("decode ConnectorReadSource");
         let ExecNodeKind::Scan(scan) = decoded.node.kind else {
@@ -524,7 +524,7 @@ mod tests {
         ));
         let context = NativePlanDecodeContext::default()
             .with_execution_resolver(connector_read_resolver("test.native"))
-            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 10 });
+            .with_query_id(novarocks_types::QueryId::new(7, 10));
         let error = decode_node(&node, &mut ExprArena::default(), &context)
             .expect_err("zero batch budget must fail native decoding");
         let protocol = error.protocol().expect("protocol error");
@@ -558,7 +558,7 @@ mod tests {
         ));
         let context = NativePlanDecodeContext::default()
             .with_execution_resolver(connector_read_resolver("test.native"))
-            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 11 });
+            .with_query_id(novarocks_types::QueryId::new(7, 11));
         let decoded = decode_node(&node, &mut ExprArena::default(), &context)
             .expect("decode ConnectorReadSource with opaque provider splits");
         let ExecNodeKind::Scan(scan) = decoded.node.kind else {
@@ -596,7 +596,7 @@ mod tests {
         ));
         let context = NativePlanDecodeContext::default()
             .with_execution_resolver(Arc::new(TestExecutionResolver { binding: None }))
-            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 12 });
+            .with_query_id(novarocks_types::QueryId::new(7, 12));
         let error = decode_node(&node, &mut ExprArena::default(), &context)
             .expect_err("unknown instances must not be materialized by native decoding");
         let protocol = error.protocol().expect("protocol error");
@@ -894,10 +894,7 @@ mod tests {
     fn native_starrocks_scan_decode_defers_tablet_resolution_without_registry_mutation() {
         let _guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
         let tablet_id = 8_700_000_000_000_001;
-        let query_id = crate::runtime::query_context::QueryId {
-            hi: 8_700_000_000_000_002,
-            lo: 8_700_000_000_000_003,
-        };
+        let query_id = novarocks_types::QueryId::new(8_700_000_000_000_002, 8_700_000_000_000_003);
         let node = scan_node(starrocks_source());
         let connectors = Arc::new(ConnectorRegistry::new());
         let ctx = NativePlanDecodeContext::default()

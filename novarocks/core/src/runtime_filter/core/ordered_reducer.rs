@@ -385,7 +385,7 @@ mod tests {
     fn stream(partition: u32) -> ProducerStreamId {
         ProducerStreamId::new(
             BindingId::new(1),
-            UniqueId { hi: 0, lo: 1 },
+            UniqueId::new(0, 1),
             PartitionId::new(partition),
         )
     }

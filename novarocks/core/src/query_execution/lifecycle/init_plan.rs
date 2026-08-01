@@ -656,8 +656,8 @@ mod tests {
 
     #[test]
     fn query_init_plan_unions_fragment_and_runtime_filter_participants() {
-        let fragment_zero = UniqueId { hi: 10, lo: 1 };
-        let fragment_one = UniqueId { hi: 10, lo: 2 };
+        let fragment_zero = UniqueId::new(10, 1);
+        let fragment_one = UniqueId::new(10, 2);
         let fragments = FragmentLifecycleProjection::new(
             BTreeMap::from([
                 (0, BTreeSet::from([fragment_zero])),
@@ -759,7 +759,7 @@ mod tests {
     #[test]
     fn query_init_plan_rejects_backend_restart_at_the_same_endpoint() {
         let fragments = FragmentLifecycleProjection::new(
-            BTreeMap::from([(0, BTreeSet::from([UniqueId { hi: 10, lo: 1 }]))]),
+            BTreeMap::from([(0, BTreeSet::from([UniqueId::new(10, 1)]))]),
             BTreeMap::from([(
                 0,
                 crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr(backend(0).endpoint()),

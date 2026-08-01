@@ -46,13 +46,14 @@ use novarocks::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledS
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use novarocks::exec::node::scan::BoundScanRanges;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::runtime::query_context::{QueryId, query_context_manager};
+use novarocks::runtime::query_context::query_context_manager;
 use novarocks::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorExecutionBinding,
     ConnectorOpenReaderRequest, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
+use novarocks_types::QueryId;
 
 struct CompatIcebergDeltaCancellation {
     query_id: QueryId,

@@ -17,8 +17,8 @@
 
 use std::ffi::CString;
 
-use novarocks::common::types::UniqueId;
-use novarocks::runtime::query_context::QueryId;
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 use prost::Message;
 
 use crate::ffi_support::NovaRocksRustBuf;
@@ -166,8 +166,8 @@ pub(crate) fn send_chunks(
 ) -> Result<(), String> {
     let params = proto::starrocks::PTransmitChunkParams {
         finst_id: Some(proto::starrocks::PUniqueId {
-            hi: finst_id.hi,
-            lo: finst_id.lo,
+            hi: finst_id.high(),
+            lo: finst_id.low(),
         }),
         node_id: Some(node_id),
         sender_id: Some(sender_id),
@@ -255,8 +255,8 @@ pub(crate) fn lookup_close(
 ) -> Result<(), String> {
     let request = proto::starrocks::PLookUpCloseRequest {
         query_id: Some(proto::starrocks::PUniqueId {
-            hi: query_id.hi(),
-            lo: query_id.lo(),
+            hi: query_id.high(),
+            lo: query_id.low(),
         }),
         lookup_node_id: Some(lookup_node_id),
     };

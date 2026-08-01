@@ -50,8 +50,8 @@ pub fn digest_v1(manifest: &ParticipantManifest) -> ParticipantManifestDigest {
 
     projection.u64(manifest.expected_fragment_instance_ids().len() as u64);
     for fragment_instance_id in manifest.expected_fragment_instance_ids() {
-        projection.i64(fragment_instance_id.hi);
-        projection.i64(fragment_instance_id.lo);
+        projection.i64(fragment_instance_id.high());
+        projection.i64(fragment_instance_id.low());
     }
 
     query_options(&mut projection, manifest.query_options().native());
@@ -85,11 +85,11 @@ fn endpoint(projection: &mut DigestProjection, endpoint: &QueryControlEndpoint) 
 
 fn exchange_route(projection: &mut DigestProjection, route: &ExchangeRouteManifest) {
     let source = route.source_fragment_instance_id();
-    projection.i64(source.hi);
-    projection.i64(source.lo);
+    projection.i64(source.high());
+    projection.i64(source.low());
     let destination = route.destination_fragment_instance_id();
-    projection.i64(destination.hi);
-    projection.i64(destination.lo);
+    projection.i64(destination.high());
+    projection.i64(destination.low());
     projection.i32(route.destination_node_id());
     projection.u32(route.sender_ordinal());
     projection.u32(route.sender_count());
@@ -288,7 +288,7 @@ mod tests {
             execution_id,
             backend,
             roles,
-            fragment_lows.into_iter().map(|lo| UniqueId { hi: 7, lo }),
+            fragment_lows.into_iter().map(|lo| UniqueId::new(7, lo)),
             ParticipantQueryOptions::new(query_options),
             10_000,
             [],

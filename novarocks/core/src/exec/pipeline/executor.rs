@@ -953,10 +953,7 @@ mod tests {
 
     #[test]
     fn driver_panic_is_a_local_error_and_does_not_cancel_the_query() {
-        let query_id = QueryId {
-            hi: 92_001,
-            lo: 92_002,
-        };
+        let query_id = QueryId::new(92_001, 92_002);
         let context_manager = query_context_manager();
         context_manager
             .ensure_native_context(
@@ -999,8 +996,8 @@ mod tests {
 
     #[test]
     fn dormant_native_filter_fails_open_for_local_shard_missing_key() {
-        let query_id = QueryId { hi: 80_007, lo: 29 };
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let query_id = QueryId::new(80_007, 29);
+        let query_key = QueryKey::from_hi_lo(query_id.high(), query_id.low());
         let lifecycle = RuntimeFilterLifecycleRegistry::global();
         lifecycle.remove_query(query_key);
         let context_manager = query_context_manager();
@@ -1027,8 +1024,8 @@ mod tests {
                 deployment_lifecycle,
                 crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install_with_expected_producer_instances(
                     BTreeSet::from([
-                        UniqueId { hi: 70, lo: 30 },
-                        UniqueId { hi: 70, lo: 31 },
+                        UniqueId::new(70, 30),
+                        UniqueId::new(70, 31),
                     ]),
                 ),
             )
@@ -1173,7 +1170,7 @@ mod tests {
                     context_manager
                         .runtime_filter_context_for_native_execution(
                             query_id,
-                            UniqueId { hi: 70, lo: 30 },
+                            UniqueId::new(70, 30),
                         )
                         .expect("producer runtime-filter context"),
                 )),
@@ -1259,7 +1256,7 @@ mod tests {
                     context_manager
                         .runtime_filter_context_for_native_execution(
                             query_id,
-                            UniqueId { hi: 70, lo: 40 },
+                            UniqueId::new(70, 40),
                         )
                         .expect("consumer runtime-filter context"),
                 )),

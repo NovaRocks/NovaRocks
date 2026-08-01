@@ -80,9 +80,9 @@ const WITNESS_B: CoverageWitnessId = CoverageWitnessId::new(421);
 const PRODUCER_FRAGMENT_A: PlanFragmentId = PlanFragmentId::new(41);
 const PRODUCER_FRAGMENT_B: PlanFragmentId = PlanFragmentId::new(42);
 const CONSUMER_FRAGMENT: PlanFragmentId = PlanFragmentId::new(43);
-const INSTANCE_A: UniqueId = UniqueId { hi: 406, lo: 10 };
-const INSTANCE_B: UniqueId = UniqueId { hi: 406, lo: 20 };
-const CONSUMER_INSTANCE: UniqueId = UniqueId { hi: 406, lo: 30 };
+const INSTANCE_A: UniqueId = UniqueId::new(406, 10);
+const INSTANCE_B: UniqueId = UniqueId::new(406, 20);
+const CONSUMER_INSTANCE: UniqueId = UniqueId::new(406, 30);
 const PARTICIPANT: RuntimeFilterParticipantId = RuntimeFilterParticipantId::new(1);
 const AGGREGATE_DOP: i32 = 2;
 const GROUP_SLOT: SlotId = SlotId::new(401);
@@ -427,7 +427,7 @@ fn install_service(install: RuntimeFilterParticipantInstall) -> Arc<RuntimeFilte
     let memory: Arc<dyn RuntimeFilterMemoryAccount> =
         MemTrackerMemoryAccount::new_root_for_test("live-aggregate-conformance");
     let service = Arc::new(RuntimeFilterService::new_with_dependencies(
-        UniqueId { hi: 406, lo: 0 },
+        UniqueId::new(406, 0),
         Arc::new(DeterministicClock(Instant::now())),
         Arc::new(DiscardEvents),
         memory,

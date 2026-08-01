@@ -90,7 +90,7 @@ impl FragmentTerminalSnapshot {
         sink: SinkCommitReportSnapshot,
         profile: Option<RuntimeProfileTree>,
     ) -> Result<Self, QueryLifecycleError> {
-        if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
+        if fragment_instance_id.high() == 0 && fragment_instance_id.low() == 0 {
             return Err(QueryLifecycleError::invalid_manifest(
                 "terminal fragment instance id must be nonzero",
             ));
@@ -278,8 +278,8 @@ impl QueryTerminalSnapshot {
         put_bytes(&mut bytes, self.init_digest.as_bytes());
         put_u64(&mut bytes, self.fragments.len() as u64);
         for fragment in &self.fragments {
-            put_i64(&mut bytes, fragment.fragment_instance_id.hi);
-            put_i64(&mut bytes, fragment.fragment_instance_id.lo);
+            put_i64(&mut bytes, fragment.fragment_instance_id.high());
+            put_i64(&mut bytes, fragment.fragment_instance_id.low());
             put_i32(&mut bytes, fragment.backend_num);
             match &fragment.outcome {
                 FragmentTerminalOutcome::Succeeded => put_u8(&mut bytes, 1),
@@ -571,7 +571,7 @@ mod tests {
             .iter()
             .map(|low| {
                 FragmentTerminalSnapshot::new(
-                    UniqueId { hi: 0, lo: *low },
+                    UniqueId::new(0, *low),
                     0,
                     FragmentTerminalOutcome::Succeeded,
                     SinkCommitReportSnapshot::default(),
@@ -594,7 +594,7 @@ mod tests {
         let first = snapshot(&[2, 1]);
         let second = snapshot(&[1, 2]);
         assert_eq!(first.digest(), second.digest());
-        assert_eq!(first.fragments()[0].fragment_instance_id().lo, 1);
+        assert_eq!(first.fragments()[0].fragment_instance_id().low(), 1);
     }
 
     #[test]
@@ -608,7 +608,7 @@ mod tests {
         )
         .unwrap();
         let fact = FragmentTerminalSnapshot::new(
-            UniqueId { hi: 0, lo: 1 },
+            UniqueId::new(0, 1),
             0,
             FragmentTerminalOutcome::Succeeded,
             SinkCommitReportSnapshot::default(),
@@ -673,7 +673,7 @@ mod tests {
             },
         };
         let fact = FragmentTerminalSnapshot::new(
-            UniqueId { hi: 0, lo: 1 },
+            UniqueId::new(0, 1),
             0,
             FragmentTerminalOutcome::Succeeded,
             SinkCommitReportSnapshot::default(),

@@ -254,7 +254,7 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
             staging_dir,
-            UniqueId { hi: 0, lo: 0 },
+            UniqueId::new(0, 0),
         )
         .with_table_metadata(metadata.clone()),
     );

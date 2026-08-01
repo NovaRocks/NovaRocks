@@ -17,7 +17,6 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::common::types::UniqueId;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks::runtime::query_options::QueryOptions;
@@ -26,6 +25,7 @@ use novarocks::runtime::scan_range::{
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
     ScanRange, ScanRangeParams,
 };
+use novarocks_types::UniqueId;
 
 use novarocks_protocol::novarocks as native_proto;
 
@@ -292,10 +292,7 @@ fn decode_file_pruning_value(
 }
 
 fn unique_id(src: &novarocks_protocol::common::UniqueId) -> UniqueId {
-    UniqueId {
-        hi: src.hi,
-        lo: src.lo,
-    }
+    UniqueId::new(src.hi, src.lo)
 }
 
 #[cfg(test)]

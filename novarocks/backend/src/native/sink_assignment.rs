@@ -17,11 +17,11 @@
 
 //! Backend-owned native sink-assignment DTO decoding.
 
-use novarocks::common::types::UniqueId;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
 use novarocks_protocol::{novarocks as proto, plan};
+use novarocks_types::UniqueId;
 
 pub(crate) fn decode_fragment_sink_assignment(
     sink: &plan::DataSink,
@@ -116,10 +116,7 @@ fn decode_instance_destinations(
                 )
             })?;
             Ok(FragmentDestination::new(
-                UniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                },
+                UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint)
                     .map_err(|error| invalid_value(path.field("endpoint"), error))?,
             ))
@@ -144,10 +141,7 @@ fn decode_stream_destination_list(
                 )
             })?;
             Ok(FragmentDestination::new(
-                UniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                },
+                UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint)
                     .map_err(|error| invalid_value(destination_path.field("endpoint"), error))?,
             ))

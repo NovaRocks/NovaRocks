@@ -89,10 +89,7 @@ pub fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter::Lookup
         response.status = Some(error_common_status("missing query_id for lookup"));
         return response;
     };
-    let query_id = QueryId {
-        hi: query_id.hi,
-        lo: query_id.lo,
-    };
+    let query_id = QueryId::new(query_id.hi, query_id.lo);
     let tuple_id = req.request_tuple_id;
 
     let mut request_columns = HashMap::new();
@@ -159,10 +156,7 @@ mod native_runtime_filter_mode_tests {
         crate::service::native_fragment_service_test_fixture::submit_exec_plan_fragment_native(
             crate::service::native_fragment_service_test_fixture::values_submission_for_test(
                 query_id,
-                crate::common::types::UniqueId {
-                    hi: query_id.hi + 1,
-                    lo: query_id.lo + 1,
-                },
+                novarocks_types::UniqueId::new(query_id.high() + 1, query_id.low() + 1),
                 81,
                 crate::exec::fragment::sink::FragmentSinkProgram::Noop,
             ),

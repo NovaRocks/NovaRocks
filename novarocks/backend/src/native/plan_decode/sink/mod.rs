@@ -190,7 +190,7 @@ fn decode_connector_write_sink_program(
     })?;
     let fragment_instance_id = unique_id_bytes(wire_finst.hi, wire_finst.lo);
     let context_finst = context.fragment_instance_id().get();
-    if fragment_instance_id != unique_id_bytes(context_finst.hi, context_finst.lo) {
+    if fragment_instance_id != unique_id_bytes(context_finst.high(), context_finst.low()) {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "handle",
@@ -215,7 +215,7 @@ fn decode_connector_write_sink_program(
             "connector writer handle requires native query identity",
         )
     })?;
-    if execution_id.query_id() != unique_id_bytes(query_id.hi(), query_id.lo()) {
+    if execution_id.query_id() != unique_id_bytes(query_id.high(), query_id.low()) {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "handle",
@@ -910,10 +910,7 @@ fn decode_stream_destination_list(
                 )
             })?;
             Ok(FragmentDestination::new(
-                novarocks::common::types::UniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                },
+                novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
                     NativeFragmentDecodeError::invalid_value(
                         destination_path.field("endpoint"),
@@ -942,10 +939,7 @@ fn decode_instance_destinations(
                 )
             })?;
             Ok(FragmentDestination::new(
-                novarocks::common::types::UniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                },
+                novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
                     NativeFragmentDecodeError::invalid_value(
                         destination_path.field("endpoint"),

@@ -552,7 +552,7 @@ pub fn prepare_fragment(
             sink,
             exchange_bindings,
             scan_bindings,
-            Some((finst_id.hi, finst_id.lo)),
+            Some((finst_id.high(), finst_id.low())),
             context.profiler.clone(),
             pipeline_dop,
             runtime_state,
@@ -661,10 +661,7 @@ mod tests {
         ));
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId {
-                hi: finst_id.hi - 2,
-                lo: finst_id.lo - 2,
-            },
+            QueryId::new(finst_id.high() - 2, finst_id.low() - 2),
             FragmentInstanceId::new(finst_id),
             ScanAssignments::default(),
             ExchangeInputAssignments::new(BTreeMap::from([(
@@ -698,10 +695,7 @@ mod tests {
         ));
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId {
-                hi: finst_id.hi - 2,
-                lo: finst_id.lo - 2,
-            },
+            QueryId::new(finst_id.high() - 2, finst_id.low() - 2),
             FragmentInstanceId::new(finst_id),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
@@ -794,18 +788,12 @@ mod tests {
             RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
         ));
         let destination = FragmentDestination::new(
-            UniqueId {
-                hi: finst_id.hi + 2,
-                lo: finst_id.lo + 2,
-            },
+            UniqueId::new(finst_id.high() + 2, finst_id.low() + 2),
             RuntimeEndpoint::new("127.0.0.1", 1).expect("test endpoint"),
         );
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId {
-                hi: finst_id.hi - 2,
-                lo: finst_id.lo - 2,
-            },
+            QueryId::new(finst_id.high() - 2, finst_id.low() - 2),
             FragmentInstanceId::new(finst_id),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
@@ -822,8 +810,8 @@ mod tests {
 
     fn exchange_key(finst_id: UniqueId) -> ExchangeKey {
         ExchangeKey {
-            finst_id_hi: finst_id.hi,
-            finst_id_lo: finst_id.lo,
+            finst_id_hi: finst_id.high(),
+            finst_id_lo: finst_id.low(),
             node_id: 17,
         }
     }
@@ -881,10 +869,7 @@ mod tests {
 
     #[test]
     fn prepare_defers_submission_and_dormant_drop_rolls_back_all_registrations() {
-        let finst_id = UniqueId {
-            hi: 72_001,
-            lo: 72_002,
-        };
+        let finst_id = UniqueId::new(72_001, 72_002);
         let dormant = prepare_fragment(
             result_exchange_submission(finst_id),
             FragmentPrepareContext::default(),
@@ -910,10 +895,7 @@ mod tests {
             (10, PrepareFailurePoint::AfterResult),
             (20, PrepareFailurePoint::AfterExchange),
         ] {
-            let finst_id = UniqueId {
-                hi: 72_101 + offset,
-                lo: 72_102 + offset,
-            };
+            let finst_id = UniqueId::new(72_101 + offset, 72_102 + offset);
             let error = expect_prepare_error(prepare_fragment(
                 result_exchange_submission(finst_id),
                 FragmentPrepareContext::default().with_prepare_failure(failure),
@@ -929,10 +911,7 @@ mod tests {
 
     #[test]
     fn prepare_error_keeps_primary_failure_and_attaches_cleanup_diagnostics() {
-        let finst_id = UniqueId {
-            hi: 72_201,
-            lo: 72_202,
-        };
+        let finst_id = UniqueId::new(72_201, 72_202);
         let failure = PrepareFailurePoint::AfterExchange;
         let error = expect_prepare_error(prepare_fragment(
             result_exchange_submission(finst_id),
@@ -953,10 +932,7 @@ mod tests {
 
     #[test]
     fn duplicate_exchange_registration_does_not_rollback_the_existing_owner() {
-        let finst_id = UniqueId {
-            hi: 72_251,
-            lo: 72_252,
-        };
+        let finst_id = UniqueId::new(72_251, 72_252);
         let key = exchange_key(finst_id);
         crate::runtime::exchange::register_expected_chunk_schema(
             key,
@@ -1003,10 +979,7 @@ mod tests {
         assert!(!priming_state.should_report_exec_state());
         std::thread::sleep(Duration::from_millis(1_050));
 
-        let finst_id = UniqueId {
-            hi: 72_271,
-            lo: 72_272,
-        };
+        let finst_id = UniqueId::new(72_271, 72_272);
         let running = prepare_fragment(
             result_exchange_submission_with(
                 finst_id,
@@ -1041,10 +1014,7 @@ mod tests {
         );
         assert!(!priming_state.should_report_exec_state());
         std::thread::sleep(Duration::from_millis(1_050));
-        let finst_id = UniqueId {
-            hi: 72_281,
-            lo: 72_282,
-        };
+        let finst_id = UniqueId::new(72_281, 72_282);
         let running = prepare_fragment(
             data_stream_submission(finst_id, 37, query_options),
             FragmentPrepareContext::default(),
@@ -1074,10 +1044,7 @@ mod tests {
 
     #[test]
     fn start_and_repeated_join_freeze_the_same_success_fact() {
-        let finst_id = UniqueId {
-            hi: 72_301,
-            lo: 72_302,
-        };
+        let finst_id = UniqueId::new(72_301, 72_302);
         let running =
             prepare_fragment(noop_submission(finst_id), FragmentPrepareContext::default())
                 .expect("fragment prepares")
@@ -1091,10 +1058,7 @@ mod tests {
         assert_eq!(first.fragment_instance_id(), finst_id);
         assert_eq!(
             first.query_id(),
-            QueryId {
-                hi: finst_id.hi - 2,
-                lo: finst_id.lo - 2,
-            }
+            QueryId::new(finst_id.high() - 2, finst_id.low() - 2)
         );
         assert!(matches!(first.outcome(), FragmentOutcome::Succeeded));
         assert!(sink_commit::is_registered(finst_id));
@@ -1104,10 +1068,7 @@ mod tests {
 
     #[test]
     fn repeated_cancel_and_join_keep_the_first_cancel_reason() {
-        let finst_id = UniqueId {
-            hi: 72_401,
-            lo: 72_402,
-        };
+        let finst_id = UniqueId::new(72_401, 72_402);
         let running = prepare_fragment(
             result_exchange_submission(finst_id),
             FragmentPrepareContext::default(),
@@ -1138,10 +1099,7 @@ mod tests {
 
     #[test]
     fn success_wins_over_late_cancel() {
-        let finst_id = UniqueId {
-            hi: 72_501,
-            lo: 72_502,
-        };
+        let finst_id = UniqueId::new(72_501, 72_502);
         let running =
             prepare_fragment(noop_submission(finst_id), FragmentPrepareContext::default())
                 .expect("fragment prepares")
@@ -1156,10 +1114,7 @@ mod tests {
 
     #[test]
     fn partial_start_failure_wins_over_late_cancel_and_drains() {
-        let finst_id = UniqueId {
-            hi: 72_601,
-            lo: 72_602,
-        };
+        let finst_id = UniqueId::new(72_601, 72_602);
         let running = prepare_fragment(
             result_exchange_submission(finst_id),
             FragmentPrepareContext::default().with_start_failure(StartFailurePoint::AfterSubmit),
@@ -1181,10 +1136,7 @@ mod tests {
 
     #[test]
     fn concurrent_join_observes_the_cancel_winner() {
-        let finst_id = UniqueId {
-            hi: 72_701,
-            lo: 72_702,
-        };
+        let finst_id = UniqueId::new(72_701, 72_702);
         let running = prepare_fragment(
             result_exchange_submission(finst_id),
             FragmentPrepareContext::default(),

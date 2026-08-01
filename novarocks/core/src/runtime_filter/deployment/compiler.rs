@@ -549,21 +549,21 @@ mod tests {
         by_fragment.insert(
             1u32,
             vec![
-                placement(1, 0, 1, UniqueId { hi: 1, lo: 1 }),
-                placement(1, 1, 10, UniqueId { hi: 1, lo: 2 }),
+                placement(1, 0, 1, UniqueId::new(1, 1)),
+                placement(1, 1, 10, UniqueId::new(1, 2)),
             ],
         );
         by_fragment.insert(
             2u32,
             vec![
-                placement(2, 0, 1, UniqueId { hi: 1, lo: 3 }),
-                placement(2, 1, 6, UniqueId { hi: 1, lo: 4 }),
+                placement(2, 0, 1, UniqueId::new(1, 3)),
+                placement(2, 1, 6, UniqueId::new(1, 4)),
             ],
         );
         let scheduling = SchedulingPlan {
             root_fragment_id: 1,
             by_fragment,
-            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_finst_id: UniqueId::new(1, 1),
             root_backend_idx: 1,
         };
         let backends = LiveBackendSnapshot::new(vec![
@@ -613,20 +613,17 @@ mod tests {
                     2,
                     backend_idx,
                     backend_idx,
-                    UniqueId {
-                        hi: 2,
-                        lo: backend_idx as i64,
-                    },
+                    UniqueId::new(2, backend_idx as i64),
                 )
             })
             .collect();
         let mut by_fragment = BTreeMap::new();
-        by_fragment.insert(1u32, vec![placement(1, 0, 4, UniqueId { hi: 1, lo: 1 })]);
+        by_fragment.insert(1u32, vec![placement(1, 0, 4, UniqueId::new(1, 1))]);
         by_fragment.insert(2u32, producer_placements);
         let scheduling = SchedulingPlan {
             root_fragment_id: 1,
             by_fragment,
-            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_finst_id: UniqueId::new(1, 1),
             root_backend_idx: 4,
         };
         let backends = LiveBackendSnapshot::new(
@@ -703,7 +700,7 @@ mod tests {
         assert_eq!(core_instances, &routing_instances);
         assert_eq!(
             core_instances,
-            &BTreeSet::from([UniqueId { hi: 1, lo: 3 }, UniqueId { hi: 1, lo: 4 }])
+            &BTreeSet::from([UniqueId::new(1, 3), UniqueId::new(1, 4)])
         );
         assert!(
             aggregator_channel
@@ -863,12 +860,12 @@ mod tests {
         let edges = vec![edge(2, 1)];
         // Both fragments scheduled onto backend 0 -> co-located -> loopback.
         let mut by_fragment = BTreeMap::new();
-        by_fragment.insert(1u32, vec![placement(1, 0, 0, UniqueId { hi: 1, lo: 1 })]);
-        by_fragment.insert(2u32, vec![placement(2, 0, 0, UniqueId { hi: 1, lo: 2 })]);
+        by_fragment.insert(1u32, vec![placement(1, 0, 0, UniqueId::new(1, 1))]);
+        by_fragment.insert(2u32, vec![placement(2, 0, 0, UniqueId::new(1, 2))]);
         let scheduling = SchedulingPlan {
             root_fragment_id: 1,
             by_fragment,
-            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_finst_id: UniqueId::new(1, 1),
             root_backend_idx: 0,
         };
         let backends = LiveBackendSnapshot::from_endpoints(vec![
@@ -906,12 +903,12 @@ mod tests {
             .unwrap();
 
         let mut by_fragment = BTreeMap::new();
-        by_fragment.insert(1u32, vec![placement(1, 0, 0, UniqueId { hi: 1, lo: 1 })]);
-        by_fragment.insert(2u32, vec![placement(2, 0, 0, UniqueId { hi: 1, lo: 2 })]);
+        by_fragment.insert(1u32, vec![placement(1, 0, 0, UniqueId::new(1, 1))]);
+        by_fragment.insert(2u32, vec![placement(2, 0, 0, UniqueId::new(1, 2))]);
         let scheduling = SchedulingPlan {
             root_fragment_id: 1,
             by_fragment,
-            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_finst_id: UniqueId::new(1, 1),
             root_backend_idx: 0,
         };
         let backends = LiveBackendSnapshot::from_endpoints(vec![
@@ -964,12 +961,12 @@ mod tests {
         // producer's first snapshot -> execution feedback cycle.
         let edges = vec![edge(2, 1)];
         let mut by_fragment = BTreeMap::new();
-        by_fragment.insert(1u32, vec![placement(1, 0, 0, UniqueId { hi: 1, lo: 1 })]);
-        by_fragment.insert(2u32, vec![placement(2, 0, 0, UniqueId { hi: 1, lo: 2 })]);
+        by_fragment.insert(1u32, vec![placement(1, 0, 0, UniqueId::new(1, 1))]);
+        by_fragment.insert(2u32, vec![placement(2, 0, 0, UniqueId::new(1, 2))]);
         let scheduling = SchedulingPlan {
             root_fragment_id: 2,
             by_fragment,
-            root_finst_id: UniqueId { hi: 1, lo: 2 },
+            root_finst_id: UniqueId::new(1, 2),
             root_backend_idx: 0,
         };
         let backends = LiveBackendSnapshot::from_endpoints(vec![

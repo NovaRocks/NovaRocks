@@ -1582,7 +1582,7 @@ mod tests {
     }
 
     fn uid(lo: i64) -> UniqueId {
-        UniqueId { hi: 7, lo }
+        UniqueId::new(7, lo)
     }
 
     fn channel(
