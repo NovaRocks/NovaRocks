@@ -118,24 +118,16 @@ impl StarRocksDirectStorageResolver for StarRocksSharedDataStorageResolver {
             }
             for (index, relative_path) in rowset.segments.iter().enumerate() {
                 let segment_path = join_frozen_path(split.tablet_root(), relative_path)?;
-                let object = self.read_exact(&access, &segment_path, &request.context)?;
                 let segment = if let Some(offset) = rowset.bundle_offsets.get(index) {
-                    let offset = usize::try_from(*offset)
+                    let offset = u64::try_from(*offset)
                         .map_err(|_| corrupt("StarRocks bundle segment offset is invalid"))?;
                     let size = *rowset.segment_sizes.get(index).ok_or_else(|| {
                         corrupt("StarRocks bundle segment is missing its frozen size")
                     })?;
-                    let size = usize::try_from(size)
-                        .map_err(|_| corrupt("StarRocks bundle segment size is invalid"))?;
-                    let end = offset
-                        .checked_add(size)
-                        .filter(|end| *end <= object.len())
-                        .ok_or_else(|| {
-                            corrupt("StarRocks bundle segment range exceeds its object")
-                        })?;
-                    Bytes::copy_from_slice(&object[offset..end])
+                    let range = FileReadRange::bounded(offset, size).map_err(map_file_error)?;
+                    self.read_range(&access, &segment_path, range, &request.context)?
                 } else {
-                    object
+                    self.read_exact(&access, &segment_path, &request.context)?
                 };
                 if let Some(expected_size) = rowset.segment_sizes.get(index)
                     && *expected_size != segment.len() as u64
@@ -179,22 +171,33 @@ impl StarRocksSharedDataStorageResolver {
         location: &str,
         context: &ConnectorRequestContext,
     ) -> Result<Bytes, ConnectorError> {
+        self.read_range(access, location, FileReadRange::WholeFile, context)
+    }
+
+    fn read_range(
+        &self,
+        access: &FsAccessHandle,
+        location: &str,
+        range: FileReadRange,
+        context: &ConnectorRequestContext,
+    ) -> Result<Bytes, ConnectorError> {
         ensure_active(context)?;
         let file = access
             .bind_location(location, FileIdentity::new(location, 0, None))
             .map_err(map_file_error)?;
         let context = (*context).clone();
         self.runtime
-            .block_on(async move { read_file(file, context).await })
+            .block_on(async move { read_file(file, range, context).await })
     }
 }
 
 async fn read_file(
     file: BoundFile,
+    range: FileReadRange,
     context: ConnectorRequestContext,
 ) -> Result<Bytes, ConnectorError> {
     let cancellation = FileCancellation::new();
-    let operation = file.read(FileReadRange::WholeFile, &cancellation);
+    let operation = file.read(range, &cancellation);
     tokio::pin!(operation);
     loop {
         ensure_active(&context)?;
