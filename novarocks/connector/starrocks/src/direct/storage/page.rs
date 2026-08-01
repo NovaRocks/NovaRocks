@@ -36,6 +36,9 @@ const PAGE_TYPE_DATA: i32 = 1;
 const PAGE_TYPE_INDEX: i32 = 2;
 const PAGE_TYPE_DICTIONARY: i32 = 3;
 const DATA_PAGE_FORMAT_V2: u32 = 2;
+const BITSHUFFLE_HEADER_SIZE: usize = 16;
+const BITSHUFFLE_TARGET_BLOCK_BYTES: usize = 8 * 1024;
+const BITSHUFFLE_MIN_BLOCK_VALUES: usize = 8;
 
 /// A validated data page body.  This is crate-private so neither the raw page
 /// body nor storage protobuf DTOs become a connector public contract.
@@ -486,6 +489,158 @@ pub(crate) fn decode_fixed_rle_values(
     Ok(output)
 }
 
+/// Decode StarRocks' fixed-width bitshuffle-plus-LZ4 data payload. The page
+/// header records both logical and padded value counts; decoding rejects a
+/// mismatch rather than treating trailing padding as user rows.
+pub(crate) fn decode_bitshuffle_fixed_values(
+    body: &[u8],
+    expected_values: usize,
+    expected_element_size: usize,
+) -> Result<Vec<u8>, ConnectorError> {
+    if body.len() < BITSHUFFLE_HEADER_SIZE || expected_element_size == 0 {
+        return Err(corrupt("invalid StarRocks bitshuffle page body"));
+    }
+    let values = u32::from_le_bytes(
+        body[..4]
+            .try_into()
+            .map_err(|_| corrupt("invalid StarRocks bitshuffle value count"))?,
+    ) as usize;
+    let encoded_size = u32::from_le_bytes(
+        body[4..8]
+            .try_into()
+            .map_err(|_| corrupt("invalid StarRocks bitshuffle encoded size"))?,
+    ) as usize;
+    let padded_values = u32::from_le_bytes(
+        body[8..12]
+            .try_into()
+            .map_err(|_| corrupt("invalid StarRocks bitshuffle padded count"))?,
+    ) as usize;
+    let element_size = u32::from_le_bytes(
+        body[12..16]
+            .try_into()
+            .map_err(|_| corrupt("invalid StarRocks bitshuffle element size"))?,
+    ) as usize;
+    if values != expected_values
+        || element_size != expected_element_size
+        || padded_values != align_up_8(values)
+        || encoded_size < BITSHUFFLE_HEADER_SIZE
+        || encoded_size != body.len()
+    {
+        return Err(corrupt(
+            "StarRocks bitshuffle page header conflicts with frozen values",
+        ));
+    }
+    let payload = &body[BITSHUFFLE_HEADER_SIZE..];
+    let output_size = padded_values
+        .checked_mul(element_size)
+        .ok_or_else(|| corrupt("StarRocks bitshuffle output size overflows"))?;
+    let mut output = vec![0_u8; output_size];
+    let block_values = bitshuffle_block_values(element_size);
+    let mut payload_offset = 0usize;
+    let mut output_offset = 0usize;
+    while output_offset < output.len() {
+        let values = ((output.len() - output_offset) / element_size).min(block_values);
+        let values = values - values % 8;
+        if values == 0 {
+            return Err(corrupt(
+                "StarRocks bitshuffle block is not eight-value aligned",
+            ));
+        }
+        let compressed_end = payload_offset
+            .checked_add(4)
+            .ok_or_else(|| corrupt("StarRocks bitshuffle block header overflows"))?;
+        if compressed_end > payload.len() {
+            return Err(corrupt("truncated StarRocks bitshuffle block header"));
+        }
+        let compressed_size = u32::from_be_bytes(
+            payload[payload_offset..compressed_end]
+                .try_into()
+                .map_err(|_| corrupt("invalid StarRocks bitshuffle block header"))?,
+        ) as usize;
+        payload_offset = compressed_end;
+        let end = payload_offset
+            .checked_add(compressed_size)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| corrupt("StarRocks bitshuffle block range is invalid"))?;
+        let bytes = values
+            .checked_mul(element_size)
+            .ok_or_else(|| corrupt("StarRocks bitshuffle block size overflows"))?;
+        let mut shuffled = vec![0_u8; bytes];
+        let decoded =
+            lz4_flex::block::decompress_into(&payload[payload_offset..end], &mut shuffled)
+                .map_err(|_| corrupt("cannot decompress StarRocks bitshuffle data block"))?;
+        if decoded != bytes {
+            return Err(corrupt("StarRocks bitshuffle data block size is invalid"));
+        }
+        bitunshuffle(
+            &shuffled,
+            &mut output[output_offset..output_offset + bytes],
+            values,
+            element_size,
+        )?;
+        payload_offset = end;
+        output_offset += bytes;
+    }
+    if payload_offset != payload.len() {
+        return Err(corrupt("StarRocks bitshuffle payload has trailing bytes"));
+    }
+    output.truncate(
+        values
+            .checked_mul(element_size)
+            .ok_or_else(|| corrupt("StarRocks bitshuffle value size overflows"))?,
+    );
+    Ok(output)
+}
+
+fn bitshuffle_block_values(element_size: usize) -> usize {
+    let values = (BITSHUFFLE_TARGET_BLOCK_BYTES / element_size) / 8 * 8;
+    values.max(BITSHUFFLE_MIN_BLOCK_VALUES)
+}
+
+fn align_up_8(value: usize) -> usize {
+    (value + 7) & !7
+}
+
+fn bitunshuffle(
+    input: &[u8],
+    output: &mut [u8],
+    values: usize,
+    element_size: usize,
+) -> Result<(), ConnectorError> {
+    if !values.is_multiple_of(8)
+        || input.len() != values * element_size
+        || output.len() != input.len()
+    {
+        return Err(corrupt("StarRocks bitshuffle dimensions are invalid"));
+    }
+    let mut transposed = vec![0_u8; input.len()];
+    let rows = values / 8;
+    for byte in 0..element_size {
+        for row in 0..rows {
+            for bit in 0..8 {
+                transposed[row * 8 * element_size + byte * 8 + bit] =
+                    input[(byte * 8 + bit) * rows + row];
+            }
+        }
+    }
+    for byte_bit in (0..8 * element_size).step_by(8) {
+        for group in 0..rows {
+            let start = group * 8 * element_size + byte_bit;
+            let matrix = u64::from_le_bytes(
+                transposed[start..start + 8]
+                    .try_into()
+                    .map_err(|_| corrupt("invalid StarRocks bitshuffle bit matrix"))?,
+            );
+            let matrix = transpose_bit_matrix(matrix);
+            for index in 0..8 {
+                output[group * 8 * element_size + byte_bit / 8 + index * element_size] =
+                    ((matrix >> (index * 8)) & 0xff) as u8;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn append_rle_value(
     output: &mut Vec<u8>,
     value: u128,
@@ -853,6 +1008,22 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::CorruptData
         );
+    }
+
+    #[test]
+    fn decodes_fixed_width_bitshuffle_data_values() {
+        let values = [1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let shuffled = transpose_bit_matrix(u64::from_le_bytes(values)).to_le_bytes();
+        let compressed = lz4_flex::block::compress(&shuffled);
+        let mut body = 8u32.to_le_bytes().to_vec();
+        body.extend_from_slice(
+            &(BITSHUFFLE_HEADER_SIZE as u32 + 4 + compressed.len() as u32).to_le_bytes(),
+        );
+        body.extend_from_slice(&8u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        body.extend_from_slice(&compressed);
+        assert_eq!(decode_bitshuffle_fixed_values(&body, 8, 1).unwrap(), values);
     }
 
     #[test]

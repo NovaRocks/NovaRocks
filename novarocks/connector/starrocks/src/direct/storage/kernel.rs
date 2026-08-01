@@ -37,8 +37,8 @@ use crate::direct::StarRocksDirectColumnBinding;
 
 use super::page::{
     StarRocksIndexPageNodeType, decode_binary_dictionary_page, decode_binary_dictionary_values,
-    decode_binary_plain_values, decode_data_page, decode_fixed_plain_values,
-    decode_fixed_rle_values, decode_index_page, page_slice,
+    decode_binary_plain_values, decode_bitshuffle_fixed_values, decode_data_page,
+    decode_fixed_plain_values, decode_fixed_rle_values, decode_index_page, page_slice,
 };
 use super::segment::{
     StarRocksLogicalType, StarRocksPageEncoding, StarRocksPagePointer, StarRocksSegmentColumnMeta,
@@ -403,8 +403,11 @@ fn decode_fixed_values(
     match encoding {
         StarRocksPageEncoding::Plain => decode_fixed_plain_values(body, values, value_size),
         StarRocksPageEncoding::Rle => decode_fixed_rle_values(body, values, value_size, bit_width),
-        StarRocksPageEncoding::Dictionary | StarRocksPageEncoding::BitShuffle => Err(unsupported(
-            "StarRocks direct fixed-width page encoding is not supported",
+        StarRocksPageEncoding::BitShuffle => {
+            decode_bitshuffle_fixed_values(body, values, value_size)
+        }
+        StarRocksPageEncoding::Dictionary => Err(unsupported(
+            "StarRocks direct fixed-width dictionary pages are not supported",
         )),
     }
 }
