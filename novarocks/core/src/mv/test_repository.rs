@@ -33,8 +33,8 @@ use super::persistence::partition::{
     ReplaceMvPartitionStatesRequest, StoredMvPartitionState, UpdateMvPartitionContractRequest,
 };
 use super::persistence::refresh::{
-    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshState,
-    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
+    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshLifecycleOwner,
+    MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
     RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
 };
 use super::repository::{
@@ -459,6 +459,8 @@ impl MvRepository for InMemoryMvRepository {
             rows: None,
             marker: None,
             external_outcome: None,
+            lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
+            frontend_ledger: None,
         };
         state.refreshes.insert(refresh_id, refresh.clone());
         Ok(refresh)
@@ -506,6 +508,8 @@ impl MvRepository for InMemoryMvRepository {
                 token: request.marker_token,
             }),
             external_outcome: None,
+            lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
+            frontend_ledger: None,
         };
         state.refreshes.insert(refresh_id, refresh.clone());
         Ok(refresh)
@@ -675,7 +679,10 @@ impl MvRepository for InMemoryMvRepository {
         Ok(self
             .list_unfinished_refreshes()?
             .into_iter()
-            .filter(|refresh| refresh.staging_branch.is_some())
+            .filter(|refresh| {
+                refresh.lifecycle_owner == MvRefreshLifecycleOwner::LegacyCore
+                    && refresh.staging_branch.is_some()
+            })
             .collect())
     }
     fn update_starrocks_refresh_summary_if_present(
