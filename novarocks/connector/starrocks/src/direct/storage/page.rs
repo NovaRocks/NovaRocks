@@ -855,6 +855,9 @@ fn read_varint(input: &mut &[u8]) -> Result<u64, ConnectorError> {
             .first()
             .ok_or_else(|| corrupt("truncated StarRocks protobuf varint"))?;
         *input = &input[1..];
+        if shift == 63 && byte > 1 {
+            return Err(corrupt("overflowing StarRocks protobuf varint"));
+        }
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
