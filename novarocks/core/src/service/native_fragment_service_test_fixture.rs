@@ -20,18 +20,32 @@
 //! Production native fragment orchestration is owned by `novarocks-backend`.
 
 #[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::num::NonZeroUsize;
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::cache::CacheOptions;
 use crate::common::app_config;
 use crate::common::types::UniqueId;
-use crate::exec::fragment::program::FragmentSinkKind;
+use crate::exec::chunk::Chunk;
+use crate::exec::fragment::program::{
+    FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkKind,
+    FragmentSinkSpec, RuntimeFilterContract,
+};
+use crate::exec::fragment::sink::FragmentSinkProgram;
+use crate::exec::node::values::ValuesNode;
+use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::novarocks_logging::{error, info, warn};
-use crate::protocol::native::decode::decode_fragment_submission;
 use crate::runtime::exchange;
 use crate::runtime::fragment::error::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
     FragmentLaunchErrorKind, FragmentLaunchStage,
+};
+use crate::runtime::fragment::instance::{
+    BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
+    FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
 };
 use crate::runtime::fragment::native_execution::{
     NativeExecutionContext, NativeExecutionStart, execute_native_submission,
@@ -233,31 +247,14 @@ fn prepare_native_query_before_fragment_registration(
     Ok(runtime_filter)
 }
 
-pub fn submit_exec_plan_fragment_native(
-    fragment: crate::proto::plan::PlanFragment,
-    instance_params: crate::proto::novarocks::InstanceParams,
-) -> Result<(), String> {
-    submit_exec_plan_fragment_native_with_manager(
-        fragment,
-        instance_params,
-        query_context_manager(),
-    )
+pub fn submit_exec_plan_fragment_native(submission: FragmentSubmission) -> Result<(), String> {
+    submit_exec_plan_fragment_native_with_manager(submission, query_context_manager())
 }
 
 pub(crate) fn submit_exec_plan_fragment_native_with_manager(
-    fragment: crate::proto::plan::PlanFragment,
-    instance_params: crate::proto::novarocks::InstanceParams,
+    submission: FragmentSubmission,
     mgr: Arc<QueryContextManager>,
 ) -> Result<(), String> {
-    let decoded = decode_fragment_submission(&fragment, &instance_params).map_err(|error| {
-        FragmentLaunchError::new(
-            FragmentLaunchStage::ValidateSubmission,
-            FragmentLaunchErrorKind::Binding,
-            error.to_string(),
-        )
-        .to_string()
-    })?;
-    let (submission, metadata) = decoded.into_parts();
     let instance = submission.instance();
     let query_id = instance.query_id();
     let finst_id = instance.fragment_instance_id().get();
@@ -283,11 +280,6 @@ pub(crate) fn submit_exec_plan_fragment_native_with_manager(
     } else {
         None
     };
-    debug_assert_eq!(
-        metadata.typed_result_sink(),
-        instance.runtime_options().typed_result_sink()
-    );
-    debug_assert_eq!(metadata.backend_num(), instance.backend_num().get());
     let uses_fetch_result_buffer = submission.program().sink().kind() == FragmentSinkKind::Result;
     spawn_exec_fragment_native(
         submission,
@@ -300,6 +292,44 @@ pub(crate) fn submit_exec_plan_fragment_native_with_manager(
         Arc::clone(&mgr),
     )
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn values_submission_for_test(
+    query_id: QueryId,
+    fragment_instance_id: UniqueId,
+    root_node_id: i32,
+    sink: FragmentSinkProgram,
+) -> FragmentSubmission {
+    let plan = ExecPlan {
+        arena: Default::default(),
+        root: ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode {
+                chunk: Chunk::default(),
+                node_id: root_node_id,
+            }),
+        },
+    };
+    let program = Arc::new(FragmentProgram::new(
+        plan,
+        FragmentSinkSpec::try_new(sink).expect("valid test sink"),
+        FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
+    ));
+    let instance = FragmentInstanceSpec::new_native(
+        FragmentContractVersion::CURRENT,
+        query_id,
+        FragmentInstanceId::new(fragment_instance_id),
+        ScanAssignments::default(),
+        ExchangeInputAssignments::default(),
+        FragmentSinkAssignment::None,
+        FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+        NonZeroUsize::new(1).expect("non-zero DOP"),
+        BackendNum::try_new(0).expect("backend number"),
+    );
+    FragmentSubmission::try_new(program, instance).expect("valid test values submission")
 }
 
 #[cfg(test)]
@@ -355,69 +385,21 @@ mod tests {
         }
     }
 
-    fn native_instance_params(query_id: QueryId) -> crate::proto::novarocks::InstanceParams {
-        crate::proto::novarocks::InstanceParams {
-            query_id: Some(crate::proto::common::UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
-            fragment_instance_id: Some(crate::proto::common::UniqueId {
-                hi: query_id.hi + 1,
-                lo: query_id.lo + 1,
-            }),
-            query_options: Some(crate::proto::novarocks::QueryOptions {
-                pipeline_dop: 1,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    fn valid_values_result_fragment(
-        fragment_id: u32,
-        root_node_id: i32,
-    ) -> crate::proto::plan::PlanFragment {
-        crate::proto::plan::PlanFragment {
-            fragment_id,
-            root: Some(crate::proto::plan::DistributedNode {
-                node_id: root_node_id,
-                fragment_id,
-                limit: -1,
-                payload: Some(crate::proto::plan::distributed_node::Payload::Physical(
-                    crate::proto::plan::PlanNode {
-                        output_columns: Vec::new(),
-                        kind: Some(crate::proto::plan::plan_node::Kind::Values(
-                            crate::proto::plan::ValuesNode {
-                                rows: Vec::new(),
-                                columns: Vec::new(),
-                            },
-                        )),
-                    },
-                )),
-                ..Default::default()
-            }),
-            sink: Some(crate::proto::plan::DataSink {
-                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
-            }),
-            output_columns: Vec::new(),
-            runtime_filter_bindings: Some(crate::proto::plan::RuntimeFilterBindingTable {
-                fragment_id,
-                bindings: Vec::new(),
-            }),
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn native_profiler_uses_true_program_root_plan_node_id() {
         let query_id = QueryId {
             hi: 73_901,
             lo: 73_902,
         };
-        let params = native_instance_params(query_id);
-        let decoded = decode_fragment_submission(&valid_values_result_fragment(16, 99), &params)
-            .expect("valid native fragment");
-        let (submission, _) = decoded.into_parts();
+        let submission = values_submission_for_test(
+            query_id,
+            UniqueId {
+                hi: query_id.hi + 1,
+                lo: query_id.lo + 1,
+            },
+            99,
+            FragmentSinkProgram::Result,
+        );
 
         let profiler = profiler_for_native_program(submission.program());
 
@@ -436,25 +418,15 @@ mod tests {
             lo: 74_104,
         };
         crate::runtime::fragment::native_execution::install_test_pre_ready_panic(finst_id);
-        let params = crate::proto::novarocks::InstanceParams {
-            query_id: Some(crate::proto::common::UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
-            fragment_instance_id: Some(crate::proto::common::UniqueId {
-                hi: finst_id.hi,
-                lo: finst_id.lo,
-            }),
-            query_options: Some(crate::proto::novarocks::QueryOptions {
-                pipeline_dop: 1,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
         let before = registration_snapshot(query_id, finst_id);
 
-        let error = submit_exec_plan_fragment_native(valid_values_result_fragment(17, 91), params)
-            .expect_err("pre-ready worker panic must fail submission synchronously");
+        let error = submit_exec_plan_fragment_native(values_submission_for_test(
+            query_id,
+            finst_id,
+            91,
+            FragmentSinkProgram::Result,
+        ))
+        .expect_err("pre-ready worker panic must fail submission synchronously");
         let after = registration_snapshot(query_id, finst_id);
 
         assert!(
@@ -464,57 +436,6 @@ mod tests {
         assert_eq!(
             after, before,
             "pre-ready panic must finish rollback before return"
-        );
-    }
-
-    #[test]
-    fn malformed_fragment_fails_before_runtime_registration() {
-        let query_id = QueryId {
-            hi: 74_001,
-            lo: 74_002,
-        };
-        let finst_id = UniqueId {
-            hi: 74_003,
-            lo: 74_004,
-        };
-        let fragment = crate::proto::plan::PlanFragment {
-            root: None,
-            sink: Some(crate::proto::plan::DataSink {
-                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
-            }),
-            runtime_filter_bindings: Some(crate::proto::plan::RuntimeFilterBindingTable {
-                fragment_id: 0,
-                bindings: Vec::new(),
-            }),
-            ..Default::default()
-        };
-        let params = crate::proto::novarocks::InstanceParams {
-            query_id: Some(crate::proto::common::UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
-            fragment_instance_id: Some(crate::proto::common::UniqueId {
-                hi: finst_id.hi,
-                lo: finst_id.lo,
-            }),
-            query_options: Some(crate::proto::novarocks::QueryOptions {
-                pipeline_dop: 1,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let before = registration_snapshot(query_id, finst_id);
-
-        let result = submit_exec_plan_fragment_native(fragment, params);
-        let after = registration_snapshot(query_id, finst_id);
-
-        assert!(
-            result.is_err(),
-            "malformed fragment must fail synchronously; before={before:?} after={after:?}"
-        );
-        assert_eq!(
-            after, before,
-            "decode failure must not mutate runtime state"
         );
     }
 

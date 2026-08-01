@@ -156,52 +156,16 @@ mod native_runtime_filter_mode_tests {
     use super::*;
 
     fn submit_native_fragment(query_id: QueryId) -> Result<(), String> {
-        let fragment_id = 8;
         crate::service::native_fragment_service_test_fixture::submit_exec_plan_fragment_native(
-            crate::proto::plan::PlanFragment {
-                fragment_id,
-                root: Some(crate::proto::plan::DistributedNode {
-                    node_id: 81,
-                    fragment_id,
-                    limit: -1,
-                    payload: Some(crate::proto::plan::distributed_node::Payload::Physical(
-                        crate::proto::plan::PlanNode {
-                            output_columns: Vec::new(),
-                            kind: Some(crate::proto::plan::plan_node::Kind::Values(
-                                crate::proto::plan::ValuesNode {
-                                    rows: Vec::new(),
-                                    columns: Vec::new(),
-                                },
-                            )),
-                        },
-                    )),
-                    ..Default::default()
-                }),
-                sink: Some(crate::proto::plan::DataSink {
-                    kind: Some(crate::proto::plan::data_sink::Kind::Noop(true)),
-                }),
-                output_columns: Vec::new(),
-                runtime_filter_bindings: Some(crate::proto::plan::RuntimeFilterBindingTable {
-                    fragment_id,
-                    bindings: Vec::new(),
-                }),
-                ..Default::default()
-            },
-            crate::proto::novarocks::InstanceParams {
-                query_id: Some(proto::common::UniqueId {
-                    hi: query_id.hi,
-                    lo: query_id.lo,
-                }),
-                fragment_instance_id: Some(proto::common::UniqueId {
+            crate::service::native_fragment_service_test_fixture::values_submission_for_test(
+                query_id,
+                crate::common::types::UniqueId {
                     hi: query_id.hi + 1,
                     lo: query_id.lo + 1,
-                }),
-                query_options: Some(crate::proto::novarocks::QueryOptions {
-                    pipeline_dop: 1,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+                },
+                81,
+                crate::exec::fragment::sink::FragmentSinkProgram::Noop,
+            ),
         )
     }
 }

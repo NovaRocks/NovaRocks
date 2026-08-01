@@ -28,7 +28,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
-use crate::connector::ConnectorRegistry;
 use crate::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::program::{
@@ -42,7 +41,6 @@ use crate::protocol::{FieldPath, ProtocolErrorKind, ProtocolFamily};
 use crate::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentSinkAssignment,
 };
-use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
@@ -274,53 +272,4 @@ pub trait NativeScanSourceContractDecoder: Send + Sync {
         root: &plan::DistributedNode,
         path: crate::protocol::FieldPath,
     ) -> Result<BTreeMap<FragmentNodeId, ScanSourceContract>, ProtocolError>;
-}
-
-pub struct AssembledNativeFragmentSubmission {
-    submission: FragmentSubmission,
-    backend_num: i32,
-}
-
-impl AssembledNativeFragmentSubmission {
-    pub fn into_parts(self) -> (FragmentSubmission, i32) {
-        (self.submission, self.backend_num)
-    }
-}
-
-pub fn assemble_fragment_submission_for_backend(
-    fragment: &plan::PlanFragment,
-    instance: NativeFragmentInstanceInput,
-    sink_assignment_params: &novarocks::InstanceParams,
-    envelope_decoder: &dyn NativeFragmentEnvelopeDecoder,
-    submission_validator: &dyn NativeFragmentSubmissionValidator,
-    sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
-    expression_decoder: Arc<dyn NativeExpressionDecoder>,
-    output_layout_decoder: Arc<dyn NativeOutputLayoutDecoder>,
-    scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
-    exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
-    runtime_filter_contract_decoder: &dyn RuntimeFilterExecutionContractDecoder,
-    connectors: Arc<ConnectorRegistry>,
-    execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
-) -> Result<AssembledNativeFragmentSubmission, String> {
-    let decoded = crate::protocol::native::decode::assemble_fragment_submission_with_connectors_and_execution_resolver(
-        fragment,
-        instance,
-        sink_assignment_params,
-        envelope_decoder,
-        submission_validator,
-        sink_assignment_decoder,
-        expression_decoder,
-        output_layout_decoder,
-        scan_source_contract_decoder,
-        exchange_contract_decoder,
-        runtime_filter_contract_decoder,
-        connectors,
-        execution_resolver,
-    )
-    .map_err(|error| error.to_string())?;
-    let (submission, metadata) = decoded.into_parts();
-    Ok(AssembledNativeFragmentSubmission {
-        submission,
-        backend_num: metadata.backend_num(),
-    })
 }
