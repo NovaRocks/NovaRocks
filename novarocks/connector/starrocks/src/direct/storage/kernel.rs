@@ -413,6 +413,52 @@ mod tests {
         segment
     }
 
+    fn rle_segment(value: i64, count: usize) -> Vec<u8> {
+        let mut page = (count as u32).to_le_bytes().to_vec();
+        page.push((count as u32 * 2) as u8);
+        page.extend_from_slice(&value.to_le_bytes());
+        let page_footer = PageFooter {
+            page_type: Some(1),
+            uncompressed_size: Some(page.len() as u32),
+            data: Some(DataFooter {
+                num_values: Some(count as u64),
+            }),
+        }
+        .encode_to_vec();
+        page.extend_from_slice(&page_footer);
+        page.extend_from_slice(&(page_footer.len() as u32).to_le_bytes());
+        page.extend_from_slice(&crc32c(&page).to_le_bytes());
+        let footer = Footer {
+            version: Some(1),
+            columns: vec![Column {
+                unique_id: Some(1),
+                logical_type: Some(7),
+                encoding: Some(4),
+                compression: Some(0),
+                nullable: Some(false),
+                indexes: vec![Index {
+                    index_type: Some(1),
+                    ordinal: Some(Ordinal {
+                        root: Some(Btree {
+                            page: Some(Pointer {
+                                offset: Some(0),
+                                size: Some(page.len() as u32),
+                            }),
+                            root_is_data: Some(true),
+                        }),
+                    }),
+                }],
+            }],
+            num_rows: Some(count as u32),
+        }
+        .encode_to_vec();
+        page.extend_from_slice(&footer);
+        page.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+        page.extend_from_slice(&crc32c(&footer).to_le_bytes());
+        page.extend_from_slice(b"D0R1");
+        page
+    }
+
     #[test]
     fn decodes_frozen_plain_segment_to_arrow() {
         let bytes = segment(&[7, 9]);
@@ -434,6 +480,30 @@ mod tests {
                 .unwrap()
                 .values(),
             &[7, 9]
+        );
+    }
+
+    #[test]
+    fn decodes_frozen_rle_segment_to_arrow() {
+        let bytes = rle_segment(7, 3);
+        let footer = super::super::segment::decode_segment_footer("seg", &bytes).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = decode_plain_segment(
+            "seg",
+            &bytes,
+            &footer,
+            schema,
+            &[StarRocksDirectColumnBinding::try_new(0, 1, "id", "BIGINT", false, None).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[7, 7, 7]
         );
     }
 
