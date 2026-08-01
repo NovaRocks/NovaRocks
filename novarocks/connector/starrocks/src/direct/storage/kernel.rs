@@ -1141,6 +1141,101 @@ mod tests {
     }
 
     #[test]
+    fn decodes_temporal_and_decimal_plain_pages() {
+        fn page(mut body: Vec<u8>, values: usize) -> Vec<u8> {
+            let footer = PageFooter {
+                page_type: Some(1),
+                uncompressed_size: Some(body.len() as u32),
+                data: Some(DataFooter {
+                    num_values: Some(values as u64),
+                }),
+                index: None,
+            }
+            .encode_to_vec();
+            body.extend_from_slice(&footer);
+            body.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+            body.extend_from_slice(&crc32c(&body).to_le_bytes());
+            body
+        }
+        fn column(logical_type: StarRocksLogicalType) -> StarRocksSegmentColumnMeta {
+            StarRocksSegmentColumnMeta {
+                column_id: None,
+                unique_id: Some(1),
+                logical_type,
+                encoding: Some(StarRocksPageEncoding::Plain),
+                compression: Some(super::super::segment::StarRocksCompression::None),
+                nullable: false,
+                dictionary_page: None,
+                ordinal_index_page: None,
+                ordinal_index_is_data_page: true,
+                num_rows: None,
+                children: Vec::new(),
+            }
+        }
+        let decode = |column: StarRocksSegmentColumnMeta, bytes: Vec<u8>, data_type: DataType| {
+            decode_single_data_page(
+                "fixture",
+                &bytes,
+                &column,
+                &data_type,
+                &StarRocksPagePointer {
+                    offset: 0,
+                    size: bytes.len() as u32,
+                },
+                1,
+            )
+            .unwrap()
+        };
+        let mut date = 1_u32.to_le_bytes().to_vec();
+        date.extend_from_slice(&2_440_589_i32.to_le_bytes());
+        let date = decode(
+            column(StarRocksLogicalType::Date),
+            page(date, 1),
+            DataType::Date32,
+        );
+        assert_eq!(
+            date.as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+
+        let encoded_datetime = (2_440_588_i64 << STARROCKS_DATETIME_TIME_BITS) | 1_000_000;
+        let mut datetime = 1_u32.to_le_bytes().to_vec();
+        datetime.extend_from_slice(&encoded_datetime.to_le_bytes());
+        let datetime = decode(
+            column(StarRocksLogicalType::DateTime),
+            page(datetime, 1),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        );
+        assert_eq!(
+            datetime
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            1_000_000
+        );
+
+        let mut decimal = 1_u32.to_le_bytes().to_vec();
+        decimal.extend_from_slice(&(-1234_i64).to_le_bytes());
+        let decimal = decode(
+            column(StarRocksLogicalType::Decimal64),
+            page(decimal, 1),
+            DataType::Decimal128(8, 2),
+        );
+        assert_eq!(
+            decimal
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            -1234
+        );
+    }
+
+    #[test]
     fn decodes_frozen_multi_page_ordinal_index_to_arrow() {
         fn finish_page(mut body: Vec<u8>, footer: PageFooter) -> Vec<u8> {
             let footer = footer.encode_to_vec();
