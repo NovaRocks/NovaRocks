@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use novarocks::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
+use novarocks::runtime::fragment::{FragmentEvent, FragmentEventSink};
 
 use crate::report::CompatReportService;
 

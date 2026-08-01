@@ -27,7 +27,7 @@ use novarocks::exec::node::scan::{
 };
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks::runtime::fragment::instance::{BackendNum, FragmentInstanceId};
+use novarocks::runtime::fragment::{BackendNum, FragmentInstanceId};
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::{
     BrokerFileFormat, BrokerFileScanRange, DatacacheOptions, DeletionVectorDescriptor, FileFormat,

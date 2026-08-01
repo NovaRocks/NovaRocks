@@ -154,3 +154,56 @@ fn external_callers_cannot_open_aggregate_final_domain_sessions() {
 
     assert_private(output, "AggregateFinalDomainSessionBuilder");
 }
+
+#[test]
+fn fragment_kernel_exposes_only_the_canonical_construction_and_runtime_paths() {
+    let output = compile_external(
+        "use novarocks::exec::fragment::program::FragmentProgramBuilder;\n\
+         use novarocks::exec::node::ExecPlanBuilder;\n\
+         use novarocks::runtime::fragment::{FragmentInstanceSpec, FragmentSubmission};\n\
+         fn main() {\n\
+             let _ = core::mem::size_of::<ExecPlanBuilder>();\n\
+             let _ = core::mem::size_of::<FragmentProgramBuilder>();\n\
+             let _ = core::mem::size_of::<FragmentInstanceSpec>();\n\
+             let _ = core::mem::size_of::<FragmentSubmission>();\n\
+         }\n",
+    );
+    assert!(
+        output.status.success(),
+        "canonical fragment-kernel API must be externally usable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn external_callers_cannot_reach_fragment_kernel_legacy_paths() {
+    for (source, capability) in [
+        (
+            "use novarocks::runtime::fragment::instance::FragmentInstanceSpec;\n\
+             fn main() { let _ = core::mem::size_of::<FragmentInstanceSpec>(); }\n",
+            "instance",
+        ),
+        (
+            "use novarocks::runtime::fragment::io::FragmentEventSink;\n\
+             fn main() { let _ = core::mem::size_of::<&dyn FragmentEventSink>(); }\n",
+            "io",
+        ),
+        (
+            "use novarocks::exec::operators::DataStreamSinkFactory;\n\
+             fn main() { let _ = core::mem::size_of::<DataStreamSinkFactory>(); }\n",
+            "operators",
+        ),
+        (
+            "use novarocks::exec::pipeline::fragment_context::FragmentContext;\n\
+             fn main() { let _ = core::mem::size_of::<FragmentContext>(); }\n",
+            "pipeline",
+        ),
+        (
+            "use novarocks::runtime::query_context::QueryContextManager;\n\
+             fn main() { let _ = core::mem::size_of::<QueryContextManager>(); }\n",
+            "query_context",
+        ),
+    ] {
+        assert_private(compile_external(source), capability);
+    }
+}

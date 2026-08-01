@@ -23,7 +23,7 @@ use std::num::NonZeroUsize;
 
 use novarocks::exec::fragment::program::FragmentNodeId;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
-use novarocks::runtime::fragment::instance::{
+use novarocks::runtime::fragment::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks::runtime::query_options::QueryOptions;

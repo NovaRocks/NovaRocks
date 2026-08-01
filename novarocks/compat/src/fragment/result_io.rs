@@ -2,12 +2,10 @@ use std::sync::Arc;
 
 use novarocks::common::types::FetchResult;
 use novarocks::runtime::exchange;
-use novarocks::runtime::fragment::io::result_format::{
-    build_result_batch, build_statistic_result_batch,
-};
-use novarocks::runtime::fragment::io::{
+use novarocks::runtime::fragment::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
-    FragmentResultWriter, ResultAbort, ResultPresentation, ResultWriteSpec,
+    FragmentResultWriter, ResultAbort, ResultPresentation, ResultWriteSpec, build_result_batch,
+    build_statistic_result_batch,
 };
 use novarocks::runtime::result_buffer::{ResultBufferWriteHandle, ResultPublication};
 

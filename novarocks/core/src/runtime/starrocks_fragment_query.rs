@@ -36,8 +36,7 @@ use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::query_context::{
     FragmentFinishReportDecision, QueryContextManager, QueryExecutionKey, StarRocksQueryGeneration,
-    StarRocksQueryHandoff,
-    query_context_manager,
+    StarRocksQueryHandoff, query_context_manager,
 };
 
 pub use crate::runtime::query_context::{LookupFetcherLifecycle, QueryCleanupLease};

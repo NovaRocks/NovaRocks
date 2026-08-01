@@ -25,7 +25,7 @@ use crate::thrift::{descriptors, internal_service, planner, types};
 use novarocks::connector::starrocks::lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest};
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::fragment::program::{
-    ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
+    ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgramBuilder,
     FragmentProgramOptions, RuntimeFilterContract,
 };
 use novarocks::exec::node::scan::BoundScanRanges;
@@ -33,18 +33,16 @@ use novarocks::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use novarocks::exec::row_position::RowPositionDescriptor;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::descriptor_snapshot::DescriptorSnapshot;
-use novarocks::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceSpec,
-    FragmentRuntimeOptions, ScanAssignments,
+use novarocks::runtime::fragment::FragmentSubmission;
+use novarocks::runtime::fragment::{
+    ExchangeFrameTransmitter, ExchangeInputAssignment, ExchangeInputAssignments, FragmentEventSink,
+    FragmentInstanceSpec, FragmentResultWriter, FragmentRuntimeOptions, ResultPresentation,
+    ResultProjection, ResultWriteSpec, ScanAssignments,
 };
-use novarocks::runtime::fragment::io::{
-    FragmentEventSink, FragmentResultWriter, ResultPresentation, ResultProjection, ResultWriteSpec,
-};
-use novarocks::runtime::fragment::submission::FragmentSubmission;
+use novarocks::runtime::query_options::query_expire_durations;
 use novarocks::runtime::starrocks_fragment_query::{
     LookupFetcherLifecycle, StarRocksFragmentQueryRuntime,
 };
-use novarocks::runtime::query_options::query_expire_durations;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -110,11 +108,6 @@ pub(crate) struct StarRocksFragmentDraft {
 impl StarRocksFragmentDraft {
     pub(crate) fn external_dependencies(&self) -> &[StarRocksExternalDependency] {
         &self.external_dependencies
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepared_program_for_test(&self) -> &FragmentProgram {
-        &self.parts.program
     }
 }
 
@@ -225,9 +218,9 @@ impl StarRocksSubmissionMetadata {
         profiler: Option<novarocks::runtime::profile::Profiler>,
         mem_tracker: Option<std::sync::Arc<novarocks::runtime::mem_tracker::MemTracker>>,
         exchange_transmitter: std::sync::Arc<
-            dyn novarocks::runtime::fragment::io::ExchangeFrameTransmitter,
+            dyn novarocks::runtime::fragment::ExchangeFrameTransmitter,
         >,
-        lookup_client: std::sync::Arc<dyn novarocks::runtime::fragment::io::FragmentLookupClient>,
+        lookup_client: std::sync::Arc<dyn novarocks::runtime::fragment::FragmentLookupClient>,
         result_writer: std::sync::Arc<dyn FragmentResultWriter>,
         event_sink: std::sync::Arc<dyn FragmentEventSink>,
         fragment_instance_id: novarocks_types::UniqueId,
@@ -248,7 +241,7 @@ impl StarRocksSubmissionMetadata {
 
 #[derive(Debug)]
 struct DecodedDraftParts {
-    program: FragmentProgram,
+    program: FragmentProgramBuilder,
     instance: FragmentInstanceSpec,
     metadata: StarRocksSubmissionMetadata,
 }
@@ -314,7 +307,7 @@ pub(crate) fn finish_fragment_submission(
             )
         })?;
         if !replace_values_chunk(
-            &mut draft.parts.program.plan_mut().root,
+            draft.parts.program.plan_mut().root_mut(),
             patch.node_id(),
             chunk,
         ) {
@@ -327,9 +320,13 @@ pub(crate) fn finish_fragment_submission(
             ));
         }
     }
-    let submission =
-        FragmentSubmission::try_new(Arc::new(draft.parts.program), draft.parts.instance)
-            .map_err(StarRocksFragmentDecodeError::Binding)?;
+    let program = draft
+        .parts
+        .program
+        .finish()
+        .map_err(StarRocksFragmentDecodeError::from)?;
+    let submission = FragmentSubmission::try_new(Arc::new(program), draft.parts.instance)
+        .map_err(StarRocksFragmentDecodeError::Binding)?;
     Ok(DecodedStarRocksFragment {
         submission,
         metadata: draft.parts.metadata,
@@ -337,13 +334,13 @@ pub(crate) fn finish_fragment_submission(
 }
 
 fn query_profile_arena_mut(
-    program: &mut FragmentProgram,
+    program: &mut FragmentProgramBuilder,
     owner: FragmentExprArenaOwner,
 ) -> Result<&mut ExprArena, StarRocksFragmentDecodeError> {
     if owner == FragmentExprArenaOwner::Plan {
-        return Ok(&mut program.plan_mut().arena);
+        return Ok(program.plan_mut().arena_mut());
     }
-    let sink = program.sink_mut().program_mut();
+    let sink = program.sink_program_mut();
     let arena = match (owner, sink) {
         (
             FragmentExprArenaOwner::DataStream,
@@ -593,8 +590,7 @@ fn decode_draft_parts(
             let (_, query_expire) = query_expire_durations(Some(&instance.query_options));
             ConnectorRequestContext::try_new(
                 Instant::now() + query_expire,
-                StarRocksFragmentQueryRuntime::new()
-                    .connector_cancellation(instance.query_id),
+                StarRocksFragmentQueryRuntime::new().connector_cancellation(instance.query_id),
                 MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )
@@ -631,33 +627,31 @@ fn decode_draft_parts(
         FieldPath::root("exec_plan_fragment").field("fragment"),
     )?;
     let runtime_filters = RuntimeFilterContract::default();
-    let plan = ExecPlan {
-        arena,
-        root: lowered.node,
-    };
-    let exchange_contracts = collect_exchange_contracts(&plan.root)?;
+    let plan = novarocks::exec::node::ExecPlanBuilder::new(arena, lowered.node)
+        .finish()
+        .map_err(StarRocksFragmentDecodeError::from)?;
+    let exchange_contracts = collect_exchange_contracts(plan.root())?;
     let exchange_assignments = decode_exchange_assignments(
         &exchange_contracts,
         &instance.per_exchange_sender_counts,
         &instance.batch_exchange_sender_counts,
     )?;
-    let program = FragmentProgram::new(
+    let mut program = novarocks::exec::fragment::program::FragmentProgramBuilder::new(
         plan,
         spec,
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-        scan_contracts,
-        exchange_contracts,
-        runtime_filters,
-    );
+    )
+    .scan_sources(scan_contracts)
+    .exchange_inputs(exchange_contracts)
+    .runtime_filters(runtime_filters);
     let mut row_position_descriptors = HashMap::new();
-    collect_row_position_descriptors(&program.plan().root, &mut row_position_descriptors).map_err(
-        |detail| {
+    collect_row_position_descriptors(program.plan_mut().root(), &mut row_position_descriptors)
+        .map_err(|detail| {
             StarRocksFragmentDecodeError::invalid_value(
                 FieldPath::root("exec_plan_fragment").field("fragment"),
                 detail,
             )
-        },
-    )?;
+        })?;
     let descriptor_snapshot = input
         .descriptors
         .map(super::descriptor::descriptor_snapshot_from_thrift)
@@ -1372,10 +1366,6 @@ mod tests {
         let params = params(query, finst);
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect("prepare values/noop fragment");
-        assert!(matches!(
-            draft.prepared_program_for_test().plan().root.kind,
-            ExecNodeKind::Values(_)
-        ));
         assert!(draft.external_dependencies().is_empty());
         let decoded = finish_fragment_submission(draft, StarRocksResolvedDependencies::default())
             .expect("finish values/noop fragment");
@@ -1384,7 +1374,7 @@ mod tests {
         assert_eq!(submission.instance().fragment_instance_id().get(), finst);
         assert_eq!(submission.program().sink().kind(), FragmentSinkKind::Noop);
         assert!(matches!(
-            submission.program().plan().root.kind,
+            submission.program().plan().root().kind,
             ExecNodeKind::Values(_)
         ));
         assert!(metadata.descriptor_snapshot().is_none());
@@ -1494,10 +1484,10 @@ mod tests {
         let decoded = finish_fragment_submission(draft, resolved)
             .expect("finish plan-owned profile expression");
         let (submission, _) = decoded.into_parts();
-        let ExecNodeKind::Filter(filter) = &submission.program().plan().root.kind else {
+        let ExecNodeKind::Filter(filter) = &submission.program().plan().root().kind else {
             panic!("root conjunct must lower to a filter");
         };
-        assert_resolved_profile(&submission.program().plan().arena, filter.predicate);
+        assert_resolved_profile(submission.program().plan().arena(), filter.predicate);
     }
 
     #[test]

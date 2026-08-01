@@ -28,6 +28,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::runtime::connector_write_report::ConnectorStagedReportCollector;
+use crate::runtime::endpoint::FragmentDestination;
 use novarocks_spi::connector::{
     ConnectorExecutionBinding, ConnectorOpenWriterRequest, StatisticsMetricRequest,
 };
@@ -88,6 +89,85 @@ impl DataStreamPartitionType {
         matches!(
             self,
             Self::HashPartitioned | Self::BucketShuffleHashPartitioned
+        )
+    }
+}
+
+/// Construction-time input for a distributed stream sink. The private
+/// operator factories consume this value but do not define the public
+/// fragment-construction contract.
+#[derive(Clone)]
+pub struct DataStreamSinkFactoryInput {
+    pub dest_node_id: i32,
+    pub output_exprs: Vec<ExprId>,
+    pub output_partition_type: DataStreamPartitionType,
+    pub output_partition_exprs: Vec<ExprId>,
+    pub output_columns: Vec<SlotId>,
+    pub destinations: Vec<FragmentDestination>,
+}
+
+impl DataStreamSinkFactoryInput {
+    pub fn try_from_static_program(
+        dest_node_id: i32,
+        output_partition_type: DataStreamPartitionType,
+        output_exprs: Vec<ExprId>,
+        mut output_partition_exprs: Vec<ExprId>,
+        output_columns: Vec<SlotId>,
+        destinations: Vec<FragmentDestination>,
+    ) -> Result<Self, String> {
+        if !output_exprs.is_empty() {
+            return Err("DATA_STREAM_SINK output_exprs are not supported".to_string());
+        }
+        let mut seen = HashSet::new();
+        if let Some(slot_id) = output_columns
+            .iter()
+            .find(|slot_id| !seen.insert(**slot_id))
+        {
+            return Err(format!(
+                "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
+            ));
+        }
+        if !output_partition_type.requires_exprs() {
+            output_partition_exprs.clear();
+        }
+        Ok(Self {
+            dest_node_id,
+            output_exprs,
+            output_partition_type,
+            output_partition_exprs,
+            output_columns,
+            destinations,
+        })
+    }
+
+    pub fn try_new(
+        dest_node_id: i32,
+        output_partition_type: DataStreamPartitionType,
+        output_exprs: Vec<ExprId>,
+        output_partition_exprs: Vec<ExprId>,
+        output_columns: Vec<i32>,
+        destinations: Vec<FragmentDestination>,
+    ) -> Result<Self, String> {
+        let mut seen = HashSet::new();
+        let mut parsed_output_columns = Vec::with_capacity(output_columns.len());
+        for raw in output_columns {
+            let slot_id = SlotId::try_from(raw).map_err(|err| {
+                format!("DATA_STREAM_SINK: invalid output_columns slot id: {err}")
+            })?;
+            if !seen.insert(slot_id) {
+                return Err(format!(
+                    "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
+                ));
+            }
+            parsed_output_columns.push(slot_id);
+        }
+        Self::try_from_static_program(
+            dest_node_id,
+            output_partition_type,
+            output_exprs,
+            output_partition_exprs,
+            parsed_output_columns,
+            destinations,
         )
     }
 }

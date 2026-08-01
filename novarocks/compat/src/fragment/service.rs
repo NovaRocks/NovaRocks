@@ -36,12 +36,12 @@ use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 use novarocks::cache::CacheOptions;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::exchange;
-use novarocks::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
-};
 use novarocks::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
     prepare_fragment,
+};
+use novarocks::runtime::fragment::{
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
 use novarocks::runtime::mem_tracker::MemTracker;
 use novarocks::runtime::profile::{ProfileUnit, Profiler};

@@ -28,10 +28,8 @@ use novarocks::exec::fragment::program::{
 };
 use novarocks::exec::node::ExecPlan;
 use novarocks::protocol::FieldPath;
-use novarocks::runtime::fragment::instance::{
-    FragmentInstanceSpec, FragmentRuntimeOptions, ScanAssignments,
-};
-use novarocks::runtime::fragment::submission::FragmentSubmission;
+use novarocks::runtime::fragment::FragmentSubmission;
+use novarocks::runtime::fragment::{FragmentInstanceSpec, FragmentRuntimeOptions, ScanAssignments};
 use novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
@@ -118,17 +116,23 @@ pub(crate) fn decode_fragment_submission(
         decode_fragment_sink_program_with_context(fragment, &decoded_root.layout, Some(&context))?;
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
-    let program = FragmentProgram::new(
-        ExecPlan {
-            arena,
-            root: decoded_root.node,
-        },
+    let plan = novarocks::exec::node::ExecPlanBuilder::new(arena, decoded_root.node)
+        .finish()
+        .map_err(NativeFragmentDecodeError::from)?;
+    let program = novarocks::exec::fragment::program::FragmentProgramBuilder::new(
+        plan,
         sink_spec,
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-        scan_sources,
+    )
+    .scan_sources(scan_sources)
+    .exchange_inputs(
         decode_exchange_contracts(root, root_path).map_err(NativeFragmentDecodeError::from)?,
+    )
+    .runtime_filters(
         decode_runtime_filter_contract(fragment).map_err(NativeFragmentDecodeError::from)?,
-    );
+    )
+    .finish()
+    .map_err(NativeFragmentDecodeError::from)?;
     let backend_num = instance.backend_num.get();
     let fragment_instance = FragmentInstanceSpec::new_native(
         FragmentContractVersion::CURRENT,

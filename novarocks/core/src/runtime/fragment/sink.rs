@@ -17,14 +17,14 @@
 
 use crate::exec::fragment::program::{FragmentProgram, FragmentSinkSpec};
 use crate::exec::fragment::sink::{
-    DataStreamSinkBranchProgram, FragmentSinkProgram, MultiCastDataStreamSinkProgram,
+    DataStreamSinkBranchProgram, DataStreamSinkFactoryInput, FragmentSinkProgram,
+    MultiCastDataStreamSinkProgram,
 };
 use crate::exec::operators::{
-    ConnectorWriteSinkFactory, DataStreamSinkFactory, DataStreamSinkFactoryInput,
-    MultiCastDataStreamSinkFactory, NoopSinkFactory, ResultBufferSinkFactory,
-    SplitDataStreamSinkFactory,
+    ConnectorWriteSinkFactory, DataStreamSinkFactory, MultiCastDataStreamSinkFactory,
+    NoopSinkFactory, ResultBufferSinkFactory, SplitDataStreamSinkFactory,
 };
-use crate::exec::operators::{OlapTableSinkFactory, StatisticsSinkFactory, StatisticsSinkHandle};
+use crate::exec::operators::{StatisticsSinkFactory, StatisticsSinkHandle};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::fragment::error::{

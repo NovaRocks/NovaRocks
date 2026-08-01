@@ -37,7 +37,8 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
 
-use super::{DataStreamSinkFactory, DataStreamSinkFactoryInput};
+use super::DataStreamSinkFactory;
+use crate::exec::fragment::sink::DataStreamSinkFactoryInput;
 
 struct InnerSinkSpec {
     factory: DataStreamSinkFactory,

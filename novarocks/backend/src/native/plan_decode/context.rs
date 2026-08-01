@@ -28,7 +28,7 @@ use novarocks::exec::fragment::program::FragmentNodeId;
 use novarocks::exec::node::scan::BoundScanRanges;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::exchange::ExchangeKey;
-use novarocks::runtime::fragment::instance::{
+use novarocks::runtime::fragment::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks::runtime::query_options::QueryOptions;

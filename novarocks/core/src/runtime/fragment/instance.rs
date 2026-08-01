@@ -182,10 +182,7 @@ pub struct FragmentRuntimeOptions {
 }
 
 impl FragmentRuntimeOptions {
-    pub fn new(
-        query_options: QueryOptions,
-        typed_result_sink: bool,
-    ) -> Self {
+    pub fn new(query_options: QueryOptions, typed_result_sink: bool) -> Self {
         Self {
             query_options,
             typed_result_sink,

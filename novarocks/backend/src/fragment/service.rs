@@ -28,7 +28,7 @@ use novarocks::novarocks_logging::error;
 #[cfg(test)]
 use novarocks::novarocks_logging::warn;
 use novarocks::query_execution::lifecycle::StageFragment;
-use novarocks::runtime::fragment::io::{
+use novarocks::runtime::fragment::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
 use novarocks::runtime::fragment::{

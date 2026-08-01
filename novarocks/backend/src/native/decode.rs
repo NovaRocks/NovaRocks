@@ -29,7 +29,7 @@ use novarocks::cache::CacheOptions;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
-use novarocks::runtime::fragment::submission::FragmentSubmission;
+use novarocks::runtime::fragment::FragmentSubmission;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::QueryId as ExecutionQueryId;

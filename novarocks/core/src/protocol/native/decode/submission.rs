@@ -310,24 +310,22 @@ where
     // the instance's scan assignments (`materialize_scan_bindings` binds these).
     let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
         .map_err(NativeFragmentDecodeError::Binding)?;
-    let plan = ExecPlan {
-        arena,
-        root: decoded_root.node,
-    };
+    let plan = crate::exec::node::ExecPlanBuilder::new(arena, decoded_root.node).finish()?;
     let sink_program =
         decode_fragment_sink_program_with_context(fragment, &decoded_root.layout, Some(&context))?;
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let exchange_inputs = decode_exchange_contracts(root, root_path)?;
     let runtime_filters = decode_runtime_filter_contract(fragment)?;
-    let program = FragmentProgram::new(
+    let program = crate::exec::fragment::program::FragmentProgramBuilder::new(
         plan,
         sink_spec,
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-        scan_sources,
-        exchange_inputs,
-        runtime_filters,
-    );
+    )
+    .scan_sources(scan_sources)
+    .exchange_inputs(exchange_inputs)
+    .runtime_filters(runtime_filters)
+    .finish()?;
     let metadata = NativeSubmissionMetadata::new(
         instance_parts.backend_num.get(),
         instance_parts.typed_result_sink,
@@ -339,7 +337,10 @@ where
         scan_assignments,
         instance_parts.exchange_inputs,
         sink_assignment,
-        FragmentRuntimeOptions::new(instance_parts.query_options, instance_parts.typed_result_sink),
+        FragmentRuntimeOptions::new(
+            instance_parts.query_options,
+            instance_parts.typed_result_sink,
+        ),
         instance_parts.pipeline_dop,
         instance_parts.backend_num,
     );

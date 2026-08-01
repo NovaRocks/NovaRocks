@@ -55,9 +55,9 @@ use novarocks::novarocks_logging::{debug, warn};
 use novarocks::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot, IcebergTableLocationMap,
 };
-use novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime;
 use novarocks::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
+use novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
     ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,

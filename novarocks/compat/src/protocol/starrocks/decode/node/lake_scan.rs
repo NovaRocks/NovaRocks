@@ -16,6 +16,7 @@
 // under the License.
 use std::collections::HashMap;
 
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::parse_min_max_conjuncts;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
@@ -24,7 +25,6 @@ use crate::protocol::starrocks::decode::layout::{
 };
 use crate::protocol::starrocks::decode::node::decode::build_scan_query_global_dicts;
 use crate::protocol::starrocks::decode::node::{Lowered, QueryGlobalDictMap, ScanRangeCarrier};
-use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::connector::starrocks::STARROCKS_WIRE_INTERNAL_CATALOG_NAME;
@@ -45,9 +45,9 @@ use novarocks::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange,
 };
 use novarocks::novarocks_logging::debug;
+use novarocks::protocol::FieldPath;
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::ScanRange;
-use novarocks::protocol::FieldPath;
 use novarocks_types::QueryId;
 
 /// Reject the retired Lake late-materialization request before lowerers build

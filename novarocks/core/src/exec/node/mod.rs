@@ -37,6 +37,7 @@ pub mod values;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
+use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::aggregate::AggregateNode;
 use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::AssertNumRowsNode;
@@ -91,6 +92,54 @@ pub struct ExecNode {
 
 #[derive(Clone, Debug)]
 pub struct ExecPlan {
-    pub arena: ExprArena,
-    pub root: ExecNode,
+    pub(crate) arena: ExprArena,
+    pub(crate) root: ExecNode,
+}
+
+impl ExecPlan {
+    pub const fn arena(&self) -> &ExprArena {
+        &self.arena
+    }
+
+    pub const fn root(&self) -> &ExecNode {
+        &self.root
+    }
+
+    pub fn arena_mut(&mut self) -> &mut ExprArena {
+        &mut self.arena
+    }
+
+    pub fn root_mut(&mut self) -> &mut ExecNode {
+        &mut self.root
+    }
+}
+
+/// The only public construction path for an executable plan.
+#[derive(Debug)]
+pub struct ExecPlanBuilder {
+    arena: ExprArena,
+    root: ExecNode,
+}
+
+impl ExecPlanBuilder {
+    pub fn new(arena: ExprArena, root: ExecNode) -> Self {
+        Self { arena, root }
+    }
+
+    pub fn finish(self) -> Result<ExecPlan, ExecPlanBuildError> {
+        let node_id = match &self.root.kind {
+            ExecNodeKind::Scan(node) => node.node_id().unwrap_or(-1),
+            _ => 0,
+        };
+        if node_id < 0 {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Node,
+                "root scan node requires a non-negative node id",
+            ));
+        }
+        Ok(ExecPlan {
+            arena: self.arena,
+            root: self.root,
+        })
+    }
 }

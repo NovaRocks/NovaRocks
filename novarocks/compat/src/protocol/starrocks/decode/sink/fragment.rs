@@ -28,16 +28,14 @@ use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::fragment::program::FragmentSinkSpec;
 use novarocks::exec::fragment::sink::{
-    DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
-    MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
+    DataStreamSinkBranchProgram, DataStreamSinkFactoryInput, DataStreamSinkProgram,
+    FragmentSinkProgram, MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     build_change_stream_split_predicate,
 };
 use novarocks::exec::node::ExecPlan;
-use novarocks::exec::operators::DataStreamSinkFactoryInput;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::FragmentDestination;
-use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
-use novarocks::runtime::fragment::io::{ResultPresentation, ResultProjection};
+use novarocks::runtime::fragment::{FragmentSinkAssignment, ResultPresentation, ResultProjection};
 use novarocks_types::PrimitiveType;
 
 fn runtime_destination_from_thrift(

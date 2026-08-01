@@ -32,7 +32,7 @@ use crate::common::ids::SlotId;
 use crate::common::types::{UniqueId, format_uuid};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::fragment::sink::DataStreamPartitionType;
+use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::fragment::io::exchange::{ExchangeFrame, ExchangeFrameTransmitter};
@@ -1015,83 +1015,6 @@ mod data_stream_sink_hash_partition {
 
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
-
-#[derive(Clone)]
-pub struct DataStreamSinkFactoryInput {
-    pub dest_node_id: i32,
-    pub output_exprs: Vec<ExprId>,
-    pub output_partition_type: DataStreamPartitionType,
-    pub output_partition_exprs: Vec<ExprId>,
-    pub output_columns: Vec<SlotId>,
-    pub destinations: Vec<FragmentDestination>,
-}
-
-impl DataStreamSinkFactoryInput {
-    pub fn try_from_static_program(
-        dest_node_id: i32,
-        output_partition_type: DataStreamPartitionType,
-        output_exprs: Vec<ExprId>,
-        mut output_partition_exprs: Vec<ExprId>,
-        output_columns: Vec<SlotId>,
-        destinations: Vec<FragmentDestination>,
-    ) -> Result<Self, String> {
-        if !output_exprs.is_empty() {
-            return Err("DATA_STREAM_SINK output_exprs are not supported".to_string());
-        }
-        let mut seen = std::collections::HashSet::new();
-        if let Some(slot_id) = output_columns
-            .iter()
-            .find(|slot_id| !seen.insert(**slot_id))
-        {
-            return Err(format!(
-                "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
-            ));
-        }
-        if !output_partition_type.requires_exprs() {
-            output_partition_exprs.clear();
-        }
-        Ok(Self {
-            dest_node_id,
-            output_exprs,
-            output_partition_type,
-            output_partition_exprs,
-            output_columns,
-            destinations,
-        })
-    }
-
-    pub fn try_new(
-        dest_node_id: i32,
-        output_partition_type: DataStreamPartitionType,
-        output_exprs: Vec<ExprId>,
-        output_partition_exprs: Vec<ExprId>,
-        output_columns: Vec<i32>,
-        destinations: Vec<FragmentDestination>,
-    ) -> Result<Self, String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut parsed_output_columns = Vec::with_capacity(output_columns.len());
-        for raw in output_columns {
-            let slot_id = SlotId::try_from(raw).map_err(|err| {
-                format!("DATA_STREAM_SINK: invalid output_columns slot id: {err}")
-            })?;
-            if !seen.insert(slot_id) {
-                return Err(format!(
-                    "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
-                ));
-            }
-            parsed_output_columns.push(slot_id);
-        }
-
-        Self::try_from_static_program(
-            dest_node_id,
-            output_partition_type,
-            output_exprs,
-            output_partition_exprs,
-            parsed_output_columns,
-            destinations,
-        )
-    }
-}
 
 /// Factory for distributed stream sinks that serialize and transmit chunks to remote fragment instances.
 pub(crate) struct DataStreamSinkFactory {

@@ -32,7 +32,7 @@ use novarocks::exec::fragment::sink::{
 };
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
+use novarocks::runtime::fragment::FragmentSinkAssignment;
 use novarocks::runtime::query_options::query_expire_durations;
 use novarocks_protocol::novarocks as native_proto;
 use novarocks_protocol::{common, expr, plan};
@@ -967,7 +967,7 @@ fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, St
 #[cfg(test)]
 mod tests {
     use super::decode_fragment_sink_assignment;
-    use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
+    use novarocks::runtime::fragment::FragmentSinkAssignment;
     use novarocks_protocol::{novarocks as proto, plan};
 
     #[test]

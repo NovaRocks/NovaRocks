@@ -56,7 +56,6 @@ fn per_submission_iceberg_table_locations_are_isolated() {
 fn fragment_execution_leaf_fields_are_protocol_neutral() {
     use novarocks::connector::starrocks::scan::LakeScanSchemaMeta;
     use novarocks::exec::node::fetch::FetchNode;
-    use novarocks::exec::pipeline::fragment_context::FragmentContext;
     use novarocks::runtime::descriptor_snapshot::LookupNodesInfo;
     use novarocks::runtime::endpoint::RuntimeEndpoint;
 
@@ -64,16 +63,11 @@ fn fragment_execution_leaf_fields_are_protocol_neutral() {
         fetch.nodes_info.as_ref()
     }
 
-    fn fragment_fe_addr(fragment: &FragmentContext) -> Option<&RuntimeEndpoint> {
-        fragment.fe_addr()
-    }
-
     fn lake_schema_fe_addr(meta: &LakeScanSchemaMeta) -> Option<&RuntimeEndpoint> {
         meta.fe_addr.as_ref()
     }
 
     let _ = fetch_nodes_info;
-    let _ = fragment_fe_addr;
     let _ = lake_schema_fe_addr;
 }
 
