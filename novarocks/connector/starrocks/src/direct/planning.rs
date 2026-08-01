@@ -136,7 +136,7 @@ impl StarRocksDirectTabletDescriptor {
         if tablet_id <= 0
             || partition_id <= 0
             || tablet_version <= 0
-            || metadata_relative_path.is_empty()
+            || !is_safe_metadata_relative_path(&metadata_relative_path)
             || metadata_relative_path.len() > MAX_DIRECT_TEXT_LEN
             || columns.is_empty()
             || columns.len() > MAX_DIRECT_COLUMNS
@@ -154,6 +154,15 @@ impl StarRocksDirectTabletDescriptor {
             estimated_bytes,
         })
     }
+}
+
+fn is_safe_metadata_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// Location facts resolved from StarOS before a split is emitted.
@@ -518,5 +527,28 @@ mod tests {
             ConnectorErrorKind::Unsupported
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn direct_metadata_path_cannot_escape_the_frozen_tablet_root() {
+        for path in ["/meta/1", "meta/../1", "meta//1", "meta\\1"] {
+            assert_eq!(
+                StarRocksDirectTabletDescriptor::try_new(
+                    1,
+                    1,
+                    1,
+                    StarRocksDirectMetadataLayout::Standalone,
+                    path,
+                    vec![
+                        StarRocksDirectColumnBinding::try_new(0, 1, "id", "BIGINT", false, None,)
+                            .unwrap()
+                    ],
+                    None,
+                )
+                .unwrap_err()
+                .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
     }
 }
