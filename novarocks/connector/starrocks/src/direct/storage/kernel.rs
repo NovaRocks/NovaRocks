@@ -103,9 +103,14 @@ fn default_array(
     data_type: &DataType,
     rows: usize,
 ) -> Result<ArrayRef, ConnectorError> {
-    let default = binding.default_value.as_deref().ok_or_else(|| {
-        corrupt("StarRocks historical segment omits a frozen column without a default")
-    })?;
+    let Some(default) = binding.default_value.as_deref() else {
+        if binding.nullable {
+            return Ok(arrow::array::new_null_array(data_type, rows));
+        }
+        return Err(corrupt(
+            "StarRocks historical segment omits a frozen non-nullable column without a default",
+        ));
+    };
     let text = std::str::from_utf8(default)
         .map_err(|_| corrupt("StarRocks column default is not UTF-8"))?
         .trim();
@@ -794,6 +799,21 @@ mod tests {
         .unwrap();
         assert_eq!(
             default_array(&nullable, &DataType::Utf8, 2)
+                .unwrap()
+                .null_count(),
+            2
+        );
+        let nullable_without_default = StarRocksDirectColumnBinding::try_new(
+            1,
+            4,
+            "nullable_without_default",
+            "VARCHAR",
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            default_array(&nullable_without_default, &DataType::Utf8, 2)
                 .unwrap()
                 .null_count(),
             2

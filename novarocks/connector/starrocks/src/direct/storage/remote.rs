@@ -317,9 +317,9 @@ fn validate_metadata(
             "StarRocks direct delete-vector reader is not implemented",
         ));
     }
-    validate_schema(split, &metadata.schema)?;
+    validate_current_schema(split, &metadata.schema)?;
     for schema in metadata.historical_schemas.values() {
-        validate_schema(split, schema)?;
+        validate_historical_schema(split.columns(), schema)?;
     }
     if metadata
         .rowset_to_schema
@@ -333,25 +333,45 @@ fn validate_metadata(
     Ok(())
 }
 
-fn validate_schema(
+fn validate_current_schema(
     split: &StarRocksDirectSplit,
     schema: &StorageSchema,
+) -> Result<(), ConnectorError> {
+    validate_schema_columns(split.columns(), schema, false)
+}
+
+fn validate_historical_schema(
+    bindings: &[crate::direct::StarRocksDirectColumnBinding],
+    schema: &StorageSchema,
+) -> Result<(), ConnectorError> {
+    validate_schema_columns(bindings, schema, true)
+}
+
+fn validate_schema_columns(
+    bindings: &[crate::direct::StarRocksDirectColumnBinding],
+    schema: &StorageSchema,
+    historical: bool,
 ) -> Result<(), ConnectorError> {
     let columns = schema
         .columns
         .iter()
         .map(|column| (column.unique_id, column))
         .collect::<BTreeMap<_, _>>();
-    for binding in split.columns() {
-        let column = columns
-            .get(&binding.unique_id)
-            .ok_or_else(|| corrupt("StarRocks storage schema omits a frozen direct column"))?;
+    for binding in bindings {
+        let Some(column) = columns.get(&binding.unique_id) else {
+            if historical && (binding.nullable || binding.default_value.is_some()) {
+                continue;
+            }
+            return Err(corrupt(
+                "StarRocks storage schema omits a required frozen direct column",
+            ));
+        };
         if column.name != binding.name.as_ref()
             || !column
                 .physical_type
                 .eq_ignore_ascii_case(binding.physical_type.as_ref())
             || column.nullable != binding.nullable
-            || column.default_value.as_deref() != binding.default_value.as_deref()
+            || (!historical && column.default_value.as_deref() != binding.default_value.as_deref())
         {
             return Err(corrupt(
                 "StarRocks storage schema differs from frozen direct mapping",
@@ -451,4 +471,82 @@ fn corrupt(message: impl Into<String>) -> ConnectorError {
 
 fn unsupported(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unsupported, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::direct::StarRocksDirectColumnBinding;
+    use crate::direct::storage::wire::StorageColumn;
+
+    fn schema(columns: Vec<StorageColumn>) -> StorageSchema {
+        StorageSchema {
+            id: None,
+            model: StorageModel::Duplicate,
+            columns,
+        }
+    }
+
+    fn column(unique_id: i32) -> StorageColumn {
+        StorageColumn {
+            unique_id,
+            name: format!("column_{unique_id}"),
+            physical_type: "INT".to_string(),
+            is_key: false,
+            aggregation: None,
+            nullable: false,
+            default_value: None,
+            precision: None,
+            scale: None,
+            length: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn historical_schema_permits_frozen_default_or_nullable_missing_columns() {
+        let defaulted = StarRocksDirectColumnBinding::try_new(
+            0,
+            2,
+            "added",
+            "INT",
+            false,
+            Some(Bytes::from_static(b"7")),
+        )
+        .unwrap();
+        let nullable =
+            StarRocksDirectColumnBinding::try_new(1, 3, "optional", "INT", true, None).unwrap();
+        let old_schema = schema(vec![column(1)]);
+
+        validate_historical_schema(&[defaulted, nullable], &old_schema).unwrap();
+    }
+
+    #[test]
+    fn historical_schema_rejects_required_missing_column_without_default() {
+        let required =
+            StarRocksDirectColumnBinding::try_new(0, 2, "missing", "INT", false, None).unwrap();
+        assert_eq!(
+            validate_historical_schema(&[required], &schema(vec![column(1)]))
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn historical_schema_uses_physical_column_facts_but_not_current_default() {
+        let binding = StarRocksDirectColumnBinding::try_new(
+            0,
+            1,
+            "column_1",
+            "INT",
+            false,
+            Some(Bytes::from_static(b"new_default")),
+        )
+        .unwrap();
+        let mut previous = column(1);
+        previous.default_value = Some(b"old_default".to_vec());
+
+        validate_historical_schema(&[binding], &schema(vec![previous])).unwrap();
+    }
 }
