@@ -10,13 +10,17 @@ use novarocks::mv::dependency::model::{
 use novarocks::mv::persistence::dependency::CreateMvDependencyRequest;
 use novarocks::mv::persistence::partition::ReplaceMvPartitionStatesRequest;
 use novarocks::mv::persistence::refresh::{
-    MvRefreshFinalizeRequest, MvRefreshState, RecordPublishCommitRequest,
+    FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
+    FrontendMvRefreshCommittedVersion, FrontendMvRefreshLedger, MvRefreshFinalizeRequest,
+    MvRefreshLifecycleOwner, MvRefreshState, RecordPublishCommitRequest,
     RecordStagingCommitRequest,
 };
 use novarocks::mv::repository::{
     FinalizeMvRefreshWithPartitionsRequest, MvRepository, MvRepositoryErrorKind,
 };
-use novarocks_frontend::mv::repository::StateStoreMvRepository;
+use novarocks_frontend::mv::repository::{
+    BeginFrontendMvRefreshIntentRequest, StateStoreMvRepository,
+};
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
@@ -121,6 +125,180 @@ fn upstream(name: &str) -> MvDependencyObjectRef {
         object_type: MvDependencyObjectType::Table,
         storage_engine: MvDependencyStorageEngine::Iceberg,
     }
+}
+
+fn frontend_ledger() -> FrontendMvRefreshLedger {
+    FrontendMvRefreshLedger {
+        request_id: uuid::Uuid::now_v7().into_bytes().to_vec(),
+        provider_id: "iceberg".to_string(),
+        instance_id: "rest".to_string(),
+        incarnation: uuid::Uuid::now_v7().into_bytes().to_vec(),
+        expected_target_version: None,
+        staging_create_operation_id: uuid::Uuid::now_v7().into_bytes().to_vec(),
+        write_operation_id: uuid::Uuid::now_v7().into_bytes().to_vec(),
+        publication_operation_id: uuid::Uuid::now_v7().into_bytes().to_vec(),
+        staging_drop_operation_id: uuid::Uuid::now_v7().into_bytes().to_vec(),
+        cohort_ids: vec!["primary".to_string()],
+        actions: Vec::new(),
+        cleanup_pending: false,
+    }
+}
+
+fn frontend_action(
+    phase: FrontendMvRefreshActionPhase,
+    state: FrontendMvRefreshActionState,
+    operation_id: Vec<u8>,
+    committed_version: Option<FrontendMvRefreshCommittedVersion>,
+) -> FrontendMvRefreshAction {
+    FrontendMvRefreshAction {
+        phase,
+        state,
+        operation_id,
+        receipt: None,
+        committed_version,
+        external_evidence: None,
+        provider_finalized: false,
+    }
+}
+
+#[test]
+fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
+    let (_temp, _runtime, _host, repository) = repository();
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_frontend_v3"),
+        )
+        .expect("create definition");
+    let ledger = frontend_ledger();
+    let refresh = repository
+        .begin_frontend_refresh_intent(BeginFrontendMvRefreshIntentRequest {
+            mv_id: definition.mv_id,
+            target_catalog: "ice".to_string(),
+            target_namespace: "sales".to_string(),
+            target_table: "daily_frontend_v3".to_string(),
+            staging_branch: "__nova_mv_1".to_string(),
+            expected_main_snapshot_id: Some(7),
+            base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
+            marker_token: "marker".to_string(),
+            ledger: ledger.clone(),
+        })
+        .expect("persist frontend intent");
+    assert_eq!(
+        refresh.operation_id, None,
+        "v3 must not create legacy operation rows"
+    );
+    assert_eq!(
+        refresh.lifecycle_owner,
+        MvRefreshLifecycleOwner::FrontendCurrent
+    );
+    assert_eq!(
+        refresh
+            .frontend_ledger
+            .as_ref()
+            .expect("v3 ledger")
+            .actions
+            .len(),
+        4
+    );
+    assert!(
+        repository
+            .list_unfinished_refreshes()
+            .expect("legacy unfinished scan")
+            .is_empty(),
+        "legacy recovery must not claim a frontend-owned attempt"
+    );
+    assert!(
+        repository
+            .list_unfinished_branch_staged_iceberg_refreshes()
+            .expect("legacy staged scan")
+            .is_empty(),
+        "legacy staged recovery must not claim a frontend-owned attempt"
+    );
+
+    let publication_before_write = frontend_action(
+        FrontendMvRefreshActionPhase::Publication,
+        FrontendMvRefreshActionState::KnownCommitted,
+        ledger.publication_operation_id.clone(),
+        None,
+    );
+    assert!(
+        repository
+            .record_frontend_refresh_action(refresh.refresh_id, publication_before_write)
+            .is_err()
+    );
+
+    let staging = frontend_action(
+        FrontendMvRefreshActionPhase::StagingCreate,
+        FrontendMvRefreshActionState::KnownCommitted,
+        ledger.staging_create_operation_id.clone(),
+        None,
+    );
+    repository
+        .record_frontend_refresh_action(refresh.refresh_id, staging.clone())
+        .expect("record staging create");
+    repository
+        .record_frontend_refresh_action(refresh.refresh_id, staging)
+        .expect("idempotent staging create");
+
+    let write_version =
+        FrontendMvRefreshCommittedVersion::try_new(b"write-version".to_vec(), Some(10))
+            .expect("committed version");
+    repository
+        .record_frontend_refresh_action(
+            refresh.refresh_id,
+            frontend_action(
+                FrontendMvRefreshActionPhase::Write,
+                FrontendMvRefreshActionState::KnownCommitted,
+                ledger.write_operation_id.clone(),
+                Some(write_version),
+            ),
+        )
+        .expect("record write");
+    repository
+        .record_frontend_refresh_action(
+            refresh.refresh_id,
+            frontend_action(
+                FrontendMvRefreshActionPhase::Publication,
+                FrontendMvRefreshActionState::KnownCommitted,
+                ledger.publication_operation_id.clone(),
+                None,
+            ),
+        )
+        .expect("record guarded publication");
+    let published = repository
+        .load_refresh(refresh.refresh_id)
+        .expect("load published refresh")
+        .expect("published refresh exists");
+    assert_eq!(published.state, MvRefreshState::PublishCommitted);
+    assert!(
+        published
+            .frontend_ledger
+            .as_ref()
+            .expect("v3 ledger")
+            .cleanup_pending
+    );
+
+    repository
+        .record_frontend_refresh_action(
+            refresh.refresh_id,
+            frontend_action(
+                FrontendMvRefreshActionPhase::StagingDrop,
+                FrontendMvRefreshActionState::KnownCommitted,
+                ledger.staging_drop_operation_id.clone(),
+                None,
+            ),
+        )
+        .expect("record cleanup");
+    assert!(
+        !repository
+            .load_refresh(refresh.refresh_id)
+            .expect("load cleaned refresh")
+            .expect("cleaned refresh exists")
+            .frontend_ledger
+            .expect("v3 ledger")
+            .cleanup_pending
+    );
 }
 
 #[test]
