@@ -154,7 +154,7 @@ pub(crate) trait SqlFunctionCatalog: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SqlStatementInput {
     Sql(String),
-    RewriteCompleteSql(String),
+    ParsedQuery(Box<sqlparser::ast::Query>),
 }
 
 /// The compiler result shape required by the caller.
@@ -495,7 +495,8 @@ impl SqlCompiler {
 
 fn parse_query(statement: &SqlStatementInput) -> Result<sqlparser::ast::Query, SqlCompileError> {
     let sql = match statement {
-        SqlStatementInput::Sql(sql) | SqlStatementInput::RewriteCompleteSql(sql) => sql,
+        SqlStatementInput::Sql(sql) => sql,
+        SqlStatementInput::ParsedQuery(query) => return Ok((**query).clone()),
     };
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
         .map_err(SqlCompileError::Compilation)?;
@@ -731,6 +732,21 @@ mod tests {
             SqlCompiler::compile(request),
             Ok(SqlCompileOutput::Distributed(_))
         ));
+    }
+
+    #[test]
+    fn parsed_query_input_preserves_complex_types_and_escapes_without_sql_round_trip() {
+        let statement =
+            crate::sql::parser::parse_sql_raw(r"SELECT CAST('{}' AS MAP<STRING, INT>), 'e\\f'")
+                .expect("query fixture must parse");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query fixture");
+        };
+
+        assert_eq!(
+            parse_query(&SqlStatementInput::ParsedQuery(query.clone())),
+            Ok(*query)
+        );
     }
 
     #[test]

@@ -1438,11 +1438,8 @@ impl StandaloneSession {
                     &self.inner,
                     &connector_context,
                     request_context.execution(),
-                    if force_logical_explain {
-                        crate::sql::explain::ExplainLevel::Normal
-                    } else {
-                        level
-                    },
+                    level,
+                    force_logical_explain,
                 )?;
                 Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
                     result: StatementResult::Query(result),
@@ -1943,11 +1940,6 @@ impl StandaloneSession {
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
-                let level = if force_logical_explain {
-                    crate::sql::explain::ExplainLevel::Normal
-                } else {
-                    level
-                };
                 let result = explain_query_with_sql_compiler_kernel(
                     &prepared,
                     &analyzer_provider,
@@ -1957,6 +1949,7 @@ impl StandaloneSession {
                     &connector_context,
                     request_context.execution(),
                     level,
+                    force_logical_explain,
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -4278,7 +4271,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
             "Iceberg write requires a non-empty admitted backend topology".to_string()
         })?;
     let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::RewriteCompleteSql(prepared.to_string()),
+        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared)),
         crate::sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         crate::sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
@@ -4834,7 +4827,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let statistics = query_stats::QueryStatisticsContext::unavailable();
     let request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::RewriteCompleteSql(query.to_string()),
+        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
         crate::sql::compiler::SqlCompileIntent::ChangeStreamWrite,
         crate::sql::compiler::SqlSessionContext {
             current_catalog: None,
@@ -4997,7 +4990,7 @@ fn prepare_query_with_sql_compiler_kernel(
         _ => crate::query_execution::contract::DistributedQueryIntent::Result,
     };
     let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::RewriteCompleteSql(query.to_string()),
+        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
         intent,
         crate::sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
@@ -5076,6 +5069,7 @@ fn explain_query_with_sql_compiler_kernel(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     level: crate::sql::explain::ExplainLevel,
+    logical: bool,
 ) -> Result<QueryResult, String> {
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
@@ -5090,13 +5084,18 @@ fn explain_query_with_sql_compiler_kernel(
     );
     let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let mv_definitions = crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?;
+    let intent = if logical {
+        crate::sql::compiler::SqlCompileIntent::LogicalOnly
+    } else {
+        crate::sql::compiler::SqlCompileIntent::Explain {
+            level,
+            analyze: false,
+        }
+    };
     let planning_inputs = crate::sql::compiler::QueryPlanningInputs {
         compile_request: crate::sql::compiler::SqlCompileRequest::new(
-            crate::sql::compiler::SqlStatementInput::RewriteCompleteSql(query.to_string()),
-            crate::sql::compiler::SqlCompileIntent::Explain {
-                level,
-                analyze: false,
-            },
+            crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
+            intent,
             crate::sql::compiler::SqlSessionContext {
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
@@ -5118,11 +5117,14 @@ fn explain_query_with_sql_compiler_kernel(
             connector_context,
         },
     };
-    let crate::sql::compiler::SqlCompileOutput::ImmediateExplain(lines) =
-        crate::sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
-            .map_err(|error| error.to_string())?
-    else {
-        return Err("EXPLAIN intent did not produce immediate SQL facts".to_string());
+    let compiled = crate::sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
+        .map_err(|error| error.to_string())?;
+    let lines = match compiled {
+        crate::sql::compiler::SqlCompileOutput::Logical(compiled) if logical => {
+            crate::sql::explain::explain_plan_checked(&compiled.logical_plan, level)?
+        }
+        crate::sql::compiler::SqlCompileOutput::ImmediateExplain(lines) if !logical => lines,
+        _ => return Err("EXPLAIN intent produced unexpected SQL facts".to_string()),
     };
     build_string_query_result("Explain String", lines)
 }
