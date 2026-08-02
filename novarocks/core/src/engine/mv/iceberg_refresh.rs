@@ -273,12 +273,22 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                 )?],
                 incremental_writes: Vec::new(),
             },
-            ExecutableRefreshDecision::Incremental => {
-                return Err(
-                    "MV refresh data-producing SQL preparation is not yet extracted for this shape"
-                        .to_string(),
-                );
-            }
+            ExecutableRefreshDecision::Incremental => match prepare_frontend_incremental_write(
+                self.state,
+                self.current_catalog,
+                self.current_database,
+                &plan.contract,
+                &request.attempt,
+                observed_binding.clone(),
+                self.connector_context.clone(),
+            )? {
+                Some(incremental) => PreparedMvRefreshWork::DataProducing {
+                    distributed_writes: Vec::new(),
+                    first_refresh_writes: Vec::new(),
+                    incremental_writes: vec![incremental],
+                },
+                None => PreparedMvRefreshWork::MetadataOnly,
+            },
         };
         Ok(PreparedMvRefresh {
             statement: request.statement,
@@ -571,6 +581,247 @@ fn prepare_frontend_first_refresh_write(
         request,
         physical_sql,
     )
+}
+
+/// Prepare the value-only non-join incremental handoff.  This is deliberately
+/// limited to change-stream shapes that already have one generic native
+/// writer contract.  Join branches and policy-driven full rebuilds retain
+/// their explicit preparation boundary until their distinct physical artifacts
+/// are extracted; treating either as an append would be incorrect.
+#[allow(clippy::too_many_arguments)]
+fn prepare_frontend_incremental_write(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    contract: &RefreshPlanContract,
+    attempt: &crate::sql::mv_refresh::MvRefreshAttemptIdentity,
+    observed_binding: ConnectorExecutionBindingKey,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Option<crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite>, String> {
+    let target = IcebergMvTarget {
+        catalog: contract.target.catalog.clone().ok_or_else(|| {
+            "Iceberg MV incremental refresh target has no connector catalog".to_string()
+        })?,
+        namespace: contract.target.database.clone(),
+        table: contract.target.name.clone(),
+    };
+    let definition = load_iceberg_mv_definition_by_target(state, &target)?;
+    let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
+        "Iceberg MV incremental refresh requires a persisted schema contract".to_string()
+    })?;
+    if schema_contract.join.is_some() {
+        return Err(
+            "MV refresh SQL preparation has not yet extracted the join incremental artifact"
+                .to_string(),
+        );
+    }
+    let is_aggregate = schema_contract.aggregate.is_some();
+    let is_branch_union = schema_contract.branch.is_some();
+    let RefreshStateBaseline::SnapshotBacked {
+        previous_snapshot_ids,
+        previous_table_uuids,
+        target_snapshot_id,
+        target_table_uuid,
+        definition_fingerprint,
+    } = &contract.state_baseline
+    else {
+        return Err(
+            "MV incremental refresh requires a snapshot-backed target baseline".to_string(),
+        );
+    };
+    let pin = RefreshSnapshotPin::from_captured_entries(
+        contract
+            .base_refs
+            .iter()
+            .map(|base| {
+                let snapshot_id = contract
+                    .snapshot_pins
+                    .get(&base.fqn())
+                    .and_then(|snapshot| *snapshot)
+                    .ok_or_else(|| {
+                        format!(
+                            "MV incremental refresh has no pinned snapshot for {}",
+                            base.fqn()
+                        )
+                    })?;
+                let loaded = load_current_iceberg_base_table(state, base)?;
+                Ok::<_, String>((
+                    base.clone(),
+                    snapshot_id,
+                    loaded.table.metadata().uuid().to_string(),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
+    if target_loaded.table.metadata().uuid().to_string() != *target_table_uuid {
+        return Err("MV incremental refresh target UUID drifted after planning".to_string());
+    }
+    let actual_target_snapshot_id = target_loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id());
+    if actual_target_snapshot_id != *target_snapshot_id {
+        return Err("MV incremental refresh target snapshot drifted after planning".to_string());
+    }
+    let canonical_query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
+    let target_identity = TableIdentity {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+    };
+    let catalogs = state.iceberg_catalogs.read().map_err(|error| {
+        format!("read Iceberg catalog registry for incremental preparation: {error}")
+    })?;
+    let context = IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
+        target_identity,
+        definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(definition),
+        Arc::new(canonical_query),
+        Arc::from(contract.base_refs.clone()),
+        Arc::new(pin),
+        previous_snapshot_ids.clone(),
+        previous_table_uuids.clone(),
+        *target_snapshot_id,
+        target_table_uuid.clone(),
+        &catalogs,
+        Arc::new(target_entry),
+        iceberg_catalog,
+        target_loaded.table,
+        contract.affected_partitions.clone(),
+        state.mv_refresh_pruning_limits,
+    )?;
+    drop(catalogs);
+
+    let loaded_bases = context
+        .rewrite
+        .base_refs
+        .iter()
+        .map(|base| {
+            let previous_snapshot_id = context
+                .rewrite
+                .previous_snapshot_ids
+                .get(&base.fqn())
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "MV incremental refresh is missing previous snapshot for {}",
+                        base.fqn()
+                    )
+                })?;
+            let current_snapshot_id = context.rewrite.pin.get(base).ok_or_else(|| {
+                format!(
+                    "MV incremental refresh is missing pinned snapshot for {}",
+                    base.fqn()
+                )
+            })?;
+            let current_table_uuid = context.rewrite.pin.uuid(base).ok_or_else(|| {
+                format!(
+                    "MV incremental refresh is missing pinned UUID for {}",
+                    base.fqn()
+                )
+            })?;
+            let loaded = load_current_iceberg_base_table(state, base)?;
+            if loaded.table.metadata().uuid().to_string() != current_table_uuid {
+                return Err(format!(
+                    "MV incremental refresh base table identity changed after planning for {}",
+                    base.fqn()
+                ));
+            }
+            Ok::<_, String>((
+                base,
+                previous_snapshot_id,
+                current_snapshot_id,
+                current_table_uuid.to_string(),
+                loaded,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let changes = loaded_bases
+        .iter()
+        .map(
+            |(base_ref, previous_snapshot_id, current_snapshot_id, current_table_uuid, loaded)| {
+                NonJoinBaseChange {
+                    base_ref,
+                    previous_snapshot_id: *previous_snapshot_id,
+                    current_snapshot_id: *current_snapshot_id,
+                    base_table: &loaded.table,
+                    current_table_uuid,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    let (mode, evidence) = match plan_non_join_incremental_changes(&changes)? {
+        NonJoinIncrementalChangePlan::MetadataOnly(_) => return Ok(None),
+        NonJoinIncrementalChangePlan::FullRebuild { reason, .. } => {
+            return Err(format!(
+                "MV refresh SQL preparation has not yet extracted the full-rebuild staging artifact: {reason}"
+            ));
+        }
+        NonJoinIncrementalChangePlan::ChangeStream {
+            has_delete_changes, ..
+        } => {
+            let mode = if has_delete_changes {
+                crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::RowDelta
+            } else {
+                crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::FastAppend
+            };
+            let evidence = if is_aggregate {
+                if is_branch_union {
+                    crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::BranchUnionAggregate
+                } else {
+                    crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::Aggregate
+                }
+            } else {
+                crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::None
+            };
+            (mode, evidence)
+        }
+    };
+    let request = crate::sql::mv_refresh::incremental::MvIncrementalWriteRequest::try_new(
+        target.catalog,
+        target.namespace,
+        target.table,
+        attempt.staging_branch.clone(),
+        current_catalog.map(str::to_string),
+        current_database.to_string(),
+        *target_snapshot_id,
+        observed_binding,
+        attempt.write_operation_id,
+        connector_context,
+    )?;
+    let marker = MvRefreshSnapshotMarker {
+        refresh_id: attempt.refresh_id,
+        mv_id: context.rewrite.mv_definition.mv_id,
+        token: attempt.marker_token.clone(),
+    };
+    let provenance_properties = build_mv_refresh_provenance(
+        &marker,
+        RefreshTechnique::Incremental,
+        build_mv_refresh_provenance_bases(
+            &context.rewrite.pin.to_snapshot_map(),
+            &context.rewrite.pin.to_table_uuid_map(),
+            &context.rewrite.previous_snapshot_ids,
+        ),
+        definition_fingerprint.clone(),
+        0,
+    )
+    .to_summary_properties()?;
+    crate::sql::mv_refresh::incremental::MvIncrementalWritePreparer::prepare(
+        request,
+        crate::engine::mv_first_refresh_staging::frozen_logical_context(&context),
+        mode,
+        evidence,
+        provenance_properties,
+    )
+    .map(Some)
 }
 
 fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
