@@ -611,6 +611,33 @@ fn write_outcome_preserves_commit_or_abort() {
 }
 
 #[test]
+fn connector_staging_rejects_a_legacy_direct_commit_payload() {
+    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
+        .write(
+            crate::runtime::query_result::QueryResult::empty(),
+            Some(WriteCommitInput {
+                write_id: novarocks_types::UniqueId::new(43, 79),
+                writers: Vec::new(),
+            }),
+            None,
+        )
+        .expect("legacy write terminal remains valid outside connector staging");
+
+    let result = outcome
+        .into_write()
+        .expect("write outcome variant")
+        .into_connector_staging();
+    let Err(error) = result else {
+        panic!("connector staging must not consume a legacy direct commit");
+    };
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert_eq!(
+        error.message(),
+        "connector staging terminal returned a legacy direct commit payload"
+    );
+}
+
+#[test]
 fn profile_outcome_preserves_fragment_profiles() {
     let profile = crate::runtime::profile::Profiler::new("fragment-7").to_native_tree();
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)

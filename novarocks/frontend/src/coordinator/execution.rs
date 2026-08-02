@@ -973,9 +973,17 @@ impl FrontendDistributedQueryCoordinator {
                         ));
                     }
                 };
-                parts
-                    .completion
-                    .write_with_connector(result, commit, abort, connector_completion)
+                let direct_commit = if connector_completion.is_some() {
+                    None
+                } else {
+                    commit
+                };
+                parts.completion.write_with_connector(
+                    result,
+                    direct_commit,
+                    abort,
+                    connector_completion,
+                )
             }
             DistributedQueryIntent::Profile => {
                 let result = expected_output.into_query_result(batches)?;

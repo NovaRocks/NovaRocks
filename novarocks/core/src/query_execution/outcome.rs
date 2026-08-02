@@ -123,6 +123,12 @@ impl WriteExecutionOutcome {
                 "connector staging terminal returned an abort payload",
             ));
         }
+        if self.commit.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector staging terminal returned a legacy direct commit payload",
+            ));
+        }
         self.connector_completion.ok_or_else(|| {
             DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
@@ -417,10 +423,10 @@ impl QueryOutcomeFactory {
                 "Write outcome cannot contain both commit and abort payloads",
             ));
         }
-        if connector_completion.is_some() && commit.is_none() {
+        if connector_completion.is_some() && commit.is_some() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "connector write completion requires a write commit payload",
+                "connector write completion cannot expose a legacy direct commit payload",
             ));
         }
         Ok(DistributedQueryOutcome::Write(WriteExecutionOutcome {
