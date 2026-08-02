@@ -160,8 +160,8 @@ use crate::sql::analysis::ProjectItem;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::mv_refresh::{
-    MvRefreshFinalizeFacts, MvRefreshPreparationRequest, MvRefreshPreparationService,
-    PreparedMvRefresh, PreparedMvRefreshWork,
+    FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts, MvRefreshPreparationRequest,
+    MvRefreshPreparationService, PreparedMvRefresh, PreparedMvRefreshWork,
 };
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
@@ -172,12 +172,6 @@ use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorExecutionBindingKey, ConnectorInstanceId,
 };
-
-pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
-     its previous behavior (drop target + delete definition + recreate empty target) \
-     was misleading and non-atomic. To recover from a broken contract or corrupted \
-     target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
-     REFRESH MATERIALIZED VIEW <name>; manually.";
 
 /// SQL-owned bridge for refresh planning.  It owns only analysis and immutable
 /// facts; all durable intent, ref mutations, and writer execution are handed

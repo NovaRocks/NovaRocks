@@ -19,6 +19,12 @@ use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 pub mod first_refresh;
 pub mod incremental;
 
+pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
+     its previous behavior (drop target + delete definition + recreate empty target) \
+     was misleading and non-atomic. To recover from a broken contract or corrupted \
+     target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
+     REFRESH MATERIALIZED VIEW <name>; manually.";
+
 /// Typed SQL projection of `REFRESH MATERIALIZED VIEW`.
 ///
 /// It intentionally preserves `FULL`: the preparation service rejects that
@@ -42,7 +48,7 @@ impl From<&RefreshMaterializedViewStmt> for MvRefreshStatement {
 impl MvRefreshStatement {
     pub fn validate_supported(&self) -> Result<(), String> {
         if self.full {
-            return Err("REFRESH MATERIALIZED VIEW FULL is not supported".to_string());
+            return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string());
         }
         Ok(())
     }
@@ -152,7 +158,10 @@ mod tests {
 
     use crate::mv::model::MvTarget;
 
-    use super::{MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshStatement};
+    use super::{
+        FULL_REFRESH_DISABLED_MESSAGE, MvRefreshAttemptIdentity, MvRefreshPreparationRequest,
+        MvRefreshStatement,
+    };
 
     #[test]
     fn full_refresh_remains_an_explicitly_unsupported_request() {
@@ -163,7 +172,7 @@ mod tests {
         .validate_supported()
         .expect_err("FULL must not silently downgrade");
 
-        assert_eq!(error, "REFRESH MATERIALIZED VIEW FULL is not supported");
+        assert_eq!(error, FULL_REFRESH_DISABLED_MESSAGE);
     }
 
     #[test]
