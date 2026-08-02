@@ -44,6 +44,7 @@ mkdir -p "$output_dir"
 run_matrix_side() {
     local label="$1"
     local enabled="$2"
+    local rewrite_runtime_filter_bindings="${3:-false}"
     local log_path="$output_dir/rf-$label.log"
 
     {
@@ -51,6 +52,16 @@ run_matrix_side() {
         printf 'suite=%s\nonly=%s\n' "$suite" "$only"
         printf 'runtime_filter=%s\n' "$enabled"
         cd "$repo_root"
+        matrix_args=()
+        if [[ "$rewrite_runtime_filter_bindings" == "true" ]]; then
+            matrix_args+=(
+                --rewrite-explain-contains-as-not-contains "producer binding"
+                --rewrite-explain-contains-as-not-contains "consumer binding"
+                --rewrite-explain-contains-as-not-contains "expr = (t3.k)"
+                --rewrite-explain-contains-as-not-contains "expr = (t1.k)"
+                --rewrite-explain-contains-as-not-contains "expr = (t2.k)"
+            )
+        fi
         cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
             --config "$NOVAROCKS_SQL_TEST_CONFIG" \
             --suite "$suite" \
@@ -59,9 +70,12 @@ run_matrix_side() {
             -j 1 \
             --cluster-mode cross-process \
             --cluster-size 3 \
-            --target-session-sql "SET enable_global_runtime_filter = $enabled"
+            --target-session-sql "SET enable_global_runtime_filter = $enabled" \
+            "${matrix_args[@]}"
     } 2>&1 | tee "$log_path"
 }
 
 run_matrix_side on true
-run_matrix_side off false
+# RF-off retains every structural EXPLAIN assertion, but rewrites the RF-on
+# binding and transitive-consumer assertions so it proves they are absent.
+run_matrix_side off false true

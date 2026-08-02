@@ -294,6 +294,14 @@ struct Cli {
     #[arg(long = "target-session-sql", value_name = "SQL", action = ArgAction::Append)]
     target_session_sql: Vec<String>,
 
+    /// Treat matching @explain_contains values as @explain_not_contains values.
+    #[arg(
+        long = "rewrite-explain-contains-as-not-contains",
+        value_name = "SUBSTRING",
+        action = ArgAction::Append
+    )]
+    rewrite_explain_contains_as_not_contains: Vec<String>,
+
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
 
@@ -431,6 +439,7 @@ struct SuiteRunContext {
     preview_lines: usize,
     update_expected: bool,
     target_session_sql: Vec<String>,
+    rewrite_explain_contains_as_not_contains: Vec<String>,
     marker_re: Regex,
     fail_fast: bool,
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
@@ -920,6 +929,7 @@ fn run_explain_directive_checks(
     step: &SqlStep,
     session: &mut crate::session::MysqlSession,
     query_timeout: u64,
+    rewrite_contains_as_not_contains: &[String],
     log: &mut String,
 ) -> Result<(), String> {
     let body = explain_contains_target_body(&step.sql);
@@ -940,6 +950,15 @@ fn run_explain_directive_checks(
     }
     let explain_text = exec.map(|e| e.text_output).unwrap_or_default();
     for needle in &step.meta.explain_contains {
+        if rewrite_contains_as_not_contains.iter().any(|value| value == needle) {
+            if explain_text.contains(needle.as_str()) {
+                return Err(format!(
+                    "@explain_contains rewrite assertion failed.\\n  expected substring to be absent: {}\\n  EXPLAIN VERBOSE output:\\n{}",
+                    needle, explain_text
+                ));
+            }
+            continue;
+        }
         if !explain_text.contains(needle.as_str()) {
             return Err(format!(
                 "@explain_contains assertion failed.\n  expected substring: {}\n  EXPLAIN VERBOSE output:\n{}",
@@ -1752,13 +1771,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             }
                         }
                         // @explain_*: issue EXPLAIN VERBOSE and assert substrings.
-                        let explain_ok = if !step.meta.explain_contains.is_empty()
-                            || !step.meta.explain_not_contains.is_empty()
-                        {
+                        let explain_requested = !step.meta.explain_contains.is_empty()
+                            || !step.meta.explain_not_contains.is_empty();
+                        let explain_ok = if explain_requested {
                             match run_explain_directive_checks(
                                 step,
                                 &mut target_session,
                                 ctx.query_timeout,
+                                &ctx.rewrite_explain_contains_as_not_contains,
                                 &mut log,
                             ) {
                                 Ok(()) => true,
@@ -2025,6 +2045,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                     step,
                                     &mut target_session,
                                     ctx.query_timeout,
+                                    &ctx.rewrite_explain_contains_as_not_contains,
                                     &mut log,
                                 ) {
                                     Ok(()) => true,
@@ -3328,6 +3349,9 @@ fn run() -> Result<i32> {
                 preview_lines: cli.preview_lines,
                 update_expected: cli.update_expected,
                 target_session_sql: cli.target_session_sql.clone(),
+                rewrite_explain_contains_as_not_contains: cli
+                    .rewrite_explain_contains_as_not_contains
+                    .clone(),
                 marker_re: marker_re.clone(),
                 fail_fast: cli.fail_fast,
                 server_handle: Arc::clone(&server_handle),
@@ -3914,6 +3938,25 @@ mod tests {
         let cli = crate::Cli::parse_from(["sql-tests", "--suite", "ssb"]);
 
         assert!(cli.target_session_sql.is_empty());
+        assert!(cli.rewrite_explain_contains_as_not_contains.is_empty());
+    }
+
+    #[test]
+    fn rewrite_explain_contains_flag_preserves_requested_substrings() {
+        let cli = crate::Cli::parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--rewrite-explain-contains-as-not-contains",
+            "producer binding",
+            "--rewrite-explain-contains-as-not-contains",
+            "consumer binding",
+        ]);
+
+        assert_eq!(
+            cli.rewrite_explain_contains_as_not_contains,
+            ["producer binding", "consumer binding"]
+        );
     }
 
     #[test]
