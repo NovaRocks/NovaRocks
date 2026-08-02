@@ -625,10 +625,9 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
 ) -> Result<PreparedDistributedWriteRequest, String> {
-    let physical_sql = prepared.physical_sql().ok_or_else(|| {
-        "MV first-refresh typed logical artifact has no generic distributed binder".to_string()
-    })?;
-    let query = parse_query_from_sql(physical_sql)?;
+    let operation_id = prepared.operation_id();
+    let cohort_id = prepared.primary_cohort();
+    let expected_target_snapshot_id = prepared.expected_target_snapshot_id();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
     let connector_context = prepared.connector_context().clone();
@@ -639,21 +638,123 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
         std::collections::BTreeMap::new(),
         exact_lease,
     )?;
-    let distributed = crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
-        state,
-        current_catalog.as_deref(),
-        &current_database,
-        &query,
-        sink_spec,
-        None,
-        Some(root_distribution),
-        execution,
-        &connector_context,
-        template,
-    )?;
-    prepared
-        .bind_distributed(distributed)
-        .map(|bound| bound.into_distributed())
+    let distributed = match prepared.into_execution_artifact() {
+        MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
+            let query = parse_query_from_sql(physical_sql.sql())?;
+            crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
+                state,
+                current_catalog.as_deref(),
+                &current_database,
+                &query,
+                sink_spec,
+                None,
+                Some(root_distribution),
+                execution,
+                &connector_context,
+                template,
+            )?
+        }
+        MvFirstRefreshExecutionArtifact::Logical(logical) => {
+            let (logical_plan, factory, facts) = logical.into_parts();
+            let refresh_context = rebuild_frozen_join_refresh_context(
+                state,
+                current_catalog.as_deref(),
+                &current_database,
+                expected_target_snapshot_id,
+                &facts,
+            )?;
+            crate::engine::prepare_logical_plan_as_iceberg_write_with_connector_binding(
+                state,
+                logical_plan,
+                factory,
+                sink_spec,
+                root_distribution,
+                execution,
+                &connector_context,
+                &refresh_context,
+                template,
+            )?
+        }
+    };
+    if distributed.write_operation_id() != operation_id
+        || distributed.write_cohort_id() != cohort_id
+    {
+        return Err("MV first-refresh distributed artifact identity mismatch".to_string());
+    }
+    Ok(distributed)
+}
+
+fn rebuild_frozen_join_refresh_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    expected_target_snapshot_id: Option<i64>,
+    facts: &crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext,
+) -> Result<crate::mv::refresh::execution_context::IcebergMvRefreshContext, String> {
+    let target_identity =
+        novarocks_catalog::identifier::TableIdentity {
+            catalog: facts.mv_definition.target_catalog.clone().ok_or_else(|| {
+                "MV first-refresh logical artifact target has no connector catalog".to_string()
+            })?,
+            namespace: facts
+                .mv_definition
+                .target_namespace
+                .clone()
+                .ok_or_else(|| {
+                    "MV first-refresh logical artifact target has no namespace".to_string()
+                })?,
+            table: facts.mv_definition.target_table.clone().ok_or_else(|| {
+                "MV first-refresh logical artifact target has no table".to_string()
+            })?,
+        };
+    let entry = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("read Iceberg catalog registry for join activation: {error}"))?
+        .get(&target_identity.catalog)?;
+    entry.invalidate_table_cache(&target_identity.namespace, &target_identity.table);
+    let target_table = crate::connector::iceberg::catalog::load_table(
+        &entry,
+        &target_identity.namespace,
+        &target_identity.table,
+    )
+    .map_err(|error| format!("reload MV join staging target: {error}"))?
+    .table;
+    if target_table.metadata().uuid().to_string() != facts.target_table_uuid {
+        return Err("MV first-refresh join target UUID drifted after preparation".to_string());
+    }
+    let actual_target_snapshot_id = target_table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id());
+    if actual_target_snapshot_id != expected_target_snapshot_id {
+        return Err("MV first-refresh join target snapshot drifted after preparation".to_string());
+    }
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
+    let catalogs = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("read Iceberg catalog registry for join context: {error}"))?;
+    crate::mv::refresh::execution_context::IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
+        target_identity,
+        facts.mv_definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(facts.mv_definition.clone()),
+        Arc::new(facts.canonical_select_query.clone()),
+        Arc::from(facts.base_refs.clone()),
+        Arc::new(facts.pin.clone()),
+        facts.previous_snapshot_ids.clone(),
+        facts.previous_table_uuids.clone(),
+        expected_target_snapshot_id,
+        facts.target_table_uuid.clone(),
+        &catalogs,
+        Arc::new(entry),
+        catalog,
+        target_table,
+        facts.affected_partitions.clone(),
+        state.mv_refresh_pruning_limits,
+    )
 }
 
 pub(crate) fn execute_prepared_mv_first_refresh_staging(

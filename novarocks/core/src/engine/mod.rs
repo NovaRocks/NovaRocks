@@ -4462,6 +4462,90 @@ pub(crate) fn execute_logical_plan_as_iceberg_staging_in_operation_with_connecto
     connector_staging_completion_from_result(result)
 }
 
+/// Prepare a typed MV logical append as the same inert distributed write
+/// request used by SQL-shaped connector writes.  It performs no submission or
+/// external mutation; the supplied template is activated from the frontend's
+/// retained exact lease and will be sealed there into one write session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
+    state: &Arc<StandaloneState>,
+    logical_plan: crate::sql::planner::logical::LogicalPlanNode,
+    factory: crate::sql::column_id::ColumnRefFactory,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    mv_refresh_ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+    crate::connector::validate_request_context(connector_context)?;
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let output_columns = crate::sql::planner::plan_output_columns(&logical_plan)?;
+    let mut matching_columns = output_columns
+        .iter()
+        .filter(|column| column.name == root_distribution_output_name(&root_distribution));
+    let root_column = matching_columns.next().ok_or_else(|| {
+        format!(
+            "MV first-refresh logical writer is missing root hash output '{}'",
+            root_distribution_output_name(&root_distribution)
+        )
+    })?;
+    if matching_columns.next().is_some()
+        || root_column.column_id == crate::sql::column_id::ColumnId::UNSET
+    {
+        return Err(
+            "MV first-refresh logical writer has an ambiguous or unbound root hash output"
+                .to_string(),
+        );
+    }
+    let root_distribution =
+        crate::sql::optimizer::property::DistributionSpec::shuffle_agg([root_column.column_id]);
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
+        &mut scalar_arena,
+    )?;
+    let providers = query_stats::QueryStatisticsContext::unavailable();
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let optimized_tree = crate::sql::optimizer::optimize_with_root_distribution(
+        optimizer_expr,
+        scalar_arena,
+        &query_stats.snapshot,
+        factory,
+        root_distribution,
+        &optimizer_settings,
+    )?;
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+        physical_plan,
+        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+            descriptor_database: mv_refresh_ctx.rewrite.current_database.clone(),
+            spec: sink_spec,
+            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        },
+        &optimizer_settings,
+    )?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        state.connector_control.as_ref(),
+        connector_context,
+        None,
+        Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
+        scan_preparation_options(&optimizer_settings),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    prepare_distributed_write_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        execution,
+        Some(DistributedConnectorWrite::Begin(connector_write)),
+    )
+}
+
 fn root_distribution_output_name(
     requirement: &crate::sql::compiler::RootDistributionRequirement,
 ) -> &str {
