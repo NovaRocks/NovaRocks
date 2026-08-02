@@ -370,6 +370,8 @@ fn execute_data_refresh(
     .map_err(|_| invalid("MV refresh committed row count exceeds i64 range"))?;
     let frontend_version = frontend_version(committed_version)?;
 
+    recovery_phase_barrier("write-committed")?;
+
     let guard = ConnectorRefreshPublicationGuard::try_new(
         attempt.refresh_id,
         finalize.mv_id,
@@ -399,6 +401,8 @@ fn execute_data_refresh(
         publication,
         Some(frontend_version.clone()),
     )?;
+
+    recovery_phase_barrier("publication-committed")?;
 
     let cleanup = resolve_catalog_mutation_with_lease(
         &mutation_lease,
@@ -791,6 +795,59 @@ fn evidence_from_external(evidence: &ExternalMutationEvidence) -> FrontendMvRefr
 
 fn sha256(payload: &[u8]) -> [u8; 32] {
     Sha256::digest(payload).into()
+}
+
+/// Debug-only, runner-owned crash barrier for recovery integration tests.
+///
+/// A trigger is deliberately a filesystem capability that is accepted only
+/// when the process already has the configured query-lifecycle fault root.
+/// Production builds compile this to a no-op, and normal debug deployments do
+/// not enter it unless a test creates the exact one-shot trigger file.
+#[cfg(debug_assertions)]
+fn recovery_phase_barrier(phase: &str) -> Result<(), MvApplicationError> {
+    use std::time::{Duration, Instant};
+
+    let Some(root) = novarocks::common::app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+    else {
+        return Ok(());
+    };
+    let path = root.join(format!("mv-refresh-at-{phase}.trigger"));
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(invalid(format!(
+                "read MV recovery phase trigger {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let mut fields = contents.lines().filter_map(|line| line.split_once('='));
+    let Some(("token", token)) = fields.next() else {
+        return Err(invalid("MV recovery phase trigger has no token"));
+    };
+    if token.is_empty() || fields.next().is_some() {
+        return Err(invalid("MV recovery phase trigger has invalid contents"));
+    }
+    eprintln!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token={token}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if path.exists() {
+        return Err(MvApplicationError::new(
+            MvApplicationErrorKind::Engine,
+            format!("timed out waiting for MV recovery test action at phase {phase}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn recovery_phase_barrier(_phase: &str) -> Result<(), MvApplicationError> {
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> MvApplicationError {

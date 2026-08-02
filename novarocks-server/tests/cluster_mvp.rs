@@ -72,6 +72,36 @@ fn runtime_dir() -> PathBuf {
     dir
 }
 
+struct EnvironmentValueGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvironmentValueGuard {
+    fn set_path(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: this integration target serializes its process-spawning
+        // tests with `CLUSTER_MVP_TEST_LOCK`; the guard restores the caller
+        // environment before the test returns.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvironmentValueGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `set_path`; restoring the inherited environment is part
+        // of the runner-owned fault scope cleanup.
+        unsafe {
+            if let Some(value) = self.previous.as_ref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
 fn write_config(name: &str, content: &str) -> NamedTempFile {
     let file = TempFileBuilder::new()
         .prefix(name)
@@ -91,14 +121,28 @@ struct ProcessGuard {
 
 impl ProcessGuard {
     fn spawn(config_path: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
+        Self::spawn_with_backend_index(config_path, None)
+    }
+
+    fn spawn_backend(config_path: &Path, backend_index: usize) -> Self {
+        Self::spawn_with_backend_index(config_path, Some(backend_index))
+    }
+
+    fn spawn_with_backend_index(config_path: &Path, backend_index: Option<usize>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
+        command
             .arg("standalone")
             .arg("--config")
             .arg(config_path)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn novarocks");
+            .stderr(Stdio::piped());
+        if let Some(backend_index) = backend_index {
+            command.env(
+                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+                backend_index.to_string(),
+            );
+        }
+        let mut child = command.spawn().expect("spawn novarocks");
         let stdout = child.stdout.take().expect("child stdout");
         let stderr = child.stderr.take().expect("child stderr pipe");
         let (tx, rx) = mpsc::channel();
@@ -540,7 +584,7 @@ backends = [{backends_list}]
         for (i, port_set) in be_port_sets.drain(..).enumerate() {
             let _ = port_set.http.release();
             let _ = port_set.grpc.release();
-            bes.push(ProcessGuard::spawn(be_configs[i].path()));
+            bes.push(ProcessGuard::spawn_backend(be_configs[i].path(), i));
         }
         for be in &mut bes {
             be.wait_for_ready("NOVAROCKS_READY role=be");
@@ -642,6 +686,39 @@ deployment_owner = "fe-1"
         Self::start_n_be_with_options(3, be_extra, &fe_extra, false)
     }
 
+    fn start_three_be_sqlite_state_store_with_metadata_and_fault_dir(
+        state_store_path: &Path,
+        metadata_path: &Path,
+        cluster_id: &str,
+        fault_dir: &Path,
+    ) -> Self {
+        let debug = format!(
+            r#"
+[debug]
+query_lifecycle_fault_dir = "{}"
+"#,
+            fault_dir.display()
+        );
+        let fe_extra = format!(
+            r#"
+[metadata]
+provider = "sqlite"
+path = "{}"
+
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "{cluster_id}"
+deployment_owner = "fe-1"
+
+{debug}
+"#,
+            metadata_path.display(),
+            state_store_path.display(),
+        );
+        Self::start_n_be_with_options(3, &debug, &fe_extra, false)
+    }
+
     fn fe_mysql_port(&self) -> u16 {
         self.fe_mysql
     }
@@ -664,11 +741,30 @@ deployment_owner = "fe-1"
     }
 
     #[cfg(unix)]
+    fn kill_fe(&mut self) {
+        let mut fe = self.fe.take().expect("FE process must be running");
+        fe.child.kill().expect("kill frontend process");
+        let status = fe.child.wait().expect("reap killed frontend process");
+        assert!(
+            !status.success(),
+            "explicit recovery fault must terminate the frontend process"
+        );
+    }
+
+    #[cfg(unix)]
     fn restart_fe(&mut self) {
         assert!(self.fe.is_none(), "old FE process must be stopped");
         let mut fe = ProcessGuard::spawn(self.fe_config.path());
         fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
         self.fe = Some(fe);
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fe_output_contains(&mut self, marker: &str, timeout: Duration) {
+        self.fe
+            .as_mut()
+            .expect("FE process must be running")
+            .wait_for_output_contains(marker, timeout);
     }
 
     fn wait_for_every_be_output_contains(
@@ -2960,6 +3056,163 @@ fn cross_process_three_be_mv_state_store_restart() {
     runtime
         .block_on(host.shutdown())
         .expect("inspection host shutdown");
+}
+
+/// Exercises the two crash windows that startup recovery must converge without
+/// replaying a historical write or publication: a staged write before main
+/// publication, and a published main snapshot before staging cleanup/finalize.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires native 1FE+3BE processes and debug recovery barriers"]
+fn cross_process_three_be_mvx3_recovery_reconciles_staged_and_published_attempts() {
+    let _guard = lock_cluster_mvp();
+    let fault_dir = tempfile::tempdir_in(runtime_dir()).expect("create MV recovery fault dir");
+    let _fault_environment = EnvironmentValueGuard::set_path(
+        "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+        fault_dir.path(),
+    );
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-mv.sqlite");
+    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_fault_dir(
+            &state_store_path,
+            &metadata_path,
+            "mvx3-recovery-reconciliation",
+            fault_dir.path(),
+        );
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create MV recovery warehouse");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        "CREATE EXTERNAL CATALOG mvx3_recovery_ice PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
+        warehouse.path().display(),
+    ))
+    .expect("create recovery Iceberg catalog");
+    conn.query_drop("CREATE DATABASE mvx3_recovery_ice.ns")
+        .expect("create recovery namespace");
+    conn.query_drop("SET CATALOG mvx3_recovery_ice")
+        .expect("select recovery catalog");
+    conn.query_drop("USE ns")
+        .expect("select recovery namespace");
+    conn.query_drop(
+        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\")",
+    )
+    .expect("create recovery base table");
+    conn.query_drop("INSERT INTO orders VALUES (1, 10), (2, 20)")
+        .expect("seed recovery base table");
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create recovery MV");
+
+    let write_trigger = fault_dir
+        .path()
+        .join("mv-refresh-at-write-committed.trigger");
+    std::fs::write(&write_trigger, "token=staged-before-publication\n")
+        .expect("arm staged recovery crash barrier");
+    let mysql_port = cluster.fe_mysql_port();
+    let (write_tx, write_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let mut refresh_conn = connect_mysql(mysql_port);
+            refresh_conn
+                .query_drop("SET CATALOG mvx3_recovery_ice")
+                .map_err(|error| error.to_string())?;
+            refresh_conn
+                .query_drop("USE ns")
+                .map_err(|error| error.to_string())?;
+            refresh_conn
+                .query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+                .map_err(|error| error.to_string())
+        })();
+        let _ = write_tx.send(result);
+    });
+    cluster.wait_for_fe_output_contains(
+        "NOVAROCKS_MV_RECOVERY_PHASE phase=write-committed token=staged-before-publication",
+        Duration::from_secs(30),
+    );
+    cluster.kill_fe();
+    std::fs::remove_file(&write_trigger).expect("remove staged recovery crash barrier");
+    assert!(
+        write_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("staged refresh client must observe FE kill")
+            .is_err(),
+        "a killed frontend must not report staged refresh success"
+    );
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    conn.query_drop("SET CATALOG mvx3_recovery_ice")
+        .expect("restore recovery catalog after staged crash");
+    conn.query_drop("USE ns")
+        .expect("restore recovery namespace after staged crash");
+    let after_staged_restart: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_mv ORDER BY k1")
+        .expect("read MV after staged recovery");
+    assert!(
+        after_staged_restart.is_empty(),
+        "staged-only recovery must not publish main: {after_staged_restart:?}"
+    );
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+        .expect("recovery must release staged attempt fence for a fresh refresh");
+    let first_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_mv ORDER BY k1")
+        .expect("read recovered first refresh");
+    assert_eq!(first_rows, vec![(1, 10), (2, 20)]);
+    conn.query_drop("INSERT INTO orders VALUES (3, 30)")
+        .expect("add incremental recovery source row");
+
+    let publication_trigger = fault_dir
+        .path()
+        .join("mv-refresh-at-publication-committed.trigger");
+    std::fs::write(&publication_trigger, "token=published-before-cleanup\n")
+        .expect("arm published recovery crash barrier");
+    let mysql_port = cluster.fe_mysql_port();
+    let (publication_tx, publication_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let mut refresh_conn = connect_mysql(mysql_port);
+            refresh_conn
+                .query_drop("SET CATALOG mvx3_recovery_ice")
+                .map_err(|error| error.to_string())?;
+            refresh_conn
+                .query_drop("USE ns")
+                .map_err(|error| error.to_string())?;
+            refresh_conn
+                .query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+                .map_err(|error| error.to_string())
+        })();
+        let _ = publication_tx.send(result);
+    });
+    cluster.wait_for_fe_output_contains(
+        "NOVAROCKS_MV_RECOVERY_PHASE phase=publication-committed token=published-before-cleanup",
+        Duration::from_secs(30),
+    );
+    cluster.kill_fe();
+    std::fs::remove_file(&publication_trigger).expect("remove published recovery crash barrier");
+    assert!(
+        publication_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("published refresh client must observe FE kill")
+            .is_err(),
+        "a killed frontend must not report publication refresh success"
+    );
+    cluster.restart_fe();
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    conn.query_drop("SET CATALOG mvx3_recovery_ice")
+        .expect("restore recovery catalog after publication crash");
+    conn.query_drop("USE ns")
+        .expect("restore recovery namespace after publication crash");
+    let published_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_mv ORDER BY k1")
+        .expect("read MV after published recovery");
+    assert_eq!(published_rows, vec![(1, 10), (2, 20), (3, 30)]);
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+        .expect("published recovery must finalize durable MV metadata");
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 }
 
 fn sqlite_state_store_config(state_store_path: &Path, cluster_id: &str) -> StateStoreHostConfig {

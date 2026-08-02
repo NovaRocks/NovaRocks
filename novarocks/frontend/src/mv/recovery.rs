@@ -541,7 +541,7 @@ fn descriptor_from_refresh(
                 .try_into()
                 .map_err(|_| "frontend refresh has an invalid cohort ID".to_string())
         })
-        .collect::<Result<Vec<[u8; 16]>, _>>()?;
+        .collect::<Result<Vec<[u8; 32]>, _>>()?;
     let mut hasher = Sha256::new();
     for cohort in &cohorts {
         hasher.update(cohort);
@@ -672,7 +672,7 @@ fn legacy_descriptor(
     let identity: [u8; 32] = identity_hasher.finalize().into();
     let operation_id =
         ConnectorMutationOperationId::from_bytes(identity[..16].try_into().map_err(|_| ())?);
-    let cohort: [u8; 16] = identity[16..].try_into().map_err(|_| ())?;
+    let cohort: [u8; 32] = Sha256::digest(identity).into();
     let actions = [
         ConnectorStagedPublicationPhase::StagingCreate,
         ConnectorStagedPublicationPhase::Write,
