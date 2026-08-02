@@ -19,9 +19,9 @@ under the License.
 
 # 分布式部署
 
-分布式部署使用 NovaRocks standalone SQL 引擎的集群角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 MySQL 入口、SQL 解析、优化和 fragment 调度；BE 角色提供 NovaRocks gRPC 后端服务并执行 fragment。
+分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 MySQL 入口、SQL 解析、优化和 fragment 调度；BE 角色提供 NovaRocks gRPC 后端服务并执行 fragment。
 
-该模式不依赖 StarRocks FE。如果要接入 StarRocks FE，请使用 [StarRocks兼容部署](starrocks-compatible.md)。
+该模式不依赖 StarRocks FE。StarRocks 数据只通过只读 external Connector 接入：RPC 支持所有拓扑，direct 永久只支持 shared-data。
 
 ## 部署拓扑
 
@@ -43,7 +43,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 | --- | --- | --- |
 | `fe` | 接收 MySQL 连接，解析 SQL，优化计划，调度 fragment 到后端 | `[standalone_server].mysql_port`；同时使用 `[server].grpc_port` 提供 coordinator report gRPC |
 | `be` | 执行 FE 下发的 fragment，处理 exchange 和结果回传 | `[server].grpc_port` |
-| `all-in-one` | 默认单进程模式，适合 standalone 单机部署；进程内仍由独立 FE/BE application host 通过 NovaRocksGrpc 通信，不走 direct-call shortcut | `[standalone_server].mysql_port`；`[server].grpc_port` |
+| `all-in-one` | 单进程测试与本地验证便利；进程内仍由独立 FE/BE application host 通过 NovaRocksGrpc 通信，不走 direct-call shortcut | `[standalone_server].mysql_port`；`[server].grpc_port` |
 
 ## 前提条件
 
@@ -56,21 +56,12 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 
 ## 编译 NovaRocks
 
-分布式部署仍然属于 NovaRocks standalone SQL 引擎，不依赖 StarRocks FE，也不需要 `compat` feature。FE 角色和 BE 角色使用同一个 NovaRocks 二进制文件，建议先构建一次 release package，再分发到所有节点。
+分布式部署使用 NovaRocks native runtime，不依赖 StarRocks FE。FE 角色和 BE 角色使用同一个 NovaRocks 二进制文件，建议构建 release 二进制后分发到所有节点。
 
 推荐构建命令：
 
 ```bash
-./build.sh --release --package
-```
-
-默认输出目录为 `./output/novarocks`。将该目录同步到所有 FE / BE 节点，并为不同节点准备各自的配置文件：
-
-```text
-./output/novarocks/bin/novarocks
-./output/novarocks/bin/novarocksctl
-./output/novarocks/conf/novarocks.toml.example
-./output/novarocks/lib/
+cargo build --release -p novarocks-server
 ```
 
 本地伪分布式验证时，也可以使用 debug 构建加快迭代：
@@ -79,7 +70,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 cargo build
 ```
 
-后续启动命令中的 `./target/release/novarocks` 可相应替换为 `./target/debug/novarocks`。只有接入 StarRocks FE 的兼容后端部署才需要 `--features compat`。
+后续启动命令中的 `./target/release/novarocks` 可相应替换为 `./target/debug/novarocks`。
 
 ## 配置 BE 节点
 

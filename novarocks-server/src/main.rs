@@ -15,17 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::net::{TcpStream, ToSocketAddrs};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{self, Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process;
 
-use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
 
 mod composition;
@@ -37,13 +29,22 @@ struct StandaloneServerCliArgs {
     role: Option<novarocks::common::app_config::ClusterRole>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ServerCommand {
+    Help(Usage),
+    Standalone(StandaloneServerCliArgs),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Usage {
+    Main,
+    Standalone,
+}
+
 fn print_main_usage() {
-    eprintln!("Usage: novarocks [run|start|stop|restart|standalone] [--config <path>]");
-    eprintln!("  run       - Run in foreground (default)");
-    eprintln!("  start     - Run in background as daemon");
-    eprintln!("  stop      - Stop running daemon");
-    eprintln!("  restart   - Restart daemon");
-    eprintln!("  standalone - Run a local MySQL-compatible standalone server");
+    eprintln!(
+        "Usage: novarocks standalone [--port <port>] [--config <path>] [--role <fe|be|all-in-one>]"
+    );
 }
 
 fn print_standalone_server_usage() {
@@ -53,18 +54,6 @@ fn print_standalone_server_usage() {
     eprintln!("Example:");
     eprintln!("  novarocks standalone --port 9030 --config /etc/novarocks/novarocks.toml");
     eprintln!("  novarocks standalone --role be --config /etc/novarocks/novarocks.toml");
-}
-
-#[cfg(feature = "compat")]
-fn validate_daemon_build(_command: &str) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(feature = "compat"))]
-fn validate_daemon_build(command: &str) -> Result<(), String> {
-    Err(format!(
-        "the {command} daemon interface requires a compat build; use `novarocks standalone --role be|fe|all-in-one --config <path>` for native roles"
-    ))
 }
 
 /// Build the tracing EnvFilter expression from config: prefer the explicit
@@ -137,6 +126,28 @@ fn parse_standalone_server_args(
     }))
 }
 
+/// Parse the entire process command line before loading configuration, raising
+/// resource limits, or starting any runtime-owned service.
+fn parse_server_command(args: &[String]) -> Result<ServerCommand, String> {
+    let Some(command) = args.first() else {
+        return Err("missing command; use `novarocks standalone --help`".to_string());
+    };
+
+    match command.as_str() {
+        "--help" | "-h" => Ok(ServerCommand::Help(Usage::Main)),
+        "standalone" => match parse_standalone_server_args(&args[1..])? {
+            Some(cli) => Ok(ServerCommand::Standalone(cli)),
+            None => Ok(ServerCommand::Help(Usage::Standalone)),
+        },
+        "run" | "start" | "stop" | "restart" => Err(format!(
+            "the `{command}` command has been retired; use `novarocks standalone --role fe|be|all-in-one --config <path>`"
+        )),
+        other => Err(format!(
+            "unknown command `{other}`; use `novarocks standalone --help`"
+        )),
+    }
+}
+
 fn parse_cluster_role(value: &str) -> Result<novarocks::common::app_config::ClusterRole, String> {
     match value {
         "fe" => Ok(novarocks::common::app_config::ClusterRole::Fe),
@@ -205,21 +216,6 @@ fn be_role_start_warning(port_override: Option<u16>) -> Option<String> {
     })
 }
 
-/// Dial every backend address in `backends` with a 3-second TCP timeout.
-/// Returns `Ok(())` if all are reachable, or an `Err` whose message identifies
-/// the failing backend index and address: `"failed to dial backend {idx} ({addr}): {e}"`.
-#[cfg(test)]
-pub(crate) fn probe_all_backends(backends: &[String]) -> Result<(), String> {
-    for (idx, b) in backends.iter().enumerate() {
-        let addr: std::net::SocketAddr = b
-            .parse()
-            .map_err(|e| format!("invalid backend addr '{}': {}", b, e))?;
-        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
-            .map_err(|e| format!("failed to dial backend {idx} ({addr}): {e}"))?;
-    }
-    Ok(())
-}
-
 fn dispatch_standalone_role_with_all_in_one(
     role: novarocks::common::app_config::ClusterRole,
     cfg: novarocks::common::app_config::NovaRocksConfig,
@@ -263,7 +259,6 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
 
     // Install the global config and initialize the tracing subscriber before
     // starting the server. Without this, standalone runs with no logging
-    // (init_with_level is otherwise only called on the FE-compatible run/start
     // path), so log_filter/log_level/sys_log_dir from the config are ignored.
     novarocks::common::app_config::install_preloaded_config(cfg.clone());
     novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
@@ -286,174 +281,6 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
         run_standalone_be_role,
         move |cfg, port| composition::run_all_in_one(cfg, resolved_config_path, port),
     )
-}
-
-fn read_pid_file(pid_file: &str) -> Result<Option<u32>, String> {
-    if !Path::new(pid_file).exists() {
-        return Ok(None);
-    }
-    let pid_raw = fs::read_to_string(pid_file).map_err(|e| format!("read pid file failed: {e}"))?;
-    let pid_text = pid_raw.trim();
-    if pid_text.is_empty() {
-        return Err("pid file is empty".to_string());
-    }
-    let pid = pid_text
-        .parse::<u32>()
-        .map_err(|e| format!("invalid pid value '{pid_text}': {e}"))?;
-    Ok(Some(pid))
-}
-
-fn is_process_running(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn stop_process(pid: u32, grace: Duration) {
-    let _ = Command::new("kill")
-        .arg("-2")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if !is_process_running(pid) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    if is_process_running(pid) {
-        eprintln!(
-            "novarocks did not stop within {}s, sending SIGKILL...",
-            grace.as_secs()
-        );
-        let _ = Command::new("kill")
-            .arg("-9")
-            .arg(pid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
-
-fn spawn_child_reaper(mut child: Child) {
-    let _ = std::thread::Builder::new()
-        .name("novarocks-daemon-reaper".to_string())
-        .spawn(move || {
-            let _ = child.wait();
-        });
-}
-
-fn health_check_host(bind_host: &str) -> String {
-    match bind_host {
-        "0.0.0.0" => "127.0.0.1".to_string(),
-        "::" | "[::]" => "::1".to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// Builds a `SocketAddr` for the BE readiness probe, correctly handling IPv6
-/// hosts by using `SocketAddr` construction via `IpAddr` rather than string
-/// concatenation, which produces invalid `::1:PORT` for IPv6.
-#[cfg(test)]
-fn be_readiness_probe_addr(bind_host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
-    let probe_host = health_check_host(bind_host);
-    // Strip brackets so bare IPv6 addresses can be parsed as IpAddr.
-    let stripped = probe_host.trim_matches(|c| c == '[' || c == ']');
-    stripped
-        .parse::<std::net::IpAddr>()
-        .map(|ip| std::net::SocketAddr::new(ip, port))
-        .or_else(|_| {
-            // Hostname fallback: use bracketed form for `format!`-style parsing.
-            let bracketed = if probe_host.contains(':') && !probe_host.starts_with('[') {
-                format!("[{probe_host}]:{port}")
-            } else {
-                format!("{probe_host}:{port}")
-            };
-            bracketed
-                .parse::<std::net::SocketAddr>()
-                .map_err(|e| format!("invalid BE readiness probe addr '{bracketed}': {e}"))
-        })
-}
-
-fn heartbeat_ready(host: &str, port: u16) -> Result<(), String> {
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("resolve {host}:{port} failed: {e}"))?;
-    for addr in addrs {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return Ok(());
-        }
-    }
-    Err(format!("connect {host}:{port} failed"))
-}
-
-fn wait_for_start_ready(
-    pid: u32,
-    pid_file: &str,
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let mut last_error = String::new();
-    let mut stable_since: Option<Instant> = None;
-    let stable_window = Duration::from_millis(800);
-    while Instant::now() < deadline {
-        if !is_process_running(pid) {
-            return Err(format!("process {pid} exited unexpectedly"));
-        }
-
-        let pid_ready = match read_pid_file(pid_file) {
-            Ok(Some(file_pid)) if file_pid == pid => true,
-            Ok(Some(file_pid)) => {
-                last_error = format!("pid file points to pid={file_pid}, expect {pid}");
-                false
-            }
-            Ok(None) => {
-                last_error = "pid file not created yet".to_string();
-                false
-            }
-            Err(e) => {
-                last_error = format!("pid file not ready: {e}");
-                false
-            }
-        };
-
-        let heartbeat_ok = match heartbeat_ready(host, port) {
-            Ok(()) => true,
-            Err(e) => {
-                last_error = e;
-                false
-            }
-        };
-
-        if pid_ready && heartbeat_ok {
-            if stable_since.is_none() {
-                stable_since = Some(Instant::now());
-            }
-            if stable_since.is_some_and(|t| t.elapsed() >= stable_window) {
-                return Ok(());
-            }
-        } else {
-            stable_since = None;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    Err(format!(
-        "timeout waiting heartbeat ready on {host}:{port}, last_error={last_error}"
-    ))
 }
 
 #[cfg(unix)]
@@ -489,376 +316,28 @@ fn raise_nofile_limit() {
 #[cfg(not(unix))]
 fn raise_nofile_limit() {}
 
-fn open_daemon_stdout_log() -> Result<(File, String), String> {
-    let log_path = novarocks_logging::resolve_stdout_log_path();
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "create daemon log directory {} failed: {e}",
-                parent.display()
-            )
-        })?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| format!("open daemon stdout log {} failed: {e}", log_path.display()))?;
-    Ok((file, log_path.display().to_string()))
-}
-
-#[cfg(feature = "compat")]
-fn run_compat_application_with<E>(
-    config: novarocks::common::app_config::NovaRocksConfig,
-    running: Arc<AtomicBool>,
-    runner: impl FnOnce(novarocks_compat::CompatServerConfig, Box<dyn FnMut() -> bool>) -> Result<(), E>,
-) -> Result<(), E> {
-    runner(
-        novarocks_compat::CompatServerConfig { config },
-        Box::new(move || !running.load(Ordering::SeqCst)),
-    )
-}
-
 fn main() {
-    raise_nofile_limit();
-
-    let args: Vec<String> = env::args().collect();
-    let mut idx = 1usize;
-    let mode = if args.get(idx).is_some_and(|s| !s.starts_with('-')) {
-        let m = args[idx].as_str();
-        idx += 1;
-        m
-    } else {
-        "run"
-    };
-
-    if mode == "standalone" {
-        match parse_standalone_server_args(&args[idx..]) {
-            Ok(Some(cli)) => {
-                if let Err(err) = run_standalone_server_cli(cli) {
-                    eprintln!("{err}");
-                    process::exit(1);
-                }
-                return;
-            }
-            Ok(None) => {
-                print_standalone_server_usage();
-                process::exit(0);
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                print_standalone_server_usage();
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    match parse_server_command(&args) {
+        Ok(ServerCommand::Help(Usage::Main)) => {
+            print_main_usage();
+            process::exit(0);
+        }
+        Ok(ServerCommand::Help(Usage::Standalone)) => {
+            print_standalone_server_usage();
+            process::exit(0);
+        }
+        Ok(ServerCommand::Standalone(cli)) => {
+            // Design: ADR-0026 (docs/adr/ADR-0026-retire-starrocks-compat-runtime-role.md)
+            // All parsing is complete before this native runtime side effect.
+            raise_nofile_limit();
+            if let Err(error) = run_standalone_server_cli(cli) {
+                eprintln!("{error}");
                 process::exit(1);
             }
         }
-    }
-
-    let mut config_path: Option<String> = None;
-    while let Some(arg) = args.get(idx) {
-        match arg.as_str() {
-            "--config" | "-c" => {
-                idx += 1;
-                config_path = args.get(idx).cloned();
-                if config_path.is_none() {
-                    eprintln!("missing value for --config/-c");
-                    process::exit(1);
-                }
-                idx += 1;
-            }
-            "--help" | "-h" => {
-                print_main_usage();
-                process::exit(0);
-            }
-            other => {
-                eprintln!("unknown arg: {other} (try --help)");
-                process::exit(1);
-            }
-        }
-    }
-    if matches!(mode, "run" | "start" | "restart")
-        && let Err(error) = validate_daemon_build(mode)
-    {
-        eprintln!("{error}");
-        process::exit(1);
-    }
-
-    let pid_file = "novarocks.pid";
-    match mode {
-        "start" => {
-            if Path::new(pid_file).exists() {
-                match read_pid_file(pid_file) {
-                    Ok(Some(pid)) if is_process_running(pid) => {
-                        eprintln!("novarocks already running with pid={pid}");
-                        return;
-                    }
-                    Ok(Some(pid)) => {
-                        eprintln!("found stale pid file (pid={pid}), removing");
-                        let _ = fs::remove_file(pid_file);
-                    }
-                    Ok(None) => {
-                        eprintln!("pid file exists without pid, removing");
-                        let _ = fs::remove_file(pid_file);
-                    }
-                    Err(err) => {
-                        eprintln!("invalid pid file, removing: {err}");
-                        let _ = fs::remove_file(pid_file);
-                    }
-                }
-            }
-
-            let cfg = match config_path.as_deref() {
-                Some(p) => novarocks_config::init_from_path(p).expect("load novarocks config"),
-                None => {
-                    novarocks_config::init_from_env_or_default().expect("load novarocks config")
-                }
-            };
-            let (stdout, log_file) = open_daemon_stdout_log().expect("open daemon stdout log");
-            let stderr = stdout.try_clone().expect("clone log file handle");
-            let ready_host = health_check_host(&cfg.server.host);
-            let ready_port = cfg.server.heartbeat_port;
-
-            let mut cmd = Command::new(env::current_exe().expect("current exe"));
-            cmd.arg("run");
-            if let Some(p) = config_path.as_deref() {
-                cmd.arg("--config").arg(p);
-            }
-            cmd.stdin(Stdio::null());
-            #[cfg(unix)]
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            let child = cmd
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::from(stderr))
-                .spawn()
-                .expect("spawn child");
-
-            let child_pid = child.id();
-            spawn_child_reaper(child);
-            match wait_for_start_ready(
-                child_pid,
-                pid_file,
-                &ready_host,
-                ready_port,
-                Duration::from_secs(8),
-            ) {
-                Ok(()) => {
-                    println!(
-                        "Started novarocks in background (PID: {}), heartbeat ready on {}:{}",
-                        child_pid, ready_host, ready_port
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "novarocks start health check failed: {}. Check {}",
-                        err, log_file
-                    );
-                    stop_process(child_pid, Duration::from_secs(2));
-                    process::exit(1);
-                }
-            }
-        }
-        "run" => {
-            let pid = process::id();
-            fs::write(pid_file, pid.to_string()).expect("write pid file");
-
-            // Setup signal handler for graceful shutdown
-            let running = Arc::new(AtomicBool::new(true));
-            let running_clone = running.clone();
-
-            ctrlc::set_handler(move || {
-                println!("\nReceived interrupt signal, shutting down...");
-                running_clone.store(false, Ordering::SeqCst);
-            })
-            .expect("Error setting Ctrl-C handler");
-
-            let cfg = match config_path.as_deref() {
-                Some(p) => novarocks_config::init_from_path(p).expect("load novarocks config"),
-                None => {
-                    novarocks_config::init_from_env_or_default().expect("load novarocks config")
-                }
-            };
-
-            // Build logging filter from config.
-            // Prefer `log_filter` (full EnvFilter expression) if present.
-            // Otherwise, treat `log_level` as the level for our own crate (`novarocks`)
-            // and keep a sane default (global `info`) for dependencies, so that
-            // noisy system libraries do not spam debug/trace logs.
-            novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
-
-            eprintln!("NovaRocks {}", novarocks::version::full_version());
-
-            let page_cache_initialized = if cfg.runtime.cache.page_cache_enable {
-                novarocks_fs::DataCacheManager::instance().init_page_cache(
-                    novarocks_fs::DataCachePageCacheOptions {
-                        capacity: cfg.runtime.cache.page_cache_capacity,
-                        evict_probability: cfg.runtime.cache.page_cache_evict_probability,
-                    },
-                )
-            } else {
-                false
-            };
-            if page_cache_initialized {
-                eprintln!(
-                    "DataCache page cache initialized: capacity={}, evict_probability={}",
-                    cfg.runtime.cache.page_cache_capacity,
-                    cfg.runtime.cache.page_cache_evict_probability
-                );
-            }
-
-            let parquet_cache_initialized =
-                novarocks_fs::init_parquet_cache(novarocks_fs::ParquetCacheOptions {
-                    enable_metadata: cfg.runtime.cache.parquet_meta_cache_enable,
-                    metadata_ttl: Duration::from_secs(
-                        cfg.runtime.cache.parquet_meta_cache_ttl_seconds,
-                    ),
-                    enable_page: cfg.runtime.cache.parquet_page_cache_enable,
-                });
-            if parquet_cache_initialized {
-                eprintln!(
-                    "Parquet physical cache policy initialized: meta_enabled={}, meta_ttl={}s, page_enabled={}",
-                    cfg.runtime.cache.parquet_meta_cache_enable,
-                    cfg.runtime.cache.parquet_meta_cache_ttl_seconds,
-                    cfg.runtime.cache.parquet_page_cache_enable,
-                );
-            }
-            if (cfg.runtime.cache.parquet_meta_cache_enable
-                || cfg.runtime.cache.parquet_page_cache_enable)
-                && !cfg.runtime.cache.page_cache_enable
-            {
-                eprintln!(
-                    "Parquet cache policy enabled but runtime.cache.page_cache_enable=false; parquet meta/page cache is disabled at runtime"
-                );
-            }
-
-            if cfg.runtime.cache.datacache_enable {
-                eprintln!(
-                    "Block cache is configured but currently disabled; skip disk datacache initialization and use memory cache only"
-                );
-            }
-
-            #[cfg(feature = "compat")]
-            let compat_result =
-                run_compat_application_with(cfg.clone(), running.clone(), |config, shutdown| {
-                    novarocks_compat::run_compat_server_until_shutdown(config, shutdown)
-                });
-
-            // Cleanup: remove pid file
-            let _ = fs::remove_file(pid_file);
-            #[cfg(feature = "compat")]
-            compat_result.expect("compatibility BE application failed");
-            #[cfg(feature = "compat")]
-            println!("novarocksd stopped");
-            #[cfg(not(feature = "compat"))]
-            unreachable!("native daemon commands are rejected before runtime initialization");
-        }
-        "stop" => match read_pid_file(pid_file) {
-            Ok(Some(pid)) => {
-                if is_process_running(pid) {
-                    println!("Stopping novarocks (PID: {})...", pid);
-                    stop_process(pid, Duration::from_secs(5));
-                } else {
-                    println!("Found stale pid file (PID: {}), cleaning up...", pid);
-                }
-                let _ = fs::remove_file(pid_file);
-            }
-            Ok(None) => {
-                println!("No novarocks.pid file found.");
-            }
-            Err(err) => {
-                eprintln!("failed to parse pid file: {err}");
-                let _ = fs::remove_file(pid_file);
-            }
-        },
-        "restart" => {
-            // Stop first
-            if Path::new(pid_file).exists() {
-                match read_pid_file(pid_file) {
-                    Ok(Some(pid)) if is_process_running(pid) => {
-                        println!("Stopping novarocks (PID: {})...", pid);
-                        stop_process(pid, Duration::from_secs(5));
-                        let _ = fs::remove_file(pid_file);
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
-                    Ok(Some(pid)) => {
-                        println!("Found stale pid file (PID: {}), cleaning up...", pid);
-                        let _ = fs::remove_file(pid_file);
-                    }
-                    Ok(None) => {
-                        let _ = fs::remove_file(pid_file);
-                    }
-                    Err(err) => {
-                        eprintln!("failed to parse pid file: {err}");
-                        let _ = fs::remove_file(pid_file);
-                    }
-                }
-            }
-
-            let cfg = match config_path.as_deref() {
-                Some(p) => novarocks_config::init_from_path(p).expect("load novarocks config"),
-                None => {
-                    novarocks_config::init_from_env_or_default().expect("load novarocks config")
-                }
-            };
-            let ready_host = health_check_host(&cfg.server.host);
-            let ready_port = cfg.server.heartbeat_port;
-
-            // Start again
-            let (stdout, log_file) = open_daemon_stdout_log().expect("open daemon stdout log");
-            let stderr = stdout.try_clone().expect("clone log file handle");
-
-            let mut cmd = Command::new(env::current_exe().expect("current exe"));
-            cmd.arg("run");
-            if let Some(p) = config_path.as_deref() {
-                cmd.arg("--config").arg(p);
-            }
-            cmd.stdin(Stdio::null());
-            #[cfg(unix)]
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            let child = cmd
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::from(stderr))
-                .spawn()
-                .expect("spawn child");
-
-            let child_pid = child.id();
-            spawn_child_reaper(child);
-            match wait_for_start_ready(
-                child_pid,
-                pid_file,
-                &ready_host,
-                ready_port,
-                Duration::from_secs(8),
-            ) {
-                Ok(()) => {
-                    println!(
-                        "Restarted novarocks in background (PID: {}), heartbeat ready on {}:{}",
-                        child_pid, ready_host, ready_port
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "novarocks restart health check failed: {}. Check {}",
-                        err, log_file
-                    );
-                    stop_process(child_pid, Duration::from_secs(2));
-                    process::exit(1);
-                }
-            }
-        }
-        _ => {
+        Err(error) => {
+            eprintln!("{error}");
             print_main_usage();
             process::exit(1);
         }
@@ -868,80 +347,59 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        StandaloneServerCliArgs, dispatch_standalone_role_with_all_in_one,
-        load_config_and_resolve_role, parse_standalone_server_args, probe_all_backends,
+        ServerCommand, StandaloneServerCliArgs, Usage, dispatch_standalone_role_with_all_in_one,
+        load_config_and_resolve_role, parse_server_command, parse_standalone_server_args,
         resolve_cluster_role,
     };
 
-    #[cfg(not(feature = "compat"))]
     #[test]
-    fn native_daemon_commands_fail_before_runtime_initialization() {
-        let error = super::validate_daemon_build("run")
-            .expect_err("native build must reject the daemon command");
-        assert!(error.contains("requires a compat build"), "{error}");
-        assert!(
-            error.contains("standalone --role be|fe|all-in-one"),
-            "{error}"
+    fn top_level_help_is_side_effect_free_command() {
+        assert_eq!(
+            parse_server_command(&["--help".to_string()]).expect("parse help"),
+            ServerCommand::Help(Usage::Main)
+        );
+        assert_eq!(
+            parse_server_command(&["standalone".to_string(), "-h".to_string()])
+                .expect("parse standalone help"),
+            ServerCommand::Help(Usage::Standalone)
         );
     }
 
-    #[cfg(feature = "compat")]
-    mod compat_delegation {
-        use std::cell::Cell;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+    #[test]
+    fn missing_and_retired_commands_fail_before_runtime_setup() {
+        for args in [
+            vec![],
+            vec!["run".to_string()],
+            vec!["start".to_string()],
+            vec!["stop".to_string()],
+            vec!["restart".to_string()],
+        ] {
+            let error = parse_server_command(&args).expect_err("command must be rejected");
+            assert!(
+                error.contains("missing command") || error.contains("has been retired"),
+                "unexpected error: {error}"
+            );
+        }
+    }
 
-        use super::super::run_compat_application_with;
-
-        #[test]
-        fn compat_run_delegates_the_loaded_config_once() {
-            let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-            config.server.brpc_port = 18_060;
-            let running = Arc::new(AtomicBool::new(true));
-            let calls = Cell::new(0);
-
-            run_compat_application_with(config, running, |received, _shutdown_requested| {
-                calls.set(calls.get() + 1);
-                assert_eq!(received.config.server.brpc_port, 18_060);
-                Ok::<(), &'static str>(())
+    #[test]
+    fn standalone_command_preserves_role_and_config_before_runtime_setup() {
+        let command = parse_server_command(&[
+            "standalone".to_string(),
+            "--role".to_string(),
+            "be".to_string(),
+            "--config".to_string(),
+            "test.toml".to_string(),
+        ])
+        .expect("parse standalone command");
+        assert_eq!(
+            command,
+            ServerCommand::Standalone(StandaloneServerCliArgs {
+                mysql_port: None,
+                config_path: Some("test.toml".to_string()),
+                role: Some(novarocks::common::app_config::ClusterRole::Be),
             })
-            .expect("compat runner delegation");
-
-            assert_eq!(calls.get(), 1);
-        }
-
-        #[test]
-        fn compat_run_forwards_the_shared_shutdown_state() {
-            let running = Arc::new(AtomicBool::new(true));
-            let runner_running = running.clone();
-
-            run_compat_application_with(
-                novarocks::common::app_config::NovaRocksConfig::default(),
-                running,
-                move |_config, mut shutdown_requested| {
-                    assert!(!shutdown_requested());
-                    runner_running.store(false, Ordering::SeqCst);
-                    assert!(shutdown_requested());
-                    Ok::<(), &'static str>(())
-                },
-            )
-            .expect("compat runner delegation");
-        }
-
-        #[test]
-        fn compat_run_propagates_the_runner_error_unchanged() {
-            #[derive(Debug, PartialEq, Eq)]
-            struct RunnerError(&'static str);
-
-            let error = run_compat_application_with(
-                novarocks::common::app_config::NovaRocksConfig::default(),
-                Arc::new(AtomicBool::new(true)),
-                |_config, _shutdown_requested| Err(RunnerError("compat runner failed")),
-            )
-            .expect_err("runner error must propagate");
-
-            assert_eq!(error, RunnerError("compat runner failed"));
-        }
+        );
     }
 
     mod frontend_dispatch {
@@ -1190,47 +648,6 @@ mod tests {
         drop(live);
     }
 
-    #[test]
-    fn test_fe_startup_dials_all_backends() {
-        // Keep the first backend live so probe_all_backends must successfully dial
-        // it, then fail on the second (dead) one. This proves the probe walks past
-        // a reachable backend rather than short-circuiting on the first entry.
-        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let live_port = live.local_addr().unwrap().port();
-        let dead_port = dead.local_addr().unwrap().port();
-        drop(dead);
-        let backends = vec![
-            format!("127.0.0.1:{live_port}"),
-            format!("127.0.0.1:{dead_port}"),
-        ];
-        let err = probe_all_backends(&backends).expect_err("second backend down should fail");
-        assert!(
-            err.contains("backend 1") && err.contains(&dead_port.to_string()),
-            "error must name backend index 1 and the dead port: {err}"
-        );
-        drop(live);
-    }
-
-    #[test]
-    fn test_fe_startup_reports_first_unreachable_backend() {
-        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let live_port = live.local_addr().unwrap().port();
-        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead_port = dead.local_addr().unwrap().port();
-        drop(dead);
-        let backends = vec![
-            format!("127.0.0.1:{}", live_port),
-            format!("127.0.0.1:{}", dead_port),
-        ];
-        let err = probe_all_backends(&backends).expect_err("one down should fail");
-        assert!(
-            err.contains(&dead_port.to_string()),
-            "error must name the failing backend: {err}"
-        );
-        drop(live);
-    }
-
     // Serialize tests that mutate process-wide state (env vars, CWD) so they
     // don't interfere when the test harness runs tests in parallel threads.
     static ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -1460,74 +877,6 @@ backends = ["127.0.0.1:9070"]
             23456,
             "all-in-one runner must receive the pre-loaded cfg with the sentinel mysql_port"
         );
-    }
-
-    // D1 PR-4: BE readiness probe must use loopback when bind host is a wildcard.
-    // The probe address is built via `health_check_host(bind_host)` so that
-    // `0.0.0.0` / `::` never appear in `wait_for_tcp_ready`.
-    #[test]
-    fn be_readiness_probe_addr_uses_loopback_for_wildcard_bind() {
-        // `health_check_host` is the shared helper used by both the daemon path
-        // and the BE path.  Assert its mapping is correct for every wildcard form.
-        assert_eq!(
-            super::health_check_host("0.0.0.0"),
-            "127.0.0.1",
-            "IPv4 wildcard must map to IPv4 loopback"
-        );
-        assert_eq!(
-            super::health_check_host("::"),
-            "::1",
-            "IPv6 wildcard :: must map to IPv6 loopback"
-        );
-        assert_eq!(
-            super::health_check_host("[::]"),
-            "::1",
-            "IPv6 wildcard [::] must map to IPv6 loopback"
-        );
-        assert_eq!(
-            super::health_check_host("192.168.1.10"),
-            "192.168.1.10",
-            "non-wildcard host must pass through unchanged"
-        );
-    }
-
-    // D1b PR-4: BE readiness probe address construction must produce a valid
-    // SocketAddr for all bind host variants, including IPv6.
-    #[test]
-    fn be_readiness_probe_addr_produces_valid_socket_addr() {
-        // IPv4 wildcard -> 127.0.0.1:port
-        let addr = super::be_readiness_probe_addr("0.0.0.0", 9020)
-            .expect("IPv4 wildcard must build valid SocketAddr");
-        assert_eq!(addr.to_string(), "127.0.0.1:9020");
-
-        // IPv6 wildcard :: -> [::1]:port
-        let addr = super::be_readiness_probe_addr("::", 9020)
-            .expect("IPv6 wildcard :: must build valid SocketAddr");
-        assert_eq!(
-            addr.ip(),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-        );
-        assert_eq!(addr.port(), 9020);
-
-        // IPv6 wildcard [::] -> [::1]:port
-        let addr = super::be_readiness_probe_addr("[::]", 9020)
-            .expect("IPv6 wildcard [::] must build valid SocketAddr");
-        assert_eq!(
-            addr.ip(),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-        );
-        assert_eq!(addr.port(), 9020);
-
-        // specific IPv4 host -> unchanged
-        let addr = super::be_readiness_probe_addr("192.168.1.10", 9020)
-            .expect("specific IPv4 host must build valid SocketAddr");
-        assert_eq!(addr.to_string(), "192.168.1.10:9020");
-
-        // specific IPv6 host -> valid SocketAddr
-        let addr = super::be_readiness_probe_addr("2001:db8::1", 9020)
-            .expect("specific IPv6 host must build valid SocketAddr");
-        assert_eq!(addr.ip().to_string(), "2001:db8::1");
-        assert_eq!(addr.port(), 9020);
     }
 
     // I1: load_config_and_resolve_role returns the resolved config path so the

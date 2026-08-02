@@ -14,7 +14,6 @@ code-anchors:
   - "novarocks/backend/src/connector/execution_host.rs (BE-local execution binding)"
   - "novarocks/core/src/query_execution/write_operation.rs (sealed operation session and attempt isolation)"
   - "novarocks/core/src/connector/iceberg/write_control.rs (provider aggregate commit and reconcile)"
-  - "novarocks/compat/src/report/status.rs (provider-owned final Thrift projection)"
 ---
 
 ## 问题

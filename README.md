@@ -19,39 +19,31 @@ under the License.
 
 # NovaRocks
 
-NovaRocks is a Rust-native analytical query engine that started as a
-StarRocks BE-compatible runtime and has evolved into a system that can also run
-independently without StarRocks FE.
+NovaRocks is a Rust-native analytical query engine. Its production runtime is
+the native NovaRocks FE/BE role model; one binary starts a `fe`, `be`, or
+`all-in-one` role through the `standalone` command.
 
-The project currently has two first-class execution modes:
+- `fe` owns the MySQL SQL entrypoint, planning, and distributed coordination.
+- `be` owns local fragment execution and the native gRPC boundary.
+- `all-in-one` is a test and local-development convenience. It keeps the FE/BE
+  application boundary rather than adding a direct-call shortcut.
 
-1. **StarRocks-compatible backend mode**
-   - StarRocks FE keeps producing plans and talking through FE-compatible
-     heartbeat, backend thrift, and brpc/internal-service protocols.
-   - A C++ shim handles brpc compatibility; Rust owns plan lowering, execution,
-     exchange, connectors, and result handling.
-
-2. **Standalone SQL engine mode**
-   - NovaRocks can parse and execute SQL without StarRocks FE.
-   - `standalone` exposes a MySQL-compatible endpoint for SQL clients and
-     SQL regression tests.
-   - The standalone engine has its own SQL catalog/session layer and external
-     Iceberg catalog registry. It does not own a native internal table type.
+StarRocks is supported only as a read-only external Connector. RPC reads can
+serve every StarRocks topology; direct reads permanently require shared-data.
+NovaRocks is not a StarRocks BE-compatible server and does not own a native
+internal StarRocks table type.
 
 NovaRocks is still experimental and is not production-ready. It is useful for
-learning StarRocks-style execution internals, iterating on connector and
-Iceberg semantics, and running local SQL
-experiments on macOS/Linux without maintaining a full StarRocks FE/BE cluster.
+iterating on distributed execution, connector, and Iceberg semantics and for
+running local SQL experiments on macOS/Linux.
 
 ## Current Scope
 
 Implemented or actively exercised areas include:
 
-- FE-compatible BE runtime entrypoints:
-  - heartbeat thrift service
-  - backend thrift service
-  - brpc/internal-service gateway through the C++ shim
-  - gRPC exchange service
+- Native distributed runtime entrypoints:
+  - native FE SQL/coordinator services
+  - native BE gRPC fragment and exchange services
 - Rust execution stack:
   - thrift-plan lowering
   - Arrow `RecordBatch` / `Chunk` processing
@@ -67,6 +59,8 @@ Implemented or actively exercised areas include:
   - Iceberg SELECT, INSERT, DELETE, UPDATE/MERGE-related mutation flows, schema
     changes, refs, and compaction experiments
   - Iceberg-backed materialized-view lifecycle work
+  - StarRocks external Connector with RPC remote reads for all topologies and
+    shared-data-only direct reads
 
 Known limits:
 
@@ -80,101 +74,51 @@ Known limits:
 
 ## Architecture
 
-### StarRocks-Compatible Mode
+### Native FE/BE Roles
 
 ```text
-StarRocks FE
-  |- HeartbeatService (Thrift) -------> Rust service/heartbeat_service
-  |- BackendService (Thrift) ---------> Rust service/backend_service
-  `- PInternalService (brpc) ---------> C++ shim
-                                          |
-                                          `- FFI
-                                               v
-                                      Rust internal_service
-                                               v
-                                          lower/**
-                                               v
-                                      exec/pipeline/**
-                                               v
-                         result_buffer / exchange / connectors
-```
-
-### Standalone Mode
-
-```text
-SQL client / mysql CLI / SQL test runner
+SQL client / mysql CLI
   `- MySQL-compatible protocol
        v
-  src/server/mod.rs
+  NovaRocks role=fe
        v
-  src/engine/**
+  frontend coordinator + SQL compiler
        v
-  src/sql/parser + analyzer + optimizer + codegen
+  native gRPC fragment submission
        v
-  exec/pipeline + runtime
+  NovaRocks role=be
        v
-  external connector backends
-     `- Iceberg catalog registry
+  Arrow execution pipeline + external connectors
 ```
 
 ## Design Principles
 
-- **Two mode boundaries are explicit.** FE-compatible mode follows
-  FE-provided thrift metadata and protocol contracts. Standalone mode owns SQL
-  parsing, catalog resolution, planning, and session context.
+- **Native role boundaries are explicit.** FE owns SQL admission and global
+  coordination; BE owns local execution. `all-in-one` preserves those owners.
 - **Arrow-first execution.** NovaRocks uses Arrow `RecordBatch` wrapped as
   `Chunk` as the in-memory batch format.
-- **Protocol and execution stay separated.** The C++ shim is only the brpc
-  compatibility gateway; execution semantics belong to Rust.
+- **Protocol and execution stay separated.** Native gRPC is the FE/BE process
+  boundary; execution semantics remain in Rust application owners.
 - **Fail fast on unsupported semantics.** Ambiguous or unsupported plan/SQL
   behavior should return explicit errors instead of silently falling back.
-- **Connector-backed storage semantics.** Standalone DDL/DML routes through
+- **Connector-backed storage semantics.** Native DDL/DML routes through
   external catalog/provider and Iceberg write contracts instead of hard-coding storage
   behavior into the SQL server.
 
 ## Prerequisites
 
 - Rust toolchain from `rust-toolchain.toml`
-- C/C++ build toolchain
-- `cmake` 3.20+; 3.27+ recommended
-
-Minimum toolchain versions:
-
-- `rustc` / `cargo`: 1.92.0
-- Linux `gcc` / `g++`: 12+
-
-### Linux
-
-Environment variables:
-
-- `STARROCKS_GCC_HOME`: GCC toolchain root containing `bin/gcc` and `bin/g++`
-- `STARROCKS_THIRDPARTY`: thirdparty root
-
-Recommended environment:
-
-- StarRocks official Docker image, where both variables are preconfigured.
-- For non-official Docker or bare metal, configure both variables manually and
-  build NovaRocks thirdparty with `./thirdparty/build-thirdparty.sh`.
-
-### macOS
-
-Environment variables:
-
-- `STARROCKS_THIRDPARTY`: thirdparty root
-
-Prepare thirdparty by following the StarRocks macOS guide:
-
-- <https://github.com/StarRocks/starrocks/blob/main/docs/en/developers/mac-compile-run-test.md>
+- A platform C toolchain required by Rust dependencies
+- `rustc` / `cargo` 1.92.0 or newer
 
 ## Build
 
 ```bash
 # debug mode (default)
-./build.sh
-./build.sh --debug
+cargo build -p novarocks-server
 
 # release mode
-./build.sh --release
+cargo build --release -p novarocks-server
 ```
 
 Build artifacts:
@@ -182,25 +126,6 @@ Build artifacts:
 - debug: `./target/debug/novarocks`
 - release: `./target/release/novarocks`
 
-Packaging is disabled by default. Use `--package` when a StarRocks-style
-runtime output is needed:
-
-```bash
-./build.sh --release --package
-```
-
-Default package output:
-
-```text
-./output/novarocks
-```
-
-Release mode uses `RUSTFLAGS="-C target-cpu=native"` by default when
-`RUSTFLAGS` is not already set. Override it with:
-
-```bash
-NOVAROCKS_RELEASE_RUSTFLAGS="-C target-cpu=native -C debuginfo=1" ./build.sh --release
-```
 
 ## Configuration
 
@@ -240,56 +165,18 @@ connector execution and does not create a native internal table store.
 
 ## Run
 
-### StarRocks-Compatible Backend Mode
+### Native Roles
 
-This daemon interface requires a binary built with the `compat` feature. A
-native build fails fast for `run`, `start`, and `restart`; use the standalone
-role commands below for native FE, BE, or all-in-one deployments.
-
-CLI usage:
+The only server command is `standalone`:
 
 ```bash
-novarocks [run|start|stop|restart] [--config <path>]
+novarocks standalone --role fe --config ./novarocks.toml
+novarocks standalone --role be --config ./be.toml
+novarocks standalone --role all-in-one --config ./novarocks.toml
 ```
 
-Control script:
-
-```bash
-# foreground
-./bin/novarocksctl start
-
-# daemon mode
-./bin/novarocksctl start --daemon
-
-# stop daemon
-./bin/novarocksctl stop
-
-# restart daemon
-./bin/novarocksctl restart
-```
-
-Built binary:
-
-```bash
-./target/debug/novarocks run --config ./novarocks.toml
-./target/release/novarocks run --config ./novarocks.toml
-```
-
-### Standalone MySQL-Compatible Server
-
-Run a local standalone SQL server without StarRocks FE:
-
-```bash
-NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --port 9030
-```
-
-Or use a config file:
-
-```bash
-NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config ./novarocks.toml
-```
+`--help` and `-h` show the command contract. Historical daemon commands
+(`run`, `start`, `stop`, and `restart`) are not supported.
 
 Native role examples:
 
@@ -405,11 +292,10 @@ Common suites include `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`,
 
 ## Development Workflow
 
-### Native development (default)
+### Native development
 
-The root workspace defaults to `novarocks-server`. Its `compat` dependency is
-optional, so ordinary native development does not build the StarRocks generated
-code, C++ shim, or third-party compat toolchain.
+The root workspace builds the native FE/BE runtime and external Connector
+crates without a StarRocks server toolchain.
 
 ```bash
 cargo fmt --all
@@ -426,25 +312,7 @@ cargo test -p novarocks-backend
 cargo test -p novarocks-server
 ```
 
-Do not use `--workspace` or `--all-features` for routine native development:
-the former includes `novarocks-compat` as a workspace member, while the latter
-enables `novarocks-server/compat`. Both intentionally enter the compatibility
-toolchain.
-
-### Compatibility validation (explicit opt-in)
-
-Only use the compatibility path when changing `novarocks-compat`, the
-StarRocks wire/shim boundary, or FE-compatible behavior:
-
-```bash
-tools/ci/local-full-ci.sh --with-compat
-```
-
-This opt-in builds a separate compat artifact and runs the StarRocks-compatible
-cluster suite. It requires the StarRocks third-party environment described in
-the compatibility test guide.
-
-For focused standalone validation:
+For focused native validation:
 
 ```bash
 cargo test --test standalone_cli

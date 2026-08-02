@@ -46,10 +46,8 @@ impl TestConfig {
         let config_content = r#"
 [server]
 host = "127.0.0.1"
-heartbeat_port = 9050
-brpc_port = 9060
 http_port = 8040
-exchange_port = 9070
+grpc_port = 9080
 
 [runtime]
 exchange_wait_ms = 5000
@@ -64,7 +62,6 @@ parquet_page_cache_ttl_seconds = 3600
 
 [debug]
 exec_node_output = false
-exec_batch_plan_json = false
 "#;
 
         std::fs::write(&config_path, config_content)?;

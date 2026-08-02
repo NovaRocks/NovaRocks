@@ -450,31 +450,14 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default)]
     pub priority_networks: String,
-    #[serde(default = "default_heartbeat_port")]
-    pub heartbeat_port: u16,
-    #[serde(default = "default_be_port")]
-    pub be_port: u16,
-    #[serde(default = "default_brpc_port")]
-    pub brpc_port: u16,
     #[serde(default = "default_http_port")]
     pub http_port: u16,
     #[serde(default = "default_grpc_port")]
     pub grpc_port: u16,
-    #[serde(default = "default_starlet_port")]
-    pub starlet_port: u16,
 }
 
 fn default_server_host() -> String {
     "127.0.0.1".to_string()
-}
-fn default_heartbeat_port() -> u16 {
-    9050
-}
-fn default_be_port() -> u16 {
-    9060
-}
-fn default_brpc_port() -> u16 {
-    8060
 }
 fn default_http_port() -> u16 {
     8040
@@ -482,21 +465,14 @@ fn default_http_port() -> u16 {
 fn default_grpc_port() -> u16 {
     9080
 }
-fn default_starlet_port() -> u16 {
-    9070
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             host: default_server_host(),
             priority_networks: String::new(),
-            heartbeat_port: default_heartbeat_port(),
-            be_port: default_be_port(),
-            brpc_port: default_brpc_port(),
             http_port: default_http_port(),
             grpc_port: default_grpc_port(),
-            starlet_port: default_starlet_port(),
         }
     }
 }
@@ -796,8 +772,6 @@ pub struct RuntimeConfig {
     pub pipeline_scan_thread_pool_queue_size: usize,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
     pub pipeline_exec_thread_pool_thread_num: usize,
-    #[serde(default = "default_internal_service_query_rpc_thread_num")]
-    pub internal_service_query_rpc_thread_num: usize,
     #[serde(default = "default_data_runtime_worker_threads")]
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
@@ -812,38 +786,10 @@ pub struct RuntimeConfig {
     pub scan_submit_fail_timeout_ms: u64,
     #[serde(default = "default_profile_report_interval")]
     pub profile_report_interval: i64,
-    #[serde(default = "default_fe_rpc_connect_timeout_ms")]
-    pub fe_rpc_connect_timeout_ms: u64,
-    #[serde(default = "default_fe_rpc_timeout_ms")]
-    pub fe_rpc_timeout_ms: u64,
-    #[serde(default = "default_fe_rpc_retry_interval_ms")]
-    pub fe_rpc_retry_interval_ms: u64,
-    #[serde(default = "default_fe_rpc_pool_max_idle_per_host")]
-    pub fe_rpc_pool_max_idle_per_host: usize,
-    #[serde(default = "default_fe_rpc_max_inflight_total")]
-    pub fe_rpc_max_inflight_total: usize,
-    #[serde(default = "default_fe_rpc_max_inflight_schema")]
-    pub fe_rpc_max_inflight_schema: usize,
-    #[serde(default = "default_fe_rpc_max_inflight_exec_status")]
-    pub fe_rpc_max_inflight_exec_status: usize,
-    #[serde(default = "default_fe_rpc_max_inflight_control")]
-    pub fe_rpc_max_inflight_control: usize,
-    #[serde(default = "default_fe_rpc_max_inflight_schema_query")]
-    pub fe_rpc_max_inflight_schema_query: usize,
     #[serde(default = "default_table_schema_service_max_retries")]
     pub table_schema_service_max_retries: usize,
     #[serde(default = "default_table_schema_service_cache_capacity")]
     pub table_schema_service_cache_capacity: u64,
-    #[serde(default = "default_exec_state_report_max_threads")]
-    pub exec_state_report_max_threads: usize,
-    #[serde(default = "default_priority_exec_state_report_max_threads")]
-    pub priority_exec_state_report_max_threads: usize,
-    #[serde(default = "default_report_exec_rpc_request_retry_num")]
-    pub report_exec_rpc_request_retry_num: usize,
-    #[serde(default = "default_report_exec_batch_flush_interval_ms")]
-    pub report_exec_batch_flush_interval_ms: u64,
-    #[serde(default = "default_report_exec_batch_max_size")]
-    pub report_exec_batch_max_size: usize,
     #[serde(default)]
     pub runtime_filter_scan_wait_time_ms_override: Option<i64>,
     #[serde(default)]
@@ -1267,10 +1213,6 @@ fn default_pipeline_exec_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores
 }
 
-fn default_internal_service_query_rpc_thread_num() -> usize {
-    0 // 0 means use CPU cores, aligned with StarRocks internal_service_query_rpc_thread_num
-}
-
 fn default_data_runtime_worker_threads() -> usize {
     0 // 0 means use CPU cores for global data runtime
 }
@@ -1339,68 +1281,12 @@ fn default_profile_report_interval() -> i64 {
     30
 }
 
-fn default_fe_rpc_connect_timeout_ms() -> u64 {
-    5_000
-}
-
-fn default_fe_rpc_timeout_ms() -> u64 {
-    5_000
-}
-
-fn default_fe_rpc_retry_interval_ms() -> u64 {
-    100
-}
-
-fn default_fe_rpc_pool_max_idle_per_host() -> usize {
-    10
-}
-
-fn default_fe_rpc_max_inflight_total() -> usize {
-    32
-}
-
-fn default_fe_rpc_max_inflight_schema() -> usize {
-    8
-}
-
-fn default_fe_rpc_max_inflight_exec_status() -> usize {
-    4
-}
-
-fn default_fe_rpc_max_inflight_control() -> usize {
-    4
-}
-
-fn default_fe_rpc_max_inflight_schema_query() -> usize {
-    4
-}
-
 fn default_table_schema_service_max_retries() -> usize {
     3
 }
 
 fn default_table_schema_service_cache_capacity() -> u64 {
     4_096
-}
-
-fn default_exec_state_report_max_threads() -> usize {
-    2
-}
-
-fn default_priority_exec_state_report_max_threads() -> usize {
-    2
-}
-
-fn default_report_exec_rpc_request_retry_num() -> usize {
-    10
-}
-
-fn default_report_exec_batch_flush_interval_ms() -> u64 {
-    50
-}
-
-fn default_report_exec_batch_max_size() -> usize {
-    32
 }
 
 fn default_object_storage_retry_log_summary_interval_ms() -> u64 {
@@ -1475,7 +1361,6 @@ impl Default for RuntimeConfig {
             io_coalesce_adaptive_lazy_active: default_io_coalesce_adaptive_lazy_active(),
             pipeline_scan_thread_pool_queue_size: default_pipeline_scan_thread_pool_queue_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
-            internal_service_query_rpc_thread_num: default_internal_service_query_rpc_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
             spill_io_threads: default_spill_io_threads(),
@@ -1483,23 +1368,8 @@ impl Default for RuntimeConfig {
             scan_submit_fail_max: default_scan_submit_fail_max(),
             scan_submit_fail_timeout_ms: default_scan_submit_fail_timeout_ms(),
             profile_report_interval: default_profile_report_interval(),
-            fe_rpc_connect_timeout_ms: default_fe_rpc_connect_timeout_ms(),
-            fe_rpc_timeout_ms: default_fe_rpc_timeout_ms(),
-            fe_rpc_retry_interval_ms: default_fe_rpc_retry_interval_ms(),
-            fe_rpc_pool_max_idle_per_host: default_fe_rpc_pool_max_idle_per_host(),
-            fe_rpc_max_inflight_total: default_fe_rpc_max_inflight_total(),
-            fe_rpc_max_inflight_schema: default_fe_rpc_max_inflight_schema(),
-            fe_rpc_max_inflight_exec_status: default_fe_rpc_max_inflight_exec_status(),
-            fe_rpc_max_inflight_control: default_fe_rpc_max_inflight_control(),
-            fe_rpc_max_inflight_schema_query: default_fe_rpc_max_inflight_schema_query(),
             table_schema_service_max_retries: default_table_schema_service_max_retries(),
             table_schema_service_cache_capacity: default_table_schema_service_cache_capacity(),
-            exec_state_report_max_threads: default_exec_state_report_max_threads(),
-            priority_exec_state_report_max_threads: default_priority_exec_state_report_max_threads(
-            ),
-            report_exec_rpc_request_retry_num: default_report_exec_rpc_request_retry_num(),
-            report_exec_batch_flush_interval_ms: default_report_exec_batch_flush_interval_ms(),
-            report_exec_batch_max_size: default_report_exec_batch_max_size(),
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             object_storage: ObjectStorageConfig::default(),
@@ -1649,18 +1519,6 @@ impl RuntimeConfig {
                 .unwrap_or(1)
         }
     }
-
-    /// Get the actual number of internal-service query RPC threads.
-    /// Returns CPU cores if configured as 0.
-    pub fn actual_internal_service_query_rpc_threads(&self) -> usize {
-        if self.internal_service_query_rpc_thread_num > 0 {
-            self.internal_service_query_rpc_thread_num
-        } else {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        }
-    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -1797,9 +1655,6 @@ impl Default for CacheConfig {
 #[derive(Clone, Default)]
 pub struct DebugConfig {
     pub exec_node_output: bool,
-    /// Dump RPC inputs as "named_json" for `exec_plan_fragment` / `exec_batch_plan_fragments`.
-    /// This is config-only (no env var fallback).
-    pub exec_batch_plan_json: bool,
     #[cfg(debug_assertions)]
     pub fault_inject_fetch_not_ready_count: Option<usize>,
     #[cfg(debug_assertions)]
@@ -1817,7 +1672,6 @@ pub struct DebugConfig {
 #[serde(default)]
 struct DebugConfigToml {
     exec_node_output: bool,
-    exec_batch_plan_json: bool,
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: bool,
     emit_grpc_fragment_marker: bool,
@@ -1830,7 +1684,6 @@ struct DebugConfigToml {
 #[serde(default)]
 struct DebugConfigToml {
     exec_node_output: bool,
-    exec_batch_plan_json: bool,
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: Option<bool>,
     emit_grpc_fragment_marker: Option<bool>,
@@ -1848,7 +1701,6 @@ impl<'de> Deserialize<'de> for DebugConfig {
         {
             Ok(Self {
                 exec_node_output: raw.exec_node_output,
-                exec_batch_plan_json: raw.exec_batch_plan_json,
                 fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
                 emit_cancel_marker: raw.emit_cancel_marker,
                 emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
@@ -1885,7 +1737,6 @@ impl<'de> Deserialize<'de> for DebugConfig {
             }
             Ok(Self {
                 exec_node_output: raw.exec_node_output,
-                exec_batch_plan_json: raw.exec_batch_plan_json,
             })
         }
     }
@@ -2250,31 +2101,6 @@ priority_networks = "10.10.10.0/24;192.168.0.0/16"
     }
 
     #[test]
-    fn test_server_starlet_port_default_is_9070() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[server]
-http_port = 8040
-"#,
-        )
-        .expect("parse config");
-        assert_eq!(cfg.server.starlet_port, 9070);
-    }
-
-    #[test]
-    fn test_server_starlet_port_can_be_overridden() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[server]
-http_port = 8040
-starlet_port = 19070
-"#,
-        )
-        .expect("parse config");
-        assert_eq!(cfg.server.starlet_port, 19070);
-    }
-
-    #[test]
     fn test_server_grpc_port_default_is_9080() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
@@ -2607,17 +2433,6 @@ data_runtime_max_blocking_threads = 99
     }
 
     #[test]
-    fn test_runtime_internal_service_query_rpc_threads_default_to_auto() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[runtime]
-"#,
-        )
-        .expect("parse config");
-        assert_eq!(cfg.runtime.internal_service_query_rpc_thread_num, 0);
-    }
-
-    #[test]
     fn test_runtime_mem_limit_defaults_to_starrocks_spec() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
@@ -2695,35 +2510,6 @@ mem_limit = "0"
                 .effective_be_mem_limit_bytes_for_visible_memory(100 * 1024 * 1024 * 1024)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn test_runtime_internal_service_query_rpc_threads_can_be_overridden() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[runtime]
-internal_service_query_rpc_thread_num = 7
-"#,
-        )
-        .expect("parse config");
-        assert_eq!(cfg.runtime.internal_service_query_rpc_thread_num, 7);
-    }
-
-    #[test]
-    fn test_actual_internal_service_query_rpc_threads_behavior() {
-        let mut runtime = RuntimeConfig {
-            internal_service_query_rpc_thread_num: 0,
-            ..Default::default()
-        };
-        let expected = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        assert_eq!(
-            runtime.actual_internal_service_query_rpc_threads(),
-            expected
-        );
-        runtime.internal_service_query_rpc_thread_num = 5;
-        assert_eq!(runtime.actual_internal_service_query_rpc_threads(), 5);
     }
 
     #[test]

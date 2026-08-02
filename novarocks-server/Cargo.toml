@@ -2,7 +2,6 @@
 name = "novarocks-server"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [[bin]]
 name = "novarocks"
@@ -11,17 +10,14 @@ path = "src/main.rs"
 [dependencies]
 novarocks = { path = "../novarocks/core" }
 novarocks-backend = { path = "../novarocks/backend" }
-novarocks-compat = { path = "../novarocks/compat", optional = true }
 novarocks-frontend = { path = "../novarocks/frontend" }
 novarocks-fs = { path = "../novarocks/fs" }
 anyhow = "1"
-ctrlc = "3.4"
 libc = "0.2"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "time"] }
 
 [features]
-compat = ["dep:novarocks-compat"]
 foundationdb-provider = ["novarocks/foundationdb-provider"]
 mysql-state-store-provider = ["novarocks/mysql-state-store-provider"]
 

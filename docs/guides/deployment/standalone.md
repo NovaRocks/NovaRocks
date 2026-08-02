@@ -30,8 +30,6 @@ standalone 部署使用一个 NovaRocks 进程提供 MySQL 兼容 SQL 入口，�
 
 ## 编译 NovaRocks
 
-standalone 部署不需要 StarRocks FE 兼容 brpc shim，使用默认非 `compat` 构建即可。
-
 本地验证或开发调试时，可以直接使用 debug 构建：
 
 ```bash
@@ -48,25 +46,8 @@ NO_PROXY=127.0.0.1,localhost \
 生产或准生产部署建议使用 release 构建：
 
 ```bash
-./build.sh --release
+cargo build --release -p novarocks-server
 ```
-
-如果需要生成包含二进制、默认配置、控制脚本和运行时库的部署目录，使用 package 输出：
-
-```bash
-./build.sh --release --package
-```
-
-默认部署目录为 `./output/novarocks`，常用文件如下：
-
-```text
-./output/novarocks/bin/novarocks
-./output/novarocks/bin/novarocksctl
-./output/novarocks/conf/novarocks.toml.example
-./output/novarocks/lib/
-```
-
-`build.sh` 会使用 `STARROCKS_THIRDPARTY` 指向的 thirdparty 目录；未显式设置时默认使用仓库下的 `./thirdparty`。
 
 ## 准备配置文件
 
@@ -126,7 +107,7 @@ NO_PROXY=127.0.0.1,localhost \
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-./target/release/novarocks standalone --port 9030 --config ./novarocks.toml
+./target/release/novarocks standalone --role all-in-one --config ./novarocks.toml
 ```
 
 启动成功后，标准输出会出现类似以下 readiness 标记：

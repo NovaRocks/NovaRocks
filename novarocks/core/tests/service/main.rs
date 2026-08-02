@@ -53,8 +53,7 @@ fn test_config_loading() {
         !config.server.host.trim().is_empty(),
         "config host should not be empty"
     );
-    assert!(config.server.heartbeat_port > 0);
-    assert!(config.server.brpc_port > 0);
+    assert!(config.server.grpc_port > 0);
 }
 
 #[test]

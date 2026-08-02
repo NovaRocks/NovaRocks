@@ -105,6 +105,16 @@ code-anchors:
 
 - ADR-0025 — SQL compiler 为何以显式 request、immutable snapshots 与 post-compile binding context 形成唯一入口（active）
 
+### runtime-role
+
+领域哲学：生产运行时只由 native FE/BE 角色组成。FE 拥有 SQL admission 和
+全局协调，BE 拥有本地执行；all-in-one 仅为测试便利且不得改变这条边界。
+外部系统经 Connector 接入，不以 inbound 兼容 server、daemon 或全局 bridge
+混入 native lifecycle。StarRocks 仅是只读 Connector：RPC 覆盖所有拓扑，direct
+永久只支持 shared-data。
+
+- ADR-0026 — 为何退役 StarRocks-compatible backend runtime role，并把 StarRocks 限定为外部 Connector（active）
+
 ### cluster-membership
 
 领域哲学：backend membership 的 durable desired state 与 heartbeat/live/generation 等运行期 observation 必须分离。
@@ -118,12 +128,11 @@ seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来�
 
 领域哲学：frontend 拥有 DML 的 statement application flow、durable operation lifecycle 与 production routing；
 core 只通过一对一 typed engine port 保留 query、connector 和 external commit truth。native persistent INSERT 当前只支持
-Iceberg；StarRocks 能力只存在于隔离的 compat BE execution，未来 native 支持只能作为 external connector，不能恢复
-内部 StarRocks 表。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
+Iceberg；StarRocks 只作为 read-only external connector，不能恢复内部 StarRocks 表或 server runtime。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
 handles，不以 service locator、core callback、metadata fallback 或公共 SPI 模糊 owner。
 
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
-- ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 compat/external StarRocks connector 隔离（active）
+- ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
 
 #### 历史
 

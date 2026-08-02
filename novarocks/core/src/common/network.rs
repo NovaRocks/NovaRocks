@@ -18,10 +18,8 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
-use std::sync::OnceLock;
 
 use crate::common::app_config::{NovaRocksConfig, ServerConfig};
-use crate::novarocks_config::config as novarocks_app_config;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Cidr {
@@ -41,20 +39,6 @@ pub struct AdvertiseEndpoint {
     pub port: u16,
 }
 
-pub fn advertise_host() -> Result<String, String> {
-    static ADVERTISE_HOST: OnceLock<Result<String, String>> = OnceLock::new();
-    ADVERTISE_HOST
-        .get_or_init(|| {
-            let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
-            advertise_endpoint_for_config(&cfg).map(|endpoint| endpoint.host)
-        })
-        .clone()
-}
-
-pub fn advertise_endpoint_for_config(cfg: &NovaRocksConfig) -> Result<AdvertiseEndpoint, String> {
-    advertise_endpoint_for_config_with_default_port(cfg, cfg.server.starlet_port)
-}
-
 pub fn standalone_advertise_endpoint_for_config(
     cfg: &NovaRocksConfig,
 ) -> Result<AdvertiseEndpoint, String> {
@@ -63,19 +47,6 @@ pub fn standalone_advertise_endpoint_for_config(
         host,
         port: cfg.server.grpc_port,
     })
-}
-
-fn advertise_endpoint_for_config_with_default_port(
-    cfg: &NovaRocksConfig,
-    default_port: u16,
-) -> Result<AdvertiseEndpoint, String> {
-    let host = advertise_host_for_cluster_config(cfg)?;
-    let port = if cfg.cluster.advertise_port == 0 {
-        default_port
-    } else {
-        cfg.cluster.advertise_port
-    };
-    Ok(AdvertiseEndpoint { host, port })
 }
 
 fn advertise_host_for_cluster_config(cfg: &NovaRocksConfig) -> Result<String, String> {
@@ -282,7 +253,7 @@ fn mask_v6(addr: Ipv6Addr, prefix_len: u8) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalAddress, advertise_endpoint_for_config, choose_advertise_host, format_host_for_url,
+        LocalAddress, choose_advertise_host, format_host_for_url,
         standalone_advertise_endpoint_for_config,
     };
     use std::net::IpAddr;
@@ -364,34 +335,9 @@ mod tests {
     }
 
     #[test]
-    fn advertise_endpoint_prefers_cluster_override() {
-        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
-        cfg.server.starlet_port = 9070;
-        cfg.cluster.advertise_host = "be.example.com".to_string();
-        cfg.cluster.advertise_port = 19070;
-
-        let endpoint = advertise_endpoint_for_config(&cfg).expect("resolve endpoint");
-        assert_eq!(endpoint.host, "be.example.com");
-        assert_eq!(endpoint.port, 19070);
-    }
-
-    #[test]
-    fn advertise_endpoint_uses_starlet_port_when_port_is_zero() {
-        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
-        cfg.server.starlet_port = 19070;
-        cfg.cluster.advertise_host = "be.example.com".to_string();
-        cfg.cluster.advertise_port = 0;
-
-        let endpoint = advertise_endpoint_for_config(&cfg).expect("resolve endpoint");
-        assert_eq!(endpoint.host, "be.example.com");
-        assert_eq!(endpoint.port, 19070);
-    }
-
-    #[test]
     fn standalone_advertise_endpoint_uses_grpc_port_when_port_is_zero() {
         let mut cfg = crate::common::app_config::NovaRocksConfig::default();
         cfg.server.grpc_port = 19080;
-        cfg.server.starlet_port = 19070;
         cfg.cluster.advertise_host = "be.example.com".to_string();
         cfg.cluster.advertise_port = 0;
 

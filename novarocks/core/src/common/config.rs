@@ -24,13 +24,6 @@ pub(crate) fn debug_exec_node_output() -> bool {
         .unwrap_or(false)
 }
 
-pub fn debug_exec_batch_plan_json() -> bool {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.debug.exec_batch_plan_json)
-        .unwrap_or(false)
-}
-
 pub(crate) fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
     novarocks_app_config()
         .ok()
@@ -185,69 +178,6 @@ pub(crate) fn optimizer_effective_backend_count() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn fe_rpc_connect_timeout_ms() -> u64 {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_connect_timeout_ms)
-        .unwrap_or(5_000)
-}
-
-pub fn fe_rpc_timeout_ms() -> u64 {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_timeout_ms)
-        .unwrap_or(5_000)
-}
-
-pub fn fe_rpc_retry_interval_ms() -> u64 {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_retry_interval_ms)
-        .unwrap_or(100)
-}
-
-pub fn fe_rpc_pool_max_idle_per_host() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_pool_max_idle_per_host.max(1))
-        .unwrap_or(10)
-}
-
-pub fn fe_rpc_max_inflight_total() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_max_inflight_total.max(1))
-        .unwrap_or(32)
-}
-
-pub fn fe_rpc_max_inflight_schema() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_max_inflight_schema.max(1))
-        .unwrap_or(8)
-}
-
-pub fn fe_rpc_max_inflight_exec_status() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_max_inflight_exec_status.max(1))
-        .unwrap_or(4)
-}
-
-pub fn fe_rpc_max_inflight_control() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_max_inflight_control.max(1))
-        .unwrap_or(4)
-}
-
-pub fn fe_rpc_max_inflight_schema_query() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.fe_rpc_max_inflight_schema_query.max(1))
-        .unwrap_or(4)
-}
-
 pub(crate) fn table_schema_service_max_retries() -> usize {
     novarocks_app_config()
         .ok()
@@ -260,41 +190,6 @@ pub(crate) fn table_schema_service_cache_capacity() -> u64 {
         .ok()
         .map(|c| c.runtime.table_schema_service_cache_capacity.max(1))
         .unwrap_or(4_096)
-}
-
-pub fn exec_state_report_max_threads() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.exec_state_report_max_threads.max(1))
-        .unwrap_or(2)
-}
-
-pub fn priority_exec_state_report_max_threads() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.priority_exec_state_report_max_threads.max(1))
-        .unwrap_or(2)
-}
-
-pub fn report_exec_rpc_request_retry_num() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.report_exec_rpc_request_retry_num.max(1))
-        .unwrap_or(10)
-}
-
-pub fn report_exec_batch_flush_interval_ms() -> u64 {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.report_exec_batch_flush_interval_ms.max(1))
-        .unwrap_or(50)
-}
-
-pub fn report_exec_batch_max_size() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.report_exec_batch_max_size.max(1))
-        .unwrap_or(32)
 }
 
 pub(crate) fn local_exchange_buffer_mem_limit_per_driver() -> usize {
@@ -336,17 +231,6 @@ pub(crate) fn pipeline_scan_thread_pool_thread_num() -> usize {
     novarocks_app_config()
         .ok()
         .map(|c| c.runtime.actual_scan_threads())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        })
-}
-
-pub fn internal_service_query_rpc_thread_num() -> usize {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.runtime.actual_internal_service_query_rpc_threads())
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -583,11 +467,4 @@ pub(crate) fn grpc_port() -> u16 {
         .ok()
         .map(|c| c.server.grpc_port)
         .unwrap_or(9080)
-}
-
-pub(crate) fn starlet_port() -> u16 {
-    novarocks_app_config()
-        .ok()
-        .map(|c| c.server.starlet_port)
-        .unwrap_or(9070)
 }

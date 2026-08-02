@@ -34,87 +34,62 @@ This guide focuses on high-frequency implementation details and modification ent
 NovaRocks is a **Rust-based, cloud-native, compute-storage decoupling friendly**
 analytical query engine.
 
-It now has two first-class modes:
+Its production runtime is the native NovaRocks FE/BE role model:
 
-- **StarRocks-compatible backend mode**
-  - FE-compatible protocol behavior with zero FE awareness changes.
-  - C++ Shim handles brpc access and protocol bridging.
-  - Rust handles thrift plan lowering, pipeline execution, exchange, and connectors.
+- **Native FE/BE roles**
+  - `role=fe` owns the MySQL SQL entrypoint, statement admission, planning, and
+    distributed coordination.
+  - `role=be` owns local fragment execution and the native gRPC boundary.
+  - `role=all-in-one` preserves the FE/BE application boundary for local
+    testing; it is not a separate production topology.
 
-- **Standalone SQL engine mode**
-  - Runs without StarRocks FE.
-  - Provides a MySQL-compatible local server through `standalone`.
-  - Owns SQL parsing, analysis, planning, codegen, catalog state, Iceberg catalog
-    dispatch, and SQL test execution.
+- **StarRocks external Connector**
+  - StarRocks is read-only external data, never an inbound server protocol.
+  - RPC reads support every topology; direct reads permanently require
+    shared-data.
 
-Columnar processing is centered on Arrow `RecordBatch` / `Chunk` in both modes.
+Columnar processing is centered on Arrow `RecordBatch` / `Chunk`.
 
 ---
 
 ## 2. Architecture Overview (Current Code)
 
-### 2.1 StarRocks-Compatible Backend Mode
+### 2.1 Native FE/BE Roles
 
 ```text
-StarRocks FE
-  |- HeartbeatService (Thrift) -------> Rust: src/service/heartbeat_service.rs
-  |- BackendService (Thrift, be_port) -> Rust: src/service/backend_service.rs
-  `- PInternalService (brpc) ---------> C++ Shim: src/shim/brpc_server.cpp
-                                          |
-                                          `- FFI (C ABI, compat.h)
-                                               v
-                                          Rust FFI: src/service/engine_ffi.rs
-                                               v
-                                          Query Execute: src/service/internal_service.rs
-                                               v
-                                          Lowering: src/lower/**
-                                               v
-                                          Pipeline: src/exec/pipeline/**
-                                               v
-                      +---------- ResultBuffer: src/runtime/result_buffer.rs
-                      `---------- Exchange (gRPC): src/runtime/exchange.rs + src/service/grpc_*.rs
-```
-
-### 2.2 Standalone SQL Engine Mode
-
-```text
-SQL client / SQL test runner
-  `- MySQL protocol -----------> Rust: src/server/mod.rs
+SQL client
+  `- MySQL protocol -----------> NovaRocks role=fe
                                       |
                                       v
-                            Standalone Engine: src/engine/**
+                            Frontend SQL/coordinator application
                                       |
                                       v
-                     SQL Parser / Analyzer / Optimizer / Codegen:
-                         src/sql/parser/**
-                         src/sql/analyzer/**
-                         src/sql/optimizer/**
-                         src/sql/codegen/**
+                            Native gRPC fragment submission
                                       |
                                       v
+                            NovaRocks role=be
+                                      |
                             Pipeline / Runtime / Connectors
-                                      |
-                               Iceberg Catalogs
-                            memory/hadoop/rest/hive
 ```
 
 ---
 
 ## 3. Non-Negotiable Rules (High Priority)
 
-1. **Strictly follow FE-provided plan and type metadata**
+1. **Strictly follow native frozen contracts and type metadata**
    No fallback behavior, no guessed defaults, no implicit type downgrade.
 
 2. **Fail fast on unsupported or ambiguous semantics**
    Return explicit errors in parsing/lowering stages instead of "best effort" execution.
 
 3. **Keep protocol and execution responsibilities separated**
-   C++ Shim is the protocol gateway; execution semantics belong to Rust.
+   Native gRPC is the FE/BE process boundary; execution semantics belong to
+   their Rust application owners.
 
-4. **Keep FE-compatible and standalone responsibilities explicit**
-   FE-compatible paths follow FE-provided thrift metadata. Standalone paths own
-   SQL parsing, catalog resolution, and session context. Do not mix assumptions
-   between the two modes without checking the active entrypoint.
+4. **Keep native role and Connector responsibilities explicit**
+   FE owns SQL admission and global coordination; BE owns local execution.
+   Connectors own external-system facts. Do not mix those owners through
+   process-global state, direct calls, or transport fallback.
 
 5. **Distributed deployment is the source of truth; standalone is test-only**
    The real, user-facing deployment is NovaRocks distributed (1 NovaRocks FE +
@@ -145,36 +120,21 @@ SQL client / SQL test runner
 
 ### 4.1 Entrypoints and Services
 
-- `src/main.rs`
-  Process entry. Dispatches FE-compatible modes (`run`, `start`, `stop`,
-  `restart`) and the `standalone` mode.
+- `novarocks-server/src/main.rs`
+  Native top-level command dispatch. The only server command is `standalone`;
+  it chooses `fe`, `be`, or `all-in-one` before startup side effects.
 
-- `src/server/mod.rs`
-  MySQL-compatible standalone server, session context, SQL batch splitting,
-  query timeout, and embedded statement routing.
+- `novarocks/frontend/src/**`
+  FE application composition, SQL admission, connector control host, and
+  distributed query coordination.
 
-- `src/service/internal_service.rs`
-  FE-compatible query execution entrypoints: `submit_exec_plan_fragment`,
-  `submit_exec_batch_plan_fragments`, `cancel`.
+- `novarocks/backend/src/**`
+  BE application composition, native gRPC services, query lifecycle registry,
+  and connector execution host.
 
-- `src/service/engine_ffi.rs`
-  C ABI exports: submit/fetch/cancel and lake publish/abort.
-
-- `src/service/compat.rs`
-  Rust-to-C++ shim bootstrap bridge.
-
-- `src/service/backend_service.rs`
-  StarRocks BE thrift service (`be_port`).
-
-- `src/service/heartbeat_service.rs`
-  FE heartbeat service (`heartbeat_port`).
-
-- `src/service/grpc_server.rs`
-  gRPC server for exchange, query lifecycle Init/Abort/control streams, runtime
-  filters, lookup, and related internal RPCs.
-
-- `src/service/grpc_client.rs`
-  gRPC client for exchange, query lifecycle, and runtime filter transmission.
+- `novarocks/core/src/**`
+  Carrier-neutral execution, query lifecycle contracts, and native runtime
+  kernels shared by FE and BE application owners.
 
 ### 4.2 Standalone SQL Engine
 
@@ -284,91 +244,44 @@ SQL client / SQL test runner
 - `src/runtime/runtime_state.rs`
   Runtime state for cache, spill, runtime filters, and execution context.
 
-### 4.7 Connectors / Catalog Backends / Formats / Filesystem
+### 4.7 Connectors / Catalog Backends / Filesystem
 
-- `src/connector/mod.rs`
-  `ConnectorRegistry`, scan connector registry, standalone catalog/table
-  source and sink backends, and MV backend registration.
+- `novarocks/connector/starrocks/**`
+  Read-only StarRocks external Connector. It owns RPC remote reads for every
+  topology and shared-data-only direct reads; it does not depend on Core,
+  Frontend, Backend, Compat, or an Iceberg provider.
 
-- `src/connector/jdbc.rs`
-  JDBC/MySQL scan connector.
+- `novarocks/connector/iceberg/**`
+  Iceberg control/execution contracts, catalog integrations, and storage facts.
 
-- `src/connector/hdfs.rs`
-  HDFS/Iceberg/Parquet-style scan connector.
-
-- `src/connector/starrocks.rs`
-  StarRocks connector.
-
-- `src/connector/iceberg/**`
-  Iceberg scan, metadata, catalog registry, memory/Hadoop/REST catalog support,
-  data/delete writers, commit actions, refs, compaction, and schema/default
-  value helpers.
-
-- `src/formats/**`
-  Parquet/ORC/StarRocks format readers.
-
-- `src/fs/**`
-  Local and opendal/OSS filesystem abstractions.
-
-### 4.8 C++ Shim
-
-- `src/shim/brpc_server.cpp`
-  brpc service entry (protocol gateway).
-
-- `src/shim/compat.cpp`
-  C++ compat layer implementation.
-
-- `src/shim/compat.h`
-  Rust/C++ FFI ABI contract.
+- `novarocks/fs/**`
+  Connector-neutral authorized object-store access.
 
 ---
 
 ## 5. Core Execution Flows
 
-### 5.1 FE-Compatible Query Path
+### 5.1 Native SQL and Connector Path
 
-1. FE sends requests to C++ Shim through brpc.
-2. C++ forwards thrift binary attachments into Rust FFI (`engine_ffi.rs`).
-3. `internal_service.rs` deserializes payloads and organizes fragment execution.
-4. `lower/` transforms thrift plan/expr into `ExecPlan` + `ExprArena`.
-5. `exec/pipeline/executor.rs` builds and schedules pipeline drivers.
-6. Results are written into `result_buffer` or sent downstream via exchange sink.
-7. FE fetches results through the fetch path (FFI fetch -> `result_buffer`).
+1. A MySQL client connects to a `role=fe` process through the native SQL
+   entrypoint.
+2. The frontend owns session admission, catalog resolution, planning, and
+   coordinator lifecycle assembly.
+3. Persistent tables belong to external providers. Iceberg owns its catalog and
+   mutation truth; StarRocks is a read-only external Connector.
+4. The frontend freezes native fragment and Connector facts, then sends them to
+   one or more `role=be` processes through native gRPC.
+5. BE hosts bind installed Connector execution instances and run Arrow batches
+   through the pipeline/runtime stack.
 
-### 5.2 Standalone SQL Path
-
-1. A MySQL client or SQL test runner connects to `standalone`
-   (`src/server/mod.rs`).
-2. The standalone server resolves session state (`USE`, `SET catalog`,
-   timeouts, current database) and forwards supported statements to
-   `StandaloneSession::execute_in_context`.
-3. `src/sql/parser/**` and `src/engine/statement.rs` route persistent-table
-   DDL/DML to external Iceberg catalogs. Native does not own an internal
-   StarRocks table type.
-4. SELECT/EXPLAIN statements go through standalone analyzer, optimizer, and
-   codegen under `src/sql/**`.
-5. Generated execution plans run through the shared pipeline/runtime stack.
-6. Results return as `QueryResult`, then `src/server/encoding.rs` converts Arrow
-   values to MySQL wire values.
-
-### 5.3 Standalone Catalog and Storage Path
-
-1. Iceberg catalogs are registered in `IcebergCatalogRegistry`; supported
-   catalog types are `memory`, `hadoop`, `rest`, and `hive`.
-2. Native has no managed internal-table storage engine. Future StarRocks
-   support must be an external connector, not a restored standalone table
-   subsystem.
-3. Standalone DDL/DML uses connector provider contracts and the Iceberg writer
-   path to keep SQL application flow separate from external storage ownership.
-
-### 5.4 Exchange Path
+### 5.2 Exchange Path
 
 1. Sender-side operators encode chunks and send through `exchange_sender -> grpc_client`.
 2. Receiver side (`grpc_server.exchange`) decodes payloads and pushes into `runtime/exchange`.
 3. `ExchangeScanOp` blocks until all senders reach EOS.
 4. On cancellation, `exchange::cancel_*` clears exchange keys and wakes blocked waiters.
 
-### 5.5 Native Distributed Query Lifecycle Path
+### 5.3 Native Distributed Query Lifecycle Path
 
 1. `novarocks/frontend/src/coordinator/execution.rs` freezes a
    `QueryExecutionId` and participant manifests from one live backend snapshot.
@@ -382,8 +295,7 @@ SQL client / SQL test runner
    tombstones, and the single termination latch.
 5. Runtime-filter state is installed as an Init contribution. Client
    cancellation remains `KILL QUERY` through the frontend query-control owner
-   and is delivered as lifecycle Abort; compat does not synthesize lifecycle
-   entries.
+   and is delivered as lifecycle Abort.
 6. QLC-2 still submits and immediately starts fragments one by one after the
    barrier. Atomic Stage/Start is a later lifecycle phase, so this path must not
    be described as global atomic startup.
@@ -441,8 +353,8 @@ SQL client / SQL test runner
 ### 7.2 Common Config Sections
 
 - `[server]`
-  `host`, `priority_networks`, `heartbeat_port`, `be_port`, `brpc_port`,
-  `http_port`, `starlet_port`
+  `host`, `priority_networks`, `http_port`, `grpc_port`, and native advertise
+  identity.
 
 - `[runtime]`
   `exchange_wait_ms`, `exchange_io_threads`, `exchange_io_max_inflight_bytes`,
@@ -662,10 +574,10 @@ entry exists.
 
 ```bash
 # Debug: fast compile, slow query (for fix verification)
-NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --role all-in-one
 
 # Release: slow compile, fast query (for suite testing)
-NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --role all-in-one
 ```
 
 When the local test environment is active:
@@ -677,8 +589,7 @@ cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONF
 ```
 
 When starting a server manually inside a Codex worktree, prefer the generated
-config or `--port "$NOVA_ENV_MYSQL_PORT"` instead of hard-coding `9030`,
-because another worktree may already be using the default MySQL port.
+config so its configured MySQL port cannot collide with another worktree.
 
 **Run test suites:**
 
@@ -696,9 +607,9 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --suite iceberg --mode verify
 ```
 
-Available suites: `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`, `sort`, etc.
-The `starrocks-compat` suite is special: the runner deploys its own FE + BE
-cluster and needs extra environment — see 8.5 before running it.
+Available suites: `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`, `sort`, and
+native distributed suites. Cluster mode and backend count come from runner CLI;
+no suite owns an alternate server runtime.
 
 **Run specific cases:**
 
@@ -706,104 +617,6 @@ cluster and needs extra environment — see 8.5 before running it.
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --suite tpc-ds --only q10,q35,q69 --mode verify
 ```
-
-### 8.5 StarRocks-Compat Suite (compat CI: runner-managed FE + 3 compat BE)
-
-The `starrocks-compat` suite is the compat CI gate. Unlike every other
-suite, it does NOT connect to a standalone server you started. The runner
-itself deploys an ephemeral cluster per run: one isolated StarRocks FE
-(symlinked from a prebuilt FE home, with a re-rendered `fe.conf` and dynamic
-ports) plus three compat-mode NovaRocks BEs (from a validated compat
-artifact), registers the BEs, waits for topology, runs the cases, and tears
-everything down. **Do not start FE/BE manually for this suite**, and do not
-confuse this flow with the long-lived manual deployment used for FE Java
-development — the two share the FE home directory but nothing else.
-
-**Prerequisites (all hard preflight failures if missing):**
-
-1. **Built StarRocks FE home** at `$HOME/starrocks-on-novarocks/fe`
-   (override with `STARROCKS_FE_HOME`). It must contain `bin/start_fe.sh`
-   and the full `lib/*.jar` set from a StarRocks `./build.sh --fe` build.
-2. **Shared-data keys in the FE home's `conf/fe.conf`.** The runner renders
-   its own isolated `fe.conf` (ports, meta dir, `run_mode = shared_data`)
-   but copies ONLY the builtin-storage-volume keys from the base file and
-   preflights them. The base `fe.conf` must therefore contain a valid block
-   such as:
-
-   ```properties
-   enable_load_volume_from_conf = true
-   cloud_native_storage_type = S3
-   aws_s3_path = <bucket>/starrocks-compat
-   aws_s3_endpoint = http://127.0.0.1:9000   # shared MinIO; see env.sh AWS_S3_ENDPOINT
-   aws_s3_access_key = <from env.sh AWS_S3_ACCESS_KEY_ID>
-   aws_s3_secret_key = <from env.sh AWS_S3_SECRET_ACCESS_KEY>
-   ```
-
-   Endpoint and credentials must match the shared MinIO from
-   `docker/iceberg-rest/runtime/current/env.sh`.
-3. **Shared MinIO running** (`docker/iceberg-rest/up.sh`).
-4. **Java 17+** on PATH (or `JAVA_HOME`).
-5. **>= 5 GB free disk** on the volume holding the repo — the FE refuses to
-   start when the meta dir has less (`MetaHelper.checkMetaDir`).
-6. **Compat artifact + thirdparty toolchain.** BEs run a compat-feature
-   binary described by a manifest. Building it (explicitly or via the
-   runner's auto-build fallback) needs the StarRocks thirdparty environment
-   exported — non-interactive shells do not source `~/.zshrc`:
-
-   ```bash
-   export STARROCKS_THIRDPARTY=$HOME/project/starrocks/thirdparty
-   export STARROCKS_THIRDPARTY_INSTALLED=$HOME/project/starrocks/thirdparty/installed
-   export STARROCKS_HOME=$HOME/project/starrocks
-   export STARROCKS_GCC_HOME=/usr/bin
-   ```
-
-**Environment contract consumed by the runner:**
-
-| Variable | Meaning |
-|----------|---------|
-| `STARROCKS_FE_HOME` | FE home override (default `$HOME/starrocks-on-novarocks/fe`) |
-| `NOVAROCKS_COMPAT_ARTIFACT_MANIFEST` | Path to a prebuilt compat artifact manifest; unset = runner builds one itself (needs thirdparty env) |
-| `NOVAROCKS_COMPAT_ARTIFACT_PROFILE` | Cargo profile the manifest must declare (e.g. `dev`) |
-| `NOVAROCKS_BIN` | Default (non-compat) binary; must be a DIFFERENT binary than the compat artifact (SHA-256 checked) |
-| `NO_PROXY=127.0.0.1,localhost` | Required, as for every suite touching local services |
-
-The manifest also pins `git_head`: it must equal the current repo HEAD, so
-rebuild the artifact after every commit/rebase (a dirty working tree is
-fine — only HEAD is compared).
-
-**Canonical commands:**
-
-```bash
-# 1. Build the compat artifact (after exporting the thirdparty env above)
-tools/ci/build-compat-artifact.sh --profile dev --output-dir /tmp/nr-compat-artifact
-
-# 2. Run the suite
-source docker/iceberg-rest/runtime/current/env.sh
-env NO_PROXY=127.0.0.1,localhost \
-  NOVAROCKS_BIN="$(pwd)/target/debug/novarocks" \
-  NOVAROCKS_COMPAT_ARTIFACT_MANIFEST=/tmp/nr-compat-artifact/manifest.txt \
-  NOVAROCKS_COMPAT_ARTIFACT_PROFILE=dev \
-  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite starrocks-compat --mode verify -j 1
-```
-
-**Debugging failures:**
-
-- Per-run state lives under `.sql-test-runner-runtime/starrocks-compat-*/`:
-  `fe/log/fe.log` (FE), `be-N.log` (captured BE stdout/stderr), and
-  `be-N/log/novarocks.INFO|WARNING|ERROR` (BE tracing files). The whole
-  directory is deleted during cleanup, so capture what you need while the
-  run is still failing, or instrument locally.
-- `@be_log_contains` / `@be_log_count_at_least` directives read ONLY the
-  captured stdout/stderr (`be-N.log`), never the rotating tracing files.
-  Test-evidence markers in BE code must be emitted with `eprintln!`
-  (see `compat_scan`, `compat_ingress`, `compat_fragment_sink`).
-- On macOS, a BE that registers fine but then drops every connection with
-  zero log output usually died from a signal; check the crash reports in
-  `~/Library/Logs/DiagnosticReports/novarocks-compat-*.ips` (the
-  `faultingThread` stack is in the JSON body).
-
----
 
 ## 9. Suggested Starting Points for Typical Changes
 
@@ -825,13 +638,13 @@ env NO_PROXY=127.0.0.1,localhost \
   `novarocks/backend/src/query_lifecycle/**`,
   `novarocks/core/src/query_execution/lifecycle/**`, and
   `novarocks/core/src/query_execution/fragment_transport.rs`. Preserve the
-  Init + ControlReady production barrier; do not add a compat lifecycle shim,
+  Init + ControlReady production barrier; do not add a lifecycle shim,
   standalone direct-call path, or no-runtime-filter retry inside an attempt.
-- **Connector behavior**: inspect `src/connector/*`, `src/connector/iceberg/**`,
-  `src/connector/starrocks/**`, and `src/formats/*`. StarRocks code here is
-  compat execution infrastructure or future external-connector substrate, not
-  a native internal-table catalog.
-- **FE/BE interface behavior**: inspect `src/service/internal_service.rs`, `src/service/backend_service.rs`, `src/service/engine_ffi.rs`, `src/shim/compat.h`.
+- **Connector behavior**: inspect `novarocks/connector/**` and
+  `novarocks/fs/**`. StarRocks is a read-only external Connector, not a native
+  internal-table catalog or a server protocol.
+- **FE/BE interface behavior**: inspect `novarocks/frontend/src/**`,
+  `novarocks/backend/src/**`, and the neutral contracts under `novarocks/spi/**`.
 - **Optimizer observability / plan-shape regression**: see
   `src/sql/explain.rs` for the EXPLAIN formatter (Normal/Verbose/Costs/
   Analyze). `EXPLAIN ANALYZE` returns a query-level Planning/Execution/
