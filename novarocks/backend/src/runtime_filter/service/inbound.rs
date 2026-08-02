@@ -20,17 +20,19 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-use crate::runtime_filter::codec::contribution::{
+use novarocks::runtime_filter_transition::codec::contribution::{
     ContributionCodecExpectation, RuntimeFilterContribution, decode_contribution,
     semantic_contribution_bytes,
 };
-use crate::runtime_filter::codec::producer::decode_producer_failure;
-use crate::runtime_filter::port::identity::ProducerStreamId;
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::codec::producer::decode_producer_failure;
+use novarocks::runtime_filter_transition::port::identity::ProducerStreamId;
+use novarocks::runtime_filter_transition::port::producer::{
     ProducerHandle, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
 };
-use crate::runtime_filter::port::routing::RuntimeFilterRouteContractError;
-use crate::runtime_filter::port::transport::{RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind};
+use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRouteContractError;
+use novarocks::runtime_filter_transition::port::transport::{
+    RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
+};
 
 use super::dedupe::{ContributionAdmission, TombstoneVerdict};
 use super::registry::{DispatchAdmission, InboundProducerContract};
@@ -448,10 +450,10 @@ fn envelope_fingerprint(envelope: &RuntimeFilterEnvelope) -> [u8; 32] {
 
 fn contribution_expectation<'a>(
     contract: &'a InboundProducerContract,
-    binding_id: crate::runtime_filter::model::contract::BindingId,
-    fragment_instance_id: crate::common::types::UniqueId,
-    partition_id: crate::runtime_filter::port::identity::PartitionId,
-    sequence: crate::runtime_filter::port::identity::ProducerSequence,
+    binding_id: novarocks::runtime_filter_transition::model::contract::BindingId,
+    fragment_instance_id: novarocks_types::UniqueId,
+    partition_id: novarocks::runtime_filter_transition::port::identity::PartitionId,
+    sequence: novarocks::runtime_filter_transition::port::identity::ProducerSequence,
 ) -> ContributionCodecExpectation<'a> {
     match contract {
         InboundProducerContract::Membership { schema, .. } => {
@@ -490,7 +492,7 @@ fn map_route_error(error: RuntimeFilterRouteContractError) -> InboundProducerDis
 }
 
 fn map_codec_error(
-    error: crate::runtime_filter::codec::contribution::ContributionCodecError,
+    error: novarocks::runtime_filter_transition::codec::contribution::ContributionCodecError,
 ) -> InboundProducerDispatchError {
     ingress_error(
         InboundProducerDispatchErrorKind::CodecContract,
@@ -524,69 +526,73 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::runtime::query_context::{QueryContextManager, QueryId};
-    use crate::runtime_filter::codec::contribution::{
-        ContributionCodecExpectation, RuntimeFilterContribution, encode_contribution,
-        semantic_contribution_bytes,
-    };
-    use crate::runtime_filter::codec::producer::encode_producer_failure;
     use crate::runtime_filter::core::channel::{ProducerIngressCoreSnapshot, RuntimeFilterChannel};
     use crate::runtime_filter::core::coverage::CoverageProgress;
     use crate::runtime_filter::core::state::TerminalProgress;
-    use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
-    use crate::runtime_filter::model::contract::{
+    use crate::runtime_filter::service::registry::InboundProducerContract as InstalledInboundContract;
+    use crate::runtime_filter::service::test_support::compiled_three_backend_all_of_plan;
+    use crate::runtime_filter::service::tests::{
+        inbound_loopback_install_for_test, ordered_update,
+    };
+    use novarocks::runtime_filter_transition::codec::contribution::{
+        ContributionCodecExpectation, RuntimeFilterContribution, encode_contribution,
+        semantic_contribution_bytes,
+    };
+    use novarocks::runtime_filter_transition::codec::producer::encode_producer_failure;
+    use novarocks::runtime_filter_transition::deployment::extension::RuntimeFilterDeploymentExtension;
+    use novarocks::runtime_filter_transition::model::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
         ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder,
         NullSemantics, OrderContract, OrderKeyContract, ReductionRequirement,
         RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
         SortDirection, TopKSummaryRequirement,
     };
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::port::artifact::{
+    use novarocks::runtime_filter_transition::model::coverage::Coverage;
+    use novarocks::runtime_filter_transition::port::artifact::{
         ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
     };
-    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-    use crate::runtime_filter::port::final_domain::{
+    use novarocks::runtime_filter_transition::port::events::{
+        RuntimeFilterEvent, RuntimeFilterEventSink,
+    };
+    use novarocks::runtime_filter_transition::port::final_domain::{
         CollectingFinalDomainTestIssuer, CompletionFenceAuthority, FinalDomainShard,
         FinalDomainTestIssuerTransition, RuntimeCompletionFenceContract,
     };
-    use crate::runtime_filter::port::identity::{
+    use novarocks::runtime_filter_transition::port::identity::{
         DeploymentEpoch, PartitionId, ProducerSequence, ProducerStreamId, RouteEdgeId,
         RuntimeFilterParticipantId,
     };
-    use crate::runtime_filter::port::install::{
+    use novarocks::runtime_filter_transition::port::install::{
         ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
         RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterParticipantInstall,
     };
-    use crate::runtime_filter::port::ordered_bound::{
+    use novarocks::runtime_filter_transition::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, RuntimeOrderContract,
         comparator_digest_for_test,
     };
-    use crate::runtime_filter::port::producer::{
+    use novarocks::runtime_filter_transition::port::producer::{
         InstallOutcome, ProducerFailureReason, RuntimeContractViolation,
         RuntimeContractViolationKind,
     };
-    use crate::runtime_filter::port::routing::RuntimeFilterRouteContractError;
-    use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
-    use crate::runtime_filter::port::support::{
+    use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRouteContractError;
+    use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRouteRole;
+    use novarocks::runtime_filter_transition::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
-    use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
-    use crate::runtime_filter::port::transport::{
+    use novarocks::runtime_filter_transition::port::topk_summary::{
+        RuntimeTopKSummaryContract, TopKSummary,
+    };
+    use novarocks::runtime_filter_transition::port::transport::{
         ContributionRouteIdentity, ProducerInstanceRouteIdentity, ProducerOpenMetadata,
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
     };
-    use crate::runtime_filter::port::transport::{
-        RuntimeFilterAcceptStatus, RuntimeFilterEnvelopeIngress,
+    use novarocks::runtime_filter_transition::port::transport::{
+        RuntimeFilterAcceptStatus, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
     };
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
-    use crate::runtime_filter::service::registry::InboundProducerContract as InstalledInboundContract;
-    use crate::runtime_filter::service::test_support::compiled_three_backend_all_of_plan;
-    use crate::runtime_filter::service::tests::{
-        inbound_loopback_install_for_test, ordered_update,
+    use novarocks::runtime_filter_transition::port::value_domain::{
+        MembershipValues, ValueDomainDelta,
     };
-    use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
+    use novarocks_types::UniqueId;
 
     use super::InboundProducerDispatchErrorKind::{
         CodecContract, DeploymentUnavailable, ProducerContract, RouteContract, ServiceUnavailable,
@@ -2249,9 +2255,29 @@ mod tests {
         contribution_payload: Vec<u8>,
     }
 
+    /// Backend-local stand-in for the native RPC adapter. It deliberately
+    /// owns an already-installed Service and cannot perform Core query lookup.
+    struct DirectServiceIngress {
+        service: Arc<RuntimeFilterService>,
+    }
+
+    impl RuntimeFilterEnvelopeIngress for DirectServiceIngress {
+        fn accept(&self, envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
+            match self.service.dispatch_inbound_producer(envelope) {
+                Ok(InboundProducerDispatchOutcome::Accepted) => {
+                    RuntimeFilterIngressResult::accepted()
+                }
+                Ok(InboundProducerDispatchOutcome::Duplicate) => {
+                    RuntimeFilterIngressResult::duplicate()
+                }
+                Err(error) => RuntimeFilterIngressResult::rejected(error.to_string())
+                    .expect("typed ingress rejection is non-empty"),
+            }
+        }
+    }
+
     impl ThreeBackendIngressFixture {
         fn compile_and_install() -> Self {
-            let manager_query_id = QueryId::new(92, 1);
             let transport_query_id = UniqueId::new(92, 1);
             let channel_id = ChannelId::new(5);
             let remote_binding_id = BindingId::new(10);
@@ -2290,18 +2316,12 @@ mod tests {
                 .find(|(participant, _)| *participant == aggregator_participant)
                 .expect("aggregator participant owns a composite install");
 
-            let manager = QueryContextManager::new_for_test();
-            manager
-                .ensure_native_context(
-                    manager_query_id,
-                    false,
-                    Duration::from_secs(10),
-                    Duration::from_secs(10),
-                )
-                .expect("register the native query context");
-            let service = manager
-                .runtime_filter_service_for_ingress(manager_query_id)
-                .expect("registered query exposes a runtime filter service");
+            let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+                transport_query_id,
+                Arc::new(Clock),
+                Arc::new(RecordingEvents::default()),
+                Arc::new(Memory),
+            ));
             assert_eq!(
                 service.install(aggregator_install).unwrap(),
                 InstallOutcome::Installed,
@@ -2331,8 +2351,9 @@ mod tests {
             .unwrap()
             .into_parts();
 
-            let ingress =
-                query_scoped_runtime_filter_envelope_ingress_with_manager(Arc::clone(&manager));
+            let ingress: Arc<dyn RuntimeFilterEnvelopeIngress> = Arc::new(DirectServiceIngress {
+                service: Arc::clone(&service),
+            });
             Self {
                 ingress,
                 service,

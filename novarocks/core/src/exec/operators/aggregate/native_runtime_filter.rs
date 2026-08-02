@@ -42,8 +42,6 @@ use crate::runtime_filter::port::producer::ProducerPortKind;
 use crate::runtime_filter::port::producer::{
     OrderedBoundProducerAdapter, ProducerFailureReason, RuntimeContractViolationKind, SubmitOutcome,
 };
-#[cfg(test)]
-use crate::runtime_filter::service::InstalledRuntimeFilterExecutionContract;
 
 #[derive(Default)]
 struct AggregateTopNProducerInstanceCoordinator {
@@ -181,7 +179,7 @@ fn frozen_execution_contract(
 fn validate_binding_contract(
     spec: &AggregateTopNRuntimeFilterProducerBinding,
     port: ProducerPortKind,
-    installed_contract: &InstalledRuntimeFilterExecutionContract,
+    installed_contract: &TestInstalledRuntimeFilterExecutionContract,
     installed_reduction: ReductionRequirement,
     installed_contribution_kinds: &BTreeSet<ContributionKind>,
     installed_completion: CompletionRequirement,
@@ -226,7 +224,7 @@ fn validate_binding_contract(
             comparator_digest,
             order_contract_digest,
         },
-        InstalledRuntimeFilterExecutionContract::Ordered {
+        TestInstalledRuntimeFilterExecutionContract::Ordered {
             keys: installed_keys,
             comparator_digest: installed_comparator_digest,
             order_contract_digest: installed_order_contract_digest,
@@ -810,11 +808,23 @@ impl AggregateTopNProducerStream {
 #[cfg(test)]
 struct TestResolvedOrderedProducer {
     port: ProducerPortKind,
-    contract: InstalledRuntimeFilterExecutionContract,
+    contract: TestInstalledRuntimeFilterExecutionContract,
     reduction: ReductionRequirement,
     contribution_kinds: BTreeSet<ContributionKind>,
     completion_requirement: CompletionRequirement,
     adapter: Arc<dyn OrderedBoundProducerAdapter>,
+}
+
+/// Test-only projection of the immutable execution contract. Core operator
+/// tests intentionally avoid Backend Service installation and exercise the
+/// producer adapter against a local port double instead.
+#[cfg(test)]
+enum TestInstalledRuntimeFilterExecutionContract {
+    Ordered {
+        keys: Arc<[crate::runtime_filter::port::ordered_bound::RuntimeOrderKey]>,
+        comparator_digest: [u8; 32],
+        order_contract_digest: [u8; 32],
+    },
 }
 
 #[cfg(test)]
@@ -829,7 +839,10 @@ mod tests {
     use arrow::datatypes::Schema;
     use arrow::record_batch::RecordBatch;
 
-    use super::{AggregateTopNProducerSessionFactory, TestResolvedOrderedProducer};
+    use super::{
+        AggregateTopNProducerSessionFactory, TestInstalledRuntimeFilterExecutionContract,
+        TestResolvedOrderedProducer,
+    };
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
     use crate::exec::node::runtime_filter::{
@@ -853,7 +866,6 @@ mod tests {
         OrderedBoundProducerAdapter, ProducerFailureReason, ProducerPortKind,
         RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
     };
-    use crate::runtime_filter::service::InstalledRuntimeFilterExecutionContract;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
@@ -990,7 +1002,7 @@ mod tests {
     ) -> TestResolvedOrderedProducer {
         TestResolvedOrderedProducer {
             port: ProducerPortKind::OrderedBound,
-            contract: InstalledRuntimeFilterExecutionContract::Ordered {
+            contract: TestInstalledRuntimeFilterExecutionContract::Ordered {
                 keys: contract.keys().to_vec().into(),
                 comparator_digest: contract.plan_comparator_digest().get(),
                 order_contract_digest: contract.digest().bytes(),
@@ -1455,7 +1467,7 @@ mod tests {
         assert!(error.contains("TightenOrderedBound"));
 
         let mut wrong_digest = resolved(&contract, adapter);
-        wrong_digest.contract = InstalledRuntimeFilterExecutionContract::Ordered {
+        wrong_digest.contract = TestInstalledRuntimeFilterExecutionContract::Ordered {
             keys: contract.keys().to_vec().into(),
             comparator_digest: contract.plan_comparator_digest().get(),
             order_contract_digest: [99; 32],

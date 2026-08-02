@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::runtime_filter::model::contract::CoverageWitnessId;
-use crate::runtime_filter::model::coverage::Coverage;
+use novarocks::runtime_filter_transition::model::contract::CoverageWitnessId;
+use novarocks::runtime_filter_transition::model::coverage::Coverage;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CoverageProgress {
@@ -95,8 +95,8 @@ pub(crate) fn evaluate(
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::runtime_filter::model::contract::CoverageWitnessId;
-    use crate::runtime_filter::model::coverage::Coverage;
+    use novarocks::runtime_filter_transition::model::contract::CoverageWitnessId;
+    use novarocks::runtime_filter_transition::model::coverage::Coverage;
 
     use super::{CoverageProgress, WitnessProgress, evaluate};
 

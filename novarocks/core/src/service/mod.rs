@@ -23,8 +23,6 @@ pub(crate) mod grpc_fragment_dispatcher;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) mod grpc_query_lifecycle_adapter;
 pub mod grpc_query_lifecycle_client;
-pub(crate) mod grpc_runtime_filter_adapter;
-pub(crate) mod grpc_runtime_filter_sender;
 pub mod grpc_server;
 pub mod internal_rpc;
 pub(crate) mod metrics_http;
@@ -39,4 +37,3 @@ pub mod native_fragment_ingress;
 #[cfg(test)]
 pub(crate) mod native_fragment_service_test_fixture;
 pub(crate) mod result_batch_wire;
-pub(crate) mod runtime_filter_envelope_ingress;

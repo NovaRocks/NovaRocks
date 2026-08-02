@@ -28,14 +28,14 @@ use crate::runtime_filter::port::identity::{
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum RuntimeFilterRouteRole {
+pub enum RuntimeFilterRouteRole {
     Producer(BindingId),
     Aggregator,
     Relay,
     Consumer(BindingId),
 }
 
-pub(crate) fn canonical_route_allowed_kinds(
+pub fn canonical_route_allowed_kinds(
     source: RuntimeFilterRouteRole,
     target: RuntimeFilterRouteRole,
 ) -> Option<BTreeSet<RuntimeFilterEnvelopeKind>> {
@@ -62,13 +62,13 @@ pub(crate) fn canonical_route_allowed_kinds(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterRouteEndpointView {
+pub struct RuntimeFilterRouteEndpointView {
     participant_id: RuntimeFilterParticipantId,
     role: RuntimeFilterRouteRole,
 }
 
 impl RuntimeFilterRouteEndpointView {
-    pub(crate) const fn new(
+    pub const fn new(
         participant_id: RuntimeFilterParticipantId,
         role: RuntimeFilterRouteRole,
     ) -> Self {
@@ -78,17 +78,17 @@ impl RuntimeFilterRouteEndpointView {
         }
     }
 
-    pub(crate) const fn participant_id(&self) -> RuntimeFilterParticipantId {
+    pub const fn participant_id(&self) -> RuntimeFilterParticipantId {
         self.participant_id
     }
 
-    pub(crate) const fn role(&self) -> RuntimeFilterRouteRole {
+    pub const fn role(&self) -> RuntimeFilterRouteRole {
         self.role
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterRoutePeer {
+pub enum RuntimeFilterRoutePeer {
     Loopback,
     Remote {
         participant_id: RuntimeFilterParticipantId,
@@ -97,7 +97,7 @@ pub(crate) enum RuntimeFilterRoutePeer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterRoutingEdgeView {
+pub struct RuntimeFilterRoutingEdgeView {
     channel_id: ChannelId,
     route_edge_id: RouteEdgeId,
     source: RuntimeFilterRouteEndpointView,
@@ -107,7 +107,7 @@ pub(crate) struct RuntimeFilterRoutingEdgeView {
 }
 
 impl RuntimeFilterRoutingEdgeView {
-    pub(crate) fn new(
+    pub fn new(
         channel_id: ChannelId,
         route_edge_id: RouteEdgeId,
         source: RuntimeFilterRouteEndpointView,
@@ -157,33 +157,33 @@ impl RuntimeFilterRoutingEdgeView {
         })
     }
 
-    pub(crate) const fn channel_id(&self) -> ChannelId {
+    pub const fn channel_id(&self) -> ChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn route_edge_id(&self) -> RouteEdgeId {
+    pub const fn route_edge_id(&self) -> RouteEdgeId {
         self.route_edge_id
     }
 
-    pub(crate) const fn source(&self) -> &RuntimeFilterRouteEndpointView {
+    pub const fn source(&self) -> &RuntimeFilterRouteEndpointView {
         &self.source
     }
 
-    pub(crate) const fn target(&self) -> &RuntimeFilterRouteEndpointView {
+    pub const fn target(&self) -> &RuntimeFilterRouteEndpointView {
         &self.target
     }
 
-    pub(crate) const fn peer(&self) -> &RuntimeFilterRoutePeer {
+    pub const fn peer(&self) -> &RuntimeFilterRoutePeer {
         &self.peer
     }
 
-    pub(crate) const fn allowed_kinds(&self) -> &BTreeSet<RuntimeFilterEnvelopeKind> {
+    pub const fn allowed_kinds(&self) -> &BTreeSet<RuntimeFilterEnvelopeKind> {
         &self.allowed_kinds
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterChannelRoutingView {
+pub struct RuntimeFilterChannelRoutingView {
     channel_id: ChannelId,
     local_roles: BTreeSet<RuntimeFilterRouteRole>,
     producer_instances: BTreeMap<(BindingId, UniqueId), RuntimeFilterParticipantId>,
@@ -192,7 +192,7 @@ pub(crate) struct RuntimeFilterChannelRoutingView {
 }
 
 impl RuntimeFilterChannelRoutingView {
-    pub(crate) fn new(
+    pub fn new(
         channel_id: ChannelId,
         local_roles: BTreeSet<RuntimeFilterRouteRole>,
         producer_instances: BTreeMap<(BindingId, UniqueId), RuntimeFilterParticipantId>,
@@ -212,15 +212,15 @@ impl RuntimeFilterChannelRoutingView {
         })
     }
 
-    pub(crate) const fn channel_id(&self) -> ChannelId {
+    pub const fn channel_id(&self) -> ChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn local_roles(&self) -> &BTreeSet<RuntimeFilterRouteRole> {
+    pub const fn local_roles(&self) -> &BTreeSet<RuntimeFilterRouteRole> {
         &self.local_roles
     }
 
-    pub(crate) fn producer_participant(
+    pub fn producer_participant(
         &self,
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
@@ -230,30 +230,30 @@ impl RuntimeFilterChannelRoutingView {
             .copied()
     }
 
-    pub(crate) const fn producer_instances(
+    pub const fn producer_instances(
         &self,
     ) -> &BTreeMap<(BindingId, UniqueId), RuntimeFilterParticipantId> {
         &self.producer_instances
     }
 
-    pub(crate) fn inbound_edges(&self) -> &[RuntimeFilterRoutingEdgeView] {
+    pub fn inbound_edges(&self) -> &[RuntimeFilterRoutingEdgeView] {
         &self.inbound_edges
     }
 
-    pub(crate) fn outbound_edges(&self) -> &[RuntimeFilterRoutingEdgeView] {
+    pub fn outbound_edges(&self) -> &[RuntimeFilterRoutingEdgeView] {
         &self.outbound_edges
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterRoutingShard {
+pub struct RuntimeFilterRoutingShard {
     deployment_epoch: DeploymentEpoch,
     local_participant_id: RuntimeFilterParticipantId,
     channels: BTreeMap<ChannelId, RuntimeFilterChannelRoutingView>,
 }
 
 impl RuntimeFilterRoutingShard {
-    pub(crate) fn new(
+    pub fn new(
         deployment_epoch: DeploymentEpoch,
         local_participant_id: RuntimeFilterParticipantId,
         channels: BTreeMap<ChannelId, RuntimeFilterChannelRoutingView>,
@@ -276,28 +276,25 @@ impl RuntimeFilterRoutingShard {
         })
     }
 
-    pub(crate) const fn deployment_epoch(&self) -> DeploymentEpoch {
+    pub const fn deployment_epoch(&self) -> DeploymentEpoch {
         self.deployment_epoch
     }
 
-    pub(crate) const fn local_participant_id(&self) -> RuntimeFilterParticipantId {
+    pub const fn local_participant_id(&self) -> RuntimeFilterParticipantId {
         self.local_participant_id
     }
 
-    pub(crate) fn channel(
-        &self,
-        channel_id: ChannelId,
-    ) -> Option<&RuntimeFilterChannelRoutingView> {
+    pub fn channel(&self, channel_id: ChannelId) -> Option<&RuntimeFilterChannelRoutingView> {
         self.channels.get(&channel_id)
     }
 
-    pub(crate) const fn channels(&self) -> &BTreeMap<ChannelId, RuntimeFilterChannelRoutingView> {
+    pub const fn channels(&self) -> &BTreeMap<ChannelId, RuntimeFilterChannelRoutingView> {
         &self.channels
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterProducerRouteIntent {
+pub struct RuntimeFilterProducerRouteIntent {
     deployment_epoch: DeploymentEpoch,
     channel_id: ChannelId,
     producer_binding_id: BindingId,
@@ -305,7 +302,7 @@ pub(crate) struct RuntimeFilterProducerRouteIntent {
 }
 
 impl RuntimeFilterProducerRouteIntent {
-    pub(crate) fn new(
+    pub fn new(
         deployment_epoch: DeploymentEpoch,
         channel_id: ChannelId,
         producer_binding_id: BindingId,
@@ -334,25 +331,25 @@ impl RuntimeFilterProducerRouteIntent {
         })
     }
 
-    pub(crate) const fn deployment_epoch(&self) -> DeploymentEpoch {
+    pub const fn deployment_epoch(&self) -> DeploymentEpoch {
         self.deployment_epoch
     }
 
-    pub(crate) const fn channel_id(&self) -> ChannelId {
+    pub const fn channel_id(&self) -> ChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn producer_binding_id(&self) -> BindingId {
+    pub const fn producer_binding_id(&self) -> BindingId {
         self.producer_binding_id
     }
 
-    pub(crate) const fn envelope_kind(&self) -> RuntimeFilterEnvelopeKind {
+    pub const fn envelope_kind(&self) -> RuntimeFilterEnvelopeKind {
         self.envelope_kind
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterDeliveryRouteIntent {
+pub struct RuntimeFilterDeliveryRouteIntent {
     deployment_epoch: DeploymentEpoch,
     channel_id: ChannelId,
     route_edge_ids: Vec<RouteEdgeId>,
@@ -360,7 +357,7 @@ pub(crate) struct RuntimeFilterDeliveryRouteIntent {
 }
 
 impl RuntimeFilterDeliveryRouteIntent {
-    pub(crate) fn new(
+    pub fn new(
         deployment_epoch: DeploymentEpoch,
         channel_id: ChannelId,
         mut route_edge_ids: Vec<RouteEdgeId>,
@@ -400,25 +397,25 @@ impl RuntimeFilterDeliveryRouteIntent {
         })
     }
 
-    pub(crate) const fn deployment_epoch(&self) -> DeploymentEpoch {
+    pub const fn deployment_epoch(&self) -> DeploymentEpoch {
         self.deployment_epoch
     }
 
-    pub(crate) const fn channel_id(&self) -> ChannelId {
+    pub const fn channel_id(&self) -> ChannelId {
         self.channel_id
     }
 
-    pub(crate) fn route_edge_ids(&self) -> &[RouteEdgeId] {
+    pub fn route_edge_ids(&self) -> &[RouteEdgeId] {
         &self.route_edge_ids
     }
 
-    pub(crate) const fn envelope_kind(&self) -> RuntimeFilterEnvelopeKind {
+    pub const fn envelope_kind(&self) -> RuntimeFilterEnvelopeKind {
         self.envelope_kind
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterRemoteRoute {
+pub struct RuntimeFilterRemoteRoute {
     route_edge_id: RouteEdgeId,
     peer_participant_id: RuntimeFilterParticipantId,
     endpoint: RuntimeEndpoint,
@@ -426,7 +423,7 @@ pub(crate) struct RuntimeFilterRemoteRoute {
 }
 
 impl RuntimeFilterRemoteRoute {
-    pub(crate) fn new(
+    pub fn new(
         route_edge_id: RouteEdgeId,
         peer_participant_id: RuntimeFilterParticipantId,
         endpoint: RuntimeEndpoint,
@@ -441,36 +438,36 @@ impl RuntimeFilterRemoteRoute {
         })
     }
 
-    pub(crate) const fn route_edge_id(&self) -> RouteEdgeId {
+    pub const fn route_edge_id(&self) -> RouteEdgeId {
         self.route_edge_id
     }
 
-    pub(crate) const fn peer_participant_id(&self) -> RuntimeFilterParticipantId {
+    pub const fn peer_participant_id(&self) -> RuntimeFilterParticipantId {
         self.peer_participant_id
     }
 
-    pub(crate) const fn endpoint(&self) -> &RuntimeEndpoint {
+    pub const fn endpoint(&self) -> &RuntimeEndpoint {
         &self.endpoint
     }
 
-    pub(crate) const fn target_role(&self) -> RuntimeFilterRouteRole {
+    pub const fn target_role(&self) -> RuntimeFilterRouteRole {
         self.target_role
     }
 
     /// Deterministic retained charge for the per-pending-entry route clone.
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(self.endpoint.retained_host_capacity())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterRouteDecision {
+pub struct RuntimeFilterRouteDecision {
     loopback_route_edge_ids: Vec<RouteEdgeId>,
     remote_routes: Vec<RuntimeFilterRemoteRoute>,
 }
 
 impl RuntimeFilterRouteDecision {
-    pub(crate) fn new(
+    pub fn new(
         mut loopback_route_edge_ids: Vec<RouteEdgeId>,
         mut remote_routes: Vec<RuntimeFilterRemoteRoute>,
     ) -> Result<Self, RuntimeFilterRouteContractError> {
@@ -499,17 +496,17 @@ impl RuntimeFilterRouteDecision {
         })
     }
 
-    pub(crate) fn loopback_route_edge_ids(&self) -> &[RouteEdgeId] {
+    pub fn loopback_route_edge_ids(&self) -> &[RouteEdgeId] {
         &self.loopback_route_edge_ids
     }
 
-    pub(crate) fn remote_routes(&self) -> &[RuntimeFilterRemoteRoute] {
+    pub fn remote_routes(&self) -> &[RuntimeFilterRemoteRoute] {
         &self.remote_routes
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterRouteContractError {
+pub enum RuntimeFilterRouteContractError {
     ZeroIdentity(&'static str),
     ChannelKeyMismatch {
         key: ChannelId,

@@ -28,7 +28,6 @@ pub mod io;
 pub mod lookup;
 pub mod mem_tracker;
 pub mod native_fragment_query;
-pub mod native_query_lifecycle;
 pub mod profile;
 pub(crate) mod query_context;
 pub mod query_options;

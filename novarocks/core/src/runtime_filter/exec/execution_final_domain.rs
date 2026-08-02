@@ -23,7 +23,7 @@ use crate::runtime_filter::port::value_domain::ValueDomainDelta;
 /// Execution completion payload. The Service adapter validates this exact
 /// native payload before it freezes a partition; neither callers nor this
 /// helper receives an issuance authority.
-pub(crate) fn final_domain_payload(
+pub fn final_domain_payload(
     domain: ValueDomainDelta,
 ) -> Result<execution::RuntimeFilterFinalDomain, String> {
     let mut canonical = Vec::new();

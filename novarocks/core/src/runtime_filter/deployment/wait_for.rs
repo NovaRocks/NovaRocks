@@ -23,7 +23,7 @@ use crate::sql::planner::runtime_filter::wait_graph::{
 use super::{DeploymentError, planning_adapter};
 
 // Design: ADR-0001 (docs/adr/ADR-0001-runtime-filter-strict-fail-liveness-philosophy.md)
-pub(crate) fn validate_wait_for(
+pub fn validate_wait_for(
     edges: &[RefinedFragmentEdge],
     consumers: &[ConsumerWaitInput],
     join_progress: &JoinBuildProgressCatalog,

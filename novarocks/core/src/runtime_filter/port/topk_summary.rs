@@ -78,11 +78,11 @@ impl RuntimeTopKSummaryContract {
         Ok(Self { order, k, digest })
     }
 
-    pub(crate) const fn order(&self) -> &Arc<RuntimeOrderContract> {
+    pub const fn order(&self) -> &Arc<RuntimeOrderContract> {
         &self.order
     }
 
-    pub(crate) const fn k(&self) -> NonZeroU32 {
+    pub const fn k(&self) -> NonZeroU32 {
         self.k
     }
 
@@ -92,14 +92,14 @@ impl RuntimeTopKSummaryContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TopKSummary {
+pub struct TopKSummary {
     contract_digest: TopKSummaryContractDigest,
     candidates: Arc<[OrderedTuple]>,
     replay_digest: [u8; 32],
 }
 
 impl TopKSummary {
-    pub(crate) fn try_new(
+    pub fn try_new(
         contract: &RuntimeTopKSummaryContract,
         candidates: Vec<OrderedTuple>,
     ) -> Result<Self, TopKSummaryError> {
@@ -133,23 +133,23 @@ impl TopKSummary {
         })
     }
 
-    pub(crate) const fn contract_digest(&self) -> TopKSummaryContractDigest {
+    pub const fn contract_digest(&self) -> TopKSummaryContractDigest {
         self.contract_digest
     }
 
-    pub(crate) fn candidates(&self) -> &[OrderedTuple] {
+    pub fn candidates(&self) -> &[OrderedTuple] {
         &self.candidates
     }
 
-    pub(crate) fn shared_candidates(&self) -> Arc<[OrderedTuple]> {
+    pub fn shared_candidates(&self) -> Arc<[OrderedTuple]> {
         self.candidates.clone()
     }
 
-    pub(crate) const fn replay_digest(&self) -> [u8; 32] {
+    pub const fn replay_digest(&self) -> [u8; 32] {
         self.replay_digest
     }
 
-    pub(crate) fn canonical_contribution_bytes(&self) -> Option<usize> {
+    pub fn canonical_contribution_bytes(&self) -> Option<usize> {
         let mut bytes = TOPK_REPLAY_DOMAIN
             .len()
             .checked_add(size_of::<u16>())?
@@ -165,7 +165,7 @@ impl TopKSummary {
         Some(bytes)
     }
 
-    pub(crate) fn canonical_body_len(&self) -> Result<usize, ContributionSizeError> {
+    pub fn canonical_body_len(&self) -> Result<usize, ContributionSizeError> {
         u64::try_from(self.candidates.len())
             .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
         self.candidates
@@ -177,7 +177,7 @@ impl TopKSummary {
             })
     }
 
-    pub(crate) fn encode_canonical_body_into(
+    pub fn encode_canonical_body_into(
         &self,
         output: &mut Vec<u8>,
     ) -> Result<(), ContributionSizeError> {

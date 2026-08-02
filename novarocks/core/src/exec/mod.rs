@@ -21,7 +21,13 @@ pub mod expr;
 pub mod fragment;
 pub mod hash_table;
 pub mod node;
+#[cfg(feature = "runtime-filter-test-support")]
+pub mod operators;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod operators;
+#[cfg(feature = "runtime-filter-test-support")]
+pub mod pipeline;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod pipeline;
 pub mod row_position;
 pub mod runtime_filter;

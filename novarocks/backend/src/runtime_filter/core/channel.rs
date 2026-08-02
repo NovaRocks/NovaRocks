@@ -21,34 +21,40 @@ use std::time::Instant;
 
 use arrow::datatypes::DataType;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::model::contract::{
+use novarocks::runtime_filter_transition::model::contract::{
     BindingId, ChannelId, CompletionRequirement, CoverageWitnessId, NullSemantics,
     ReductionRequirement, RuntimeFilterLogicalDomain,
 };
-use crate::runtime_filter::model::coverage::Coverage;
-use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-use crate::runtime_filter::port::events::{
+use novarocks::runtime_filter_transition::model::coverage::Coverage;
+use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
+use novarocks::runtime_filter_transition::port::events::{
     FinalDomainRejectionKind, ProducerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
 };
-use crate::runtime_filter::port::final_domain::{FinalDomainShard, RuntimeCompletionFenceContract};
-use crate::runtime_filter::port::identity::{
+use novarocks::runtime_filter_transition::port::final_domain::{
+    FinalDomainShard, RuntimeCompletionFenceContract,
+};
+use novarocks::runtime_filter_transition::port::identity::{
     ContributionIdentity, DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence,
     ProducerStreamId, RuntimeFilterParticipantId,
 };
-use crate::runtime_filter::port::install::RuntimeFilterChannelDeployment;
-use crate::runtime_filter::port::ordered_bound::{OrderedBoundUpdate, RuntimeOrderContract};
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::install::RuntimeFilterChannelDeployment;
+use novarocks::runtime_filter_transition::port::ordered_bound::{
+    OrderedBoundUpdate, RuntimeOrderContract,
+};
+use novarocks::runtime_filter_transition::port::producer::{
     ProducerFailureReason, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
 };
-use crate::runtime_filter::port::subscription::UnavailableReason;
-use crate::runtime_filter::port::support::{
+use novarocks::runtime_filter_transition::port::subscription::UnavailableReason;
+use novarocks::runtime_filter_transition::port::support::{
     RetainedMemoryReservation, RuntimeFilterMemoryAccount, TemporaryContributionLease,
 };
-use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
+use novarocks::runtime_filter_transition::port::topk_summary::{
+    RuntimeTopKSummaryContract, TopKSummary,
+};
 #[cfg(test)]
-use crate::runtime_filter::port::value_domain::MembershipValues;
-use crate::runtime_filter::port::value_domain::{LogicalSnapshot, ValueDomainDelta};
+use novarocks::runtime_filter_transition::port::value_domain::MembershipValues;
+use novarocks::runtime_filter_transition::port::value_domain::{LogicalSnapshot, ValueDomainDelta};
+use novarocks_types::UniqueId;
 
 use super::coverage::{CoverageProgress, WitnessProgress, evaluate};
 use super::error::ChannelBuildError;
@@ -242,7 +248,10 @@ enum OrderedCoreReducer {
 }
 
 impl OrderedCoreReducer {
-    fn global(&self) -> Option<&Arc<super::ordered_reducer::OrderedBoundDomain>> {
+    fn global(
+        &self,
+    ) -> Option<&Arc<novarocks::runtime_filter_transition::port::value_domain::OrderedBoundDomain>>
+    {
         match self {
             Self::Direct(reducer) => reducer.global(),
             Self::TopK(reducer) => reducer.global(),
@@ -3448,28 +3457,30 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::runtime_filter::model::contract::*;
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::port::events::RuntimeFilterEvent;
-    use crate::runtime_filter::port::identity::*;
-    use crate::runtime_filter::port::install::*;
-    use crate::runtime_filter::port::ordered_bound::{
+    use novarocks::runtime_filter_transition::model::contract::*;
+    use novarocks::runtime_filter_transition::model::coverage::Coverage;
+    use novarocks::runtime_filter_transition::port::events::RuntimeFilterEvent;
+    use novarocks::runtime_filter_transition::port::identity::*;
+    use novarocks::runtime_filter_transition::port::install::*;
+    use novarocks::runtime_filter_transition::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
         RuntimeOrderContract, comparator_digest_for_test,
     };
-    use crate::runtime_filter::port::producer::{
+    use novarocks::runtime_filter_transition::port::producer::{
         ProducerFailureReason, RuntimeContractViolation, RuntimeContractViolationKind,
         SubmitOutcome,
     };
-    use crate::runtime_filter::port::subscription::UnavailableReason;
-    use crate::runtime_filter::port::support::{
+    use novarocks::runtime_filter_transition::port::subscription::UnavailableReason;
+    use novarocks::runtime_filter_transition::port::support::{
         MemoryAccountError, RuntimeFilterMemoryAccount, TemporaryContributionLease,
     };
-    use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
-    use crate::runtime_filter::port::value_domain::{
+    use novarocks::runtime_filter_transition::port::topk_summary::{
+        RuntimeTopKSummaryContract, TopKSummary,
+    };
+    use novarocks::runtime_filter_transition::port::value_domain::{
         LogicalSnapshot, MembershipValues, ValueDomainDelta,
     };
+    use novarocks_types::UniqueId;
 
     use super::{
         ChannelAction, ChannelTerminal, FinalDomainRejection, RuntimeFilterChannel,
@@ -3619,7 +3630,7 @@ mod tests {
                 max_retries: 0,
             },
             RuntimeFilterCoreBudget::new(budget),
-            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
+            novarocks::runtime_filter_transition::port::install::MaterializationPolicy::for_test(),
             producers,
             BTreeMap::new(),
         )
@@ -3704,7 +3715,7 @@ mod tests {
                 max_retries: 0,
             },
             RuntimeFilterCoreBudget::new(4096),
-            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
+            novarocks::runtime_filter_transition::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(10),
                 ProducerDeployment::new(witness, BTreeSet::from([uid(10), uid(11)])),
@@ -3720,8 +3731,10 @@ mod tests {
         instance: i64,
         sequence: u64,
         values: &[i64],
-    ) -> Result<ChannelAction, crate::runtime_filter::port::producer::RuntimeContractViolation>
-    {
+    ) -> Result<
+        ChannelAction,
+        novarocks::runtime_filter_transition::port::producer::RuntimeContractViolation,
+    > {
         let delta = ValueDomainDelta::new(MembershipValues::int64(values.iter().copied()), false);
         let bytes = delta.estimated_contribution_bytes().unwrap();
         channel.submit(
@@ -6929,8 +6942,8 @@ mod tests {
 
     mod fenced_final {
         use super::*;
-        use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-        use crate::runtime_filter::port::final_domain::{
+        use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
+        use novarocks::runtime_filter_transition::port::final_domain::{
             CollectingFinalDomainTestIssuer, CompletionFenceAuthority,
             FinalDomainTestIssuerTransition, FrozenFinalDomainTestIssuer,
             RuntimeCompletionFenceContract,
@@ -7094,7 +7107,7 @@ mod tests {
             partition: u32,
             sequence: u64,
             values: &[i64],
-        ) -> crate::runtime_filter::port::final_domain::FinalDomainShard {
+        ) -> novarocks::runtime_filter_transition::port::final_domain::FinalDomainShard {
             issuer
                 .issue_shard(
                     ProducerStreamId::new(
@@ -7115,7 +7128,7 @@ mod tests {
             instance: i64,
             partition: u32,
             sequence: u64,
-            shard: crate::runtime_filter::port::final_domain::FinalDomainShard,
+            shard: novarocks::runtime_filter_transition::port::final_domain::FinalDomainShard,
         ) -> Result<ChannelAction, FinalDomainRejection> {
             let bytes = shard.canonical_contribution_bytes().unwrap();
             channel.complete_final(

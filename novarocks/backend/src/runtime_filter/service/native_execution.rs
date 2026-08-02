@@ -22,35 +22,39 @@ use std::time::Duration;
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::codec::contribution::{
+use novarocks::runtime_filter_transition::codec::contribution::{
     ContributionCodecError, RuntimeFilterContribution as CoreContribution, decode_contribution,
     encode_contribution,
 };
-use crate::runtime_filter::exec::execution_predicate::NativeExecutionPredicate;
-use crate::runtime_filter::exec::membership_predicate::{
+use novarocks::runtime_filter_transition::exec::execution_predicate::NativeExecutionPredicate;
+use novarocks::runtime_filter_transition::exec::membership_predicate::{
     MembershipPredicateContract, NativeRuntimeFilterPredicate,
 };
-use crate::runtime_filter::exec::ordered_range_predicate::{
+use novarocks::runtime_filter_transition::exec::ordered_range_predicate::{
     NativeOrderedRangePredicate, OrderedRangePredicateContract,
 };
-use crate::runtime_filter::model::contract::{
+use novarocks::runtime_filter_transition::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
     ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
 };
-use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ConsumerArtifactProfile};
-use crate::runtime_filter::port::identity::{DeploymentEpoch, LogicalVersion};
-use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::artifact::{
+    ArtifactMembershipSchema, ConsumerArtifactProfile,
+};
+use novarocks::runtime_filter_transition::port::identity::{DeploymentEpoch, LogicalVersion};
+use novarocks::runtime_filter_transition::port::ordered_bound::{
+    RuntimeOrderContract, RuntimeOrderKey,
+};
+use novarocks::runtime_filter_transition::port::producer::{
     OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, ProducerHandle,
     ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
 };
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::subscription::{
     ArtifactAcquireOutcome, ArtifactUnsupportedReason, BlockingSnapshotSubscription,
     LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription, SubscriptionHandle,
     SubscriptionKind, UnavailableReason,
 };
-use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
+use novarocks::runtime_filter_transition::port::topk_summary::RuntimeTopKSummaryContract;
+use novarocks_types::UniqueId;
 
 use super::RuntimeFilterService;
 
@@ -135,8 +139,8 @@ impl NativeRuntimeFilterExecutionContext {
         let contract = Arc::new(
             RuntimeOrderContract::from_codec(
                 keys.to_vec(),
-                crate::runtime_filter::model::contract::ComparatorDigest::new(*comparator_digest),
-                crate::runtime_filter::port::ordered_bound::OrderContractDigest::
+                novarocks::runtime_filter_transition::model::contract::ComparatorDigest::new(*comparator_digest),
+                novarocks::runtime_filter_transition::port::ordered_bound::OrderContractDigest::
                     from_bytes_for_codec(*order_contract_digest),
             )
             .expect("installed ordered test contract is valid"),
@@ -242,10 +246,10 @@ impl NativeRuntimeFilterExecutionContext {
             ));
         }
         let installed_kind = match consumer.activation() {
-            crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
+            novarocks::runtime_filter_transition::model::contract::ConsumerActivation::BlockingSnapshot => {
                 SubscriptionKind::BlockingSnapshot
             }
-            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+            novarocks::runtime_filter_transition::model::contract::ConsumerActivation::NonBlockingLive {
                 ..
             } => SubscriptionKind::NonBlockingLive,
         };
@@ -375,8 +379,8 @@ impl ResolvedNativeProducer {
 
     pub(crate) fn encode_execution_contribution(
         &self,
-        partition: crate::runtime_filter::port::identity::PartitionId,
-        sequence: crate::runtime_filter::port::identity::ProducerSequence,
+        partition: novarocks::runtime_filter_transition::port::identity::PartitionId,
+        sequence: novarocks::runtime_filter_transition::port::identity::ProducerSequence,
         contribution: CoreContribution,
     ) -> Result<execution::RuntimeFilterContribution, execution::RuntimeFilterContractViolation>
     {
@@ -392,7 +396,7 @@ impl ResolvedNativeProducer {
                 execution::RuntimeFilterContributionKind::FinalDomain
             }
         };
-        let stream = crate::runtime_filter::port::identity::ProducerStreamId::new(
+        let stream = novarocks::runtime_filter_transition::port::identity::ProducerStreamId::new(
             self.binding_id,
             self.fragment_instance_id,
             partition,
@@ -663,9 +667,11 @@ impl execution::RuntimeFilterFinalDomainCompletion for NativeExecutionFinalDomai
         execution::RuntimeFilterContractViolation,
     > {
         self.session
-            .partition(crate::runtime_filter::port::identity::PartitionId::new(
-                partition.get(),
-            ))
+            .partition(
+                novarocks::runtime_filter_transition::port::identity::PartitionId::new(
+                    partition.get(),
+                ),
+            )
             .map(|committer| {
                 Box::new(NativeExecutionFinalDomainPartition {
                     committer,
@@ -706,7 +712,7 @@ impl execution::RuntimeFilterFinalDomainPartition for NativeExecutionFinalDomain
             ));
         }
         let Some(domain) =
-            payload.downcast_ref::<crate::runtime_filter::port::value_domain::ValueDomainDelta>()
+            payload.downcast_ref::<novarocks::runtime_filter_transition::port::value_domain::ValueDomainDelta>()
         else {
             return Err(execution::RuntimeFilterContractViolation::new(
                 execution::RuntimeFilterContractViolationKind::RoleMismatch,
@@ -764,15 +770,18 @@ impl execution::RuntimeFilterProducer for NativeExecutionProducerAdapter {
         contribution: execution::RuntimeFilterContribution,
     ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
     {
-        let partition = crate::runtime_filter::port::identity::PartitionId::new(partition.get());
-        let sequence = crate::runtime_filter::port::identity::ProducerSequence::new(sequence.get());
+        let partition =
+            novarocks::runtime_filter_transition::port::identity::PartitionId::new(partition.get());
+        let sequence = novarocks::runtime_filter_transition::port::identity::ProducerSequence::new(
+            sequence.get(),
+        );
         if contribution.contract_digest() != self.inbound_contract.schema_digest() {
             return Err(execution::RuntimeFilterContractViolation::new(
                 execution::RuntimeFilterContractViolationKind::ContractMismatch,
                 "contribution contract digest does not match the installed producer route",
             ));
         }
-        let stream = crate::runtime_filter::port::identity::ProducerStreamId::new(
+        let stream = novarocks::runtime_filter_transition::port::identity::ProducerStreamId::new(
             self.binding_id,
             self.fragment_instance_id,
             partition,
@@ -818,8 +827,11 @@ impl execution::RuntimeFilterProducer for NativeExecutionProducerAdapter {
         terminal: execution::ProducerSequence,
     ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
     {
-        let partition = crate::runtime_filter::port::identity::PartitionId::new(partition.get());
-        let terminal = crate::runtime_filter::port::identity::ProducerSequence::new(terminal.get());
+        let partition =
+            novarocks::runtime_filter_transition::port::identity::PartitionId::new(partition.get());
+        let terminal = novarocks::runtime_filter_transition::port::identity::ProducerSequence::new(
+            terminal.get(),
+        );
         match &self.handle {
             ProducerHandle::Membership(adapter) => adapter.close_partition(partition, terminal),
             ProducerHandle::OrderedBound(adapter) => adapter.close_partition(partition, terminal),
@@ -890,18 +902,18 @@ fn to_execution_contract(
                     execution::RuntimeOrderKey::new(
                         key.data_type().clone(),
                         match key.direction() {
-                            crate::runtime_filter::model::contract::SortDirection::Ascending => {
+                            novarocks::runtime_filter_transition::model::contract::SortDirection::Ascending => {
                                 execution::RuntimeOrderSortDirection::Ascending
                             }
-                            crate::runtime_filter::model::contract::SortDirection::Descending => {
+                            novarocks::runtime_filter_transition::model::contract::SortDirection::Descending => {
                                 execution::RuntimeOrderSortDirection::Descending
                             }
                         },
                         match key.null_order() {
-                            crate::runtime_filter::model::contract::NullOrder::First => {
+                            novarocks::runtime_filter_transition::model::contract::NullOrder::First => {
                                 execution::RuntimeOrderNullOrder::First
                             }
-                            crate::runtime_filter::model::contract::NullOrder::Last => {
+                            novarocks::runtime_filter_transition::model::contract::NullOrder::Last => {
                                 execution::RuntimeOrderNullOrder::Last
                             }
                         },
@@ -947,43 +959,43 @@ fn codec_violation(error: ContributionCodecError) -> execution::RuntimeFilterCon
 }
 
 fn execution_submit_outcome(
-    outcome: crate::runtime_filter::port::producer::SubmitOutcome,
+    outcome: novarocks::runtime_filter_transition::port::producer::SubmitOutcome,
 ) -> execution::RuntimeFilterSubmitOutcome {
     match outcome {
-        crate::runtime_filter::port::producer::SubmitOutcome::Applied => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::Applied => {
             execution::RuntimeFilterSubmitOutcome::Applied
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::Duplicate => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::Duplicate => {
             execution::RuntimeFilterSubmitOutcome::Duplicate
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::Stale => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::Stale => {
             execution::RuntimeFilterSubmitOutcome::Stale
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::SequenceAdvancedEqual => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::SequenceAdvancedEqual => {
             execution::RuntimeFilterSubmitOutcome::SequenceAdvancedEqual
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::StreamAcceptedNoGlobalChange => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::StreamAcceptedNoGlobalChange => {
             execution::RuntimeFilterSubmitOutcome::StreamAcceptedNoGlobalChange
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::Published => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::Published => {
             execution::RuntimeFilterSubmitOutcome::Published
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::PendingGap => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::PendingGap => {
             execution::RuntimeFilterSubmitOutcome::PendingGap
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::PendingFinalSnapshot => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::PendingFinalSnapshot => {
             execution::RuntimeFilterSubmitOutcome::PendingFinalSnapshot
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::CoverageStillPossible => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::CoverageStillPossible => {
             execution::RuntimeFilterSubmitOutcome::CoverageStillPossible
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::TerminalNoop => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::TerminalNoop => {
             execution::RuntimeFilterSubmitOutcome::TerminalNoop
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::Completed => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::Completed => {
             execution::RuntimeFilterSubmitOutcome::Completed
         }
-        crate::runtime_filter::port::producer::SubmitOutcome::CompletedWithoutArtifact => {
+        novarocks::runtime_filter_transition::port::producer::SubmitOutcome::CompletedWithoutArtifact => {
             execution::RuntimeFilterSubmitOutcome::CompletedWithoutArtifact
         }
     }
@@ -995,7 +1007,7 @@ pub(crate) struct ResolvedNativeConsumer {
     channel_id: ChannelId,
     fragment_instance_id: UniqueId,
     subscription_kind: SubscriptionKind,
-    activation: crate::runtime_filter::model::contract::ConsumerActivation,
+    activation: novarocks::runtime_filter_transition::model::contract::ConsumerActivation,
     capabilities: BTreeSet<ArtifactCapability>,
     artifact_profile: ConsumerArtifactProfile,
     contract: InstalledRuntimeFilterExecutionContract,
@@ -1020,7 +1032,7 @@ impl std::fmt::Debug for ResolvedNativeConsumer {
 impl ResolvedNativeConsumer {
     pub(crate) const fn activation(
         &self,
-    ) -> crate::runtime_filter::model::contract::ConsumerActivation {
+    ) -> novarocks::runtime_filter_transition::model::contract::ConsumerActivation {
         self.activation
     }
 
@@ -1073,7 +1085,7 @@ impl ResolvedNativeConsumer {
 enum SnapshotPredicateCompiler {
     Membership {
         data_type: DataType,
-        null_semantics: crate::runtime_filter::model::contract::NullSemantics,
+        null_semantics: novarocks::runtime_filter_transition::model::contract::NullSemantics,
     },
     Ordered {
         order_contract: Arc<RuntimeOrderContract>,
@@ -1083,7 +1095,7 @@ enum SnapshotPredicateCompiler {
 impl SnapshotPredicateCompiler {
     fn compile(
         &self,
-        bundle: &crate::runtime_filter::port::artifact::ArtifactBundle,
+        bundle: &novarocks::runtime_filter_transition::port::artifact::ArtifactBundle,
         binding_id: execution::RuntimeFilterBindingId,
         contract_digest: [u8; 32],
     ) -> Result<Arc<execution::RuntimeFilterSnapshot>, execution::UnavailableReason> {

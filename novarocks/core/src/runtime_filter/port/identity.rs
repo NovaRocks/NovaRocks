@@ -21,14 +21,14 @@ use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 macro_rules! runtime_id {
     ($name:ident, $raw:ty) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub(crate) struct $name($raw);
+        pub struct $name($raw);
 
         impl $name {
-            pub(crate) const fn new(raw: $raw) -> Self {
+            pub const fn new(raw: $raw) -> Self {
                 Self(raw)
             }
 
-            pub(crate) const fn get(self) -> $raw {
+            pub const fn get(self) -> $raw {
                 self.0
             }
         }
@@ -43,9 +43,9 @@ runtime_id!(ProducerSequence, u64);
 runtime_id!(LogicalVersion, u64);
 
 impl LogicalVersion {
-    pub(crate) const FIRST: Self = Self(1);
+    pub const FIRST: Self = Self(1);
 
-    pub(crate) const fn checked_next(self) -> Option<Self> {
+    pub const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(next) => Some(Self(next)),
             None => None,
@@ -54,14 +54,14 @@ impl LogicalVersion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ProducerStreamId {
+pub struct ProducerStreamId {
     binding_id: BindingId,
     fragment_instance_id: UniqueId,
     partition_id: PartitionId,
 }
 
 impl ProducerStreamId {
-    pub(crate) const fn new(
+    pub const fn new(
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
         partition_id: PartitionId,
@@ -73,21 +73,21 @@ impl ProducerStreamId {
         }
     }
 
-    pub(crate) const fn binding_id(self) -> BindingId {
+    pub const fn binding_id(self) -> BindingId {
         self.binding_id
     }
 
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 
-    pub(crate) const fn partition_id(self) -> PartitionId {
+    pub const fn partition_id(self) -> PartitionId {
         self.partition_id
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ContributionIdentity {
+pub struct ContributionIdentity {
     query_id: UniqueId,
     participant_id: RuntimeFilterParticipantId,
     channel_id: ChannelId,
@@ -97,7 +97,7 @@ pub(crate) struct ContributionIdentity {
 }
 
 impl ContributionIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         query_id: UniqueId,
         participant_id: RuntimeFilterParticipantId,
         channel_id: ChannelId,
@@ -115,27 +115,27 @@ impl ContributionIdentity {
         }
     }
 
-    pub(crate) const fn query_id(self) -> UniqueId {
+    pub const fn query_id(self) -> UniqueId {
         self.query_id
     }
 
-    pub(crate) const fn participant_id(self) -> RuntimeFilterParticipantId {
+    pub const fn participant_id(self) -> RuntimeFilterParticipantId {
         self.participant_id
     }
 
-    pub(crate) const fn channel_id(self) -> ChannelId {
+    pub const fn channel_id(self) -> ChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn epoch(self) -> DeploymentEpoch {
+    pub const fn epoch(self) -> DeploymentEpoch {
         self.epoch
     }
 
-    pub(crate) const fn stream(self) -> ProducerStreamId {
+    pub const fn stream(self) -> ProducerStreamId {
         self.stream
     }
 
-    pub(crate) const fn sequence(self) -> ProducerSequence {
+    pub const fn sequence(self) -> ProducerSequence {
         self.sequence
     }
 }

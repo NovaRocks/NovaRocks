@@ -33,6 +33,8 @@ pub(crate) mod layout;
 pub(crate) mod lifecycle_adapter;
 pub(crate) mod plan_decode;
 pub(crate) mod runtime_filter;
+pub(crate) mod runtime_filter_adapter;
+pub(crate) mod runtime_filter_sender;
 pub(crate) mod scan_contract;
 pub(crate) mod service;
 pub(crate) mod sink_assignment;

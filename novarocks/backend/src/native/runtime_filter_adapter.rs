@@ -17,18 +17,18 @@
 
 use std::sync::Arc;
 
-use crate::common::types::UniqueId;
-use crate::proto;
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-use crate::runtime_filter::port::identity::{
+use novarocks::proto;
+use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+use novarocks::runtime_filter_transition::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
 };
-use crate::runtime_filter::port::transport::{
+use novarocks::runtime_filter_transition::port::transport::{
     ContributionRouteIdentity, DeliveryRouteIdentity, ProducerInstanceRouteIdentity,
     ProducerOpenMetadata, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
     RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
     RuntimeFilterTransportError,
 };
+use novarocks_types::UniqueId;
 
 pub(crate) fn encode_runtime_filter_envelope(
     envelope: &RuntimeFilterEnvelope,
@@ -316,16 +316,16 @@ mod tests {
 
     use tonic::Code;
 
-    use crate::common::types::UniqueId;
-    use crate::proto;
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-    use crate::runtime_filter::port::identity::{
+    use novarocks::proto;
+    use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+    use novarocks::runtime_filter_transition::port::identity::{
         DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
     };
-    use crate::runtime_filter::port::transport::{
+    use novarocks::runtime_filter_transition::port::transport::{
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind,
         RuntimeFilterIngressResult,
     };
+    use novarocks_types::UniqueId;
 
     use super::handle_runtime_filter_envelope;
 

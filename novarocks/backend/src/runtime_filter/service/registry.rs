@@ -19,41 +19,43 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::codec::contribution::max_encoded_len_for_contribution_budget;
 use crate::runtime_filter::core::channel::RuntimeFilterChannel;
-use crate::runtime_filter::deployment::install_validation::validate_participant_install;
-use crate::runtime_filter::model::contract::{
+use crate::runtime_filter::router::loopback::LoopbackRouter;
+use crate::runtime_filter::router::role_graph::RoleRouter;
+use novarocks::runtime_filter_transition::codec::contribution::max_encoded_len_for_contribution_budget;
+use novarocks::runtime_filter_transition::deployment::install_validation::validate_participant_install;
+use novarocks::runtime_filter_transition::model::contract::{
     BindingId, ChannelId, CompletionFenceKind, CompletionRequirement, ConsumerActivation,
     ReductionRequirement, RuntimeFilterLogicalDomain,
 };
-use crate::runtime_filter::port::artifact::{
+use novarocks::runtime_filter_transition::port::artifact::{
     ArtifactMembershipSchema, ConsumerArtifactProfile, ConsumerProfileId,
 };
-use crate::runtime_filter::port::events::{
+use novarocks::runtime_filter_transition::port::events::{
     RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
 };
 #[cfg(test)]
-use crate::runtime_filter::port::final_domain::CompletionFenceAuthority;
-use crate::runtime_filter::port::final_domain::RuntimeCompletionFenceContract;
-use crate::runtime_filter::port::identity::{
+use novarocks::runtime_filter_transition::port::final_domain::CompletionFenceAuthority;
+use novarocks::runtime_filter_transition::port::final_domain::RuntimeCompletionFenceContract;
+use novarocks::runtime_filter_transition::port::identity::{
     DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
 };
-use crate::runtime_filter::port::install::{
+use novarocks::runtime_filter_transition::port::install::{
     RuntimeFilterChannelDeployment, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
 };
-use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::ordered_bound::RuntimeOrderContract;
+use novarocks::runtime_filter_transition::port::producer::{
     InstallContractError, InstallContractErrorKind, InstallOutcome, ProducerPortKind,
     RuntimeContractViolation, RuntimeContractViolationKind,
 };
-use crate::runtime_filter::port::subscription::{SubscriptionHandle, SubscriptionKind};
-use crate::runtime_filter::port::support::{
+use novarocks::runtime_filter_transition::port::subscription::{
+    SubscriptionHandle, SubscriptionKind,
+};
+use novarocks::runtime_filter_transition::port::support::{
     ArtifactRetainedBudget, ArtifactScratchBudget, RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
-use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
-use crate::runtime_filter::router::loopback::LoopbackRouter;
-use crate::runtime_filter::router::role_graph::RoleRouter;
+use novarocks::runtime_filter_transition::port::topk_summary::RuntimeTopKSummaryContract;
+use novarocks_types::UniqueId;
 
 use super::materialization::{ArtifactPublishGate, ArtifactPublishKey};
 use super::subscription::SubscriptionGroup;
@@ -165,10 +167,11 @@ impl InboundProducerContract {
 
     pub(super) fn codec_expectation(
         &self,
-        stream: crate::runtime_filter::port::identity::ProducerStreamId,
-        sequence: crate::runtime_filter::port::identity::ProducerSequence,
-    ) -> crate::runtime_filter::codec::contribution::ContributionCodecExpectation<'_> {
-        use crate::runtime_filter::codec::contribution::ContributionCodecExpectation;
+        stream: novarocks::runtime_filter_transition::port::identity::ProducerStreamId,
+        sequence: novarocks::runtime_filter_transition::port::identity::ProducerSequence,
+    ) -> novarocks::runtime_filter_transition::codec::contribution::ContributionCodecExpectation<'_>
+    {
+        use novarocks::runtime_filter_transition::codec::contribution::ContributionCodecExpectation;
         match self {
             Self::Membership { schema, .. } => ContributionCodecExpectation::Membership(schema),
             Self::OrderedBound { contract, .. } => {
@@ -244,7 +247,7 @@ impl CapabilityGroup {
 
 pub(super) struct ChannelArtifactPlan {
     schema: Option<ArtifactMembershipSchema>,
-    policy: crate::runtime_filter::port::install::MaterializationPolicy,
+    policy: novarocks::runtime_filter_transition::port::install::MaterializationPolicy,
     max_artifact_bytes: usize,
     max_concurrent_jobs: usize,
     retained_budget: Arc<ArtifactRetainedBudget>,
@@ -258,7 +261,7 @@ impl ChannelArtifactPlan {
     }
     pub(super) const fn policy(
         &self,
-    ) -> crate::runtime_filter::port::install::MaterializationPolicy {
+    ) -> novarocks::runtime_filter_transition::port::install::MaterializationPolicy {
         self.policy
     }
     pub(super) const fn max_artifact_bytes(&self) -> usize {
@@ -309,7 +312,7 @@ impl CancelledDeployment {
         for routes in self.cancelled_routes.values() {
             self.installed.router.route(
                 routes,
-                &crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome::Cancelled,
+                &novarocks::runtime_filter_transition::port::subscription::ArtifactDeliveryOutcome::Cancelled,
             );
         }
     }
@@ -338,7 +341,8 @@ impl InstalledDeployment {
     pub(super) fn channel_deployment(
         &self,
         channel_id: ChannelId,
-    ) -> Option<&crate::runtime_filter::port::install::RuntimeFilterChannelDeployment> {
+    ) -> Option<&novarocks::runtime_filter_transition::port::install::RuntimeFilterChannelDeployment>
+    {
         self.install.core_view().channels().get(&channel_id)
     }
 
@@ -997,8 +1001,10 @@ struct RoutingBuild {
     producers: BTreeMap<BindingId, ProducerRoute>,
     consumer_activations: BTreeMap<BindingId, ConsumerActivation>,
     subscriptions: BTreeMap<BindingId, Arc<SubscriptionGroup>>,
-    routes:
-        BTreeMap<RouteEdgeId, Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>>,
+    routes: BTreeMap<
+        RouteEdgeId,
+        Arc<dyn novarocks::runtime_filter_transition::port::subscription::ArtifactDelivery>,
+    >,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
     route_event_identities: BTreeMap<RouteEdgeId, Vec<RouteEventIdentity>>,
     delivery_profiles: BTreeMap<(ChannelId, RouteEdgeId), ConsumerArtifactProfile>,
@@ -1104,7 +1110,7 @@ fn build_routing(
                 build.routes.insert(
                     *route_edge_id,
                     group.clone()
-                        as Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>,
+                        as Arc<dyn novarocks::runtime_filter_transition::port::subscription::ArtifactDelivery>,
                 );
                 build
                     .channel_routes
@@ -1494,32 +1500,34 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime_filter::deployment::install_validation::{
+    use novarocks::runtime::endpoint::RuntimeEndpoint;
+    use novarocks::runtime_filter_transition::deployment::install_validation::{
         validate_channel_contract_for_test as validate_channel_contract,
         validate_install_view_contract_for_test as validate_view,
     };
-    use crate::runtime_filter::materializer::bloom::BloomHashContract;
-    use crate::runtime_filter::model::contract::*;
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::port::artifact::{
+    use novarocks::runtime_filter_transition::materializer::bloom::BloomHashContract;
+    use novarocks::runtime_filter_transition::model::contract::*;
+    use novarocks::runtime_filter_transition::model::coverage::Coverage;
+    use novarocks::runtime_filter_transition::port::artifact::{
         ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile, ConsumerProfileId,
     };
-    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-    use crate::runtime_filter::port::identity::*;
-    use crate::runtime_filter::port::install::*;
-    use crate::runtime_filter::port::producer::{
+    use novarocks::runtime_filter_transition::port::events::{
+        RuntimeFilterEvent, RuntimeFilterEventSink,
+    };
+    use novarocks::runtime_filter_transition::port::identity::*;
+    use novarocks::runtime_filter_transition::port::install::*;
+    use novarocks::runtime_filter_transition::port::producer::{
         InstallContractError, InstallContractErrorKind, InstallOutcome,
     };
-    use crate::runtime_filter::port::routing::{
+    use novarocks::runtime_filter_transition::port::routing::{
         RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
         RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
     };
-    use crate::runtime_filter::port::support::{
+    use novarocks::runtime_filter_transition::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
-    use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
+    use novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelopeKind;
+    use novarocks_types::UniqueId;
 
     use super::{
         DeploymentRegistry, EventEmitter, InboundProducerContract, RuntimeCompletionFenceContract,
@@ -1614,7 +1622,7 @@ mod tests {
                 max_retries: 3,
             },
             RuntimeFilterCoreBudget::new(4096),
-            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
+            novarocks::runtime_filter_transition::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(producer),
                 ProducerDeployment::new(
@@ -1700,7 +1708,7 @@ mod tests {
                 .producer(BindingId::new(10))
                 .unwrap()
                 .kind,
-            crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain
+            novarocks::runtime_filter_transition::port::producer::ProducerPortKind::FinalDomain
         );
     }
 
@@ -1825,9 +1833,9 @@ mod tests {
         }];
         let plan = OrderContract {
             comparator_digest:
-                crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                novarocks::runtime_filter_transition::port::ordered_bound::comparator_digest_for_test(
                     &keys,
-                    crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                    novarocks::runtime_filter_transition::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
                 ),
             keys,
             inclusive: true,
@@ -1974,13 +1982,13 @@ mod tests {
 
         assert_eq!(
             installed.producer(BindingId::new(10)).unwrap().kind,
-            crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary
+            novarocks::runtime_filter_transition::port::producer::ProducerPortKind::TopKSummary
         );
     }
 
     fn assert_installed_inbound_contract(
         registry: &DeploymentRegistry,
-        expected_kind: crate::runtime_filter::port::producer::ProducerPortKind,
+        expected_kind: novarocks::runtime_filter_transition::port::producer::ProducerPortKind,
         expected_digest: [u8; 32],
     ) {
         let installed = registry.active_installation().unwrap();
@@ -2012,7 +2020,7 @@ mod tests {
 
         assert_installed_inbound_contract(
             &registry,
-            crate::runtime_filter::port::producer::ProducerPortKind::Membership,
+            novarocks::runtime_filter_transition::port::producer::ProducerPortKind::Membership,
             expected_digest,
         );
     }
@@ -2034,7 +2042,7 @@ mod tests {
 
         assert_installed_inbound_contract(
             &registry,
-            crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound,
+            novarocks::runtime_filter_transition::port::producer::ProducerPortKind::OrderedBound,
             expected_digest,
         );
     }
@@ -2060,7 +2068,7 @@ mod tests {
 
         assert_installed_inbound_contract(
             &registry,
-            crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary,
+            novarocks::runtime_filter_transition::port::producer::ProducerPortKind::TopKSummary,
             expected_digest,
         );
     }
@@ -2090,7 +2098,7 @@ mod tests {
 
         assert_installed_inbound_contract(
             &registry,
-            crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain,
+            novarocks::runtime_filter_transition::port::producer::ProducerPortKind::FinalDomain,
             expected_digest,
         );
         let installed = registry.active_installation().unwrap();
@@ -2162,9 +2170,9 @@ mod tests {
         }];
         let wrong_plan = OrderContract {
             comparator_digest:
-                crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                novarocks::runtime_filter_transition::port::ordered_bound::comparator_digest_for_test(
                     &keys,
-                    crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                    novarocks::runtime_filter_transition::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
                 ),
             keys,
             inclusive: true,
@@ -3406,7 +3414,7 @@ mod tests {
             base.completion_requirement(),
             base.policy(),
             base.core_budget(),
-            crate::runtime_filter::port::install::MaterializationPolicy::new(
+            novarocks::runtime_filter_transition::port::install::MaterializationPolicy::new(
                 8,
                 5,
                 17,
@@ -3440,7 +3448,11 @@ mod tests {
                     ArtifactKind::ValueSet,
                     ArtifactKind::EmptyDomain,
                 ]),
-                Some(crate::runtime_filter::port::artifact::HashContractDigest::new([7; 32])),
+                Some(
+                    novarocks::runtime_filter_transition::port::artifact::HashContractDigest::new(
+                        [7; 32],
+                    ),
+                ),
             )
             .unwrap(),
         );

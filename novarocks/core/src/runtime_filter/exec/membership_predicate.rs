@@ -39,16 +39,16 @@ use crate::runtime_filter::port::artifact::{
 use crate::runtime_filter::port::identity::LogicalVersion;
 
 #[derive(Clone, Debug)]
-pub(crate) struct MembershipPredicateContract {
-    pub(crate) channel_id: ChannelId,
-    pub(crate) data_type: DataType,
-    pub(crate) null_semantics: NullSemantics,
-    pub(crate) logical_version: LogicalVersion,
+pub struct MembershipPredicateContract {
+    pub channel_id: ChannelId,
+    pub data_type: DataType,
+    pub null_semantics: NullSemantics,
+    pub logical_version: LogicalVersion,
     profile: ConsumerArtifactProfile,
 }
 
 impl MembershipPredicateContract {
-    pub(crate) fn join(
+    pub fn join(
         channel_id: ChannelId,
         data_type: DataType,
         null_semantics: NullSemantics,
@@ -68,7 +68,7 @@ impl MembershipPredicateContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PredicateCompileError {
+pub enum PredicateCompileError {
     ChannelMismatch {
         expected: ChannelId,
         actual: ChannelId,
@@ -107,7 +107,7 @@ impl fmt::Display for PredicateCompileError {
 impl Error for PredicateCompileError {}
 
 #[derive(Clone)]
-pub(crate) struct NativeRuntimeFilterPredicate {
+pub struct NativeRuntimeFilterPredicate {
     // The retained canonical artifact is the only resident membership payload.
     // `resident` stores validated offsets/metadata only, so compilation adds no
     // unaccounted value-set or string allocation beyond the existing retention.
@@ -117,7 +117,7 @@ pub(crate) struct NativeRuntimeFilterPredicate {
 }
 
 impl NativeRuntimeFilterPredicate {
-    pub(crate) fn compile(
+    pub fn compile(
         bundle: &ArtifactBundle,
         expected: &MembershipPredicateContract,
     ) -> Result<Self, PredicateCompileError> {
@@ -186,10 +186,7 @@ impl NativeRuntimeFilterPredicate {
         })
     }
 
-    pub(crate) fn evaluate(
-        &self,
-        array: &dyn Array,
-    ) -> Result<BooleanArray, PredicateEvaluationError> {
+    pub fn evaluate(&self, array: &dyn Array) -> Result<BooleanArray, PredicateEvaluationError> {
         if array.data_type() != &self.data_type {
             return Err(PredicateEvaluationError::TypeMismatch {
                 expected: self.data_type.clone(),
@@ -273,7 +270,7 @@ impl NativeRuntimeFilterPredicate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PredicateEvaluationError {
+pub enum PredicateEvaluationError {
     TypeMismatch {
         expected: DataType,
         actual: DataType,

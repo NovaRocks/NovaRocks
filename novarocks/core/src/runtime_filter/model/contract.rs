@@ -22,14 +22,14 @@ use arrow::datatypes::DataType;
 macro_rules! model_id {
     ($name:ident, $raw:ty) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub(crate) struct $name($raw);
+        pub struct $name($raw);
 
         impl $name {
-            pub(crate) const fn new(raw: $raw) -> Self {
+            pub const fn new(raw: $raw) -> Self {
                 Self(raw)
             }
 
-            pub(crate) const fn get(self) -> $raw {
+            pub const fn get(self) -> $raw {
                 self.0
             }
         }
@@ -106,7 +106,7 @@ pub enum ContributionKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterLifecycle {
+pub enum RuntimeFilterLifecycle {
     CompleteOnce,
     MonotonicUpdates,
 }
@@ -177,7 +177,7 @@ impl ConsumerActivation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterPolicyRequirement {
+pub struct RuntimeFilterPolicyRequirement {
     pub max_contribution_bytes: u64,
     pub max_artifact_bytes: u64,
     pub deadline_ms: u64,

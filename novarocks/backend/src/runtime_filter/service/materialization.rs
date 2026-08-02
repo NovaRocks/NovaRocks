@@ -20,26 +20,30 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
-use crate::runtime_filter::model::contract::ChannelId;
-use crate::runtime_filter::port::artifact::{ArtifactBundle, ConsumerProfileId};
-use crate::runtime_filter::port::identity::{DeploymentEpoch, LogicalVersion};
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::model::contract::ChannelId;
+use novarocks::runtime_filter_transition::port::artifact::{ArtifactBundle, ConsumerProfileId};
+use novarocks::runtime_filter_transition::port::identity::{DeploymentEpoch, LogicalVersion};
+use novarocks::runtime_filter_transition::port::producer::{
     RuntimeContractViolation, RuntimeContractViolationKind,
 };
-use crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome;
+use novarocks::runtime_filter_transition::port::subscription::ArtifactDeliveryOutcome;
 
-use crate::runtime_filter::materializer::range::{
+use novarocks::runtime_filter_transition::materializer::range::{
     AdmittedRangeMaterialization, RangeMaterializationOutcome, RangeMaterializer,
 };
-use crate::runtime_filter::materializer::{
+use novarocks::runtime_filter_transition::materializer::{
     AdmittedMaterialization, MaterializationAdmission, MaterializationOutcome, Materializer,
     UnavailableReason as MaterializerUnavailableReason,
     UnsupportedReason as MaterializerUnsupportedReason,
 };
-use crate::runtime_filter::port::events::{ArtifactMaterializationIdentity, RuntimeFilterEvent};
-use crate::runtime_filter::port::subscription::{ArtifactUnsupportedReason, UnavailableReason};
-use crate::runtime_filter::port::support::RuntimeFilterMemoryAccount;
-use crate::runtime_filter::port::value_domain::LogicalSnapshot;
+use novarocks::runtime_filter_transition::port::events::{
+    ArtifactMaterializationIdentity, RuntimeFilterEvent,
+};
+use novarocks::runtime_filter_transition::port::subscription::{
+    ArtifactUnsupportedReason, UnavailableReason,
+};
+use novarocks::runtime_filter_transition::port::support::RuntimeFilterMemoryAccount;
+use novarocks::runtime_filter_transition::port::value_domain::LogicalSnapshot;
 
 use super::registry::{CapabilityGroup, ChannelArtifactPlan};
 
@@ -941,17 +945,17 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
-    use crate::runtime_filter::port::artifact::{
+    use novarocks::runtime_filter_transition::model::contract::{ChannelId, NullSemantics};
+    use novarocks::runtime_filter_transition::port::artifact::{
         ArtifactBundle, ArtifactKind, ArtifactSchemaDigest, ConsumerArtifactProfile,
         ConsumerProfileId, PhysicalArtifact,
     };
-    use crate::runtime_filter::port::identity::{DeploymentEpoch, LogicalVersion};
-    use crate::runtime_filter::port::producer::RuntimeContractViolationKind;
-    use crate::runtime_filter::port::subscription::{
+    use novarocks::runtime_filter_transition::port::identity::{DeploymentEpoch, LogicalVersion};
+    use novarocks::runtime_filter_transition::port::producer::RuntimeContractViolationKind;
+    use novarocks::runtime_filter_transition::port::subscription::{
         ArtifactDeliveryOutcome, ArtifactUnsupportedReason, UnavailableReason,
     };
-    use crate::runtime_filter::port::support::{
+    use novarocks::runtime_filter_transition::port::support::{
         ArtifactRetainedBudget, ArtifactRetention, MemoryAccountError, RuntimeFilterMemoryAccount,
     };
 

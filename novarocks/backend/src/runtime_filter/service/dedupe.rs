@@ -62,13 +62,15 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-use crate::runtime_filter::port::identity::{
+use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+use novarocks::runtime_filter_transition::port::identity::{
     DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence, RouteEdgeId,
 };
-use crate::runtime_filter::port::transport::ProducerInstanceRouteIdentity;
-use crate::runtime_filter::port::transport::{ContributionRouteIdentity, DeliveryRouteIdentity};
+use novarocks::runtime_filter_transition::port::transport::ProducerInstanceRouteIdentity;
+use novarocks::runtime_filter_transition::port::transport::{
+    ContributionRouteIdentity, DeliveryRouteIdentity,
+};
+use novarocks_types::UniqueId;
 
 /// Per-channel key for a producer contribution transport identity. It is exactly
 /// the `ContributionRouteIdentity` (binding + finst + partition + sequence).
@@ -400,14 +402,14 @@ mod tests {
         ContributionAdmission, DeliveredVersionKind, DeliveryAdmission, IngressDedupe,
         TombstoneVerdict,
     };
-    use crate::common::types::UniqueId;
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-    use crate::runtime_filter::port::identity::{
+    use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+    use novarocks::runtime_filter_transition::port::identity::{
         DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence, RouteEdgeId,
     };
-    use crate::runtime_filter::port::transport::{
+    use novarocks::runtime_filter_transition::port::transport::{
         ContributionRouteIdentity, DeliveryRouteIdentity,
     };
+    use novarocks_types::UniqueId;
 
     const QID: UniqueId = UniqueId::new(5, 6);
 

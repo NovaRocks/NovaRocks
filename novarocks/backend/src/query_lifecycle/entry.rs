@@ -27,6 +27,7 @@ use novarocks::query_execution::lifecycle::{
 use novarocks_types::UniqueId;
 
 use super::stage::StartGate;
+use crate::runtime_filter::participant::RuntimeFilterParticipant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueryLifecyclePhase {
@@ -57,9 +58,10 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) phase: QueryLifecyclePhase,
     pub(crate) init_outcome: Option<QueryInitOutcome>,
     pub(crate) termination_reason: Option<QueryTerminationReason>,
-    pub(crate) runtime_filter_installed: bool,
-    pub(crate) runtime_filter_cleanup_required: bool,
-    pub(crate) runtime_filter_cleanup_in_flight: bool,
+    /// Published with a successful Init and owned by this full execution
+    /// attempt. No process-global context owns a second Service.
+    pub(crate) runtime_filter: Option<Arc<RuntimeFilterParticipant>>,
+    pub(crate) runtime_filter_close_in_flight: bool,
     pub(crate) ever_initialized: bool,
     pub(crate) terminated_at: Option<Instant>,
     pub(crate) in_flight_fragments: BTreeSet<UniqueId>,
@@ -115,9 +117,8 @@ impl QueryLifecycleEntry {
                 phase: QueryLifecyclePhase::Initializing,
                 init_outcome: None,
                 termination_reason: None,
-                runtime_filter_installed: false,
-                runtime_filter_cleanup_required: false,
-                runtime_filter_cleanup_in_flight: false,
+                runtime_filter: None,
+                runtime_filter_close_in_flight: false,
                 ever_initialized: false,
                 terminated_at: None,
                 in_flight_fragments: BTreeSet::new(),

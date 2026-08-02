@@ -27,46 +27,46 @@ use crate::sql::planner::runtime_filter::progress::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct RefinedFragmentEdge {
-    pub(crate) source_fragment: u32,
-    pub(crate) target_fragment: u32,
-    pub(crate) target_exchange_node: i32,
+pub struct RefinedFragmentEdge {
+    pub source_fragment: u32,
+    pub target_fragment: u32,
+    pub target_exchange_node: i32,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerWaitInput {
-    pub(crate) channel: ChannelId,
-    pub(crate) binding: BindingId,
-    pub(crate) fragment: u32,
-    pub(crate) node_id: i32,
-    pub(crate) completion_requirement: CompletionRequirement,
+pub struct ProducerWaitInput {
+    pub channel: ChannelId,
+    pub binding: BindingId,
+    pub fragment: u32,
+    pub node_id: i32,
+    pub completion_requirement: CompletionRequirement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConsumerWaitBehavior {
+pub enum ConsumerWaitBehavior {
     BlocksUntilComplete,
     NeverBlocks,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConsumerWaitInput {
-    pub(crate) channel: ChannelId,
-    pub(crate) binding: BindingId,
-    pub(crate) consumer_fragment: u32,
-    pub(crate) behavior: ConsumerWaitBehavior,
-    pub(crate) producers: Vec<ProducerWaitInput>,
+pub struct ConsumerWaitInput {
+    pub channel: ChannelId,
+    pub binding: BindingId,
+    pub consumer_fragment: u32,
+    pub behavior: ConsumerWaitBehavior,
+    pub producers: Vec<ProducerWaitInput>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct WaitProvenance {
-    pub(crate) channel: ChannelId,
-    pub(crate) consumer_binding: BindingId,
-    pub(crate) producer_binding: BindingId,
+pub struct WaitProvenance {
+    pub channel: ChannelId,
+    pub consumer_binding: BindingId,
+    pub producer_binding: BindingId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PureBlockingScc {
-    pub(crate) waits: Vec<WaitProvenance>,
-    pub(crate) witness: Vec<CycleStep>,
+pub struct PureBlockingScc {
+    pub waits: Vec<WaitProvenance>,
+    pub witness: Vec<CycleStep>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -87,14 +87,14 @@ enum WaitEdgeKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct CycleStep {
+pub struct CycleStep {
     from: WaitNode,
     kind: WaitEdgeKind,
     to: WaitNode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProofRejection {
+pub enum ProofRejection {
     PayloadChannelMismatch,
     PayloadProducerBindingMismatch,
     PayloadProducerFragmentMismatch,
@@ -115,32 +115,32 @@ enum ProofFallback {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RefinedWaitGraphBuildError {
+pub enum RefinedWaitGraphBuildError {
     FragmentCycle,
 }
 
 type WaitGraph = BTreeMap<WaitNode, BTreeSet<(WaitNode, WaitEdgeKind)>>;
 
 #[derive(Clone, Debug)]
-pub(crate) struct RefinedWaitGraph {
+pub struct RefinedWaitGraph {
     succ: WaitGraph,
     fallbacks: BTreeMap<WaitProvenance, ProofFallback>,
     accepted_build_ready: BTreeSet<(u32, i32)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RefinedCycle {
+pub struct RefinedCycle {
     steps: Vec<CycleStep>,
     fallbacks: BTreeMap<WaitProvenance, ProofFallback>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ExecutionDependencyGraph {
+pub struct ExecutionDependencyGraph {
     deps: BTreeMap<u32, BTreeSet<u32>>,
 }
 
 impl ExecutionDependencyGraph {
-    pub(crate) fn from_fragment_edges(
+    pub fn from_fragment_edges(
         edges: &[RefinedFragmentEdge],
     ) -> Result<Self, RefinedWaitGraphBuildError> {
         let mut direct: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
@@ -203,14 +203,14 @@ impl ExecutionDependencyGraph {
         Ok(Self { deps })
     }
 
-    pub(crate) fn reaches(&self, fragment: u32, predecessor: u32) -> bool {
+    pub fn reaches(&self, fragment: u32, predecessor: u32) -> bool {
         self.deps
             .get(&fragment)
             .is_some_and(|deps| deps.contains(&predecessor))
     }
 }
 
-pub(crate) fn project_consumer_waits<A>(
+pub fn project_consumer_waits<A>(
     graph: &RuntimeFilterGraphData<A>,
     behavior: impl Fn(&A) -> ConsumerWaitBehavior,
 ) -> Vec<ConsumerWaitInput> {
@@ -252,7 +252,7 @@ pub(crate) fn project_consumer_waits<A>(
     waits
 }
 
-pub(crate) fn revalidate_proof(
+pub fn revalidate_proof(
     proof: &JoinBuildProgressProof,
     edges: &[RefinedFragmentEdge],
     deps: &ExecutionDependencyGraph,
@@ -326,7 +326,7 @@ fn add_wait_edge(from: WaitNode, to: WaitNode, kind: WaitEdgeKind, succ: &mut Wa
     succ.entry(to).or_default();
 }
 
-pub(crate) fn build_refined_wait_graph(
+pub fn build_refined_wait_graph(
     edges: &[RefinedFragmentEdge],
     consumers: &[ConsumerWaitInput],
     join_progress: &JoinBuildProgressCatalog,
@@ -480,7 +480,7 @@ pub(crate) fn build_refined_wait_graph(
 }
 
 impl RefinedWaitGraph {
-    pub(crate) fn find_cycle(&self) -> Option<RefinedCycle> {
+    pub fn find_cycle(&self) -> Option<RefinedCycle> {
         match find_cycle_steps(&self.succ) {
             Some(steps) => Some(RefinedCycle {
                 steps,
@@ -497,7 +497,7 @@ impl RefinedWaitGraph {
         }
     }
 
-    pub(crate) fn pure_blocking_sccs(&self) -> Vec<PureBlockingScc> {
+    pub fn pure_blocking_sccs(&self) -> Vec<PureBlockingScc> {
         let mut result = Vec::new();
         for nodes in strongly_connected_components(&self.succ) {
             let node_set: BTreeSet<WaitNode> = nodes.iter().copied().collect();
@@ -555,7 +555,7 @@ impl RefinedWaitGraph {
 }
 
 impl RefinedCycle {
-    pub(crate) fn primary_wait(&self) -> WaitProvenance {
+    pub fn primary_wait(&self) -> WaitProvenance {
         self.steps
             .iter()
             .filter_map(|step| match step.kind {
@@ -566,7 +566,7 @@ impl RefinedCycle {
             .expect("a refined-graph cycle must cross a wait or backpressure edge")
     }
 
-    pub(crate) fn render(&self) -> Vec<String> {
+    pub fn render(&self) -> Vec<String> {
         self.steps
             .iter()
             .map(|step| render_cycle_step(step, &self.fallbacks))

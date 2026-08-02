@@ -24,7 +24,7 @@ use super::node::DistributedNode;
 use crate::sql::planner::runtime_filter::activation::ActivationConstraint;
 use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraphData;
 
-pub(crate) type FragmentId = u32;
+pub type FragmentId = u32;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PartitionKind {
@@ -34,7 +34,7 @@ pub(crate) enum PartitionKind {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DataPartition {
+pub struct DataPartition {
     pub kind: PartitionKind,
     pub exprs: Vec<TypedExpr>,
 }
@@ -106,7 +106,7 @@ pub(crate) struct PlanFragment {
 
 /// Result of emitting a multi-fragment plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FragmentEdgeKind {
+pub enum FragmentEdgeKind {
     Stream,
     CteMulticast {
         cte_id: CteId,
@@ -120,7 +120,7 @@ pub(crate) enum FragmentEdgeKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FragmentStreamKind {
+pub enum FragmentStreamKind {
     Gather,
     Broadcast,
     Partitioned,
@@ -128,7 +128,7 @@ pub(crate) enum FragmentStreamKind {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct FragmentEdge {
+pub struct FragmentEdge {
     pub source_fragment_id: FragmentId,
     pub target_fragment_id: FragmentId,
     pub target_exchange_node_id: i32,

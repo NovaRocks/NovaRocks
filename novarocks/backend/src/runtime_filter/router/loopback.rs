@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::runtime_filter::port::identity::RouteEdgeId;
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::identity::RouteEdgeId;
+use novarocks::runtime_filter_transition::port::subscription::{
     ArtifactDelivery, ArtifactDeliveryOutcome, LiveTerminal,
 };
 
@@ -90,8 +90,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, Weak};
 
-    use crate::runtime_filter::port::identity::RouteEdgeId;
-    use crate::runtime_filter::port::subscription::{
+    use novarocks::runtime_filter_transition::port::identity::RouteEdgeId;
+    use novarocks::runtime_filter_transition::port::subscription::{
         ArtifactDelivery, ArtifactDeliveryOutcome, UnavailableReason,
     };
 

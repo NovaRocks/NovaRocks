@@ -692,7 +692,7 @@ impl HashJoinBuildSinkOperator {
     }
 
     fn publish_runtime_filters(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        // Native runtime filters are produced through RuntimeFilterService, not here.
+        // Native runtime filters are produced through the injected backend session, not here.
         Ok(())
     }
 

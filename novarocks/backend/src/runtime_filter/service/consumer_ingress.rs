@@ -32,14 +32,18 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::runtime_filter::codec::artifact::{
+use novarocks::runtime_filter_transition::codec::artifact::{
     ArtifactDecodeExpectation, ArtifactWireCodecError, decode_artifact_bundle, decode_unavailable,
     max_encoded_len_for_artifact_budget,
 };
-use crate::runtime_filter::port::identity::LogicalVersion;
-use crate::runtime_filter::port::routing::RuntimeFilterRouteContractError;
-use crate::runtime_filter::port::subscription::{ArtifactDeliveryOutcome, LiveTerminal};
-use crate::runtime_filter::port::transport::{RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind};
+use novarocks::runtime_filter_transition::port::identity::LogicalVersion;
+use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRouteContractError;
+use novarocks::runtime_filter_transition::port::subscription::{
+    ArtifactDeliveryOutcome, LiveTerminal,
+};
+use novarocks::runtime_filter_transition::port::transport::{
+    RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
+};
 
 use super::RuntimeFilterService;
 use super::dedupe::{DeliveredVersionKind, DeliveryAdmission, TombstoneVerdict};
@@ -388,63 +392,67 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::runtime_filter::codec::artifact::{
+    use novarocks::runtime_filter_transition::codec::artifact::{
         ArtifactDecodeExpectation, encode_artifact_bundle, encode_unavailable,
         max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
     };
-    use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
-    use crate::runtime_filter::materializer::bloom::BloomHashContract;
-    use crate::runtime_filter::materializer::range::{
+    use novarocks::runtime_filter_transition::materializer::bloom::BloomHashContract;
+    use novarocks::runtime_filter_transition::materializer::range::{
         RangeMaterializationOutcome, RangeMaterializer,
     };
-    use crate::runtime_filter::materializer::{MaterializationOutcome, Materializer};
-    use crate::runtime_filter::model::contract::{
+    use novarocks::runtime_filter_transition::materializer::{
+        MaterializationOutcome, Materializer,
+    };
+    use novarocks::runtime_filter_transition::model::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
         ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, NullSemantics,
         OrderContract, OrderKeyContract, ReductionRequirement, RuntimeFilterLifecycle,
         RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement, SortDirection,
     };
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::port::artifact::{
+    use novarocks::runtime_filter_transition::model::coverage::Coverage;
+    use novarocks::runtime_filter_transition::port::artifact::{
         ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
     };
-    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-    use crate::runtime_filter::port::identity::{
+    use novarocks::runtime_filter_transition::port::events::{
+        RuntimeFilterEvent, RuntimeFilterEventSink,
+    };
+    use novarocks::runtime_filter_transition::port::identity::{
         DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence, RouteEdgeId,
         RuntimeFilterParticipantId,
     };
-    use crate::runtime_filter::port::install::{
+    use novarocks::runtime_filter_transition::port::install::{
         ConsumerDeployment, MaterializationPolicy, OutboundMaterializationGroup,
         OutboundMaterializationOwner, ProducerDeployment, RuntimeFilterChannelDeployment,
         RuntimeFilterCoreBudget, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
     };
-    use crate::runtime_filter::port::ordered_bound::{
+    use novarocks::runtime_filter_transition::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, RuntimeOrderContract,
         comparator_digest_for_test,
     };
-    use crate::runtime_filter::port::producer::InstallOutcome;
-    use crate::runtime_filter::port::routing::{
+    use novarocks::runtime_filter_transition::port::producer::InstallOutcome;
+    use novarocks::runtime_filter_transition::port::routing::{
         RuntimeFilterChannelRoutingView, RuntimeFilterRemoteRoute, RuntimeFilterRouteContractError,
         RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer, RuntimeFilterRouteRole,
         RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
     };
-    use crate::runtime_filter::port::subscription::{
+    use novarocks::runtime_filter_transition::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDeliveryOutcome, LivePollOutcome, LiveTerminal,
         SubscriptionKind, UnavailableReason,
     };
-    use crate::runtime_filter::port::support::{
+    use novarocks::runtime_filter_transition::port::support::{
         ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
         RetainedMemoryReservation, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
-    use crate::runtime_filter::port::transport::{
+    use novarocks::runtime_filter_transition::port::transport::{
         ContributionRouteIdentity, DeliveryRouteIdentity, ProducerOpenMetadata,
         RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
         RuntimeFilterRouteIdentity,
     };
-    use crate::runtime_filter::port::value_domain::{
+    use novarocks::runtime_filter_transition::port::value_domain::OrderedBoundDomain;
+    use novarocks::runtime_filter_transition::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
     };
+    use novarocks_types::UniqueId;
 
     use crate::runtime_filter::router::remote::{
         RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
@@ -695,7 +703,7 @@ mod tests {
                         ),
                         RuntimeFilterRoutePeer::Remote {
                             participant_id: remote_aggregator,
-                            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new(
+                            endpoint: novarocks::runtime::endpoint::RuntimeEndpoint::new(
                                 "remote-aggregator",
                                 9060,
                             )
@@ -849,7 +857,7 @@ mod tests {
                     } else {
                         RuntimeFilterRoutePeer::Remote {
                             participant_id: source_participant,
-                            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new(
+                            endpoint: novarocks::runtime::endpoint::RuntimeEndpoint::new(
                                 "remote-aggregator",
                                 9060,
                             )
@@ -1221,7 +1229,7 @@ mod tests {
                     BindingId::new(PRODUCER_BINDING),
                     producer_finst(),
                     1,
-                    crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound,
+                    novarocks::runtime_filter_transition::port::producer::ProducerPortKind::OrderedBound,
                 )
                 .is_err(),
             "consumer-only installation must not rely on a local producer"
@@ -2109,7 +2117,7 @@ mod tests {
         // The codec-error mapping always lands under the codec-contract prefix.
         assert_eq!(
             map_codec_error(
-                crate::runtime_filter::codec::artifact::ArtifactWireCodecError::Malformed
+                novarocks::runtime_filter_transition::codec::artifact::ArtifactWireCodecError::Malformed
             )
             .kind(),
             CodecContract,
@@ -2134,7 +2142,7 @@ mod tests {
         fn try_send(
             &self,
             _route: RuntimeFilterRemoteRoute,
-            _envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
+            _envelope: novarocks::runtime_filter_transition::port::transport::RuntimeFilterTransportEnvelope,
         ) -> SinkSubmitOutcome {
             panic!("a loopback-only delivery scope must not reach the remote sink");
         }

@@ -27,7 +27,7 @@ use super::subscription::{ArtifactUnsupportedReason, LiveTerminal, UnavailableRe
 use super::transport::RuntimeFilterAcceptStatus;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct RuntimeFilterEventIdentity {
+pub struct RuntimeFilterEventIdentity {
     query_id: UniqueId,
     participant_id: RuntimeFilterParticipantId,
     channel_id: ChannelId,
@@ -35,7 +35,7 @@ pub(crate) struct RuntimeFilterEventIdentity {
 }
 
 impl RuntimeFilterEventIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         query_id: UniqueId,
         participant_id: RuntimeFilterParticipantId,
         channel_id: ChannelId,
@@ -49,29 +49,29 @@ impl RuntimeFilterEventIdentity {
         }
     }
 
-    pub(crate) const fn query_id(self) -> UniqueId {
+    pub const fn query_id(self) -> UniqueId {
         self.query_id
     }
-    pub(crate) const fn participant_id(self) -> RuntimeFilterParticipantId {
+    pub const fn participant_id(self) -> RuntimeFilterParticipantId {
         self.participant_id
     }
-    pub(crate) const fn channel_id(self) -> ChannelId {
+    pub const fn channel_id(self) -> ChannelId {
         self.channel_id
     }
-    pub(crate) const fn epoch(self) -> DeploymentEpoch {
+    pub const fn epoch(self) -> DeploymentEpoch {
         self.epoch
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ProducerEventIdentity {
+pub struct ProducerEventIdentity {
     common: RuntimeFilterEventIdentity,
     producer_binding_id: BindingId,
     fragment_instance_id: UniqueId,
 }
 
 impl ProducerEventIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         common: RuntimeFilterEventIdentity,
         producer_binding_id: BindingId,
         fragment_instance_id: UniqueId,
@@ -82,26 +82,26 @@ impl ProducerEventIdentity {
             fragment_instance_id,
         }
     }
-    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+    pub const fn common(self) -> RuntimeFilterEventIdentity {
         self.common
     }
-    pub(crate) const fn producer_binding_id(self) -> BindingId {
+    pub const fn producer_binding_id(self) -> BindingId {
         self.producer_binding_id
     }
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ConsumerEventIdentity {
+pub struct ConsumerEventIdentity {
     common: RuntimeFilterEventIdentity,
     consumer_binding_id: BindingId,
     fragment_instance_id: UniqueId,
 }
 
 impl ConsumerEventIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         common: RuntimeFilterEventIdentity,
         consumer_binding_id: BindingId,
         fragment_instance_id: UniqueId,
@@ -112,32 +112,32 @@ impl ConsumerEventIdentity {
             fragment_instance_id,
         }
     }
-    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+    pub const fn common(self) -> RuntimeFilterEventIdentity {
         self.common
     }
-    pub(crate) const fn consumer_binding_id(self) -> BindingId {
+    pub const fn consumer_binding_id(self) -> BindingId {
         self.consumer_binding_id
     }
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct RouteEventIdentity {
+pub struct RouteEventIdentity {
     consumer: ConsumerEventIdentity,
     route_edge_id: RouteEdgeId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ArtifactMaterializationIdentity {
+pub struct ArtifactMaterializationIdentity {
     common: RuntimeFilterEventIdentity,
     profile_id: ConsumerProfileId,
     version: LogicalVersion,
 }
 
 impl ArtifactMaterializationIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         common: RuntimeFilterEventIdentity,
         profile_id: ConsumerProfileId,
         version: LogicalVersion,
@@ -149,21 +149,21 @@ impl ArtifactMaterializationIdentity {
         }
     }
 
-    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+    pub const fn common(self) -> RuntimeFilterEventIdentity {
         self.common
     }
 
-    pub(crate) const fn profile_id(self) -> ConsumerProfileId {
+    pub const fn profile_id(self) -> ConsumerProfileId {
         self.profile_id
     }
 
-    pub(crate) const fn version(self) -> LogicalVersion {
+    pub const fn version(self) -> LogicalVersion {
         self.version
     }
 }
 
 impl RouteEventIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         common: RuntimeFilterEventIdentity,
         consumer_binding_id: BindingId,
         fragment_instance_id: UniqueId,
@@ -174,22 +174,22 @@ impl RouteEventIdentity {
             route_edge_id,
         }
     }
-    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+    pub const fn common(self) -> RuntimeFilterEventIdentity {
         self.consumer.common()
     }
-    pub(crate) const fn consumer_binding_id(self) -> BindingId {
+    pub const fn consumer_binding_id(self) -> BindingId {
         self.consumer.consumer_binding_id()
     }
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.consumer.fragment_instance_id()
     }
-    pub(crate) const fn route_edge_id(self) -> RouteEdgeId {
+    pub const fn route_edge_id(self) -> RouteEdgeId {
         self.route_edge_id
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FinalDomainRejectionKind {
+pub enum FinalDomainRejectionKind {
     Contract(RuntimeContractViolationKind),
     ResourceLimit,
 }
@@ -204,27 +204,24 @@ pub(crate) enum FinalDomainRejectionKind {
 /// data. `participant_id` in the common coordinates is the LOCAL (emitting) participant,
 /// consistent with every other lifecycle event.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct TransportRouteEventIdentity {
+pub struct TransportRouteEventIdentity {
     common: RuntimeFilterEventIdentity,
     route_edge_id: RouteEdgeId,
 }
 
 impl TransportRouteEventIdentity {
-    pub(crate) const fn new(
-        common: RuntimeFilterEventIdentity,
-        route_edge_id: RouteEdgeId,
-    ) -> Self {
+    pub const fn new(common: RuntimeFilterEventIdentity, route_edge_id: RouteEdgeId) -> Self {
         Self {
             common,
             route_edge_id,
         }
     }
 
-    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+    pub const fn common(self) -> RuntimeFilterEventIdentity {
         self.common
     }
 
-    pub(crate) const fn route_edge_id(self) -> RouteEdgeId {
+    pub const fn route_edge_id(self) -> RouteEdgeId {
         self.route_edge_id
     }
 }
@@ -233,7 +230,7 @@ impl TransportRouteEventIdentity {
 /// erroring the query (runtime filters are an optimization, never a correctness
 /// dependency).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TransportFailOpenReason {
+pub enum TransportFailOpenReason {
     /// The buffered frame outlived its retry/ack deadline and was released.
     Deadline,
     /// A self-owned sender-buffer ceiling refused the frame before it was buffered or
@@ -246,7 +243,7 @@ pub(crate) enum TransportFailOpenReason {
 
 /// One step in a remote delivery frame's sender-side reliable-transport lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TransportEventKind {
+pub enum TransportEventKind {
     /// The frame was buffered for ack-release + bounded retry and handed to the sink once.
     Sent,
     /// A buffered, still-unacked frame was re-handed to the sink on a retry tick.
@@ -260,7 +257,7 @@ pub(crate) enum TransportEventKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterEvent {
+pub enum RuntimeFilterEvent {
     DeploymentInstalled {
         query_id: UniqueId,
         participant_id: RuntimeFilterParticipantId,
@@ -431,7 +428,7 @@ pub(crate) enum RuntimeFilterEvent {
     },
 }
 
-pub(crate) trait RuntimeFilterEventSink: Send + Sync {
+pub trait RuntimeFilterEventSink: Send + Sync {
     fn record(&self, event: RuntimeFilterEvent);
 }
 

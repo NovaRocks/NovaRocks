@@ -15,6 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod artifact;
-pub(crate) mod contribution;
-pub(crate) mod producer;
+pub mod artifact;
+pub mod contribution;
+pub mod producer;

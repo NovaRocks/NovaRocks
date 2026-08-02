@@ -19,29 +19,34 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-use crate::runtime_filter::port::identity::{LogicalVersion, PartitionId, ProducerSequence};
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+use novarocks::runtime_filter_transition::port::identity::{
+    LogicalVersion, PartitionId, ProducerSequence,
+};
+use novarocks::runtime_filter_transition::port::producer::{
     ProducerFailureReason, ProducerHandle, ProducerPortKind, RuntimeContractViolationKind,
     SubmitOutcome,
 };
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::subscription::{
     ArtifactDeliveryOutcome, LivePollOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
     UnavailableReason,
 };
-use crate::runtime_filter::port::support::{MemoryAccountError, RuntimeFilterMemoryAccount};
+use novarocks::runtime_filter_transition::port::support::{
+    MemoryAccountError, RuntimeFilterMemoryAccount,
+};
 
 use super::tests::{
     installed_ordered_service_fixture, installed_ordered_service_with_account, ordered_update,
 };
 
-fn uid(lo: i64) -> crate::common::types::UniqueId {
+fn uid(lo: i64) -> novarocks_types::UniqueId {
     novarocks_types::UniqueId::new(70, lo)
 }
 
 fn live_handle(
     service: &super::RuntimeFilterService,
-) -> Arc<dyn crate::runtime_filter::port::subscription::NonBlockingLiveSubscription> {
+) -> Arc<dyn novarocks::runtime_filter_transition::port::subscription::NonBlockingLiveSubscription>
+{
     match service
         .subscribe(BindingId::new(2), uid(2), SubscriptionKind::NonBlockingLive)
         .unwrap()

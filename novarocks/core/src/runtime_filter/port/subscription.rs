@@ -26,30 +26,30 @@ use super::producer::RuntimeContractViolation;
 use super::identity::RouteEdgeId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SubscriptionRequest {
+pub struct SubscriptionRequest {
     binding_id: BindingId,
     fragment_instance_id: UniqueId,
 }
 
 impl SubscriptionRequest {
-    pub(crate) const fn new(binding_id: BindingId, fragment_instance_id: UniqueId) -> Self {
+    pub const fn new(binding_id: BindingId, fragment_instance_id: UniqueId) -> Self {
         Self {
             binding_id,
             fragment_instance_id,
         }
     }
 
-    pub(crate) const fn binding_id(self) -> BindingId {
+    pub const fn binding_id(self) -> BindingId {
         self.binding_id
     }
 
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UnavailableReason {
+pub enum UnavailableReason {
     ResourceLimit,
     IncompleteCoverage,
     ProducerFailed,
@@ -58,13 +58,13 @@ pub(crate) enum UnavailableReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArtifactUnsupportedReason {
+pub enum ArtifactUnsupportedReason {
     RangeDeferred,
     NoAcceptedRepresentation,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ArtifactAcquireOutcome {
+pub enum ArtifactAcquireOutcome {
     Published(Arc<ArtifactBundle>),
     Unsupported(ArtifactUnsupportedReason),
     Unavailable(UnavailableReason),
@@ -73,7 +73,7 @@ pub(crate) enum ArtifactAcquireOutcome {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ArtifactDeliveryOutcome {
+pub enum ArtifactDeliveryOutcome {
     Published(Arc<ArtifactBundle>),
     Unsupported(ArtifactUnsupportedReason),
     Unavailable(UnavailableReason),
@@ -81,7 +81,7 @@ pub(crate) enum ArtifactDeliveryOutcome {
 }
 
 impl ArtifactDeliveryOutcome {
-    pub(crate) fn acquire_outcome(&self) -> ArtifactAcquireOutcome {
+    pub fn acquire_outcome(&self) -> ArtifactAcquireOutcome {
         match self {
             Self::Published(bundle) => ArtifactAcquireOutcome::Published(bundle.clone()),
             Self::Unsupported(reason) => ArtifactAcquireOutcome::Unsupported(*reason),
@@ -91,7 +91,7 @@ impl ArtifactDeliveryOutcome {
     }
 }
 
-pub(crate) trait ArtifactDelivery: Send + Sync {
+pub trait ArtifactDelivery: Send + Sync {
     fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);
 
     fn deliver_live(
@@ -107,13 +107,13 @@ pub(crate) trait ArtifactDelivery: Send + Sync {
     }
 }
 
-pub(crate) trait BlockingSnapshotSubscription: Send + Sync {
+pub trait BlockingSnapshotSubscription: Send + Sync {
     fn acquire(&self, timeout: Duration) -> ArtifactAcquireOutcome;
     fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LiveTerminal {
+pub enum LiveTerminal {
     Completed,
     CompletedWithoutArtifact,
     DegradedLogical(UnavailableReason),
@@ -124,7 +124,7 @@ pub(crate) enum LiveTerminal {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum LivePollOutcome {
+pub enum LivePollOutcome {
     Updated {
         bundle: Arc<ArtifactBundle>,
         terminal: Option<LiveTerminal>,
@@ -135,18 +135,18 @@ pub(crate) enum LivePollOutcome {
     },
 }
 
-pub(crate) trait NonBlockingLiveSubscription: Send + Sync {
+pub trait NonBlockingLiveSubscription: Send + Sync {
     fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
     fn poll_after(&self, observed: Option<super::identity::LogicalVersion>) -> LivePollOutcome;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SubscriptionKind {
+pub enum SubscriptionKind {
     BlockingSnapshot,
     NonBlockingLive,
 }
 
-pub(crate) enum SubscriptionHandle {
+pub enum SubscriptionHandle {
     Blocking(Arc<dyn BlockingSnapshotSubscription>),
     Live(Arc<dyn NonBlockingLiveSubscription>),
 }
@@ -161,14 +161,14 @@ impl std::fmt::Debug for SubscriptionHandle {
 }
 
 impl SubscriptionHandle {
-    pub(crate) const fn kind(&self) -> SubscriptionKind {
+    pub const fn kind(&self) -> SubscriptionKind {
         match self {
             Self::Blocking(_) => SubscriptionKind::BlockingSnapshot,
             Self::Live(_) => SubscriptionKind::NonBlockingLive,
         }
     }
 
-    pub(crate) fn into_blocking(
+    pub fn into_blocking(
         self,
     ) -> Result<Arc<dyn BlockingSnapshotSubscription>, RuntimeContractViolation> {
         match self {
@@ -180,7 +180,7 @@ impl SubscriptionHandle {
         }
     }
 
-    pub(crate) fn into_live(
+    pub fn into_live(
         self,
     ) -> Result<Arc<dyn NonBlockingLiveSubscription>, RuntimeContractViolation> {
         match self {

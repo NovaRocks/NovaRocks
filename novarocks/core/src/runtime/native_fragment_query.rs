@@ -72,10 +72,6 @@ impl NativeFragmentQueryRuntime {
             "native_query_active_fragments",
             snapshot.active_fragments,
         );
-        crate::service::publish_backend_query_execution_resource(
-            "native_runtime_filter_services",
-            snapshot.runtime_filter_services,
-        );
     }
     pub fn global() -> Self {
         Self {
@@ -90,7 +86,7 @@ impl NativeFragmentQueryRuntime {
         delivery_expire: Duration,
         query_expire: Duration,
         cache_options: CacheOptions,
-        has_runtime_filter_bindings: bool,
+        runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Result<NativeFragmentAdmissionResources, String> {
         let execution = execution_key(execution_id);
         self.manager.ensure_native_context_execution(
@@ -99,17 +95,6 @@ impl NativeFragmentQueryRuntime {
             delivery_expire,
             query_expire,
         )?;
-        let runtime_filter = if has_runtime_filter_bindings {
-            Some(Arc::new(
-                self.manager
-                    .runtime_filter_context_for_native_execution_attempt(
-                        execution,
-                        fragment_instance_id,
-                    )?,
-            ) as RuntimeFilterSessionRef)
-        } else {
-            None
-        };
         self.manager
             .set_cache_options_execution(execution, cache_options)?;
         let query_mem_tracker = self
@@ -166,18 +151,10 @@ impl NativeFragmentQueryRuntime {
         delivery_expire: Duration,
         query_expire: Duration,
         cache_options: CacheOptions,
-        has_runtime_filter_bindings: bool,
+        runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Result<NativeFragmentAdmissionResources, String> {
         self.manager
             .ensure_native_context(query_id, false, delivery_expire, query_expire)?;
-        let runtime_filter = if has_runtime_filter_bindings {
-            Some(Arc::new(
-                self.manager
-                    .runtime_filter_context_for_native_execution(query_id, fragment_instance_id)?,
-            ) as RuntimeFilterSessionRef)
-        } else {
-            None
-        };
         self.manager.set_cache_options(query_id, cache_options)?;
         let query_mem_tracker = self
             .manager

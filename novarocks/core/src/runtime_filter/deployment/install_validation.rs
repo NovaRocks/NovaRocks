@@ -51,7 +51,7 @@ use crate::runtime_filter::port::routing::{
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 use crate::runtime_filter::port::value_domain::MembershipValues;
 
-pub(crate) fn validate_participant_install(
+pub fn validate_participant_install(
     install: &RuntimeFilterParticipantInstall,
 ) -> Result<(), InstallContractError> {
     validate_install_identity(install)?;
@@ -61,15 +61,15 @@ pub(crate) fn validate_participant_install(
     validate_view_with_routing(install.core_view(), Some(install.routing_shard()))
 }
 
-#[cfg(test)]
-pub(crate) fn validate_install_view_contract_for_test(
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
+pub fn validate_install_view_contract_for_test(
     view: &RuntimeFilterInstallView,
 ) -> Result<(), InstallContractError> {
     validate_view_with_routing(view, None)
 }
 
-#[cfg(test)]
-pub(crate) fn validate_channel_contract_for_test(
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
+pub fn validate_channel_contract_for_test(
     channel: &RuntimeFilterChannelDeployment,
 ) -> Result<(), InstallContractError> {
     validate_channel(channel, &mut BTreeMap::new(), (true, true))

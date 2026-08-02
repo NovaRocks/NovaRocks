@@ -61,7 +61,7 @@ use crate::sql::planner::runtime_filter::wait_graph::{
 /// Pure and deterministic: never mutates `scheduling`, iterates only
 /// `BTreeMap`/`BTreeSet`, and never hardcodes backend/replica counts (they are
 /// read from `backends` and clamped by `policy.replica_redundancy`).
-pub(crate) fn compile(
+pub fn compile(
     graph: &RuntimeFilterGraph,
     scheduling: &SchedulingPlan,
     edges: &[FragmentEdge],
@@ -80,7 +80,7 @@ pub(crate) fn compile(
     )
 }
 
-pub(crate) fn compile_with_join_progress(
+pub fn compile_with_join_progress(
     graph: &RuntimeFilterGraph,
     scheduling: &SchedulingPlan,
     edges: &[FragmentEdge],

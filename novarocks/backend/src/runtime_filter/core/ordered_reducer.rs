@@ -19,37 +19,14 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::runtime_filter::port::identity::{ProducerSequence, ProducerStreamId};
-use crate::runtime_filter::port::ordered_bound::{
+use novarocks::runtime_filter_transition::port::identity::{ProducerSequence, ProducerStreamId};
+use novarocks::runtime_filter_transition::port::ordered_bound::{
     OrderedBoundUpdate, OrderedTuple, RuntimeOrderContract,
 };
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::producer::{
     RuntimeContractViolation, RuntimeContractViolationKind,
 };
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OrderedBoundDomain {
-    contract: Arc<RuntimeOrderContract>,
-    bound: OrderedTuple,
-}
-
-impl OrderedBoundDomain {
-    pub(crate) fn new(contract: Arc<RuntimeOrderContract>, bound: OrderedTuple) -> Self {
-        Self { contract, bound }
-    }
-
-    pub(crate) const fn contract(&self) -> &Arc<RuntimeOrderContract> {
-        &self.contract
-    }
-
-    pub(crate) const fn bound(&self) -> &OrderedTuple {
-        &self.bound
-    }
-
-    pub(crate) fn estimated_retained_bytes(&self) -> Option<usize> {
-        self.bound.estimated_retained_bytes()
-    }
-}
+use novarocks::runtime_filter_transition::port::value_domain::OrderedBoundDomain;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OrderedApplyOutcome {
@@ -326,8 +303,8 @@ impl OrderedReducer {
 
     pub(crate) fn terminal_partition_count(
         &self,
-        binding_id: crate::runtime_filter::model::contract::BindingId,
-        fragment_instance_id: crate::common::types::UniqueId,
+        binding_id: novarocks::runtime_filter_transition::model::contract::BindingId,
+        fragment_instance_id: novarocks_types::UniqueId,
     ) -> usize {
         self.streams
             .iter()
@@ -353,16 +330,18 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::runtime_filter::model::contract::{
+    use novarocks::runtime_filter_transition::model::contract::{
         BindingId, NullOrder, OrderContract, OrderKeyContract, SortDirection,
     };
-    use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence, ProducerStreamId};
-    use crate::runtime_filter::port::ordered_bound::{
+    use novarocks::runtime_filter_transition::port::identity::{
+        PartitionId, ProducerSequence, ProducerStreamId,
+    };
+    use novarocks::runtime_filter_transition::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
         RuntimeOrderContract, comparator_digest_for_test,
     };
-    use crate::runtime_filter::port::producer::RuntimeContractViolation;
+    use novarocks::runtime_filter_transition::port::producer::RuntimeContractViolation;
+    use novarocks_types::UniqueId;
 
     use super::{OrderedApplyOutcome, OrderedReducer};
 
@@ -433,7 +412,7 @@ mod tests {
         let error = apply_for_test(&mut reducer, 0, 4, 101).unwrap_err();
         assert_eq!(
             error.kind(),
-            crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedBoundLoosened
+            novarocks::runtime_filter_transition::port::producer::RuntimeContractViolationKind::OrderedBoundLoosened
         );
         assert_eq!(format!("{reducer:?}"), before);
     }

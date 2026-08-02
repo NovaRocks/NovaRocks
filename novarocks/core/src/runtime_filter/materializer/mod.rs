@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod bitset;
-pub(crate) mod bloom;
-pub(crate) mod codec;
-pub(crate) mod range;
+pub mod bitset;
+pub mod bloom;
+pub mod codec;
+pub mod range;
 
 use std::sync::Arc;
 
@@ -40,16 +40,14 @@ use self::bloom::BloomHashContract;
 use self::codec::{encode_membership_leaf, encode_physical_leaf, encoded_leaf_len};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MaterializationError {
+pub enum MaterializationError {
     UnsupportedRange,
     SchemaMismatch,
     ProfileHashMismatch,
     SizeOverflow,
 }
 
-pub(crate) const fn validate_membership_kind(
-    kind: ArtifactKind,
-) -> Result<(), MaterializationError> {
+pub const fn validate_membership_kind(kind: ArtifactKind) -> Result<(), MaterializationError> {
     if matches!(kind, ArtifactKind::Range) {
         Err(MaterializationError::UnsupportedRange)
     } else {
@@ -58,46 +56,46 @@ pub(crate) const fn validate_membership_kind(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UnsupportedReason {
+pub enum UnsupportedReason {
     NoAcceptedRepresentation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UnavailableReason {
+pub enum UnavailableReason {
     ResourceLimit,
     MaterializationFailed,
 }
 
 #[derive(Debug)]
-pub(crate) enum MaterializationOutcome {
+pub enum MaterializationOutcome {
     Published(Arc<ArtifactBundle>),
     Unsupported(UnsupportedReason),
     Unavailable(UnavailableReason),
 }
 
 impl MaterializationOutcome {
-    pub(crate) fn published_kind(&self) -> Option<ArtifactKind> {
+    pub fn published_kind(&self) -> Option<ArtifactKind> {
         match self {
             Self::Published(bundle) => bundle.artifacts().first().map(|(kind, _)| *kind),
             Self::Unsupported(_) | Self::Unavailable(_) => None,
         }
     }
 
-    pub(crate) fn published_digest(&self) -> Option<[u8; 32]> {
+    pub fn published_digest(&self) -> Option<[u8; 32]> {
         match self {
             Self::Published(bundle) => Some(bundle.canonical_digest()),
             Self::Unsupported(_) | Self::Unavailable(_) => None,
         }
     }
 
-    pub(crate) fn published_version(&self) -> Option<LogicalVersion> {
+    pub fn published_version(&self) -> Option<LogicalVersion> {
         match self {
             Self::Published(bundle) => Some(bundle.version()),
             Self::Unsupported(_) | Self::Unavailable(_) => None,
         }
     }
 
-    pub(crate) fn published_channel(&self) -> Option<ChannelId> {
+    pub fn published_channel(&self) -> Option<ChannelId> {
         match self {
             Self::Published(bundle) => Some(bundle.channel_id()),
             Self::Unsupported(_) | Self::Unavailable(_) => None,
@@ -116,7 +114,7 @@ enum SelectedRepresentation {
 }
 
 #[derive(Debug)]
-pub(crate) struct MaterializationPlan<'a> {
+pub struct MaterializationPlan<'a> {
     snapshot: Arc<LogicalSnapshot>,
     schema: &'a ArtifactMembershipSchema,
     profile: &'a ConsumerArtifactProfile,
@@ -129,12 +127,12 @@ pub(crate) struct MaterializationPlan<'a> {
     resident_index_bytes: usize,
 }
 
-pub(crate) enum MaterializationAdmission<'a> {
+pub enum MaterializationAdmission<'a> {
     Ready(AdmittedMaterialization<'a>),
     Complete(MaterializationOutcome),
 }
 
-pub(crate) struct AdmittedMaterialization<'a> {
+pub struct AdmittedMaterialization<'a> {
     plan: MaterializationPlan<'a>,
     _scratch: ArtifactScratchReservation,
     artifact_footprint: usize,
@@ -147,10 +145,10 @@ enum PreparationFailure {
     Internal,
 }
 
-pub(crate) struct Materializer;
+pub struct Materializer;
 
 impl Materializer {
-    pub(crate) fn plan<'a>(
+    pub fn plan<'a>(
         snapshot: Arc<LogicalSnapshot>,
         schema: &'a ArtifactMembershipSchema,
         profile: &'a ConsumerArtifactProfile,
@@ -295,7 +293,7 @@ impl Materializer {
         })
     }
 
-    pub(crate) fn materialize(
+    pub fn materialize(
         plan: MaterializationPlan<'_>,
         retained_budget: Arc<ArtifactRetainedBudget>,
         scratch_budget: Arc<ArtifactScratchBudget>,
@@ -312,7 +310,7 @@ impl Materializer {
         }
     }
 
-    pub(crate) fn admit<'a>(
+    pub fn admit<'a>(
         plan: MaterializationPlan<'a>,
         retained_budget: Arc<ArtifactRetainedBudget>,
         scratch_budget: Arc<ArtifactScratchBudget>,
@@ -407,7 +405,7 @@ impl Materializer {
         })
     }
 
-    pub(crate) fn encode(prepared: AdmittedMaterialization<'_>) -> Result<Arc<ArtifactBundle>, ()> {
+    pub fn encode(prepared: AdmittedMaterialization<'_>) -> Result<Arc<ArtifactBundle>, ()> {
         let AdmittedMaterialization {
             plan,
             _scratch,

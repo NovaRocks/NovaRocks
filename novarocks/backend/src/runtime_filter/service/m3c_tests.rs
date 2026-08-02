@@ -22,30 +22,32 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::DataType;
 
-use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::ChannelAction;
-use crate::runtime_filter::model::contract::*;
-use crate::runtime_filter::model::coverage::Coverage;
-use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerArtifactProfile};
-use crate::runtime_filter::port::events::{
+use novarocks::runtime_filter_transition::model::contract::*;
+use novarocks::runtime_filter_transition::model::coverage::Coverage;
+use novarocks::runtime_filter_transition::port::artifact::{ArtifactKind, ConsumerArtifactProfile};
+use novarocks::runtime_filter_transition::port::events::{
     FinalDomainRejectionKind, RuntimeFilterEvent, RuntimeFilterEventSink,
 };
-use crate::runtime_filter::port::final_domain::{
+use novarocks::runtime_filter_transition::port::final_domain::{
     FinalDomainTestIssuerTransition, FrozenFinalDomainTestIssuer,
 };
-use crate::runtime_filter::port::identity::*;
-use crate::runtime_filter::port::install::*;
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::identity::*;
+use novarocks::runtime_filter_transition::port::install::*;
+use novarocks::runtime_filter_transition::port::producer::{
     FinalDomainProducerAdapter, ProducerHandle, ProducerPortKind, RuntimeContractViolationKind,
     SubmitOutcome,
 };
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::subscription::{
     LivePollOutcome, LiveTerminal, SubscriptionKind, UnavailableReason,
 };
-use crate::runtime_filter::port::support::{
+use novarocks::runtime_filter_transition::port::support::{
     MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
-use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+use novarocks::runtime_filter_transition::port::value_domain::{
+    MembershipValues, ValueDomainDelta,
+};
+use novarocks_types::UniqueId;
 
 use super::RuntimeFilterService;
 use super::memory::MemTrackerMemoryAccount;
@@ -323,7 +325,7 @@ fn shard(
     instance: UniqueId,
     sequence: u64,
     values: &[i64],
-) -> crate::runtime_filter::port::final_domain::FinalDomainShard {
+) -> novarocks::runtime_filter_transition::port::final_domain::FinalDomainShard {
     shard_at(
         issuer,
         binding,
@@ -341,7 +343,7 @@ fn shard_at(
     partition: PartitionId,
     sequence: u64,
     values: &[i64],
-) -> crate::runtime_filter::port::final_domain::FinalDomainShard {
+) -> novarocks::runtime_filter_transition::port::final_domain::FinalDomainShard {
     issuer
         .issue_shard(
             ProducerStreamId::new(binding, instance, partition),

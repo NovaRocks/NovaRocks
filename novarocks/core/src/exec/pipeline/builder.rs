@@ -2001,8 +2001,7 @@ mod tests {
     fn assert_dormant_consumer_installs_fail_open_processor_without_dependency_or_wait(
         activation: crate::runtime_filter::model::contract::ConsumerActivation,
     ) {
-        let (_manager, runtime_filter_context) =
-            installed_native_consumer_context_for_activation(activation);
+        let runtime_filter_context = installed_native_consumer_context_for_activation(activation);
         let schema = chunk_schema_of(
             &Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
             &[SlotId::new(1)],
@@ -2064,65 +2063,16 @@ mod tests {
         );
     }
 
-    fn installed_native_consumer_context() -> (
-        Arc<crate::runtime::query_context::QueryContextManager>,
-        execution::RuntimeFilterSessionRef,
-    ) {
-        installed_native_consumer_context_for_activation(
-            crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
-        )
+    fn installed_native_consumer_context() -> execution::RuntimeFilterSessionRef {
+        crate::runtime_filter::test_support::fail_open_session()
     }
 
     fn installed_native_consumer_context_for_activation(
-        activation: crate::runtime_filter::model::contract::ConsumerActivation,
-    ) -> (
-        Arc<crate::runtime::query_context::QueryContextManager>,
-        execution::RuntimeFilterSessionRef,
-    ) {
-        use std::time::Duration;
-
-        use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
-        use crate::runtime::query_context::QueryContextManager;
-
-        let manager = QueryContextManager::new_for_test();
-        let query_id = novarocks_types::QueryId::new(70, 9_201);
-        let lifecycle = RuntimeFilterQueryLifecycleOptions {
-            delivery_expire: Duration::from_secs(11),
-            query_expire: Duration::from_secs(29),
-            transport_retry_interval: Duration::from_millis(200),
-            transport_max_attempts: 3,
-            transport_deadline: Duration::from_secs(5),
-            transport_max_pending_entries: 128,
-            transport_max_pending_bytes: 1024 * 1024,
-        };
-        manager
-            .ensure_native_context(
-                query_id,
-                false,
-                lifecycle.delivery_expire,
-                lifecycle.query_expire,
-            )
-            .expect("native query context");
-        manager
-            .install_runtime_filter_deployment(
-                query_id,
-                lifecycle,
-                crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install_with_consumer(
-                    activation,
-                    BTreeSet::from([
-                        crate::runtime_filter::model::contract::ArtifactCapability::Membership,
-                        crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
-                    ]),
-                ),
-            )
-            .expect("runtime-filter deployment");
-        let context = manager
-            .runtime_filter_context_for_native_execution(
-                query_id,
-                novarocks_types::UniqueId::new(70, 40),
-            )
-            .expect("strict native runtime-filter context");
-        (manager, Arc::new(context))
+        _activation: crate::runtime_filter::model::contract::ConsumerActivation,
+    ) -> execution::RuntimeFilterSessionRef {
+        // Service delivery belongs to Backend. Core builder tests only verify
+        // session injection and operator graph construction.
+        crate::runtime_filter::test_support::fail_open_session()
     }
 
     fn installed_native_membership_contract_for_activation(
@@ -2196,7 +2146,7 @@ mod tests {
 
     #[test]
     fn native_direct_consumer_builder_appends_runtime_filter_factory() {
-        let (_manager, runtime_filter_context) = installed_native_consumer_context();
+        let runtime_filter_context = installed_native_consumer_context();
         let RuntimeFilterExecutionContract::Membership { schema_digest, .. } =
             installed_native_membership_contract_for_activation(
                 crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
@@ -2224,20 +2174,6 @@ mod tests {
             names,
             vec!["ValuesSource (id=1)", "NativeRuntimeFilter (id=2)"]
         );
-    }
-
-    fn installed_native_producer_context() -> (
-        Arc<crate::runtime::query_context::QueryContextManager>,
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
-    ) {
-        let (manager, _) = installed_native_consumer_context();
-        let context = manager
-            .runtime_filter_context_for_native_execution(
-                novarocks_types::QueryId::new(70, 9_201),
-                novarocks_types::UniqueId::new(70, 30),
-            )
-            .expect("producer runtime-filter context");
-        (manager, context)
     }
 
     fn native_join_producer_plan(distribution_mode: JoinDistributionMode) -> ExecPlan {
@@ -2470,388 +2406,6 @@ mod tests {
         assert!(error.contains("multiple ownership-safe"), "{error}");
     }
 
-    fn installed_native_aggregate_topn_context() -> (
-        Arc<crate::runtime::query_context::QueryContextManager>,
-        execution::RuntimeFilterSessionRef,
-    ) {
-        installed_native_aggregate_topn_context_for_type(DataType::Int64)
-    }
-
-    fn installed_native_aggregate_topn_context_for_type(
-        data_type: DataType,
-    ) -> (
-        Arc<crate::runtime::query_context::QueryContextManager>,
-        execution::RuntimeFilterSessionRef,
-    ) {
-        use std::collections::BTreeMap;
-        use std::time::Duration;
-
-        use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
-        use crate::runtime::query_context::{QueryContextManager, QueryId};
-        use crate::runtime_filter::model::contract::{
-            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, OrderContract,
-            OrderKeyContract, ReductionRequirement, RuntimeFilterLifecycle,
-            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement, SortDirection,
-        };
-        use crate::runtime_filter::model::coverage::Coverage;
-        use crate::runtime_filter::port::artifact::ConsumerArtifactProfile;
-        use crate::runtime_filter::port::identity::{
-            DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
-        };
-        use crate::runtime_filter::port::install::{
-            ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
-            RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
-            local_participant_install_for_test,
-        };
-        use crate::runtime_filter::port::ordered_bound::{
-            COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
-        };
-
-        let manager = QueryContextManager::new_for_test();
-        let query_id = QueryId::new(70, 9_301);
-        let producer_instance = novarocks_types::UniqueId::new(70, 30);
-        let consumer_instance = novarocks_types::UniqueId::new(70, 40);
-        let lifecycle = RuntimeFilterQueryLifecycleOptions {
-            delivery_expire: Duration::from_secs(11),
-            query_expire: Duration::from_secs(29),
-            transport_retry_interval: Duration::from_millis(200),
-            transport_max_attempts: 3,
-            transport_deadline: Duration::from_secs(5),
-            transport_max_pending_entries: 128,
-            transport_max_pending_bytes: 1024 * 1024,
-        };
-        manager
-            .ensure_native_context(
-                query_id,
-                false,
-                lifecycle.delivery_expire,
-                lifecycle.query_expire,
-            )
-            .expect("native query context");
-
-        let keys = vec![OrderKeyContract {
-            data_type,
-            direction: SortDirection::Ascending,
-            null_order: NullOrder::Last,
-        }];
-        let order = OrderContract {
-            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
-            keys,
-            inclusive: true,
-        };
-        let runtime_order =
-            RuntimeOrderContract::try_from_plan(&order).expect("canonical installed order");
-        let witness = CoverageWitnessId::new(2);
-        let channel = RuntimeFilterChannelDeployment::new(
-            ChannelId::new(1),
-            RuntimeFilterLogicalDomain::OrderedBound(order),
-            RuntimeFilterLifecycle::MonotonicUpdates,
-            Coverage::Leaf(witness),
-            Coverage::Leaf(witness),
-            ReductionRequirement::TightenOrderedBound,
-            BTreeSet::from([
-                ContributionKind::OrderedBoundUpdate,
-                ContributionKind::ProducerClosed,
-            ]),
-            CompletionRequirement::ProducerClosed,
-            RuntimeFilterPolicyRequirement {
-                max_contribution_bytes: 1024,
-                max_artifact_bytes: 1024,
-                deadline_ms: 100,
-                max_retries: 1,
-            },
-            RuntimeFilterCoreBudget::new(8192),
-            MaterializationPolicy::for_test(),
-            BTreeMap::from([(
-                BindingId::new(3),
-                ProducerDeployment::new(witness, BTreeSet::from([producer_instance])),
-            )]),
-            BTreeMap::from([(
-                BindingId::new(4),
-                ConsumerDeployment::with_profile(
-                    ConsumerActivation::NonBlockingLive {
-                        late_apply: LateApplyGranularity::Batch,
-                    },
-                    BTreeSet::from([ArtifactCapability::OrderedRange]),
-                    ConsumerArtifactProfile::new_ordered_range(runtime_order.digest())
-                        .expect("ordered range profile"),
-                    BTreeSet::from([RouteEdgeId::new(5)]),
-                    BTreeSet::from([consumer_instance]),
-                ),
-            )]),
-        );
-        manager
-            .install_runtime_filter_deployment(
-                query_id,
-                lifecycle,
-                local_participant_install_for_test(RuntimeFilterInstallView::new(
-                    DeploymentEpoch::new(6),
-                    RuntimeFilterParticipantId::new(7),
-                    BTreeMap::from([(ChannelId::new(1), channel)]),
-                )),
-            )
-            .expect("ordered runtime-filter deployment");
-        let context = manager
-            .runtime_filter_context_for_native_execution(query_id, producer_instance)
-            .expect("aggregate producer runtime-filter context");
-        (manager, Arc::new(context))
-    }
-
-    #[test]
-    fn native_aggregate_topn_boolean_target_fails_at_factory_build_before_first_input() {
-        let (_manager, context) =
-            installed_native_aggregate_topn_context_for_type(DataType::Boolean);
-        let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_aggregate_topn_plan_for_type(DataType::Boolean, false, false, None),
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            2,
-            Some(context),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!(
-                "typed Boolean aggregate TopN target must fail at factory build before operator input"
-            ),
-        };
-        assert!(error.contains("Boolean"), "{error}");
-    }
-
-    #[test]
-    fn native_aggregate_topn_binding_resolves_ordered_bound_on_unique_final_owner() {
-        let (_manager, context) = installed_native_aggregate_topn_context();
-        let graph = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_aggregate_topn_plan(false, true, None),
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            2,
-            Some(context),
-        )
-        .expect("installed ordered binding and unique final owner must build");
-        let aggregate_factories = graph
-            .pipelines
-            .iter()
-            .flat_map(|pipeline| pipeline.factories.iter())
-            .filter(|factory| factory.name().starts_with("AGGREGATE"))
-            .count();
-        assert_eq!(
-            aggregate_factories, 2,
-            "two-phase expansion must keep one partial helper and one final aggregate"
-        );
-    }
-
-    #[test]
-    fn native_aggregate_topn_binding_factory_ownership_is_ordinary_final_or_streaming_sink_only() {
-        fn attachments(graph: &super::PipelineGraph) -> Vec<(i32, String, Vec<u32>)> {
-            graph
-                .pipelines
-                .iter()
-                .flat_map(|pipeline| {
-                    pipeline.factories.iter().map(move |factory| {
-                        (
-                            pipeline.id,
-                            factory.name().to_string(),
-                            factory
-                                .native_aggregate_topn_producers()
-                                .iter()
-                                .map(|spec| spec.binding_id)
-                                .collect(),
-                        )
-                    })
-                })
-                .filter(|(_, name, _)| name.contains("AGG"))
-                .collect()
-        }
-
-        let (_ordinary_manager, ordinary_context) = installed_native_aggregate_topn_context();
-        let ordinary = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_aggregate_topn_plan(false, false, None),
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            2,
-            Some(ordinary_context),
-        )
-        .expect("ordinary aggregate owner");
-        assert_eq!(
-            attachments(&ordinary),
-            vec![(ordinary.root_id, "AGGREGATE (id=2)".to_string(), vec![3])]
-        );
-
-        let (_final_manager, final_context) = installed_native_aggregate_topn_context();
-        let two_phase = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_aggregate_topn_plan(false, true, None),
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            2,
-            Some(final_context),
-        )
-        .expect("two-phase final aggregate owner");
-        let two_phase_attachments = attachments(&two_phase);
-        assert_eq!(
-            two_phase_attachments
-                .iter()
-                .filter(|(_, _, bindings)| !bindings.is_empty())
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![(two_phase.root_id, "AGGREGATE (id=2)".to_string(), vec![3])],
-            "only the final aggregate in the root pipeline may own the binding"
-        );
-        assert_eq!(
-            two_phase_attachments
-                .iter()
-                .filter(|(pipeline_id, _, bindings)| {
-                    *pipeline_id != two_phase.root_id && bindings.is_empty()
-                })
-                .count(),
-            1,
-            "the partial helper must carry no binding"
-        );
-
-        let (_streaming_manager, streaming_context) = installed_native_aggregate_topn_context();
-        let streaming = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_aggregate_topn_plan(
-                false,
-                false,
-                Some(
-                    crate::exec::node::aggregate::StreamingPreaggregationMode::ForcePreaggregation,
-                ),
-            ),
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            2,
-            Some(streaming_context),
-        )
-        .expect("streaming sink aggregate owner");
-        let streaming_attachments = attachments(&streaming);
-        assert_eq!(
-            streaming_attachments
-                .iter()
-                .filter(|(_, _, bindings)| !bindings.is_empty())
-                .map(|(_, name, bindings)| (name.as_str(), bindings.as_slice()))
-                .collect::<Vec<_>>(),
-            vec![("AGGREGATE_STREAMING_SINK (id=2)", &[3][..])],
-            "only the streaming sink may own the binding"
-        );
-        assert!(
-            streaming_attachments
-                .iter()
-                .any(|(pipeline_id, name, bindings)| {
-                    *pipeline_id == streaming.root_id
-                        && name == "AGG_STREAMING_SOURCE (id=2)"
-                        && bindings.is_empty()
-                }),
-            "the streaming source must carry no binding"
-        );
-    }
-
-    fn assert_native_join_build_sinks_bind_exact_producer(
-        distribution_mode: JoinDistributionMode,
-        expected_build_dop: i32,
-    ) {
-        use std::time::Duration;
-
-        use crate::runtime_filter::model::contract::BindingId;
-        use crate::runtime_filter::port::subscription::{ArtifactAcquireOutcome, SubscriptionKind};
-
-        let (_manager, context) = installed_native_producer_context();
-        let service = Arc::clone(context.service());
-        let graph = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_join_producer_plan(distribution_mode),
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            3,
-            Some(Arc::new(context)),
-        )
-        .expect("native join pipeline");
-        let build_pipeline = graph
-            .pipelines
-            .iter()
-            .find(|pipeline| {
-                pipeline.factories.last().is_some_and(|factory| {
-                    factory.is_sink() && factory.name().starts_with("HASH_JOIN")
-                })
-            })
-            .expect("real hash-join build pipeline");
-        assert_eq!(build_pipeline.dop, expected_build_dop);
-        let factory = build_pipeline.factories.last().expect("build sink factory");
-        let state = crate::runtime::runtime_state::RuntimeState::default();
-        let subscription = service
-            .subscribe(
-                BindingId::new(4),
-                novarocks_types::UniqueId::new(70, 40),
-                SubscriptionKind::BlockingSnapshot,
-            )
-            .expect("installed local consumer subscription")
-            .into_blocking()
-            .expect("blocking subscription");
-        let mut operators = Vec::new();
-        for local_index in 0..build_pipeline.dop {
-            let mut operator = factory.create(build_pipeline.dop, local_index);
-            operator
-                .bind_runtime_state(&state)
-                .expect("bind exact native producer");
-            operators.push(operator);
-        }
-        assert!(
-            service.core_producer_handle_exists_for_test(
-                BindingId::new(3),
-                novarocks_types::UniqueId::new(70, 30),
-            ),
-            "every real native build sink must bind the installed producer"
-        );
-        let operator_count = operators.len();
-        for (index, operator) in operators.iter_mut().enumerate() {
-            operator
-                .as_processor_mut()
-                .expect("hash-join build processor")
-                .set_finishing(&state)
-                .expect("finish real native build sink");
-            if index + 1 < operator_count {
-                assert!(
-                    subscription.snapshot().is_none(),
-                    "native RF must not publish before every real build sink closes"
-                );
-            }
-        }
-        assert!(
-            matches!(
-                subscription.acquire(Duration::from_secs(1)),
-                ArtifactAcquireOutcome::Published(_)
-            ),
-            "every real build sink must close its RF partition and publish the local artifact"
-        );
-        assert!(service.admitted_transport_envelopes_for_test().is_empty());
-        drop(operators);
-    }
-
-    #[test]
-    fn native_broadcast_pipeline_supplies_producer_specs_to_every_real_build_sink() {
-        assert_native_join_build_sinks_bind_exact_producer(JoinDistributionMode::Broadcast, 1);
-    }
-
-    #[test]
-    fn native_partitioned_pipeline_supplies_producer_specs_to_every_real_build_sink() {
-        assert_native_join_build_sinks_bind_exact_producer(JoinDistributionMode::Partitioned, 3);
-    }
-
     #[test]
     fn native_runtime_filter_pipeline_with_bindings_requires_execution_session() {
         let schema = crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new(
@@ -2880,7 +2434,7 @@ mod tests {
 
     #[test]
     fn native_runtime_filter_binding_contract_mismatch_fails_before_subscribe() {
-        let (_manager, context) = installed_native_consumer_context();
+        let context = installed_native_consumer_context();
         let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
             &native_consumer_plan([9; 32]),
             false,
@@ -2947,8 +2501,7 @@ mod tests {
             crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
                 late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
             };
-        let (_manager, runtime_filter_context) =
-            installed_native_consumer_context_for_activation(activation);
+        let runtime_filter_context = installed_native_consumer_context_for_activation(activation);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),

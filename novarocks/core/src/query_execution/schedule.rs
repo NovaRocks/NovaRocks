@@ -34,27 +34,27 @@ use novarocks_spi::connector::ConnectorSplit;
 
 /// Placement information for one fragment instance.
 #[derive(Clone, Debug)]
-pub(crate) struct FragmentInstancePlacement {
-    pub(crate) fragment_id: FragmentId,
-    pub(crate) instance_index: usize,
-    pub(crate) finst_id: UniqueId,
-    pub(crate) backend_idx: usize,
-    pub(crate) endpoint: RuntimeEndpoint,
-    pub(crate) scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
+pub struct FragmentInstancePlacement {
+    pub fragment_id: FragmentId,
+    pub instance_index: usize,
+    pub finst_id: UniqueId,
+    pub backend_idx: usize,
+    pub endpoint: RuntimeEndpoint,
+    pub scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
     /// Opaque provider splits assigned by the frontend scheduler.  They never
     /// enter `InstanceParams.per_node_scan_ranges`.
-    pub(crate) connector_splits: BTreeMap<i32, Vec<ConnectorSplit>>,
-    pub(crate) destinations: Vec<FragmentDestination>,
-    pub(crate) per_exch_num_senders: BTreeMap<i32, i32>,
+    pub connector_splits: BTreeMap<i32, Vec<ConnectorSplit>>,
+    pub destinations: Vec<FragmentDestination>,
+    pub per_exch_num_senders: BTreeMap<i32, i32>,
 }
 
 /// A sealed, role-neutral scheduling result.
 #[derive(Clone, Debug)]
-pub(crate) struct SchedulingPlan {
-    pub(crate) root_fragment_id: FragmentId,
-    pub(crate) by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
-    pub(crate) root_finst_id: UniqueId,
-    pub(crate) root_backend_idx: usize,
+pub struct SchedulingPlan {
+    pub root_fragment_id: FragmentId,
+    pub by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
+    pub root_finst_id: UniqueId,
+    pub root_backend_idx: usize,
 }
 
 impl SchedulingPlan {

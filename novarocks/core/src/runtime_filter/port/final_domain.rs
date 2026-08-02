@@ -33,9 +33,9 @@ use super::value_domain::ValueDomainDelta;
 
 const CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.completion-fence-contract";
 const CONTRACT_VERSION: u16 = 1;
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 const AUTHORITY_SCOPE_DOMAIN: &[u8] = b"novarocks.runtime-filter.completion-fence-authority";
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 const AUTHORITY_SCOPE_VERSION: u16 = 1;
 const FENCE_DOMAIN: &[u8] = b"novarocks.runtime-filter.completion-fence";
 const FENCE_VERSION: u16 = 1;
@@ -43,16 +43,16 @@ const SHARD_DOMAIN: &[u8] = b"novarocks.runtime-filter.final-domain-shard";
 const SHARD_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct CompletionFenceContractDigest([u8; 32]);
+pub struct CompletionFenceContractDigest([u8; 32]);
 
 impl CompletionFenceContractDigest {
-    pub(crate) const fn bytes(self) -> [u8; 32] {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FinalDomainError {
+pub enum FinalDomainError {
     ContractRequiresNullSafeEqual,
     FrozenProofMismatch,
     UnauthorizedBinding,
@@ -84,7 +84,7 @@ impl fmt::Display for FinalDomainError {
 impl Error for FinalDomainError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeCompletionFenceContract {
+pub struct RuntimeCompletionFenceContract {
     query_id: UniqueId,
     deployment_epoch: DeploymentEpoch,
     channel_id: ChannelId,
@@ -94,7 +94,7 @@ pub(crate) struct RuntimeCompletionFenceContract {
 }
 
 impl RuntimeCompletionFenceContract {
-    pub(crate) fn try_from_install(
+    pub fn try_from_install(
         query_id: UniqueId,
         deployment_epoch: DeploymentEpoch,
         channel_id: ChannelId,
@@ -124,11 +124,11 @@ impl RuntimeCompletionFenceContract {
         })
     }
 
-    pub(crate) const fn digest(&self) -> CompletionFenceContractDigest {
+    pub const fn digest(&self) -> CompletionFenceContractDigest {
         self.digest
     }
 
-    pub(crate) const fn membership_schema(&self) -> &ArtifactMembershipSchema {
+    pub const fn membership_schema(&self) -> &ArtifactMembershipSchema {
         &self.membership_schema
     }
 }
@@ -139,24 +139,24 @@ fn fence_kind_tag(kind: CompletionFenceKind) -> u8 {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct CommittedDomainFrozenProof {
+pub struct CommittedDomainFrozenProof {
     authority_scope_digest: [u8; 32],
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 #[derive(Debug)]
-pub(crate) struct CompletionFenceAuthority {
+pub struct CompletionFenceAuthority {
     contract: Arc<RuntimeCompletionFenceContract>,
     binding_id: BindingId,
     fragment_instance_id: UniqueId,
     scope_digest: [u8; 32],
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 impl CompletionFenceAuthority {
-    pub(crate) fn try_new(
+    pub fn try_new(
         contract: Arc<RuntimeCompletionFenceContract>,
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
@@ -171,7 +171,7 @@ impl CompletionFenceAuthority {
         })
     }
 
-    pub(crate) fn issue(
+    pub fn issue(
         &self,
         proof: &CommittedDomainFrozenProof,
         stream: ProducerStreamId,
@@ -200,23 +200,23 @@ impl CompletionFenceAuthority {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 #[derive(Debug)]
-pub(crate) struct CollectingFinalDomainTestIssuer {
+pub struct CollectingFinalDomainTestIssuer {
     authority: CompletionFenceAuthority,
     open_drivers: u32,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 #[derive(Debug)]
-pub(crate) enum FinalDomainTestIssuerTransition {
+pub enum FinalDomainTestIssuerTransition {
     Collecting(CollectingFinalDomainTestIssuer),
     Frozen(FrozenFinalDomainTestIssuer),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 impl CollectingFinalDomainTestIssuer {
-    pub(crate) fn new(authority: CompletionFenceAuthority, open_drivers: u32) -> Self {
+    pub fn new(authority: CompletionFenceAuthority, open_drivers: u32) -> Self {
         assert!(open_drivers > 0, "a collecting issuer needs an open driver");
         Self {
             authority,
@@ -224,7 +224,7 @@ impl CollectingFinalDomainTestIssuer {
         }
     }
 
-    pub(crate) fn close_driver(mut self) -> FinalDomainTestIssuerTransition {
+    pub fn close_driver(mut self) -> FinalDomainTestIssuerTransition {
         self.open_drivers -= 1;
         if self.open_drivers == 0 {
             let proof = self.authority.frozen_proof_for_test();
@@ -238,16 +238,16 @@ impl CollectingFinalDomainTestIssuer {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 #[derive(Debug)]
-pub(crate) struct FrozenFinalDomainTestIssuer {
+pub struct FrozenFinalDomainTestIssuer {
     authority: CompletionFenceAuthority,
     proof: CommittedDomainFrozenProof,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 impl FrozenFinalDomainTestIssuer {
-    pub(crate) fn issue(
+    pub fn issue(
         &self,
         stream: ProducerStreamId,
         sequence: ProducerSequence,
@@ -255,7 +255,7 @@ impl FrozenFinalDomainTestIssuer {
         self.authority.issue(&self.proof, stream, sequence)
     }
 
-    pub(crate) fn issue_shard(
+    pub fn issue_shard(
         &self,
         stream: ProducerStreamId,
         sequence: ProducerSequence,
@@ -266,7 +266,7 @@ impl FrozenFinalDomainTestIssuer {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 fn authority_scope_digest(
     contract_digest: CompletionFenceContractDigest,
     binding_id: BindingId,
@@ -283,7 +283,7 @@ fn authority_scope_digest(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CompletionFence {
+pub struct CompletionFence {
     contract_digest: CompletionFenceContractDigest,
     stream: ProducerStreamId,
     sequence: ProducerSequence,
@@ -304,11 +304,11 @@ impl CompletionFence {
         }
     }
 
-    pub(crate) const fn digest(&self) -> [u8; 32] {
+    pub const fn digest(&self) -> [u8; 32] {
         self.digest
     }
 
-    pub(crate) fn try_from_remote_codec(
+    pub fn try_from_remote_codec(
         contract_digest: CompletionFenceContractDigest,
         stream: ProducerStreamId,
         sequence: ProducerSequence,
@@ -359,28 +359,35 @@ fn fence_digest(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FinalDomainShard {
+pub struct FinalDomainShard {
     fence: CompletionFence,
     domain: ValueDomainDelta,
     replay_digest: [u8; 32],
 }
 
+/// Backend-owned authority that binds a frozen final-domain payload to the
+/// producer stream allowed to issue it. The Core contract validates only the
+/// immutable proof and never names the participant service that owns it.
+pub trait FinalDomainIssuanceAuthorizer: Send + Sync {
+    fn authorizes_final_domain(&self, stream: ProducerStreamId, domain: &ValueDomainDelta) -> bool;
+}
+
 impl FinalDomainShard {
-    pub(crate) fn issue_for_service(
-        permit: crate::runtime_filter::service::FinalDomainServiceIssuancePermit,
+    pub fn issue_for_service(
+        permit: &impl FinalDomainIssuanceAuthorizer,
         contract: &RuntimeCompletionFenceContract,
         stream: ProducerStreamId,
         sequence: ProducerSequence,
         domain: ValueDomainDelta,
     ) -> Result<Self, FinalDomainError> {
-        if !permit.authorizes(stream, &domain) {
+        if !permit.authorizes_final_domain(stream, &domain) {
             return Err(FinalDomainError::FrozenProofMismatch);
         }
         let fence = CompletionFence::issue(contract.digest(), stream, sequence);
         Self::try_new(contract, fence, domain)
     }
 
-    pub(crate) fn try_new(
+    pub fn try_new(
         contract: &RuntimeCompletionFenceContract,
         fence: CompletionFence,
         domain: ValueDomainDelta,
@@ -402,7 +409,7 @@ impl FinalDomainShard {
         })
     }
 
-    pub(crate) fn verify_scope(
+    pub fn verify_scope(
         &self,
         contract: &RuntimeCompletionFenceContract,
         stream: ProducerStreamId,
@@ -450,19 +457,19 @@ impl FinalDomainShard {
         Ok(())
     }
 
-    pub(crate) const fn domain(&self) -> &ValueDomainDelta {
+    pub const fn domain(&self) -> &ValueDomainDelta {
         &self.domain
     }
 
-    pub(crate) const fn fence_digest(&self) -> [u8; 32] {
+    pub const fn fence_digest(&self) -> [u8; 32] {
         self.fence.digest()
     }
 
-    pub(crate) const fn replay_digest(&self) -> [u8; 32] {
+    pub const fn replay_digest(&self) -> [u8; 32] {
         self.replay_digest
     }
 
-    pub(crate) fn canonical_contribution_bytes(&self) -> Option<usize> {
+    pub fn canonical_contribution_bytes(&self) -> Option<usize> {
         canonical_contribution_bytes_for(
             self.fence.canonical_bytes(),
             self.domain.estimated_contribution_bytes().ok()?,

@@ -62,7 +62,7 @@ pub(crate) enum WindowBound {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum LiteralValue {
+pub enum LiteralValue {
     Null,
     Bool(bool),
     Int(i64),

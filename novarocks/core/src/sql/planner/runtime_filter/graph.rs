@@ -28,7 +28,7 @@ use super::contract::{
 use super::coverage::Coverage;
 
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeFilterChannelSpec {
+pub struct RuntimeFilterChannelSpec {
     pub channel_id: ChannelId,
     pub logical_domain: RuntimeFilterLogicalDomain,
     pub lifecycle: RuntimeFilterLifecycle,
@@ -40,14 +40,14 @@ pub(crate) struct RuntimeFilterChannelSpec {
     pub policy: RuntimeFilterPolicyRequirement,
 }
 #[derive(Clone, Debug)]
-pub(crate) struct ProducerRequirement {
+pub struct ProducerRequirement {
     pub contribution_kinds: BTreeSet<ContributionKind>,
     pub completion_requirement: CompletionRequirement,
     pub target: ProducerBindingTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProducerBindingTarget {
+pub enum ProducerBindingTarget {
     JoinBuildKey {
         ordinal: usize,
     },
@@ -58,38 +58,38 @@ pub(crate) enum ProducerBindingTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConsumerBindingTarget {
+pub enum ConsumerBindingTarget {
     DirectInput { input_ordinal: usize },
     SourceBoundary,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ConsumerRequirementData<A> {
+pub struct ConsumerRequirementData<A> {
     pub capabilities: BTreeSet<ArtifactCapability>,
     pub activation: A,
     pub target: ConsumerBindingTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PlanLocation {
+pub struct PlanLocation {
     pub fragment_id: PlanFragmentId,
     pub node_id: PlanNodeId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ApplyPoint {
+pub enum ApplyPoint {
     NodeInput,
     NodeOutput,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum RuntimeFilterBindingRoleData<A> {
+pub enum RuntimeFilterBindingRoleData<A> {
     Producer(ProducerRequirement),
     Consumer(ConsumerRequirementData<A>),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeFilterBindingSpecData<A> {
+pub struct RuntimeFilterBindingSpecData<A> {
     pub binding_id: BindingId,
     pub channel_id: ChannelId,
     pub coverage_witness_id: Option<CoverageWitnessId>,
@@ -100,7 +100,7 @@ pub(crate) struct RuntimeFilterBindingSpecData<A> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeFilterGraphData<A> {
+pub struct RuntimeFilterGraphData<A> {
     channels: BTreeMap<ChannelId, RuntimeFilterChannelSpec>,
     bindings: BTreeMap<BindingId, RuntimeFilterBindingSpecData<A>>,
 }
@@ -114,19 +114,19 @@ impl<A> Default for RuntimeFilterGraphData<A> {
     }
 }
 
-pub(crate) type ConsumerRequirement = ConsumerRequirementData<ConsumerActivation>;
-pub(crate) type RuntimeFilterBindingRole = RuntimeFilterBindingRoleData<ConsumerActivation>;
-pub(crate) type RuntimeFilterBindingSpec = RuntimeFilterBindingSpecData<ConsumerActivation>;
-pub(crate) type RuntimeFilterGraph = RuntimeFilterGraphData<ConsumerActivation>;
+pub type ConsumerRequirement = ConsumerRequirementData<ConsumerActivation>;
+pub type RuntimeFilterBindingRole = RuntimeFilterBindingRoleData<ConsumerActivation>;
+pub type RuntimeFilterBindingSpec = RuntimeFilterBindingSpecData<ConsumerActivation>;
+pub type RuntimeFilterGraph = RuntimeFilterGraphData<ConsumerActivation>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GraphBuildError {
+pub enum GraphBuildError {
     DuplicateChannel(ChannelId),
     DuplicateBinding(BindingId),
 }
 
 impl<A> RuntimeFilterGraphData<A> {
-    pub(crate) fn insert_channel(
+    pub fn insert_channel(
         &mut self,
         channel: RuntimeFilterChannelSpec,
     ) -> Result<(), GraphBuildError> {
@@ -137,7 +137,7 @@ impl<A> RuntimeFilterGraphData<A> {
         Ok(())
     }
 
-    pub(crate) fn insert_binding(
+    pub fn insert_binding(
         &mut self,
         binding: RuntimeFilterBindingSpecData<A>,
     ) -> Result<(), GraphBuildError> {
@@ -148,38 +148,35 @@ impl<A> RuntimeFilterGraphData<A> {
         Ok(())
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.channels.is_empty() && self.bindings.is_empty()
     }
 
-    pub(crate) fn channel_count(&self) -> usize {
+    pub fn channel_count(&self) -> usize {
         self.channels.len()
     }
 
-    pub(crate) fn binding_count(&self) -> usize {
+    pub fn binding_count(&self) -> usize {
         self.bindings.len()
     }
 
-    pub(crate) fn channel(&self, channel_id: ChannelId) -> Option<&RuntimeFilterChannelSpec> {
+    pub fn channel(&self, channel_id: ChannelId) -> Option<&RuntimeFilterChannelSpec> {
         self.channels.get(&channel_id)
     }
 
-    pub(crate) fn binding(
-        &self,
-        binding_id: BindingId,
-    ) -> Option<&RuntimeFilterBindingSpecData<A>> {
+    pub fn binding(&self, binding_id: BindingId) -> Option<&RuntimeFilterBindingSpecData<A>> {
         self.bindings.get(&binding_id)
     }
 
-    pub(crate) fn channels(&self) -> impl Iterator<Item = &RuntimeFilterChannelSpec> {
+    pub fn channels(&self) -> impl Iterator<Item = &RuntimeFilterChannelSpec> {
         self.channels.values()
     }
 
-    pub(crate) fn bindings(&self) -> impl Iterator<Item = &RuntimeFilterBindingSpecData<A>> {
+    pub fn bindings(&self) -> impl Iterator<Item = &RuntimeFilterBindingSpecData<A>> {
         self.bindings.values()
     }
 
-    pub(crate) fn map_consumer_activations<B, E>(
+    pub fn map_consumer_activations<B, E>(
         self,
         mut decide: impl FnMut(BindingId, ChannelId, PlanLocation, &A) -> Result<B, E>,
     ) -> Result<RuntimeFilterGraphData<B>, E> {
@@ -263,7 +260,7 @@ impl<A> RuntimeFilterGraphData<A> {
     }
 
     #[cfg(test)]
-    pub(crate) fn binding_mut_for_test(
+    pub fn binding_mut_for_test(
         &mut self,
         binding_id: BindingId,
     ) -> Option<&mut RuntimeFilterBindingSpecData<A>> {
@@ -354,7 +351,7 @@ pub(super) mod tests {
         );
     }
 
-    pub(crate) fn expression() -> TypedExpr {
+    pub fn expression() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
             data_type: DataType::Int64,
@@ -362,7 +359,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn policy() -> RuntimeFilterPolicyRequirement {
+    pub fn policy() -> RuntimeFilterPolicyRequirement {
         RuntimeFilterPolicyRequirement {
             max_contribution_bytes: 1024,
             max_artifact_bytes: 4096,
@@ -371,7 +368,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn join_channel(channel_id: ChannelId) -> RuntimeFilterChannelSpec {
+    pub fn join_channel(channel_id: ChannelId) -> RuntimeFilterChannelSpec {
         RuntimeFilterChannelSpec {
             channel_id,
             logical_domain: RuntimeFilterLogicalDomain::Membership {
@@ -394,7 +391,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn topn_channel(channel_id: ChannelId) -> RuntimeFilterChannelSpec {
+    pub fn topn_channel(channel_id: ChannelId) -> RuntimeFilterChannelSpec {
         RuntimeFilterChannelSpec {
             channel_id,
             logical_domain: RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
@@ -419,7 +416,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn aggregate_channel(channel_id: ChannelId) -> RuntimeFilterChannelSpec {
+    pub fn aggregate_channel(channel_id: ChannelId) -> RuntimeFilterChannelSpec {
         RuntimeFilterChannelSpec {
             channel_id,
             logical_domain: RuntimeFilterLogicalDomain::Membership {
@@ -442,7 +439,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn producer_binding(
+    pub fn producer_binding(
         binding_id: BindingId,
         channel_id: ChannelId,
         witness_id: CoverageWitnessId,
@@ -468,7 +465,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn consumer_binding(
+    pub fn consumer_binding(
         binding_id: BindingId,
         channel_id: ChannelId,
         capabilities: BTreeSet<ArtifactCapability>,
@@ -492,7 +489,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn join_producer_binding(
+    pub fn join_producer_binding(
         binding_id: BindingId,
         channel_id: ChannelId,
         witness_id: CoverageWitnessId,
@@ -510,7 +507,7 @@ pub(super) mod tests {
         )
     }
 
-    pub(crate) fn join_consumer_binding(
+    pub fn join_consumer_binding(
         binding_id: BindingId,
         channel_id: ChannelId,
     ) -> RuntimeFilterBindingSpec {

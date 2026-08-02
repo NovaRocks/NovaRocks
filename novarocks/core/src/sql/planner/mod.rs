@@ -22,6 +22,9 @@
 //! `PhysicalPlanNode`; the planner pipeline applies physical placement passes
 //! before distributed planning cuts fragments and wires cross-fragment state.
 
+#[cfg(feature = "runtime-filter-test-support")]
+pub mod distributed;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod distributed;
 pub(crate) mod imv_rewrite;
 pub(crate) mod logical;

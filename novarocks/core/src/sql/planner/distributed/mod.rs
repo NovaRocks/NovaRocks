@@ -24,6 +24,9 @@ pub(crate) use crate::sql::planner::runtime_filter::activation::{
 pub(crate) use activation_decision::DraftRuntimeFilterGraph;
 pub(crate) mod boundary;
 pub(crate) mod build;
+#[cfg(feature = "runtime-filter-test-support")]
+pub mod fragment;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 mod fragment;
 mod node;
 pub(crate) mod output;
@@ -37,10 +40,8 @@ pub(crate) mod write;
 pub(crate) mod test_support;
 
 pub(crate) use boundary::{BoundaryColumn, BoundaryContract, BoundaryKind, ExecutionColumnId};
-pub(crate) use fragment::{
-    DataPartition, DataSink, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
-    PartitionKind, PlanFragment,
-};
+pub use fragment::{DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
+pub(crate) use fragment::{DataSink, PartitionKind, PlanFragment};
 pub(crate) use node::{
     DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
     distributed_kind_from_physical, distributed_kind_to_physical,

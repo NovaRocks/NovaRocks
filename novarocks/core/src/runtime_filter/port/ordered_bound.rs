@@ -30,7 +30,7 @@ use super::artifact::encode_schema;
 use super::value_domain::ContributionSizeError;
 
 const ORDER_CONTRACT_VERSION: u16 = 1;
-pub(crate) const COMPARATOR_ALGORITHM_VERSION: u16 = 1;
+pub const COMPARATOR_ALGORITHM_VERSION: u16 = 1;
 const COMPARATOR_DOMAIN: &[u8] = b"novarocks.runtime-filter.comparator";
 const ORDER_CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.order-contract";
 const REPLAY_DIGEST_DOMAIN: &[u8] = b"novarocks.runtime-filter.ordered-bound-replay";
@@ -86,7 +86,7 @@ pub struct RuntimeOrderContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OrderedScalar {
+pub enum OrderedScalar {
     Boolean(bool),
     Int8(i8),
     Int16(i16),
@@ -100,12 +100,12 @@ pub(crate) enum OrderedScalar {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OrderedTuple {
+pub struct OrderedTuple {
     values: Arc<[Option<OrderedScalar>]>,
 }
 
 impl OrderedTuple {
-    pub(crate) fn try_new(
+    pub fn try_new(
         contract: &RuntimeOrderContract,
         values: impl IntoIterator<Item = Option<OrderedScalar>>,
     ) -> Result<Self, OrderedTupleError> {
@@ -126,11 +126,11 @@ impl OrderedTuple {
         })
     }
 
-    pub(crate) fn values(&self) -> &[Option<OrderedScalar>] {
+    pub fn values(&self) -> &[Option<OrderedScalar>] {
         &self.values
     }
 
-    pub(crate) fn try_from_codec(
+    pub fn try_from_codec(
         contract: &RuntimeOrderContract,
         values: Vec<Option<OrderedScalar>>,
     ) -> Result<Self, OrderedTupleError> {
@@ -149,7 +149,7 @@ impl OrderedTuple {
         })
     }
 
-    pub(crate) fn estimated_retained_bytes(&self) -> Option<usize> {
+    pub fn estimated_retained_bytes(&self) -> Option<usize> {
         self.values.iter().try_fold(0usize, |bytes, value| {
             let value_bytes = match value {
                 None => 1,
@@ -164,7 +164,7 @@ impl OrderedTuple {
         })
     }
 
-    pub(crate) fn visit_canonical(&self, mut visitor: impl FnMut(&[u8])) {
+    pub fn visit_canonical(&self, mut visitor: impl FnMut(&[u8])) {
         visitor(
             &u64::try_from(self.values.len())
                 .expect("ordered tuple arity must fit canonical u64")
@@ -181,7 +181,7 @@ impl OrderedTuple {
         }
     }
 
-    pub(crate) fn canonical_codec_len(&self) -> Result<usize, ContributionSizeError> {
+    pub fn canonical_codec_len(&self) -> Result<usize, ContributionSizeError> {
         self.validate_canonical_u64_lengths()?;
         let mut bytes = Some(0usize);
         self.visit_canonical(|part| {
@@ -190,10 +190,7 @@ impl OrderedTuple {
         bytes.ok_or(ContributionSizeError::SizeOverflow)
     }
 
-    pub(crate) fn encode_canonical_into(
-        &self,
-        output: &mut Vec<u8>,
-    ) -> Result<(), ContributionSizeError> {
+    pub fn encode_canonical_into(&self, output: &mut Vec<u8>) -> Result<(), ContributionSizeError> {
         let exact_len = self.canonical_codec_len()?;
         let start = output.len();
         self.visit_canonical(|part| output.extend_from_slice(part));
@@ -215,14 +212,14 @@ impl OrderedTuple {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OrderedBoundUpdate {
+pub struct OrderedBoundUpdate {
     order_contract_digest: OrderContractDigest,
     bound: OrderedTuple,
     replay_digest: [u8; 32],
 }
 
 impl OrderedBoundUpdate {
-    pub(crate) fn new(
+    pub fn new(
         contract: &RuntimeOrderContract,
         bound: OrderedTuple,
     ) -> Result<Self, OrderedTupleError> {
@@ -235,19 +232,19 @@ impl OrderedBoundUpdate {
         })
     }
 
-    pub(crate) const fn order_contract_digest(&self) -> OrderContractDigest {
+    pub const fn order_contract_digest(&self) -> OrderContractDigest {
         self.order_contract_digest
     }
 
-    pub(crate) const fn bound(&self) -> &OrderedTuple {
+    pub const fn bound(&self) -> &OrderedTuple {
         &self.bound
     }
 
-    pub(crate) const fn replay_digest(&self) -> [u8; 32] {
+    pub const fn replay_digest(&self) -> [u8; 32] {
         self.replay_digest
     }
 
-    pub(crate) fn canonical_contribution_bytes(&self) -> Option<usize> {
+    pub fn canonical_contribution_bytes(&self) -> Option<usize> {
         let mut bytes = Some(
             REPLAY_DIGEST_DOMAIN
                 .len()
@@ -260,11 +257,11 @@ impl OrderedBoundUpdate {
         bytes
     }
 
-    pub(crate) fn canonical_contribution_len(&self) -> Result<usize, ContributionSizeError> {
+    pub fn canonical_contribution_len(&self) -> Result<usize, ContributionSizeError> {
         self.bound.canonical_codec_len()
     }
 
-    pub(crate) fn encode_bound_canonical_into(
+    pub fn encode_bound_canonical_into(
         &self,
         output: &mut Vec<u8>,
     ) -> Result<(), ContributionSizeError> {
@@ -282,15 +279,15 @@ pub enum OrderContractError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OrderedTupleError {
+pub enum OrderedTupleError {
     ArityMismatch,
     TypeMismatch,
 }
 
-pub(crate) struct ComparatorDigestV1;
+pub struct ComparatorDigestV1;
 
 impl ComparatorDigestV1 {
-    pub(crate) fn for_contract(
+    pub fn for_contract(
         keys: &[OrderKeyContract],
         algorithm_version: u16,
     ) -> Result<ComparatorDigest, OrderContractError> {
@@ -309,7 +306,7 @@ pub fn comparator_digest_for_plan(
 }
 
 impl RuntimeOrderContract {
-    pub(crate) fn from_codec(
+    pub fn from_codec(
         keys: Vec<RuntimeOrderKey>,
         plan_comparator_digest: ComparatorDigest,
         order_contract_digest: OrderContractDigest,
@@ -327,7 +324,7 @@ impl RuntimeOrderContract {
         })
     }
 
-    pub(crate) fn validate_codec_contract_digest(
+    pub fn validate_codec_contract_digest(
         canonical_keys: &[u8],
         comparator_digest: [u8; 32],
     ) -> Result<OrderContractDigest, OrderContractError> {
@@ -379,7 +376,7 @@ impl RuntimeOrderContract {
         })
     }
 
-    pub(crate) fn compare(
+    pub fn compare(
         &self,
         left: &OrderedTuple,
         right: &OrderedTuple,
@@ -416,11 +413,11 @@ impl RuntimeOrderContract {
         self.order_contract_digest
     }
 
-    pub(crate) fn keys(&self) -> &[RuntimeOrderKey] {
+    pub fn keys(&self) -> &[RuntimeOrderKey] {
         &self.keys
     }
 
-    pub(crate) const fn plan_comparator_digest(&self) -> ComparatorDigest {
+    pub const fn plan_comparator_digest(&self) -> ComparatorDigest {
         self.plan_comparator_digest
     }
 }
@@ -590,8 +587,8 @@ fn compare_non_null(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn comparator_digest_for_test(
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
+pub fn comparator_digest_for_test(
     keys: &[OrderKeyContract],
     algorithm_version: u16,
 ) -> ComparatorDigest {

@@ -39,7 +39,7 @@ use crate::runtime_filter::port::ordered_bound::{
 };
 
 #[derive(Clone, Debug)]
-pub(crate) struct OrderedRangePredicateContract {
+pub struct OrderedRangePredicateContract {
     channel_id: ChannelId,
     order_contract: Arc<RuntimeOrderContract>,
     logical_version: LogicalVersion,
@@ -47,7 +47,7 @@ pub(crate) struct OrderedRangePredicateContract {
 }
 
 impl OrderedRangePredicateContract {
-    pub(crate) fn new(
+    pub fn new(
         channel_id: ChannelId,
         order_contract: Arc<RuntimeOrderContract>,
         logical_version: LogicalVersion,
@@ -67,13 +67,13 @@ impl OrderedRangePredicateContract {
         })
     }
 
-    pub(crate) const fn order_contract(&self) -> &Arc<RuntimeOrderContract> {
+    pub const fn order_contract(&self) -> &Arc<RuntimeOrderContract> {
         &self.order_contract
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OrderedPredicateCompileError {
+pub enum OrderedPredicateCompileError {
     ChannelMismatch {
         expected: ChannelId,
         actual: ChannelId,
@@ -116,7 +116,7 @@ impl fmt::Display for OrderedPredicateCompileError {
 impl Error for OrderedPredicateCompileError {}
 
 #[derive(Clone)]
-pub(crate) struct NativeOrderedRangePredicate {
+pub struct NativeOrderedRangePredicate {
     artifact: Arc<PhysicalArtifact>,
     order_contract: Arc<RuntimeOrderContract>,
     bound: OrderedTuple,
@@ -124,7 +124,7 @@ pub(crate) struct NativeOrderedRangePredicate {
 }
 
 impl NativeOrderedRangePredicate {
-    pub(crate) fn compile(
+    pub fn compile(
         bundle: &ArtifactBundle,
         expected: &OrderedRangePredicateContract,
     ) -> Result<Self, OrderedPredicateCompileError> {
@@ -200,15 +200,15 @@ impl NativeOrderedRangePredicate {
         })
     }
 
-    pub(crate) const fn logical_version(&self) -> LogicalVersion {
+    pub const fn logical_version(&self) -> LogicalVersion {
         self.logical_version
     }
 
-    pub(crate) fn data_type(&self) -> &DataType {
+    pub fn data_type(&self) -> &DataType {
         self.order_contract.keys()[0].data_type()
     }
 
-    pub(crate) fn evaluate(
+    pub fn evaluate(
         &self,
         array: &dyn Array,
     ) -> Result<BooleanArray, OrderedPredicateEvaluationError> {
@@ -303,7 +303,7 @@ impl fmt::Debug for NativeOrderedRangePredicate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OrderedPredicateEvaluationError {
+pub enum OrderedPredicateEvaluationError {
     TypeMismatch {
         expected: DataType,
         actual: DataType,
@@ -345,12 +345,11 @@ fn downcast<'a, T: Array + 'static>(
 }
 
 #[cfg(test)]
-pub(crate) mod tests_support {
+pub mod tests_support {
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
     use crate::runtime_filter::materializer::range::{
         RangeMaterializationOutcome, RangeMaterializer,
     };
@@ -368,6 +367,7 @@ pub(crate) mod tests_support {
         RetainedMemoryReservation, RuntimeFilterMemoryAccount,
     };
     use crate::runtime_filter::port::value_domain::LogicalSnapshot;
+    use crate::runtime_filter::port::value_domain::OrderedBoundDomain;
 
     struct UnlimitedMemory;
 
@@ -379,7 +379,7 @@ pub(crate) mod tests_support {
         fn release(&self, _bytes: usize) {}
     }
 
-    pub(crate) fn contract(
+    pub fn contract(
         data_type: DataType,
         direction: SortDirection,
         null_order: NullOrder,
@@ -403,7 +403,7 @@ pub(crate) mod tests_support {
         )
     }
 
-    pub(crate) fn bundle(
+    pub fn bundle(
         contract: Arc<RuntimeOrderContract>,
         bound: Option<OrderedScalar>,
         version: LogicalVersion,

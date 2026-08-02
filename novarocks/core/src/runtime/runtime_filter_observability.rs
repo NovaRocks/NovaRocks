@@ -154,6 +154,17 @@ impl RuntimeFilterLifecycleRegistry {
     }
 }
 
+/// Construct a one-way diagnostic event sink for a Backend-owned participant.
+///
+/// This is intentionally an observer only: it exposes neither service lookup
+/// nor lifecycle mutation, so execution ownership cannot flow back into Core.
+pub fn backend_participant_event_sink(query: QueryKey) -> Arc<dyn RuntimeFilterEventSink> {
+    Arc::new(RegistryRuntimeFilterEventSink::new(
+        RuntimeFilterLifecycleRegistry::global(),
+        query,
+    ))
+}
+
 fn runtime_filter_lifecycle_registry() -> &'static RuntimeFilterLifecycleRegistry {
     static REGISTRY: OnceLock<RuntimeFilterLifecycleRegistry> = OnceLock::new();
     REGISTRY.get_or_init(RuntimeFilterLifecycleRegistry::new)

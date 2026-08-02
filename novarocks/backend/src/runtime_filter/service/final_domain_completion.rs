@@ -22,15 +22,19 @@ use std::sync::{Arc, Mutex, Weak};
 use arrow::datatypes::DataType;
 use sha2::{Digest, Sha256};
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::model::contract::BindingId;
-use crate::runtime_filter::port::final_domain::{FinalDomainShard, RuntimeCompletionFenceContract};
-use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence, ProducerStreamId};
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::model::contract::BindingId;
+use novarocks::runtime_filter_transition::port::final_domain::{
+    FinalDomainIssuanceAuthorizer, FinalDomainShard, RuntimeCompletionFenceContract,
+};
+use novarocks::runtime_filter_transition::port::identity::{
+    PartitionId, ProducerSequence, ProducerStreamId,
+};
+use novarocks::runtime_filter_transition::port::producer::{
     FinalDomainProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
     RuntimeContractViolationKind, SubmitOutcome,
 };
-use crate::runtime_filter::port::value_domain::ValueDomainDelta;
+use novarocks::runtime_filter_transition::port::value_domain::ValueDomainDelta;
+use novarocks_types::UniqueId;
 
 const COMPLETION_SET_DOMAIN: &[u8] = b"novarocks.runtime-filter.final-domain-completion-set";
 const COMPLETION_SET_VERSION: u16 = 1;
@@ -213,7 +217,7 @@ impl FinalDomainCompletionAuthority {
                 &payload.domain,
             );
             let shard = FinalDomainShard::issue_for_service(
-                permit,
+                &permit,
                 &self.contract,
                 payload.stream,
                 ProducerSequence::new(0),
@@ -256,6 +260,12 @@ impl FinalDomainServiceIssuancePermit {
             && self.domain_fingerprint == domain_fingerprint
             && self.binding_digest
                 == issuance_permit_digest(self.frozen_set_digest, stream, domain_fingerprint)
+    }
+}
+
+impl FinalDomainIssuanceAuthorizer for FinalDomainServiceIssuancePermit {
+    fn authorizes_final_domain(&self, stream: ProducerStreamId, domain: &ValueDomainDelta) -> bool {
+        self.authorizes(stream, domain)
     }
 }
 
@@ -726,27 +736,33 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::runtime_filter::model::contract::{
+    use novarocks::runtime_filter_transition::model::contract::{
         BindingId, ChannelId, CompletionFenceKind, NullSemantics,
     };
-    use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-    use crate::runtime_filter::port::final_domain::{
+    use novarocks::runtime_filter_transition::port::artifact::ArtifactMembershipSchema;
+    use novarocks::runtime_filter_transition::port::events::{
+        RuntimeFilterEvent, RuntimeFilterEventSink,
+    };
+    use novarocks::runtime_filter_transition::port::final_domain::{
         FinalDomainError, FinalDomainShard, RuntimeCompletionFenceContract,
     };
-    use crate::runtime_filter::port::identity::{DeploymentEpoch, PartitionId, ProducerSequence};
-    use crate::runtime_filter::port::producer::{
+    use novarocks::runtime_filter_transition::port::identity::{
+        DeploymentEpoch, PartitionId, ProducerSequence,
+    };
+    use novarocks::runtime_filter_transition::port::producer::{
         FinalDomainProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
         RuntimeContractViolationKind, SubmitOutcome,
     };
-    use crate::runtime_filter::port::subscription::{
+    use novarocks::runtime_filter_transition::port::subscription::{
         LivePollOutcome, LiveTerminal, SubscriptionKind, UnavailableReason,
     };
-    use crate::runtime_filter::port::support::{
+    use novarocks::runtime_filter_transition::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+    use novarocks::runtime_filter_transition::port::value_domain::{
+        MembershipValues, ValueDomainDelta,
+    };
+    use novarocks_types::UniqueId;
 
     use super::*;
 
@@ -1022,7 +1038,7 @@ mod tests {
         forged.binding_digest[0] ^= 1;
         assert_eq!(
             FinalDomainShard::issue_for_service(
-                forged,
+                &forged,
                 &contract(),
                 stream,
                 ProducerSequence::new(0),

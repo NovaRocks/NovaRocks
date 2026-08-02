@@ -35,6 +35,9 @@ pub(crate) mod profile;
 pub mod read_session;
 pub mod request_context;
 mod runtime_filter;
+#[cfg(feature = "runtime-filter-test-support")]
+pub mod schedule;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod schedule;
 pub mod service;
 pub mod session;

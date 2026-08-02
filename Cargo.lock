@@ -3214,6 +3214,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-buffer",
+ "async-trait",
  "bytes",
  "iceberg",
  "novarocks",
@@ -3227,6 +3228,7 @@ dependencies = [
  "prost 0.13.5",
  "protoc-bin-vendored",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tonic",

@@ -18,11 +18,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use novarocks::query_execution::lifecycle::{
-    QueryExecutionId, QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminationReason,
-    RuntimeFilterContribution,
-};
-use novarocks::runtime::native_query_lifecycle::NativeQueryLifecycleRuntime;
+use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryTerminationReason};
+use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks_types::UniqueId;
 
 use crate::ConnectorExecutionHost;
@@ -31,7 +28,7 @@ use crate::fragment::control::FragmentControlRegistry;
 use super::registry::QueryLifecycleLocalRuntime;
 
 pub(crate) struct NativeQueryLifecycleLocalRuntime {
-    runtime: NativeQueryLifecycleRuntime,
+    runtime: NativeFragmentQueryRuntime,
     controls: Arc<FragmentControlRegistry>,
     execution_host: Arc<ConnectorExecutionHost>,
 }
@@ -42,7 +39,7 @@ impl NativeQueryLifecycleLocalRuntime {
         execution_host: Arc<ConnectorExecutionHost>,
     ) -> Self {
         Self {
-            runtime: NativeQueryLifecycleRuntime::global(),
+            runtime: NativeFragmentQueryRuntime::global(),
             controls,
             execution_host,
         }
@@ -50,25 +47,6 @@ impl NativeQueryLifecycleLocalRuntime {
 }
 
 impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
-    fn install_runtime_filter(
-        &self,
-        execution_id: QueryExecutionId,
-        contribution: RuntimeFilterContribution,
-    ) -> Result<(), QueryLifecycleError> {
-        self.runtime
-            .install_runtime_filter_contribution(execution_id, contribution)
-            .map_err(runtime_error)
-    }
-
-    fn abort_runtime_filter(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Result<(), QueryLifecycleError> {
-        self.runtime
-            .abort_runtime_filter_contribution(execution_id)
-            .map_err(runtime_error)
-    }
-
     fn terminate_query(
         &self,
         execution_id: QueryExecutionId,
@@ -109,8 +87,4 @@ fn fragment_failure_test_markers_enabled() -> bool {
 #[cfg(not(debug_assertions))]
 fn fragment_failure_test_markers_enabled() -> bool {
     false
-}
-
-fn runtime_error(error: String) -> QueryLifecycleError {
-    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error)
 }

@@ -37,10 +37,10 @@ use super::support::ArtifactRetention;
 const PROFILE_VERSION: u8 = 1;
 const ORDERED_PROFILE_VERSION: u8 = 2;
 const SCHEMA_VERSION: u8 = 1;
-pub(crate) const LEAF_CODEC_VERSION: u16 = 1;
+pub const LEAF_CODEC_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ArtifactKind {
+pub enum ArtifactKind {
     ValueSet,
     Bloom,
     Bitset,
@@ -49,7 +49,7 @@ pub(crate) enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    pub(crate) const fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         match self {
             Self::ValueSet => 1,
             Self::Bloom => 2,
@@ -59,7 +59,7 @@ impl ArtifactKind {
         }
     }
 
-    pub(crate) const fn from_tag(tag: u8) -> Option<Self> {
+    pub const fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             1 => Some(Self::ValueSet),
             2 => Some(Self::Bloom),
@@ -72,10 +72,10 @@ impl ArtifactKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct HashContractDigest([u8; 32]);
+pub struct HashContractDigest([u8; 32]);
 
 impl HashContractDigest {
-    pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+    pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
@@ -85,15 +85,15 @@ impl HashContractDigest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ConsumerProfileId([u8; 32]);
+pub struct ConsumerProfileId([u8; 32]);
 
 impl ConsumerProfileId {
     pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 
-    #[cfg(test)]
-    pub(crate) const fn for_test(bytes: [u8; 32]) -> Self {
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
+    pub const fn for_test(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 }
@@ -102,11 +102,11 @@ impl ConsumerProfileId {
 pub struct ArtifactSchemaDigest([u8; 32]);
 
 impl ArtifactSchemaDigest {
-    pub(crate) const fn from_canonical_bytes(bytes: [u8; 32]) -> Self {
+    pub const fn from_canonical_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub(crate) fn for_membership(
+    pub fn for_membership(
         data_type: &DataType,
         null_semantics: NullSemantics,
     ) -> Result<Self, ArtifactContractError> {
@@ -239,18 +239,18 @@ pub struct ArtifactMembershipSchemaView<'a> {
 }
 
 impl<'a> ArtifactMembershipSchemaView<'a> {
-    pub(crate) const fn payload_tag(self) -> u8 {
+    pub const fn payload_tag(self) -> u8 {
         self.payload_tag
     }
 
-    pub(crate) const fn timestamp_contract(self) -> Option<(u8, Option<&'a str>)> {
+    pub const fn timestamp_contract(self) -> Option<(u8, Option<&'a str>)> {
         match self.type_contract {
             ArtifactMembershipTypeContract::Timestamp { unit, timezone } => Some((unit, timezone)),
             _ => None,
         }
     }
 
-    pub(crate) const fn decimal_contract(self) -> Option<(u8, i8)> {
+    pub const fn decimal_contract(self) -> Option<(u8, i8)> {
         match self.type_contract {
             ArtifactMembershipTypeContract::Decimal { precision, scale } => {
                 Some((precision, scale))
@@ -351,7 +351,7 @@ pub(super) fn encode_schema(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConsumerArtifactProfile {
+pub struct ConsumerArtifactProfile {
     accepted_kinds: BTreeSet<ArtifactKind>,
     bloom_hash_contract: Option<HashContractDigest>,
     order_contract_digest: Option<OrderContractDigest>,
@@ -367,7 +367,7 @@ impl ConsumerArtifactProfile {
         Self::new_with_order_contract(accepted_kinds, bloom_hash_contract, None)
     }
 
-    pub(crate) fn new_ordered_range(
+    pub fn new_ordered_range(
         order_contract_digest: OrderContractDigest,
     ) -> Result<Self, ArtifactContractError> {
         Self::new_with_order_contract(
@@ -425,8 +425,8 @@ impl ConsumerArtifactProfile {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn m1_test_default() -> Self {
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
+    pub fn m1_test_default() -> Self {
         Self::new(
             BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
             None,
@@ -434,19 +434,19 @@ impl ConsumerArtifactProfile {
         .expect("built-in test profile is valid")
     }
 
-    pub(crate) const fn accepted_kinds(&self) -> &BTreeSet<ArtifactKind> {
+    pub const fn accepted_kinds(&self) -> &BTreeSet<ArtifactKind> {
         &self.accepted_kinds
     }
 
-    pub(crate) fn accepts(&self, kind: ArtifactKind) -> bool {
+    pub fn accepts(&self, kind: ArtifactKind) -> bool {
         self.accepted_kinds.contains(&kind)
     }
 
-    pub(crate) const fn bloom_hash_contract(&self) -> Option<HashContractDigest> {
+    pub const fn bloom_hash_contract(&self) -> Option<HashContractDigest> {
         self.bloom_hash_contract
     }
 
-    pub(crate) const fn order_contract_digest(&self) -> Option<OrderContractDigest> {
+    pub const fn order_contract_digest(&self) -> Option<OrderContractDigest> {
         self.order_contract_digest
     }
 
@@ -454,12 +454,12 @@ impl ConsumerArtifactProfile {
         &self.canonical_bytes
     }
 
-    pub(crate) const fn id(&self) -> ConsumerProfileId {
+    pub const fn id(&self) -> ConsumerProfileId {
         self.id
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_test_identity(mut self, id: ConsumerProfileId) -> Self {
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
+    pub fn with_test_identity(mut self, id: ConsumerProfileId) -> Self {
         self.id = id;
         self
     }
@@ -498,7 +498,7 @@ impl fmt::Display for ArtifactContractError {
 impl Error for ArtifactContractError {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ArtifactSemanticDigest([u8; 32]);
+pub struct ArtifactSemanticDigest([u8; 32]);
 
 impl ArtifactSemanticDigest {
     pub const fn bytes(self) -> [u8; 32] {
@@ -507,24 +507,24 @@ impl ArtifactSemanticDigest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RangeArtifactData {
+pub struct RangeArtifactData {
     contract: Arc<RuntimeOrderContract>,
     bound: OrderedTuple,
     semantic_digest: ArtifactSemanticDigest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RangeArtifactResidentLayout {
-    pub(crate) key_count: usize,
-    pub(crate) timezone_count: usize,
-    pub(crate) timezone_bytes: usize,
-    pub(crate) tuple_arity: usize,
-    pub(crate) utf8_count: usize,
-    pub(crate) utf8_bytes: usize,
+pub struct RangeArtifactResidentLayout {
+    pub key_count: usize,
+    pub timezone_count: usize,
+    pub timezone_bytes: usize,
+    pub tuple_arity: usize,
+    pub utf8_count: usize,
+    pub utf8_bytes: usize,
 }
 
 impl RangeArtifactResidentLayout {
-    pub(crate) fn from_data(
+    pub fn from_data(
         contract: &RuntimeOrderContract,
         bound: &OrderedTuple,
     ) -> Result<Self, ArtifactContractError> {
@@ -569,7 +569,7 @@ impl RangeArtifactResidentLayout {
         })
     }
 
-    pub(crate) fn decode_temporary_bytes(self) -> Result<usize, ArtifactContractError> {
+    pub fn decode_temporary_bytes(self) -> Result<usize, ArtifactContractError> {
         self.key_count
             .checked_mul(size_of::<RuntimeOrderKey>())
             .and_then(|bytes| {
@@ -612,26 +612,26 @@ impl RangeArtifactData {
         })
     }
 
-    pub(crate) const fn contract(&self) -> &Arc<RuntimeOrderContract> {
+    pub const fn contract(&self) -> &Arc<RuntimeOrderContract> {
         &self.contract
     }
 
-    pub(crate) const fn bound(&self) -> &OrderedTuple {
+    pub const fn bound(&self) -> &OrderedTuple {
         &self.bound
     }
 
-    pub(crate) const fn semantic_digest(&self) -> ArtifactSemanticDigest {
+    pub const fn semantic_digest(&self) -> ArtifactSemanticDigest {
         self.semantic_digest
     }
 
-    pub(crate) fn accounted_resident_bytes(&self) -> Result<usize, ArtifactContractError> {
+    pub fn accounted_resident_bytes(&self) -> Result<usize, ArtifactContractError> {
         Self::accounted_resident_bytes_for_layout(RangeArtifactResidentLayout::from_data(
             &self.contract,
             &self.bound,
         )?)
     }
 
-    pub(crate) fn accounted_resident_bytes_for_layout(
+    pub fn accounted_resident_bytes_for_layout(
         layout: RangeArtifactResidentLayout,
     ) -> Result<usize, ArtifactContractError> {
         let arc_header = 2usize
@@ -714,7 +714,7 @@ fn hash_ordered_scalar(digest: &mut Sha256, value: &OrderedScalar) {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResidentMembershipIndex {
+pub struct ResidentMembershipIndex {
     kind: ArtifactKind,
     canonical_digest: [u8; 32],
     layout: ResidentMembershipIndexLayout,
@@ -736,7 +736,7 @@ enum ResidentMembershipIndexLayout {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum ResidentMembershipIndexView<'a> {
+pub enum ResidentMembershipIndexView<'a> {
     EmptyDomain,
     Fixed {
         tag: u8,
@@ -751,7 +751,7 @@ pub(crate) enum ResidentMembershipIndexView<'a> {
 }
 
 impl ResidentMembershipIndex {
-    pub(crate) fn empty_domain(canonical_bytes: &[u8]) -> Self {
+    pub fn empty_domain(canonical_bytes: &[u8]) -> Self {
         Self {
             kind: ArtifactKind::EmptyDomain,
             canonical_digest: Sha256::digest(canonical_bytes).into(),
@@ -759,7 +759,7 @@ impl ResidentMembershipIndex {
         }
     }
 
-    pub(crate) fn fixed(
+    pub fn fixed(
         canonical_bytes: &[u8],
         tag: u8,
         values: Range<usize>,
@@ -778,7 +778,7 @@ impl ResidentMembershipIndex {
         }
     }
 
-    pub(crate) fn utf8(
+    pub fn utf8(
         canonical_bytes: &[u8],
         payload: Range<usize>,
         length_offsets: Box<[usize]>,
@@ -817,7 +817,7 @@ impl ResidentMembershipIndex {
         }
     }
 
-    pub(crate) fn heap_bytes(&self) -> Result<usize, ArtifactContractError> {
+    pub fn heap_bytes(&self) -> Result<usize, ArtifactContractError> {
         match &self.layout {
             ResidentMembershipIndexLayout::Utf8 { length_offsets, .. } => length_offsets
                 .len()
@@ -848,12 +848,12 @@ impl ResidentMembershipIndex {
 }
 
 #[derive(Clone)]
-pub(crate) enum PhysicalArtifactPayload {
+pub enum PhysicalArtifactPayload {
     Membership(Option<ResidentMembershipIndex>),
     Range(Arc<RangeArtifactData>),
 }
 
-pub(crate) struct PhysicalArtifact {
+pub struct PhysicalArtifact {
     kind: ArtifactKind,
     codec_version: u16,
     schema_digest: ArtifactSchemaDigest,
@@ -866,7 +866,7 @@ pub(crate) struct PhysicalArtifact {
 }
 
 impl PhysicalArtifact {
-    pub(crate) fn accounted_resident_component_bytes(
+    pub fn accounted_resident_component_bytes(
         encoded_bytes: usize,
     ) -> Result<usize, ArtifactContractError> {
         encoded_bytes
@@ -875,15 +875,13 @@ impl PhysicalArtifact {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
-    pub(crate) fn accounted_resident_bytes(
-        encoded_bytes: usize,
-    ) -> Result<usize, ArtifactContractError> {
+    pub fn accounted_resident_bytes(encoded_bytes: usize) -> Result<usize, ArtifactContractError> {
         Self::accounted_resident_component_bytes(encoded_bytes)?
             .checked_add(size_of::<ArtifactRetention>())
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
-    pub(crate) fn accounted_indexed_resident_component_bytes(
+    pub fn accounted_indexed_resident_component_bytes(
         encoded_bytes: usize,
         index_heap_bytes: usize,
     ) -> Result<usize, ArtifactContractError> {
@@ -892,7 +890,7 @@ impl PhysicalArtifact {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
-    pub(crate) fn accounted_indexed_resident_bytes(
+    pub fn accounted_indexed_resident_bytes(
         encoded_bytes: usize,
         index_heap_bytes: usize,
     ) -> Result<usize, ArtifactContractError> {
@@ -901,7 +899,7 @@ impl PhysicalArtifact {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
-    pub(crate) fn from_retained_bytes(
+    pub fn from_retained_bytes(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
         version: LogicalVersion,
@@ -930,7 +928,7 @@ impl PhysicalArtifact {
         })
     }
 
-    pub(crate) fn from_shared_retained_bytes(
+    pub fn from_shared_retained_bytes(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
         version: LogicalVersion,
@@ -962,8 +960,8 @@ impl PhysicalArtifact {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_test(
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
+    pub fn new_test(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
         version: LogicalVersion,
@@ -985,7 +983,7 @@ impl PhysicalArtifact {
     }
 
     #[cfg(test)]
-    pub(crate) fn clone_with_test_codec_version(&self, codec_version: u16) -> Self {
+    pub fn clone_with_test_codec_version(&self, codec_version: u16) -> Self {
         Self {
             kind: self.kind,
             codec_version,
@@ -999,7 +997,7 @@ impl PhysicalArtifact {
         }
     }
 
-    pub(crate) fn from_indexed_retained_bytes(
+    pub fn from_indexed_retained_bytes(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
         version: LogicalVersion,
@@ -1032,7 +1030,7 @@ impl PhysicalArtifact {
         })
     }
 
-    pub(crate) fn from_shared_indexed_retained_bytes(
+    pub fn from_shared_indexed_retained_bytes(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
         version: LogicalVersion,
@@ -1071,7 +1069,7 @@ impl PhysicalArtifact {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_indexed_test(
+    pub fn new_indexed_test(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
         version: LogicalVersion,
@@ -1094,7 +1092,7 @@ impl PhysicalArtifact {
         })
     }
 
-    pub(crate) fn accounted_range_resident_component_bytes(
+    pub fn accounted_range_resident_component_bytes(
         encoded_bytes: usize,
         data: &RangeArtifactData,
     ) -> Result<usize, ArtifactContractError> {
@@ -1104,7 +1102,7 @@ impl PhysicalArtifact {
         )
     }
 
-    pub(crate) fn accounted_range_resident_component_bytes_for_layout(
+    pub fn accounted_range_resident_component_bytes_for_layout(
         encoded_bytes: usize,
         layout: RangeArtifactResidentLayout,
     ) -> Result<usize, ArtifactContractError> {
@@ -1123,7 +1121,7 @@ impl PhysicalArtifact {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
-    pub(crate) fn from_range_retained(
+    pub fn from_range_retained(
         version: LogicalVersion,
         data: RangeArtifactData,
         canonical_bytes: Arc<[u8]>,
@@ -1147,7 +1145,7 @@ impl PhysicalArtifact {
         )
     }
 
-    pub(crate) fn from_range_shared_retained(
+    pub fn from_range_shared_retained(
         version: LogicalVersion,
         data: RangeArtifactData,
         canonical_bytes: Arc<[u8]>,
@@ -1180,40 +1178,40 @@ impl PhysicalArtifact {
         })
     }
 
-    pub(crate) const fn kind(&self) -> ArtifactKind {
+    pub const fn kind(&self) -> ArtifactKind {
         self.kind
     }
-    pub(crate) const fn codec_version(&self) -> u16 {
+    pub const fn codec_version(&self) -> u16 {
         self.codec_version
     }
-    pub(crate) const fn schema_digest(&self) -> ArtifactSchemaDigest {
+    pub const fn schema_digest(&self) -> ArtifactSchemaDigest {
         self.schema_digest
     }
-    pub(crate) const fn version(&self) -> LogicalVersion {
+    pub const fn version(&self) -> LogicalVersion {
         self.version
     }
-    pub(crate) const fn contains_null(&self) -> bool {
+    pub const fn contains_null(&self) -> bool {
         self.contains_null
     }
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
-    pub(crate) const fn canonical_digest(&self) -> [u8; 32] {
+    pub const fn canonical_digest(&self) -> [u8; 32] {
         self.canonical_digest
     }
-    pub(crate) fn range(&self) -> Option<&RangeArtifactData> {
+    pub fn range(&self) -> Option<&RangeArtifactData> {
         match &self.payload {
             PhysicalArtifactPayload::Membership(_) => None,
             PhysicalArtifactPayload::Range(data) => Some(data),
         }
     }
-    pub(crate) fn membership_index(&self) -> Option<&ResidentMembershipIndex> {
+    pub fn membership_index(&self) -> Option<&ResidentMembershipIndex> {
         match &self.payload {
             PhysicalArtifactPayload::Membership(index) => index.as_ref(),
             PhysicalArtifactPayload::Range(_) => None,
         }
     }
-    pub(crate) fn retained_memory_bytes(&self) -> usize {
+    pub fn retained_memory_bytes(&self) -> usize {
         self.retained_memory
             .as_ref()
             .map_or(0, |retention| retention.bytes())
@@ -1259,7 +1257,7 @@ impl fmt::Debug for PhysicalArtifact {
 }
 
 #[derive(Debug)]
-pub(crate) struct ArtifactBundle {
+pub struct ArtifactBundle {
     channel_id: ChannelId,
     version: LogicalVersion,
     profile_id: ConsumerProfileId,
@@ -1272,7 +1270,7 @@ pub(crate) struct ArtifactBundle {
 impl ArtifactBundle {
     const CANONICAL_HEADER_BYTES: usize = 4 + 1 + 8 + 8 + 32 + 2;
 
-    pub(crate) fn canonical_encoded_len(
+    pub fn canonical_encoded_len(
         artifacts: &[(ArtifactKind, Arc<PhysicalArtifact>)],
     ) -> Result<usize, ArtifactContractError> {
         u16::try_from(artifacts.len()).map_err(|_| ArtifactContractError::EncodedSizeOverflow)?;
@@ -1288,7 +1286,7 @@ impl ArtifactBundle {
             })
     }
 
-    pub(crate) fn canonical_encoded_len_for_single_artifact(
+    pub fn canonical_encoded_len_for_single_artifact(
         artifact_encoded_bytes: usize,
     ) -> Result<usize, ArtifactContractError> {
         Self::CANONICAL_HEADER_BYTES
@@ -1297,7 +1295,7 @@ impl ArtifactBundle {
             .ok_or(ArtifactContractError::EncodedSizeOverflow)
     }
 
-    pub(crate) fn accounted_resident_overhead(
+    pub fn accounted_resident_overhead(
         profile: &ConsumerArtifactProfile,
         artifact_count: usize,
     ) -> Result<usize, ArtifactContractError> {
@@ -1311,7 +1309,7 @@ impl ArtifactBundle {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
-    pub(crate) fn accounted_range_resident_overhead(
+    pub fn accounted_range_resident_overhead(
         artifact_count: usize,
     ) -> Result<usize, ArtifactContractError> {
         let arc_header = 2usize
@@ -1345,7 +1343,7 @@ impl ArtifactBundle {
         )
     }
 
-    pub(crate) fn new_retained(
+    pub fn new_retained(
         channel_id: ChannelId,
         version: LogicalVersion,
         profile: &ConsumerArtifactProfile,
@@ -1456,26 +1454,26 @@ impl ArtifactBundle {
         })
     }
 
-    pub(crate) const fn channel_id(&self) -> ChannelId {
+    pub const fn channel_id(&self) -> ChannelId {
         self.channel_id
     }
-    pub(crate) const fn version(&self) -> LogicalVersion {
+    pub const fn version(&self) -> LogicalVersion {
         self.version
     }
-    pub(crate) const fn profile_id(&self) -> ConsumerProfileId {
+    pub const fn profile_id(&self) -> ConsumerProfileId {
         self.profile_id
     }
-    pub(crate) const fn artifacts(&self) -> &[(ArtifactKind, Arc<PhysicalArtifact>)] {
+    pub const fn artifacts(&self) -> &[(ArtifactKind, Arc<PhysicalArtifact>)] {
         &self.artifacts
     }
-    pub(crate) const fn canonical_digest(&self) -> [u8; 32] {
+    pub const fn canonical_digest(&self) -> [u8; 32] {
         self.canonical_digest
     }
-    pub(crate) const fn encoded_bytes(&self) -> usize {
+    pub const fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
     }
 
-    pub(crate) fn retained_memory_bytes(&self) -> usize {
+    pub fn retained_memory_bytes(&self) -> usize {
         self.retained_memory
             .as_ref()
             .map_or(0, |retention| retention.bytes())

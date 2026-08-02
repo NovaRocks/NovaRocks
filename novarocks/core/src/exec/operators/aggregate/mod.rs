@@ -78,7 +78,7 @@ pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 ///
 /// The completion capability stays here for the complete factory lifetime.
 /// Operators receive only their one-shot partition committer.
-pub(crate) struct AggregateFinalDomainSessionBuilder {
+pub struct AggregateFinalDomainSessionBuilder {
     completion: execution::RuntimeFilterFinalDomainCompletionHandle,
     declared_dop: i32,
     installed_membership_key_type: DataType,
@@ -98,7 +98,7 @@ struct AggregateFinalDomainPartitionCommitter {
 }
 
 impl AggregateFinalDomainSessionBuilder {
-    pub(crate) fn new(
+    pub fn new(
         completion: execution::RuntimeFilterFinalDomainCompletionHandle,
         declared_dop: i32,
         requested_max_domain_canonical_bytes: usize,
@@ -411,7 +411,7 @@ struct AggregateRuntimeFilterExecution {
 }
 
 impl AggregateProcessorFactory {
-    pub(crate) fn new_native(
+    pub fn new_native(
         node_id: i32,
         arena: Arc<ExprArena>,
         group_by: Vec<ExprId>,
@@ -1725,7 +1725,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_execution::runtime_filter as execution;
-    use novarocks_execution::runtime_filter::RuntimeFilterSession;
 
     use super::{
         AggregateFinalDomainSessionBuilder, AggregateProcessorFactory,
@@ -1738,26 +1737,12 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
-    use crate::runtime_filter::model::contract::{
-        BindingId, ChannelId, CompletionFenceKind, CompletionRequirement, ContributionKind,
-        CoverageWitnessId, NullSemantics, ReductionRequirement, RuntimeFilterLifecycle,
-        RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
-    };
-    use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
     use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-    use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-    use crate::runtime_filter::port::install::{
-        MaterializationPolicy, ProducerDeployment, RuntimeFilterChannelDeployment,
-        RuntimeFilterCoreBudget, RuntimeFilterInstallView, local_participant_install_for_test,
-    };
-    use crate::runtime_filter::port::subscription::UnavailableReason;
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
     use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
-    use crate::runtime_filter::service::{
-        NativeRuntimeFilterExecutionContext, RuntimeFilterService,
-    };
 
     const RF_BINDING: BindingId = BindingId::new(10);
     const RF_CHANNEL: ChannelId = ChannelId::new(1);
@@ -1804,60 +1789,136 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeFinalDomainCompletion {
+        accepted_partitions: Mutex<Vec<u32>>,
+        claimed_partitions: Mutex<BTreeSet<u32>>,
+        failures: AtomicUsize,
+        max_domain_canonical_bytes: usize,
+        self_ref: Mutex<std::sync::Weak<FakeFinalDomainCompletion>>,
+    }
+
+    impl FakeFinalDomainCompletion {
+        fn with_budget(max_domain_canonical_bytes: usize) -> Arc<Self> {
+            let completion = Arc::new(Self {
+                max_domain_canonical_bytes,
+                ..Self::default()
+            });
+            *completion
+                .self_ref
+                .lock()
+                .expect("completion self reference") = Arc::downgrade(&completion);
+            completion
+        }
+
+        fn fail_once(&self) {
+            self.failures.store(1, Ordering::SeqCst);
+        }
+    }
+
+    struct FakeFinalDomainPartition {
+        completion: Arc<FakeFinalDomainCompletion>,
+        partition: execution::PartitionId,
+        sealed: bool,
+        closed: bool,
+    }
+
+    impl execution::RuntimeFilterFinalDomainPartition for FakeFinalDomainPartition {
+        fn seal(
+            &mut self,
+            _domain: execution::RuntimeFilterFinalDomain,
+        ) -> Result<(), execution::RuntimeFilterContractViolation> {
+            self.sealed = true;
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), execution::RuntimeFilterContractViolation> {
+            if !self.closed {
+                self.closed = true;
+                if self.sealed {
+                    self.completion
+                        .accepted_partitions
+                        .lock()
+                        .expect("accepted partitions lock")
+                        .push(self.partition.get());
+                } else {
+                    self.completion.fail_once();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for FakeFinalDomainPartition {
+        fn drop(&mut self) {
+            if !self.closed {
+                self.completion.fail_once();
+            }
+        }
+    }
+
+    impl execution::RuntimeFilterFinalDomainCompletion for FakeFinalDomainCompletion {
+        fn membership_key_type(&self) -> DataType {
+            DataType::Int64
+        }
+
+        fn max_domain_canonical_bytes(&self) -> usize {
+            self.max_domain_canonical_bytes
+        }
+
+        fn claim_partition(
+            &self,
+            partition: execution::PartitionId,
+        ) -> Result<
+            execution::RuntimeFilterFinalDomainPartitionHandle,
+            execution::RuntimeFilterContractViolation,
+        > {
+            let mut claimed = self
+                .claimed_partitions
+                .lock()
+                .expect("claimed partitions lock");
+            if !claimed.insert(partition.get()) {
+                self.fail_once();
+                return Err(execution::RuntimeFilterContractViolation::new(
+                    execution::RuntimeFilterContractViolationKind::InvalidPartitionCount,
+                    format!(
+                        "final-domain partition {} was already created",
+                        partition.get()
+                    ),
+                ));
+            }
+            Ok(Box::new(FakeFinalDomainPartition {
+                completion: self
+                    .self_ref
+                    .lock()
+                    .expect("completion self reference")
+                    .upgrade()
+                    .expect("completion remains owned by test fixture"),
+                partition,
+                sealed: false,
+                closed: false,
+            }))
+        }
+
+        fn fail(
+            &self,
+            _reason: execution::RuntimeFilterProducerFailure,
+        ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+        {
+            self.fail_once();
+            Ok(execution::RuntimeFilterSubmitOutcome::TerminalNoop)
+        }
+    }
+
     struct FinalDomainFixture {
-        service: Arc<RuntimeFilterService>,
-        events: Arc<TestEvents>,
+        completion: Arc<FakeFinalDomainCompletion>,
     }
 
     impl FinalDomainFixture {
         fn new() -> Self {
-            let witness = CoverageWitnessId::new(101);
-            let coverage = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
-            let deployment = RuntimeFilterChannelDeployment::new(
-                RF_CHANNEL,
-                RuntimeFilterLogicalDomain::Membership {
-                    value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NullSafeEqual,
-                },
-                RuntimeFilterLifecycle::CompleteOnce,
-                coverage.clone(),
-                coverage,
-                ReductionRequirement::SetUnion,
-                BTreeSet::from([
-                    ContributionKind::FinalDomainShard,
-                    ContributionKind::ProducerClosed,
-                ]),
-                CompletionRequirement::FencedFinalDomain(
-                    CompletionFenceKind::CommittedDomainFrozen,
-                ),
-                RuntimeFilterPolicyRequirement {
-                    max_contribution_bytes: 1024,
-                    max_artifact_bytes: 1024,
-                    deadline_ms: 1_000,
-                    max_retries: 2,
-                },
-                RuntimeFilterCoreBudget::new(8192),
-                MaterializationPolicy::for_test(),
-                BTreeMap::from([(
-                    RF_BINDING,
-                    ProducerDeployment::new(witness, BTreeSet::from([RF_INSTANCE])),
-                )]),
-                BTreeMap::new(),
-            );
-            let install = local_participant_install_for_test(RuntimeFilterInstallView::new(
-                DeploymentEpoch::new(9),
-                RuntimeFilterParticipantId::new(3),
-                BTreeMap::from([(RF_CHANNEL, deployment)]),
-            ));
-            let events = Arc::new(TestEvents::default());
-            let service = Arc::new(RuntimeFilterService::new_for_lifecycle_test(
-                UniqueId::new(70, 0),
-                Arc::new(TestClock(Instant::now())),
-                events.clone(),
-                Arc::new(TestMemory::default()),
-            ));
-            service.install(install).expect("final-domain install");
-            Self { service, events }
+            Self {
+                completion: FakeFinalDomainCompletion::with_budget(512),
+            }
         }
 
         fn session_builder(&self, dop: i32) -> AggregateFinalDomainSessionBuilder {
@@ -1869,73 +1930,26 @@ mod tests {
             dop: i32,
             max_domain_canonical_bytes: usize,
         ) -> AggregateFinalDomainSessionBuilder {
-            let context = NativeRuntimeFilterExecutionContext::new(
-                Arc::clone(&self.service),
-                UniqueId::new(70, 0),
-                DeploymentEpoch::new(9),
-                RF_INSTANCE,
-            );
-            let resolved = context
-                .resolve_producer(
-                    RF_BINDING,
-                    RF_CHANNEL,
-                    crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain,
-                )
-                .expect("installed final-domain producer resolves");
-            let request = execution::RuntimeFilterFinalDomainOpenRequest::new(
-                execution::RuntimeFilterProducerContract::new(
-                    execution::RuntimeFilterBindingId::new(RF_BINDING.get()),
-                    execution::RuntimeFilterChannelId::new(RF_CHANNEL.get()),
-                    execution::RuntimeFilterProducerKind::FinalDomain,
-                    resolved.execution_contract(),
-                ),
-                dop as u32,
-            );
-            let execution::RuntimeFilterBindOutcome::Bound(completion) = context
-                .open_final_domain_completion(request)
-                .expect("final-domain completion capability opens")
-            else {
-                panic!("installed final-domain producer must be available")
-            };
+            let completion: execution::RuntimeFilterFinalDomainCompletionHandle =
+                Arc::clone(&self.completion) as _;
             AggregateFinalDomainSessionBuilder::new(completion, dop, max_domain_canonical_bytes)
                 .expect("aggregate final-domain session builder")
         }
 
         fn accepted_partitions(&self) -> Vec<u32> {
-            self.events
-                .snapshot()
-                .into_iter()
-                .filter_map(|event| match event {
-                    RuntimeFilterEvent::FinalDomainShardAccepted { identity } => {
-                        Some(identity.stream().partition_id().get())
-                    }
-                    _ => None,
-                })
-                .collect()
+            self.completion
+                .accepted_partitions
+                .lock()
+                .expect("accepted partitions lock")
+                .clone()
         }
 
         fn failure_count(&self) -> usize {
-            self.events
-                .snapshot()
-                .iter()
-                .filter(|event| matches!(event, RuntimeFilterEvent::ProducerInstanceFailed { .. }))
-                .count()
+            self.completion.failures.load(Ordering::SeqCst)
         }
 
         fn producer_failed_unavailable_count(&self) -> usize {
-            self.events
-                .snapshot()
-                .iter()
-                .filter(|event| {
-                    matches!(
-                        event,
-                        RuntimeFilterEvent::ChannelUnavailable {
-                            reason: UnavailableReason::ProducerFailed,
-                            ..
-                        }
-                    )
-                })
-                .count()
+            self.failure_count()
         }
     }
 

@@ -21,20 +21,20 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, mpsc};
 
-use crate::novarocks_logging::error;
-use crate::runtime::global_async_runtime::data_runtime_handle;
-use crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute;
-use crate::runtime_filter::port::transport::{
-    RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterRouteIdentity,
-    RuntimeFilterTransportEnvelope,
+use crate::native::runtime_filter_adapter::{
+    decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
 };
 use crate::runtime_filter::router::remote::{
     RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome, SinkTransportError,
 };
-use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
-use crate::service::grpc_runtime_filter_adapter::{
-    decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
+use novarocks::novarocks_logging::error;
+use novarocks::runtime::global_async_runtime::data_runtime_handle;
+use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRemoteRoute;
+use novarocks::runtime_filter_transition::port::transport::{
+    RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterRouteIdentity,
+    RuntimeFilterTransportEnvelope,
 };
+use novarocks::service::grpc_client::NovaRocksGrpcRemoteClient;
 
 const LIVE_REQUEST_CAPACITY: usize = 1024;
 const LIVE_COMPLETION_CAPACITY: usize = 1024;
@@ -110,7 +110,7 @@ impl RuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryClient {
 }
 
 fn decode_runtime_filter_unary_ack(
-    response: crate::proto::filter::RuntimeFilterEnvelopeResponse,
+    response: novarocks::proto::filter::RuntimeFilterEnvelopeResponse,
 ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
     decode_runtime_filter_envelope_response(response)
         .map(|(identity, status)| RuntimeFilterUnaryAck::new(identity, status))
@@ -304,21 +304,23 @@ mod tests {
         GrpcRuntimeFilterEnvelopeSink, RuntimeFilterEnvelopeUnaryClient, RuntimeFilterUnaryAck,
         RuntimeFilterUnaryError, decode_runtime_filter_unary_ack,
     };
-    use crate::common::types::UniqueId;
-    use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-    use crate::runtime_filter::port::identity::{
-        DeploymentEpoch, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
-    };
-    use crate::runtime_filter::port::routing::{RuntimeFilterRemoteRoute, RuntimeFilterRouteRole};
-    use crate::runtime_filter::port::transport::{
-        DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
-        RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
-    };
     use crate::runtime_filter::router::remote::{
         RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
     };
+    use novarocks::runtime::endpoint::RuntimeEndpoint;
+    use novarocks::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
+    use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+    use novarocks::runtime_filter_transition::port::identity::{
+        DeploymentEpoch, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
+    };
+    use novarocks::runtime_filter_transition::port::routing::{
+        RuntimeFilterRemoteRoute, RuntimeFilterRouteRole,
+    };
+    use novarocks::runtime_filter_transition::port::transport::{
+        DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
+        RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
+    };
+    use novarocks_types::UniqueId;
 
     struct FakeUnaryClient {
         seen: mpsc::Sender<(RuntimeFilterRemoteRoute, Arc<RuntimeFilterEnvelope>)>,
@@ -362,13 +364,14 @@ mod tests {
             envelope: Arc<RuntimeFilterEnvelope>,
             _deadline: Duration,
         ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
-            let response = crate::proto::filter::RuntimeFilterEnvelopeResponse {
+            let response = novarocks::proto::filter::RuntimeFilterEnvelopeResponse {
                 acked_route_identity:
-                    crate::service::grpc_runtime_filter_adapter::encode_runtime_filter_envelope(
+                    crate::native::runtime_filter_adapter::encode_runtime_filter_envelope(
                         envelope.as_ref(),
                     )
                     .route_identity,
-                accept_status: crate::proto::filter::RuntimeFilterAcceptStatus::Unspecified as i32,
+                accept_status: novarocks::proto::filter::RuntimeFilterAcceptStatus::Unspecified
+                    as i32,
                 rejection_reason: String::new(),
             };
             decode_runtime_filter_unary_ack(response)

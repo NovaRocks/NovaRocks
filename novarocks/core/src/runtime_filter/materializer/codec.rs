@@ -46,7 +46,7 @@ const RANGE_CODEC_VERSION: u16 = 1;
 const FLAG_CONTAINS_NULL: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MembershipIndexPlan {
+pub struct MembershipIndexPlan {
     kind: ArtifactKind,
     layout: MembershipIndexLayoutPlan,
 }
@@ -67,7 +67,7 @@ enum MembershipIndexLayoutPlan {
 }
 
 impl MembershipIndexPlan {
-    pub(crate) fn heap_bytes(&self) -> Result<usize, ArtifactCodecError> {
+    pub fn heap_bytes(&self) -> Result<usize, ArtifactCodecError> {
         match self.layout {
             MembershipIndexLayoutPlan::Utf8 { count, .. } => count
                 .checked_mul(std::mem::size_of::<usize>())
@@ -80,7 +80,7 @@ impl MembershipIndexPlan {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum MembershipProbe<'a> {
+pub enum MembershipProbe<'a> {
     Boolean(bool),
     Int8(i8),
     Int16(i16),
@@ -95,9 +95,7 @@ pub(crate) enum MembershipProbe<'a> {
     Decimal128(i128),
 }
 
-pub(crate) fn inspect_membership_index(
-    encoded: &[u8],
-) -> Result<MembershipIndexPlan, ArtifactCodecError> {
+pub fn inspect_membership_index(encoded: &[u8]) -> Result<MembershipIndexPlan, ArtifactCodecError> {
     let header = parse_header(encoded)?;
     let payload_start = header.payload.as_ptr() as usize - encoded.as_ptr() as usize;
     let layout = match header.kind {
@@ -171,7 +169,7 @@ fn inspect_value_set_layout(
     })
 }
 
-pub(crate) fn build_membership_index(
+pub fn build_membership_index(
     encoded: &[u8],
     plan: &MembershipIndexPlan,
 ) -> Result<ResidentMembershipIndex, ArtifactCodecError> {
@@ -206,7 +204,7 @@ pub(crate) fn build_membership_index(
     })
 }
 
-pub(crate) fn validate_membership_index_binding(
+pub fn validate_membership_index_binding(
     encoded: &[u8],
     kind: ArtifactKind,
     index: &ResidentMembershipIndex,
@@ -271,7 +269,7 @@ pub(crate) fn validate_membership_index_binding(
     }
 }
 
-pub(crate) fn indexed_membership_contains(
+pub fn indexed_membership_contains(
     encoded: &[u8],
     index: &ResidentMembershipIndex,
     probe: MembershipProbe<'_>,
@@ -344,7 +342,7 @@ fn indexed_membership_contains_inner(
 }
 
 #[cfg(test)]
-pub(crate) fn indexed_membership_contains_counted_for_test(
+pub fn indexed_membership_contains_counted_for_test(
     encoded: &[u8],
     index: &ResidentMembershipIndex,
     probe: MembershipProbe<'_>,
@@ -442,7 +440,7 @@ fn canonical_probe_f64(value: f64) -> u64 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ArtifactDecodeExpectations {
+pub struct ArtifactDecodeExpectations {
     pub expected_kind: ArtifactKind,
     pub expected_schema_digest: ArtifactSchemaDigest,
     pub expected_logical_version: LogicalVersion,
@@ -450,13 +448,13 @@ pub(crate) struct ArtifactDecodeExpectations {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RangeDecodeExpectations {
+pub struct RangeDecodeExpectations {
     pub expected_order_digest: OrderContractDigest,
     pub expected_logical_version: LogicalVersion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArtifactCodecError {
+pub enum ArtifactCodecError {
     ContractViolation,
     Malformed,
     ResourceUnavailable,
@@ -500,7 +498,7 @@ impl From<RetainedReservationError> for ArtifactCodecError {
     }
 }
 
-pub(crate) fn encode_membership_leaf(
+pub fn encode_membership_leaf(
     domain: &ReducedMembershipDomain,
     null_semantics: NullSemantics,
     logical_version: LogicalVersion,
@@ -534,7 +532,7 @@ pub(crate) fn encode_membership_leaf(
     )
 }
 
-pub(crate) fn encoded_leaf_len(
+pub fn encoded_leaf_len(
     schema: &ArtifactMembershipSchema,
     hash_contract: Option<HashContractDigest>,
     payload_len: usize,
@@ -560,7 +558,7 @@ pub(crate) fn encoded_leaf_len(
         .ok_or(ArtifactCodecError::LengthOverflow)
 }
 
-pub(crate) fn encode_physical_leaf(
+pub fn encode_physical_leaf(
     kind: ArtifactKind,
     schema: &ArtifactMembershipSchema,
     logical_version: LogicalVersion,
@@ -604,7 +602,7 @@ pub(crate) fn encode_physical_leaf(
     Ok(encoded)
 }
 
-pub(crate) fn decode_leaf(
+pub fn decode_leaf(
     encoded: &[u8],
     expectations: ArtifactDecodeExpectations,
     max_artifact_bytes: usize,
@@ -1067,7 +1065,7 @@ fn validate_decimal(
     )
 }
 
-pub(crate) fn encoded_range_leaf_len(
+pub fn encoded_range_leaf_len(
     contract: &RuntimeOrderContract,
     bound: &OrderedTuple,
 ) -> Result<usize, ArtifactCodecError> {
@@ -1086,7 +1084,7 @@ pub(crate) fn encoded_range_leaf_len(
         .ok_or(ArtifactCodecError::ResourceUnavailable)
 }
 
-pub(crate) fn encode_range_leaf(
+pub fn encode_range_leaf(
     contract: &RuntimeOrderContract,
     bound: &OrderedTuple,
     logical_version: LogicalVersion,
@@ -1108,7 +1106,7 @@ pub(crate) fn encode_range_leaf(
     Ok(encoded)
 }
 
-pub(crate) fn decode_range(
+pub fn decode_range(
     encoded: &[u8],
     expectations: RangeDecodeExpectations,
     max_artifact_bytes: usize,
@@ -1849,7 +1847,6 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
     use crate::runtime_filter::model::contract::NullSemantics;
     use crate::runtime_filter::model::contract::{
         ChannelId, NullOrder, OrderContract, OrderKeyContract, SortDirection,
@@ -1868,6 +1865,7 @@ mod tests {
     use crate::runtime_filter::port::support::{
         ArtifactRetainedBudget, ArtifactRetention, MemoryAccountError, RuntimeFilterMemoryAccount,
     };
+    use crate::runtime_filter::port::value_domain::OrderedBoundDomain;
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
     };

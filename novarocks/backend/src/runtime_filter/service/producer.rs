@@ -19,39 +19,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::codec::contribution::{
+use crate::runtime_filter::core::channel::{FinalDomainRejection, RuntimeFilterChannel};
+use novarocks::runtime_filter_transition::codec::contribution::{
     ContributionCodecError, RuntimeFilterContribution, encode_contribution,
     encoded_contribution_len, semantic_contribution_bytes, validate_contribution_contract,
 };
-use crate::runtime_filter::codec::producer::encode_producer_failure;
-use crate::runtime_filter::core::channel::{FinalDomainRejection, RuntimeFilterChannel};
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-use crate::runtime_filter::port::events::{
+use novarocks::runtime_filter_transition::codec::producer::encode_producer_failure;
+use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+use novarocks::runtime_filter_transition::port::events::{
     RuntimeFilterEventIdentity, TransportRouteEventIdentity,
 };
 #[cfg(test)]
-use crate::runtime_filter::port::final_domain::CompletionFenceAuthority;
-use crate::runtime_filter::port::final_domain::FinalDomainShard;
-use crate::runtime_filter::port::identity::{
+use novarocks::runtime_filter_transition::port::final_domain::CompletionFenceAuthority;
+use novarocks::runtime_filter_transition::port::final_domain::FinalDomainShard;
+use novarocks::runtime_filter_transition::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, ProducerStreamId, RuntimeFilterParticipantId,
 };
-use crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate;
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::ordered_bound::OrderedBoundUpdate;
+use novarocks::runtime_filter_transition::port::producer::{
     FinalDomainProducerAdapter, OrderedBoundProducerAdapter, ProducerAdapter,
     ProducerFailureReason, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
     TopKSummaryProducerAdapter,
 };
-use crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute;
-use crate::runtime_filter::port::support::{
+use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRemoteRoute;
+use novarocks::runtime_filter_transition::port::support::{
     RuntimeFilterMemoryAccount, TemporaryContributionLease,
 };
-use crate::runtime_filter::port::topk_summary::TopKSummary;
-use crate::runtime_filter::port::transport::{
+use novarocks::runtime_filter_transition::port::topk_summary::TopKSummary;
+use novarocks::runtime_filter_transition::port::transport::{
     ContributionRouteIdentity, ProducerInstanceRouteIdentity, ProducerOpenMetadata,
     RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
 };
-use crate::runtime_filter::port::value_domain::ValueDomainDelta;
+use novarocks::runtime_filter_transition::port::value_domain::ValueDomainDelta;
+use novarocks_types::UniqueId;
 
 use super::ActionDispatcher;
 use super::registry::InboundProducerContract;
@@ -62,7 +62,7 @@ use super::reliable_transport::{
 pub(super) struct RemoteProducerState {
     epoch: DeploymentEpoch,
     route: RuntimeFilterRemoteRoute,
-    kind: crate::runtime_filter::port::producer::ProducerPortKind,
+    kind: novarocks::runtime_filter_transition::port::producer::ProducerPortKind,
     local_partition_count: u32,
     lifecycle: Mutex<RemoteProducerLifecycle>,
     lifecycle_wake: Condvar,
@@ -120,7 +120,7 @@ impl RemoteProducerState {
     pub(super) fn new(
         epoch: DeploymentEpoch,
         route: RuntimeFilterRemoteRoute,
-        kind: crate::runtime_filter::port::producer::ProducerPortKind,
+        kind: novarocks::runtime_filter_transition::port::producer::ProducerPortKind,
         local_partition_count: u32,
     ) -> Self {
         Self {
@@ -142,7 +142,7 @@ impl RemoteProducerState {
         &self,
         epoch: DeploymentEpoch,
         route: &RuntimeFilterRemoteRoute,
-        kind: crate::runtime_filter::port::producer::ProducerPortKind,
+        kind: novarocks::runtime_filter_transition::port::producer::ProducerPortKind,
         local_partition_count: u32,
     ) -> Result<(), RuntimeContractViolation> {
         if self.kind != kind {
@@ -897,13 +897,15 @@ impl ServiceProducerAdapter {
     pub(super) fn final_domain_test_issuer(
         &self,
         open_drivers: u32,
-    ) -> Option<crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer> {
+    ) -> Option<
+        novarocks::runtime_filter_transition::port::final_domain::CollectingFinalDomainTestIssuer,
+    > {
         self.final_domain_authority
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
             .map(|authority| {
-                crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer::new(
+                novarocks::runtime_filter_transition::port::final_domain::CollectingFinalDomainTestIssuer::new(
                     authority,
                     open_drivers,
                 )

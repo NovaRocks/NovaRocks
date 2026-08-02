@@ -19,7 +19,7 @@
 //! Responsibilities:
 //! - Detects null composite keys while building runtime-filter values.
 //!
-//! The native runtime-filter data plane is owned by `runtime_filter::service`.
+//! Native runtime-filter data-plane state is injected as a backend-owned session.
 
 use crate::exec::hash_table::key_builder::GroupKeyArrayView;
 

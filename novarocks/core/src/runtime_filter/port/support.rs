@@ -20,35 +20,35 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-pub(crate) trait RuntimeFilterClock: Send + Sync {
+pub trait RuntimeFilterClock: Send + Sync {
     fn now(&self) -> Instant;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MemoryAccountError {
+pub enum MemoryAccountError {
     CapacityExceeded,
 }
 
-pub(crate) trait RuntimeFilterMemoryAccount: Send + Sync {
+pub trait RuntimeFilterMemoryAccount: Send + Sync {
     fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError>;
     fn release(&self, bytes: usize);
 }
 
 #[derive(Debug)]
-pub(crate) struct ArtifactRetainedBudget {
+pub struct ArtifactRetainedBudget {
     max_bytes: usize,
     retained_bytes: AtomicUsize,
 }
 
 impl ArtifactRetainedBudget {
-    pub(crate) fn new(max_bytes: usize) -> Self {
+    pub fn new(max_bytes: usize) -> Self {
         Self {
             max_bytes,
             retained_bytes: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn try_acquire(
+    pub fn try_acquire(
         self: &Arc<Self>,
         bytes: usize,
     ) -> Result<ArtifactRetainedLease, RetainedReservationError> {
@@ -77,25 +77,25 @@ impl ArtifactRetainedBudget {
         }
     }
 
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         self.retained_bytes.load(Ordering::Acquire)
     }
 }
 
-pub(crate) struct ArtifactRetainedLease {
+pub struct ArtifactRetainedLease {
     budget: Arc<ArtifactRetainedBudget>,
     bytes: usize,
 }
 
 #[derive(Debug)]
-pub(crate) struct ArtifactScratchBudget {
+pub struct ArtifactScratchBudget {
     max_bytes_per_job: usize,
     max_total_bytes: usize,
     retained_bytes: AtomicUsize,
 }
 
 impl ArtifactScratchBudget {
-    pub(crate) fn new(
+    pub fn new(
         max_bytes_per_job: usize,
         max_total_bytes: usize,
     ) -> Result<Self, RetainedReservationError> {
@@ -109,7 +109,7 @@ impl ArtifactScratchBudget {
         })
     }
 
-    pub(crate) fn try_acquire(
+    pub fn try_acquire(
         self: &Arc<Self>,
         bytes: usize,
     ) -> Result<ArtifactScratchLease, RetainedReservationError> {
@@ -141,18 +141,18 @@ impl ArtifactScratchBudget {
         }
     }
 
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         self.retained_bytes.load(Ordering::Acquire)
     }
 }
 
-pub(crate) struct ArtifactScratchLease {
+pub struct ArtifactScratchLease {
     budget: Arc<ArtifactScratchBudget>,
     bytes: usize,
 }
 
 impl ArtifactScratchLease {
-    pub(crate) const fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.bytes
     }
 }
@@ -178,7 +178,7 @@ impl fmt::Debug for ArtifactScratchLease {
     }
 }
 
-pub(crate) struct ArtifactScratchReservation {
+pub struct ArtifactScratchReservation {
     budget: ArtifactScratchLease,
     memory: MemoryLease,
 }
@@ -193,7 +193,7 @@ impl fmt::Debug for ArtifactScratchReservation {
 }
 
 impl ArtifactScratchReservation {
-    pub(crate) fn try_new(
+    pub fn try_new(
         bytes: usize,
         budget: Arc<ArtifactScratchBudget>,
         account: Arc<dyn RuntimeFilterMemoryAccount>,
@@ -204,17 +204,17 @@ impl ArtifactScratchReservation {
         Ok(Self { budget, memory })
     }
 
-    pub(crate) const fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.memory.bytes
     }
 
-    pub(crate) fn budget_bytes(&self) -> usize {
+    pub fn budget_bytes(&self) -> usize {
         self.budget.bytes()
     }
 }
 
 impl ArtifactRetainedLease {
-    pub(crate) const fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.bytes
     }
 }
@@ -241,13 +241,13 @@ impl fmt::Debug for ArtifactRetainedLease {
 }
 
 #[derive(Debug)]
-pub(crate) struct ArtifactRetention {
+pub struct ArtifactRetention {
     budget: ArtifactRetainedLease,
     memory: RetainedMemoryReservation,
 }
 
 impl ArtifactRetention {
-    pub(crate) fn try_new(
+    pub fn try_new(
         bytes: usize,
         budget: Arc<ArtifactRetainedBudget>,
         account: Arc<dyn RuntimeFilterMemoryAccount>,
@@ -257,11 +257,11 @@ impl ArtifactRetention {
         Ok(Self { budget, memory })
     }
 
-    pub(crate) const fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.memory.bytes()
     }
 
-    pub(crate) fn budget_bytes(&self) -> usize {
+    pub fn budget_bytes(&self) -> usize {
         self.budget.bytes()
     }
 }
@@ -291,22 +291,22 @@ impl Drop for MemoryLease {
     }
 }
 
-pub(crate) struct TemporaryContributionLease(MemoryLease);
+pub struct TemporaryContributionLease(MemoryLease);
 
 impl TemporaryContributionLease {
-    pub(crate) fn try_new(
+    pub fn try_new(
         account: Arc<dyn RuntimeFilterMemoryAccount>,
         bytes: usize,
     ) -> Result<Self, MemoryAccountError> {
         MemoryLease::try_new(account, bytes).map(Self)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(account: Arc<dyn RuntimeFilterMemoryAccount>, bytes: usize) -> Self {
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
+    pub fn new(account: Arc<dyn RuntimeFilterMemoryAccount>, bytes: usize) -> Self {
         Self::try_new(account, bytes).expect("test memory account accepts reservation")
     }
 
-    pub(crate) const fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.0.bytes
     }
 }
@@ -321,7 +321,7 @@ impl fmt::Debug for TemporaryContributionLease {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RetainedReservationError {
+pub enum RetainedReservationError {
     SizeOverflow,
     AccountMismatch,
     CapacityExceeded,
@@ -342,23 +342,23 @@ impl fmt::Display for RetainedReservationError {
 impl std::error::Error for RetainedReservationError {}
 
 #[derive(Default)]
-pub(crate) struct RetainedMemoryReservation {
+pub struct RetainedMemoryReservation {
     account: Option<Arc<dyn RuntimeFilterMemoryAccount>>,
     bytes: usize,
 }
 
-pub(crate) struct RetainedReservationAbsorbFailure {
+pub struct RetainedReservationAbsorbFailure {
     error: RetainedReservationError,
     incoming: RetainedMemoryReservation,
 }
 
 impl RetainedReservationAbsorbFailure {
     #[cfg(test)]
-    pub(crate) const fn error(&self) -> RetainedReservationError {
+    pub const fn error(&self) -> RetainedReservationError {
         self.error
     }
 
-    pub(crate) fn into_parts(self) -> (RetainedReservationError, RetainedMemoryReservation) {
+    pub fn into_parts(self) -> (RetainedReservationError, RetainedMemoryReservation) {
         (self.error, self.incoming)
     }
 }
@@ -374,14 +374,14 @@ impl fmt::Debug for RetainedReservationAbsorbFailure {
 }
 
 impl RetainedMemoryReservation {
-    pub(crate) const fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             account: None,
             bytes: 0,
         }
     }
 
-    pub(crate) fn try_new(
+    pub fn try_new(
         account: Arc<dyn RuntimeFilterMemoryAccount>,
         bytes: usize,
     ) -> Result<Self, RetainedReservationError> {
@@ -398,14 +398,11 @@ impl RetainedMemoryReservation {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(account: Arc<dyn RuntimeFilterMemoryAccount>, bytes: usize) -> Self {
+    pub fn new(account: Arc<dyn RuntimeFilterMemoryAccount>, bytes: usize) -> Self {
         Self::try_new(account, bytes).expect("test memory account accepts reservation")
     }
 
-    pub(crate) fn absorb(
-        &mut self,
-        mut incoming: Self,
-    ) -> Result<(), RetainedReservationAbsorbFailure> {
+    pub fn absorb(&mut self, mut incoming: Self) -> Result<(), RetainedReservationAbsorbFailure> {
         if incoming.bytes == 0 {
             return Ok(());
         }
@@ -443,7 +440,7 @@ impl RetainedMemoryReservation {
         Ok(())
     }
 
-    pub(crate) fn split_off_excess(&mut self, retained_bytes: usize) -> Self {
+    pub fn split_off_excess(&mut self, retained_bytes: usize) -> Self {
         assert!(
             retained_bytes <= self.bytes,
             "retained reservation cannot grow while splitting excess"
@@ -467,7 +464,7 @@ impl RetainedMemoryReservation {
         }
     }
 
-    pub(crate) const fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.bytes
     }
 }

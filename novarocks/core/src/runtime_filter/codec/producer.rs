@@ -22,7 +22,7 @@ const VERSION: u8 = 1;
 const ENCODED_LEN: usize = MAGIC.len() + 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProducerFailureCodecError {
+pub enum ProducerFailureCodecError {
     Malformed,
     UnknownVersion,
     UnknownReason,
@@ -39,7 +39,7 @@ impl std::fmt::Display for ProducerFailureCodecError {
 
 impl std::error::Error for ProducerFailureCodecError {}
 
-pub(crate) fn encode_producer_failure(reason: ProducerFailureReason) -> Vec<u8> {
+pub fn encode_producer_failure(reason: ProducerFailureReason) -> Vec<u8> {
     let tag = match reason {
         ProducerFailureReason::Cancelled => 1,
         ProducerFailureReason::ExecutionFailed => 2,
@@ -52,7 +52,7 @@ pub(crate) fn encode_producer_failure(reason: ProducerFailureReason) -> Vec<u8> 
     encoded
 }
 
-pub(crate) fn decode_producer_failure(
+pub fn decode_producer_failure(
     encoded: &[u8],
 ) -> Result<ProducerFailureReason, ProducerFailureCodecError> {
     if encoded.len() != ENCODED_LEN || &encoded[..MAGIC.len()] != MAGIC {

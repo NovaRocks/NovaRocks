@@ -28,21 +28,21 @@ use crate::runtime_filter::model::coverage::Coverage;
 use super::artifact::{ConsumerArtifactProfile, ConsumerProfileId};
 use super::identity::{DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId};
 use super::routing::RuntimeFilterRoutingShard;
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 use super::routing::{
     RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
     RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 use super::transport::RuntimeFilterEnvelopeKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterCoreBudget {
+pub struct RuntimeFilterCoreBudget {
     max_reducer_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MaterializationPolicy {
+pub struct MaterializationPolicy {
     bloom_bits_per_key: u64,
     bloom_hash_count: u32,
     bloom_seed: u64,
@@ -54,7 +54,7 @@ pub(crate) struct MaterializationPolicy {
 
 impl MaterializationPolicy {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         bloom_bits_per_key: u64,
         bloom_hash_count: u32,
         bloom_seed: u64,
@@ -96,29 +96,29 @@ impl MaterializationPolicy {
         })
     }
 
-    pub(crate) const fn bloom_bits_per_key(self) -> u64 {
+    pub const fn bloom_bits_per_key(self) -> u64 {
         self.bloom_bits_per_key
     }
-    pub(crate) const fn bloom_hash_count(self) -> u32 {
+    pub const fn bloom_hash_count(self) -> u32 {
         self.bloom_hash_count
     }
-    pub(crate) const fn bloom_seed(self) -> u64 {
+    pub const fn bloom_seed(self) -> u64 {
         self.bloom_seed
     }
-    pub(crate) const fn bloom_algorithm_version(self) -> u16 {
+    pub const fn bloom_algorithm_version(self) -> u16 {
         self.bloom_algorithm_version
     }
-    pub(crate) const fn max_total_retained_bytes(self) -> u64 {
+    pub const fn max_total_retained_bytes(self) -> u64 {
         self.max_total_retained_bytes
     }
-    pub(crate) const fn max_scratch_bytes_per_job(self) -> u64 {
+    pub const fn max_scratch_bytes_per_job(self) -> u64 {
         self.max_scratch_bytes_per_job
     }
-    pub(crate) const fn max_concurrent_jobs(self) -> usize {
+    pub const fn max_concurrent_jobs(self) -> usize {
         self.max_concurrent_jobs
     }
 
-    pub(crate) fn with_max_concurrent_jobs(
+    pub fn with_max_concurrent_jobs(
         self,
         max_concurrent_jobs: usize,
     ) -> Result<Self, MaterializationPolicyError> {
@@ -133,7 +133,7 @@ impl MaterializationPolicy {
         )
     }
 
-    pub(crate) fn aggregate_scratch_bytes(self) -> Result<usize, MaterializationPolicyError> {
+    pub fn aggregate_scratch_bytes(self) -> Result<usize, MaterializationPolicyError> {
         let total = self
             .max_scratch_bytes_per_job
             .checked_mul(
@@ -144,15 +144,15 @@ impl MaterializationPolicy {
         usize::try_from(total).map_err(|_| MaterializationPolicyError::PlatformSizeOverflow)
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
+    pub fn for_test() -> Self {
         Self::new(8, 5, 17, 1, 1 << 20, 1 << 16, 1)
             .expect("built-in materialization test policy is valid")
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MaterializationPolicyError {
+pub enum MaterializationPolicyError {
     InvalidBloomContract,
     ZeroResourceLimit,
     PlatformSizeOverflow,
@@ -160,23 +160,23 @@ pub(crate) enum MaterializationPolicyError {
 }
 
 impl RuntimeFilterCoreBudget {
-    pub(crate) const fn new(max_reducer_bytes: u64) -> Self {
+    pub const fn new(max_reducer_bytes: u64) -> Self {
         Self { max_reducer_bytes }
     }
 
-    pub(crate) const fn max_reducer_bytes(self) -> u64 {
+    pub const fn max_reducer_bytes(self) -> u64 {
         self.max_reducer_bytes
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerDeployment {
+pub struct ProducerDeployment {
     coverage_witness_id: CoverageWitnessId,
     expected_fragment_instances: BTreeSet<UniqueId>,
 }
 
 impl ProducerDeployment {
-    pub(crate) fn new(
+    pub fn new(
         coverage_witness_id: CoverageWitnessId,
         expected_fragment_instances: BTreeSet<UniqueId>,
     ) -> Self {
@@ -186,17 +186,17 @@ impl ProducerDeployment {
         }
     }
 
-    pub(crate) const fn coverage_witness_id(&self) -> CoverageWitnessId {
+    pub const fn coverage_witness_id(&self) -> CoverageWitnessId {
         self.coverage_witness_id
     }
 
-    pub(crate) const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
+    pub const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
         &self.expected_fragment_instances
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConsumerDeployment {
+pub struct ConsumerDeployment {
     activation: ConsumerActivation,
     capabilities: BTreeSet<ArtifactCapability>,
     artifact_profile: ConsumerArtifactProfile,
@@ -205,20 +205,20 @@ pub(crate) struct ConsumerDeployment {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OutboundMaterializationOwner {
+pub enum OutboundMaterializationOwner {
     DirectSource,
     Aggregator,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OutboundMaterializationGroup {
+pub struct OutboundMaterializationGroup {
     owner: OutboundMaterializationOwner,
     profile: ConsumerArtifactProfile,
     route_edge_ids: BTreeSet<RouteEdgeId>,
 }
 
 impl OutboundMaterializationGroup {
-    pub(crate) fn new(
+    pub fn new(
         owner: OutboundMaterializationOwner,
         profile: ConsumerArtifactProfile,
         route_edge_ids: BTreeSet<RouteEdgeId>,
@@ -230,22 +230,22 @@ impl OutboundMaterializationGroup {
         }
     }
 
-    pub(crate) const fn owner(&self) -> OutboundMaterializationOwner {
+    pub const fn owner(&self) -> OutboundMaterializationOwner {
         self.owner
     }
 
-    pub(crate) const fn profile(&self) -> &ConsumerArtifactProfile {
+    pub const fn profile(&self) -> &ConsumerArtifactProfile {
         &self.profile
     }
 
-    pub(crate) const fn route_edge_ids(&self) -> &BTreeSet<RouteEdgeId> {
+    pub const fn route_edge_ids(&self) -> &BTreeSet<RouteEdgeId> {
         &self.route_edge_ids
     }
 }
 
 impl ConsumerDeployment {
-    #[cfg(test)]
-    pub(crate) fn new(
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
+    pub fn new(
         activation: ConsumerActivation,
         mut capabilities: BTreeSet<ArtifactCapability>,
         route_edge_ids: BTreeSet<RouteEdgeId>,
@@ -263,7 +263,7 @@ impl ConsumerDeployment {
         )
     }
 
-    pub(crate) fn with_profile(
+    pub fn with_profile(
         activation: ConsumerActivation,
         capabilities: BTreeSet<ArtifactCapability>,
         artifact_profile: ConsumerArtifactProfile,
@@ -279,29 +279,29 @@ impl ConsumerDeployment {
         }
     }
 
-    pub(crate) const fn activation(&self) -> ConsumerActivation {
+    pub const fn activation(&self) -> ConsumerActivation {
         self.activation
     }
 
-    pub(crate) const fn capabilities(&self) -> &BTreeSet<ArtifactCapability> {
+    pub const fn capabilities(&self) -> &BTreeSet<ArtifactCapability> {
         &self.capabilities
     }
 
-    pub(crate) const fn artifact_profile(&self) -> &ConsumerArtifactProfile {
+    pub const fn artifact_profile(&self) -> &ConsumerArtifactProfile {
         &self.artifact_profile
     }
 
-    pub(crate) const fn route_edge_ids(&self) -> &BTreeSet<RouteEdgeId> {
+    pub const fn route_edge_ids(&self) -> &BTreeSet<RouteEdgeId> {
         &self.route_edge_ids
     }
 
-    pub(crate) const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
+    pub const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
         &self.expected_fragment_instances
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterChannelDeployment {
+pub struct RuntimeFilterChannelDeployment {
     channel_id: ChannelId,
     logical_domain: RuntimeFilterLogicalDomain,
     lifecycle: RuntimeFilterLifecycle,
@@ -320,7 +320,7 @@ pub(crate) struct RuntimeFilterChannelDeployment {
 
 impl RuntimeFilterChannelDeployment {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         channel_id: ChannelId,
         logical_domain: RuntimeFilterLogicalDomain,
         lifecycle: RuntimeFilterLifecycle,
@@ -353,7 +353,7 @@ impl RuntimeFilterChannelDeployment {
         }
     }
 
-    pub(crate) fn with_outbound_materialization_groups(
+    pub fn with_outbound_materialization_groups(
         mut self,
         groups: BTreeMap<ConsumerProfileId, OutboundMaterializationGroup>,
     ) -> Self {
@@ -361,46 +361,46 @@ impl RuntimeFilterChannelDeployment {
         self
     }
 
-    pub(crate) const fn channel_id(&self) -> ChannelId {
+    pub const fn channel_id(&self) -> ChannelId {
         self.channel_id
     }
-    pub(crate) const fn logical_domain(&self) -> &RuntimeFilterLogicalDomain {
+    pub const fn logical_domain(&self) -> &RuntimeFilterLogicalDomain {
         &self.logical_domain
     }
-    pub(crate) const fn lifecycle(&self) -> RuntimeFilterLifecycle {
+    pub const fn lifecycle(&self) -> RuntimeFilterLifecycle {
         self.lifecycle
     }
-    pub(crate) const fn availability_coverage(&self) -> &Coverage {
+    pub const fn availability_coverage(&self) -> &Coverage {
         &self.availability_coverage
     }
-    pub(crate) const fn terminal_coverage(&self) -> &Coverage {
+    pub const fn terminal_coverage(&self) -> &Coverage {
         &self.terminal_coverage
     }
-    pub(crate) const fn reduction_requirement(&self) -> ReductionRequirement {
+    pub const fn reduction_requirement(&self) -> ReductionRequirement {
         self.reduction_requirement
     }
-    pub(crate) const fn allowed_contribution_kinds(&self) -> &BTreeSet<ContributionKind> {
+    pub const fn allowed_contribution_kinds(&self) -> &BTreeSet<ContributionKind> {
         &self.allowed_contribution_kinds
     }
-    pub(crate) const fn completion_requirement(&self) -> CompletionRequirement {
+    pub const fn completion_requirement(&self) -> CompletionRequirement {
         self.completion_requirement
     }
-    pub(crate) const fn policy(&self) -> RuntimeFilterPolicyRequirement {
+    pub const fn policy(&self) -> RuntimeFilterPolicyRequirement {
         self.policy
     }
-    pub(crate) const fn core_budget(&self) -> RuntimeFilterCoreBudget {
+    pub const fn core_budget(&self) -> RuntimeFilterCoreBudget {
         self.core_budget
     }
-    pub(crate) const fn materialization_policy(&self) -> MaterializationPolicy {
+    pub const fn materialization_policy(&self) -> MaterializationPolicy {
         self.materialization_policy
     }
-    pub(crate) const fn producers(&self) -> &BTreeMap<BindingId, ProducerDeployment> {
+    pub const fn producers(&self) -> &BTreeMap<BindingId, ProducerDeployment> {
         &self.producers
     }
-    pub(crate) const fn consumers(&self) -> &BTreeMap<BindingId, ConsumerDeployment> {
+    pub const fn consumers(&self) -> &BTreeMap<BindingId, ConsumerDeployment> {
         &self.consumers
     }
-    pub(crate) const fn outbound_materialization_groups(
+    pub const fn outbound_materialization_groups(
         &self,
     ) -> &BTreeMap<ConsumerProfileId, OutboundMaterializationGroup> {
         &self.outbound_materialization_groups
@@ -408,14 +408,14 @@ impl RuntimeFilterChannelDeployment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterInstallView {
+pub struct RuntimeFilterInstallView {
     epoch: DeploymentEpoch,
     local_participant_id: RuntimeFilterParticipantId,
     channels: BTreeMap<ChannelId, RuntimeFilterChannelDeployment>,
 }
 
 impl RuntimeFilterInstallView {
-    pub(crate) fn new(
+    pub fn new(
         epoch: DeploymentEpoch,
         local_participant_id: RuntimeFilterParticipantId,
         channels: BTreeMap<ChannelId, RuntimeFilterChannelDeployment>,
@@ -427,28 +427,28 @@ impl RuntimeFilterInstallView {
         }
     }
 
-    pub(crate) const fn epoch(&self) -> DeploymentEpoch {
+    pub const fn epoch(&self) -> DeploymentEpoch {
         self.epoch
     }
-    pub(crate) const fn local_participant_id(&self) -> RuntimeFilterParticipantId {
+    pub const fn local_participant_id(&self) -> RuntimeFilterParticipantId {
         self.local_participant_id
     }
-    pub(crate) const fn channels(&self) -> &BTreeMap<ChannelId, RuntimeFilterChannelDeployment> {
+    pub const fn channels(&self) -> &BTreeMap<ChannelId, RuntimeFilterChannelDeployment> {
         &self.channels
     }
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterParticipantInstall {
+pub struct RuntimeFilterParticipantInstall {
     core_view: RuntimeFilterInstallView,
     routing_shard: RuntimeFilterRoutingShard,
 }
 
 impl RuntimeFilterParticipantInstall {
-    pub(crate) fn new(
+    pub fn new(
         core_view: RuntimeFilterInstallView,
         routing_shard: RuntimeFilterRoutingShard,
     ) -> Self {
@@ -458,34 +458,34 @@ impl RuntimeFilterParticipantInstall {
         }
     }
 
-    pub(crate) const fn epoch(&self) -> DeploymentEpoch {
+    pub const fn epoch(&self) -> DeploymentEpoch {
         self.core_view.epoch()
     }
 
-    pub(crate) const fn local_participant_id(&self) -> RuntimeFilterParticipantId {
+    pub const fn local_participant_id(&self) -> RuntimeFilterParticipantId {
         self.core_view.local_participant_id()
     }
 
-    pub(crate) const fn core_view(&self) -> &RuntimeFilterInstallView {
+    pub const fn core_view(&self) -> &RuntimeFilterInstallView {
         &self.core_view
     }
 
-    pub(crate) const fn routing_shard(&self) -> &RuntimeFilterRoutingShard {
+    pub const fn routing_shard(&self) -> &RuntimeFilterRoutingShard {
         &self.routing_shard
     }
 
-    pub(crate) fn into_parts(self) -> (RuntimeFilterInstallView, RuntimeFilterRoutingShard) {
+    pub fn into_parts(self) -> (RuntimeFilterInstallView, RuntimeFilterRoutingShard) {
         (self.core_view, self.routing_shard)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 /// Builds a local-only composite for Service unit tests.
 ///
 /// This helper maps every expected producer instance to the view's local participant.
 /// It must not be used for aggregator or compiler-conformance tests, which require the
 /// compiler-produced remote-aware routing shard.
-pub(crate) fn local_participant_install_for_test(
+pub fn local_participant_install_for_test(
     core_view: RuntimeFilterInstallView,
 ) -> RuntimeFilterParticipantInstall {
     let participant = core_view.local_participant_id();

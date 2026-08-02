@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod execution_final_domain;
-pub(crate) mod execution_predicate;
-pub(crate) mod membership_delta;
-pub(crate) mod membership_predicate;
-pub(crate) mod ordered_range_predicate;
+pub mod execution_final_domain;
+pub mod execution_predicate;
+pub mod membership_delta;
+pub mod membership_predicate;
+pub mod ordered_range_predicate;

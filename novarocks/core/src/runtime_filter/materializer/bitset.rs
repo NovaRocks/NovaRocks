@@ -19,10 +19,10 @@ use arrow::datatypes::DataType;
 
 use crate::runtime_filter::port::value_domain::{IntegralProjectionError, MembershipValues};
 
-pub(crate) const BITSET_METADATA_BYTES: usize = 1 + 8 + 8 + 8;
+pub const BITSET_METADATA_BYTES: usize = 1 + 8 + 8 + 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BitsetPlan {
+pub struct BitsetPlan {
     type_tag: u8,
     min: i64,
     max: i64,
@@ -31,7 +31,7 @@ pub(crate) struct BitsetPlan {
 }
 
 impl BitsetPlan {
-    pub(crate) fn new(values: &MembershipValues) -> Result<Self, BitsetError> {
+    pub fn new(values: &MembershipValues) -> Result<Self, BitsetError> {
         if values.is_empty() {
             return Err(BitsetError::EmptyDomain);
         }
@@ -72,22 +72,22 @@ impl BitsetPlan {
         })
     }
 
-    pub(crate) const fn type_tag(self) -> u8 {
+    pub const fn type_tag(self) -> u8 {
         self.type_tag
     }
-    pub(crate) const fn min(self) -> i64 {
+    pub const fn min(self) -> i64 {
         self.min
     }
-    pub(crate) const fn max(self) -> i64 {
+    pub const fn max(self) -> i64 {
         self.max
     }
-    pub(crate) const fn bit_count(self) -> u64 {
+    pub const fn bit_count(self) -> u64 {
         self.bit_count
     }
-    pub(crate) const fn byte_count(self) -> usize {
+    pub const fn byte_count(self) -> usize {
         self.byte_count
     }
-    pub(crate) fn payload_len(self) -> Result<usize, BitsetError> {
+    pub fn payload_len(self) -> Result<usize, BitsetError> {
         BITSET_METADATA_BYTES
             .checked_add(self.byte_count)
             .ok_or(BitsetError::SizeOverflow)
@@ -95,7 +95,7 @@ impl BitsetPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BitsetError {
+pub enum BitsetError {
     UnsupportedType,
     ValueOutOfRange,
     EmptyDomain,
@@ -112,10 +112,7 @@ impl From<IntegralProjectionError> for BitsetError {
     }
 }
 
-pub(crate) fn build_bits(
-    values: &MembershipValues,
-    plan: BitsetPlan,
-) -> Result<Vec<u8>, BitsetError> {
+pub fn build_bits(values: &MembershipValues, plan: BitsetPlan) -> Result<Vec<u8>, BitsetError> {
     let mut bits = vec![0u8; plan.byte_count()];
     let mut error = None;
     values
@@ -139,7 +136,7 @@ pub(crate) fn build_bits(
     Ok(bits)
 }
 
-pub(crate) fn contains(plan: BitsetPlan, bits: &[u8], value: i64) -> bool {
+pub fn contains(plan: BitsetPlan, bits: &[u8], value: i64) -> bool {
     let offset = i128::from(value) - i128::from(plan.min());
     let Ok(offset) = u64::try_from(offset) else {
         return false;

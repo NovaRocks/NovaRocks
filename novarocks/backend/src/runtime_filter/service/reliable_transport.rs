@@ -58,22 +58,22 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::runtime_filter::codec::artifact::EncodedArtifactFrame;
-use crate::runtime_filter::port::events::{
-    RuntimeFilterEvent, RuntimeFilterEventSink, TransportEventKind, TransportFailOpenReason,
-    TransportRouteEventIdentity,
-};
-use crate::runtime_filter::port::identity::{ProducerSequence, RouteEdgeId};
-use crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute;
-use crate::runtime_filter::port::support::RuntimeFilterClock;
-use crate::runtime_filter::port::transport::{
-    DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
-    RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
-};
+use crate::native::runtime_filter_sender::GrpcRuntimeFilterEnvelopeSink;
 use crate::runtime_filter::router::remote::{
     RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
 };
-use crate::service::grpc_runtime_filter_sender::GrpcRuntimeFilterEnvelopeSink;
+use novarocks::runtime_filter_transition::codec::artifact::EncodedArtifactFrame;
+use novarocks::runtime_filter_transition::port::events::{
+    RuntimeFilterEvent, RuntimeFilterEventSink, TransportEventKind, TransportFailOpenReason,
+    TransportRouteEventIdentity,
+};
+use novarocks::runtime_filter_transition::port::identity::{ProducerSequence, RouteEdgeId};
+use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRemoteRoute;
+use novarocks::runtime_filter_transition::port::support::RuntimeFilterClock;
+use novarocks::runtime_filter_transition::port::transport::{
+    DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
+    RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
+};
 
 use super::{
     CloseRole, FinalizerCompletion, LifecycleBarrier, LifecyclePermit, finish_finalizer_panic,
@@ -182,14 +182,14 @@ enum PendingKey {
         sequence: ProducerSequence,
     },
     Contribution {
-        binding_id: crate::runtime_filter::model::contract::BindingId,
-        fragment_instance_id: crate::common::types::UniqueId,
-        partition_id: crate::runtime_filter::port::identity::PartitionId,
+        binding_id: novarocks::runtime_filter_transition::model::contract::BindingId,
+        fragment_instance_id: novarocks_types::UniqueId,
+        partition_id: novarocks::runtime_filter_transition::port::identity::PartitionId,
         sequence: ProducerSequence,
     },
     ProducerInstance {
-        binding_id: crate::runtime_filter::model::contract::BindingId,
-        fragment_instance_id: crate::common::types::UniqueId,
+        binding_id: novarocks::runtime_filter_transition::model::contract::BindingId,
+        fragment_instance_id: novarocks_types::UniqueId,
     },
 }
 
@@ -219,7 +219,7 @@ impl PendingKey {
     }
 
     fn into_route_identity(self) -> RuntimeFilterRouteIdentity {
-        use crate::runtime_filter::port::transport::{
+        use novarocks::runtime_filter_transition::port::transport::{
             ContributionRouteIdentity, ProducerInstanceRouteIdentity,
         };
         match self {
@@ -534,7 +534,7 @@ fn pending_key_fingerprint(key: PendingKey) -> [u8; 32] {
 }
 
 fn route_fingerprint(route: &RuntimeFilterRemoteRoute) -> [u8; 32] {
-    use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
+    use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRouteRole;
 
     let mut digest = Sha256::new();
     digest.update(route.route_edge_id().get().to_le_bytes());
@@ -1360,27 +1360,29 @@ mod tests {
         EnvelopeAckOutcome, ReliableEnvelopeTransport, ReliableSendOutcome,
         ReliableTransportPolicy, TransportResourceLimit,
     };
-    use crate::common::types::UniqueId;
-    use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime_filter::codec::artifact::EncodedArtifactFrame;
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-    use crate::runtime_filter::port::events::{
+    use crate::runtime_filter::router::remote::{
+        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome, SinkTransportError,
+    };
+    use novarocks::runtime::endpoint::RuntimeEndpoint;
+    use novarocks::runtime_filter_transition::codec::artifact::EncodedArtifactFrame;
+    use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+    use novarocks::runtime_filter_transition::port::events::{
         RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink, TransportEventKind,
         TransportFailOpenReason, TransportRouteEventIdentity,
     };
-    use crate::runtime_filter::port::identity::{
+    use novarocks::runtime_filter_transition::port::identity::{
         DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
     };
-    use crate::runtime_filter::port::routing::{RuntimeFilterRemoteRoute, RuntimeFilterRouteRole};
-    use crate::runtime_filter::port::support::RuntimeFilterClock;
-    use crate::runtime_filter::port::transport::{
+    use novarocks::runtime_filter_transition::port::routing::{
+        RuntimeFilterRemoteRoute, RuntimeFilterRouteRole,
+    };
+    use novarocks::runtime_filter_transition::port::support::RuntimeFilterClock;
+    use novarocks::runtime_filter_transition::port::transport::{
         ContributionRouteIdentity, ProducerInstanceRouteIdentity, ProducerOpenMetadata,
         RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
         RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
     };
-    use crate::runtime_filter::router::remote::{
-        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome, SinkTransportError,
-    };
+    use novarocks_types::UniqueId;
 
     /// A no-op lifecycle sink for the Task-2/Task-4 mechanics tests, which assert buffer /
     /// retry / ack / deadline behavior and do not observe events.

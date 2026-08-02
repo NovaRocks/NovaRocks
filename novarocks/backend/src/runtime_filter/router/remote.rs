@@ -34,8 +34,8 @@
 //! receives was already vetted by the Router's `route_delivery`, so the sink only
 //! transmits to the route's peer participant/endpoint.
 
-use crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute;
-use crate::runtime_filter::port::transport::{
+use novarocks::runtime_filter_transition::port::routing::RuntimeFilterRemoteRoute;
+use novarocks::runtime_filter_transition::port::transport::{
     RuntimeFilterAcceptStatus, RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
 };
 

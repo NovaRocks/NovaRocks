@@ -28,7 +28,7 @@ use crate::runtime_filter::port::identity::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum RuntimeFilterEnvelopeKind {
+pub enum RuntimeFilterEnvelopeKind {
     Contribution,
     Artifact,
     ProducerClosed,
@@ -56,7 +56,7 @@ impl RuntimeFilterEnvelopeKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterTransportError {
+pub struct RuntimeFilterTransportError {
     kind: RuntimeFilterTransportErrorKind,
 }
 
@@ -194,7 +194,7 @@ impl fmt::Display for RuntimeFilterTransportError {
 impl Error for RuntimeFilterTransportError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ContributionRouteIdentity {
+pub struct ContributionRouteIdentity {
     producer_binding_id: BindingId,
     fragment_instance_id: UniqueId,
     partition_id: PartitionId,
@@ -202,7 +202,7 @@ pub(crate) struct ContributionRouteIdentity {
 }
 
 impl ContributionRouteIdentity {
-    pub(crate) fn try_new(
+    pub fn try_new(
         producer_binding_id: BindingId,
         fragment_instance_id: UniqueId,
         partition_id: PartitionId,
@@ -226,37 +226,37 @@ impl ContributionRouteIdentity {
         })
     }
 
-    pub(crate) const fn producer_binding_id(&self) -> BindingId {
+    pub const fn producer_binding_id(&self) -> BindingId {
         self.producer_binding_id
     }
 
-    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
+    pub const fn fragment_instance_id(&self) -> UniqueId {
         self.fragment_instance_id
     }
 
-    pub(crate) const fn partition_id(&self) -> PartitionId {
+    pub const fn partition_id(&self) -> PartitionId {
         self.partition_id
     }
 
-    pub(crate) const fn sequence(&self) -> ProducerSequence {
+    pub const fn sequence(&self) -> ProducerSequence {
         self.sequence
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DeliveryRouteIdentity {
+pub struct DeliveryRouteIdentity {
     route_edge_id: RouteEdgeId,
     sequence: ProducerSequence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerInstanceRouteIdentity {
+pub struct ProducerInstanceRouteIdentity {
     producer_binding_id: BindingId,
     fragment_instance_id: UniqueId,
 }
 
 impl ProducerInstanceRouteIdentity {
-    pub(crate) fn try_new(
+    pub fn try_new(
         producer_binding_id: BindingId,
         fragment_instance_id: UniqueId,
     ) -> Result<Self, RuntimeFilterTransportError> {
@@ -276,17 +276,17 @@ impl ProducerInstanceRouteIdentity {
         })
     }
 
-    pub(crate) const fn producer_binding_id(&self) -> BindingId {
+    pub const fn producer_binding_id(&self) -> BindingId {
         self.producer_binding_id
     }
 
-    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
+    pub const fn fragment_instance_id(&self) -> UniqueId {
         self.fragment_instance_id
     }
 }
 
 impl DeliveryRouteIdentity {
-    pub(crate) fn try_new(
+    pub fn try_new(
         route_edge_id: RouteEdgeId,
         sequence: ProducerSequence,
     ) -> Result<Self, RuntimeFilterTransportError> {
@@ -304,17 +304,17 @@ impl DeliveryRouteIdentity {
         })
     }
 
-    pub(crate) const fn route_edge_id(&self) -> RouteEdgeId {
+    pub const fn route_edge_id(&self) -> RouteEdgeId {
         self.route_edge_id
     }
 
-    pub(crate) const fn sequence(&self) -> ProducerSequence {
+    pub const fn sequence(&self) -> ProducerSequence {
         self.sequence
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterRouteIdentity {
+pub struct RuntimeFilterRouteIdentity {
     kind: RuntimeFilterRouteIdentityKind,
 }
 
@@ -326,25 +326,25 @@ enum RuntimeFilterRouteIdentityKind {
 }
 
 impl RuntimeFilterRouteIdentity {
-    pub(crate) const fn contribution(identity: ContributionRouteIdentity) -> Self {
+    pub const fn contribution(identity: ContributionRouteIdentity) -> Self {
         Self {
             kind: RuntimeFilterRouteIdentityKind::Contribution(identity),
         }
     }
 
-    pub(crate) const fn delivery(identity: DeliveryRouteIdentity) -> Self {
+    pub const fn delivery(identity: DeliveryRouteIdentity) -> Self {
         Self {
             kind: RuntimeFilterRouteIdentityKind::Delivery(identity),
         }
     }
 
-    pub(crate) const fn producer_instance(identity: ProducerInstanceRouteIdentity) -> Self {
+    pub const fn producer_instance(identity: ProducerInstanceRouteIdentity) -> Self {
         Self {
             kind: RuntimeFilterRouteIdentityKind::ProducerInstance(identity),
         }
     }
 
-    pub(crate) const fn as_contribution(&self) -> Option<&ContributionRouteIdentity> {
+    pub const fn as_contribution(&self) -> Option<&ContributionRouteIdentity> {
         match &self.kind {
             RuntimeFilterRouteIdentityKind::Contribution(identity) => Some(identity),
             RuntimeFilterRouteIdentityKind::Delivery(_)
@@ -352,7 +352,7 @@ impl RuntimeFilterRouteIdentity {
         }
     }
 
-    pub(crate) const fn as_delivery(&self) -> Option<&DeliveryRouteIdentity> {
+    pub const fn as_delivery(&self) -> Option<&DeliveryRouteIdentity> {
         match &self.kind {
             RuntimeFilterRouteIdentityKind::Delivery(identity) => Some(identity),
             RuntimeFilterRouteIdentityKind::Contribution(_)
@@ -360,7 +360,7 @@ impl RuntimeFilterRouteIdentity {
         }
     }
 
-    pub(crate) const fn as_producer_instance(&self) -> Option<&ProducerInstanceRouteIdentity> {
+    pub const fn as_producer_instance(&self) -> Option<&ProducerInstanceRouteIdentity> {
         match &self.kind {
             RuntimeFilterRouteIdentityKind::ProducerInstance(identity) => Some(identity),
             RuntimeFilterRouteIdentityKind::Contribution(_)
@@ -370,12 +370,12 @@ impl RuntimeFilterRouteIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerOpenMetadata {
+pub struct ProducerOpenMetadata {
     local_partition_count: NonZeroU32,
 }
 
 impl ProducerOpenMetadata {
-    pub(crate) fn try_new(local_partition_count: u32) -> Result<Self, RuntimeFilterTransportError> {
+    pub fn try_new(local_partition_count: u32) -> Result<Self, RuntimeFilterTransportError> {
         let local_partition_count = NonZeroU32::new(local_partition_count)
             .ok_or_else(RuntimeFilterTransportError::zero_local_partition_count)?;
         Ok(Self {
@@ -383,7 +383,7 @@ impl ProducerOpenMetadata {
         })
     }
 
-    pub(crate) fn try_from_raw_for_kind(
+    pub fn try_from_raw_for_kind(
         kind: RuntimeFilterEnvelopeKind,
         local_partition_count: Option<u32>,
     ) -> Result<Option<Self>, RuntimeFilterTransportError> {
@@ -391,7 +391,7 @@ impl ProducerOpenMetadata {
         local_partition_count.map(Self::try_new).transpose()
     }
 
-    pub(crate) const fn local_partition_count(self) -> NonZeroU32 {
+    pub const fn local_partition_count(self) -> NonZeroU32 {
         self.local_partition_count
     }
 }
@@ -423,7 +423,7 @@ fn validate_accept_status_presence(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterEnvelope {
+pub struct RuntimeFilterEnvelope {
     kind: RuntimeFilterEnvelopeKind,
     query_id: UniqueId,
     channel_id: ChannelId,
@@ -438,7 +438,7 @@ pub(crate) struct RuntimeFilterEnvelope {
 }
 
 impl RuntimeFilterEnvelope {
-    pub(crate) fn try_new(
+    pub fn try_new(
         kind: RuntimeFilterEnvelopeKind,
         query_id: UniqueId,
         channel_id: ChannelId,
@@ -515,42 +515,42 @@ impl RuntimeFilterEnvelope {
         })
     }
 
-    pub(crate) const fn kind(&self) -> RuntimeFilterEnvelopeKind {
+    pub const fn kind(&self) -> RuntimeFilterEnvelopeKind {
         self.kind
     }
 
-    pub(crate) const fn query_id(&self) -> UniqueId {
+    pub const fn query_id(&self) -> UniqueId {
         self.query_id
     }
 
-    pub(crate) const fn channel_id(&self) -> ChannelId {
+    pub const fn channel_id(&self) -> ChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn deployment_epoch(&self) -> DeploymentEpoch {
+    pub const fn deployment_epoch(&self) -> DeploymentEpoch {
         self.deployment_epoch
     }
 
-    pub(crate) const fn route_identity(&self) -> &RuntimeFilterRouteIdentity {
+    pub const fn route_identity(&self) -> &RuntimeFilterRouteIdentity {
         &self.route_identity
     }
 
-    pub(crate) const fn producer_open(&self) -> Option<ProducerOpenMetadata> {
+    pub const fn producer_open(&self) -> Option<ProducerOpenMetadata> {
         self.producer_open
     }
 
     /// The accept status acknowledged by an `Ack` envelope. `None` for every
     /// other kind. The identity being acknowledged is `route_identity`, not a
     /// separate field.
-    pub(crate) const fn accept_status(&self) -> Option<RuntimeFilterAcceptStatus> {
+    pub const fn accept_status(&self) -> Option<RuntimeFilterAcceptStatus> {
         self.accept_status
     }
 
-    pub(crate) const fn schema_digest(&self) -> &[u8; 32] {
+    pub const fn schema_digest(&self) -> &[u8; 32] {
         &self.schema_digest
     }
 
-    pub(crate) fn payload(&self) -> &[u8] {
+    pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 
@@ -558,7 +558,7 @@ impl RuntimeFilterEnvelope {
     /// variable heap component uses `Vec::capacity`, not its logical wire length.
     /// Arc/control-block and transport-entry fixed overhead are bounded separately by
     /// the reliable transport's pending-entry ceiling.
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(self.payload.capacity())
     }
 }
@@ -568,13 +568,13 @@ impl RuntimeFilterEnvelope {
 /// The reliable transport owns the envelope identity and retry lifetime. The sink
 /// receives this immutable value and is responsible only for wire transmission.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterTransportEnvelope {
+pub struct RuntimeFilterTransportEnvelope {
     envelope: Arc<RuntimeFilterEnvelope>,
     rpc_deadline: Duration,
 }
 
 impl RuntimeFilterTransportEnvelope {
-    pub(crate) fn new(envelope: Arc<RuntimeFilterEnvelope>, rpc_deadline: Duration) -> Self {
+    pub fn new(envelope: Arc<RuntimeFilterEnvelope>, rpc_deadline: Duration) -> Self {
         assert!(
             !rpc_deadline.is_zero(),
             "runtime filter envelope RPC deadline must be nonzero"
@@ -585,48 +585,48 @@ impl RuntimeFilterTransportEnvelope {
         }
     }
 
-    pub(crate) fn envelope(&self) -> &RuntimeFilterEnvelope {
+    pub fn envelope(&self) -> &RuntimeFilterEnvelope {
         self.envelope.as_ref()
     }
 
-    pub(crate) const fn envelope_arc(&self) -> &Arc<RuntimeFilterEnvelope> {
+    pub const fn envelope_arc(&self) -> &Arc<RuntimeFilterEnvelope> {
         &self.envelope
     }
 
-    pub(crate) fn into_parts(self) -> (Arc<RuntimeFilterEnvelope>, Duration) {
+    pub fn into_parts(self) -> (Arc<RuntimeFilterEnvelope>, Duration) {
         (self.envelope, self.rpc_deadline)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterAcceptStatus {
+pub enum RuntimeFilterAcceptStatus {
     Accepted,
     Duplicate,
     Rejected,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterIngressResult {
+pub struct RuntimeFilterIngressResult {
     accept_status: RuntimeFilterAcceptStatus,
     rejection_reason: Option<String>,
 }
 
 impl RuntimeFilterIngressResult {
-    pub(crate) const fn accepted() -> Self {
+    pub const fn accepted() -> Self {
         Self {
             accept_status: RuntimeFilterAcceptStatus::Accepted,
             rejection_reason: None,
         }
     }
 
-    pub(crate) const fn duplicate() -> Self {
+    pub const fn duplicate() -> Self {
         Self {
             accept_status: RuntimeFilterAcceptStatus::Duplicate,
             rejection_reason: None,
         }
     }
 
-    pub(crate) fn rejected(reason: impl Into<String>) -> Result<Self, RuntimeFilterTransportError> {
+    pub fn rejected(reason: impl Into<String>) -> Result<Self, RuntimeFilterTransportError> {
         let reason = reason.into();
         if reason.is_empty() {
             return Err(RuntimeFilterTransportError::empty_rejection_reason());
@@ -637,16 +637,16 @@ impl RuntimeFilterIngressResult {
         })
     }
 
-    pub(crate) const fn accept_status(&self) -> RuntimeFilterAcceptStatus {
+    pub const fn accept_status(&self) -> RuntimeFilterAcceptStatus {
         self.accept_status
     }
 
-    pub(crate) fn rejection_reason(&self) -> Option<&str> {
+    pub fn rejection_reason(&self) -> Option<&str> {
         self.rejection_reason.as_deref()
     }
 }
 
-pub(crate) trait RuntimeFilterEnvelopeIngress: Send + Sync + 'static {
+pub trait RuntimeFilterEnvelopeIngress: Send + Sync + 'static {
     fn accept(&self, envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult;
 }
 

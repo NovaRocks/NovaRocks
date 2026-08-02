@@ -231,20 +231,11 @@ fn pre_ready_launch_error(error: FragmentExecutionError) -> FragmentLaunchError 
 fn prepare_native_query_before_fragment_registration(
     mgr: &QueryContextManager,
     query_id: QueryId,
-    finst_id: UniqueId,
     query_opts: &QueryOptions,
-    has_runtime_filter_bindings: bool,
+    runtime_filter: Option<RuntimeFilterSessionRef>,
 ) -> Result<Option<RuntimeFilterSessionRef>, String> {
     let (delivery_expire, query_expire) = query_expire_durations(Some(query_opts));
     mgr.ensure_native_context(query_id, false, delivery_expire, query_expire)?;
-    let runtime_filter = if has_runtime_filter_bindings {
-        Some(
-            Arc::new(mgr.runtime_filter_context_for_native_execution(query_id, finst_id)?)
-                as RuntimeFilterSessionRef,
-        )
-    } else {
-        None
-    };
     let cache_options = CacheOptions::from_query_options(Some(query_opts))?;
     mgr.set_cache_options(query_id, cache_options)?;
     Ok(runtime_filter)
@@ -263,12 +254,17 @@ pub(crate) fn submit_exec_plan_fragment_native_with_manager(
     let finst_id = instance.fragment_instance_id().get();
     let query_opts = instance.runtime_options().query_options().clone();
     let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts));
+    if submission.program().runtime_filters().has_bindings() {
+        return Err(
+            "native fragment runtime-filter bindings require a Backend-injected execution session"
+                .to_string(),
+        );
+    }
     let runtime_filter = prepare_native_query_before_fragment_registration(
         mgr.as_ref(),
         query_id,
-        finst_id,
         &query_opts,
-        submission.program().runtime_filters().has_bindings(),
+        None,
     )?;
 
     let query_mem_tracker = mgr
@@ -449,20 +445,14 @@ mod tests {
     fn conflicting_cache_preflight_after_strict_rf_context_does_not_register_fragment() {
         let manager = QueryContextManager::new_for_test();
         let query_id = QueryId::new(74_201, 74_202);
-        let finst_id = UniqueId::new(70, 40);
-        let lifecycle = RuntimeFilterQueryLifecycleOptions {
-            delivery_expire: Duration::from_secs(1),
-            query_expire: Duration::from_secs(5),
-            transport_retry_interval: Duration::from_millis(200),
-            transport_max_attempts: 3,
-            transport_deadline: Duration::from_secs(5),
-            transport_max_pending_entries: 128,
-            transport_max_pending_bytes: 1024 * 1024,
-        };
-        let install = crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install();
         manager
-            .install_runtime_filter_deployment(query_id, lifecycle, install.clone())
-            .expect("install query-owned runtime-filter Service");
+            .ensure_native_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("create native query context");
         manager
             .set_cache_options(
                 query_id,
@@ -481,9 +471,8 @@ mod tests {
         let error = match prepare_native_query_before_fragment_registration(
             manager.as_ref(),
             query_id,
-            finst_id,
             &conflicting_query_options,
-            true,
+            Some(crate::runtime_filter::test_support::fail_open_session()),
         ) {
             Ok(_) => panic!("cache conflict must fail after strict Service acquisition"),
             Err(error) => error,
@@ -491,12 +480,6 @@ mod tests {
 
         assert!(error.contains("cache options mismatch"), "{error}");
         assert_eq!(manager.fragment_counts_for_test(query_id), Some((0, 0)));
-        manager
-            .abort_runtime_filter_deployment(query_id, install.epoch())
-            .expect("zero-fragment deployment remains cleanup-eligible");
-        assert!(
-            manager.with_context_mut(query_id, |_| Ok(())).is_err(),
-            "zero registered fragments must not pin the query context"
-        );
+        manager.cancel_query(query_id, "test cleanup".to_string());
     }
 }

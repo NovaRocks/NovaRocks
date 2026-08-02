@@ -26,9 +26,9 @@ pub(crate) mod expr_display;
 use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
+pub use crate::sql::common::LiteralValue;
 pub(crate) use crate::sql::common::{
-    BinOp, JoinKind, LambdaParam, LiteralValue, OutputColumn, UnOp, WindowBound, WindowFrame,
-    WindowFrameType,
+    BinOp, JoinKind, LambdaParam, OutputColumn, UnOp, WindowBound, WindowFrame, WindowFrameType,
 };
 use crate::sql::planner::table::TableDef;
 
@@ -280,14 +280,14 @@ pub(crate) struct ResolvedValues {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub(crate) struct TypedExpr {
+pub struct TypedExpr {
     pub kind: ExprKind,
     pub data_type: DataType,
     pub nullable: bool,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ExprKind {
+pub enum ExprKind {
     /// Resolved column reference.
     ColumnRef {
         column_id: ColumnId,

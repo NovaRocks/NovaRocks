@@ -18,7 +18,7 @@
 use std::error::Error;
 use std::fmt;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 use std::cell::Cell;
 
 use arrow::datatypes::{DataType, TimeUnit};
@@ -96,7 +96,7 @@ fn decode_frame_header(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterContribution {
+pub enum RuntimeFilterContribution {
     Membership(ValueDomainDelta),
     OrderedBound(OrderedBoundUpdate),
     TopKSummary(TopKSummary),
@@ -104,7 +104,7 @@ pub(crate) enum RuntimeFilterContribution {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum ContributionCodecExpectation<'a> {
+pub enum ContributionCodecExpectation<'a> {
     Membership(&'a ArtifactMembershipSchema),
     OrderedBound(&'a RuntimeOrderContract),
     TopKSummary(&'a RuntimeTopKSummaryContract),
@@ -116,27 +116,27 @@ pub(crate) enum ContributionCodecExpectation<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EncodedContribution {
+pub struct EncodedContribution {
     schema_digest: [u8; 32],
     payload: Vec<u8>,
 }
 
 impl EncodedContribution {
-    pub(crate) const fn schema_digest(&self) -> &[u8; 32] {
+    pub const fn schema_digest(&self) -> &[u8; 32] {
         &self.schema_digest
     }
 
-    pub(crate) fn payload(&self) -> &[u8] {
+    pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 
-    pub(crate) fn into_parts(self) -> ([u8; 32], Vec<u8>) {
+    pub fn into_parts(self) -> ([u8; 32], Vec<u8>) {
         (self.schema_digest, self.payload)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContributionCodecError {
+pub enum ContributionCodecError {
     Malformed,
     Truncated,
     UnknownVersion,
@@ -165,7 +165,7 @@ impl From<ContributionSizeError> for ContributionCodecError {
     }
 }
 
-pub(crate) fn max_encoded_len_for_contribution_budget(
+pub fn max_encoded_len_for_contribution_budget(
     max_contribution_bytes: usize,
 ) -> Result<usize, ContributionCodecError> {
     HEADER_LEN
@@ -173,7 +173,7 @@ pub(crate) fn max_encoded_len_for_contribution_budget(
         .ok_or(ContributionCodecError::LengthOverflow)
 }
 
-pub(crate) fn semantic_contribution_bytes(
+pub fn semantic_contribution_bytes(
     contribution: &RuntimeFilterContribution,
 ) -> Result<usize, ContributionCodecError> {
     match contribution {
@@ -192,7 +192,7 @@ pub(crate) fn semantic_contribution_bytes(
     }
 }
 
-pub(crate) fn encoded_contribution_len(
+pub fn encoded_contribution_len(
     contribution: &RuntimeFilterContribution,
     expectation: ContributionCodecExpectation<'_>,
 ) -> Result<usize, ContributionCodecError> {
@@ -245,7 +245,7 @@ pub(crate) fn encoded_contribution_len(
 /// Validate only the typed contribution/installed-contract relationship. This does
 /// not walk or allocate the contribution body, so callers can preserve structural
 /// errors even after a producer becomes terminal without encoding a large payload.
-pub(crate) fn validate_contribution_contract(
+pub fn validate_contribution_contract(
     contribution: &RuntimeFilterContribution,
     expectation: ContributionCodecExpectation<'_>,
 ) -> Result<(), ContributionCodecError> {
@@ -283,12 +283,12 @@ pub(crate) fn validate_contribution_contract(
     }
 }
 
-pub(crate) fn encode_contribution(
+pub fn encode_contribution(
     contribution: &RuntimeFilterContribution,
     expectation: ContributionCodecExpectation<'_>,
     max_encoded_bytes: usize,
 ) -> Result<EncodedContribution, ContributionCodecError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
     if REJECT_CONTRIBUTION_ALLOCATION_FOR_TEST.with(Cell::get) {
         return encode_contribution_with_allocator(
             contribution,
@@ -305,7 +305,7 @@ pub(crate) fn encode_contribution(
     )
 }
 
-pub(crate) fn decode_contribution(
+pub fn decode_contribution(
     payload: &[u8],
     envelope_schema_digest: &[u8; 32],
     expectation: ContributionCodecExpectation<'_>,
@@ -376,7 +376,7 @@ trait ContributionFrameAllocator {
 
 struct SystemContributionFrameAllocator;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 struct AlwaysRejectContributionFrameAllocator;
 
 impl ContributionFrameAllocator for SystemContributionFrameAllocator {
@@ -389,22 +389,22 @@ impl ContributionFrameAllocator for SystemContributionFrameAllocator {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 impl ContributionFrameAllocator for AlwaysRejectContributionFrameAllocator {
     fn allocate(&self, _exact_len: usize) -> Result<Vec<u8>, ContributionCodecError> {
         Err(ContributionCodecError::ResourceLimit)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
 thread_local! {
     static REJECT_CONTRIBUTION_ALLOCATION_FOR_TEST: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run a real contribution encode through a deterministic rejecting allocator on this
 /// test thread. The thread-local scope keeps parallel adapter tests isolated.
-#[cfg(test)]
-pub(crate) fn with_rejecting_contribution_allocator_for_test<T>(run: impl FnOnce() -> T) -> T {
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
+pub fn with_rejecting_contribution_allocator_for_test<T>(run: impl FnOnce() -> T) -> T {
     struct Reset(bool);
 
     impl Drop for Reset {

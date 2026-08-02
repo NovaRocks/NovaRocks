@@ -61,7 +61,11 @@ impl NovaRocksGrpcRemoteClient {
         Self::new_host_port(addr.ip().to_string(), addr.port())
     }
 
-    pub(crate) fn new_runtime_endpoint(endpoint: &RuntimeEndpoint) -> Result<Self, String> {
+    /// Create a client for a neutral runtime endpoint.
+    ///
+    /// Backend-owned data-plane transports use this generic channel helper;
+    /// it does not create or look up query-scoped runtime-filter state.
+    pub fn new_runtime_endpoint(endpoint: &RuntimeEndpoint) -> Result<Self, String> {
         let port = u16::try_from(endpoint.port())
             .map_err(|_| format!("invalid runtime filter endpoint port {}", endpoint.port()))?;
         Self::new_host_port(endpoint.host().to_string(), port)
@@ -395,7 +399,9 @@ impl NovaRocksGrpcRemoteClient {
             .map_err(|e| format!("heartbeat rpc failed: {e}"))
     }
 
-    pub(crate) async fn transmit_runtime_filter_envelope_async(
+    /// Send an already-encoded runtime-filter envelope over the neutral gRPC
+    /// channel. Routing, retries, and service ownership belong to Backend.
+    pub async fn transmit_runtime_filter_envelope_async(
         &self,
         request: proto::filter::RuntimeFilterEnvelope,
         deadline: Duration,

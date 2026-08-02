@@ -28,14 +28,14 @@ use super::topk_summary::TopKSummary;
 use super::value_domain::ValueDomainDelta;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InstallOutcome {
+pub enum InstallOutcome {
     IgnoredEmpty,
     Installed,
     AlreadyInstalled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InstallContractErrorKind {
+pub enum InstallContractErrorKind {
     InvalidEpoch,
     DuplicateIdentity,
     UnsupportedChannelContract,
@@ -54,24 +54,24 @@ pub(crate) enum InstallContractErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InstallContractError {
+pub struct InstallContractError {
     kind: InstallContractErrorKind,
     detail: String,
 }
 
 impl InstallContractError {
-    pub(crate) fn new(kind: InstallContractErrorKind, detail: impl Into<String>) -> Self {
+    pub fn new(kind: InstallContractErrorKind, detail: impl Into<String>) -> Self {
         Self {
             kind,
             detail: detail.into(),
         }
     }
 
-    pub(crate) const fn kind(&self) -> InstallContractErrorKind {
+    pub const fn kind(&self) -> InstallContractErrorKind {
         self.kind
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
@@ -89,7 +89,7 @@ impl fmt::Display for InstallContractError {
 impl Error for InstallContractError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeContractViolationKind {
+pub enum RuntimeContractViolationKind {
     UnauthorizedBinding,
     UnauthorizedFragmentInstance,
     InvalidPartitionCount,
@@ -112,24 +112,24 @@ pub(crate) enum RuntimeContractViolationKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeContractViolation {
+pub struct RuntimeContractViolation {
     kind: RuntimeContractViolationKind,
     detail: String,
 }
 
 impl RuntimeContractViolation {
-    pub(crate) fn new(kind: RuntimeContractViolationKind, detail: impl Into<String>) -> Self {
+    pub fn new(kind: RuntimeContractViolationKind, detail: impl Into<String>) -> Self {
         Self {
             kind,
             detail: detail.into(),
         }
     }
 
-    pub(crate) const fn kind(&self) -> RuntimeContractViolationKind {
+    pub const fn kind(&self) -> RuntimeContractViolationKind {
         self.kind
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
@@ -147,14 +147,14 @@ impl fmt::Display for RuntimeContractViolation {
 impl Error for RuntimeContractViolation {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProducerFailureReason {
+pub enum ProducerFailureReason {
     Cancelled,
     ExecutionFailed,
     UpstreamUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SubmitOutcome {
+pub enum SubmitOutcome {
     Applied,
     Duplicate,
     Stale,
@@ -170,14 +170,14 @@ pub(crate) enum SubmitOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerOpenRequest {
+pub struct ProducerOpenRequest {
     binding_id: BindingId,
     fragment_instance_id: UniqueId,
     local_partition_count: u32,
 }
 
 impl ProducerOpenRequest {
-    pub(crate) const fn new(
+    pub const fn new(
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
         local_partition_count: u32,
@@ -189,20 +189,20 @@ impl ProducerOpenRequest {
         }
     }
 
-    pub(crate) const fn binding_id(self) -> BindingId {
+    pub const fn binding_id(self) -> BindingId {
         self.binding_id
     }
 
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 
-    pub(crate) const fn local_partition_count(self) -> u32 {
+    pub const fn local_partition_count(self) -> u32 {
         self.local_partition_count
     }
 }
 
-pub(crate) trait ProducerAdapter: Send + Sync {
+pub trait ProducerAdapter: Send + Sync {
     fn submit(
         &self,
         partition_id: PartitionId,
@@ -222,7 +222,7 @@ pub(crate) trait ProducerAdapter: Send + Sync {
     ) -> Result<SubmitOutcome, RuntimeContractViolation>;
 }
 
-pub(crate) trait OrderedBoundProducerAdapter: Send + Sync {
+pub trait OrderedBoundProducerAdapter: Send + Sync {
     fn submit_bound(
         &self,
         partition_id: PartitionId,
@@ -242,7 +242,7 @@ pub(crate) trait OrderedBoundProducerAdapter: Send + Sync {
     ) -> Result<SubmitOutcome, RuntimeContractViolation>;
 }
 
-pub(crate) trait TopKSummaryProducerAdapter: Send + Sync {
+pub trait TopKSummaryProducerAdapter: Send + Sync {
     fn submit_summary(
         &self,
         partition_id: PartitionId,
@@ -262,7 +262,7 @@ pub(crate) trait TopKSummaryProducerAdapter: Send + Sync {
     ) -> Result<SubmitOutcome, RuntimeContractViolation>;
 }
 
-pub(crate) trait FinalDomainProducerAdapter: Send + Sync {
+pub trait FinalDomainProducerAdapter: Send + Sync {
     /// Submit an authority-signed immutable shard. Raw value domains are sealed by
     /// the Service-owned completion session and cannot enter this transport port.
     fn complete(
@@ -285,14 +285,14 @@ pub(crate) trait FinalDomainProducerAdapter: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProducerPortKind {
+pub enum ProducerPortKind {
     Membership,
     OrderedBound,
     TopKSummary,
     FinalDomain,
 }
 
-pub(crate) enum ProducerHandle {
+pub enum ProducerHandle {
     Membership(Arc<dyn ProducerAdapter>),
     OrderedBound(Arc<dyn OrderedBoundProducerAdapter>),
     TopKSummary(Arc<dyn TopKSummaryProducerAdapter>),
@@ -309,7 +309,7 @@ impl fmt::Debug for ProducerHandle {
 }
 
 impl ProducerHandle {
-    pub(crate) const fn kind(&self) -> ProducerPortKind {
+    pub const fn kind(&self) -> ProducerPortKind {
         match self {
             Self::Membership(_) => ProducerPortKind::Membership,
             Self::OrderedBound(_) => ProducerPortKind::OrderedBound,
@@ -318,7 +318,7 @@ impl ProducerHandle {
         }
     }
 
-    pub(crate) fn downgrade(&self) -> ProducerHandleWeak {
+    pub fn downgrade(&self) -> ProducerHandleWeak {
         match self {
             Self::Membership(handle) => ProducerHandleWeak::Membership(Arc::downgrade(handle)),
             Self::OrderedBound(handle) => ProducerHandleWeak::OrderedBound(Arc::downgrade(handle)),
@@ -327,9 +327,7 @@ impl ProducerHandle {
         }
     }
 
-    pub(crate) fn into_membership(
-        self,
-    ) -> Result<Arc<dyn ProducerAdapter>, RuntimeContractViolation> {
+    pub fn into_membership(self) -> Result<Arc<dyn ProducerAdapter>, RuntimeContractViolation> {
         match self {
             Self::Membership(handle) => Ok(handle),
             Self::OrderedBound(_) => Err(RuntimeContractViolation::new(
@@ -347,7 +345,7 @@ impl ProducerHandle {
         }
     }
 
-    pub(crate) fn into_final_domain(
+    pub fn into_final_domain(
         self,
     ) -> Result<Arc<dyn FinalDomainProducerAdapter>, RuntimeContractViolation> {
         match self {
@@ -362,7 +360,7 @@ impl ProducerHandle {
     }
 }
 
-pub(crate) enum ProducerHandleWeak {
+pub enum ProducerHandleWeak {
     Membership(Weak<dyn ProducerAdapter>),
     OrderedBound(Weak<dyn OrderedBoundProducerAdapter>),
     TopKSummary(Weak<dyn TopKSummaryProducerAdapter>),
@@ -370,7 +368,7 @@ pub(crate) enum ProducerHandleWeak {
 }
 
 impl ProducerHandleWeak {
-    pub(crate) const fn kind(&self) -> ProducerPortKind {
+    pub const fn kind(&self) -> ProducerPortKind {
         match self {
             Self::Membership(_) => ProducerPortKind::Membership,
             Self::OrderedBound(_) => ProducerPortKind::OrderedBound,
@@ -379,7 +377,7 @@ impl ProducerHandleWeak {
         }
     }
 
-    pub(crate) fn upgrade(&self) -> Option<ProducerHandle> {
+    pub fn upgrade(&self) -> Option<ProducerHandle> {
         match self {
             Self::Membership(handle) => handle.upgrade().map(ProducerHandle::Membership),
             Self::OrderedBound(handle) => handle.upgrade().map(ProducerHandle::OrderedBound),

@@ -107,12 +107,12 @@ const fn unavailable_reason_from_tag(tag: u8) -> Option<UnavailableReason> {
 /// profile identity digest; the wire decode never derives contract facts from
 /// the payload.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ArtifactDecodeExpectation<'a> {
+pub struct ArtifactDecodeExpectation<'a> {
     profile: &'a ConsumerArtifactProfile,
 }
 
 impl<'a> ArtifactDecodeExpectation<'a> {
-    pub(crate) const fn new(profile: &'a ConsumerArtifactProfile) -> Self {
+    pub const fn new(profile: &'a ConsumerArtifactProfile) -> Self {
         Self { profile }
     }
 
@@ -124,29 +124,29 @@ impl<'a> ArtifactDecodeExpectation<'a> {
 /// A canonical artifact-delivery wire frame plus the consumer profile digest it
 /// commits to. Dual of `EncodedContribution`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EncodedArtifactFrame {
+pub struct EncodedArtifactFrame {
     profile_digest: [u8; 32],
     payload: Vec<u8>,
 }
 
 impl EncodedArtifactFrame {
-    pub(crate) const fn profile_digest(&self) -> &[u8; 32] {
+    pub const fn profile_digest(&self) -> &[u8; 32] {
         &self.profile_digest
     }
 
-    pub(crate) fn payload(&self) -> &[u8] {
+    pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 
-    pub(crate) fn into_parts(self) -> ([u8; 32], Vec<u8>) {
+    pub fn into_parts(self) -> ([u8; 32], Vec<u8>) {
         (self.profile_digest, self.payload)
     }
 
     /// Build an opaque frame directly from parts. Reserved for tests that exercise
     /// transport plumbing (buffering / retry / ack release), which treat the frame
     /// as already-serialized bytes and never decode it.
-    #[cfg(test)]
-    pub(crate) fn from_parts_for_test(profile_digest: [u8; 32], payload: Vec<u8>) -> Self {
+    #[cfg(any(test, feature = "runtime-filter-test-support"))]
+    pub fn from_parts_for_test(profile_digest: [u8; 32], payload: Vec<u8>) -> Self {
         Self {
             profile_digest,
             payload,
@@ -154,7 +154,7 @@ impl EncodedArtifactFrame {
     }
 }
 
-pub(crate) fn encode_completed_without_artifact(
+pub fn encode_completed_without_artifact(
     expectation: ArtifactDecodeExpectation<'_>,
 ) -> EncodedArtifactFrame {
     EncodedArtifactFrame {
@@ -164,7 +164,7 @@ pub(crate) fn encode_completed_without_artifact(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArtifactWireCodecError {
+pub enum ArtifactWireCodecError {
     Malformed,
     Truncated,
     UnknownVersion,
@@ -199,7 +199,7 @@ impl Error for ArtifactWireCodecError {}
 ///
 /// Converts a semantic bundle budget (the maximum canonical bundle size) into the
 /// corresponding maximum wire frame length by adding the fixed frame header.
-pub(crate) fn max_encoded_len_for_artifact_budget(
+pub fn max_encoded_len_for_artifact_budget(
     max_semantic_bytes: usize,
 ) -> Result<usize, ArtifactWireCodecError> {
     HEADER_LEN
@@ -212,14 +212,12 @@ pub(crate) fn max_encoded_len_for_artifact_budget(
 /// This is the bundle's own canonical encoded length, independent of the wire
 /// framing overhead, and is what callers compare against an installed semantic
 /// budget.
-pub(crate) fn semantic_artifact_bytes(
-    bundle: &ArtifactBundle,
-) -> Result<usize, ArtifactWireCodecError> {
+pub fn semantic_artifact_bytes(bundle: &ArtifactBundle) -> Result<usize, ArtifactWireCodecError> {
     ArtifactBundle::canonical_encoded_len(bundle.artifacts())
         .map_err(|_| ArtifactWireCodecError::LengthOverflow)
 }
 
-pub(crate) fn encode_artifact_bundle(
+pub fn encode_artifact_bundle(
     bundle: &ArtifactBundle,
     expectation: ArtifactDecodeExpectation<'_>,
     max_encoded: usize,
@@ -284,7 +282,7 @@ pub(crate) fn encode_artifact_bundle(
     })
 }
 
-pub(crate) fn decode_artifact_bundle(
+pub fn decode_artifact_bundle(
     payload: &[u8],
     envelope_profile_digest: &[u8; 32],
     expectation: ArtifactDecodeExpectation<'_>,
@@ -390,7 +388,7 @@ pub(crate) fn decode_artifact_bundle(
     Ok(Arc::new(bundle))
 }
 
-pub(crate) fn encode_unavailable(
+pub fn encode_unavailable(
     reason: UnavailableReason,
     expectation: ArtifactDecodeExpectation<'_>,
     max_encoded: usize,
@@ -422,7 +420,7 @@ pub(crate) fn encode_unavailable(
     })
 }
 
-pub(crate) fn decode_unavailable(
+pub fn decode_unavailable(
     payload: &[u8],
     envelope_profile_digest: &[u8; 32],
     expectation: ArtifactDecodeExpectation<'_>,
@@ -634,7 +632,6 @@ mod tests {
         decode_unavailable, encode_artifact_bundle, encode_unavailable,
         max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
     };
-    use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
     use crate::runtime_filter::materializer::bloom::BloomHashContract;
     use crate::runtime_filter::materializer::range::{
         RangeMaterializationOutcome, RangeMaterializer,
@@ -657,6 +654,7 @@ mod tests {
         ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
         RetainedMemoryReservation, RuntimeFilterMemoryAccount,
     };
+    use crate::runtime_filter::port::value_domain::OrderedBoundDomain;
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
     };

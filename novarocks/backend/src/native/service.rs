@@ -31,6 +31,7 @@ use novarocks::query_execution::lifecycle::{
     QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
     decode_query_terminal_snapshot,
 };
+use novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelopeIngress;
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -43,6 +44,7 @@ use super::lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
 };
+use super::runtime_filter_adapter::handle_runtime_filter_envelope;
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -56,6 +58,7 @@ pub(crate) struct NativeBackendGrpcService {
     query_control_shutdown: Option<watch::Receiver<bool>>,
     terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     data_plane: NativeDataPlaneKernel,
+    runtime_filter_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
 }
 
 impl NativeBackendGrpcService {
@@ -63,6 +66,7 @@ impl NativeBackendGrpcService {
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
+        runtime_filter_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     ) -> Self {
         Self {
             native_fragment_ingress,
@@ -70,6 +74,7 @@ impl NativeBackendGrpcService {
             query_control_shutdown: None,
             terminal_ingress,
             data_plane: NativeDataPlaneKernel::query_scoped(),
+            runtime_filter_ingress,
         }
     }
 
@@ -159,9 +164,9 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
         &self,
         request: tonic::Request<filter::RuntimeFilterEnvelope>,
     ) -> Result<tonic::Response<filter::RuntimeFilterEnvelopeResponse>, tonic::Status> {
-        let kernel = self.data_plane.clone();
+        let ingress = Arc::clone(&self.runtime_filter_ingress);
         let response = tokio::task::spawn_blocking(move || {
-            kernel.transmit_runtime_filter_envelope(request.into_inner())
+            handle_runtime_filter_envelope(ingress, request.into_inner())
         })
         .await
         .map_err(|error| {

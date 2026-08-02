@@ -32,18 +32,18 @@ use crate::runtime_filter::port::value_domain::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MembershipEncodingUnavailable {
+pub enum MembershipEncodingUnavailable {
     ResourceOrSize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MembershipEncodingOutcome {
+pub enum MembershipEncodingOutcome {
     Deltas(Vec<ValueDomainDelta>),
     Unavailable(MembershipEncodingUnavailable),
 }
 
 impl MembershipEncodingOutcome {
-    pub(crate) fn into_deltas(self) -> Option<Vec<ValueDomainDelta>> {
+    pub fn into_deltas(self) -> Option<Vec<ValueDomainDelta>> {
         match self {
             Self::Deltas(deltas) => Some(deltas),
             Self::Unavailable(_) => None,
@@ -52,7 +52,7 @@ impl MembershipEncodingOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MembershipEncodingError {
+pub enum MembershipEncodingError {
     TypeMismatch {
         expected: DataType,
         actual: DataType,
@@ -100,10 +100,10 @@ impl fmt::Display for MembershipEncodingError {
 
 impl Error for MembershipEncodingError {}
 
-pub(crate) struct MembershipDeltaEncoder;
+pub struct MembershipDeltaEncoder;
 
 impl MembershipDeltaEncoder {
-    pub(crate) fn encode(
+    pub fn encode(
         array: &dyn Array,
         expected_type: &DataType,
         max_bytes: usize,

@@ -4,24 +4,18 @@
 //! report policy. Role-owned gRPC services keep their wire gates and delegate
 //! only exchange, lookup, typed-result fetch, and runtime-filter delivery here.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use novarocks_types::UniqueId;
 
 use crate::proto;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
-use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
-use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
 use crate::service::internal_rpc;
-use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
-pub struct NativeDataPlaneKernel {
-    runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
-}
+pub struct NativeDataPlaneKernel {}
 
 impl std::fmt::Debug for NativeDataPlaneKernel {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,18 +33,7 @@ impl Default for NativeDataPlaneKernel {
 
 impl NativeDataPlaneKernel {
     pub fn query_scoped() -> Self {
-        Self {
-            runtime_filter_envelope_ingress: query_scoped_runtime_filter_envelope_ingress(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_runtime_filter_envelope_ingress(
-        runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
-    ) -> Self {
-        Self {
-            runtime_filter_envelope_ingress,
-        }
+        Self {}
     }
 
     pub fn exchange(
@@ -62,13 +45,6 @@ impl NativeDataPlaneKernel {
 
     pub fn lookup(&self, request: proto::filter::LookupRequest) -> proto::filter::LookupResponse {
         internal_rpc::handle_lookup(request)
-    }
-
-    pub fn transmit_runtime_filter_envelope(
-        &self,
-        request: proto::filter::RuntimeFilterEnvelope,
-    ) -> Result<proto::filter::RuntimeFilterEnvelopeResponse, tonic::Status> {
-        handle_runtime_filter_envelope(Arc::clone(&self.runtime_filter_envelope_ingress), request)
     }
 
     pub fn fetch_result(

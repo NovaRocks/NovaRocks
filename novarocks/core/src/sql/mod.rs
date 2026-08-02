@@ -18,6 +18,9 @@
 pub(crate) mod agg_mergeability;
 pub mod common;
 
+#[cfg(feature = "runtime-filter-test-support")]
+pub mod analysis;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod analysis;
 pub(crate) mod catalog;
 pub(crate) mod column_id;
@@ -31,6 +34,9 @@ pub(crate) mod optimizer;
 
 pub(crate) mod analyzer;
 pub(crate) mod explain;
+#[cfg(feature = "runtime-filter-test-support")]
+pub mod planner;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod planner;
 
 pub(crate) use parser::ast::{

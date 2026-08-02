@@ -20,21 +20,21 @@ use std::collections::BTreeSet;
 use super::contract::CoverageWitnessId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Coverage {
+pub enum Coverage {
     Leaf(CoverageWitnessId),
     AllOf(Vec<Coverage>),
     AnyOf(Vec<Coverage>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CoverageShapeError {
+pub enum CoverageShapeError {
     EmptyAllOf,
     EmptyAnyOf,
     DuplicateChild,
 }
 
 impl Coverage {
-    pub(crate) fn validate_shape(&self) -> Result<(), CoverageShapeError> {
+    pub fn validate_shape(&self) -> Result<(), CoverageShapeError> {
         let (children, empty_error) = match self {
             Self::Leaf(_) => return Ok(()),
             Self::AllOf(children) => (children, CoverageShapeError::EmptyAllOf),
@@ -59,11 +59,11 @@ impl Coverage {
         Ok(())
     }
 
-    pub(crate) fn is_canonically_equivalent_to(&self, other: &Self) -> bool {
+    pub fn is_canonically_equivalent_to(&self, other: &Self) -> bool {
         CanonicalCoverage::from(self) == CanonicalCoverage::from(other)
     }
 
-    pub(crate) fn is_all_of_only(&self) -> bool {
+    pub fn is_all_of_only(&self) -> bool {
         match self {
             Self::Leaf(_) => true,
             Self::AllOf(children) => children.iter().all(Self::is_all_of_only),
@@ -71,7 +71,7 @@ impl Coverage {
         }
     }
 
-    pub(crate) fn witness_ids_in_order(&self) -> Vec<CoverageWitnessId> {
+    pub fn witness_ids_in_order(&self) -> Vec<CoverageWitnessId> {
         let mut witness_ids = BTreeSet::new();
         self.collect_witness_ids(&mut witness_ids);
         witness_ids.into_iter().collect()

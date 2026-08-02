@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
-use crate::runtime_filter::port::subscription::UnavailableReason;
+use novarocks::runtime_filter_transition::port::identity::{PartitionId, ProducerSequence};
+use novarocks::runtime_filter_transition::port::subscription::UnavailableReason;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LogicalTerminal {
@@ -129,8 +129,10 @@ impl InstanceState {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+    use novarocks::runtime_filter_transition::port::identity::{PartitionId, ProducerSequence};
+    use novarocks::runtime_filter_transition::port::value_domain::{
+        MembershipValues, ValueDomainDelta,
+    };
 
     use super::*;
 

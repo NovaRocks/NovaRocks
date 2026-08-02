@@ -20,8 +20,8 @@ use std::fmt;
 
 use arrow::datatypes::DataType;
 
-use crate::runtime_filter::model::contract::NullSemantics;
-use crate::runtime_filter::port::value_domain::{
+use novarocks::runtime_filter_transition::model::contract::NullSemantics;
+use novarocks::runtime_filter_transition::port::value_domain::{
     ContributionSizeError, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
 };
 
@@ -197,8 +197,10 @@ fn projected_value_growth(
 mod tests {
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::model::contract::NullSemantics;
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+    use novarocks::runtime_filter_transition::model::contract::NullSemantics;
+    use novarocks::runtime_filter_transition::port::value_domain::{
+        MembershipValues, ValueDomainDelta,
+    };
 
     use super::MembershipReducer;
 

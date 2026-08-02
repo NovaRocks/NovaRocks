@@ -57,6 +57,9 @@ mod statistics_sink;
 mod table_function_processor;
 mod values_source;
 
+#[cfg(feature = "runtime-filter-test-support")]
+pub use aggregate::AggregateFinalDomainSessionBuilder;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) use aggregate::AggregateFinalDomainSessionBuilder;
 pub use aggregate::AggregateProcessorFactory;
 pub use aggregate::streaming_sink::AggregateStreamingSinkFactory;

@@ -115,6 +115,7 @@ mysql-state-store-provider = ["novarocks-state-store/mysql-state-store-provider"
 state-store-test-hooks = ["novarocks-state-store/state-store-test-hooks"]
 query-execution-contract-test-support = []
 mv-first-refresh-staging-test-support = []
+runtime-filter-test-support = []
 ssb = []
 
 [build-dependencies]

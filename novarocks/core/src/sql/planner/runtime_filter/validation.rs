@@ -32,14 +32,14 @@ use super::graph::{
 use super::policy::{RuntimeFilterPolicyValidationError, validate_runtime_filter_policy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PolicyField {
+pub enum PolicyField {
     MaxContributionBytes,
     MaxArtifactBytes,
     DeadlineMs,
     MaxRetries,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum GraphValidationErrorKind {
+pub enum GraphValidationErrorKind {
     ChannelIdMismatch {
         map_key: ChannelId,
         object_id: ChannelId,
@@ -91,7 +91,7 @@ pub(crate) enum GraphValidationErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GraphValidationError {
+pub struct GraphValidationError {
     pub channel_id: Option<ChannelId>,
     pub binding_id: Option<BindingId>,
     pub kind: GraphValidationErrorKind,
@@ -112,7 +112,7 @@ impl fmt::Display for GraphValidationError {
 
 impl std::error::Error for GraphValidationError {}
 
-pub(crate) trait ActivationContract {
+pub trait ActivationContract {
     fn satisfies_required_non_blocking(&self) -> bool;
 }
 
@@ -123,7 +123,7 @@ impl ActivationContract for ConsumerActivation {
 }
 
 impl<A: ActivationContract> RuntimeFilterGraphData<A> {
-    pub(crate) fn validate(&self) -> Result<(), GraphValidationError> {
+    pub fn validate(&self) -> Result<(), GraphValidationError> {
         self.validate_channels()?;
         self.validate_bindings()?;
         self.validate_channel_relationships()

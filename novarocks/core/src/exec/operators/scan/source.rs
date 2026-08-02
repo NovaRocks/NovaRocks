@@ -784,6 +784,30 @@ mod tests {
         }
     }
 
+    fn ordered_contract_for_test()
+    -> Arc<crate::runtime_filter::port::ordered_bound::RuntimeOrderContract> {
+        use crate::runtime_filter::model::contract::{
+            NullOrder, OrderContract, OrderKeyContract, SortDirection,
+        };
+        use crate::runtime_filter::port::ordered_bound::{
+            COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
+        };
+
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        Arc::new(
+            RuntimeOrderContract::try_from_plan(&OrderContract {
+                comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+                keys,
+                inclusive: true,
+            })
+            .expect("ordered runtime-filter contract"),
+        )
+    }
+
     struct PlainScanOp {
         plain_calls: AtomicUsize,
     }
@@ -1148,8 +1172,7 @@ mod tests {
         };
         use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 
-        let (_, order) = crate::runtime_filter::service::NativeRuntimeFilterExecutionContext::
-            installed_ordered_consumer_context_for_exec_test();
+        let order = ordered_contract_for_test();
         let mut arena = ExprArena::default();
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let membership_schema =
@@ -1251,9 +1274,7 @@ mod tests {
             ArtifactCapability, ConsumerActivation, LateApplyGranularity,
         };
 
-        let (context, order) =
-            crate::runtime_filter::service::NativeRuntimeFilterExecutionContext::
-                installed_ordered_consumer_context_for_exec_test();
+        let order = ordered_contract_for_test();
         let mut arena = ExprArena::default();
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
         let op: Arc<dyn ScanOp> = Arc::new(TestMorselScanOp {
@@ -1282,7 +1303,9 @@ mod tests {
         source
             .prepare()
             .expect("prepare creates scan runners before bind");
-        let state = RuntimeState::default().with_runtime_filter_session(Some(Arc::new(context)));
+        let state = RuntimeState::default().with_runtime_filter_session(Some(
+            crate::runtime_filter::test_support::fail_open_session(),
+        ));
         source
             .bind_runtime_state(&state)
             .expect("bind ordered live subscription");
@@ -1320,8 +1343,7 @@ mod tests {
             ArtifactCapability, ConsumerActivation, LateApplyGranularity,
         };
 
-        let (_, order) = crate::runtime_filter::service::NativeRuntimeFilterExecutionContext::
-            installed_ordered_consumer_context_for_exec_test();
+        let order = ordered_contract_for_test();
         for late_apply in [LateApplyGranularity::File, LateApplyGranularity::RowGroup] {
             let mut arena = ExprArena::default();
             let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);

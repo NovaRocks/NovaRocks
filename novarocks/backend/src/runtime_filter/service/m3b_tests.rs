@@ -22,27 +22,31 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::DataType;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::model::contract::*;
-use crate::runtime_filter::model::coverage::Coverage;
-use crate::runtime_filter::port::artifact::ConsumerArtifactProfile;
-use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-use crate::runtime_filter::port::identity::*;
-use crate::runtime_filter::port::install::*;
-use crate::runtime_filter::port::ordered_bound::{
+use novarocks::runtime_filter_transition::model::contract::*;
+use novarocks::runtime_filter_transition::model::coverage::Coverage;
+use novarocks::runtime_filter_transition::port::artifact::ConsumerArtifactProfile;
+use novarocks::runtime_filter_transition::port::events::{
+    RuntimeFilterEvent, RuntimeFilterEventSink,
+};
+use novarocks::runtime_filter_transition::port::identity::*;
+use novarocks::runtime_filter_transition::port::install::*;
+use novarocks::runtime_filter_transition::port::ordered_bound::{
     COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
     RuntimeOrderContract, comparator_digest_for_test,
 };
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::producer::{
     ProducerHandle, ProducerPortKind, RuntimeContractViolationKind, SubmitOutcome,
 };
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::subscription::{
     LivePollOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
 };
-use crate::runtime_filter::port::support::{
+use novarocks::runtime_filter_transition::port::support::{
     MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount, TemporaryContributionLease,
 };
-use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
+use novarocks::runtime_filter_transition::port::topk_summary::{
+    RuntimeTopKSummaryContract, TopKSummary,
+};
+use novarocks_types::UniqueId;
 
 use super::RuntimeFilterService;
 use super::memory::MemTrackerMemoryAccount;
@@ -83,7 +87,7 @@ struct TopKReentrantEvents {
     recorded: Mutex<Vec<RuntimeFilterEvent>>,
     producer: Mutex<
         Option<
-            std::sync::Weak<dyn crate::runtime_filter::port::producer::TopKSummaryProducerAdapter>,
+            std::sync::Weak<dyn novarocks::runtime_filter_transition::port::producer::TopKSummaryProducerAdapter>,
         >,
     >,
     replay: Mutex<Option<TopKSummary>>,
@@ -97,7 +101,7 @@ struct CrossChannelTopKEvents {
     trigger_binding: BindingId,
     nested_producer: Mutex<
         Option<
-            std::sync::Weak<dyn crate::runtime_filter::port::producer::TopKSummaryProducerAdapter>,
+            std::sync::Weak<dyn novarocks::runtime_filter_transition::port::producer::TopKSummaryProducerAdapter>,
         >,
     >,
     nested_summary: Mutex<Option<TopKSummary>>,
@@ -332,7 +336,7 @@ fn summary_producer(
     service: &RuntimeFilterService,
     binding: BindingId,
     instance: UniqueId,
-) -> Arc<dyn crate::runtime_filter::port::producer::TopKSummaryProducerAdapter> {
+) -> Arc<dyn novarocks::runtime_filter_transition::port::producer::TopKSummaryProducerAdapter> {
     let ProducerHandle::TopKSummary(producer) = service
         .open_producer(binding, instance, 1, ProducerPortKind::TopKSummary)
         .unwrap()
@@ -344,7 +348,8 @@ fn summary_producer(
 
 fn live(
     service: &RuntimeFilterService,
-) -> Arc<dyn crate::runtime_filter::port::subscription::NonBlockingLiveSubscription> {
+) -> Arc<dyn novarocks::runtime_filter_transition::port::subscription::NonBlockingLiveSubscription>
+{
     let SubscriptionHandle::Live(live) = service
         .subscribe(CONSUMER, uid(2), SubscriptionKind::NonBlockingLive)
         .unwrap()
@@ -358,7 +363,7 @@ fn range_value(outcome: LivePollOutcome) -> (LogicalVersion, i64, Option<LiveTer
     let LivePollOutcome::Updated { bundle, terminal } = outcome else {
         panic!("expected a live range update")
     };
-    let [(crate::runtime_filter::port::artifact::ArtifactKind::Range, artifact)] =
+    let [(novarocks::runtime_filter_transition::port::artifact::ArtifactKind::Range, artifact)] =
         bundle.artifacts()
     else {
         panic!("expected exactly one range artifact")
@@ -667,7 +672,7 @@ fn topk_resource_failure_retains_latest_as_degraded() {
         LivePollOutcome::Idle {
             latest_version: None,
             terminal: Some(LiveTerminal::Unavailable(
-                crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+                novarocks::runtime_filter_transition::port::subscription::UnavailableReason::ResourceLimit
             ))
         }
     ));
@@ -719,7 +724,7 @@ fn topk_resource_failure_retains_latest_as_degraded() {
             LogicalVersion::FIRST,
             4,
             Some(LiveTerminal::DegradedLogical(
-                crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+                novarocks::runtime_filter_transition::port::subscription::UnavailableReason::ResourceLimit
             ))
         )
     );

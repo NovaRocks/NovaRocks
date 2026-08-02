@@ -16,6 +16,9 @@
 // under the License.
 
 pub(crate) mod change_stream;
+#[cfg(feature = "runtime-filter-test-support")]
+pub mod expr;
+#[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod expr;
 pub(crate) mod imv;
 pub(crate) mod plan_hints;
@@ -26,8 +29,9 @@ pub(crate) use change_stream::{
     CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind, ChangeStreamRouteKey,
     DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
 };
+pub use expr::LiteralValue;
 pub(crate) use expr::{
-    BinOp, JoinKind, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
+    BinOp, JoinKind, LambdaParam, UnOp, WindowBound, WindowFrame, WindowFrameType,
 };
 pub(crate) use imv::{ImvVersionRef, ImvVersionRole};
 pub(crate) use plan_hints::{ApplyKind, ScanVariantColumn};

@@ -264,6 +264,14 @@ impl NativeFragmentService {
             .lifecycle
             .admit_fragment(execution_id, fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
+        let runtime_filter = self
+            .lifecycle
+            .runtime_filter_session_for_fragment(
+                execution_id,
+                fragment_instance_id,
+                request.has_runtime_filter_bindings(),
+            )
+            .map_err(NativeFragmentIngressError::new)?;
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
@@ -280,7 +288,7 @@ impl NativeFragmentService {
                 delivery_expire,
                 query_expire,
                 cache_options,
-                request.has_runtime_filter_bindings(),
+                runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
         let query_mem_tracker = admission.query_mem_tracker();
@@ -400,6 +408,14 @@ impl NativeFragmentService {
             .lifecycle
             .admit_fragment(execution_id, fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
+        let runtime_filter = self
+            .lifecycle
+            .runtime_filter_session_for_fragment(
+                execution_id,
+                fragment_instance_id,
+                request.has_runtime_filter_bindings(),
+            )
+            .map_err(NativeFragmentIngressError::new)?;
         #[cfg(test)]
         if let Some(after_lifecycle_admission) = self.after_lifecycle_admission.as_ref() {
             after_lifecycle_admission();
@@ -420,7 +436,7 @@ impl NativeFragmentService {
                 delivery_expire,
                 query_expire,
                 cache_options,
-                request.has_runtime_filter_bindings(),
+                runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
         let query_mem_tracker = admission.query_mem_tracker();
@@ -933,7 +949,7 @@ mod tests {
                 delivery_expire,
                 query_expire,
                 request.cache_options().expect("valid cache options"),
-                request.has_runtime_filter_bindings(),
+                None,
             )
             .expect("native fragment admission");
         prepare_fragment(

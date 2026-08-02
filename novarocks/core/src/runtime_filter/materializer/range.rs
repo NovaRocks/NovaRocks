@@ -32,14 +32,14 @@ use crate::runtime_filter::port::support::{
 use crate::runtime_filter::port::value_domain::LogicalSnapshot;
 
 #[derive(Debug)]
-pub(crate) enum RangeMaterializationOutcome {
+pub enum RangeMaterializationOutcome {
     Published(Arc<ArtifactBundle>),
     ContractViolation(RuntimeContractViolation),
     ResourceUnavailable,
     MaterializationFailed,
 }
 
-pub(crate) struct RangeMaterializationPlan<'a> {
+pub struct RangeMaterializationPlan<'a> {
     snapshot: Arc<LogicalSnapshot>,
     profile: &'a ConsumerArtifactProfile,
     max_artifact_bytes: usize,
@@ -47,7 +47,7 @@ pub(crate) struct RangeMaterializationPlan<'a> {
     resident_layout: RangeArtifactResidentLayout,
 }
 
-pub(crate) struct AdmittedRangeMaterialization<'a> {
+pub struct AdmittedRangeMaterialization<'a> {
     plan: RangeMaterializationPlan<'a>,
     _scratch: ArtifactScratchReservation,
     artifact_footprint: usize,
@@ -55,10 +55,10 @@ pub(crate) struct AdmittedRangeMaterialization<'a> {
     retained: Arc<ArtifactRetention>,
 }
 
-pub(crate) struct RangeMaterializer;
+pub struct RangeMaterializer;
 
 impl RangeMaterializer {
-    pub(crate) fn plan<'a>(
+    pub fn plan<'a>(
         snapshot: Arc<LogicalSnapshot>,
         profile: &'a ConsumerArtifactProfile,
         max_artifact_bytes: usize,
@@ -99,7 +99,7 @@ impl RangeMaterializer {
         })
     }
 
-    pub(crate) fn admit<'a>(
+    pub fn admit<'a>(
         plan: RangeMaterializationPlan<'a>,
         retained_budget: Arc<ArtifactRetainedBudget>,
         scratch_budget: Arc<ArtifactScratchBudget>,
@@ -149,7 +149,7 @@ impl RangeMaterializer {
         })
     }
 
-    pub(crate) fn encode(
+    pub fn encode(
         admitted: AdmittedRangeMaterialization<'_>,
     ) -> Result<Arc<ArtifactBundle>, RangeMaterializationOutcome> {
         let domain =
@@ -194,7 +194,7 @@ impl RangeMaterializer {
         Ok(Arc::new(bundle))
     }
 
-    pub(crate) fn materialize(
+    pub fn materialize(
         snapshot: Arc<LogicalSnapshot>,
         profile: &ConsumerArtifactProfile,
         max_artifact_bytes: usize,
@@ -258,7 +258,6 @@ mod tests {
 
     use arrow::datatypes::{DataType, TimeUnit};
 
-    use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
     use crate::runtime_filter::model::contract::{
         ChannelId, NullOrder, OrderContract, OrderKeyContract, SortDirection,
     };
@@ -275,6 +274,7 @@ mod tests {
         ArtifactRetainedBudget, ArtifactRetention, ArtifactScratchBudget, MemoryAccountError,
         RetainedMemoryReservation, RuntimeFilterMemoryAccount,
     };
+    use crate::runtime_filter::port::value_domain::OrderedBoundDomain;
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
     };

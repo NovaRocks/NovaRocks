@@ -53,7 +53,7 @@ impl RuntimeEndpoint {
         self.port
     }
 
-    pub(crate) fn from_socket_addr(addr: SocketAddr) -> Self {
+    pub fn from_socket_addr(addr: SocketAddr) -> Self {
         Self {
             host: addr.ip().to_string(),
             port: i32::from(addr.port()),

@@ -50,7 +50,6 @@ use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, Frag
 use crate::runtime::fragment::io::{NoopFragmentEventSink, UnavailableFragmentLookupClient};
 use crate::runtime::fragment::prepare_fragment;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-use crate::runtime::native_query_lifecycle::NativeQueryLifecycleRuntime;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
@@ -60,19 +59,6 @@ const TEST_QUERY_ID_HIGH: i64 = i64::MIN + 0x4e52;
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
-}
-
-struct RuntimeFilterInstallLease {
-    runtime: NativeQueryLifecycleRuntime,
-    execution_id: QueryExecutionId,
-}
-
-impl Drop for RuntimeFilterInstallLease {
-    fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .abort_runtime_filter_contribution(self.execution_id);
-    }
 }
 
 #[derive(Default)]
@@ -154,18 +140,6 @@ pub(crate) fn execute(
         .bind_schedule(schedule)?
         .assemble_for_in_process_test(query_id, &parts.options, &live_backends)?;
     let resolver = install_connector_bindings(&artifact.declarations)?;
-    let runtime_filter_lifecycle = NativeQueryLifecycleRuntime::global();
-    for contribution in artifact.runtime_filters.iter().cloned() {
-        runtime_filter_lifecycle
-            .install_runtime_filter_contribution(execution_id, contribution)
-            .map_err(failed)?;
-    }
-    let _runtime_filter_lease =
-        (!artifact.runtime_filters.is_empty()).then(|| RuntimeFilterInstallLease {
-            runtime: runtime_filter_lifecycle,
-            execution_id,
-        });
-
     let writer_ids = artifact
         .writer_registrations
         .writer_identities()
@@ -190,6 +164,11 @@ pub(crate) fn execute(
             .map_err(|error| failed(error.to_string()))?;
         let (submission, _) = decoded.into_parts();
         let has_runtime_filter_bindings = submission.program().runtime_filters().has_bindings();
+        if has_runtime_filter_bindings {
+            return Err(failed(
+                "in-process native test execution requires an injected runtime-filter session",
+            ));
+        }
         let fragment_instance_id = submission.fragment_instance_id();
         let (delivery_expire, query_expire) =
             query_expire_durations(Some(submission.query_options()));
@@ -202,7 +181,7 @@ pub(crate) fn execute(
                 delivery_expire,
                 query_expire,
                 cache_options,
-                has_runtime_filter_bindings,
+                None,
             )
             .map_err(failed)?;
         let profiler = profile_enabled.then(|| {

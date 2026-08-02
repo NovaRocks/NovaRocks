@@ -27,13 +27,13 @@ use super::ordered_range_predicate::NativeOrderedRangePredicate;
 /// This is deliberately an execution adapter rather than a Service type so
 /// consumers can retain evaluator-specific capabilities without observing
 /// artifact delivery or installed deployment state.
-pub(crate) enum NativeExecutionPredicate {
+pub enum NativeExecutionPredicate {
     Membership(NativeRuntimeFilterPredicate),
     Ordered(Arc<NativeOrderedRangePredicate>),
 }
 
 impl NativeExecutionPredicate {
-    pub(crate) fn ordered_range(&self) -> Option<&Arc<NativeOrderedRangePredicate>> {
+    pub fn ordered_range(&self) -> Option<&Arc<NativeOrderedRangePredicate>> {
         match self {
             Self::Membership(_) => None,
             Self::Ordered(predicate) => Some(predicate),

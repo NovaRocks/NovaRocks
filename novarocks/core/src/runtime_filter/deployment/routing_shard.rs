@@ -220,7 +220,7 @@ fn validate_role_graph_channel(
     }
 }
 
-pub(crate) fn project_routing_shards(
+pub fn project_routing_shards(
     epoch: DeploymentEpoch,
     role_graph: &RoleGraph,
     instances: &BindingInstanceIndex,

@@ -156,20 +156,20 @@ pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LiveBackendSnapshot {
+pub struct LiveBackendSnapshot {
     entries: Vec<(usize, SocketAddr)>,
 }
 
 impl LiveBackendSnapshot {
-    pub(crate) fn new(entries: Vec<(usize, SocketAddr)>) -> Self {
+    pub fn new(entries: Vec<(usize, SocketAddr)>) -> Self {
         Self { entries }
     }
 
-    pub(crate) fn from_endpoints(backends: Vec<SocketAddr>) -> Self {
+    pub fn from_endpoints(backends: Vec<SocketAddr>) -> Self {
         Self::new(backends.into_iter().enumerate().collect())
     }
 
-    pub(crate) fn entries(&self) -> &[(usize, SocketAddr)] {
+    pub fn entries(&self) -> &[(usize, SocketAddr)] {
         &self.entries
     }
 }

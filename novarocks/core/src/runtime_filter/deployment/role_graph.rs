@@ -22,7 +22,7 @@ use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::port::identity::{RouteEdgeId, RuntimeFilterParticipantId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RouteKind {
+pub enum RouteKind {
     Loopback,
     ReplicaDirect,
     ToAggregator,
@@ -30,13 +30,13 @@ pub(crate) enum RouteKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct RouteEndpoint {
+pub struct RouteEndpoint {
     pub participant: RuntimeFilterParticipantId,
     pub binding: BindingId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RouteEdge {
+pub struct RouteEdge {
     pub channel: ChannelId,
     pub edge_id: RouteEdgeId,
     pub kind: RouteKind,
@@ -47,7 +47,7 @@ pub(crate) struct RouteEdge {
 /// Per-channel role graph. `producers`/`consumers` map a participant to the
 /// binding ids it hosts. `aggregator` is set only for `AllOf` (sharded) channels.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ChannelRoleGraph {
+pub struct ChannelRoleGraph {
     pub channel_id: ChannelId,
     pub producers: BTreeMap<RuntimeFilterParticipantId, BTreeSet<BindingId>>,
     pub consumers: BTreeMap<RuntimeFilterParticipantId, BTreeSet<BindingId>>,
@@ -56,7 +56,7 @@ pub(crate) struct ChannelRoleGraph {
 }
 
 impl ChannelRoleGraph {
-    pub(crate) fn empty(channel_id: ChannelId) -> Self {
+    pub fn empty(channel_id: ChannelId) -> Self {
         Self {
             channel_id,
             producers: BTreeMap::new(),
@@ -68,18 +68,18 @@ impl ChannelRoleGraph {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RoleGraph {
+pub struct RoleGraph {
     pub channels: BTreeMap<ChannelId, ChannelRoleGraph>,
 }
 
 /// Deterministic, query-global route-edge id allocator (starts at 1; 0 reserved).
 #[derive(Debug)]
-pub(crate) struct RouteEdgeAllocator {
+pub struct RouteEdgeAllocator {
     next: u32,
 }
 
 impl RouteEdgeAllocator {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { next: 1 }
     }
     fn alloc(&mut self) -> RouteEdgeId {
@@ -91,20 +91,20 @@ impl RouteEdgeAllocator {
 
 /// Compiler-projected placement of one producer binding across participants.
 #[derive(Clone, Debug)]
-pub(crate) struct ProducerPlacement {
+pub struct ProducerPlacement {
     pub binding: BindingId,
     pub participants: BTreeSet<RuntimeFilterParticipantId>,
 }
 
 /// Compiler-projected placement of one consumer binding across participants.
 #[derive(Clone, Debug)]
-pub(crate) struct ConsumerPlacement {
+pub struct ConsumerPlacement {
     pub binding: BindingId,
     pub participants: BTreeSet<RuntimeFilterParticipantId>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChannelRoleInputs {
+pub struct ChannelRoleInputs {
     pub channel_id: ChannelId,
     pub availability_coverage: Coverage,
     pub producers: Vec<ProducerPlacement>,
@@ -128,7 +128,7 @@ fn consumer_participants(inputs: &ChannelRoleInputs) -> BTreeSet<RuntimeFilterPa
 
 /// Build one channel's role graph. `replica_redundancy` clamps how many
 /// `AnyOf` replica producers deliver directly (never a hardcoded BE count).
-pub(crate) fn build_channel_role_graph(
+pub fn build_channel_role_graph(
     inputs: &ChannelRoleInputs,
     replica_redundancy: u32,
     alloc: &mut RouteEdgeAllocator,

@@ -12,6 +12,7 @@ use novarocks::query_execution::lifecycle::{
     QueryLifecycleError, QueryLifecycleIngress, QueryStageAck, QueryStageOutcome,
     QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
+use novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelopeIngress;
 use novarocks::service::MetricsHttpServer;
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 
@@ -378,6 +379,8 @@ impl BackendApplicationHost {
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
 
+        let runtime_filter_ingress: Arc<dyn RuntimeFilterEnvelopeIngress> =
+            services.query_lifecycle_registry.clone();
         let mut grpc_server = NativeGrpcServerHandle::start(
             &bind_host,
             grpc_port,
@@ -385,6 +388,7 @@ impl BackendApplicationHost {
                 native_fragment_service.clone(),
                 services.query_lifecycle_ingress.clone(),
                 terminal_ingress,
+                runtime_filter_ingress,
             ),
         )
         .map_err(|error| {

@@ -23,16 +23,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::port::events::{
+use novarocks::runtime_filter_transition::port::events::{
     ConsumerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
 };
-use crate::runtime_filter::port::identity::RouteEdgeId;
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::identity::RouteEdgeId;
+use novarocks::runtime_filter_transition::port::subscription::{
     ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
     BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription,
     SubscriptionHandle, SubscriptionKind, UnavailableReason,
 };
+use novarocks_types::UniqueId;
 
 use super::EventBatchCompletion;
 
@@ -147,7 +147,9 @@ impl BlockingSnapshotSubscription for SubscriptionSlot {
         outcome
     }
 
-    fn snapshot(&self) -> Option<Arc<crate::runtime_filter::port::artifact::ArtifactBundle>> {
+    fn snapshot(
+        &self,
+    ) -> Option<Arc<novarocks::runtime_filter_transition::port::artifact::ArtifactBundle>> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         match &*state {
             SubscriptionState::Terminal(ArtifactDeliveryOutcome::Published(bundle)) => {
@@ -188,7 +190,10 @@ impl NativeAcquireGate {
 }
 
 #[cfg(test)]
-type NativeAcquireGateKey = (UniqueId, crate::runtime_filter::model::contract::BindingId);
+type NativeAcquireGateKey = (
+    UniqueId,
+    novarocks::runtime_filter_transition::model::contract::BindingId,
+);
 
 #[cfg(test)]
 fn native_acquire_gates() -> &'static Mutex<BTreeMap<NativeAcquireGateKey, Weak<NativeAcquireGate>>>
@@ -229,7 +234,7 @@ impl Drop for NativeAcquireGateGuard {
 #[cfg(test)]
 pub(crate) fn install_native_acquire_gate_for_test(
     query_id: UniqueId,
-    binding_id: crate::runtime_filter::model::contract::BindingId,
+    binding_id: novarocks::runtime_filter_transition::model::contract::BindingId,
 ) -> NativeAcquireGateGuard {
     let key = (query_id, binding_id);
     let gate = Arc::new(NativeAcquireGate {
@@ -261,7 +266,7 @@ fn notify_native_acquire_waiter_registered_for_test(identity: ConsumerEventIdent
 
 #[derive(Default)]
 struct LiveSubscriptionState {
-    latest: Option<Arc<crate::runtime_filter::port::artifact::ArtifactBundle>>,
+    latest: Option<Arc<novarocks::runtime_filter_transition::port::artifact::ArtifactBundle>>,
     terminal: Option<LiveTerminal>,
 }
 
@@ -326,7 +331,7 @@ impl LiveSubscriptionSlot {
 
     pub(super) fn deliver(
         &self,
-        bundle: Arc<crate::runtime_filter::port::artifact::ArtifactBundle>,
+        bundle: Arc<novarocks::runtime_filter_transition::port::artifact::ArtifactBundle>,
         terminal: Option<LiveTerminal>,
     ) {
         self.apply_delivery(Some(ArtifactDeliveryOutcome::Published(bundle)), terminal);
@@ -417,7 +422,9 @@ impl LiveSubscriptionSlot {
 }
 
 impl NonBlockingLiveSubscription for LiveSubscriptionSlot {
-    fn snapshot(&self) -> Option<Arc<crate::runtime_filter::port::artifact::ArtifactBundle>> {
+    fn snapshot(
+        &self,
+    ) -> Option<Arc<novarocks::runtime_filter_transition::port::artifact::ArtifactBundle>> {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -427,7 +434,7 @@ impl NonBlockingLiveSubscription for LiveSubscriptionSlot {
 
     fn poll_after(
         &self,
-        observed: Option<crate::runtime_filter::port::identity::LogicalVersion>,
+        observed: Option<novarocks::runtime_filter_transition::port::identity::LogicalVersion>,
     ) -> LivePollOutcome {
         let (latest, terminal) = {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -466,7 +473,7 @@ impl NonBlockingLiveSubscription for LiveSubscriptionSlot {
 
 pub(super) struct SubscriptionGroup {
     route_edge_ids: BTreeSet<RouteEdgeId>,
-    activation: crate::runtime_filter::model::contract::ConsumerActivation,
+    activation: novarocks::runtime_filter_transition::model::contract::ConsumerActivation,
     slots: BTreeMap<UniqueId, InstalledSubscriptionSlot>,
     #[cfg(test)]
     before_deliver: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -482,8 +489,8 @@ enum InstalledSubscriptionSlot {
 impl SubscriptionGroup {
     pub(super) fn new(
         common: RuntimeFilterEventIdentity,
-        binding_id: crate::runtime_filter::model::contract::BindingId,
-        activation: crate::runtime_filter::model::contract::ConsumerActivation,
+        binding_id: novarocks::runtime_filter_transition::model::contract::BindingId,
+        activation: novarocks::runtime_filter_transition::model::contract::ConsumerActivation,
         route_edge_ids: impl IntoIterator<Item = RouteEdgeId>,
         instances: impl IntoIterator<Item = UniqueId>,
         events: Arc<dyn RuntimeFilterEventSink>,
@@ -494,13 +501,13 @@ impl SubscriptionGroup {
                 (
                     instance,
                     match activation {
-                        crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
+                        novarocks::runtime_filter_transition::model::contract::ConsumerActivation::BlockingSnapshot => {
                             InstalledSubscriptionSlot::Blocking(Arc::new(SubscriptionSlot::new(
                                 ConsumerEventIdentity::new(common, binding_id, instance),
                                 events.clone(),
                             )))
                         }
-                        crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive { .. } => {
+                        novarocks::runtime_filter_transition::model::contract::ConsumerActivation::NonBlockingLive { .. } => {
                             InstalledSubscriptionSlot::Live(Arc::new(LiveSubscriptionSlot::new(
                                 ConsumerEventIdentity::new(common, binding_id, instance),
                                 events.clone(),
@@ -527,10 +534,10 @@ impl SubscriptionGroup {
         requested: SubscriptionKind,
     ) -> Option<SubscriptionHandle> {
         let installed = match self.activation {
-            crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
+            novarocks::runtime_filter_transition::model::contract::ConsumerActivation::BlockingSnapshot => {
                 SubscriptionKind::BlockingSnapshot
             }
-            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+            novarocks::runtime_filter_transition::model::contract::ConsumerActivation::NonBlockingLive {
                 ..
             } => SubscriptionKind::NonBlockingLive,
         };
@@ -552,7 +559,7 @@ impl SubscriptionGroup {
     pub(super) fn live_route_edge_ids(&self) -> Option<&BTreeSet<RouteEdgeId>> {
         matches!(
             self.activation,
-            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive { .. }
+            novarocks::runtime_filter_transition::model::contract::ConsumerActivation::NonBlockingLive { .. }
         )
         .then_some(&self.route_edge_ids)
     }
@@ -631,23 +638,25 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId, NullSemantics};
-    use crate::runtime_filter::port::artifact::{
+    use novarocks::runtime_filter_transition::model::contract::{
+        BindingId, ChannelId, NullSemantics,
+    };
+    use novarocks::runtime_filter_transition::port::artifact::{
         ArtifactBundle, ArtifactKind, ArtifactSchemaDigest, ConsumerArtifactProfile,
         PhysicalArtifact,
     };
-    use crate::runtime_filter::port::events::{
+    use novarocks::runtime_filter_transition::port::events::{
         ConsumerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
         RuntimeFilterEventSink,
     };
-    use crate::runtime_filter::port::identity::{
+    use novarocks::runtime_filter_transition::port::identity::{
         DeploymentEpoch, LogicalVersion, RuntimeFilterParticipantId,
     };
-    use crate::runtime_filter::port::subscription::{
+    use novarocks::runtime_filter_transition::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDeliveryOutcome, BlockingSnapshotSubscription,
         LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription, UnavailableReason,
     };
-    use crate::runtime_filter::port::support::{
+    use novarocks::runtime_filter_transition::port::support::{
         ArtifactRetainedBudget, ArtifactRetention, MemoryAccountError, RuntimeFilterMemoryAccount,
     };
 

@@ -28,10 +28,10 @@ const SCALAR_HASH_DOMAIN: &[u8] = b"novarocks.runtime-filter.bloom-scalar";
 const SCALAR_FRAMING_VERSION: u16 = 1;
 const BIG_ENDIAN_EXTRACTION: u8 = 1;
 const LSB0_BIT_ORDER: u8 = 1;
-pub(crate) const BLOOM_METADATA_BYTES: usize = 2 + 2 + 8 + 8 + 4 + 8 + 8;
+pub const BLOOM_METADATA_BYTES: usize = 2 + 2 + 8 + 8 + 4 + 8 + 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BloomHashContract {
+pub struct BloomHashContract {
     algorithm_version: u16,
     scalar_framing_version: u16,
     schema_digest: ArtifactSchemaDigest,
@@ -42,7 +42,7 @@ pub(crate) struct BloomHashContract {
 }
 
 impl BloomHashContract {
-    pub(crate) fn new(
+    pub fn new(
         schema: &ArtifactMembershipSchema,
         policy: MaterializationPolicy,
     ) -> Result<Self, BloomError> {
@@ -56,7 +56,7 @@ impl BloomHashContract {
         )
     }
 
-    pub(crate) fn from_fields(
+    pub fn from_fields(
         schema_digest: ArtifactSchemaDigest,
         algorithm_version: u16,
         scalar_framing_version: u16,
@@ -86,25 +86,25 @@ impl BloomHashContract {
         Ok(contract)
     }
 
-    pub(crate) const fn algorithm_version(&self) -> u16 {
+    pub const fn algorithm_version(&self) -> u16 {
         self.algorithm_version
     }
-    pub(crate) const fn scalar_framing_version(&self) -> u16 {
+    pub const fn scalar_framing_version(&self) -> u16 {
         self.scalar_framing_version
     }
-    pub(crate) const fn schema_digest(&self) -> ArtifactSchemaDigest {
+    pub const fn schema_digest(&self) -> ArtifactSchemaDigest {
         self.schema_digest
     }
-    pub(crate) const fn seed(&self) -> u64 {
+    pub const fn seed(&self) -> u64 {
         self.seed
     }
-    pub(crate) const fn bits_per_key(&self) -> u64 {
+    pub const fn bits_per_key(&self) -> u64 {
         self.bits_per_key
     }
-    pub(crate) const fn hash_count(&self) -> u32 {
+    pub const fn hash_count(&self) -> u32 {
         self.hash_count
     }
-    pub(crate) const fn digest(&self) -> HashContractDigest {
+    pub const fn digest(&self) -> HashContractDigest {
         self.digest
     }
 
@@ -120,7 +120,7 @@ impl BloomHashContract {
         hash.update(self.hash_count.to_be_bytes());
     }
 
-    pub(crate) fn bit_count(&self, cardinality: usize) -> Result<u64, BloomError> {
+    pub fn bit_count(&self, cardinality: usize) -> Result<u64, BloomError> {
         if cardinality == 0 {
             return Err(BloomError::EmptyDomain);
         }
@@ -134,7 +134,7 @@ impl BloomHashContract {
             .ok_or(BloomError::SizeOverflow)
     }
 
-    pub(crate) fn bit_count_u64(&self, cardinality: u64) -> Result<u64, BloomError> {
+    pub fn bit_count_u64(&self, cardinality: u64) -> Result<u64, BloomError> {
         if cardinality == 0 {
             return Err(BloomError::EmptyDomain);
         }
@@ -147,7 +147,7 @@ impl BloomHashContract {
             .ok_or(BloomError::SizeOverflow)
     }
 
-    pub(crate) fn payload_len(&self, cardinality: usize) -> Result<usize, BloomError> {
+    pub fn payload_len(&self, cardinality: usize) -> Result<usize, BloomError> {
         let bytes = self.bit_count(cardinality)? / 8;
         usize::try_from(bytes)
             .map_err(|_| BloomError::SizeOverflow)?
@@ -157,7 +157,7 @@ impl BloomHashContract {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BloomError {
+pub enum BloomError {
     InvalidContract,
     EmptyDomain,
     SizeOverflow,
@@ -169,7 +169,7 @@ impl From<ContributionSizeError> for BloomError {
     }
 }
 
-pub(crate) fn build_bits(
+pub fn build_bits(
     values: &MembershipValues,
     contract: &BloomHashContract,
     frame: &mut Vec<u8>,
@@ -186,7 +186,7 @@ pub(crate) fn build_bits(
     Ok((bit_count, bits))
 }
 
-pub(crate) fn contains_scalar(
+pub fn contains_scalar(
     contract: &BloomHashContract,
     bit_count: u64,
     bits: &[u8],

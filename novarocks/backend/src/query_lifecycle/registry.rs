@@ -37,10 +37,18 @@ use novarocks::query_execution::lifecycle::{
 use novarocks::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks::runtime::profile::RuntimeProfileTree;
 use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
+use novarocks::runtime_filter_transition::port::transport::{
+    RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
+};
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_types::UniqueId;
 use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
+use crate::runtime_filter::participant::{
+    BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
+    RuntimeFilterParticipantFactory,
+};
 
 const CONTROL_EVENT_BUFFER_CAPACITY: usize = 16;
 const RESERVED_CONTROL_EVENT_CAPACITY: usize = 3;
@@ -60,18 +68,13 @@ fn send_reserved_control_event(
     }
 }
 
+impl RuntimeFilterEnvelopeIngress for QueryLifecycleRegistry {
+    fn accept(&self, envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
+        self.dispatch_runtime_filter_envelope(envelope)
+    }
+}
+
 pub(crate) trait QueryLifecycleLocalRuntime: Send + Sync + 'static {
-    fn install_runtime_filter(
-        &self,
-        execution_id: QueryExecutionId,
-        contribution: RuntimeFilterContribution,
-    ) -> Result<(), QueryLifecycleError>;
-
-    fn abort_runtime_filter(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Result<(), QueryLifecycleError>;
-
     fn terminate_query(
         &self,
         execution_id: QueryExecutionId,
@@ -307,6 +310,7 @@ impl Drop for StageResourceReservation {
 pub(crate) struct QueryLifecycleRegistry {
     state: Mutex<QueryLifecycleRegistryState>,
     local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+    runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
     config: QueryLifecycleRegistryConfig,
     local_backend_id: Mutex<Option<u64>>,
     local_start_epoch: u64,
@@ -597,6 +601,29 @@ impl QueryLifecycleRegistry {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
+        local_backend_id: u64,
+        local_start_epoch: u64,
+        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+        config: QueryLifecycleRegistryConfig,
+        clock: Arc<dyn MonotonicClock>,
+        metrics: Arc<dyn QueryLifecycleMetricsSink>,
+        terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
+        runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
+    ) -> Arc<Self> {
+        Self::new_with_backend_identity_and_runtime_filter_factory(
+            Some(local_backend_id),
+            local_start_epoch,
+            local_runtime,
+            config,
+            clock,
+            metrics,
+            terminal_fallback,
+            runtime_filter_factory,
+        )
+    }
+
     pub(crate) fn new_unbound(
         local_start_epoch: u64,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
@@ -622,6 +649,28 @@ impl QueryLifecycleRegistry {
         metrics: Arc<dyn QueryLifecycleMetricsSink>,
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
     ) -> Arc<Self> {
+        Self::new_with_backend_identity_and_runtime_filter_factory(
+            local_backend_id,
+            local_start_epoch,
+            local_runtime,
+            config,
+            clock,
+            metrics,
+            terminal_fallback,
+            Arc::new(BackendRuntimeFilterParticipantFactory),
+        )
+    }
+
+    fn new_with_backend_identity_and_runtime_filter_factory(
+        local_backend_id: Option<u64>,
+        local_start_epoch: u64,
+        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+        config: QueryLifecycleRegistryConfig,
+        clock: Arc<dyn MonotonicClock>,
+        metrics: Arc<dyn QueryLifecycleMetricsSink>,
+        terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
+        runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
+    ) -> Arc<Self> {
         assert!(config.max_active_entries > 0);
         assert!(config.tombstone_capacity > 0);
         assert!(!config.tombstone_retention.is_zero());
@@ -646,6 +695,7 @@ impl QueryLifecycleRegistry {
         let registry = Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
+            runtime_filter_factory,
             config,
             local_backend_id: Mutex::new(local_backend_id),
             local_start_epoch,
@@ -1559,6 +1609,84 @@ impl QueryLifecycleRegistry {
         })
     }
 
+    /// Returns a fragment-bound execution capability from the already
+    /// initialized exact attempt. This lookup never creates, revives, or
+    /// extends lifecycle retention.
+    pub(crate) fn runtime_filter_session_for_fragment(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        required: bool,
+    ) -> Result<Option<RuntimeFilterSessionRef>, QueryLifecycleError> {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned()
+            .ok_or_else(|| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "runtime filter execution attempt is not active",
+                )
+            })?;
+        let participant = {
+            let state = entry.state.lock().expect("query lifecycle entry lock");
+            if !state.in_flight_fragments.contains(&fragment_instance_id) {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Conflict,
+                    "runtime filter session requires a held fragment admission permit",
+                ));
+            }
+            state.runtime_filter.clone()
+        };
+        match participant {
+            Some(participant) => {
+                participant.session_for_fragment(execution_id, fragment_instance_id, required)
+            }
+            None if required => Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::InvalidManifest,
+                "fragment requires a runtime filter session but this participant has no runtime filter contribution",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Dispatches an already decoded envelope through an existing exact
+    /// attempt. A miss is deliberately lookup-only and cannot release a gate.
+    pub(crate) fn dispatch_runtime_filter_envelope(
+        &self,
+        envelope: RuntimeFilterEnvelope,
+    ) -> RuntimeFilterIngressResult {
+        let participant = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .iter()
+            .find(|(execution_id, _)| {
+                execution_id.query_id().high() == envelope.query_id().high()
+                    && execution_id.query_id().low() == envelope.query_id().low()
+                    && execution_id.attempt_id().get() == envelope.deployment_epoch().get()
+            })
+            .map(|(_, entry)| entry)
+            .and_then(|entry| {
+                entry
+                    .state
+                    .lock()
+                    .expect("query lifecycle entry lock")
+                    .runtime_filter
+                    .clone()
+            });
+        match participant {
+            Some(participant) => participant.dispatch_envelope(envelope),
+            None => RuntimeFilterIngressResult::rejected(
+                "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace",
+            ).expect("query-unavailable reason is non-empty"),
+        }
+    }
+
     fn admission_error(
         &self,
         execution_id: QueryExecutionId,
@@ -1749,9 +1877,6 @@ impl QueryLifecycleRegistry {
             }
             state.phase = QueryLifecyclePhase::Terminating;
             entry.stage_completed.notify_all();
-            if state.runtime_filter_installed {
-                state.runtime_filter_cleanup_required = true;
-            }
             (
                 entry.manifest.execution_id(),
                 entry
@@ -2070,7 +2195,7 @@ impl QueryLifecycleRegistry {
                 state.events.clone(),
             )
         };
-        let _ = self.local_runtime.abort_runtime_filter(execution_id);
+        let _ = self.try_complete_runtime_filter_cleanup(&entry, execution_id);
         self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
         send_reserved_control_event(
             terminal_delivery.0,
@@ -2154,7 +2279,7 @@ impl QueryLifecycleRegistry {
             QueryTerminationReason::CoordinatorFinalize,
             "query finalized after local drain",
         );
-        let _ = self.local_runtime.abort_runtime_filter(execution_id);
+        let _ = self.try_complete_runtime_filter_cleanup(&entry, execution_id);
         self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
         send_reserved_control_event(
             terminal_delivery.0,
@@ -2454,43 +2579,42 @@ impl QueryLifecycleRegistry {
     fn try_complete_runtime_filter_cleanup(
         &self,
         entry: &Arc<QueryLifecycleEntry>,
-        execution_id: QueryExecutionId,
+        _execution_id: QueryExecutionId,
     ) -> bool {
-        {
+        let participant = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
-            if !state.runtime_filter_cleanup_required {
-                return true;
-            }
-            if state.runtime_filter_cleanup_in_flight {
+            if state.runtime_filter_close_in_flight {
                 return false;
             }
-            state.runtime_filter_cleanup_in_flight = true;
-        }
-
-        let cleanup_result = self.local_runtime.abort_runtime_filter(execution_id);
+            if state.runtime_filter.is_none() {
+                return true;
+            }
+            state.runtime_filter_close_in_flight = true;
+            state.runtime_filter.take()
+        };
+        let participant = participant.expect("runtime-filter participant was checked present");
+        let reason = entry
+            .state
+            .lock()
+            .expect("query lifecycle entry lock")
+            .termination_reason
+            .unwrap_or(QueryTerminationReason::LocalFailure);
+        // Service close has its own first-wins quiescence barrier. Keep it out
+        // of the entry lock so inbound ingress and terminal callers cannot
+        // deadlock each other around the participant owner.
+        let close_result = participant.close(reason);
         let mut state = entry.state.lock().expect("query lifecycle entry lock");
-        state.runtime_filter_cleanup_in_flight = false;
-        if cleanup_result.is_ok() {
-            state.runtime_filter_cleanup_required = false;
-            state.runtime_filter_installed = false;
-            return true;
+        state.runtime_filter_close_in_flight = false;
+        match close_result {
+            Ok(()) => true,
+            Err(_) => {
+                // Preserve the same attempt-local owner for a later terminal
+                // sweep. A failed close must not release active capacity or
+                // publish a tombstone while the Service can still be live.
+                state.runtime_filter = Some(participant);
+                false
+            }
         }
-        drop(state);
-
-        warn!(
-            target: "novarocks::query_lifecycle",
-            query_id = ?execution_id.query_id(),
-            attempt_id = execution_id.attempt_id().get(),
-            backend_id = ?self.local_backend_id(),
-            start_epoch = self.local_start_epoch,
-            digest = %format_digest(entry.digest),
-            outcome = "runtime_filter_cleanup_failed",
-            reason = "local runtime rejected runtime-filter cleanup",
-            error = %cleanup_result.expect_err("cleanup result was checked"),
-            "backend query lifecycle runtime-filter cleanup will be retried"
-        );
-        self.publish_metrics();
-        false
     }
 
     fn publish_tombstone(
@@ -2504,9 +2628,7 @@ impl QueryLifecycleRegistry {
             if entry_state.phase == QueryLifecyclePhase::Tombstone {
                 return;
             }
-            if entry_state.runtime_filter_cleanup_required
-                || entry_state.runtime_filter_cleanup_in_flight
-            {
+            if entry_state.runtime_filter.is_some() || entry_state.runtime_filter_close_in_flight {
                 return;
             }
             entry_state.phase = QueryLifecyclePhase::Tombstone;
@@ -2781,11 +2903,28 @@ impl QueryLifecycleRegistry {
     }
 
     fn publish_metrics(&self) {
-        let (snapshot, termination_reasons) = {
+        let (snapshot, termination_reasons, runtime_filter_services) = {
             let state = self.state.lock().expect("query lifecycle registry lock");
-            fold_metrics_locked(&state)
+            let (snapshot, termination_reasons) = fold_metrics_locked(&state);
+            let runtime_filter_services = state
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry
+                        .state
+                        .lock()
+                        .expect("query lifecycle entry lock")
+                        .runtime_filter
+                        .is_some()
+                })
+                .count();
+            (snapshot, termination_reasons, runtime_filter_services)
         };
         self.metrics.publish(snapshot, termination_reasons);
+        novarocks::service::publish_backend_query_execution_resource(
+            "native_runtime_filter_services",
+            runtime_filter_services,
+        );
     }
 
     fn increment_terminal_metric(&self, update: impl FnOnce(&mut QueryLifecycleRegistryState)) {
@@ -2839,11 +2978,11 @@ impl QueryLifecycleRegistry {
 impl InitWorkspace {
     fn install_and_publish(self) -> QueryInitAck {
         let contribution = self.entry.manifest.runtime_filter().cloned();
-        let has_runtime_filter = contribution.is_some();
-        let install_result = contribution.map_or(Ok(()), |contribution| {
+        let install_result = contribution.map_or(Ok(None), |contribution| {
             self.registry
-                .local_runtime
-                .install_runtime_filter(self.execution_id, contribution)
+                .runtime_filter_factory
+                .install(self.execution_id, contribution)
+                .map(Some)
         });
         if install_result.is_err() {
             let (reason, terminate_locally) = {
@@ -2854,7 +2993,6 @@ impl InitWorkspace {
                     .termination_reason
                     .get_or_insert(QueryTerminationReason::LocalFailure);
                 state.phase = QueryLifecyclePhase::Terminating;
-                state.runtime_filter_cleanup_required = has_runtime_filter;
                 self.entry.init_completed.notify_all();
                 (reason, terminate_locally)
             };
@@ -2887,17 +3025,16 @@ impl InitWorkspace {
             );
         }
 
+        let participant = install_result.expect("runtime-filter install result was checked");
         let terminated = {
             let mut state = self.entry.state.lock().expect("query lifecycle entry lock");
-            state.runtime_filter_installed = contribution_is_present(&self.entry);
             if state.termination_reason.is_some() {
-                if state.runtime_filter_installed {
-                    state.runtime_filter_cleanup_required = true;
-                }
+                state.runtime_filter = participant;
                 state.init_outcome = Some(QueryInitOutcome::RejectedTerminated);
                 self.entry.init_completed.notify_all();
                 true
             } else {
+                state.runtime_filter = participant;
                 state.phase = QueryLifecyclePhase::Initialized;
                 state.ever_initialized = true;
                 state.init_outcome = Some(QueryInitOutcome::Applied);
@@ -3264,10 +3401,6 @@ fn fold_metrics_locked(
         }
     }
     (snapshot, state.termination_reasons)
-}
-
-fn contribution_is_present(entry: &QueryLifecycleEntry) -> bool {
-    entry.manifest.runtime_filter().is_some()
 }
 
 const fn phase_name(phase: QueryLifecyclePhase) -> &'static str {

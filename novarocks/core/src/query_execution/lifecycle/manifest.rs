@@ -250,7 +250,10 @@ impl RuntimeFilterContribution {
         self.lifecycle
     }
 
-    pub(crate) const fn install(&self) -> &RuntimeFilterParticipantInstall {
+    /// Returns the immutable participant install carried by the lifecycle
+    /// manifest. Backend role owners consume this contract to construct their
+    /// attempt-scoped participant; it contains no mutable service state.
+    pub const fn install(&self) -> &RuntimeFilterParticipantInstall {
         &self.install
     }
 

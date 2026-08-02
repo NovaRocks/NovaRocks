@@ -19,16 +19,20 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::model::contract::BindingId;
-use crate::runtime_filter::port::identity::{ProducerSequence, ProducerStreamId};
-use crate::runtime_filter::port::ordered_bound::{OrderedTuple, RuntimeOrderContract};
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::model::contract::BindingId;
+use novarocks::runtime_filter_transition::port::identity::{ProducerSequence, ProducerStreamId};
+use novarocks::runtime_filter_transition::port::ordered_bound::{
+    OrderedTuple, RuntimeOrderContract,
+};
+use novarocks::runtime_filter_transition::port::producer::{
     RuntimeContractViolation, RuntimeContractViolationKind,
 };
-use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
+use novarocks::runtime_filter_transition::port::topk_summary::{
+    RuntimeTopKSummaryContract, TopKSummary,
+};
+use novarocks_types::UniqueId;
 
-use super::ordered_reducer::OrderedBoundDomain;
+use novarocks::runtime_filter_transition::port::value_domain::OrderedBoundDomain;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TopKApplyOutcome {
@@ -699,17 +703,21 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::runtime_filter::model::contract::{
+    use novarocks::runtime_filter_transition::model::contract::{
         BindingId, NullOrder, OrderContract, OrderKeyContract, SortDirection,
         TopKSummaryRequirement,
     };
-    use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence, ProducerStreamId};
-    use crate::runtime_filter::port::ordered_bound::{
+    use novarocks::runtime_filter_transition::port::identity::{
+        PartitionId, ProducerSequence, ProducerStreamId,
+    };
+    use novarocks::runtime_filter_transition::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, comparator_digest_for_test,
     };
-    use crate::runtime_filter::port::producer::RuntimeContractViolationKind;
-    use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
+    use novarocks::runtime_filter_transition::port::producer::RuntimeContractViolationKind;
+    use novarocks::runtime_filter_transition::port::topk_summary::{
+        RuntimeTopKSummaryContract, TopKSummary,
+    };
+    use novarocks_types::UniqueId;
 
     use super::{TopKApplyOutcome, TopKCloseOutcome, TopKSummaryReducer};
 
@@ -777,8 +785,10 @@ mod tests {
         partition: u32,
         sequence: u64,
         values: &[i64],
-    ) -> Result<TopKApplyOutcome, crate::runtime_filter::port::producer::RuntimeContractViolation>
-    {
+    ) -> Result<
+        TopKApplyOutcome,
+        novarocks::runtime_filter_transition::port::producer::RuntimeContractViolation,
+    > {
         let update = summary(reducer.contract(), values);
         let projection =
             reducer.preflight_apply(stream(partition), ProducerSequence::new(sequence), &update)?;
@@ -806,8 +816,10 @@ mod tests {
         reducer: &mut TopKSummaryReducer,
         partition: u32,
         terminal: u64,
-    ) -> Result<TopKCloseOutcome, crate::runtime_filter::port::producer::RuntimeContractViolation>
-    {
+    ) -> Result<
+        TopKCloseOutcome,
+        novarocks::runtime_filter_transition::port::producer::RuntimeContractViolation,
+    > {
         let projection =
             reducer.preflight_close(stream(partition), ProducerSequence::new(terminal))?;
         let outcome = projection.outcome();

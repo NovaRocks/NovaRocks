@@ -17,12 +17,12 @@
 
 use super::contract::RuntimeFilterPolicyRequirement;
 
-pub(crate) const MAX_ARTIFACT_BYTES: u64 = 1 << 30;
-pub(crate) const MAX_DEADLINE_MS: u64 = 86_400_000;
-pub(crate) const MAX_RETRIES: u32 = 100;
+pub const MAX_ARTIFACT_BYTES: u64 = 1 << 30;
+pub const MAX_DEADLINE_MS: u64 = 86_400_000;
+pub const MAX_RETRIES: u32 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterPolicyValidationError {
+pub enum RuntimeFilterPolicyValidationError {
     ZeroMaxContributionBytes,
     ZeroMaxArtifactBytes,
     ZeroDeadlineMs,
@@ -33,7 +33,7 @@ pub(crate) enum RuntimeFilterPolicyValidationError {
     RetriesExceedLimit,
 }
 
-pub(crate) fn validate_runtime_filter_policy(
+pub fn validate_runtime_filter_policy(
     policy: RuntimeFilterPolicyRequirement,
 ) -> Result<(), RuntimeFilterPolicyValidationError> {
     if policy.max_contribution_bytes == 0 {

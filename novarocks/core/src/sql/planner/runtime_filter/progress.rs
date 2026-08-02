@@ -22,27 +22,27 @@ use crate::sql::planner::runtime_filter::contract::{BindingId, ChannelId};
 /// Neutral projection of a planner-owned fragment input edge. The deployment
 /// compiler validates this projection against the sealed planner edge set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct FrontierEdge {
-    pub(crate) source_fragment: u32,
-    pub(crate) target_exchange_node: i32,
+pub struct FrontierEdge {
+    pub source_fragment: u32,
+    pub target_exchange_node: i32,
 }
 /// Planner-sealed proof that one hash-join producer can publish its runtime
 /// filter after only its build-side frontier completes, independent of the
 /// probe side and of the rest of the fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct JoinBuildProgressProof {
-    pub(crate) channel: ChannelId,
-    pub(crate) producer_binding: BindingId,
-    pub(crate) producer_fragment: u32,
-    pub(crate) join_node_id: i32,
-    pub(crate) build_frontier: Vec<FrontierEdge>,
-    pub(crate) non_build_inputs: Vec<FrontierEdge>,
+pub struct JoinBuildProgressProof {
+    pub channel: ChannelId,
+    pub producer_binding: BindingId,
+    pub producer_fragment: u32,
+    pub join_node_id: i32,
+    pub build_frontier: Vec<FrontierEdge>,
+    pub non_build_inputs: Vec<FrontierEdge>,
 }
 
 /// Why a join was skipped (no proof sealed). Diagnostic only; deployment keeps
 /// the coarse-grained wait edges and runs the final cycle guard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FrontierSkip {
+pub enum FrontierSkip {
     NoRfSides,
     MissingChild,
     UnauditedNode { node_id: i32 },
@@ -51,9 +51,9 @@ pub(crate) enum FrontierSkip {
 /// Planner provenance for one producer that could not seal a build-frontier
 /// proof. Deployment keeps the coarse edge and uses this only for diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct JoinBuildProgressSkip {
-    pub(crate) join_node_id: i32,
-    pub(crate) rule: FrontierSkip,
+pub struct JoinBuildProgressSkip {
+    pub join_node_id: i32,
+    pub rule: FrontierSkip,
 }
 
 type JoinBuildProgressKey = (ChannelId, BindingId, u32);
@@ -62,44 +62,40 @@ type JoinBuildProgressKey = (ChannelId, BindingId, u32);
 /// provenance share the same expected producer tuple without conflating their
 /// semantics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct JoinBuildProgressCatalog {
+pub struct JoinBuildProgressCatalog {
     proofs: BTreeMap<JoinBuildProgressKey, JoinBuildProgressProof>,
     skips: BTreeMap<JoinBuildProgressKey, JoinBuildProgressSkip>,
 }
 
 impl JoinBuildProgressCatalog {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.proofs.len() + self.skips.len()
     }
 
     #[cfg(test)]
-    pub(crate) fn values(&self) -> impl Iterator<Item = &JoinBuildProgressProof> {
+    pub fn values(&self) -> impl Iterator<Item = &JoinBuildProgressProof> {
         self.proofs.values()
     }
 
-    pub(crate) fn get(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressProof> {
+    pub fn get(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressProof> {
         self.proofs.get(key)
     }
 
-    pub(crate) fn skipped(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressSkip> {
+    pub fn skipped(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressSkip> {
         self.skips.get(key)
     }
 
-    pub(crate) fn insert_proof(
-        &mut self,
-        key: JoinBuildProgressKey,
-        proof: JoinBuildProgressProof,
-    ) {
+    pub fn insert_proof(&mut self, key: JoinBuildProgressKey, proof: JoinBuildProgressProof) {
         self.skips.remove(&key);
         self.proofs.insert(key, proof);
     }
 
-    pub(crate) fn insert_skip(&mut self, key: JoinBuildProgressKey, skip: JoinBuildProgressSkip) {
+    pub fn insert_skip(&mut self, key: JoinBuildProgressKey, skip: JoinBuildProgressSkip) {
         self.proofs.remove(&key);
         self.skips.insert(key, skip);
     }

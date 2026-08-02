@@ -31,7 +31,7 @@ use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
 /// installs (RFD-6). Distinct from RFD-2's compile-time `DeploymentError`:
 /// these are runtime phase-contract violations, not static plan defects.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DeploymentInstallError {
+pub enum DeploymentInstallError {
     /// The participant already has a deployment installed under a different epoch.
     EpochConflict { installed: u64, incoming: u64 },
     /// The coordinator produced a core view without the matching routing authority.
@@ -97,11 +97,11 @@ impl std::error::Error for DeploymentInstallError {}
 
 /// Coordinator-side install port. `RuntimeFilterInstallPort` is RFD-2's own
 /// abstraction; RFD-6 later provides the real adapter that wraps
-/// `RuntimeFilterService::install` on each participant BE. Defining the
+/// backend participant installation on each BE. Defining the
 /// contract here lets the pre-submit phase contract (participant-only
 /// install, idempotent retries, epoch-conflict rejection) be proven against a
 /// fake ahead of any live wiring.
-pub(crate) trait RuntimeFilterInstallPort: Send + Sync {
+pub trait RuntimeFilterInstallPort: Send + Sync {
     fn install(
         &self,
         query_id: UniqueId,
@@ -115,17 +115,17 @@ pub(crate) trait RuntimeFilterInstallPort: Send + Sync {
 /// into per-participant install requests. It does not own query lifecycle —
 /// The frontend query execution owner wires this into its pre-submit phase.
 #[derive(Debug, Default)]
-pub(crate) struct RuntimeFilterDeploymentExtension;
+pub struct RuntimeFilterDeploymentExtension;
 
 impl RuntimeFilterDeploymentExtension {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self
     }
 
     /// Install requests for the participants the compiler assigned an install
     /// view to (participant-only fan-out — a strict subset of the plan's live
     /// `participants`; role-less backends get no install request).
-    pub(crate) fn participant_installs(
+    pub fn participant_installs(
         &self,
         plan: &RuntimeFilterDeploymentPlan,
     ) -> Result<
@@ -177,7 +177,7 @@ impl RuntimeFilterDeploymentExtension {
 /// participant that already has a deployment installed. Used to prove the
 /// pre-submit phase contract ahead of RFD-6's real adapter.
 #[derive(Default)]
-pub(crate) struct RecordingInstallPort {
+pub struct RecordingInstallPort {
     installed: Mutex<
         BTreeMap<RuntimeFilterParticipantId, (DeploymentEpoch, RuntimeFilterParticipantInstall)>,
     >,
@@ -185,10 +185,7 @@ pub(crate) struct RecordingInstallPort {
 
 impl RecordingInstallPort {
     /// True iff every participant in `participants` has a recorded install.
-    pub(crate) fn all_installed(
-        &self,
-        participants: &BTreeSet<RuntimeFilterParticipantId>,
-    ) -> bool {
+    pub fn all_installed(&self, participants: &BTreeSet<RuntimeFilterParticipantId>) -> bool {
         let guard = self
             .installed
             .lock()

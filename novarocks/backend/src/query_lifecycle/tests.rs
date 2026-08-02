@@ -42,6 +42,9 @@ use super::registry::{
     MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleMetricsSink, QueryLifecycleRegistry,
     QueryLifecycleRegistryConfig, StageBuildDecision,
 };
+use crate::runtime_filter::participant::{
+    BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
+};
 
 const LOCAL_BACKEND_ID: u64 = 7;
 const LOCAL_START_EPOCH: u64 = 11;
@@ -199,55 +202,6 @@ impl RecordingLocalRuntime {
 }
 
 impl QueryLifecycleLocalRuntime for RecordingLocalRuntime {
-    fn install_runtime_filter(
-        &self,
-        execution_id: QueryExecutionId,
-        _contribution: RuntimeFilterContribution,
-    ) -> Result<(), QueryLifecycleError> {
-        self.state
-            .install_calls
-            .lock()
-            .expect("install calls")
-            .push(execution_id);
-        let mut gate = self.state.install_gate.lock().expect("install gate");
-        gate.entered = true;
-        self.state.install_gate_changed.notify_all();
-        while gate.block {
-            gate = self
-                .state
-                .install_gate_changed
-                .wait(gate)
-                .expect("install gate wait");
-        }
-        if *self.state.fail_install.lock().expect("fail install") {
-            Err(QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Internal,
-                "injected runtime filter install failure",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn abort_runtime_filter(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Result<(), QueryLifecycleError> {
-        self.state
-            .abort_calls
-            .lock()
-            .expect("abort calls")
-            .push(execution_id);
-        if *self.state.fail_abort.lock().expect("fail abort") {
-            Err(QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Internal,
-                "injected runtime filter abort failure",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
     fn terminate_query(
         &self,
         execution_id: QueryExecutionId,
@@ -261,6 +215,61 @@ impl QueryLifecycleLocalRuntime for RecordingLocalRuntime {
             reason,
             detail.to_string(),
         ));
+    }
+}
+
+impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
+    fn install(
+        &self,
+        execution_id: QueryExecutionId,
+        contribution: RuntimeFilterContribution,
+    ) -> Result<
+        Arc<crate::runtime_filter::participant::RuntimeFilterParticipant>,
+        QueryLifecycleError,
+    > {
+        {
+            let mut gate = self.state.install_gate.lock().expect("install gate");
+            gate.entered = true;
+            self.state.install_gate_changed.notify_all();
+            while gate.block {
+                gate = self
+                    .state
+                    .install_gate_changed
+                    .wait(gate)
+                    .expect("install gate wait");
+            }
+        }
+        self.state
+            .install_calls
+            .lock()
+            .expect("install calls")
+            .push(execution_id);
+        if *self.state.fail_install.lock().expect("fail install") {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::InvalidManifest,
+                "injected runtime-filter participant install failure",
+            ));
+        }
+        let participant =
+            BackendRuntimeFilterParticipantFactory.install(execution_id, contribution)?;
+        let state = Arc::clone(&self.state);
+        Ok(
+            participant.with_close_hook_for_test(Arc::new(move |service, _reason| {
+                state
+                    .abort_calls
+                    .lock()
+                    .expect("abort calls")
+                    .push(execution_id);
+                if *state.fail_abort.lock().expect("fail abort") {
+                    return Err(QueryLifecycleError::new(
+                        QueryLifecycleErrorCode::Internal,
+                        "injected runtime-filter participant close failure",
+                    ));
+                }
+                service.shutdown();
+                Ok(())
+            })),
+        )
     }
 }
 
@@ -362,12 +371,15 @@ fn registry_with_config(
     runtime: RecordingLocalRuntime,
     config: QueryLifecycleRegistryConfig,
 ) -> Arc<QueryLifecycleRegistry> {
-    QueryLifecycleRegistry::new_with_clock(
+    QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
         LOCAL_BACKEND_ID,
         LOCAL_START_EPOCH,
-        Arc::new(runtime),
+        Arc::new(runtime.clone()),
         config,
         Arc::new(ManualClock::default()),
+        Arc::new(RecordingMetricsSink::default()),
+        Arc::new(RejectedTerminalFallback),
+        Arc::new(runtime),
     )
 }
 
@@ -376,12 +388,15 @@ fn registry_with_clock(
     max_active_entries: usize,
     clock: Arc<ManualClock>,
 ) -> Arc<QueryLifecycleRegistry> {
-    QueryLifecycleRegistry::new_with_clock(
+    QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
         LOCAL_BACKEND_ID,
         LOCAL_START_EPOCH,
-        Arc::new(runtime),
+        Arc::new(runtime.clone()),
         registry_config(max_active_entries),
         clock,
+        Arc::new(RecordingMetricsSink::default()),
+        Arc::new(RejectedTerminalFallback),
+        Arc::new(runtime),
     )
 }
 
@@ -1151,14 +1166,17 @@ fn query_lifecycle_initializing_to_terminating_publishes_metrics_immediately() {
     let runtime = RecordingLocalRuntime::default();
     runtime.block_install();
     let metrics = Arc::new(RecordingMetricsSink::default());
-    let registry = QueryLifecycleRegistry::new_with_clock_and_metrics(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
-        Arc::new(runtime.clone()),
-        registry_config(8),
-        Arc::new(ManualClock::default()),
-        Arc::clone(&metrics) as Arc<dyn QueryLifecycleMetricsSink>,
-    );
+    let registry =
+        QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
+            LOCAL_BACKEND_ID,
+            LOCAL_START_EPOCH,
+            Arc::new(runtime.clone()),
+            registry_config(8),
+            Arc::new(ManualClock::default()),
+            Arc::clone(&metrics) as Arc<dyn QueryLifecycleMetricsSink>,
+            Arc::new(RejectedTerminalFallback),
+            Arc::new(runtime.clone()),
+        );
     let request = init_request_fixture(7, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
     let digest = request.digest();
@@ -2126,7 +2144,7 @@ fn query_lifecycle_registry_runtime_filter_install_failure_rolls_back_workspace(
         QueryInitOutcome::RejectedInvalidManifest
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
-    assert_eq!(runtime.runtime_filter_abort_calls(), 1);
+    assert_eq!(runtime.runtime_filter_abort_calls(), 0);
     assert_eq!(
         registry.phase(execution_id),
         Some(QueryLifecyclePhase::Tombstone)
@@ -2190,37 +2208,7 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
 }
 
 #[test]
-fn query_lifecycle_install_and_abort_failure_stays_terminating_until_retry() {
-    let runtime = RecordingLocalRuntime::default();
-    runtime.fail_install();
-    runtime.fail_abort();
-    let clock = Arc::new(ManualClock::default());
-    let registry = registry_with_clock(runtime.clone(), 1, Arc::clone(&clock));
-    let request = init_request_fixture(964, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
-    let execution_id = request.manifest().execution_id();
-
-    assert_eq!(
-        registry.init_query(request).outcome(),
-        QueryInitOutcome::RejectedInvalidManifest
-    );
-    assert_eq!(
-        registry.phase(execution_id),
-        Some(QueryLifecyclePhase::Terminating)
-    );
-    assert_eq!(runtime.runtime_filter_abort_calls(), 1);
-
-    runtime.allow_abort();
-    registry.sweep_expired(clock.now());
-
-    assert_eq!(
-        registry.phase(execution_id),
-        Some(QueryLifecyclePhase::Tombstone)
-    );
-    assert_eq!(runtime.runtime_filter_abort_calls(), 2);
-}
-
-#[test]
-fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_and_cleanup_once() {
+fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_without_participant() {
     let runtime = RecordingLocalRuntime::default();
     runtime.block_install();
     runtime.fail_install();
@@ -2256,7 +2244,7 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_and_clean
         registry.phase(execution_id),
         Some(QueryLifecyclePhase::Tombstone)
     );
-    assert_eq!(runtime.runtime_filter_abort_calls(), 1);
+    assert_eq!(runtime.runtime_filter_abort_calls(), 0);
     assert_eq!(
         runtime
             .state

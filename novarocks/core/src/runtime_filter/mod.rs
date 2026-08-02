@@ -16,7 +16,6 @@
 // under the License.
 
 pub(crate) mod codec;
-pub(crate) mod core;
 // RFD-6 live cutover will consume this deployment compiler; remove the allowance then.
 #[allow(dead_code)]
 pub(crate) mod deployment;
@@ -26,5 +25,5 @@ pub(crate) mod materializer;
 #[allow(dead_code)]
 pub(crate) mod model;
 pub(crate) mod port;
-pub(crate) mod router;
-pub(crate) mod service;
+#[cfg(any(test, feature = "runtime-filter-test-support"))]
+pub(crate) mod test_support;

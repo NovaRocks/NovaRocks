@@ -19,12 +19,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
-use crate::common::types::UniqueId;
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime_filter::port::events::RuntimeFilterEventSink;
-use crate::runtime_filter::port::support::{
+use novarocks::runtime::mem_tracker::MemTracker;
+use novarocks::runtime_filter_transition::port::events::RuntimeFilterEventSink;
+use novarocks::runtime_filter_transition::port::support::{
     MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
+use novarocks_types::UniqueId;
 
 use super::RuntimeFilterService;
 
@@ -115,15 +115,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    use crate::common::types::UniqueId;
-    use crate::runtime::mem_tracker::MemTracker;
-    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-    use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-    use crate::runtime_filter::port::install::{
+    use novarocks::runtime::mem_tracker::MemTracker;
+    use novarocks::runtime_filter_transition::port::events::{
+        RuntimeFilterEvent, RuntimeFilterEventSink,
+    };
+    use novarocks::runtime_filter_transition::port::identity::{
+        DeploymentEpoch, RuntimeFilterParticipantId,
+    };
+    use novarocks::runtime_filter_transition::port::install::{
         RuntimeFilterInstallView, local_participant_install_for_test,
     };
-    use crate::runtime_filter::port::producer::InstallOutcome;
-    use crate::runtime_filter::port::support::RuntimeFilterMemoryAccount;
+    use novarocks::runtime_filter_transition::port::producer::InstallOutcome;
+    use novarocks::runtime_filter_transition::port::support::RuntimeFilterMemoryAccount;
+    use novarocks_types::UniqueId;
 
     use super::MemTrackerMemoryAccount;
     use super::RuntimeFilterService;

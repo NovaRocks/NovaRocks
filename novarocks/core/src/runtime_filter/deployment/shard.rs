@@ -41,7 +41,7 @@ use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 /// channel spec, plus the per-channel completion requirement and producer→witness
 /// map the compiler pre-computes from the global graph).
 #[derive(Clone, Debug)]
-pub(crate) struct ChannelProjectionSpec {
+pub struct ChannelProjectionSpec {
     pub channel_id: ChannelId,
     pub logical_domain: RuntimeFilterLogicalDomain,
     pub lifecycle: RuntimeFilterLifecycle,
@@ -56,7 +56,7 @@ pub(crate) struct ChannelProjectionSpec {
 
 /// Consumer activation + capabilities, looked up per binding.
 #[derive(Clone, Debug)]
-pub(crate) struct ConsumerBindingFacts {
+pub struct ConsumerBindingFacts {
     pub activation: ConsumerActivation,
     pub capabilities: BTreeSet<ArtifactCapability>,
 }
@@ -108,7 +108,7 @@ fn consumer_artifact_profile(
 ///
 /// Fails with [`DeploymentError::InvalidArtifactProfile`] if a consumer's
 /// semantic capabilities cannot form a valid M2 physical artifact profile.
-pub(crate) fn project_install_views(
+pub fn project_install_views(
     epoch: DeploymentEpoch,
     role_graph: &RoleGraph,
     channel_specs: &BTreeMap<ChannelId, ChannelProjectionSpec>,

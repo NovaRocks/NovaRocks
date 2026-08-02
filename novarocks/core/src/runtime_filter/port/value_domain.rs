@@ -28,20 +28,48 @@ use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 
 use super::identity::LogicalVersion;
+use super::ordered_bound::{OrderedTuple, RuntimeOrderContract};
 use super::support::RetainedMemoryReservation;
 
-pub(crate) const FINGERPRINT_VERSION_TAG: &[u8] = b"novarocks.runtime-filter.value-domain-delta.v1";
+pub const FINGERPRINT_VERSION_TAG: &[u8] = b"novarocks.runtime-filter.value-domain-delta.v1";
 const CANONICAL_F32_NAN: u32 = 0x7fc0_0000;
 const CANONICAL_F64_NAN: u64 = 0x7ff8_0000_0000_0000;
 
+/// Immutable ordered-domain value shared by the execution predicate and the
+/// backend participant reducer.  It deliberately contains no stream or
+/// query-lifecycle state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderedBoundDomain {
+    contract: Arc<RuntimeOrderContract>,
+    bound: OrderedTuple,
+}
+
+impl OrderedBoundDomain {
+    pub fn new(contract: Arc<RuntimeOrderContract>, bound: OrderedTuple) -> Self {
+        Self { contract, bound }
+    }
+
+    pub const fn contract(&self) -> &Arc<RuntimeOrderContract> {
+        &self.contract
+    }
+
+    pub const fn bound(&self) -> &OrderedTuple {
+        &self.bound
+    }
+
+    pub fn estimated_retained_bytes(&self) -> Option<usize> {
+        self.bound.estimated_retained_bytes()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContributionSizeError {
+pub enum ContributionSizeError {
     LengthExceedsCanonicalRange,
     SizeOverflow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IntegralProjectionError {
+pub enum IntegralProjectionError {
     UnsupportedType,
     ValueOutOfRange,
 }
@@ -60,7 +88,7 @@ impl fmt::Display for ContributionSizeError {
 impl Error for ContributionSizeError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Decimal128ValidationError {
+pub enum Decimal128ValidationError {
     InvalidPrecision { precision: u8 },
     InvalidScale { precision: u8, scale: i8 },
     ValueOutOfRange { precision: u8, value: i128 },
@@ -87,7 +115,7 @@ impl fmt::Display for Decimal128ValidationError {
 impl Error for Decimal128ValidationError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Decimal128UnionError {
+pub enum Decimal128UnionError {
     TypeMismatch {
         expected_precision: u8,
         expected_scale: i8,
@@ -115,7 +143,7 @@ impl fmt::Display for Decimal128UnionError {
 impl Error for Decimal128UnionError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Decimal128Values {
+pub struct Decimal128Values {
     precision: u8,
     scale: i8,
     values: BTreeSet<i128>,
@@ -130,19 +158,19 @@ impl Decimal128Values {
         }
     }
 
-    pub(crate) const fn precision(&self) -> u8 {
+    pub const fn precision(&self) -> u8 {
         self.precision
     }
 
-    pub(crate) const fn scale(&self) -> i8 {
+    pub const fn scale(&self) -> i8 {
         self.scale
     }
 
-    pub(crate) const fn values(&self) -> &BTreeSet<i128> {
+    pub const fn values(&self) -> &BTreeSet<i128> {
         &self.values
     }
 
-    pub(crate) fn union(&mut self, incoming: &Self) -> Result<usize, Decimal128UnionError> {
+    pub fn union(&mut self, incoming: &Self) -> Result<usize, Decimal128UnionError> {
         if self.precision != incoming.precision || self.scale != incoming.scale {
             return Err(Decimal128UnionError::TypeMismatch {
                 expected_precision: self.precision,
@@ -196,10 +224,10 @@ impl CanonicalOutput for VecOutput<'_> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CanonicalF32(u32);
+pub struct CanonicalF32(u32);
 
 impl CanonicalF32 {
-    pub(crate) fn new(value: f32) -> Self {
+    pub fn new(value: f32) -> Self {
         let bits = if value == 0.0 {
             0
         } else if value.is_nan() {
@@ -224,10 +252,10 @@ impl PartialOrd for CanonicalF32 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CanonicalF64(u64);
+pub struct CanonicalF64(u64);
 
 impl CanonicalF64 {
-    pub(crate) fn new(value: f64) -> Self {
+    pub fn new(value: f64) -> Self {
         let bits = if value == 0.0 {
             0
         } else if value.is_nan() {
@@ -252,7 +280,7 @@ impl PartialOrd for CanonicalF64 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MembershipValues {
+pub enum MembershipValues {
     Boolean(BTreeSet<bool>),
     Int8(BTreeSet<i8>),
     Int16(BTreeSet<i16>),
@@ -273,7 +301,7 @@ pub(crate) enum MembershipValues {
 
 macro_rules! membership_constructor {
     ($name:ident, $variant:ident, $value:ty) => {
-        pub(crate) fn $name(values: impl IntoIterator<Item = $value>) -> Self {
+        pub fn $name(values: impl IntoIterator<Item = $value>) -> Self {
             Self::$variant(values.into_iter().collect())
         }
     };
@@ -288,38 +316,38 @@ impl MembershipValues {
     membership_constructor!(large_int, LargeInt, i128);
     membership_constructor!(date32, Date32, i32);
 
-    pub(crate) fn boolean_set(values: BTreeSet<bool>) -> Self {
+    pub fn boolean_set(values: BTreeSet<bool>) -> Self {
         Self::Boolean(values)
     }
-    pub(crate) fn int8_set(values: BTreeSet<i8>) -> Self {
+    pub fn int8_set(values: BTreeSet<i8>) -> Self {
         Self::Int8(values)
     }
-    pub(crate) fn int16_set(values: BTreeSet<i16>) -> Self {
+    pub fn int16_set(values: BTreeSet<i16>) -> Self {
         Self::Int16(values)
     }
-    pub(crate) fn int32_set(values: BTreeSet<i32>) -> Self {
+    pub fn int32_set(values: BTreeSet<i32>) -> Self {
         Self::Int32(values)
     }
-    pub(crate) fn int64_set(values: BTreeSet<i64>) -> Self {
+    pub fn int64_set(values: BTreeSet<i64>) -> Self {
         Self::Int64(values)
     }
-    pub(crate) fn large_int_set(values: BTreeSet<i128>) -> Self {
+    pub fn large_int_set(values: BTreeSet<i128>) -> Self {
         Self::LargeInt(values)
     }
-    pub(crate) fn date32_set(values: BTreeSet<i32>) -> Self {
+    pub fn date32_set(values: BTreeSet<i32>) -> Self {
         Self::Date32(values)
     }
-    pub(crate) fn float32_set(values: BTreeSet<CanonicalF32>) -> Self {
+    pub fn float32_set(values: BTreeSet<CanonicalF32>) -> Self {
         Self::Float32(values)
     }
-    pub(crate) fn float64_set(values: BTreeSet<CanonicalF64>) -> Self {
+    pub fn float64_set(values: BTreeSet<CanonicalF64>) -> Self {
         Self::Float64(values)
     }
-    pub(crate) fn utf8_set(values: BTreeSet<String>) -> Self {
+    pub fn utf8_set(values: BTreeSet<String>) -> Self {
         Self::Utf8(values)
     }
 
-    pub(crate) fn timestamp_set(
+    pub fn timestamp_set(
         unit: TimeUnit,
         timezone: Option<Arc<str>>,
         values: BTreeSet<i64>,
@@ -331,7 +359,7 @@ impl MembershipValues {
         }
     }
 
-    pub(crate) fn decimal128_set(
+    pub fn decimal128_set(
         precision: u8,
         scale: i8,
         values: BTreeSet<i128>,
@@ -342,7 +370,7 @@ impl MembershipValues {
         )))
     }
 
-    pub(crate) fn validate_decimal128_values(
+    pub fn validate_decimal128_values(
         precision: u8,
         scale: i8,
         values: &BTreeSet<i128>,
@@ -366,7 +394,7 @@ impl MembershipValues {
         Ok(())
     }
 
-    pub(crate) fn validate_decimal128_scalar(
+    pub fn validate_decimal128_scalar(
         precision: u8,
         scale: i8,
         value: i128,
@@ -386,15 +414,15 @@ impl MembershipValues {
         Ok(())
     }
 
-    pub(crate) fn float32(values: impl IntoIterator<Item = f32>) -> Self {
+    pub fn float32(values: impl IntoIterator<Item = f32>) -> Self {
         Self::Float32(values.into_iter().map(CanonicalF32::new).collect())
     }
 
-    pub(crate) fn float64(values: impl IntoIterator<Item = f64>) -> Self {
+    pub fn float64(values: impl IntoIterator<Item = f64>) -> Self {
         Self::Float64(values.into_iter().map(CanonicalF64::new).collect())
     }
 
-    pub(crate) fn utf8<I, S>(values: I) -> Self
+    pub fn utf8<I, S>(values: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -402,7 +430,7 @@ impl MembershipValues {
         Self::Utf8(values.into_iter().map(Into::into).collect())
     }
 
-    pub(crate) fn timestamp(
+    pub fn timestamp(
         unit: TimeUnit,
         timezone: Option<Arc<str>>,
         values: impl IntoIterator<Item = i64>,
@@ -414,7 +442,7 @@ impl MembershipValues {
         }
     }
 
-    pub(crate) fn decimal128(
+    pub fn decimal128(
         precision: u8,
         scale: i8,
         values: impl IntoIterator<Item = i128>,
@@ -441,7 +469,7 @@ impl MembershipValues {
         )))
     }
 
-    pub(crate) fn data_type(&self) -> DataType {
+    pub fn data_type(&self) -> DataType {
         match self {
             Self::Boolean(_) => DataType::Boolean,
             Self::Int8(_) => DataType::Int8,
@@ -460,7 +488,7 @@ impl MembershipValues {
         }
     }
 
-    pub(crate) fn empty_for_data_type(data_type: &DataType) -> Option<Self> {
+    pub fn empty_for_data_type(data_type: &DataType) -> Option<Self> {
         Some(match data_type {
             DataType::Boolean => Self::boolean([]),
             DataType::Int8 => Self::int8([]),
@@ -484,7 +512,7 @@ impl MembershipValues {
         })
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         match self {
             Self::Boolean(values) => values.len(),
             Self::Int8(values) => values.len(),
@@ -500,11 +528,11 @@ impl MembershipValues {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub(crate) fn estimated_value_bytes(&self) -> Result<usize, ContributionSizeError> {
+    pub fn estimated_value_bytes(&self) -> Result<usize, ContributionSizeError> {
         let fixed = |len: usize, width: usize| {
             len.checked_mul(width)
                 .ok_or(ContributionSizeError::SizeOverflow)
@@ -528,27 +556,24 @@ impl MembershipValues {
         }
     }
 
-    pub(crate) fn float32_bits(&self) -> Option<Vec<u32>> {
+    pub fn float32_bits(&self) -> Option<Vec<u32>> {
         match self {
             Self::Float32(values) => Some(values.iter().map(|value| value.0).collect()),
             _ => None,
         }
     }
 
-    pub(crate) fn canonical_encoded_len(&self) -> Result<usize, ContributionSizeError> {
+    pub fn canonical_encoded_len(&self) -> Result<usize, ContributionSizeError> {
         let mut output = SizeOutput::default();
         self.encode_canonical(&mut output)?;
         Ok(output.0)
     }
 
-    pub(crate) fn encode_canonical_into(
-        &self,
-        output: &mut Vec<u8>,
-    ) -> Result<(), ContributionSizeError> {
+    pub fn encode_canonical_into(&self, output: &mut Vec<u8>) -> Result<(), ContributionSizeError> {
         self.encode_canonical(&mut VecOutput(output))
     }
 
-    pub(crate) fn visit_lossless_i64(
+    pub fn visit_lossless_i64(
         &self,
         mut visit: impl FnMut(i64),
     ) -> Result<(), IntegralProjectionError> {
@@ -594,7 +619,7 @@ impl MembershipValues {
         }
     }
 
-    pub(crate) fn canonical_scalar_max_frame_len(&self) -> Result<usize, ContributionSizeError> {
+    pub fn canonical_scalar_max_frame_len(&self) -> Result<usize, ContributionSizeError> {
         let payload = match self {
             Self::Boolean(_) | Self::Int8(_) => 1,
             Self::Int16(_) => 2,
@@ -609,7 +634,7 @@ impl MembershipValues {
             .ok_or(ContributionSizeError::SizeOverflow)
     }
 
-    pub(crate) fn visit_canonical_scalar_frames(
+    pub fn visit_canonical_scalar_frames(
         &self,
         frame: &mut Vec<u8>,
         mut visit: impl FnMut(&[u8]),
@@ -797,28 +822,28 @@ fn decimal_scale_is_valid(precision: u8, scale: i8) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ContributionFingerprint([u8; 32]);
+pub struct ContributionFingerprint([u8; 32]);
 
 impl ContributionFingerprint {
-    pub(crate) const fn bytes(self) -> [u8; 32] {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ValueDomainDelta {
+pub struct ValueDomainDelta {
     values: MembershipValues,
     contains_null: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReducedMembershipDomain {
+pub struct ReducedMembershipDomain {
     values: MembershipValues,
     contains_null: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MembershipUnionError {
+pub enum MembershipUnionError {
     TypeMismatch,
 }
 
@@ -831,26 +856,26 @@ impl fmt::Display for MembershipUnionError {
 impl Error for MembershipUnionError {}
 
 impl ReducedMembershipDomain {
-    pub(crate) fn new(values: MembershipValues, contains_null: bool) -> Self {
+    pub fn new(values: MembershipValues, contains_null: bool) -> Self {
         Self {
             values,
             contains_null,
         }
     }
 
-    pub(crate) const fn values(&self) -> &MembershipValues {
+    pub const fn values(&self) -> &MembershipValues {
         &self.values
     }
 
-    pub(crate) const fn contains_null(&self) -> bool {
+    pub const fn contains_null(&self) -> bool {
         self.contains_null
     }
 
-    pub(crate) fn data_type(&self) -> DataType {
+    pub fn data_type(&self) -> DataType {
         self.values.data_type()
     }
 
-    pub(crate) fn estimated_retained_bytes(&self) -> Result<usize, ContributionSizeError> {
+    pub fn estimated_retained_bytes(&self) -> Result<usize, ContributionSizeError> {
         self.values.estimated_value_bytes().and_then(|bytes| {
             bytes
                 .checked_add(usize::from(self.contains_null))
@@ -858,7 +883,7 @@ impl ReducedMembershipDomain {
         })
     }
 
-    pub(crate) fn union_prevalidated(
+    pub fn union_prevalidated(
         &mut self,
         incoming: &MembershipValues,
         retain_null: bool,
@@ -919,12 +944,12 @@ impl ReducedMembershipDomain {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LogicalSnapshotDomain {
+pub enum LogicalSnapshotDomain {
     Membership(Arc<ReducedMembershipDomain>),
-    OrderedBound(Arc<crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain>),
+    OrderedBound(Arc<OrderedBoundDomain>),
 }
 
-pub(crate) struct LogicalSnapshot {
+pub struct LogicalSnapshot {
     channel_id: ChannelId,
     version: LogicalVersion,
     domain: LogicalSnapshotDomain,
@@ -932,7 +957,7 @@ pub(crate) struct LogicalSnapshot {
 }
 
 impl LogicalSnapshot {
-    pub(crate) fn first(
+    pub fn first(
         channel_id: ChannelId,
         domain: ReducedMembershipDomain,
         retained_memory_reservation: RetainedMemoryReservation,
@@ -945,10 +970,10 @@ impl LogicalSnapshot {
         }
     }
 
-    pub(crate) fn ordered(
+    pub fn ordered(
         channel_id: ChannelId,
         version: LogicalVersion,
-        domain: Arc<crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain>,
+        domain: Arc<OrderedBoundDomain>,
         retained_memory_reservation: RetainedMemoryReservation,
     ) -> Self {
         Self {
@@ -959,15 +984,15 @@ impl LogicalSnapshot {
         }
     }
 
-    pub(crate) const fn channel_id(&self) -> ChannelId {
+    pub const fn channel_id(&self) -> ChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn version(&self) -> LogicalVersion {
+    pub const fn version(&self) -> LogicalVersion {
         self.version
     }
 
-    pub(crate) fn domain(&self) -> &ReducedMembershipDomain {
+    pub fn domain(&self) -> &ReducedMembershipDomain {
         match &self.domain {
             LogicalSnapshotDomain::Membership(domain) => domain,
             LogicalSnapshotDomain::OrderedBound(_) => {
@@ -976,20 +1001,18 @@ impl LogicalSnapshot {
         }
     }
 
-    pub(crate) const fn logical_domain(&self) -> &LogicalSnapshotDomain {
+    pub const fn logical_domain(&self) -> &LogicalSnapshotDomain {
         &self.domain
     }
 
-    pub(crate) const fn ordered_bound(
-        &self,
-    ) -> Option<&Arc<crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain>> {
+    pub const fn ordered_bound(&self) -> Option<&Arc<OrderedBoundDomain>> {
         match &self.domain {
             LogicalSnapshotDomain::Membership(_) => None,
             LogicalSnapshotDomain::OrderedBound(domain) => Some(domain),
         }
     }
 
-    pub(crate) const fn retained_memory_bytes(&self) -> usize {
+    pub const fn retained_memory_bytes(&self) -> usize {
         self.retained_memory_reservation.bytes()
     }
 }
@@ -1010,34 +1033,34 @@ impl std::fmt::Debug for LogicalSnapshot {
 }
 
 impl ValueDomainDelta {
-    pub(crate) fn new(values: MembershipValues, contains_null: bool) -> Self {
+    pub fn new(values: MembershipValues, contains_null: bool) -> Self {
         Self {
             values,
             contains_null,
         }
     }
 
-    pub(crate) fn values(&self) -> &MembershipValues {
+    pub fn values(&self) -> &MembershipValues {
         &self.values
     }
 
-    pub(crate) fn data_type(&self) -> DataType {
+    pub fn data_type(&self) -> DataType {
         self.values.data_type()
     }
 
-    pub(crate) fn matches_data_type(&self, expected: &DataType) -> bool {
+    pub fn matches_data_type(&self, expected: &DataType) -> bool {
         self.data_type() == *expected
     }
 
-    pub(crate) const fn contains_null(&self) -> bool {
+    pub const fn contains_null(&self) -> bool {
         self.contains_null
     }
 
-    pub(crate) const fn retains_null(&self, null_semantics: NullSemantics) -> bool {
+    pub const fn retains_null(&self, null_semantics: NullSemantics) -> bool {
         self.contains_null && matches!(null_semantics, NullSemantics::NullSafeEqual)
     }
 
-    pub(crate) fn estimated_retained_bytes(
+    pub fn estimated_retained_bytes(
         &self,
         null_semantics: NullSemantics,
     ) -> Result<usize, ContributionSizeError> {
@@ -1047,24 +1070,21 @@ impl ValueDomainDelta {
             .ok_or(ContributionSizeError::SizeOverflow)
     }
 
-    pub(crate) fn estimated_contribution_bytes(&self) -> Result<usize, ContributionSizeError> {
+    pub fn estimated_contribution_bytes(&self) -> Result<usize, ContributionSizeError> {
         self.canonical_encoded_len()
     }
 
-    pub(crate) fn canonical_encoded_len(&self) -> Result<usize, ContributionSizeError> {
+    pub fn canonical_encoded_len(&self) -> Result<usize, ContributionSizeError> {
         let mut output = SizeOutput::default();
         self.encode_canonical(&mut output)?;
         Ok(output.0)
     }
 
-    pub(crate) fn encode_canonical_into(
-        &self,
-        output: &mut Vec<u8>,
-    ) -> Result<(), ContributionSizeError> {
+    pub fn encode_canonical_into(&self, output: &mut Vec<u8>) -> Result<(), ContributionSizeError> {
         self.encode_canonical(&mut VecOutput(output))
     }
 
-    pub(crate) fn fingerprint(&self) -> ContributionFingerprint {
+    pub fn fingerprint(&self) -> ContributionFingerprint {
         let mut output = DigestOutput(Sha256::new());
         self.encode_canonical(&mut output)
             .expect("addressable contribution lengths fit the canonical u64 format");

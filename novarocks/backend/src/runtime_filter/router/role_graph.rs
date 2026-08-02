@@ -17,16 +17,16 @@
 
 use std::sync::Arc;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-use crate::runtime_filter::port::identity::{DeploymentEpoch, RouteEdgeId};
-use crate::runtime_filter::port::routing::{
+use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+use novarocks::runtime_filter_transition::port::identity::{DeploymentEpoch, RouteEdgeId};
+use novarocks::runtime_filter_transition::port::routing::{
     RuntimeFilterChannelRoutingView, RuntimeFilterDeliveryRouteIntent,
     RuntimeFilterProducerRouteIntent, RuntimeFilterRemoteRoute, RuntimeFilterRouteContractError,
     RuntimeFilterRouteDecision, RuntimeFilterRoutePeer, RuntimeFilterRouteRole,
     RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
 };
-use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
+use novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelopeKind;
+use novarocks_types::UniqueId;
 
 pub(crate) struct RoleRouter {
     shard: Arc<RuntimeFilterRoutingShard>,
@@ -264,26 +264,26 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    use crate::common::types::UniqueId;
-    use crate::query_execution::backend::LiveBackendSnapshot;
-    use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime_filter::deployment::BindingInstanceIndex;
-    use crate::runtime_filter::deployment::role_graph::{
+    use novarocks::query_execution::backend::LiveBackendSnapshot;
+    use novarocks::runtime::endpoint::RuntimeEndpoint;
+    use novarocks::runtime_filter_transition::deployment::BindingInstanceIndex;
+    use novarocks::runtime_filter_transition::deployment::role_graph::{
         ChannelRoleGraph, RoleGraph, RouteEdge, RouteEndpoint, RouteKind,
     };
-    use crate::runtime_filter::deployment::routing_shard::project_routing_shards;
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-    use crate::runtime_filter::port::identity::{
+    use novarocks::runtime_filter_transition::deployment::routing_shard::project_routing_shards;
+    use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+    use novarocks::runtime_filter_transition::port::identity::{
         ContributionIdentity, DeploymentEpoch, PartitionId, ProducerSequence, ProducerStreamId,
         RouteEdgeId, RuntimeFilterParticipantId,
     };
-    use crate::runtime_filter::port::routing::{
+    use novarocks::runtime_filter_transition::port::routing::{
         RuntimeFilterChannelRoutingView, RuntimeFilterDeliveryRouteIntent,
         RuntimeFilterProducerRouteIntent, RuntimeFilterRouteContractError,
         RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer, RuntimeFilterRouteRole,
         RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
     };
-    use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
+    use novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelopeKind;
+    use novarocks_types::UniqueId;
 
     use super::RoleRouter;
 
