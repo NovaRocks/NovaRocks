@@ -609,14 +609,16 @@ fn prepare_frontend_incremental_write(
     let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
         "Iceberg MV incremental refresh requires a persisted schema contract".to_string()
     })?;
-    if schema_contract.join.is_some() {
-        return Err(
-            "MV refresh SQL preparation has not yet extracted the join incremental artifact"
-                .to_string(),
-        );
-    }
+    let is_join = schema_contract.join.is_some();
     let is_aggregate = schema_contract.aggregate.is_some();
     let is_branch_union = schema_contract.branch.is_some();
+    let join_bases = if is_join {
+        let (left, right) =
+            join_base_refs_for_schema_contract(schema_contract, &contract.base_refs)?;
+        Some((left.clone(), right.clone()))
+    } else {
+        None
+    };
     let RefreshStateBaseline::SnapshotBacked {
         previous_snapshot_ids,
         previous_table_uuids,
@@ -699,6 +701,139 @@ fn prepare_frontend_incremental_write(
         state.mv_refresh_pruning_limits,
     )?;
     drop(catalogs);
+
+    if let Some((left_ref, right_ref)) = join_bases {
+        let left_from = context
+            .rewrite
+            .previous_snapshot_ids
+            .get(&left_ref.fqn())
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "MV join incremental refresh is missing previous snapshot for {}",
+                    left_ref.fqn()
+                )
+            })?;
+        let right_from = context
+            .rewrite
+            .previous_snapshot_ids
+            .get(&right_ref.fqn())
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "MV join incremental refresh is missing previous snapshot for {}",
+                    right_ref.fqn()
+                )
+            })?;
+        let left_to = context.rewrite.pin.get(&left_ref).ok_or_else(|| {
+            format!(
+                "MV join incremental refresh is missing pinned snapshot for {}",
+                left_ref.fqn()
+            )
+        })?;
+        let right_to = context.rewrite.pin.get(&right_ref).ok_or_else(|| {
+            format!(
+                "MV join incremental refresh is missing pinned snapshot for {}",
+                right_ref.fqn()
+            )
+        })?;
+        let left_loaded = load_current_iceberg_base_table(state, &left_ref)?;
+        let right_loaded = load_current_iceberg_base_table(state, &right_ref)?;
+        let left_batch = plan_changes(&left_loaded.table, left_from, Some(left_to), &[])
+            .map_err(|error| format!("MV join left change planning failed: {error}"))?;
+        let right_batch = plan_changes(&right_loaded.table, right_from, Some(right_to), &[])
+            .map_err(|error| format!("MV join right change planning failed: {error}"))?;
+        if left_batch.current_snapshot_id != left_to || right_batch.current_snapshot_id != right_to
+        {
+            return Err(
+                "MV join incremental change planning drifted from pinned snapshots".to_string(),
+            );
+        }
+        let left_has_delete_changes = iceberg_change_batch_has_row_deletes(&left_batch);
+        let right_has_delete_changes = iceberg_change_batch_has_row_deletes(&right_batch);
+        let branches = crate::engine::mv::iceberg_join_branch::plan_join_delta_branches(
+            &left_ref,
+            &right_ref,
+            crate::engine::mv::iceberg_join_branch::SnapshotWindow {
+                from: left_from,
+                to: left_to,
+            },
+            crate::engine::mv::iceberg_join_branch::SnapshotWindow {
+                from: right_from,
+                to: right_to,
+            },
+            !left_batch.inserts.is_empty() || left_has_delete_changes,
+            !right_batch.inserts.is_empty() || right_has_delete_changes,
+        );
+        if branches.is_empty() {
+            return Ok(None);
+        }
+        let join_mode = if is_aggregate {
+            JoinIncrementalRefreshMode::Coalesce
+        } else {
+            select_join_incremental_refresh_mode(left_has_delete_changes, right_has_delete_changes)
+        };
+        let (plan, factory) =
+            plan_canonical_select_for_imv(state, &context).map_err(|error| error.message)?;
+        let logical = build_join_incremental_refresh_logical_plan(
+            &context.rewrite,
+            join_mode,
+            JoinIncrementalLogicalInput { plan, factory },
+        )?;
+        let request = crate::sql::mv_refresh::incremental::MvIncrementalWriteRequest::try_new(
+            target.catalog,
+            target.namespace,
+            target.table,
+            attempt.staging_branch.clone(),
+            current_catalog.map(str::to_string),
+            current_database.to_string(),
+            *target_snapshot_id,
+            observed_binding,
+            attempt.write_operation_id,
+            connector_context,
+        )?;
+        let marker = MvRefreshSnapshotMarker {
+            refresh_id: attempt.refresh_id,
+            mv_id: context.rewrite.mv_definition.mv_id,
+            token: attempt.marker_token.clone(),
+        };
+        let provenance_properties = build_mv_refresh_provenance(
+            &marker,
+            RefreshTechnique::Incremental,
+            build_mv_refresh_provenance_bases(
+                &context.rewrite.pin.to_snapshot_map(),
+                &context.rewrite.pin.to_table_uuid_map(),
+                &context.rewrite.previous_snapshot_ids,
+            ),
+            definition_fingerprint.clone(),
+            0,
+        )
+        .to_summary_properties()?;
+        return crate::sql::mv_refresh::incremental::MvIncrementalWritePreparer::prepare(
+            request,
+            crate::engine::mv_first_refresh_staging::frozen_logical_context(&context),
+            match join_mode {
+                JoinIncrementalRefreshMode::AppendOnly => {
+                    crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::FastAppend
+                }
+                JoinIncrementalRefreshMode::Coalesce => {
+                    crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::RowDelta
+                }
+            },
+            if is_aggregate {
+                crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::JoinAggregate
+            } else {
+                crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::None
+            },
+            crate::sql::mv_refresh::incremental::MvIncrementalExecutionArtifact::JoinLogical {
+                plan: logical.plan,
+                factory: logical.factory,
+                change_stream_override: logical.change_stream_override,
+            },
+            provenance_properties,
+        )
+        .map(Some);
+    }
 
     let loaded_bases = context
         .rewrite
@@ -819,6 +954,7 @@ fn prepare_frontend_incremental_write(
         crate::engine::mv_first_refresh_staging::frozen_logical_context(&context),
         mode,
         evidence,
+        crate::sql::mv_refresh::incremental::MvIncrementalExecutionArtifact::CanonicalQuery,
         provenance_properties,
     )
     .map(Some)
@@ -15403,7 +15539,8 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
-    let (request, facts, mode, evidence, provenance_properties) = prepared.into_parts();
+    let (request, facts, mode, evidence, execution_artifact, provenance_properties) =
+        prepared.into_parts();
     if request.observed_binding != *exact_lease.binding_key() {
         return Err("MV incremental write lease drifted from prepared binding".to_string());
     }
@@ -15427,7 +15564,6 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     };
     let base_refs = refresh_context.rewrite.base_refs.iter().collect::<Vec<_>>();
     let catalog = build_imv_refresh_catalog(state, &base_refs, &refresh_context.rewrite.pin)?;
-    let mut query = (*refresh_context.rewrite.canonical_select_query).clone();
     let rewrite_evidence = match evidence {
         crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::None => {
             RewriteMergeRefreshEvidence::None
@@ -15442,20 +15578,37 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             RewriteMergeRefreshEvidence::BranchUnionAggregate
         }
     };
-    if rewrite_evidence != RewriteMergeRefreshEvidence::None
-        && rewrite_evidence != RewriteMergeRefreshEvidence::BranchUnionAggregate
-    {
-        alias_aggregate_refresh_group_key_projection(&mut query, &refresh_context)?;
-    }
-    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
-    let imv_rewrite_input = IcebergImvRewriteInput::new(&refresh_context, rewrite_evidence);
-    let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
-        &query,
-        &catalog,
-        &refresh_context.rewrite.current_database,
-        Some(&imv_rewrite_input),
-        execution,
-    )?;
+    let planned_query = match execution_artifact {
+        crate::sql::mv_refresh::incremental::MvIncrementalExecutionArtifact::CanonicalQuery => {
+            let mut query = (*refresh_context.rewrite.canonical_select_query).clone();
+            if rewrite_evidence != RewriteMergeRefreshEvidence::None
+                && rewrite_evidence != RewriteMergeRefreshEvidence::BranchUnionAggregate
+            {
+                alias_aggregate_refresh_group_key_projection(&mut query, &refresh_context)?;
+            }
+            crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
+            let imv_rewrite_input = IcebergImvRewriteInput::new(&refresh_context, rewrite_evidence);
+            crate::engine::plan_query_for_iceberg_change_stream_refresh(
+                &query,
+                &catalog,
+                &refresh_context.rewrite.current_database,
+                Some(&imv_rewrite_input),
+                execution,
+            )?
+        }
+        crate::sql::mv_refresh::incremental::MvIncrementalExecutionArtifact::JoinLogical {
+            plan,
+            factory,
+            change_stream_override,
+        } => {
+            let mut planned =
+                crate::engine::plan_logical_for_iceberg_change_stream_refresh(plan, factory)?;
+            if let Some(change_stream) = change_stream_override {
+                planned.change_stream = change_stream;
+            }
+            planned
+        }
+    };
     let producer_branches = match mode {
         crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::FastAppend => {
             vec![ImvChangeStreamProducerBranch::FreshData]

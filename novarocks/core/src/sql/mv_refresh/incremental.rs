@@ -17,6 +17,19 @@ use novarocks_spi::connector::{
 
 use super::first_refresh::MvFirstRefreshLogicalContext;
 
+/// The logical execution shape frozen by SQL preparation. It contains no
+/// provider handle or local executor; native fragment construction remains an
+/// exact-lease activation responsibility.
+pub(crate) enum MvIncrementalExecutionArtifact {
+    CanonicalQuery,
+    JoinLogical {
+        plan: crate::sql::planner::logical::LogicalPlanNode,
+        factory: crate::sql::column_id::ColumnRefFactory,
+        change_stream_override:
+            Option<crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor>,
+    },
+}
+
 /// The Iceberg commit semantics selected from immutable change facts. The
 /// frontend can carry this value but cannot turn it into a provider operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +108,7 @@ pub struct PreparedMvIncrementalWrite {
     logical_context: MvFirstRefreshLogicalContext,
     mode: MvIncrementalWriteMode,
     evidence: MvIncrementalRewriteEvidence,
+    execution_artifact: MvIncrementalExecutionArtifact,
     provenance_properties: BTreeMap<String, String>,
 }
 
@@ -158,6 +172,7 @@ impl PreparedMvIncrementalWrite {
         MvFirstRefreshLogicalContext,
         MvIncrementalWriteMode,
         MvIncrementalRewriteEvidence,
+        MvIncrementalExecutionArtifact,
         BTreeMap<String, String>,
     ) {
         (
@@ -165,6 +180,7 @@ impl PreparedMvIncrementalWrite {
             self.logical_context,
             self.mode,
             self.evidence,
+            self.execution_artifact,
             self.provenance_properties,
         )
     }
@@ -178,6 +194,7 @@ impl MvIncrementalWritePreparer {
         logical_context: MvFirstRefreshLogicalContext,
         mode: MvIncrementalWriteMode,
         evidence: MvIncrementalRewriteEvidence,
+        execution_artifact: MvIncrementalExecutionArtifact,
         provenance_properties: BTreeMap<String, String>,
     ) -> Result<PreparedMvIncrementalWrite, String> {
         if logical_context.base_refs.is_empty() || logical_context.pin.is_empty() {
@@ -191,6 +208,7 @@ impl MvIncrementalWritePreparer {
             logical_context,
             mode,
             evidence,
+            execution_artifact,
             provenance_properties,
         })
     }
