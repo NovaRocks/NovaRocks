@@ -342,6 +342,14 @@ fn prepare_frontend_first_refresh_write(
         table: contract.target.name.clone(),
     };
     let definition = load_iceberg_mv_definition_by_target(state, &target)?;
+    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
+    let definition = rebind_mv_definition_before_refresh_derivation(
+        state,
+        &definition,
+        &contract.base_refs,
+        &target_loaded.table,
+    )
+    .map_err(IcebergMvRefreshExecutionError::into_message)?;
     let provenance_properties = frontend_refresh_provenance(
         contract,
         attempt,
@@ -353,7 +361,6 @@ fn prepare_frontend_first_refresh_write(
         "Iceberg MV first-refresh requires a persisted schema contract".to_string()
     })?;
     let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
-    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     let target_schema = target_loaded.table.metadata().current_schema();
     let target_arrow_schema = iceberg::arrow::schema_to_arrow_schema(target_schema)
         .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
@@ -758,6 +765,13 @@ fn prepare_frontend_incremental_write(
     if actual_target_snapshot_id != *target_snapshot_id {
         return Err("MV incremental refresh target snapshot drifted after planning".to_string());
     }
+    let definition = rebind_mv_definition_before_refresh_derivation(
+        state,
+        &definition,
+        &contract.base_refs,
+        &target_loaded.table,
+    )
+    .map_err(IcebergMvRefreshExecutionError::into_message)?;
     let canonical_query = canonicalize_iceberg_mv_select_query(
         &parse_mv_select_query(&definition.select_sql)?,
         current_catalog,
@@ -5004,6 +5018,16 @@ fn refresh_iceberg_mv_with_planned_partitions(
         target_table,
         base_refs,
     } = runtime;
+    // Rebind renamed base columns before the common strategy derivation.  That
+    // derivation analyzes the stored SELECT, so deferring this until a
+    // shape-specific refresh function would make a compatible field-id rename
+    // fail before the rebind decision is reached.
+    let mv_definition = rebind_mv_definition_before_refresh_derivation(
+        state,
+        &mv_definition,
+        &base_refs,
+        &target_table,
+    )?;
     if full {
         // REFRESH FULL is intentionally disabled. The previous implementation
         // dropped the target table, deleted the MV definition, and re-ran
@@ -5455,6 +5479,55 @@ fn refresh_iceberg_mv_with_planned_partitions(
             )
         },
     )
+}
+
+fn rebind_mv_definition_before_refresh_derivation(
+    state: &Arc<StandaloneState>,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[TableIdentity],
+    target_table: &iceberg::table::Table,
+) -> Result<StoredMvDefinition, IcebergMvRefreshExecutionError> {
+    let Some(contract) = mv_definition.schema_contract.as_ref() else {
+        return Ok(mv_definition.clone());
+    };
+    let caps = RefreshCapabilities::from_schema_contract(contract)?;
+    match caps.snapshot_policy {
+        BaseSnapshotPolicy::SingleBase => {
+            let [base_ref] = base_refs else {
+                return Err("single-base MV refresh has an invalid base reference set"
+                    .to_string()
+                    .into());
+            };
+            let loaded = load_current_iceberg_base_table(state, base_ref)?;
+            match validate_current_schema_contract(contract, &loaded.table, target_table) {
+                ContractDecision::Incompatible(error) => Err(format!("{error}").into()),
+                ContractDecision::CompatibleSafe => Ok(mv_definition.clone()),
+                ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
+                    let mut definition = mv_definition.clone();
+                    definition.select_sql =
+                        rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+                    Ok(definition)
+                }
+            }
+        }
+        BaseSnapshotPolicy::JoinPairPartialInitialSkip => {
+            let [left_ref, right_ref] = base_refs else {
+                return Err("join MV refresh has an invalid base reference set"
+                    .to_string()
+                    .into());
+            };
+            let left = load_current_iceberg_base_table(state, left_ref)?;
+            let right = load_current_iceberg_base_table(state, right_ref)?;
+            let decision = validate_current_join_schema_contract(
+                contract,
+                &[(left_ref, &left.table), (right_ref, &right.table)],
+                target_table,
+            )
+            .map_err(|error| error.to_string())?;
+            apply_join_schema_contract_decision(decision, mv_definition).map_err(Into::into)
+        }
+        BaseSnapshotPolicy::AllBasesRequired => Ok(mv_definition.clone()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6894,6 +6967,14 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
 
     let base_refs =
         parse_iceberg_table_refs(&mv_definition.base_table_refs).map_err(RefreshError::user)?;
+    let mv_definition = rebind_mv_definition_before_refresh_derivation(
+        state,
+        &mv_definition,
+        &base_refs,
+        &target_loaded.table,
+    )
+    .map_err(IcebergMvRefreshExecutionError::into_message)
+    .map_err(RefreshError::user)?;
     let refresh_state_baseline = build_refresh_state_baseline(
         &mv_definition,
         &target_loaded.table,
