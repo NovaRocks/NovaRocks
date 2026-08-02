@@ -4625,6 +4625,12 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
             target.catalog, target.namespace, target.table
         )
     })?;
+    if schema_contract.branch.is_some() && schema_contract.aggregate.is_some() {
+        return Err(
+            "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION does not support branch UNION ALL aggregates"
+                .to_string(),
+        );
+    }
     let caps = RefreshCapabilities::from_schema_contract(schema_contract)?;
     let support = select_repartition_shape(&caps).map_err(|err| {
         format!(
