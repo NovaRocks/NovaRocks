@@ -45,39 +45,43 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::Instant;
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::codec::artifact::{
+use crate::runtime_filter::core::channel::ChannelAction;
+use novarocks::runtime_filter_transition::codec::artifact::{
     ArtifactDecodeExpectation, ArtifactWireCodecError, encode_artifact_bundle,
     encode_completed_without_artifact, encode_unavailable, max_encoded_len_for_artifact_budget,
 };
-use crate::runtime_filter::codec::producer::encode_producer_failure;
-use crate::runtime_filter::core::channel::ChannelAction;
-use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
-use crate::runtime_filter::port::artifact::ConsumerArtifactProfile;
-use crate::runtime_filter::port::events::{
+use novarocks::runtime_filter_transition::codec::producer::encode_producer_failure;
+use novarocks::runtime_filter_transition::model::contract::{
+    BindingId, ChannelId, ConsumerActivation,
+};
+use novarocks::runtime_filter_transition::port::artifact::ConsumerArtifactProfile;
+use novarocks::runtime_filter_transition::port::events::{
     RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink, TransportEventKind,
     TransportFailOpenReason, TransportRouteEventIdentity,
 };
-use crate::runtime_filter::port::identity::RouteEdgeId;
-use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::identity::RouteEdgeId;
+use novarocks::runtime_filter_transition::port::install::RuntimeFilterParticipantInstall;
+use novarocks::runtime_filter_transition::port::producer::{
     FinalDomainProducerAdapter, InstallContractError, InstallContractErrorKind, InstallOutcome,
     OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, ProducerHandle,
     ProducerHandleWeak, ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
     SubmitOutcome, TopKSummaryProducerAdapter,
 };
-use crate::runtime_filter::port::routing::{
+use novarocks::runtime_filter_transition::port::routing::{
     RuntimeFilterDeliveryRouteIntent, RuntimeFilterProducerRouteIntent,
     RuntimeFilterRouteContractError, RuntimeFilterRouteDecision,
 };
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::subscription::{
     ArtifactDeliveryOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
 };
-use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
-use crate::runtime_filter::port::transport::{
+use novarocks::runtime_filter_transition::port::support::{
+    RuntimeFilterClock, RuntimeFilterMemoryAccount,
+};
+use novarocks::runtime_filter_transition::port::transport::{
     ProducerInstanceRouteIdentity, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
     RuntimeFilterRouteIdentity,
 };
+use novarocks_types::UniqueId;
 
 pub(crate) use self::consumer_ingress::{
     InboundConsumerDispatchError, InboundConsumerDispatchErrorKind, InboundConsumerDispatchOutcome,
@@ -423,11 +427,23 @@ struct ActionDispatcher {
     after_materialization_gate_claim: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     before_encode: Mutex<
-        Option<Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>>,
+        Option<
+            Arc<
+                dyn Fn(novarocks::runtime_filter_transition::port::artifact::ConsumerProfileId)
+                    + Send
+                    + Sync,
+            >,
+        >,
     >,
     #[cfg(test)]
     after_encode: Mutex<
-        Option<Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>>,
+        Option<
+            Arc<
+                dyn Fn(novarocks::runtime_filter_transition::port::artifact::ConsumerProfileId)
+                    + Send
+                    + Sync,
+            >,
+        >,
     >,
     #[cfg(test)]
     before_owner_finish: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -464,7 +480,7 @@ struct ChannelDispatchFlight {
 
 struct ClaimedActionMaterialization {
     installed: Arc<InstalledDeployment>,
-    snapshot: Arc<crate::runtime_filter::port::value_domain::LogicalSnapshot>,
+    snapshot: Arc<novarocks::runtime_filter_transition::port::value_domain::LogicalSnapshot>,
     jobs: Vec<ClaimedMaterializationJob>,
     launch_batch: Option<EventBatchHandle>,
 }
@@ -946,7 +962,7 @@ impl ActionDispatcher {
                     claimed.jobs,
                 ) {
                     let identity =
-                        crate::runtime_filter::port::events::ArtifactMaterializationIdentity::new(
+                        novarocks::runtime_filter_transition::port::events::ArtifactMaterializationIdentity::new(
                             work.group.common(),
                             work.group.profile().id(),
                             snapshot.version(),
@@ -1873,7 +1889,7 @@ impl RuntimeFilterService {
             binding_id,
             fragment_instance_id,
             local_partition_count,
-            crate::runtime_filter::port::identity::PartitionId::new(0),
+            novarocks::runtime_filter_transition::port::identity::PartitionId::new(0),
         )?;
         let producer_intent = RuntimeFilterProducerRouteIntent::new(
             installed.epoch(),
@@ -1936,7 +1952,7 @@ impl RuntimeFilterService {
         &self,
         installed: &Arc<InstalledDeployment>,
         route: &registry::ProducerRoute,
-        remote_route: crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute,
+        remote_route: novarocks::runtime_filter_transition::port::routing::RuntimeFilterRemoteRoute,
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
         local_partition_count: u32,
@@ -2168,9 +2184,9 @@ impl RuntimeFilterService {
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
     ) -> Result<
-        Arc<dyn crate::runtime_filter::port::subscription::BlockingSnapshotSubscription>,
+        Arc<dyn novarocks::runtime_filter_transition::port::subscription::BlockingSnapshotSubscription>,
         RuntimeContractViolation,
-    > {
+    >{
         self.subscribe(
             binding_id,
             fragment_instance_id,
@@ -2600,8 +2616,8 @@ impl RuntimeFilterService {
     #[cfg(test)]
     pub(crate) fn seed_remote_transport_for_test(
         &self,
-        route: &crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute,
-        frame: Arc<crate::runtime_filter::codec::artifact::EncodedArtifactFrame>,
+        route: &novarocks::runtime_filter_transition::port::routing::RuntimeFilterRemoteRoute,
+        frame: Arc<novarocks::runtime_filter_transition::codec::artifact::EncodedArtifactFrame>,
         identity: TransportRouteEventIdentity,
     ) {
         assert!(matches!(
@@ -2619,8 +2635,8 @@ impl RuntimeFilterService {
     pub(crate) fn admitted_transport_envelopes_for_test(
         &self,
     ) -> Vec<(
-        crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute,
-        Arc<crate::runtime_filter::port::transport::RuntimeFilterEnvelope>,
+        novarocks::runtime_filter_transition::port::routing::RuntimeFilterRemoteRoute,
+        Arc<novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelope>,
     )> {
         self.reliable_transport.admitted_envelopes_for_test()
     }
@@ -2674,8 +2690,8 @@ impl RuntimeFilterService {
         &self,
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
-        partition_id: crate::runtime_filter::port::identity::PartitionId,
-        sequence: crate::runtime_filter::port::identity::ProducerSequence,
+        partition_id: novarocks::runtime_filter_transition::port::identity::PartitionId,
+        sequence: novarocks::runtime_filter_transition::port::identity::ProducerSequence,
     ) {
         self.producer_test_handles
             .lock()
@@ -2692,7 +2708,9 @@ impl RuntimeFilterService {
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
         open_drivers: u32,
-    ) -> Option<crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer> {
+    ) -> Option<
+        novarocks::runtime_filter_transition::port::final_domain::CollectingFinalDomainTestIssuer,
+    > {
         self.producer_test_handles
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -2731,7 +2749,11 @@ impl RuntimeFilterService {
     #[cfg(test)]
     fn set_before_encode_hook(
         &self,
-        hook: Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>,
+        hook: Arc<
+            dyn Fn(novarocks::runtime_filter_transition::port::artifact::ConsumerProfileId)
+                + Send
+                + Sync,
+        >,
     ) {
         *self
             .dispatcher
@@ -2743,7 +2765,11 @@ impl RuntimeFilterService {
     #[cfg(test)]
     fn set_after_encode_hook(
         &self,
-        hook: Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>,
+        hook: Arc<
+            dyn Fn(novarocks::runtime_filter_transition::port::artifact::ConsumerProfileId)
+                + Send
+                + Sync,
+        >,
     ) {
         *self
             .dispatcher
@@ -2905,183 +2931,10 @@ fn violation(
     RuntimeContractViolation::new(kind, detail)
 }
 
-// Shared production-compiler test fixture. It lives in its own module (rather than
-// `mod tests`) so both `service::tests` and `service::inbound::tests` can build the
-// same three-backend `AllOf` deployment from the real `deployment::compiler::compile`
-// entry, never a hand-written routing shard.
+// Shared compiler-produced deployment fixture. SQL planning remains private to Core.
 #[cfg(test)]
 pub(super) mod test_support {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use arrow::datatypes::DataType;
-
-    use crate::common::types::UniqueId;
-    use crate::query_execution::backend::LiveBackendSnapshot;
-    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-    use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime_filter::deployment::compiler::compile;
-    use crate::runtime_filter::deployment::{
-        RuntimeFilterDeploymentPlan, RuntimeFilterDeploymentPolicy,
-    };
-    use crate::runtime_filter::port::identity::*;
-    use crate::runtime_filter::port::install::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-    use crate::sql::planner::distributed::{
-        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
-    };
-    use crate::sql::planner::runtime_filter::contract::*;
-    use crate::sql::planner::runtime_filter::coverage::Coverage;
-    use crate::sql::planner::runtime_filter::graph::{
-        ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation,
-        ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRole,
-        RuntimeFilterBindingSpec, RuntimeFilterChannelSpec, RuntimeFilterGraph,
-    };
-
-    pub(super) fn compiled_three_backend_all_of_plan() -> RuntimeFilterDeploymentPlan {
-        let channel_id = ChannelId::new(5);
-        let producer_binding = BindingId::new(10);
-        let consumer_binding = BindingId::new(11);
-        let witness = CoverageWitnessId::new(1);
-        let coverage = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
-        let contributions = BTreeSet::from([
-            ContributionKind::ValueDomainDelta,
-            ContributionKind::ProducerClosed,
-        ]);
-        let capabilities = BTreeSet::from([
-            ArtifactCapability::Membership,
-            ArtifactCapability::EmptyDomain,
-        ]);
-        let expression = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(1)),
-            data_type: DataType::Int64,
-            nullable: false,
-        };
-        let mut graph = RuntimeFilterGraph::default();
-        graph
-            .insert_channel(RuntimeFilterChannelSpec {
-                channel_id,
-                logical_domain: RuntimeFilterLogicalDomain::Membership {
-                    value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NeverMatches,
-                },
-                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                availability_coverage: coverage.clone(),
-                terminal_coverage: coverage,
-                reduction_requirement: ReductionRequirement::SetUnion,
-                allowed_contribution_kinds: contributions.clone(),
-                required_consumer_capabilities: capabilities.clone(),
-                policy: RuntimeFilterPolicyRequirement {
-                    max_contribution_bytes: 1024,
-                    max_artifact_bytes: 1024,
-                    deadline_ms: 100,
-                    max_retries: 1,
-                },
-            })
-            .unwrap();
-        graph
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: producer_binding,
-                channel_id,
-                coverage_witness_id: Some(witness),
-                location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(2),
-                    node_id: PlanNodeId::new(1),
-                },
-                expression: expression.clone(),
-                apply_point: ApplyPoint::NodeOutput,
-                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
-                    contribution_kinds: contributions,
-                    completion_requirement: CompletionRequirement::ProducerClosed,
-                    target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
-                }),
-            })
-            .unwrap();
-        graph
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: consumer_binding,
-                channel_id,
-                coverage_witness_id: None,
-                location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(1),
-                    node_id: PlanNodeId::new(2),
-                },
-                expression,
-                apply_point: ApplyPoint::NodeInput,
-                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
-                    capabilities,
-                    activation: ConsumerActivation::BlockingSnapshot,
-                    target: ConsumerBindingTarget::SourceBoundary,
-                }),
-            })
-            .unwrap();
-
-        let placement = |fragment_id: u32,
-                         instance_index: usize,
-                         backend_idx: usize,
-                         finst_id: UniqueId,
-                         endpoint: &str| FragmentInstancePlacement {
-            fragment_id,
-            instance_index,
-            finst_id,
-            backend_idx,
-            endpoint: RuntimeEndpoint::from_socket_addr(endpoint.parse().unwrap()),
-            scan_ranges: BTreeMap::new(),
-            connector_splits: BTreeMap::new(),
-            destinations: Vec::new(),
-            per_exch_num_senders: BTreeMap::new(),
-        };
-        let local_producer = UniqueId::new(1, 3);
-        let remote_producer = UniqueId::new(1, 4);
-        let scheduling = SchedulingPlan {
-            root_fragment_id: 1,
-            by_fragment: BTreeMap::from([
-                (
-                    1,
-                    vec![
-                        placement(1, 0, 2, UniqueId::new(1, 1), "10.0.0.2:9060"),
-                        placement(1, 1, 11, UniqueId::new(1, 2), "10.0.0.11:9060"),
-                    ],
-                ),
-                (
-                    2,
-                    vec![
-                        placement(2, 0, 2, local_producer, "10.0.0.2:9060"),
-                        placement(2, 1, 7, remote_producer, "10.0.0.7:9060"),
-                    ],
-                ),
-            ]),
-            root_finst_id: UniqueId::new(1, 1),
-            root_backend_idx: 2,
-        };
-        let edges = vec![FragmentEdge {
-            source_fragment_id: 2,
-            target_fragment_id: 1,
-            target_exchange_node_id: 1,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: Vec::new(),
-        }];
-        let backends = LiveBackendSnapshot::new(vec![
-            (2, "10.0.0.2:9060".parse().unwrap()),
-            (7, "10.0.0.7:9060".parse().unwrap()),
-            (11, "10.0.0.11:9060".parse().unwrap()),
-        ]);
-        let policy = RuntimeFilterDeploymentPolicy {
-            core_budget: RuntimeFilterCoreBudget::new(8192),
-            replica_redundancy: 2,
-            materialization: MaterializationPolicy::for_test(),
-        };
-        compile(
-            &graph,
-            &scheduling,
-            &edges,
-            &backends,
-            &policy,
-            DeploymentEpoch::new(9),
-        )
-        .unwrap()
-    }
+    pub(super) use novarocks::runtime_filter_transition::test_support::compiled_three_backend_all_of_plan;
 }
 
 #[cfg(test)]
@@ -3093,72 +2946,69 @@ pub(crate) mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::query_execution::backend::LiveBackendSnapshot;
-    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-    use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime_filter::codec::artifact::{
-        ArtifactDecodeExpectation, EncodedArtifactFrame, decode_artifact_bundle, decode_unavailable,
-    };
-    use crate::runtime_filter::codec::producer::encode_producer_failure;
-    use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
-    use crate::runtime_filter::deployment::compiler::compile;
-    use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
-    use crate::runtime_filter::materializer::codec::{ArtifactDecodeExpectations, decode_leaf};
-    use crate::runtime_filter::materializer::{MaterializationOutcome, Materializer};
-    use crate::runtime_filter::model::contract::*;
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::port::artifact::{
-        ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
-        ConsumerProfileId, PhysicalArtifact,
-    };
-    use crate::runtime_filter::port::events::{
-        ConsumerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
-        RuntimeFilterEventSink, TransportEventKind, TransportFailOpenReason,
-        TransportRouteEventIdentity,
-    };
-    use crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition;
-    use crate::runtime_filter::port::identity::*;
-    use crate::runtime_filter::port::install::*;
-    use crate::runtime_filter::port::ordered_bound::{
-        COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
-        RuntimeOrderContract, comparator_digest_for_test,
-    };
-    use crate::runtime_filter::port::producer::{
-        InstallOutcome, ProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
-        RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
-    };
-    use crate::runtime_filter::port::routing::{
-        RuntimeFilterChannelRoutingView, RuntimeFilterRemoteRoute, RuntimeFilterRouteEndpointView,
-        RuntimeFilterRoutePeer, RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView,
-        RuntimeFilterRoutingShard,
-    };
-    use crate::runtime_filter::port::subscription::{
-        ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
-        BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal, SubscriptionHandle,
-        SubscriptionKind, UnavailableReason,
-    };
-    use crate::runtime_filter::port::support::{
-        ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
-        RetainedMemoryReservation, RuntimeFilterClock, RuntimeFilterMemoryAccount,
-        TemporaryContributionLease,
-    };
-    use crate::runtime_filter::port::transport::{
-        ContributionRouteIdentity, ProducerInstanceRouteIdentity, ProducerOpenMetadata,
-        RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
-        RuntimeFilterRouteIdentity,
-    };
-    use crate::runtime_filter::port::value_domain::{
-        LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
-    };
     use crate::runtime_filter::router::loopback::LoopbackRouter;
     use crate::runtime_filter::router::remote::{
         RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome, SinkTransportError,
     };
-    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-    use crate::sql::planner::runtime_filter::{
-        contract as sql_contract, coverage::Coverage as SqlCoverage, graph as sql_graph,
+    use novarocks::runtime::endpoint::RuntimeEndpoint;
+    use novarocks::runtime_filter_transition::codec::artifact::{
+        ArtifactDecodeExpectation, EncodedArtifactFrame, decode_artifact_bundle, decode_unavailable,
     };
+    use novarocks::runtime_filter_transition::codec::producer::encode_producer_failure;
+    use novarocks::runtime_filter_transition::deployment::extension::RuntimeFilterDeploymentExtension;
+    use novarocks::runtime_filter_transition::materializer::codec::{
+        ArtifactDecodeExpectations, decode_leaf,
+    };
+    use novarocks::runtime_filter_transition::materializer::{
+        MaterializationOutcome, Materializer,
+    };
+    use novarocks::runtime_filter_transition::model::contract::*;
+    use novarocks::runtime_filter_transition::model::coverage::Coverage;
+    use novarocks::runtime_filter_transition::port::artifact::{
+        ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
+        ConsumerProfileId, PhysicalArtifact,
+    };
+    use novarocks::runtime_filter_transition::port::events::{
+        ConsumerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
+        RuntimeFilterEventSink, TransportEventKind, TransportFailOpenReason,
+        TransportRouteEventIdentity,
+    };
+    use novarocks::runtime_filter_transition::port::final_domain::FinalDomainTestIssuerTransition;
+    use novarocks::runtime_filter_transition::port::identity::*;
+    use novarocks::runtime_filter_transition::port::install::*;
+    use novarocks::runtime_filter_transition::port::ordered_bound::{
+        COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
+        RuntimeOrderContract, comparator_digest_for_test,
+    };
+    use novarocks::runtime_filter_transition::port::producer::{
+        InstallOutcome, ProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
+        RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
+    };
+    use novarocks::runtime_filter_transition::port::routing::{
+        RuntimeFilterChannelRoutingView, RuntimeFilterRemoteRoute, RuntimeFilterRouteEndpointView,
+        RuntimeFilterRoutePeer, RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView,
+        RuntimeFilterRoutingShard,
+    };
+    use novarocks::runtime_filter_transition::port::subscription::{
+        ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
+        BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal, SubscriptionHandle,
+        SubscriptionKind, UnavailableReason,
+    };
+    use novarocks::runtime_filter_transition::port::support::{
+        ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
+        RetainedMemoryReservation, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+        TemporaryContributionLease,
+    };
+    use novarocks::runtime_filter_transition::port::transport::{
+        ContributionRouteIdentity, ProducerInstanceRouteIdentity, ProducerOpenMetadata,
+        RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
+        RuntimeFilterRouteIdentity,
+    };
+    use novarocks::runtime_filter_transition::port::value_domain::{
+        LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
+    };
+    use novarocks::runtime_filter_transition::test_support::compiled_fenced_final_fixture;
+    use novarocks_types::UniqueId;
 
     use super::materialization::MaterializationWorkClaim;
     use super::memory::MemTrackerMemoryAccount;
@@ -3167,7 +3017,8 @@ pub(crate) mod tests {
     use super::subscription::SubscriptionGroup;
     use super::{
         ActionDispatcher, ArtifactDeliveryError, ChannelAction, EventBatchCompletion, EventEmitter,
-        PendingDispatch, RuntimeFilterService, run_materialization_jobs,
+        InboundConsumerDispatchOutcome, PendingDispatch, RuntimeFilterService,
+        run_materialization_jobs,
     };
 
     #[derive(Default)]
@@ -3628,7 +3479,7 @@ pub(crate) mod tests {
                 max_retries: 2,
             },
             RuntimeFilterCoreBudget::new(8192),
-            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
+            novarocks::runtime_filter_transition::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(producer_binding),
                 ProducerDeployment::new(witness, producer_instances.into_iter().map(uid).collect()),
@@ -4100,137 +3951,7 @@ pub(crate) mod tests {
     }
 
     pub(super) fn compiled_fenced_final_install() -> RuntimeFilterParticipantInstall {
-        let deployment = fenced_final_deployment();
-        let expression = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(1)),
-            data_type: DataType::Int64,
-            nullable: false,
-        };
-        let mut graph = sql_graph::RuntimeFilterGraph::default();
-        graph
-            .insert_channel(sql_graph::RuntimeFilterChannelSpec {
-                channel_id: sql_contract::ChannelId::new(deployment.channel_id().get()),
-                logical_domain: sql_contract::RuntimeFilterLogicalDomain::Membership {
-                    value_type: DataType::Int64,
-                    null_semantics: sql_contract::NullSemantics::NullSafeEqual,
-                },
-                lifecycle: sql_contract::RuntimeFilterLifecycle::CompleteOnce,
-                availability_coverage: SqlCoverage::AllOf(vec![SqlCoverage::Leaf(
-                    sql_contract::CoverageWitnessId::new(101),
-                )]),
-                terminal_coverage: SqlCoverage::AllOf(vec![SqlCoverage::Leaf(
-                    sql_contract::CoverageWitnessId::new(101),
-                )]),
-                reduction_requirement: sql_contract::ReductionRequirement::SetUnion,
-                allowed_contribution_kinds: BTreeSet::from([
-                    sql_contract::ContributionKind::FinalDomainShard,
-                    sql_contract::ContributionKind::ProducerClosed,
-                ]),
-                required_consumer_capabilities: BTreeSet::from([
-                    sql_contract::ArtifactCapability::Membership,
-                    sql_contract::ArtifactCapability::EmptyDomain,
-                ]),
-                policy: sql_contract::RuntimeFilterPolicyRequirement {
-                    max_contribution_bytes: deployment.policy().max_contribution_bytes,
-                    max_artifact_bytes: deployment.policy().max_artifact_bytes,
-                    deadline_ms: deployment.policy().deadline_ms,
-                    max_retries: deployment.policy().max_retries,
-                },
-            })
-            .unwrap();
-        graph
-            .insert_binding(sql_graph::RuntimeFilterBindingSpec {
-                binding_id: sql_contract::BindingId::new(10),
-                channel_id: sql_contract::ChannelId::new(1),
-                coverage_witness_id: Some(sql_contract::CoverageWitnessId::new(101)),
-                location: sql_graph::PlanLocation {
-                    fragment_id: sql_contract::PlanFragmentId::new(0),
-                    node_id: sql_contract::PlanNodeId::new(1),
-                },
-                expression: expression.clone(),
-                apply_point: sql_graph::ApplyPoint::NodeOutput,
-                role: sql_graph::RuntimeFilterBindingRole::Producer(
-                    sql_graph::ProducerRequirement {
-                        contribution_kinds: BTreeSet::from([
-                            sql_contract::ContributionKind::FinalDomainShard,
-                            sql_contract::ContributionKind::ProducerClosed,
-                        ]),
-                        completion_requirement:
-                            sql_contract::CompletionRequirement::FencedFinalDomain(
-                                sql_contract::CompletionFenceKind::CommittedDomainFrozen,
-                            ),
-                        target: sql_graph::ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
-                    },
-                ),
-            })
-            .unwrap();
-        graph
-            .insert_binding(sql_graph::RuntimeFilterBindingSpec {
-                binding_id: sql_contract::BindingId::new(30),
-                channel_id: sql_contract::ChannelId::new(1),
-                coverage_witness_id: None,
-                location: sql_graph::PlanLocation {
-                    fragment_id: sql_contract::PlanFragmentId::new(0),
-                    node_id: sql_contract::PlanNodeId::new(2),
-                },
-                expression,
-                apply_point: sql_graph::ApplyPoint::NodeInput,
-                role: sql_graph::RuntimeFilterBindingRole::Consumer(
-                    sql_graph::ConsumerRequirement {
-                        capabilities: BTreeSet::from([
-                            sql_contract::ArtifactCapability::Membership,
-                            sql_contract::ArtifactCapability::EmptyDomain,
-                        ]),
-                        activation: sql_contract::ConsumerActivation::NonBlockingLive {
-                            late_apply: sql_contract::LateApplyGranularity::Batch,
-                        },
-                        target: sql_graph::ConsumerBindingTarget::SourceBoundary,
-                    },
-                ),
-            })
-            .unwrap();
-        let placement = FragmentInstancePlacement {
-            fragment_id: 0,
-            instance_index: 0,
-            finst_id: uid(10),
-            backend_idx: 0,
-            endpoint: RuntimeEndpoint::from_socket_addr("127.0.0.1:9060".parse().unwrap()),
-            scan_ranges: BTreeMap::new(),
-            connector_splits: BTreeMap::new(),
-            destinations: Vec::new(),
-            per_exch_num_senders: BTreeMap::new(),
-        };
-        let scheduling = SchedulingPlan {
-            root_fragment_id: 0,
-            by_fragment: BTreeMap::from([(0, vec![placement])]),
-            root_finst_id: uid(10),
-            root_backend_idx: 0,
-        };
-        let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
-        let policy = RuntimeFilterDeploymentPolicy {
-            core_budget: deployment.core_budget(),
-            replica_redundancy: 1,
-            materialization: deployment.materialization_policy(),
-        };
-        let mut plan = compile(
-            &graph,
-            &scheduling,
-            &[],
-            &backends,
-            &policy,
-            DeploymentEpoch::new(9),
-        )
-        .unwrap();
-        let participant = RuntimeFilterParticipantId::new(1);
-        let core_view = plan
-            .install_views
-            .remove(&participant)
-            .expect("compiler projects the colocated aggregate install view");
-        let routing_shard = plan
-            .routing_shards
-            .remove(&participant)
-            .expect("compiler projects the matching routing shard");
-        RuntimeFilterParticipantInstall::new(core_view, routing_shard)
+        compiled_fenced_final_fixture().into_install()
     }
 
     pub(super) fn compiled_three_backend_all_of_aggregator_install()
@@ -4242,7 +3963,8 @@ pub(crate) mod tests {
         // identities are deliberately nonzero, so the compiler projects backend N
         // as participant N + 1 rather than preserving the backend index verbatim.
         let remote_participant =
-            crate::runtime_filter::deployment::participant_id_for_backend(7).unwrap();
+            novarocks::runtime_filter_transition::deployment::participant_id_for_backend(7)
+                .unwrap();
         let mut plan = super::test_support::compiled_three_backend_all_of_plan();
         let aggregator = plan
             .routing_shards
@@ -4279,9 +4001,9 @@ pub(crate) mod tests {
         channel: RuntimeFilterChannelDeployment,
     ) -> RuntimeFilterParticipantInstall {
         let mut grouped = BTreeMap::<
-            crate::runtime_filter::port::artifact::ConsumerProfileId,
+            novarocks::runtime_filter_transition::port::artifact::ConsumerProfileId,
             (
-                crate::runtime_filter::port::artifact::ConsumerArtifactProfile,
+                novarocks::runtime_filter_transition::port::artifact::ConsumerArtifactProfile,
                 BTreeSet<RouteEdgeId>,
             ),
         >::new();
@@ -4465,7 +4187,7 @@ pub(crate) mod tests {
             base.completion_requirement(),
             base.policy(),
             base.core_budget(),
-            crate::runtime_filter::port::install::MaterializationPolicy::new(
+            novarocks::runtime_filter_transition::port::install::MaterializationPolicy::new(
                 8,
                 5,
                 17,
@@ -5911,7 +5633,7 @@ pub(crate) mod tests {
             direct_route,
             RuntimeFilterEnvelopeKind::Contribution,
         );
-        crate::runtime_filter::deployment::install_validation::validate_participant_install(
+        novarocks::runtime_filter_transition::deployment::install_validation::validate_participant_install(
             &direct,
         )
         .expect_err("direct delivery rejects contribution-family authority");
@@ -5945,7 +5667,7 @@ pub(crate) mod tests {
                 .collect::<BTreeSet<_>>();
             for (route_edge_id, extra) in edges {
                 let mutated = install_with_extra_route_kind(install.clone(), route_edge_id, extra);
-                crate::runtime_filter::deployment::install_validation::validate_participant_install(
+                novarocks::runtime_filter_transition::deployment::install_validation::validate_participant_install(
                     &mutated,
                 )
                 .expect_err("To/FromAggregator edges reject cross-family authority");
@@ -8972,7 +8694,7 @@ pub(crate) mod tests {
         envelopes: Mutex<
             Vec<(
                 RouteEdgeId,
-                crate::runtime_filter::port::transport::RuntimeFilterEnvelope,
+                novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelope,
             )>,
         >,
         completions: Mutex<VecDeque<SinkCompletion>>,
@@ -8983,7 +8705,7 @@ pub(crate) mod tests {
         fn try_send(
             &self,
             route: RuntimeFilterRemoteRoute,
-            envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
+            envelope: novarocks::runtime_filter_transition::port::transport::RuntimeFilterTransportEnvelope,
         ) -> SinkSubmitOutcome {
             let envelope = envelope.envelope().clone();
             let hook = self
@@ -9051,7 +8773,7 @@ pub(crate) mod tests {
             &self,
         ) -> Vec<(
             RouteEdgeId,
-            crate::runtime_filter::port::transport::RuntimeFilterEnvelope,
+            novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelope,
         )> {
             self.envelopes
                 .lock()
@@ -9074,7 +8796,7 @@ pub(crate) mod tests {
         fn try_send(
             &self,
             _route: RuntimeFilterRemoteRoute,
-            _envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
+            _envelope: novarocks::runtime_filter_transition::port::transport::RuntimeFilterTransportEnvelope,
         ) -> SinkSubmitOutcome {
             self.send_entered.send(()).expect("transport call entered");
             if let Some(release) = self
@@ -9931,7 +9653,7 @@ pub(crate) mod tests {
 
     // A compiler-produced consumer-delivery composite. The routing authority (delivery
     // route edge id, remote producer source) is projected entirely by the production
-    // `deployment::compiler::compile`; only the consumer core-view entry the compiler
+    // the compiler-produced fixture; only the consumer Core-view entry
     // defers to RFD-4 (`project_install_views` is loopback-only) is supplied so the
     // authorized delivery can land in a real subscription.
     struct CompilerConsumerDeliveryFixture {
@@ -10047,69 +9769,55 @@ pub(crate) mod tests {
 
     #[test]
     fn consumer_delivery_compiler_fixture_remote_source_reaches_subscription() {
-        use crate::runtime::query_context::{QueryContextManager, QueryId};
-        use crate::runtime_filter::codec::artifact::{
+        use novarocks::runtime_filter_transition::codec::artifact::{
             encode_artifact_bundle, max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
         };
-        use crate::runtime_filter::port::transport::{
-            DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
-            RuntimeFilterRouteIdentity,
+        use novarocks::runtime_filter_transition::port::transport::{
+            DeliveryRouteIdentity, RuntimeFilterEnvelope, RuntimeFilterRouteIdentity,
         };
-        use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
 
-        let fixture = compiler_consumer_delivery_fixture();
+        let compiler_fixture = compiler_consumer_delivery_fixture();
         // The compiled plan is genuinely distributed: the artifact's producer source is a
         // different backend than the consumer participant receiving the delivery.
         assert_ne!(
-            fixture.remote_source_participant, fixture.consumer_participant,
+            compiler_fixture.remote_source_participant, compiler_fixture.consumer_participant,
             "the delivered artifact's source must be a remote participant"
         );
 
-        const QUERY: QueryId = QueryId::new(71, 72);
         let query_uid = UniqueId::new(71, 72);
-        let epoch = fixture.install.epoch();
-
-        let manager = QueryContextManager::new_for_test();
-        manager
-            .get_or_register_native(
-                QUERY,
-                false,
-                Duration::from_secs(30),
-                Duration::from_secs(30),
-            )
-            .expect("register native query context");
-        let service = manager
-            .runtime_filter_service_for_ingress(QUERY)
-            .expect("registered query exposes a runtime filter service");
+        let epoch = compiler_fixture.install.epoch();
+        let service_fixture = fixture();
+        let service = &service_fixture.service;
         assert_eq!(
-            service.install(fixture.install).unwrap(),
+            service.install(compiler_fixture.install).unwrap(),
             InstallOutcome::Installed
         );
 
         // Materialize a real bundle for the consumer profile and encode it to a wire frame.
-        let bundle =
-            service_outbound_delivery_membership_bundle(&fixture.profile, fixture.channel_id);
+        let bundle = service_outbound_delivery_membership_bundle(
+            &compiler_fixture.profile,
+            compiler_fixture.channel_id,
+        );
         let ceiling =
             max_encoded_len_for_artifact_budget(semantic_artifact_bytes(&bundle).unwrap()).unwrap();
         let (digest, payload) = encode_artifact_bundle(
             &bundle,
-            ArtifactDecodeExpectation::new(&fixture.profile),
+            ArtifactDecodeExpectation::new(&compiler_fixture.profile),
             ceiling,
         )
         .unwrap()
         .into_parts();
 
-        // Submit the remote Artifact envelope through the production query-scoped gRPC
-        // ingress adapter (lookup -> dispatch_inbound_consumer).
-        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager.clone());
+        // Submit the remote Artifact envelope through the Backend Service ingress seam.
+        // Query-attempt lookup and authorization are covered by QLC owner tests.
         let envelope = RuntimeFilterEnvelope::try_new(
             RuntimeFilterEnvelopeKind::Artifact,
             query_uid,
-            fixture.channel_id,
+            compiler_fixture.channel_id,
             epoch,
             RuntimeFilterRouteIdentity::delivery(
                 DeliveryRouteIdentity::try_new(
-                    fixture.delivery_route_edge,
+                    compiler_fixture.delivery_route_edge,
                     ProducerSequence::new(1),
                 )
                 .unwrap(),
@@ -10121,18 +9829,16 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(
-            ingress.accept(envelope).accept_status(),
-            RuntimeFilterAcceptStatus::Accepted,
+            service.dispatch_inbound_consumer(envelope).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
         );
 
         // Route-authorization (against the compiler routing shard) -> decode -> deliver
         // formed one chain: the real subscription now retains the logically-equal artifact.
-        let delivered = manager
-            .runtime_filter_service_for_ingress(QUERY)
-            .expect("installed query exposes a runtime filter service")
+        let delivered = service
             .subscribe(
-                fixture.consumer_binding,
-                fixture.consumer_finst,
+                compiler_fixture.consumer_binding,
+                compiler_fixture.consumer_finst,
                 SubscriptionKind::BlockingSnapshot,
             )
             .expect("compiler consumer binding is subscribable")
@@ -10456,7 +10162,7 @@ pub(crate) mod tests {
     fn remote_final_encode_allocator_rejection_fails_open_without_query_error() {
         let fixture = remote_producer_fixture(DataType::Int64, 1024);
         let producer = open_remote_membership(&fixture, 1).unwrap();
-        let outcome = crate::runtime_filter::codec::contribution::with_rejecting_contribution_allocator_for_test(
+        let outcome = novarocks::runtime_filter_transition::codec::contribution::with_rejecting_contribution_allocator_for_test(
             || {
                 producer.submit(
                     PartitionId::new(0),
@@ -11137,7 +10843,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reliable_transport_fixture_send_then_ack_releases_and_records_the_lifecycle() {
-        use crate::runtime_filter::port::transport::{
+        use novarocks::runtime_filter_transition::port::transport::{
             DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterRouteIdentity,
         };
 
@@ -11273,61 +10979,47 @@ pub(crate) mod tests {
 
     #[test]
     fn reliable_transport_fixture_duplicate_wire_identity_answers_duplicate() {
-        use crate::runtime::query_context::{QueryContextManager, QueryId};
-        use crate::runtime_filter::codec::artifact::{
+        use novarocks::runtime_filter_transition::codec::artifact::{
             encode_artifact_bundle, max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
         };
-        use crate::runtime_filter::port::transport::{
-            DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
-            RuntimeFilterRouteIdentity,
+        use novarocks::runtime_filter_transition::port::transport::{
+            DeliveryRouteIdentity, RuntimeFilterEnvelope, RuntimeFilterRouteIdentity,
         };
-        use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
 
-        let fixture = compiler_consumer_delivery_fixture();
-        const QUERY: QueryId = QueryId::new(81, 82);
+        let compiler_fixture = compiler_consumer_delivery_fixture();
         let query_uid = UniqueId::new(81, 82);
-        let epoch = fixture.install.epoch();
-
-        let manager = QueryContextManager::new_for_test();
-        manager
-            .get_or_register_native(
-                QUERY,
-                false,
-                Duration::from_secs(30),
-                Duration::from_secs(30),
-            )
-            .expect("register native query context");
-        let service = manager
-            .runtime_filter_service_for_ingress(QUERY)
-            .expect("registered query exposes a runtime filter service");
+        let epoch = compiler_fixture.install.epoch();
+        let service_fixture = fixture();
+        let service = &service_fixture.service;
         assert_eq!(
-            service.install(fixture.install).unwrap(),
+            service.install(compiler_fixture.install).unwrap(),
             InstallOutcome::Installed
         );
 
-        let bundle =
-            service_outbound_delivery_membership_bundle(&fixture.profile, fixture.channel_id);
+        let bundle = service_outbound_delivery_membership_bundle(
+            &compiler_fixture.profile,
+            compiler_fixture.channel_id,
+        );
         let ceiling =
             max_encoded_len_for_artifact_budget(semantic_artifact_bytes(&bundle).unwrap()).unwrap();
         let (digest, payload) = encode_artifact_bundle(
             &bundle,
-            ArtifactDecodeExpectation::new(&fixture.profile),
+            ArtifactDecodeExpectation::new(&compiler_fixture.profile),
             ceiling,
         )
         .unwrap()
         .into_parts();
 
-        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager.clone());
         // Same wire route identity (edge + transport sequence) each time.
         let envelope = || {
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::Artifact,
                 query_uid,
-                fixture.channel_id,
+                compiler_fixture.channel_id,
                 epoch,
                 RuntimeFilterRouteIdentity::delivery(
                     DeliveryRouteIdentity::try_new(
-                        fixture.delivery_route_edge,
+                        compiler_fixture.delivery_route_edge,
                         ProducerSequence::new(1),
                     )
                     .unwrap(),
@@ -11343,73 +11035,59 @@ pub(crate) mod tests {
         // The first arrival is accepted; an exact at-least-once wire retry (identical
         // route edge + transport sequence) is absorbed as Duplicate, never re-applied.
         assert_eq!(
-            ingress.accept(envelope()).accept_status(),
-            RuntimeFilterAcceptStatus::Accepted,
+            service.dispatch_inbound_consumer(envelope()).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
         );
         assert_eq!(
-            ingress.accept(envelope()).accept_status(),
-            RuntimeFilterAcceptStatus::Duplicate,
+            service.dispatch_inbound_consumer(envelope()).unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate,
         );
     }
 
     #[test]
     fn reliable_transport_fixture_out_of_order_arrival_absorbed_by_logical_identity() {
-        use crate::runtime::query_context::{QueryContextManager, QueryId};
-        use crate::runtime_filter::codec::artifact::{
+        use novarocks::runtime_filter_transition::codec::artifact::{
             encode_artifact_bundle, max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
         };
-        use crate::runtime_filter::port::transport::{
-            DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
-            RuntimeFilterRouteIdentity,
+        use novarocks::runtime_filter_transition::port::transport::{
+            DeliveryRouteIdentity, RuntimeFilterEnvelope, RuntimeFilterRouteIdentity,
         };
-        use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
 
-        let fixture = compiler_consumer_delivery_fixture();
-        const QUERY: QueryId = QueryId::new(91, 92);
+        let compiler_fixture = compiler_consumer_delivery_fixture();
         let query_uid = UniqueId::new(91, 92);
-        let epoch = fixture.install.epoch();
-
-        let manager = QueryContextManager::new_for_test();
-        manager
-            .get_or_register_native(
-                QUERY,
-                false,
-                Duration::from_secs(30),
-                Duration::from_secs(30),
-            )
-            .expect("register native query context");
-        let service = manager
-            .runtime_filter_service_for_ingress(QUERY)
-            .expect("registered query exposes a runtime filter service");
+        let epoch = compiler_fixture.install.epoch();
+        let service_fixture = fixture();
+        let service = &service_fixture.service;
         assert_eq!(
-            service.install(fixture.install).unwrap(),
+            service.install(compiler_fixture.install).unwrap(),
             InstallOutcome::Installed
         );
 
-        let bundle =
-            service_outbound_delivery_membership_bundle(&fixture.profile, fixture.channel_id);
+        let bundle = service_outbound_delivery_membership_bundle(
+            &compiler_fixture.profile,
+            compiler_fixture.channel_id,
+        );
         let ceiling =
             max_encoded_len_for_artifact_budget(semantic_artifact_bytes(&bundle).unwrap()).unwrap();
         let (digest, payload) = encode_artifact_bundle(
             &bundle,
-            ArtifactDecodeExpectation::new(&fixture.profile),
+            ArtifactDecodeExpectation::new(&compiler_fixture.profile),
             ceiling,
         )
         .unwrap()
         .into_parts();
 
-        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager.clone());
         // Same logical artifact (same `(route_edge, version)`) arriving under two DIFFERENT
         // transport sequences, out of order (the later sequence first).
         let arrival = |sequence: u64| {
             RuntimeFilterEnvelope::try_new(
                 RuntimeFilterEnvelopeKind::Artifact,
                 query_uid,
-                fixture.channel_id,
+                compiler_fixture.channel_id,
                 epoch,
                 RuntimeFilterRouteIdentity::delivery(
                     DeliveryRouteIdentity::try_new(
-                        fixture.delivery_route_edge,
+                        compiler_fixture.delivery_route_edge,
                         ProducerSequence::new(sequence),
                     )
                     .unwrap(),
@@ -11424,15 +11102,15 @@ pub(crate) mod tests {
 
         // Transport sequence 2 arrives first and is accepted.
         assert_eq!(
-            ingress.accept(arrival(2)).accept_status(),
-            RuntimeFilterAcceptStatus::Accepted,
+            service.dispatch_inbound_consumer(arrival(2)).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
         );
         // Transport sequence 1 arrives afterward (out of order): the transport-identity gate
         // admits the fresh sequence, but the stable logical `(route_edge, version)` identity
         // absorbs it as Duplicate — never delivered or applied twice.
         assert_eq!(
-            ingress.accept(arrival(1)).accept_status(),
-            RuntimeFilterAcceptStatus::Duplicate,
+            service.dispatch_inbound_consumer(arrival(1)).unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate,
         );
     }
 

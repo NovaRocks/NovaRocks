@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod artifact;
+pub mod artifact;
 pub(crate) mod binding;
-pub(crate) mod events;
-pub(crate) mod final_domain;
-pub(crate) mod identity;
-pub(crate) mod install;
-pub(crate) mod ordered_bound;
-pub(crate) mod producer;
-pub(crate) mod routing;
-pub(crate) mod subscription;
-pub(crate) mod support;
-pub(crate) mod topk_summary;
-pub(crate) mod transport;
-pub(crate) mod value_domain;
+pub mod events;
+pub mod final_domain;
+pub mod identity;
+pub mod install;
+pub mod ordered_bound;
+pub mod producer;
+pub mod routing;
+pub mod subscription;
+pub mod support;
+pub mod topk_summary;
+pub mod transport;
+pub mod value_domain;

@@ -15,6 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod contract;
-pub(crate) mod coverage;
+pub mod contract;
+pub mod coverage;
 pub(crate) mod policy;

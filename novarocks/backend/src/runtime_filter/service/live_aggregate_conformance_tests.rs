@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,65 +25,43 @@ use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime_filter as execution;
 use novarocks_execution::runtime_filter::RuntimeFilterSession;
 
-use crate::common::ids::SlotId;
-use crate::common::types::UniqueId;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::operators::{AggregateFinalDomainSessionBuilder, AggregateProcessorFactory};
-use crate::exec::pipeline::operator::Operator;
-use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::query_execution::backend::LiveBackendSnapshot;
-use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime::runtime_state::RuntimeState;
-use crate::runtime_filter::deployment::{RuntimeFilterDeploymentPolicy, compiler};
-use crate::runtime_filter::model::contract::{
-    ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
-    ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
-    PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
-    RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
-};
-use crate::runtime_filter::model::coverage::Coverage;
-use crate::runtime_filter::port::artifact::{
+use novarocks::common::ids::SlotId;
+use novarocks::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+use novarocks::exec::expr::{ExprArena, ExprNode};
+use novarocks::exec::operators::{AggregateFinalDomainSessionBuilder, AggregateProcessorFactory};
+use novarocks::exec::pipeline::operator::Operator;
+use novarocks::exec::pipeline::operator_factory::OperatorFactory;
+use novarocks::runtime::runtime_state::RuntimeState;
+use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
+use novarocks::runtime_filter_transition::port::artifact::{
     ArtifactBundle, ArtifactKind, ResidentMembershipIndexView,
 };
-use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-use crate::runtime_filter::port::identity::{
-    DeploymentEpoch, LogicalVersion, RuntimeFilterParticipantId,
+use novarocks::runtime_filter_transition::port::events::{
+    RuntimeFilterEvent, RuntimeFilterEventSink,
 };
-use crate::runtime_filter::port::install::{
-    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterParticipantInstall,
-};
-use crate::runtime_filter::port::producer::InstallOutcome;
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::identity::{DeploymentEpoch, LogicalVersion};
+use novarocks::runtime_filter_transition::port::install::RuntimeFilterParticipantInstall;
+use novarocks::runtime_filter_transition::port::producer::{InstallOutcome, ProducerPortKind};
+use novarocks::runtime_filter_transition::port::subscription::{
     LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription, UnavailableReason,
 };
-use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
-use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-use crate::sql::planner::distributed::{
-    DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+use novarocks::runtime_filter_transition::port::support::{
+    RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
-use crate::sql::planner::runtime_filter::{
-    contract as sql_contract, coverage::Coverage as SqlCoverage, graph as sql_graph,
-};
+use novarocks::runtime_filter_transition::test_support::compiled_live_final_domain_fixture;
+use novarocks_types::UniqueId;
 
 use super::RuntimeFilterService;
 use super::memory::MemTrackerMemoryAccount;
 use super::native_execution::NativeRuntimeFilterExecutionContext;
 
-const CHANNEL: ChannelId = ChannelId::new(401);
-const PRODUCER_A: BindingId = BindingId::new(410);
-const PRODUCER_B: BindingId = BindingId::new(420);
-const CONSUMER: BindingId = BindingId::new(430);
-const WITNESS_A: CoverageWitnessId = CoverageWitnessId::new(411);
-const WITNESS_B: CoverageWitnessId = CoverageWitnessId::new(421);
-const PRODUCER_FRAGMENT_A: PlanFragmentId = PlanFragmentId::new(41);
-const PRODUCER_FRAGMENT_B: PlanFragmentId = PlanFragmentId::new(42);
-const CONSUMER_FRAGMENT: PlanFragmentId = PlanFragmentId::new(43);
-const INSTANCE_A: UniqueId = UniqueId::new(406, 10);
-const INSTANCE_B: UniqueId = UniqueId::new(406, 20);
-const CONSUMER_INSTANCE: UniqueId = UniqueId::new(406, 30);
-const PARTICIPANT: RuntimeFilterParticipantId = RuntimeFilterParticipantId::new(1);
+const CHANNEL: ChannelId = ChannelId::new(1);
+const PRODUCER_A: BindingId = BindingId::new(10);
+const PRODUCER_B: BindingId = BindingId::new(20);
+const CONSUMER: BindingId = BindingId::new(30);
+const INSTANCE_A: UniqueId = UniqueId::new(94, 10);
+const INSTANCE_B: UniqueId = UniqueId::new(94, 20);
+const CONSUMER_INSTANCE: UniqueId = UniqueId::new(94, 30);
 const AGGREGATE_DOP: i32 = 2;
 const GROUP_SLOT: SlotId = SlotId::new(401);
 
@@ -92,13 +69,6 @@ const GROUP_SLOT: SlotId = SlotId::new(401);
 enum Witness {
     A,
     B,
-}
-
-struct ProducerFixture {
-    binding: BindingId,
-    witness: CoverageWitnessId,
-    fragment: PlanFragmentId,
-    instance: UniqueId,
 }
 
 struct DeterministicClock(Instant);
@@ -129,11 +99,7 @@ impl WitnessProcessors {
             instance,
         );
         let resolved = context
-            .resolve_producer(
-                binding,
-                CHANNEL,
-                crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain,
-            )
+            .resolve_producer(binding, CHANNEL, ProducerPortKind::FinalDomain)
             .expect("compiler-installed final-domain producer resolves");
         let request = execution::RuntimeFilterFinalDomainOpenRequest::new(
             execution::RuntimeFilterProducerContract::new(
@@ -207,18 +173,23 @@ struct LiveAggregateHarness {
 
 impl LiveAggregateHarness {
     fn new() -> Self {
-        let producers = producer_fixtures();
-        let graph = aggregate_graph(&producers);
-        let scheduling = scheduling_plan(&producers);
-        let edges = fragment_edges(&producers);
-        let service = install_service(compile_participant_install(&graph, &scheduling, &edges));
+        let fixture = compiled_live_final_domain_fixture();
+        assert_eq!(fixture.channel_id(), CHANNEL);
+        assert_eq!(fixture.producers().len(), 2);
+        assert_eq!(fixture.producers()[0].binding_id(), PRODUCER_A);
+        assert_eq!(fixture.producers()[0].instance_id(), INSTANCE_A);
+        assert_eq!(fixture.producers()[1].binding_id(), PRODUCER_B);
+        assert_eq!(fixture.producers()[1].instance_id(), INSTANCE_B);
+        assert_eq!(fixture.consumer().binding_id(), CONSUMER);
+        assert_eq!(fixture.consumer().instance_id(), CONSUMER_INSTANCE);
+        let service = install_service(fixture.into_install());
         let producer_a = WitnessProcessors::open(&service, PRODUCER_A, INSTANCE_A);
         let producer_b = WitnessProcessors::open(&service, PRODUCER_B, INSTANCE_B);
         let live = service
             .subscribe(
                 CONSUMER,
                 CONSUMER_INSTANCE,
-                crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive,
+                novarocks::runtime_filter_transition::port::subscription::SubscriptionKind::NonBlockingLive,
             )
             .expect("compiler-installed aggregate consumer subscribes")
             .into_live()
@@ -251,209 +222,6 @@ impl Drop for LiveAggregateHarness {
     fn drop(&mut self) {
         self.service.cancel();
     }
-}
-
-fn producer_fixtures() -> [ProducerFixture; 2] {
-    [
-        ProducerFixture {
-            binding: PRODUCER_A,
-            witness: WITNESS_A,
-            fragment: PRODUCER_FRAGMENT_A,
-            instance: INSTANCE_A,
-        },
-        ProducerFixture {
-            binding: PRODUCER_B,
-            witness: WITNESS_B,
-            fragment: PRODUCER_FRAGMENT_B,
-            instance: INSTANCE_B,
-        },
-    ]
-}
-
-fn expression() -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Int(1)),
-        data_type: DataType::Int64,
-        nullable: false,
-    }
-}
-
-fn aggregate_graph(producers: &[ProducerFixture]) -> sql_graph::RuntimeFilterGraph {
-    let capabilities = BTreeSet::from([
-        sql_contract::ArtifactCapability::Membership,
-        sql_contract::ArtifactCapability::EmptyDomain,
-    ]);
-    let contributions = BTreeSet::from([
-        sql_contract::ContributionKind::FinalDomainShard,
-        sql_contract::ContributionKind::ProducerClosed,
-    ]);
-    let coverage = SqlCoverage::AllOf(
-        producers
-            .iter()
-            .map(|producer| {
-                SqlCoverage::Leaf(sql_contract::CoverageWitnessId::new(producer.witness.get()))
-            })
-            .collect(),
-    );
-    let mut graph = sql_graph::RuntimeFilterGraph::default();
-    graph
-        .insert_channel(sql_graph::RuntimeFilterChannelSpec {
-            channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-            logical_domain: sql_contract::RuntimeFilterLogicalDomain::Membership {
-                value_type: DataType::Int64,
-                null_semantics: sql_contract::NullSemantics::NullSafeEqual,
-            },
-            lifecycle: sql_contract::RuntimeFilterLifecycle::CompleteOnce,
-            availability_coverage: coverage.clone(),
-            terminal_coverage: coverage,
-            reduction_requirement: sql_contract::ReductionRequirement::SetUnion,
-            allowed_contribution_kinds: contributions.clone(),
-            required_consumer_capabilities: capabilities.clone(),
-            policy: sql_contract::RuntimeFilterPolicyRequirement {
-                max_contribution_bytes: 4096,
-                max_artifact_bytes: 4096,
-                deadline_ms: 1000,
-                max_retries: 1,
-            },
-        })
-        .expect("insert aggregate channel");
-    for (index, producer) in producers.iter().enumerate() {
-        graph
-            .insert_binding(sql_graph::RuntimeFilterBindingSpec {
-                binding_id: sql_contract::BindingId::new(producer.binding.get()),
-                channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-                coverage_witness_id: Some(sql_contract::CoverageWitnessId::new(
-                    producer.witness.get(),
-                )),
-                location: sql_graph::PlanLocation {
-                    fragment_id: sql_contract::PlanFragmentId::new(producer.fragment.get()),
-                    node_id: sql_contract::PlanNodeId::new(index as i32 + 1),
-                },
-                expression: expression(),
-                apply_point: sql_graph::ApplyPoint::NodeOutput,
-                role: sql_graph::RuntimeFilterBindingRole::Producer(
-                    sql_graph::ProducerRequirement {
-                        contribution_kinds: contributions.clone(),
-                        completion_requirement:
-                            sql_contract::CompletionRequirement::FencedFinalDomain(
-                                sql_contract::CompletionFenceKind::CommittedDomainFrozen,
-                            ),
-                        target: sql_graph::ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
-                    },
-                ),
-            })
-            .expect("insert aggregate producer binding");
-    }
-    graph
-        .insert_binding(sql_graph::RuntimeFilterBindingSpec {
-            binding_id: sql_contract::BindingId::new(CONSUMER.get()),
-            channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-            coverage_witness_id: None,
-            location: sql_graph::PlanLocation {
-                fragment_id: sql_contract::PlanFragmentId::new(CONSUMER_FRAGMENT.get()),
-                node_id: sql_contract::PlanNodeId::new(30),
-            },
-            expression: expression(),
-            apply_point: sql_graph::ApplyPoint::NodeInput,
-            role: sql_graph::RuntimeFilterBindingRole::Consumer(sql_graph::ConsumerRequirement {
-                capabilities,
-                activation: sql_contract::ConsumerActivation::NonBlockingLive {
-                    late_apply: sql_contract::LateApplyGranularity::Batch,
-                },
-                target: sql_graph::ConsumerBindingTarget::SourceBoundary,
-            }),
-        })
-        .expect("insert aggregate consumer binding");
-    graph
-        .validate()
-        .expect("live aggregate graph validates before compilation");
-    graph
-}
-
-fn fixture_endpoint() -> SocketAddr {
-    "127.0.0.1:9460".parse().expect("fixture endpoint is valid")
-}
-
-fn placement(fragment: PlanFragmentId, instance: UniqueId) -> FragmentInstancePlacement {
-    FragmentInstancePlacement {
-        fragment_id: fragment.get(),
-        instance_index: 0,
-        finst_id: instance,
-        backend_idx: 0,
-        endpoint: RuntimeEndpoint::from_socket_addr(fixture_endpoint()),
-        scan_ranges: BTreeMap::new(),
-        connector_splits: BTreeMap::new(),
-        destinations: Vec::new(),
-        per_exch_num_senders: BTreeMap::new(),
-    }
-}
-
-fn scheduling_plan(producers: &[ProducerFixture]) -> SchedulingPlan {
-    let mut by_fragment = producers
-        .iter()
-        .map(|producer| {
-            (
-                producer.fragment.get(),
-                vec![placement(producer.fragment, producer.instance)],
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    by_fragment.insert(
-        CONSUMER_FRAGMENT.get(),
-        vec![placement(CONSUMER_FRAGMENT, CONSUMER_INSTANCE)],
-    );
-    SchedulingPlan {
-        root_fragment_id: CONSUMER_FRAGMENT.get(),
-        by_fragment,
-        root_finst_id: CONSUMER_INSTANCE,
-        root_backend_idx: 0,
-    }
-}
-
-fn fragment_edges(producers: &[ProducerFixture]) -> Vec<FragmentEdge> {
-    producers
-        .iter()
-        .enumerate()
-        .map(|(index, producer)| FragmentEdge {
-            source_fragment_id: producer.fragment.get(),
-            target_fragment_id: CONSUMER_FRAGMENT.get(),
-            target_exchange_node_id: index as i32 + 1,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: Vec::new(),
-        })
-        .collect()
-}
-
-fn compile_participant_install(
-    graph: &sql_graph::RuntimeFilterGraph,
-    scheduling: &SchedulingPlan,
-    edges: &[FragmentEdge],
-) -> RuntimeFilterParticipantInstall {
-    let backends = LiveBackendSnapshot::from_endpoints(vec![fixture_endpoint()]);
-    let policy = RuntimeFilterDeploymentPolicy {
-        core_budget: RuntimeFilterCoreBudget::new(16 * 1024),
-        replica_redundancy: backends.entries().len() as u32,
-        materialization: MaterializationPolicy::for_test(),
-    };
-    let mut plan = compiler::compile(
-        graph,
-        scheduling,
-        edges,
-        &backends,
-        &policy,
-        DeploymentEpoch::new(1),
-    )
-    .expect("aggregate graph compiles against the live placement");
-    RuntimeFilterParticipantInstall::new(
-        plan.install_views
-            .remove(&PARTICIPANT)
-            .expect("compiler projects the aggregate service install"),
-        plan.routing_shards
-            .remove(&PARTICIPANT)
-            .expect("compiler projects the aggregate service routes"),
-    )
 }
 
 fn install_service(install: RuntimeFilterParticipantInstall) -> Arc<RuntimeFilterService> {

@@ -16,10 +16,10 @@
 // under the License.
 
 pub(crate) mod compiler;
-pub(crate) mod extension;
-pub(crate) mod install_validation;
+pub mod extension;
+pub mod install_validation;
 pub(crate) mod planning_adapter;
-pub(crate) mod role_graph;
+pub mod role_graph;
 pub(crate) mod routing_shard;
 pub(crate) mod shard;
 pub(crate) mod wait_for;
@@ -76,7 +76,7 @@ pub(crate) struct RuntimeFilterQueryDeploymentPolicy {
     pub(crate) install_rpc_deadline: Duration,
 }
 
-pub(crate) type BindingInstanceIndex =
+pub type BindingInstanceIndex =
     BTreeMap<(ChannelId, BindingId, RuntimeFilterParticipantId), BTreeSet<UniqueId>>;
 
 /// Static contract failures. Every variant is caught before fragment submission.
@@ -223,7 +223,7 @@ pub(crate) fn participant_id_for_backend(
 /// topology, while `install_views` and `routing_shards` carry the per-participant
 /// views compiled atomically under the same deployment epoch.
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeFilterDeploymentPlan {
+pub struct RuntimeFilterDeploymentPlan {
     pub epoch: DeploymentEpoch,
     pub participants: BTreeSet<RuntimeFilterParticipantId>,
     pub install_views: BTreeMap<RuntimeFilterParticipantId, RuntimeFilterInstallView>,

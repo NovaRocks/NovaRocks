@@ -16,70 +16,61 @@
 // under the License.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::datatypes::DataType;
 
-use crate::common::types::UniqueId;
-use crate::query_execution::backend::LiveBackendSnapshot;
-use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
-use crate::runtime_filter::deployment::compiler;
-use crate::runtime_filter::materializer::codec::{
+use novarocks::runtime_filter_transition::materializer::codec::{
     ArtifactDecodeExpectations, decode_leaf, encode_physical_leaf,
 };
-use crate::runtime_filter::model::contract::{
-    ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
-    ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder,
-    NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
-    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-    RuntimeFilterPolicyRequirement, SortDirection, TopKSummaryRequirement,
+use novarocks::runtime_filter_transition::model::contract::{
+    BindingId, ChannelId, NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
+    TopKSummaryRequirement,
 };
-use crate::runtime_filter::model::coverage::Coverage;
-use crate::runtime_filter::port::artifact::{
+use novarocks::runtime_filter_transition::port::artifact::{
     ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
     PhysicalArtifact,
 };
-use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-use crate::runtime_filter::port::final_domain::{
+use novarocks::runtime_filter_transition::port::events::{
+    RuntimeFilterEvent, RuntimeFilterEventSink,
+};
+use novarocks::runtime_filter_transition::port::final_domain::{
     CollectingFinalDomainTestIssuer, FinalDomainTestIssuerTransition, FrozenFinalDomainTestIssuer,
 };
-use crate::runtime_filter::port::identity::{
+use novarocks::runtime_filter_transition::port::identity::{
     DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence, ProducerStreamId,
-    RuntimeFilterParticipantId,
 };
-use crate::runtime_filter::port::install::{
-    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterParticipantInstall,
-};
-use crate::runtime_filter::port::ordered_bound::{
+use novarocks::runtime_filter_transition::port::install::RuntimeFilterParticipantInstall;
+use novarocks::runtime_filter_transition::port::ordered_bound::{
     COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
     RuntimeOrderContract, comparator_digest_for_test,
 };
-use crate::runtime_filter::port::producer::{
+use novarocks::runtime_filter_transition::port::producer::{
     FinalDomainProducerAdapter, InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter,
     ProducerHandle, ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
     SubmitOutcome, TopKSummaryProducerAdapter,
 };
-use crate::runtime_filter::port::subscription::{
+use novarocks::runtime_filter_transition::port::subscription::{
     BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription,
     SubscriptionHandle, SubscriptionKind, UnavailableReason,
 };
-use crate::runtime_filter::port::support::{
+use novarocks::runtime_filter_transition::port::support::{
     ArtifactRetainedBudget, MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
-use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
-use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
-use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-use crate::sql::planner::distributed::{
-    DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+use novarocks::runtime_filter_transition::port::topk_summary::{
+    RuntimeTopKSummaryContract, TopKSummary,
 };
-use crate::sql::planner::runtime_filter::{
-    contract as sql_contract, coverage::Coverage as SqlCoverage, graph as sql_graph,
+use novarocks::runtime_filter_transition::port::value_domain::{
+    MembershipValues, ValueDomainDelta,
 };
+use novarocks::runtime_filter_transition::test_support::{
+    CompiledRuntimeFilterServiceFixture, RuntimeFilterFixtureCoverage,
+    compiled_fenced_final_fixture, compiled_live_final_domain_fixture,
+    compiled_membership_service_fixture, compiled_ordered_bound_fixture, compiled_topk_fixture,
+};
+use novarocks_types::UniqueId;
 
 use super::RuntimeFilterService;
 use super::memory::MemTrackerMemoryAccount;
@@ -88,142 +79,8 @@ const CHANNEL: ChannelId = ChannelId::new(1);
 const PRODUCER_A: BindingId = BindingId::new(10);
 const PRODUCER_B: BindingId = BindingId::new(20);
 const CONSUMER: BindingId = BindingId::new(30);
-const WITNESS_A: CoverageWitnessId = CoverageWitnessId::new(101);
-const WITNESS_B: CoverageWitnessId = CoverageWitnessId::new(102);
-const PRODUCER_FRAGMENT_A: PlanFragmentId = PlanFragmentId::new(1);
-const PRODUCER_FRAGMENT_B: PlanFragmentId = PlanFragmentId::new(2);
-const CONSUMER_FRAGMENT: PlanFragmentId = PlanFragmentId::new(3);
 const INSTANCE_A: UniqueId = UniqueId::new(94, 10);
 const INSTANCE_B: UniqueId = UniqueId::new(94, 20);
-const CONSUMER_INSTANCE: UniqueId = UniqueId::new(94, 30);
-const PARTICIPANT: RuntimeFilterParticipantId = RuntimeFilterParticipantId::new(1);
-
-fn sql_coverage(value: &Coverage) -> SqlCoverage {
-    match value {
-        Coverage::Leaf(witness) => {
-            SqlCoverage::Leaf(sql_contract::CoverageWitnessId::new(witness.get()))
-        }
-        Coverage::AllOf(children) => {
-            SqlCoverage::AllOf(children.iter().map(sql_coverage).collect())
-        }
-        Coverage::AnyOf(children) => {
-            SqlCoverage::AnyOf(children.iter().map(sql_coverage).collect())
-        }
-    }
-}
-
-fn sql_contributions(
-    values: &BTreeSet<ContributionKind>,
-) -> BTreeSet<sql_contract::ContributionKind> {
-    values
-        .iter()
-        .map(|value| match value {
-            ContributionKind::ValueDomainDelta => sql_contract::ContributionKind::ValueDomainDelta,
-            ContributionKind::FinalDomainShard => sql_contract::ContributionKind::FinalDomainShard,
-            ContributionKind::OrderedBoundUpdate => {
-                sql_contract::ContributionKind::OrderedBoundUpdate
-            }
-            ContributionKind::TopKSummary => sql_contract::ContributionKind::TopKSummary,
-            ContributionKind::ProducerClosed => sql_contract::ContributionKind::ProducerClosed,
-        })
-        .collect()
-}
-
-fn sql_capabilities(
-    values: &BTreeSet<ArtifactCapability>,
-) -> BTreeSet<sql_contract::ArtifactCapability> {
-    values
-        .iter()
-        .map(|value| match value {
-            ArtifactCapability::Membership => sql_contract::ArtifactCapability::Membership,
-            ArtifactCapability::OrderedRange => sql_contract::ArtifactCapability::OrderedRange,
-            ArtifactCapability::EmptyDomain => sql_contract::ArtifactCapability::EmptyDomain,
-        })
-        .collect()
-}
-
-fn sql_activation(value: ConsumerActivation) -> sql_contract::ConsumerActivation {
-    match value {
-        ConsumerActivation::BlockingSnapshot => sql_contract::ConsumerActivation::BlockingSnapshot,
-        ConsumerActivation::NonBlockingLive { late_apply } => {
-            sql_contract::ConsumerActivation::NonBlockingLive {
-                late_apply: match late_apply {
-                    LateApplyGranularity::Row => sql_contract::LateApplyGranularity::Row,
-                    LateApplyGranularity::Batch => sql_contract::LateApplyGranularity::Batch,
-                    LateApplyGranularity::RowGroup => sql_contract::LateApplyGranularity::RowGroup,
-                    LateApplyGranularity::Split => sql_contract::LateApplyGranularity::Split,
-                    LateApplyGranularity::File => sql_contract::LateApplyGranularity::File,
-                },
-            }
-        }
-    }
-}
-
-fn sql_policy() -> sql_contract::RuntimeFilterPolicyRequirement {
-    sql_contract::RuntimeFilterPolicyRequirement {
-        max_contribution_bytes: 4096,
-        max_artifact_bytes: 4096,
-        deadline_ms: 1000,
-        max_retries: 1,
-    }
-}
-
-fn sql_producer_binding(
-    producer: &ProducerFixture,
-    contribution_kinds: BTreeSet<sql_contract::ContributionKind>,
-    completion_requirement: sql_contract::CompletionRequirement,
-    node_id: i32,
-) -> sql_graph::RuntimeFilterBindingSpec {
-    sql_graph::RuntimeFilterBindingSpec {
-        binding_id: sql_contract::BindingId::new(producer.binding.get()),
-        channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-        coverage_witness_id: Some(sql_contract::CoverageWitnessId::new(producer.witness.get())),
-        location: sql_graph::PlanLocation {
-            fragment_id: sql_contract::PlanFragmentId::new(producer.fragment.get()),
-            node_id: sql_contract::PlanNodeId::new(node_id),
-        },
-        expression: expression(),
-        apply_point: sql_graph::ApplyPoint::NodeOutput,
-        role: sql_graph::RuntimeFilterBindingRole::Producer(sql_graph::ProducerRequirement {
-            contribution_kinds,
-            completion_requirement,
-            target: sql_graph::ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
-        }),
-    }
-}
-
-fn sql_consumer_binding(
-    capabilities: BTreeSet<sql_contract::ArtifactCapability>,
-    activation: sql_contract::ConsumerActivation,
-) -> sql_graph::RuntimeFilterBindingSpec {
-    sql_graph::RuntimeFilterBindingSpec {
-        binding_id: sql_contract::BindingId::new(CONSUMER.get()),
-        channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-        coverage_witness_id: None,
-        location: sql_graph::PlanLocation {
-            fragment_id: sql_contract::PlanFragmentId::new(CONSUMER_FRAGMENT.get()),
-            node_id: sql_contract::PlanNodeId::new(30),
-        },
-        expression: expression(),
-        apply_point: sql_graph::ApplyPoint::NodeInput,
-        role: sql_graph::RuntimeFilterBindingRole::Consumer(sql_graph::ConsumerRequirement {
-            capabilities,
-            activation,
-            target: sql_graph::ConsumerBindingTarget::SourceBoundary,
-        }),
-    }
-}
-
-fn fixture_backend_idx() -> usize {
-    usize::try_from(PARTICIPANT.get() - 1).expect("fixture participant fits backend identity")
-}
-
-struct ProducerFixture {
-    binding: BindingId,
-    witness: CoverageWitnessId,
-    fragment: PlanFragmentId,
-    instance: UniqueId,
-}
 
 struct MembershipHarness {
     service: Arc<RuntimeFilterService>,
@@ -290,235 +147,6 @@ impl RuntimeFilterEventSink for RecordingEvents {
     }
 }
 
-fn producer_fixtures() -> [ProducerFixture; 2] {
-    [
-        ProducerFixture {
-            binding: PRODUCER_A,
-            witness: WITNESS_A,
-            fragment: PRODUCER_FRAGMENT_A,
-            instance: INSTANCE_A,
-        },
-        ProducerFixture {
-            binding: PRODUCER_B,
-            witness: WITNESS_B,
-            fragment: PRODUCER_FRAGMENT_B,
-            instance: INSTANCE_B,
-        },
-    ]
-}
-
-fn expression() -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Int(1)),
-        data_type: DataType::Int64,
-        nullable: false,
-    }
-}
-
-fn membership_graph(
-    coverage: Coverage,
-    producers: &[ProducerFixture],
-    activation: ConsumerActivation,
-) -> sql_graph::RuntimeFilterGraph {
-    let capabilities = BTreeSet::from([
-        ArtifactCapability::Membership,
-        ArtifactCapability::EmptyDomain,
-    ]);
-    let contributions = BTreeSet::from([
-        ContributionKind::ValueDomainDelta,
-        ContributionKind::ProducerClosed,
-    ]);
-    let mut graph = sql_graph::RuntimeFilterGraph::default();
-    graph
-        .insert_channel(sql_graph::RuntimeFilterChannelSpec {
-            channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-            logical_domain: sql_contract::RuntimeFilterLogicalDomain::Membership {
-                value_type: DataType::Int64,
-                null_semantics: sql_contract::NullSemantics::NeverMatches,
-            },
-            lifecycle: sql_contract::RuntimeFilterLifecycle::CompleteOnce,
-            availability_coverage: sql_coverage(&coverage),
-            terminal_coverage: sql_coverage(&coverage),
-            reduction_requirement: sql_contract::ReductionRequirement::SetUnion,
-            allowed_contribution_kinds: sql_contributions(&contributions),
-            required_consumer_capabilities: sql_capabilities(&capabilities),
-            policy: sql_policy(),
-        })
-        .unwrap();
-    for (index, producer) in producers.iter().enumerate() {
-        graph
-            .insert_binding(sql_producer_binding(
-                producer,
-                sql_contributions(&contributions),
-                sql_contract::CompletionRequirement::ProducerClosed,
-                index as i32 + 1,
-            ))
-            .unwrap();
-    }
-    graph
-        .insert_binding(sql_consumer_binding(
-            sql_capabilities(&capabilities),
-            sql_activation(activation),
-        ))
-        .unwrap();
-    graph
-        .validate()
-        .expect("M4 fixture graph must pass RFD-1 validation before compilation");
-    graph
-}
-
-fn aggregate_graph(producers: &[ProducerFixture]) -> sql_graph::RuntimeFilterGraph {
-    let capabilities = BTreeSet::from([
-        ArtifactCapability::Membership,
-        ArtifactCapability::EmptyDomain,
-    ]);
-    let contributions = BTreeSet::from([
-        ContributionKind::FinalDomainShard,
-        ContributionKind::ProducerClosed,
-    ]);
-    let coverage = Coverage::AllOf(
-        producers
-            .iter()
-            .map(|producer| Coverage::Leaf(producer.witness))
-            .collect(),
-    );
-    let mut graph = sql_graph::RuntimeFilterGraph::default();
-    graph
-        .insert_channel(sql_graph::RuntimeFilterChannelSpec {
-            channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-            logical_domain: sql_contract::RuntimeFilterLogicalDomain::Membership {
-                value_type: DataType::Int64,
-                null_semantics: sql_contract::NullSemantics::NullSafeEqual,
-            },
-            lifecycle: sql_contract::RuntimeFilterLifecycle::CompleteOnce,
-            availability_coverage: sql_coverage(&coverage),
-            terminal_coverage: sql_coverage(&coverage),
-            reduction_requirement: sql_contract::ReductionRequirement::SetUnion,
-            allowed_contribution_kinds: sql_contributions(&contributions),
-            required_consumer_capabilities: sql_capabilities(&capabilities),
-            policy: sql_policy(),
-        })
-        .unwrap();
-    for (index, producer) in producers.iter().enumerate() {
-        graph
-            .insert_binding(sql_producer_binding(
-                producer,
-                sql_contributions(&contributions),
-                sql_contract::CompletionRequirement::FencedFinalDomain(
-                    sql_contract::CompletionFenceKind::CommittedDomainFrozen,
-                ),
-                index as i32 + 1,
-            ))
-            .unwrap();
-    }
-    graph
-        .insert_binding(sql_consumer_binding(
-            sql_capabilities(&capabilities),
-            sql_contract::ConsumerActivation::NonBlockingLive {
-                late_apply: sql_contract::LateApplyGranularity::Batch,
-            },
-        ))
-        .unwrap();
-    graph
-        .validate()
-        .expect("Aggregate fixture graph must pass RFD-1 validation before compilation");
-    graph
-}
-
-fn placement(
-    fragment: PlanFragmentId,
-    instance_index: usize,
-    instance: UniqueId,
-    endpoint: SocketAddr,
-) -> FragmentInstancePlacement {
-    FragmentInstancePlacement {
-        fragment_id: fragment.get(),
-        instance_index,
-        finst_id: instance,
-        backend_idx: fixture_backend_idx(),
-        endpoint: RuntimeEndpoint::from_socket_addr(endpoint),
-        scan_ranges: BTreeMap::new(),
-        connector_splits: BTreeMap::new(),
-        destinations: Vec::new(),
-        per_exch_num_senders: BTreeMap::new(),
-    }
-}
-
-fn scheduling_plan(producers: &[ProducerFixture]) -> SchedulingPlan {
-    let endpoint = fixture_endpoint();
-    let mut by_fragment = producers
-        .iter()
-        .map(|producer| {
-            (
-                producer.fragment.get(),
-                vec![placement(producer.fragment, 0, producer.instance, endpoint)],
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    by_fragment.insert(
-        CONSUMER_FRAGMENT.get(),
-        vec![placement(CONSUMER_FRAGMENT, 0, CONSUMER_INSTANCE, endpoint)],
-    );
-    SchedulingPlan {
-        root_fragment_id: CONSUMER_FRAGMENT.get(),
-        by_fragment,
-        root_finst_id: CONSUMER_INSTANCE,
-        root_backend_idx: fixture_backend_idx(),
-    }
-}
-
-fn fixture_endpoint() -> SocketAddr {
-    "127.0.0.1:9060".parse().unwrap()
-}
-
-fn fragment_edges(producers: &[ProducerFixture]) -> Vec<FragmentEdge> {
-    producers
-        .iter()
-        .enumerate()
-        .map(|(index, producer)| FragmentEdge {
-            source_fragment_id: producer.fragment.get(),
-            target_fragment_id: CONSUMER_FRAGMENT.get(),
-            target_exchange_node_id: index as i32 + 1,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: Vec::new(),
-        })
-        .collect()
-}
-
-fn compile_participant_install(
-    graph: &sql_graph::RuntimeFilterGraph,
-    scheduling: &SchedulingPlan,
-    edges: &[FragmentEdge],
-    participant: RuntimeFilterParticipantId,
-) -> RuntimeFilterParticipantInstall {
-    let backends = LiveBackendSnapshot::from_endpoints(vec![fixture_endpoint()]);
-    let policy = RuntimeFilterDeploymentPolicy {
-        core_budget: RuntimeFilterCoreBudget::new(16 * 1024),
-        replica_redundancy: backends.entries().len() as u32,
-        materialization: MaterializationPolicy::for_test(),
-    };
-    let mut plan = compiler::compile(
-        graph,
-        scheduling,
-        edges,
-        &backends,
-        &policy,
-        DeploymentEpoch::new(1),
-    )
-    .expect("valid graph and live placement must compile");
-    let core_view = plan
-        .install_views
-        .remove(&participant)
-        .expect("compiler must project the colocated participant install view");
-    let routing_shard = plan
-        .routing_shards
-        .remove(&participant)
-        .expect("compiler must project the matching participant routing shard");
-    RuntimeFilterParticipantInstall::new(core_view, routing_shard)
-}
-
 fn install_service(install: RuntimeFilterParticipantInstall) -> Arc<RuntimeFilterService> {
     install_service_with_memory(
         install,
@@ -540,22 +168,18 @@ fn install_service_with_memory(
     service
 }
 
-fn join_harness(coverage: Coverage) -> MembershipHarness {
-    let producers = producer_fixtures();
-    let graph = membership_graph(coverage, &producers, ConsumerActivation::BlockingSnapshot);
-    let scheduling = scheduling_plan(&producers);
-    let edges = fragment_edges(&producers);
-    let service = install_service(compile_participant_install(
-        &graph,
-        &scheduling,
-        &edges,
-        PARTICIPANT,
-    ));
-    for producer in &producers {
+fn join_harness(coverage: RuntimeFilterFixtureCoverage) -> MembershipHarness {
+    let fixture = compiled_membership_service_fixture(coverage);
+    assert_eq!(fixture.channel_id(), CHANNEL);
+    assert_eq!(fixture.producers().len(), 2);
+    let producers = fixture.producers().to_vec();
+    let consumer = fixture.consumer();
+    let service = install_service(fixture.into_install());
+    for producer in producers {
         let ProducerHandle::Membership(_) = service
             .open_producer(
-                producer.binding,
-                producer.instance,
+                producer.binding_id(),
+                producer.instance_id(),
                 1,
                 ProducerPortKind::Membership,
             )
@@ -566,8 +190,8 @@ fn join_harness(coverage: Coverage) -> MembershipHarness {
     }
     let SubscriptionHandle::Blocking(blocking) = service
         .subscribe(
-            CONSUMER,
-            CONSUMER_INSTANCE,
+            consumer.binding_id(),
+            consumer.instance_id(),
             SubscriptionKind::BlockingSnapshot,
         )
         .expect("compiler-installed blocking consumer is authorized")
@@ -578,17 +202,11 @@ fn join_harness(coverage: Coverage) -> MembershipHarness {
 }
 
 fn join_allof_harness() -> MembershipHarness {
-    join_harness(Coverage::AllOf(vec![
-        Coverage::Leaf(WITNESS_A),
-        Coverage::Leaf(WITNESS_B),
-    ]))
+    join_harness(RuntimeFilterFixtureCoverage::AllOf)
 }
 
 fn join_anyof_harness() -> MembershipHarness {
-    join_harness(Coverage::AnyOf(vec![
-        Coverage::Leaf(WITNESS_A),
-        Coverage::Leaf(WITNESS_B),
-    ]))
+    join_harness(RuntimeFilterFixtureCoverage::AnyOf)
 }
 
 fn publish_membership(
@@ -719,153 +337,6 @@ fn order_plan(
     (plan, contract)
 }
 
-fn sql_order_contract(contract: &OrderContract) -> sql_contract::OrderContract {
-    sql_contract::OrderContract {
-        keys: contract
-            .keys
-            .iter()
-            .map(|key| sql_contract::OrderKeyContract {
-                data_type: key.data_type.clone(),
-                direction: match key.direction {
-                    SortDirection::Ascending => sql_contract::SortDirection::Ascending,
-                    SortDirection::Descending => sql_contract::SortDirection::Descending,
-                },
-                null_order: match key.null_order {
-                    NullOrder::First => sql_contract::NullOrder::First,
-                    NullOrder::Last => sql_contract::NullOrder::Last,
-                },
-            })
-            .collect(),
-        inclusive: true,
-        comparator_digest: sql_contract::ComparatorDigest::new(contract.comparator_digest.get()),
-    }
-}
-
-fn plan_from_runtime_contract(contract: &RuntimeOrderContract) -> sql_contract::OrderContract {
-    let runtime = OrderContract {
-        keys: contract
-            .keys()
-            .iter()
-            .map(|key| OrderKeyContract {
-                data_type: key.data_type().clone(),
-                direction: key.direction(),
-                null_order: key.null_order(),
-            })
-            .collect(),
-        inclusive: true,
-        comparator_digest: contract.plan_comparator_digest(),
-    };
-    sql_order_contract(&runtime)
-}
-
-fn ordered_binding(
-    producer: &ProducerFixture,
-    contributions: &BTreeSet<ContributionKind>,
-    node_id: i32,
-) -> sql_graph::RuntimeFilterBindingSpec {
-    sql_producer_binding(
-        producer,
-        sql_contributions(contributions),
-        sql_contract::CompletionRequirement::ProducerClosed,
-        node_id,
-    )
-}
-
-fn ordered_consumer_binding() -> sql_graph::RuntimeFilterBindingSpec {
-    sql_consumer_binding(
-        BTreeSet::from([sql_contract::ArtifactCapability::OrderedRange]),
-        sql_contract::ConsumerActivation::NonBlockingLive {
-            late_apply: sql_contract::LateApplyGranularity::Batch,
-        },
-    )
-}
-
-fn ordered_graph(
-    contract: &RuntimeOrderContract,
-    producer: &ProducerFixture,
-) -> sql_graph::RuntimeFilterGraph {
-    let contributions = BTreeSet::from([
-        ContributionKind::OrderedBoundUpdate,
-        ContributionKind::ProducerClosed,
-    ]);
-    let coverage = SqlCoverage::Leaf(sql_contract::CoverageWitnessId::new(producer.witness.get()));
-    let mut graph = sql_graph::RuntimeFilterGraph::default();
-    graph
-        .insert_channel(sql_graph::RuntimeFilterChannelSpec {
-            channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-            logical_domain: sql_contract::RuntimeFilterLogicalDomain::OrderedBound(
-                plan_from_runtime_contract(contract),
-            ),
-            lifecycle: sql_contract::RuntimeFilterLifecycle::MonotonicUpdates,
-            availability_coverage: coverage.clone(),
-            terminal_coverage: coverage,
-            reduction_requirement: sql_contract::ReductionRequirement::TightenOrderedBound,
-            allowed_contribution_kinds: sql_contributions(&contributions),
-            required_consumer_capabilities: BTreeSet::from([
-                sql_contract::ArtifactCapability::OrderedRange,
-            ]),
-            policy: sql_policy(),
-        })
-        .unwrap();
-    graph
-        .insert_binding(ordered_binding(producer, &contributions, 1))
-        .unwrap();
-    graph.insert_binding(ordered_consumer_binding()).unwrap();
-    graph
-        .validate()
-        .expect("direct TopN graph must pass RFD-1 validation before compilation");
-    graph
-}
-
-fn topk_graph(
-    plan: OrderContract,
-    requirement: TopKSummaryRequirement,
-    producers: &[ProducerFixture],
-) -> sql_graph::RuntimeFilterGraph {
-    let contributions = BTreeSet::from([
-        ContributionKind::TopKSummary,
-        ContributionKind::ProducerClosed,
-    ]);
-    let coverage = SqlCoverage::AllOf(
-        producers
-            .iter()
-            .map(|producer| {
-                SqlCoverage::Leaf(sql_contract::CoverageWitnessId::new(producer.witness.get()))
-            })
-            .collect(),
-    );
-    let mut graph = sql_graph::RuntimeFilterGraph::default();
-    graph
-        .insert_channel(sql_graph::RuntimeFilterChannelSpec {
-            channel_id: sql_contract::ChannelId::new(CHANNEL.get()),
-            logical_domain: sql_contract::RuntimeFilterLogicalDomain::OrderedBound(
-                sql_order_contract(&plan),
-            ),
-            lifecycle: sql_contract::RuntimeFilterLifecycle::MonotonicUpdates,
-            availability_coverage: coverage.clone(),
-            terminal_coverage: coverage,
-            reduction_requirement: sql_contract::ReductionRequirement::MergeTopKSummary(
-                sql_contract::TopKSummaryRequirement::try_new(requirement.k().get()).unwrap(),
-            ),
-            allowed_contribution_kinds: sql_contributions(&contributions),
-            required_consumer_capabilities: BTreeSet::from([
-                sql_contract::ArtifactCapability::OrderedRange,
-            ]),
-            policy: sql_policy(),
-        })
-        .unwrap();
-    for (index, producer) in producers.iter().enumerate() {
-        graph
-            .insert_binding(ordered_binding(producer, &contributions, index as i32 + 1))
-            .unwrap();
-    }
-    graph.insert_binding(ordered_consumer_binding()).unwrap();
-    graph
-        .validate()
-        .expect("TopKSummary graph must pass RFD-1 validation before compilation");
-    graph
-}
-
 struct DirectTopNHarness {
     _service: Arc<RuntimeFilterService>,
     producer: Arc<dyn OrderedBoundProducerAdapter>,
@@ -873,21 +344,14 @@ struct DirectTopNHarness {
 }
 
 fn direct_topn_harness(contract: Arc<RuntimeOrderContract>) -> DirectTopNHarness {
-    let producers = producer_fixtures();
-    let direct = &producers[0];
-    let graph = ordered_graph(&contract, direct);
-    let scheduling = scheduling_plan(std::slice::from_ref(direct));
-    let edges = fragment_edges(std::slice::from_ref(direct));
-    let service = install_service(compile_participant_install(
-        &graph,
-        &scheduling,
-        &edges,
-        PARTICIPANT,
-    ));
+    let fixture = compiled_ordered_bound_fixture(&contract);
+    let direct = fixture.producers()[0];
+    let consumer = fixture.consumer();
+    let service = install_service(fixture.into_install());
     let ProducerHandle::OrderedBound(producer) = service
         .open_producer(
-            direct.binding,
-            direct.instance,
+            direct.binding_id(),
+            direct.instance_id(),
             1,
             ProducerPortKind::OrderedBound,
         )
@@ -897,8 +361,8 @@ fn direct_topn_harness(contract: Arc<RuntimeOrderContract>) -> DirectTopNHarness
     };
     let SubscriptionHandle::Live(live) = service
         .subscribe(
-            CONSUMER,
-            CONSUMER_INSTANCE,
+            consumer.binding_id(),
+            consumer.instance_id(),
             SubscriptionKind::NonBlockingLive,
         )
         .expect("compiler-installed ordered consumer is authorized")
@@ -1405,26 +869,19 @@ impl TopKSummaryHarness {
 }
 
 fn topk_allof_harness(k: u32) -> TopKSummaryHarness {
-    let producers = producer_fixtures();
     let (plan, _) = order_plan(SortDirection::Ascending, NullOrder::Last);
     let requirement = TopKSummaryRequirement::try_new(k).expect("TopK requires positive K");
     let contract = Arc::new(
         RuntimeTopKSummaryContract::try_from_plan(&plan, requirement)
             .expect("TopKSummary plan contract is valid"),
     );
-    let graph = topk_graph(plan, requirement, &producers);
-    let scheduling = scheduling_plan(&producers);
-    let edges = fragment_edges(&producers);
-    let service = install_service(compile_participant_install(
-        &graph,
-        &scheduling,
-        &edges,
-        PARTICIPANT,
-    ));
+    let fixture = compiled_topk_fixture(contract.order(), requirement.k());
+    let consumer = fixture.consumer();
+    let service = install_service(fixture.into_install());
     let SubscriptionHandle::Live(live) = service
         .subscribe(
-            CONSUMER,
-            CONSUMER_INSTANCE,
+            consumer.binding_id(),
+            consumer.instance_id(),
             SubscriptionKind::NonBlockingLive,
         )
         .expect("compiler-installed TopKSummary consumer is authorized")
@@ -1496,6 +953,13 @@ struct AggregateHarness {
 }
 
 impl AggregateHarness {
+    fn only_producer_identity(&self) -> (BindingId, UniqueId) {
+        let [(binding, instance, _)] = self.producers.as_slice() else {
+            panic!("single-producer Aggregate fixture must install exactly one producer")
+        };
+        (*binding, *instance)
+    }
+
     fn producer(
         &self,
         binding: BindingId,
@@ -1579,22 +1043,18 @@ impl AggregateHarness {
 }
 
 fn aggregate_harness_with_memory(
-    producers: &[ProducerFixture],
+    fixture: CompiledRuntimeFilterServiceFixture,
     memory: Arc<dyn RuntimeFilterMemoryAccount>,
 ) -> AggregateHarness {
-    let graph = aggregate_graph(producers);
-    let scheduling = scheduling_plan(producers);
-    let edges = fragment_edges(producers);
-    let service = install_service_with_memory(
-        compile_participant_install(&graph, &scheduling, &edges, PARTICIPANT),
-        memory,
-    );
+    let producers = fixture.producers().to_vec();
+    let consumer = fixture.consumer();
+    let service = install_service_with_memory(fixture.into_install(), memory);
     let mut opened = Vec::with_capacity(producers.len());
     for producer in producers {
         let error = service
             .open_producer(
-                producer.binding,
-                producer.instance,
+                producer.binding_id(),
+                producer.instance_id(),
                 1,
                 ProducerPortKind::Membership,
             )
@@ -1605,8 +1065,8 @@ fn aggregate_harness_with_memory(
         );
         let ProducerHandle::FinalDomain(handle) = service
             .open_producer(
-                producer.binding,
-                producer.instance,
+                producer.binding_id(),
+                producer.instance_id(),
                 1,
                 ProducerPortKind::FinalDomain,
             )
@@ -1614,12 +1074,12 @@ fn aggregate_harness_with_memory(
         else {
             panic!("Aggregate graph must install only the FinalDomain producer port")
         };
-        opened.push((producer.binding, producer.instance, handle));
+        opened.push((producer.binding_id(), producer.instance_id(), handle));
     }
     let SubscriptionHandle::Live(live) = service
         .subscribe(
-            CONSUMER,
-            CONSUMER_INSTANCE,
+            consumer.binding_id(),
+            consumer.instance_id(),
             SubscriptionKind::NonBlockingLive,
         )
         .expect("compiler-installed Aggregate consumer is authorized")
@@ -1634,9 +1094,8 @@ fn aggregate_harness_with_memory(
 }
 
 fn aggregate_allof_harness() -> AggregateHarness {
-    let producers = producer_fixtures();
     aggregate_harness_with_memory(
-        &producers,
+        compiled_live_final_domain_fixture(),
         MemTrackerMemoryAccount::new_root_for_test("m4-aggregate-allof"),
     )
 }
@@ -1669,17 +1128,15 @@ fn expect_live_completed(outcome: LivePollOutcome) -> Arc<ArtifactBundle> {
 }
 
 fn assert_explicit_empty_is_empty_domain() {
-    let producers = producer_fixtures();
     let empty = aggregate_harness_with_memory(
-        &producers[..1],
+        compiled_fenced_final_fixture(),
         MemTrackerMemoryAccount::new_root_for_test("m4-aggregate-explicit-empty"),
     );
-    let frozen = empty.freeze(PRODUCER_A, INSTANCE_A, 1);
-    empty
-        .complete(PRODUCER_A, INSTANCE_A, 0, &frozen, &[])
-        .unwrap();
+    let (producer, instance) = empty.only_producer_identity();
+    let frozen = empty.freeze(producer, instance, 1);
+    empty.complete(producer, instance, 0, &frozen, &[]).unwrap();
     assert_eq!(
-        empty.close(PRODUCER_A, INSTANCE_A, 0, 1).unwrap(),
+        empty.close(producer, instance, 0, 1).unwrap(),
         SubmitOutcome::Completed
     );
     let bundle = expect_live_completed(empty.live.poll_after(None));
@@ -1700,13 +1157,15 @@ impl RuntimeFilterMemoryAccount for RejectingMemoryAccount {
 }
 
 fn assert_resource_failure_is_unavailable() {
-    let producers = producer_fixtures();
-    let unavailable =
-        aggregate_harness_with_memory(&producers[..1], Arc::new(RejectingMemoryAccount));
-    let frozen = unavailable.freeze(PRODUCER_A, INSTANCE_A, 1);
+    let unavailable = aggregate_harness_with_memory(
+        compiled_fenced_final_fixture(),
+        Arc::new(RejectingMemoryAccount),
+    );
+    let (producer, instance) = unavailable.only_producer_identity();
+    let frozen = unavailable.freeze(producer, instance, 1);
     assert_eq!(
         unavailable
-            .complete(PRODUCER_A, INSTANCE_A, 0, &frozen, &[])
+            .complete(producer, instance, 0, &frozen, &[])
             .unwrap(),
         SubmitOutcome::TerminalNoop
     );
@@ -1721,7 +1180,7 @@ fn assert_resource_failure_is_unavailable() {
 }
 
 #[test]
-fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts() {
+fn m4_join_conformance_uses_compiler_produced_install_and_route_equivalent_artifacts() {
     let all_of = join_allof_harness();
     let first = all_of.producer(PRODUCER_A, INSTANCE_A);
     first.submit_values(0, 0, [1]).unwrap();
