@@ -45,16 +45,18 @@ impl FrontendMvService {
         }
     }
 
-    pub fn with_refresh_dependencies(
+    pub(crate) fn with_refresh_dependencies(
         repository: Arc<dyn MvRepository>,
         query_execution: QueryExecutionService,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        first_refresh_activator: Arc<refresh::FrontendMvFirstRefreshWriteActivatorPort>,
     ) -> Self {
         Self {
             repository,
             refresh: Some(refresh::FrontendMvRefreshDependencies {
                 query_execution,
                 connector_control,
+                first_refresh_activator,
             }),
         }
     }

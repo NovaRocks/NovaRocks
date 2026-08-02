@@ -25,7 +25,8 @@ use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
 use crate::runtime::query_result::QueryResult;
-use crate::sql::mv_refresh::PreparedMvRefresh;
+use crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
+use crate::sql::mv_refresh::{PreparedDistributedWriteRequest, PreparedMvRefresh};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
 };
@@ -307,6 +308,30 @@ pub trait MvApplicationService: Send + Sync {
             "frontend MV refresh lifecycle is unavailable",
         ))
     }
+}
+
+/// Core-owned provider activation and native fragment preparation for a
+/// SQL-shaped first-refresh artifact. The frontend owns intent persistence,
+/// write-session admission, execution, commit, publication, and cleanup; the
+/// port only turns an already frozen artifact into the generic result-free
+/// distributed write request after the exact lease is retained.
+pub trait MvFirstRefreshWriteActivator: Send + Sync {
+    fn bind_first_refresh_write(
+        &self,
+        prepared: PreparedMvFirstRefreshWrite,
+        exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, String>;
+}
+
+/// Frontend composition sink installed before Core opens. Core binds its
+/// provider activation adapter only after connector control and the engine
+/// state are available, avoiding a direct all-in-one call path.
+pub trait MvFirstRefreshWriteActivatorSink: Send + Sync {
+    fn bind_mv_first_refresh_write_activator(
+        &self,
+        activator: std::sync::Arc<dyn MvFirstRefreshWriteActivator>,
+    ) -> Result<(), String>;
 }
 
 pub trait MvEngine: Send + Sync {

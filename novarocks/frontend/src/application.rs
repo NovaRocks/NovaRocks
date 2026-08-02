@@ -30,7 +30,9 @@ use crate::connector::ConnectorControlHost;
 use crate::coordinator::{BackendQueryActivity, FrontendDistributedQueryCoordinator};
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::dml::{DmlService, StateStoreOperationJournal};
-use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
+use crate::mv::{
+    FrontendMvFirstRefreshWriteActivatorPort, FrontendMvService, repository::StateStoreMvRepository,
+};
 use crate::query_control::FrontendQueryControl;
 use crate::statistics::FrontendStatisticsService;
 use crate::statistics_jobs::repository::StatisticsJobRepository;
@@ -107,6 +109,7 @@ pub struct FrontendApplicationHost {
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn novarocks::mv::repository::MvRepository>>,
     mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
+    mv_first_refresh_activator: Option<Arc<FrontendMvFirstRefreshWriteActivatorPort>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
     query_control: novarocks::query_execution::control::QueryControlService,
@@ -152,6 +155,7 @@ impl FrontendApplicationHost {
             table_maintenance_service: None,
             mv_repository: None,
             mv_application_service: None,
+            mv_first_refresh_activator: None,
             state_store_host: None,
             query_execution: None,
             query_control: FrontendQueryControl::service(),
@@ -244,13 +248,17 @@ impl FrontendApplicationHost {
                     Ok(repository) => {
                         let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
                             repository;
+                        let first_refresh_activator =
+                            Arc::new(FrontendMvFirstRefreshWriteActivatorPort::new());
                         host.mv_application_service =
                             Some(Arc::new(FrontendMvService::with_refresh_dependencies(
                                 Arc::clone(&repository),
                                 host.query_execution_service(),
                                 host.connector_control_registry(),
+                                Arc::clone(&first_refresh_activator),
                             )));
                         host.mv_repository = Some(repository);
+                        host.mv_first_refresh_activator = Some(first_refresh_activator);
                     }
                     Err(error) => {
                         return Err(host
@@ -364,6 +372,15 @@ impl FrontendApplicationHost {
                 .as_ref()
                 .expect("frontend MV application service is installed before host open returns"),
         )
+    }
+
+    pub fn mv_first_refresh_write_activator_sink(
+        &self,
+    ) -> Option<Arc<dyn novarocks::mv::application::MvFirstRefreshWriteActivatorSink>> {
+        self.mv_first_refresh_activator.as_ref().map(|port| {
+            Arc::clone(port)
+                as Arc<dyn novarocks::mv::application::MvFirstRefreshWriteActivatorSink>
+        })
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
@@ -573,6 +590,7 @@ impl FrontendApplicationHost {
         self.statistics_application_service.take();
         self.view_service.take();
         self.mv_application_service.take();
+        self.mv_first_refresh_activator.take();
         self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             if let Err(error) = host

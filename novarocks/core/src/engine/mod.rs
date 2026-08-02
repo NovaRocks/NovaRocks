@@ -33,9 +33,9 @@ use tokio::runtime::Handle;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::novarocks_config;
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_options::QueryOptions;
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
 };
@@ -44,7 +44,9 @@ use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRe
 use crate::connector::{IcebergCatalogRegistry, iceberg_namespace_exists};
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
-use crate::mv::application::{MvApplicationService, UnavailableMvApplicationService};
+use crate::mv::application::{
+    MvApplicationService, MvFirstRefreshWriteActivator, UnavailableMvApplicationService,
+};
 use crate::mv::repository::{MvRepository, UnavailableMvRepository};
 use crate::sql::catalog::local::PlannerMemoryCatalog;
 use crate::sql::catalog::{StandaloneCatalogService, TableLookupMode};
@@ -937,6 +939,11 @@ pub struct StandaloneOpenServices {
     /// durable worker only when it also owns a StateStore repository.
     pub statistics_attempt_executor_sink:
         Option<std::sync::Arc<dyn statistics_application::StatisticsAttemptExecutorSink>>,
+    /// Receives the Core-owned provider activation adapter after the engine
+    /// has its connector registry. The frontend remains the owner of every
+    /// durable and external refresh transition.
+    pub mv_first_refresh_write_activator_sink:
+        Option<std::sync::Arc<dyn crate::mv::application::MvFirstRefreshWriteActivatorSink>>,
     pub table_maintenance_service:
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
@@ -993,6 +1000,7 @@ impl StandaloneOpenServices {
             statistics_target_resolver_sink: None,
             statistics_table_reader_sink: None,
             statistics_attempt_executor_sink: None,
+            mv_first_refresh_write_activator_sink: None,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -1050,9 +1058,25 @@ impl StandaloneOpenServices {
         self.statistics_attempt_executor_sink = Some(sink);
         self
     }
+
+    pub fn with_mv_first_refresh_write_activator_sink(
+        mut self,
+        sink: Option<std::sync::Arc<dyn crate::mv::application::MvFirstRefreshWriteActivatorSink>>,
+    ) -> Self {
+        self.mv_first_refresh_write_activator_sink = sink;
+        self
+    }
 }
 
 impl StandaloneNovaRocks {
+    pub fn mv_first_refresh_write_activator(&self) -> Arc<dyn MvFirstRefreshWriteActivator> {
+        Arc::new(
+            crate::engine::mv_first_refresh_staging::StandaloneMvFirstRefreshWriteActivator::new(
+                Arc::downgrade(&self.inner),
+            ),
+        )
+    }
+
     pub fn open(opts: StandaloneOptions, services: StandaloneOpenServices) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -1121,6 +1145,7 @@ impl StandaloneNovaRocks {
             statistics_target_resolver_sink,
             statistics_table_reader_sink,
             statistics_attempt_executor_sink,
+            mv_first_refresh_write_activator_sink,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -1175,6 +1200,9 @@ impl StandaloneNovaRocks {
         }
         if let Some(sink) = statistics_attempt_executor_sink {
             sink.bind_statistics_attempt_executor(engine.statistics_attempt_executor())?;
+        }
+        if let Some(sink) = mv_first_refresh_write_activator_sink {
+            sink.bind_mv_first_refresh_write_activator(engine.mv_first_refresh_write_activator())?;
         }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
@@ -4618,7 +4646,9 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
     );
     let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| "Iceberg write requires a non-empty admitted backend topology".to_string())?;
+        .ok_or_else(|| {
+            "Iceberg write requires a non-empty admitted backend topology".to_string()
+        })?;
     let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
         crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared_query)),
         crate::sql::compiler::SqlCompileIntent::IcebergWrite {
@@ -4646,7 +4676,8 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
     else {
         return Err("Iceberg write intent did not produce optimized SQL facts".to_string());
     };
-    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    let physical_plan =
+        crate::sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let writer_input = match sink_spec.mode {
         crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::PositionDeletes
         | crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::DeletionVectors => {
@@ -4975,11 +5006,11 @@ fn bind_prepared_distributed_write_request(
     let session = query_execution
         .begin_write_operation(prepared.registration())
         .map_err(|error| error.to_string())?;
-    let registration = crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
-        session,
-        cohort_id,
-    )
-    .map_err(|error| error.to_string())?;
+    let registration =
+        crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+            session, cohort_id,
+        )
+        .map_err(|error| error.to_string())?;
     prepared
         .into_request(execution, registration)
         .map_err(|error| error.to_string())

@@ -16,7 +16,7 @@ use crate::mv::model::MvTarget;
 pub use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 
-pub(crate) mod first_refresh;
+pub mod first_refresh;
 
 /// Typed SQL projection of `REFRESH MATERIALIZED VIEW`.
 ///
@@ -115,6 +115,10 @@ pub enum PreparedMvRefreshWork {
     /// remains unbound until the frontend holds the exact connector lease.
     DataProducing {
         distributed_writes: Vec<PreparedDistributedWriteRequest>,
+        /// SQL-shaped first-refresh artifacts whose provider activation and
+        /// native fragment preparation are deferred until the frontend holds
+        /// the exact retained write lease.
+        first_refresh_writes: Vec<first_refresh::PreparedMvFirstRefreshWrite>,
     },
 }
 

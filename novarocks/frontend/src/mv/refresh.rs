@@ -18,12 +18,13 @@
 //! Frontend-owned execution of one SQL-prepared MV refresh attempt.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
 };
 use novarocks::mv::application::{MvApplicationError, MvApplicationErrorKind, MvStatementResult};
+use novarocks::mv::application::{MvFirstRefreshWriteActivator, MvFirstRefreshWriteActivatorSink};
 use novarocks::mv::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
     FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
@@ -54,6 +55,60 @@ use sha2::{Digest, Sha256};
 pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
+    pub(super) first_refresh_activator: Arc<FrontendMvFirstRefreshWriteActivatorPort>,
+}
+
+/// Composition-owned indirection between the frontend lifecycle and the Core
+/// provider adapter. It is intentionally bound only after Core has opened its
+/// connector registry; no all-in-one direct call is available before then.
+pub(crate) struct FrontendMvFirstRefreshWriteActivatorPort {
+    activator: RwLock<Option<Arc<dyn MvFirstRefreshWriteActivator>>>,
+}
+
+impl FrontendMvFirstRefreshWriteActivatorPort {
+    pub(crate) fn new() -> Self {
+        Self {
+            activator: RwLock::new(None),
+        }
+    }
+
+    fn bind(&self, activator: Arc<dyn MvFirstRefreshWriteActivator>) -> Result<(), String> {
+        let mut current = self
+            .activator
+            .write()
+            .map_err(|_| "MV first-refresh activator lock is poisoned".to_string())?;
+        if current.is_some() {
+            return Err("MV first-refresh activator is already bound".to_string());
+        }
+        *current = Some(activator);
+        Ok(())
+    }
+
+    fn bind_write(
+        &self,
+        prepared: novarocks::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite,
+        lease: &novarocks_spi::connector::ConnectorWriteLease,
+        execution: &novarocks::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, MvApplicationError> {
+        let activator = self
+            .activator
+            .read()
+            .map_err(|_| unavailable("MV first-refresh activator lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| unavailable("MV first-refresh provider activation is unavailable"))?;
+        activator
+            .bind_first_refresh_write(prepared, lease, execution)
+            .map_err(invalid)
+    }
+}
+
+impl MvFirstRefreshWriteActivatorSink for FrontendMvFirstRefreshWriteActivatorPort {
+    fn bind_mv_first_refresh_write_activator(
+        &self,
+        activator: Arc<dyn MvFirstRefreshWriteActivator>,
+    ) -> Result<(), String> {
+        self.bind(activator)
+    }
 }
 
 pub(super) fn execute(
@@ -124,13 +179,17 @@ pub(super) fn execute(
                 .map_err(repository_error)?;
             Ok(MvStatementResult::Ok)
         }
-        PreparedMvRefreshWork::DataProducing { distributed_writes } => execute_data_refresh(
+        PreparedMvRefreshWork::DataProducing {
+            distributed_writes,
+            first_refresh_writes,
+        } => execute_data_refresh(
             repository,
             dependencies,
             &planning_lease,
             attempt,
             finalize,
             distributed_writes,
+            first_refresh_writes,
             base_snapshots,
             connector_context,
             execution,
@@ -146,18 +205,16 @@ fn execute_data_refresh(
     attempt: novarocks::sql::mv_refresh::MvRefreshAttemptIdentity,
     finalize: MvRefreshFinalizeFacts,
     distributed_writes: Vec<PreparedDistributedWriteRequest>,
+    first_refresh_writes: Vec<
+        novarocks::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite,
+    >,
     base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
     execution: &novarocks::query_execution::request_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
-    let [write] = distributed_writes.as_slice() else {
+    if distributed_writes.len() + first_refresh_writes.len() != 1 {
         return Err(invalid(
             "MV refresh data preparation must produce exactly one staged distributed write",
-        ));
-    };
-    if write.write_operation_id() != attempt.write_operation_id {
-        return Err(invalid(
-            "SQL-prepared MV write does not use the frontend-preallocated operation ID",
         ));
     }
     let mutation_lease = planning_lease
@@ -188,14 +245,34 @@ fn execute_data_refresh(
         None,
     )?;
 
-    let write = distributed_writes
-        .into_iter()
-        .next()
-        .expect("checked one prepared MV distributed write");
-    let cohort_id = write.write_cohort_id();
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| unavailable(error.to_string()))?;
+    let write = match (
+        distributed_writes.into_iter().next(),
+        first_refresh_writes.into_iter().next(),
+    ) {
+        (Some(write), None) => write,
+        (None, Some(first_refresh)) => {
+            if first_refresh.operation_id() != attempt.write_operation_id {
+                return Err(invalid(
+                    "SQL-prepared MV first-refresh write does not use the frontend-preallocated operation ID",
+                ));
+            }
+            dependencies.first_refresh_activator.bind_write(
+                first_refresh,
+                &write_lease,
+                execution,
+            )?
+        }
+        _ => unreachable!("checked exactly one prepared MV write"),
+    };
+    if write.write_operation_id() != attempt.write_operation_id {
+        return Err(invalid(
+            "SQL-prepared MV write does not use the frontend-preallocated operation ID",
+        ));
+    }
+    let cohort_id = write.write_cohort_id();
     let session = dependencies
         .query_execution
         .begin_write_operation_with_lease(write.registration(), write_lease)
@@ -323,9 +400,17 @@ fn new_ledger(
     has_external_actions: bool,
 ) -> Result<FrontendMvRefreshLedger, MvApplicationError> {
     let cohort_ids = match &refresh.work {
-        PreparedMvRefreshWork::DataProducing { distributed_writes } => distributed_writes
+        PreparedMvRefreshWork::DataProducing {
+            distributed_writes,
+            first_refresh_writes,
+        } => distributed_writes
             .iter()
             .map(|write| hex::encode(write.write_cohort_id().to_bytes()))
+            .chain(
+                first_refresh_writes
+                    .iter()
+                    .map(|write| hex::encode(write.primary_cohort().to_bytes())),
+            )
             .collect(),
         PreparedMvRefreshWork::NoOp | PreparedMvRefreshWork::MetadataOnly => Vec::new(),
     };
@@ -679,4 +764,44 @@ fn repository_error(error: MvRepositoryError) -> MvApplicationError {
         _ => MvApplicationErrorKind::Repository,
     };
     MvApplicationError::new(kind, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use novarocks::mv::application::{
+        MvFirstRefreshWriteActivator, MvFirstRefreshWriteActivatorSink,
+    };
+    use novarocks::query_execution::request_context::QueryExecutionContext;
+    use novarocks::sql::mv_refresh::PreparedDistributedWriteRequest;
+    use novarocks::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
+    use novarocks_spi::connector::ConnectorWriteLease;
+
+    use super::FrontendMvFirstRefreshWriteActivatorPort;
+
+    struct FakeActivator;
+
+    impl MvFirstRefreshWriteActivator for FakeActivator {
+        fn bind_first_refresh_write(
+            &self,
+            _prepared: PreparedMvFirstRefreshWrite,
+            _exact_lease: &ConnectorWriteLease,
+            _execution: &QueryExecutionContext,
+        ) -> Result<PreparedDistributedWriteRequest, String> {
+            unreachable!("the composition test never binds a write")
+        }
+    }
+
+    #[test]
+    fn first_refresh_activator_is_bound_once_after_frontend_composition() {
+        let port = FrontendMvFirstRefreshWriteActivatorPort::new();
+        port.bind_mv_first_refresh_write_activator(Arc::new(FakeActivator))
+            .expect("first Core activation adapter binds");
+
+        let error = port
+            .bind_mv_first_refresh_write_activator(Arc::new(FakeActivator))
+            .expect_err("a second Core activation adapter must fail closed");
+        assert_eq!(error, "MV first-refresh activator is already bound");
+    }
 }

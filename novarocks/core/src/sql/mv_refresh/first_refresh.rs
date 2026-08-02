@@ -168,6 +168,13 @@ impl MvFirstRefreshTargetContract {
 pub(crate) struct MvFirstRefreshWriteRequest {
     canonical_select_sql: String,
     shape: MvFirstRefreshShape,
+    target_catalog: String,
+    target_namespace: String,
+    target_name: String,
+    staging_branch: String,
+    current_catalog: Option<String>,
+    current_database: String,
+    expected_target_snapshot_id: Option<i64>,
     target_table: ConnectorTableHandle,
     target_contract: MvFirstRefreshTargetContract,
     observed_binding: ConnectorExecutionBindingKey,
@@ -180,6 +187,13 @@ impl MvFirstRefreshWriteRequest {
     pub(crate) fn try_new(
         canonical_select_sql: String,
         shape: MvFirstRefreshShape,
+        target_catalog: String,
+        target_namespace: String,
+        target_name: String,
+        staging_branch: String,
+        current_catalog: Option<String>,
+        current_database: String,
+        expected_target_snapshot_id: Option<i64>,
         target_table: ConnectorTableHandle,
         target_contract: MvFirstRefreshTargetContract,
         observed_binding: ConnectorExecutionBindingKey,
@@ -187,6 +201,11 @@ impl MvFirstRefreshWriteRequest {
         connector_context: ConnectorRequestContext,
     ) -> Result<Self, String> {
         if canonical_select_sql.trim().is_empty()
+            || target_catalog.is_empty()
+            || target_namespace.is_empty()
+            || target_name.is_empty()
+            || staging_branch.is_empty()
+            || current_database.is_empty()
             || target_table.owner() != &observed_binding.instance_id
         {
             return Err("invalid MV first-refresh write request identity".to_string());
@@ -194,6 +213,13 @@ impl MvFirstRefreshWriteRequest {
         Ok(Self {
             canonical_select_sql,
             shape,
+            target_catalog,
+            target_namespace,
+            target_name,
+            staging_branch,
+            current_catalog,
+            current_database,
+            expected_target_snapshot_id,
             target_table,
             target_contract,
             observed_binding,
@@ -208,6 +234,34 @@ impl MvFirstRefreshWriteRequest {
 
     pub(crate) const fn shape(&self) -> MvFirstRefreshShape {
         self.shape
+    }
+
+    pub(crate) fn target_catalog(&self) -> &str {
+        &self.target_catalog
+    }
+
+    pub(crate) fn target_namespace(&self) -> &str {
+        &self.target_namespace
+    }
+
+    pub(crate) fn target_name(&self) -> &str {
+        &self.target_name
+    }
+
+    pub(crate) fn staging_branch(&self) -> &str {
+        &self.staging_branch
+    }
+
+    pub(crate) fn current_catalog(&self) -> Option<&str> {
+        self.current_catalog.as_deref()
+    }
+
+    pub(crate) fn current_database(&self) -> &str {
+        &self.current_database
+    }
+
+    pub(crate) const fn expected_target_snapshot_id(&self) -> Option<i64> {
+        self.expected_target_snapshot_id
     }
 
     pub(crate) fn target_table(&self) -> &ConnectorTableHandle {
@@ -234,22 +288,22 @@ impl MvFirstRefreshWriteRequest {
 /// Side-effect-free SQL preparation for a first-refresh write.  Its fields
 /// remain private so an application owner can inspect facts but cannot obtain
 /// a local program, catalog object, record batch or provider payload.
-pub(crate) struct PreparedMvFirstRefreshWrite {
+pub struct PreparedMvFirstRefreshWrite {
     request: MvFirstRefreshWriteRequest,
     artifact: MvFirstRefreshExecutionArtifact,
     primary_cohort: ConnectorWriteCohortId,
 }
 
 impl PreparedMvFirstRefreshWrite {
-    pub(crate) fn operation_id(&self) -> ConnectorWriteOperationId {
+    pub fn operation_id(&self) -> ConnectorWriteOperationId {
         self.request.operation_id()
     }
 
-    pub(crate) const fn primary_cohort(&self) -> ConnectorWriteCohortId {
+    pub const fn primary_cohort(&self) -> ConnectorWriteCohortId {
         self.primary_cohort
     }
 
-    pub(crate) fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
+    pub fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
         self.request.observed_binding()
     }
 
@@ -265,8 +319,47 @@ impl PreparedMvFirstRefreshWrite {
         self.request.connector_context()
     }
 
+    pub(crate) fn target_catalog(&self) -> &str {
+        self.request.target_catalog()
+    }
+
+    pub(crate) fn target_namespace(&self) -> &str {
+        self.request.target_namespace()
+    }
+
+    pub(crate) fn target_name(&self) -> &str {
+        self.request.target_name()
+    }
+
+    pub(crate) fn staging_branch(&self) -> &str {
+        self.request.staging_branch()
+    }
+
+    pub(crate) fn current_catalog(&self) -> Option<&str> {
+        self.request.current_catalog()
+    }
+
+    pub(crate) fn current_database(&self) -> &str {
+        self.request.current_database()
+    }
+
+    pub(crate) const fn expected_target_snapshot_id(&self) -> Option<i64> {
+        self.request.expected_target_snapshot_id()
+    }
+
     pub(crate) fn into_execution_artifact(self) -> MvFirstRefreshExecutionArtifact {
         self.artifact
+    }
+
+    /// Returns the frozen SQL physicalization for the generic distributed
+    /// writer binder. Typed join artifacts deliberately return `None`: their
+    /// dedicated native binder has not yet been extracted, so callers must
+    /// fail closed rather than materialize rows in the frontend.
+    pub(crate) fn physical_sql(&self) -> Option<&str> {
+        match &self.artifact {
+            MvFirstRefreshExecutionArtifact::Sql(sql) => Some(sql.sql()),
+            MvFirstRefreshExecutionArtifact::Logical(_) => None,
+        }
     }
 
     /// Consuming bind boundary: fragment preparation may only happen after
