@@ -15015,6 +15015,132 @@ fn execute_imv_change_stream_writer(
     )
 }
 
+/// Bind an already prepared IMV change-stream plan to the frontend's admitted
+/// execution and retained exact lease. Unlike the legacy executor above, this
+/// function has no query submission, provider commit, catalog publication, or
+/// MV repository transition. It is the Core-side activation half of a
+/// frontend-owned incremental refresh attempt.
+#[allow(clippy::too_many_arguments)]
+fn prepare_imv_change_stream_writer(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    table: &iceberg::table::Table,
+    ident: &TableIdent,
+    refresh_plan: ImvRefreshPlannedChangeStream<'_>,
+    target_ref: &str,
+    exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+    let (refresh_plan, data_route_output_ordinal) =
+        ensure_imv_change_stream_data_route(refresh_plan)?;
+    let entry = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?
+        .get(&target.catalog)?;
+    let connector_context = refresh_plan
+        .mv_refresh_ctx
+        .and_then(|ctx| ctx.connector_context.as_ref())
+        .ok_or_else(|| {
+            "Iceberg MV change-stream write is missing its caller connector context".to_string()
+        })?;
+    crate::connector::validate_request_context(connector_context)?;
+    let resolved = crate::connector::metadata_load_table(
+        state.connector_control.as_ref(),
+        connector_context.clone(),
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?
+    .0;
+    let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
+        target,
+        &resolved,
+        table,
+        &entry,
+        &refresh_plan,
+        target_ref,
+        data_route_output_ordinal,
+    )?;
+    let planned =
+        crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
+            state,
+            Some(&target.catalog),
+            &target.namespace,
+            &refresh_plan.optimized_tree,
+            refresh_plan.table_bindings.as_deref(),
+            &mut dag,
+            refresh_plan.mv_refresh_ctx,
+            None,
+            connector_context,
+        )?;
+    let op_kind = if refresh_plan
+        .producer_branches
+        .iter()
+        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::DeleteDv))
+    {
+        CommitOpKind::RowDeltaDvFromFiles
+    } else {
+        CommitOpKind::FastAppend
+    };
+    let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
+        table, ident, target_ref, op_kind,
+    );
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+    let commit_executor = Arc::new(crate::engine::IcebergWriteCommitExecutor {
+        state: Arc::downgrade(state),
+        target: target.clone(),
+        catalog,
+        table: table.clone(),
+        collector,
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: refresh_plan.snapshot_properties.clone(),
+    });
+    let base_snapshot_id = table
+        .metadata()
+        .refs()
+        .get(target_ref)
+        .map(|reference| reference.snapshot_id)
+        .or_else(|| {
+            (target_ref == "main")
+                .then(|| {
+                    table
+                        .metadata()
+                        .current_snapshot()
+                        .map(|snapshot| snapshot.snapshot_id())
+                })
+                .flatten()
+        });
+    let connector_write =
+        crate::engine::mutation_flow::activate_change_stream_connector_write_template(
+            state,
+            target,
+            &planned.topology,
+            planned.commit_plan,
+            commit_executor,
+            &entry,
+            base_snapshot_id,
+            refresh_plan.connector_operation_id,
+            connector_context.clone(),
+            exact_lease,
+        )?;
+    crate::engine::prepare_planned_iceberg_change_stream_write(
+        planned.prepared,
+        planned.native_bundle,
+        None,
+        execution,
+        Some(crate::engine::DistributedConnectorWrite::Begin(
+            connector_write,
+        )),
+    )
+}
+
 fn executed_change_stream_write_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
     commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,

@@ -4587,7 +4587,7 @@ fn connector_staging_completion_from_result(
     Ok((completion, summary))
 }
 
-enum DistributedConnectorWrite {
+pub(crate) enum DistributedConnectorWrite {
     Begin(crate::query_execution::contract::ConnectorWritePlanningTemplate),
     Sealed(crate::query_execution::contract::ConnectorWriteExecutionRegistration),
 }
