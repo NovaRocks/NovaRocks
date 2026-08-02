@@ -11,12 +11,12 @@ use novarocks::mv::persistence::refresh::{
 use novarocks::mv::repository::MvTargetLookup;
 use novarocks_frontend::mv::repository::catalog::schema_catalog;
 use novarocks_frontend::mv::repository::codec::{
-    DecodedMvRecord, MvRecordKind, decode_definition, decode_record, encode_definition,
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_definition, decode_record, encode_definition,
     encode_record,
 };
 use novarocks_frontend::mv::repository::key::{
     MvKeyKind, decode_key, definition_by_id_key, dependency_by_downstream_key,
-    dependency_by_upstream_key, partition_by_mv_key, target_lookup_key,
+    dependency_by_upstream_key, partition_by_mv_key, sequence_key, target_lookup_key,
 };
 use novarocks_spi::state_store::{Key, Value};
 use std::collections::BTreeMap;
@@ -133,6 +133,19 @@ fn envelope_round_trips_and_rejects_corruption() {
 }
 
 #[test]
+fn sequence_v2_round_trips_the_frontend_refresh_high_water_mark() {
+    let key = sequence_key().expect("sequence key");
+    let sequence = MvSequence {
+        last_allocated_id: 42,
+        last_refresh_id: 99,
+    };
+    let value = encode_record(MvRecordKind::Sequence, Uuid::now_v7(), &sequence)
+        .expect("encode sequence v2");
+    let decoded: DecodedMvRecord<MvSequence> = decode_record(&key, &value).expect("decode v2");
+    assert_eq!(decoded.value, sequence);
+}
+
+#[test]
 fn envelope_rejects_key_kind_unknown_schema_and_trailing_bytes() {
     let operation_id = Uuid::now_v7();
     let value = encode_record(
@@ -213,6 +226,10 @@ fn mv_catalog_validates_all_historical_schemas_transitively() {
     assert_eq!(
         catalog.latest("mv.refresh").expect("refresh schema").id(),
         3
+    );
+    assert_eq!(
+        catalog.latest("mv.sequence").expect("sequence schema").id(),
+        2
     );
 }
 

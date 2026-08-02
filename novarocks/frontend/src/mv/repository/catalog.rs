@@ -196,5 +196,10 @@ fn schema_sources() -> &'static [SchemaSource] {
             id: 1,
             raw_schema: include_str!("schemas/mv.sequence/0001.avsc"),
         },
+        SchemaSource {
+            subject: "mv.sequence",
+            id: 2,
+            raw_schema: include_str!("schemas/mv.sequence/0002.avsc"),
+        },
     ]
 }

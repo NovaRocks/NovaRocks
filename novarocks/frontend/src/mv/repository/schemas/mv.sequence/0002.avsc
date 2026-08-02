@@ -1,0 +1,9 @@
+{
+  "type": "record",
+  "name": "MvSequenceV1",
+  "namespace": "org.apache.novarocks.mv",
+  "fields": [
+    {"name": "last_allocated_id", "type": "long"},
+    {"name": "last_refresh_id", "type": "long", "default": 0}
+  ]
+}
