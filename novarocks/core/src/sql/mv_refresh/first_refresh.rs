@@ -916,6 +916,7 @@ fn aggregate_physical_sql(
 
 fn aggregate_visible_type_witness(data_type: &DataType) -> Result<String, String> {
     let sql_type = match data_type {
+        DataType::Boolean => "BOOLEAN".to_string(),
         DataType::Int8 => "TINYINT".to_string(),
         DataType::Int16 => "SMALLINT".to_string(),
         DataType::Int32 => "INT".to_string(),
