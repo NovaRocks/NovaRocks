@@ -354,13 +354,6 @@ fn execute_data_refresh(
     let completion = completion.ok_or_else(|| {
         invalid("MV refresh distributed write completed without connector terminal reports")
     })?;
-    let rows = i64::try_from(
-        completion
-            .staging_summary()
-            .map_err(|error| invalid(error.to_string()))?
-            .input_rows(),
-    )
-    .map_err(|_| invalid("MV refresh staged row count exceeds i64 range"))?;
     let receipt = resolve_write_commit(
         repository,
         attempt.refresh_id,
@@ -371,6 +364,10 @@ fn execute_data_refresh(
     let committed_version = receipt.committed_version().ok_or_else(|| {
         invalid("MV refresh connector write committed without a provider version")
     })?;
+    let rows = i64::try_from(receipt.resulting_row_count().ok_or_else(|| {
+        invalid("MV refresh connector write committed without resulting row-count fact")
+    })?)
+    .map_err(|_| invalid("MV refresh committed row count exceeds i64 range"))?;
     let frontend_version = frontend_version(committed_version)?;
 
     let guard = ConnectorRefreshPublicationGuard::try_new(

@@ -10652,6 +10652,7 @@ fn publish_iceberg_mv_refresh(
     let committed_version =
         match crate::connector::iceberg::write_contract::connector_write_receipt(
             staging_snapshot_id,
+            None,
         )
         .and_then(|receipt| {
             receipt.committed_version().cloned().ok_or_else(|| {

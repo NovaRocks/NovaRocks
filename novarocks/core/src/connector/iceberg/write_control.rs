@@ -182,6 +182,17 @@ pub(crate) trait IcebergWriteControlBackend: Send + Sync {
         &self,
         evidence: &IcebergWriteReconcileEvidenceV1,
     ) -> Result<Option<CommitOutcome>, CommitServiceError>;
+
+    /// Returns the committed table row count only when the operation has an
+    /// MV provenance contract. The value is derived from the committed
+    /// snapshot's `total-records`, never from frontend-visible staged input.
+    fn resulting_row_count(
+        &self,
+        _: ConnectorWriteOperationId,
+        _: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -289,14 +300,26 @@ impl IcebergWriteControlAdapter {
         Ok(())
     }
 
+    fn receipt(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+        outcome: &CommitOutcome,
+    ) -> Result<ConnectorWriteReceipt, ConnectorError> {
+        let resulting_row_count = self
+            .backend
+            .resulting_row_count(operation_id, outcome)
+            .map_err(|error| internal(format!("read Iceberg committed row count: {error:?}")))?;
+        connector_write_receipt(outcome.new_snapshot_id, resulting_row_count)
+            .map_err(|error| internal(format!("encode Iceberg write receipt: {error}")))
+    }
+
     fn commit_outcome(
         &self,
         request: &ConnectorWriteCommitRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         match self.backend.commit(request) {
             Ok(outcome) => {
-                let receipt = connector_write_receipt(outcome.new_snapshot_id)
-                    .map_err(|error| internal(format!("encode Iceberg write receipt: {error}")))?;
+                let receipt = self.receipt(request.operation_id(), &outcome)?;
                 Ok(ExternalMutationOutcome::KnownCommitted {
                     effect: ExternalMutationEffect::Applied,
                     receipt,
@@ -312,20 +335,25 @@ impl IcebergWriteControlAdapter {
                 outcome,
                 finalize_error,
                 ..
-            }) => Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt: connector_write_receipt(
-                    outcome
-                        .as_ref()
-                        .map(|outcome| outcome.new_snapshot_id)
-                        .unwrap_or_default(),
-                )
-                .map_err(|error| internal(format!("encode Iceberg write receipt: {error}")))?,
-                finalization: ExternalMutationFinalization::Failed(failure(
-                    ConnectorMutationFailureKind::Internal,
-                    finalize_error,
-                )),
-            }),
+            }) => {
+                let receipt = outcome
+                    .as_ref()
+                    .map(|outcome| self.receipt(request.operation_id(), outcome))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        internal(
+                            "Iceberg known-committed write finalization has no committed snapshot",
+                        )
+                    })?;
+                Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt,
+                    finalization: ExternalMutationFinalization::Failed(failure(
+                        ConnectorMutationFailureKind::Internal,
+                        finalize_error,
+                    )),
+                })
+            }
             Err(CommitServiceError::Unknown { message, evidence }) => {
                 Ok(ExternalMutationOutcome::CommitUnknown {
                     failure: failure(ConnectorMutationFailureKind::Unavailable, message),
@@ -627,8 +655,7 @@ impl ConnectorWriteControl for IcebergWriteControlAdapter {
         let reconciled = match self.backend.reconcile(&evidence) {
             Ok(Some(outcome)) => ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
-                receipt: connector_write_receipt(outcome.new_snapshot_id)
-                    .map_err(|error| internal(format!("encode Iceberg write receipt: {error}")))?,
+                receipt: self.receipt(operation_id, &outcome)?,
                 finalization: ExternalMutationFinalization::Complete,
             },
             Ok(None) => ExternalMutationOutcome::KnownUncommitted {
@@ -656,20 +683,25 @@ impl ConnectorWriteControl for IcebergWriteControlAdapter {
                 outcome,
                 finalize_error,
                 ..
-            }) => ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt: connector_write_receipt(
-                    outcome
-                        .as_ref()
-                        .map(|outcome| outcome.new_snapshot_id)
-                        .unwrap_or_default(),
-                )
-                .map_err(|error| internal(format!("encode Iceberg write receipt: {error}")))?,
-                finalization: ExternalMutationFinalization::Failed(failure(
-                    ConnectorMutationFailureKind::Internal,
-                    finalize_error,
-                )),
-            },
+            }) => {
+                let receipt = outcome
+                    .as_ref()
+                    .map(|outcome| self.receipt(operation_id, outcome))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        internal(
+                            "Iceberg reconciled known-committed write finalization has no committed snapshot",
+                        )
+                    })?;
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt,
+                    finalization: ExternalMutationFinalization::Failed(failure(
+                        ConnectorMutationFailureKind::Internal,
+                        finalize_error,
+                    )),
+                }
+            }
         };
         operations.insert(
             operation_id,
