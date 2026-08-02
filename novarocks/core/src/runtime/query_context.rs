@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -408,14 +408,6 @@ impl QueryContext {
 
     pub(crate) fn cache_options(&self) -> Option<CacheOptions> {
         self.cache_options.clone()
-    }
-
-    pub(crate) fn set_lake_tablet_paths(&mut self, cache_key: String, paths: HashMap<i64, String>) {
-        self.lake_tablet_paths.insert(cache_key, paths);
-    }
-
-    pub(crate) fn lake_tablet_paths(&self, cache_key: &str) -> Option<HashMap<i64, String>> {
-        self.lake_tablet_paths.get(cache_key).cloned()
     }
 }
 
@@ -856,31 +848,6 @@ impl QueryContextManager {
         query_ids.sort_by_key(|query_id| (query_id.high(), query_id.low()));
         query_ids.dedup();
         query_ids
-    }
-
-    pub(crate) fn set_lake_tablet_paths(
-        &self,
-        query_id: QueryId,
-        cache_key: String,
-        paths: HashMap<i64, String>,
-    ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| {
-            ctx.set_lake_tablet_paths(cache_key, paths);
-            Ok(())
-        })
-    }
-
-    pub(crate) fn lake_tablet_paths(
-        &self,
-        query_id: QueryId,
-        cache_key: &str,
-    ) -> Option<HashMap<i64, String>> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.lake_tablet_paths(cache_key))
     }
 
     pub(crate) fn register_row_pos_descs(
@@ -2112,7 +2079,6 @@ mod incremental_scan_domain_tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod tests {}
