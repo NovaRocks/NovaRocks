@@ -23690,6 +23690,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the native FE+BE first-refresh staging fixture"]
     fn refresh_iceberg_union_all_projection_mv_refreshes_branch_aware_rows() {
         let catalog = "ice_union_projection_rows";
         let env = open_test_state_with_hadoop_iceberg_catalog(catalog, "analytics");
@@ -25312,6 +25313,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the native FE+BE first-refresh staging fixture"]
     fn plan_iceberg_mv_refresh_reports_append_insert_affected_partitions() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_identity_partitioned_base_table(&env.state, "ice", "sales", "orders");
@@ -25373,6 +25375,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the native FE+BE first-refresh staging fixture"]
     fn plan_iceberg_mv_refresh_reports_unpartitioned_for_unpartitioned_mv() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);

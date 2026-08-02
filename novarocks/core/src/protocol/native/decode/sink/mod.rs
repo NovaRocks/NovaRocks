@@ -143,6 +143,12 @@ pub(crate) fn decode_fragment_sink_program_with_context(
                 .map_err(super::NativeFragmentDecodeError::from)
         }
         plan::data_sink::Kind::ConnectorWrite(connector) => {
+            if connector.handle.is_none() {
+                return Err(super::NativeFragmentDecodeError::missing(
+                    path.clone().field("connector_write").field("handle"),
+                    "native connector write sink requires a writer handle",
+                ));
+            }
             let context = context.ok_or_else(|| {
                 super::NativeFragmentDecodeError::unsupported(
                     path.clone().field("connector_write"),
