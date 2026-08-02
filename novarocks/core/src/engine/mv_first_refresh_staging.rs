@@ -545,6 +545,7 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)
             .map_err(|error| format!("reload MV first-refresh staging target: {error}"))?
             .table;
+    validate_first_refresh_target_contract(&target_table, prepared.target_contract())?;
     let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
         target_table.metadata().current_schema(),
     )?;
@@ -612,6 +613,26 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         exact_lease,
     )?;
     Ok((sink_spec, template))
+}
+
+fn validate_first_refresh_target_contract(
+    target_table: &iceberg::table::Table,
+    contract: &MvFirstRefreshTargetContract,
+) -> Result<(), String> {
+    let actual_schema = target_table.metadata().current_schema();
+    let actual_arrow_schema = iceberg::arrow::schema_to_arrow_schema(actual_schema)
+        .map_err(|error| format!("convert MV first-refresh activation schema to Arrow: {error}"))?;
+    let actual_field_ids = actual_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.id)
+        .collect::<Vec<_>>();
+    contract.validate_observed(
+        &actual_arrow_schema,
+        &actual_field_ids,
+        target_table.metadata().default_partition_spec_id(),
+    )
 }
 
 /// Bind an SQL-shaped first-refresh artifact only after the frontend has

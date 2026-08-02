@@ -27,7 +27,7 @@ use crate::mv::refresh::projection_first_refresh::{
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::planner::logical::LogicalPlanNode;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorTableHandle,
     ConnectorWriteCohortId, ConnectorWriteOperationId,
@@ -183,6 +183,36 @@ impl MvFirstRefreshTargetContract {
 
     pub(crate) fn hidden_hash_key(&self) -> &str {
         &self.hidden_hash_key
+    }
+
+    /// Verify provider-observed target facts before a deferred writer is
+    /// activated. This is value-only so the SQL contract retains neither a
+    /// catalog handle nor a provider codec.
+    pub(crate) fn validate_observed(
+        &self,
+        schema: &Schema,
+        field_ids: &[i32],
+        partition_spec_id: i32,
+    ) -> Result<(), String> {
+        if schema != self.schema.as_ref()
+            || field_ids != self.field_ids
+            || partition_spec_id != self.partition_spec_id
+        {
+            return Err(
+                "MV first-refresh target physical contract drifted after preparation".to_string(),
+            );
+        }
+        if !self
+            .schema
+            .fields()
+            .iter()
+            .any(|field| field.name() == &self.hidden_hash_key)
+        {
+            return Err(
+                "MV first-refresh target contract has no hidden hash key field".to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -740,6 +770,9 @@ fn quote_sql_identifier(identifier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
     use super::*;
 
     fn pin() -> RefreshSnapshotPin {
@@ -846,5 +879,42 @@ mod tests {
         assert!(prepared.sql().contains("VERSION AS OF 11"));
         assert!(prepared.sql().contains("VERSION AS OF 22"));
         assert!(prepared.sql().contains("count_state_visible"));
+    }
+
+    #[test]
+    fn target_contract_rejects_schema_identity_and_partition_drift() {
+        let expected = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+            Field::new("__apply_key__", DataType::Utf8, false),
+        ]));
+        let contract = MvFirstRefreshTargetContract::try_new(
+            Arc::clone(&expected),
+            vec![1, 2],
+            7,
+            "__apply_key__".to_string(),
+        )
+        .expect("valid target contract");
+        contract
+            .validate_observed(expected.as_ref(), &[1, 2], 7)
+            .expect("exact observed contract");
+        assert!(
+            contract
+                .validate_observed(expected.as_ref(), &[1, 3], 7)
+                .is_err()
+        );
+        assert!(
+            contract
+                .validate_observed(expected.as_ref(), &[1, 2], 8)
+                .is_err()
+        );
+        let drifted_schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("__apply_key__", DataType::Utf8, false),
+        ]));
+        assert!(
+            contract
+                .validate_observed(drifted_schema.as_ref(), &[1, 2], 7)
+                .is_err()
+        );
     }
 }
