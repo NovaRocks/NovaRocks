@@ -194,7 +194,7 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
     FunctionMeta {
         name: "avg_state_visible",
         min_args: 1,
-        max_args: 2,
+        max_args: 3,
     },
     FunctionMeta {
         name: "sum_state_union",
@@ -204,7 +204,7 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
     FunctionMeta {
         name: "sum_state_visible",
         min_args: 1,
-        max_args: 1,
+        max_args: 2,
     },
     FunctionMeta {
         name: "min_state_union",
@@ -214,7 +214,7 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
     FunctionMeta {
         name: "min_state_visible",
         min_args: 1,
-        max_args: 1,
+        max_args: 2,
     },
     FunctionMeta {
         name: "max_state_union",
@@ -224,7 +224,7 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
     FunctionMeta {
         name: "max_state_visible",
         min_args: 1,
-        max_args: 1,
+        max_args: 2,
     },
     FunctionMeta {
         name: "bool_or_state_union",
@@ -253,14 +253,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+    use arrow::array::{Array, ArrayRef, BinaryArray, Decimal128Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
-    use crate::exec::expr::ExprNode;
     use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
+    use crate::exec::expr::{ExprNode, LiteralValue};
 
     #[test]
     fn state_all_zero_is_registered_as_mv_state_function() {
@@ -309,6 +309,45 @@ mod tests {
         for row in 0..out.len() {
             assert_eq!(out.value(row), expected.value(row));
         }
+    }
+
+    #[test]
+    fn avg_state_visible_three_args_keeps_decimal_scale() {
+        let mut arena = ExprArena::default();
+        let state = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Binary);
+        let scale = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(4)), DataType::Int64);
+        let witness = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Null),
+            DataType::Decimal128(38, 10),
+        );
+        let expr = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::MvState("avg_state_visible"),
+                args: vec![state, scale, witness],
+            },
+            DataType::Decimal128(38, 10),
+        );
+        let state = crate::mv::aggregate_state::state_codec::encode_sum_decimal128(2, 300_000);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "state",
+                DataType::Binary,
+                false,
+            )])),
+            vec![Arc::new(BinaryArray::from(vec![Some(state.as_slice())])) as ArrayRef],
+        )
+        .unwrap();
+        let schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .unwrap();
+
+        let out = arena
+            .eval(expr, &Chunk::new_with_chunk_schema(batch, schema))
+            .unwrap();
+        let out = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(out.value(0), 150_000_000_000);
     }
 
     fn two_key_chunk() -> Chunk {

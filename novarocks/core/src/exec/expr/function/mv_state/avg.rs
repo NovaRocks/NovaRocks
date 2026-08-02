@@ -54,19 +54,24 @@ pub(crate) fn eval_avg_state_visible(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    if !(1..=2).contains(&args.len()) {
+    if !(1..=3).contains(&args.len()) {
         return Err(format!(
-            "avg_state_visible expects 1 or 2 arguments, got {}",
+            "avg_state_visible expects 1 to 3 arguments, got {}",
             args.len()
         ));
     }
     let input = arena.eval(args[0], chunk)?;
-    let input_scale = if args.len() == 2 {
+    let input_scale = if args.len() >= 2 {
         Some(arena.eval(args[1], chunk)?)
     } else {
         None
     };
-    let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Float64);
+    let output_type = args
+        .get(2)
+        .and_then(|witness| arena.data_type(*witness))
+        .cloned()
+        .or_else(|| arena.data_type(expr).cloned())
+        .unwrap_or(DataType::Float64);
     eval_avg_state_visible_array(&input, input_scale.as_ref(), &output_type)
 }
 
@@ -96,12 +101,6 @@ pub(crate) fn eval_avg_state_visible_array(
     };
     match output_type {
         DataType::Float64 | DataType::Null => {
-            if input_scale.is_some() {
-                return Err(
-                    "avg_state_visible input decimal scale requires Decimal128 output type"
-                        .to_string(),
-                );
-            }
             let mut builder = Float64Builder::new();
             for row in 0..rows {
                 let state = binary_value_or_empty(
@@ -110,7 +109,22 @@ pub(crate) fn eval_avg_state_visible_array(
                     "avg_state_visible",
                     0,
                 )?;
-                match avg_state_visible_as_float64(state)? {
+                let value = if let Some(input_scale) = input_scale {
+                    let input_scale = int64_value(
+                        input_scale,
+                        row_index(row, input_scale.len())?,
+                        "avg_state_visible",
+                        1,
+                    )?;
+                    if input_scale == -1 {
+                        avg_state_visible_as_float64(state)?
+                    } else {
+                        avg_decimal_state_visible_as_float64(state, input_scale)?
+                    }
+                } else {
+                    avg_state_visible_as_float64(state)?
+                };
+                match value {
                     Some(value) => builder.append_value(value),
                     None => builder.append_null(),
                 }
@@ -136,7 +150,12 @@ pub(crate) fn eval_avg_state_visible_array(
                     "avg_state_visible",
                     1,
                 )?;
-                match avg_state_visible_as_decimal128(state, input_scale, *scale)? {
+                let value = if input_scale == -1 {
+                    avg_int64_state_visible_as_decimal128(state, *scale)?
+                } else {
+                    avg_state_visible_as_decimal128(state, input_scale, *scale)?
+                };
+                match value {
                     Some(value) => builder.append_value(value),
                     None => builder.append_null(),
                 }
@@ -149,6 +168,21 @@ pub(crate) fn eval_avg_state_visible_array(
     }
 }
 
+fn avg_int64_state_visible_as_decimal128(
+    s: &[u8],
+    output_scale: i8,
+) -> Result<Option<i128>, String> {
+    let output_scale = validate_decimal_scale("output", i64::from(output_scale))?;
+    let (row_count, sum) = decode_avg_int64(s)?;
+    if row_count == 0 {
+        return Ok(None);
+    }
+    let scaled_sum = i128::from(sum)
+        .checked_mul(pow10_i128(output_scale as usize)?)
+        .ok_or_else(|| "decimal overflow".to_string())?;
+    Ok(Some(div_round_i128(scaled_sum, i128::from(row_count))))
+}
+
 fn avg_state_visible_as_float64(s: &[u8]) -> Result<Option<f64>, String> {
     let (row_count, sum) = decode_avg_int64(s)?;
     if row_count == 0 {
@@ -156,6 +190,17 @@ fn avg_state_visible_as_float64(s: &[u8]) -> Result<Option<f64>, String> {
     } else {
         Ok(Some(sum as f64 / row_count as f64))
     }
+}
+
+fn avg_decimal_state_visible_as_float64(s: &[u8], input_scale: i64) -> Result<Option<f64>, String> {
+    let input_scale = validate_decimal_scale("input", input_scale)?;
+    let (row_count, sum) = decode_avg_decimal128(s)?;
+    if row_count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        sum as f64 / 10_f64.powi(input_scale) / row_count as f64,
+    ))
 }
 
 fn avg_state_visible_as_decimal128(
@@ -297,17 +342,25 @@ mod tests {
     }
 
     #[test]
-    fn avg_state_visible_float64_rejects_input_scale_arg() {
-        let input = binary_array(&[Some(encode_sum_int64(4, 10))]);
+    fn avg_state_visible_float64_decodes_decimal_input_with_scale() {
+        let input = binary_array(&[Some(encode_sum_decimal128(2, 300_000))]);
         let input_scale = int64_array(&[Some(6)]);
 
-        let err = eval_avg_state_visible_array(&input, Some(&input_scale), &DataType::Float64)
-            .expect_err("Float64 visible output should not accept input scale");
+        let out =
+            eval_avg_state_visible_array(&input, Some(&input_scale), &DataType::Float64).unwrap();
+        let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(out.value(0), 0.15);
+    }
 
-        assert_eq!(
-            err,
-            "avg_state_visible input decimal scale requires Decimal128 output type"
-        );
+    #[test]
+    fn avg_state_visible_float64_decodes_int64_input_with_sentinel_scale() {
+        let input = binary_array(&[Some(encode_sum_int64(4, 10))]);
+        let input_scale = int64_array(&[Some(-1)]);
+
+        let out =
+            eval_avg_state_visible_array(&input, Some(&input_scale), &DataType::Float64).unwrap();
+        let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(out.value(0), 2.5);
     }
 
     #[test]

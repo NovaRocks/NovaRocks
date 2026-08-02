@@ -133,11 +133,22 @@ fn eval_min_max_state_visible(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    if args.len() != 1 {
-        return Err(format!("{fn_name} expects 1 argument, got {}", args.len()));
+    if !(1..=2).contains(&args.len()) {
+        return Err(format!(
+            "{fn_name} expects 1 or 2 arguments, got {}",
+            args.len()
+        ));
     }
     let input = arena.eval(args[0], chunk)?;
-    let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Int64);
+    // See sum_state_visible: a second typed NULL witness freezes the target
+    // MV column type for first-refresh state decoding without exposing state
+    // payloads outside the BE.
+    let output_type = args
+        .get(1)
+        .and_then(|witness| arena.data_type(*witness))
+        .cloned()
+        .or_else(|| arena.data_type(expr).cloned())
+        .unwrap_or(DataType::Int64);
     eval_min_max_state_visible_array(fn_name, pick_max, &input, &output_type)
 }
 

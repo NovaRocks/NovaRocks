@@ -512,38 +512,51 @@ fn prepare_frontend_first_refresh_write(
     let (shape, physical_sql) = if capabilities.has_agg_state {
         let calls =
             crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)?;
+        let aggregate_layout = build_aggregate_layout_for_refresh_select_sql(
+            state,
+            current_catalog,
+            current_database,
+            &definition.select_sql,
+            &calls,
+            &connector_context,
+        )?;
         if let Some(branch) = &schema_contract.branch {
             (
                 crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::BranchUnionAggregate,
-                crate::sql::mv_refresh::first_refresh::prepare_branch_union_aggregate_first_refresh_write_sql(
+                crate::sql::mv_refresh::first_refresh::prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
                     &definition.select_sql,
                     branch.branch_count as usize,
                     &calls,
                     &pin,
                     current_catalog,
                     current_database,
+                    Some(target_contract.schema()),
                 )?,
             )
         } else if !schema_contract.bases.is_empty() {
             (
                 crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::FanInAggregate,
-                crate::sql::mv_refresh::first_refresh::prepare_fan_in_aggregate_first_refresh_write_sql(
+                crate::sql::mv_refresh::first_refresh::prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
                     &definition.select_sql,
                     &calls,
                     &pin,
                     current_catalog,
                     current_database,
+                    Some(target_contract.schema()),
+                    Some(&aggregate_layout.aggregate_input_types),
                 )?,
             )
         } else {
             (
                 crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Aggregate,
-                crate::sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql(
+                crate::sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
                     &definition.select_sql,
                     &calls,
                     &pin,
                     current_catalog,
                     current_database,
+                    Some(target_contract.schema()),
+                    Some(&aggregate_layout.aggregate_input_types),
                 )?,
             )
         }
@@ -979,11 +992,7 @@ fn prepare_frontend_incremental_write(
         NonJoinIncrementalChangePlan::ChangeStream {
             has_delete_changes, ..
         } => {
-            let mode = if has_delete_changes {
-                crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::RowDelta
-            } else {
-                crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::FastAppend
-            };
+            let mode = non_join_incremental_write_mode(is_aggregate, has_delete_changes);
             let evidence = if is_aggregate {
                 if is_branch_union {
                     crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::BranchUnionAggregate
@@ -1034,6 +1043,17 @@ fn prepare_frontend_incremental_write(
         provenance_properties,
     )
     .map(PreparedIncrementalRefreshWork::ChangeStream)
+}
+
+fn non_join_incremental_write_mode(
+    is_aggregate: bool,
+    has_delete_changes: bool,
+) -> crate::sql::mv_refresh::incremental::MvIncrementalWriteMode {
+    if is_aggregate || has_delete_changes {
+        crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::RowDelta
+    } else {
+        crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::FastAppend
+    }
 }
 
 fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
@@ -17153,6 +17173,22 @@ mod tests {
     use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn aggregate_incremental_inserts_use_row_delta() {
+        assert!(matches!(
+            non_join_incremental_write_mode(true, false),
+            crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::RowDelta
+        ));
+        assert!(matches!(
+            non_join_incremental_write_mode(false, false),
+            crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::FastAppend
+        ));
+        assert!(matches!(
+            non_join_incremental_write_mode(false, true),
+            crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::RowDelta
+        ));
+    }
     use std::sync::Arc as StdArc;
     use tempfile::TempDir;
 

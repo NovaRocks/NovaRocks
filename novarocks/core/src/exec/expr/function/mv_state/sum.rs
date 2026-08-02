@@ -101,14 +101,24 @@ pub(crate) fn eval_sum_state_visible(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    if args.len() != 1 {
+    if !(1..=2).contains(&args.len()) {
         return Err(format!(
-            "sum_state_visible expects 1 argument, got {}",
+            "sum_state_visible expects 1 or 2 arguments, got {}",
             args.len()
         ));
     }
     let input = arena.eval(args[0], chunk)?;
-    let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Int64);
+    // First-refresh physicalization may attach a typed NULL witness to keep
+    // the opaque state decoder aligned with the target MV column. The native
+    // plan still carries the historical one-argument function metadata, so
+    // the witness—not the legacy call result annotation—is authoritative for
+    // the BE-local decoder when it is present.
+    let output_type = args
+        .get(1)
+        .and_then(|witness| arena.data_type(*witness))
+        .cloned()
+        .or_else(|| arena.data_type(expr).cloned())
+        .unwrap_or(DataType::Int64);
     eval_sum_state_visible_array(&input, &output_type)
 }
 
@@ -136,7 +146,7 @@ pub(crate) fn eval_sum_state_visible_array(
                 .with_data_type(DataType::Decimal128(*precision, *scale));
             for row in 0..input.len() {
                 let state = binary_value_or_empty(input, row, "sum_state_visible", 0)?;
-                match sum_state_visible_as_decimal128(state)? {
+                match sum_state_visible_as_decimal128_for_output(state)? {
                     Some(value) => builder.append_value(value),
                     None => builder.append_null(),
                 }
@@ -184,6 +194,19 @@ fn sum_state_visible_as_decimal128(s: &[u8]) -> Result<Option<i128>, String> {
         Ok(None)
     } else {
         Ok(Some(sum))
+    }
+}
+
+// SUM's stored state layout is chosen by the aggregate input type, while SQL
+// may widen an integral SUM to DECIMAL in the visible MV schema. Decode the
+// opaque state by its self-identifying fixed width, then widen only the
+// returned BE value. This keeps the provider-owned state opaque to FE while
+// avoiding an invalid assumption that output and state layouts coincide.
+fn sum_state_visible_as_decimal128_for_output(s: &[u8]) -> Result<Option<i128>, String> {
+    match sum_state_layout(s)? {
+        SumStateLayout::Empty => Ok(None),
+        SumStateLayout::Int64 => sum_state_visible_as_int64(s).map(|value| value.map(i128::from)),
+        SumStateLayout::Decimal128 => sum_state_visible_as_decimal128(s),
     }
 }
 

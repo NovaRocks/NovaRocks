@@ -1250,6 +1250,14 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
     add(
         m,
+        "avg_state_visible",
+        Signature::new(
+            vec![TypeSpec::Binary, TypeSpec::Int64, TypeSpec::Any("T")],
+            TypeSpec::Any("T"),
+        ),
+    );
+    add(
+        m,
         "sum_state_union",
         Signature::new(vec![TypeSpec::Binary, TypeSpec::Binary], TypeSpec::Binary),
     );
@@ -1257,6 +1265,14 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
         m,
         "sum_state_visible",
         Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+    );
+    add(
+        m,
+        "sum_state_visible",
+        Signature::new(
+            vec![TypeSpec::Binary, TypeSpec::Any("T")],
+            TypeSpec::Any("T"),
+        ),
     );
     for name in ["min_state_union", "max_state_union"] {
         add(
@@ -1270,6 +1286,14 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
             m,
             name,
             Signature::new(vec![TypeSpec::Binary], TypeSpec::Int64),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Binary, TypeSpec::Any("T")],
+                TypeSpec::Any("T"),
+            ),
         );
     }
     for name in ["bool_or_state_union", "bool_and_state_union"] {

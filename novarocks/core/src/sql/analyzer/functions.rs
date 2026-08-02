@@ -234,7 +234,10 @@ fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Resu
         | "max_state_union"
         | "bool_or_state_union"
         | "bool_and_state_union" => 2,
-        "avg_state_visible" if arg_types.len() == 2 => 2,
+        "avg_state_visible" if arg_types.len() == 2 || arg_types.len() == 3 => arg_types.len(),
+        "sum_state_visible" | "min_state_visible" | "max_state_visible" if arg_types.len() == 2 => {
+            2
+        }
         "count_state_visible"
         | "count_distinct_state_visible"
         | "approx_count_distinct_state_visible"
@@ -247,13 +250,20 @@ fn validate_mv_state_scalar_function(name: &str, arg_types: &[DataType]) -> Resu
         | "state_all_zero" => 1,
         _ => return Ok(()),
     };
-    let valid_args = if name == "avg_state_visible" && arg_types.len() == 2 {
-        binary_arg(&arg_types[0]) && matches!(arg_types[1], DataType::Int64)
-    } else if name == "state_all_zero" {
-        arg_types.iter().all(zero_check_arg)
-    } else {
-        arg_types.iter().all(binary_arg)
-    };
+    let valid_args =
+        if name == "avg_state_visible" && (arg_types.len() == 2 || arg_types.len() == 3) {
+            binary_arg(&arg_types[0]) && matches!(arg_types[1], DataType::Int64)
+        } else if matches!(
+            name,
+            "sum_state_visible" | "min_state_visible" | "max_state_visible"
+        ) && arg_types.len() == 2
+        {
+            binary_arg(&arg_types[0])
+        } else if name == "state_all_zero" {
+            arg_types.iter().all(zero_check_arg)
+        } else {
+            arg_types.iter().all(binary_arg)
+        };
     if arg_types.len() != expected || !valid_args {
         return Err(no_matching_signature(name, arg_types));
     }
@@ -1036,6 +1046,9 @@ pub(super) fn infer_scalar_return_type_with_catalog(
         | "sum_state_visible"
         | "min_state_visible"
         | "max_state_visible" => DataType::Int64,
+        "avg_state_visible" if arg_types.len() == 3 => {
+            arg_types.get(2).cloned().unwrap_or(DataType::Float64)
+        }
         "avg_state_visible" => DataType::Float64,
         "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
         "mv_group_row_id" => DataType::Utf8,
