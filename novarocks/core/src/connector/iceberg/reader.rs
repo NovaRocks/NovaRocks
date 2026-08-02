@@ -661,6 +661,9 @@ fn map_field_id_recursive(
     let mut metadata = field.metadata().clone();
     metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
     let data_type = match field.data_type() {
+        data_type if crate::formats::parquet::is_variant_struct_data_type(data_type) => {
+            data_type.clone()
+        }
         DataType::Struct(children) => DataType::Struct(
             children
                 .iter()
@@ -728,6 +731,9 @@ fn mapped_field_for_name<'a>(
 
 fn field_id_coverage(field: &Field) -> Result<(usize, usize), String> {
     let identified = usize::from(parse_field_id(field)?.is_some());
+    if crate::formats::parquet::is_variant_struct_data_type(field.data_type()) {
+        return Ok((identified, 1));
+    }
     let (children_identified, children_total) = match field.data_type() {
         DataType::Struct(children) => {
             children
@@ -1111,6 +1117,27 @@ mod tests {
         )]))
     }
 
+    fn physical_variant_field(name: &str, field_id: Option<i32>) -> Field {
+        let field = Field::new(
+            name,
+            DataType::Struct(
+                vec![
+                    Field::new("metadata", DataType::Binary, false),
+                    Field::new("value", DataType::Binary, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        match field_id {
+            Some(field_id) => field.with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                field_id.to_string(),
+            )])),
+            None => field,
+        }
+    }
+
     #[test]
     fn applies_name_mapping_recursively_to_reordered_nested_schema() {
         let schema = Arc::new(Schema::new(vec![
@@ -1184,6 +1211,45 @@ mod tests {
             Field::new("unidentified", DataType::Int32, false),
         ]));
         assert_eq!(schema_field_id_coverage(&mixed).expect("coverage"), (1, 2));
+    }
+
+    #[test]
+    fn variant_physical_children_do_not_participate_in_iceberg_field_id_coverage() {
+        let schema = Arc::new(Schema::new(vec![
+            field_with_id("id", 1, false),
+            physical_variant_field("payload", Some(2)),
+        ]));
+        assert_eq!(schema_field_id_coverage(&schema).expect("coverage"), (2, 2));
+
+        let ordinary_struct = Arc::new(Schema::new(vec![
+            Field::new(
+                "record",
+                DataType::Struct(vec![Field::new("child", DataType::Int32, false)].into()),
+                false,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "3".to_string(),
+            )])),
+        ]));
+        assert_eq!(
+            schema_field_id_coverage(&ordinary_struct).expect("ordinary struct coverage"),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn name_mapping_treats_variant_physical_children_as_opaque() {
+        let schema = Arc::new(Schema::new(vec![physical_variant_field("payload", None)]));
+        let mapping: iceberg::spec::NameMapping =
+            serde_json::from_str(r#"[{"field-id":2,"names":["payload"]}]"#).expect("mapping");
+
+        let mapped = apply_name_mapping_to_schema(&schema, &mapping).expect("variant mapping");
+        assert_eq!(schema_field_id_coverage(&mapped).expect("coverage"), (1, 1));
+        assert_eq!(
+            parse_field_id(mapped.field(0)).expect("variant field ID"),
+            Some(2)
+        );
     }
 
     #[test]
