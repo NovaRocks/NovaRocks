@@ -431,6 +431,37 @@ impl FixtureControlResolver {
 
 #[cfg(test)]
 impl novarocks_spi::connector::ConnectorControlResolver for FixtureControlResolver {
+    fn observe_current_binding(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorExecutionBindingKey,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .registry
+            .fixture_controls
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "fixture connector control lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "test fixture did not register a connector control binding",
+                )
+            })?;
+        Ok(novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: binding.descriptor().instance_id.clone(),
+            incarnation: binding.incarnation(),
+        })
+    }
+
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,

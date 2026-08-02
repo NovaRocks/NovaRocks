@@ -236,15 +236,11 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             .as_deref()
             .ok_or_else(|| "Iceberg MV refresh target has no connector catalog".to_string())?;
         let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-        let lease = self
+        let observed_binding = self
             .state
             .connector_control
-            .acquire_current(&instance_id)
+            .observe_current_binding(&instance_id)
             .map_err(|error| error.to_string())?;
-        let observed_binding = ConnectorExecutionBindingKey {
-            instance_id: lease.binding().descriptor().instance_id.clone(),
-            incarnation: lease.binding().incarnation(),
-        };
         let base_table_uuids = plan
             .contract
             .base_refs

@@ -19,14 +19,13 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorDataMutation, ConnectorDataMutationResolver,
-    ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionDeclaration, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceResolver, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStatistics, ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorWriteControl,
-    ConnectorWriteLease, ConnectorWriteResolver,
+    ConnectorDataMutation, ConnectorDataMutationResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorRequestContext,
+    ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorStatistics, ConnectorStatisticsResolver,
+    ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -348,6 +347,14 @@ impl ConnectorControlBinding {
 /// to the frontend process; core neither owns the control registry nor creates
 /// a control binding.
 pub trait ConnectorControlResolver: Send + Sync {
+    /// Read the active binding identity without retaining a generation. SQL
+    /// preparation uses this only as an observation to be checked again when
+    /// the frontend acquires its exact lifecycle lease.
+    fn observe_current_binding(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorExecutionBindingKey, ConnectorError>;
+
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,

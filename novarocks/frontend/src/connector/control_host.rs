@@ -570,6 +570,35 @@ impl ConnectorControlHost {
 }
 
 impl ConnectorControlResolver for ConnectorControlHost {
+    fn observe_current_binding(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+        let state = self.lock_state()?;
+        let key = state.active.get(instance_id).cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                format!(
+                    "connector control instance `{}` is not active",
+                    instance_id.as_str()
+                ),
+            )
+        })?;
+        let generation = state.generations.get(&key).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "active connector control generation is missing",
+            )
+        })?;
+        if generation.state != ControlGenerationState::Active {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "connector control generation is retiring",
+            ));
+        }
+        Ok(key)
+    }
+
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,
@@ -1025,6 +1054,27 @@ mod tests {
             None,
         )
         .expect("control binding")
+    }
+
+    #[test]
+    fn observing_current_binding_does_not_require_a_planning_lease() {
+        let host = ConnectorControlHost::new();
+        let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+        host.register(binding(7)).expect("register generation");
+
+        assert_eq!(
+            host.observe_current_binding(&instance_id)
+                .expect("observe active generation")
+                .incarnation
+                .to_bytes(),
+            [7; 16]
+        );
+        host.retire_current(&instance_id)
+            .expect("retire unleased generation");
+        assert!(
+            host.acquire_current(&instance_id).is_err(),
+            "an observation must not keep a retiring generation live"
+        );
     }
 
     #[test]
