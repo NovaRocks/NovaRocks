@@ -588,6 +588,54 @@ where
     build_iceberg_connector_write_templates(target, target_ref, operation_id, cohorts)
 }
 
+/// Reserve an Iceberg write service only after the application has retained
+/// the exact write lease. The factory is evaluated lazily by the first SPI
+/// planning request, so SQL preparation cannot mutate the provider registry
+/// or accidentally bind a newer connector generation.
+#[allow(clippy::type_complexity)]
+pub(crate) fn reserve_iceberg_connector_write_cohort_service_with_exact_lease<F>(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    target_ref: &str,
+    operation_id: ConnectorWriteOperationId,
+    cohorts: Vec<(
+        novarocks_spi::connector::ConnectorWriteCohortId,
+        ConnectorWriteIntent,
+        Arc<Schema>,
+        Bytes,
+        novarocks_spi::connector::ConnectorRequestContext,
+    )>,
+    activation_digest: [u8; 32],
+    exact_lease: &ConnectorWriteLease,
+    factory: F,
+) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String>
+where
+    F: Fn() -> Result<
+            Arc<dyn crate::connector::iceberg::write_control::IcebergWriteControlBackend>,
+            novarocks_spi::connector::ConnectorError,
+        > + Send
+        + Sync
+        + 'static,
+{
+    if cohorts.is_empty() {
+        return Err("Iceberg connector write operation has no cohorts".to_string());
+    }
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    if exact_lease.binding_key().instance_id != instance_id {
+        return Err("Iceberg write lease does not match the target connector instance".to_string());
+    }
+    let services = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
+        .write_services();
+    services
+        .register_lazy(operation_id, activation_digest, factory)
+        .map_err(|error| format!("reserve Iceberg connector write service: {error}"))?;
+    build_iceberg_connector_write_templates(target, target_ref, operation_id, cohorts)
+}
+
 #[allow(clippy::type_complexity)]
 fn build_iceberg_connector_write_templates(
     target: &TargetBackend,
@@ -732,7 +780,8 @@ impl PreparedIcebergWrite {
     /// through the same prepared inputs.
     pub(crate) fn into_prepared_distributed_write(
         self,
-    ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+    ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String>
+    {
         let Self { executor, .. } = self;
         let execution = executor.execution.as_ref().ok_or_else(|| {
             "prepared distributed Iceberg write requires an admitted execution context".to_string()

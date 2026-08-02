@@ -1321,6 +1321,84 @@ pub(crate) fn build_change_stream_connector_write_template(
     )
 }
 
+/// Activate a change-stream writer only after the frontend has retained the
+/// exact connector generation for this attempt. This is the deferred variant
+/// of [`build_change_stream_connector_write_template`]: it reserves a lazy
+/// provider service and returns the same generic SPI write template without
+/// executing fragments or committing Iceberg metadata.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activate_change_stream_connector_write_template(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+    commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    let handle_payloads = change_stream_writer_handle_payloads(
+        topology,
+        &commit_executor.table,
+        entry,
+        base_snapshot_id,
+    )?;
+    let plan_payload = crate::connector::iceberg::write_control::IcebergWritePlanPayloadV1 {
+        version: 1,
+        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+        target_ref: commit_executor.target_ref.clone(),
+    };
+    let provider_payload = plan_payload
+        .encode()
+        .map_err(|error| format!("encode Iceberg change-stream plan payload: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(operation_id.to_bytes());
+    hasher.update(provider_payload.as_ref());
+    for (fragment_id, payload) in &handle_payloads {
+        hasher.update(fragment_id.to_be_bytes());
+        hasher.update(payload.as_ref());
+    }
+    let activation_digest: [u8; 32] = hasher.finalize().into();
+    let committer: Arc<dyn crate::connector::iceberg::write_service::IcebergWriteReportCommitter> =
+        Arc::new(
+            crate::connector::iceberg::write_service::IcebergChangeStreamWriteReportCommitter::new(
+                Arc::clone(&commit_executor),
+                commit_plan,
+            ),
+        );
+    let target_ref = commit_executor.target_ref.clone();
+    let mut templates = crate::engine::iceberg_writer::reserve_iceberg_connector_write_cohort_service_with_exact_lease(
+        state,
+        target,
+        &target_ref,
+        operation_id,
+        vec![ (
+            novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            Arc::new(Schema::empty()),
+            provider_payload,
+            context,
+        ) ],
+        activation_digest,
+        exact_lease,
+        move || {
+            let context = crate::connector::iceberg::write_service::IcebergWriteControlServiceContext::new_with_fragment_handle_payloads(
+                handle_payloads.clone(),
+                plan_payload.clone(),
+                Arc::clone(&committer),
+            )?;
+            Ok(Arc::new(
+                crate::connector::iceberg::write_service::IcebergWriteControlService::new(context),
+            ))
+        },
+    )?;
+    Ok(templates
+        .pop()
+        .expect("single Iceberg change-stream cohort registration returns one template"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_mor_update_change_stream_transaction(
     state: &Arc<StandaloneState>,
