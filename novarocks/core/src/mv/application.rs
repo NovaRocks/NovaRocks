@@ -26,6 +26,7 @@ use crate::mv::repository::{
 };
 use crate::runtime::query_result::QueryResult;
 use crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
+use crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
 use crate::sql::mv_refresh::{
     MvRefreshPreparationService, MvRefreshStatement, PreparedDistributedWriteRequest,
     PreparedMvRefresh,
@@ -340,6 +341,15 @@ pub trait MvFirstRefreshWriteActivator: Send + Sync {
     fn bind_first_refresh_write(
         &self,
         prepared: PreparedMvFirstRefreshWrite,
+        exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, String>;
+
+    /// Bind one value-only incremental change-stream artifact after the same
+    /// retained exact lease has admitted its staging attempt.
+    fn bind_incremental_refresh_write(
+        &self,
+        prepared: PreparedMvIncrementalWrite,
         exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
         execution: &crate::query_execution::request_context::QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, String>;

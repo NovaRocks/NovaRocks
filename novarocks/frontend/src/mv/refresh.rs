@@ -100,6 +100,23 @@ impl FrontendMvFirstRefreshWriteActivatorPort {
             .bind_first_refresh_write(prepared, lease, execution)
             .map_err(invalid)
     }
+
+    fn bind_incremental_write(
+        &self,
+        prepared: novarocks::sql::mv_refresh::incremental::PreparedMvIncrementalWrite,
+        lease: &novarocks_spi::connector::ConnectorWriteLease,
+        execution: &novarocks::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, MvApplicationError> {
+        let activator = self
+            .activator
+            .read()
+            .map_err(|_| unavailable("MV first-refresh activator lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| unavailable("MV incremental provider activation is unavailable"))?;
+        activator
+            .bind_incremental_refresh_write(prepared, lease, execution)
+            .map_err(invalid)
+    }
 }
 
 impl MvFirstRefreshWriteActivatorSink for FrontendMvFirstRefreshWriteActivatorPort {
@@ -793,6 +810,7 @@ mod tests {
     use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks::sql::mv_refresh::PreparedDistributedWriteRequest;
     use novarocks::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
+    use novarocks::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
     use novarocks_spi::connector::ConnectorWriteLease;
 
     use super::FrontendMvFirstRefreshWriteActivatorPort;
@@ -803,6 +821,15 @@ mod tests {
         fn bind_first_refresh_write(
             &self,
             _prepared: PreparedMvFirstRefreshWrite,
+            _exact_lease: &ConnectorWriteLease,
+            _execution: &QueryExecutionContext,
+        ) -> Result<PreparedDistributedWriteRequest, String> {
+            unreachable!("the composition test never binds a write")
+        }
+
+        fn bind_incremental_refresh_write(
+            &self,
+            _prepared: PreparedMvIncrementalWrite,
             _exact_lease: &ConnectorWriteLease,
             _execution: &QueryExecutionContext,
         ) -> Result<PreparedDistributedWriteRequest, String> {

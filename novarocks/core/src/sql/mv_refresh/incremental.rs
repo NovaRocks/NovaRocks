@@ -24,20 +24,30 @@ pub(crate) enum MvIncrementalWriteMode {
     RowDelta,
 }
 
+/// Semantic evidence required by the typed IMV rewrite. It is SQL-owned and
+/// intentionally independent of the provider's commit vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvIncrementalRewriteEvidence {
+    None,
+    Aggregate,
+    JoinAggregate,
+    BranchUnionAggregate,
+}
+
 /// SQL/application handoff before an incremental change-stream plan is bound.
 /// It contains no catalog handle, physical fragment, provider codec or local
 /// executable program.
 pub(crate) struct MvIncrementalWriteRequest {
-    target_catalog: String,
-    target_namespace: String,
-    target_name: String,
-    staging_branch: String,
-    current_catalog: Option<String>,
-    current_database: String,
-    expected_target_snapshot_id: Option<i64>,
-    observed_binding: ConnectorExecutionBindingKey,
-    operation_id: ConnectorWriteOperationId,
-    connector_context: ConnectorRequestContext,
+    pub(crate) target_catalog: String,
+    pub(crate) target_namespace: String,
+    pub(crate) target_name: String,
+    pub(crate) staging_branch: String,
+    pub(crate) current_catalog: Option<String>,
+    pub(crate) current_database: String,
+    pub(crate) expected_target_snapshot_id: Option<i64>,
+    pub(crate) observed_binding: ConnectorExecutionBindingKey,
+    pub(crate) operation_id: ConnectorWriteOperationId,
+    pub(crate) connector_context: ConnectorRequestContext,
 }
 
 impl MvIncrementalWriteRequest {
@@ -83,6 +93,7 @@ pub struct PreparedMvIncrementalWrite {
     request: MvIncrementalWriteRequest,
     logical_context: MvFirstRefreshLogicalContext,
     mode: MvIncrementalWriteMode,
+    evidence: MvIncrementalRewriteEvidence,
     provenance_properties: BTreeMap<String, String>,
 }
 
@@ -131,18 +142,24 @@ impl PreparedMvIncrementalWrite {
         self.mode
     }
 
+    pub(crate) const fn evidence(&self) -> MvIncrementalRewriteEvidence {
+        self.evidence
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
         MvIncrementalWriteRequest,
         MvFirstRefreshLogicalContext,
         MvIncrementalWriteMode,
+        MvIncrementalRewriteEvidence,
         BTreeMap<String, String>,
     ) {
         (
             self.request,
             self.logical_context,
             self.mode,
+            self.evidence,
             self.provenance_properties,
         )
     }
@@ -155,6 +172,7 @@ impl MvIncrementalWritePreparer {
         request: MvIncrementalWriteRequest,
         logical_context: MvFirstRefreshLogicalContext,
         mode: MvIncrementalWriteMode,
+        evidence: MvIncrementalRewriteEvidence,
         provenance_properties: BTreeMap<String, String>,
     ) -> Result<PreparedMvIncrementalWrite, String> {
         if logical_context.base_refs.is_empty() || logical_context.pin.is_empty() {
@@ -167,6 +185,7 @@ impl MvIncrementalWritePreparer {
             request,
             logical_context,
             mode,
+            evidence,
             provenance_properties,
         })
     }

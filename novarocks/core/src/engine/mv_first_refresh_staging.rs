@@ -34,6 +34,7 @@ use crate::sql::mv_refresh::first_refresh::{
     MvFirstRefreshTargetContract, MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest,
     PreparedMvFirstRefreshWrite,
 };
+use crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
 use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
 
 /// Core-side implementation installed into the frontend composition through
@@ -62,6 +63,23 @@ impl crate::mv::application::MvFirstRefreshWriteActivator
             "MV first-refresh write activator is unavailable during engine shutdown".to_string()
         })?;
         bind_prepared_mv_first_refresh_staging(&state, prepared, exact_lease, execution)
+    }
+
+    fn bind_incremental_refresh_write(
+        &self,
+        prepared: PreparedMvIncrementalWrite,
+        exact_lease: &ConnectorWriteLease,
+        execution: &QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, String> {
+        let state = self.state.upgrade().ok_or_else(|| {
+            "MV incremental write activator is unavailable during engine shutdown".to_string()
+        })?;
+        crate::engine::mv::iceberg_refresh::bind_prepared_mv_incremental_staging(
+            &state,
+            prepared,
+            exact_lease,
+            execution,
+        )
     }
 }
 
@@ -680,7 +698,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
         }
         MvFirstRefreshExecutionArtifact::Logical(logical) => {
             let (logical_plan, factory, facts) = logical.into_parts();
-            let refresh_context = rebuild_frozen_join_refresh_context(
+            let refresh_context = rebuild_frozen_mv_refresh_context(
                 state,
                 current_catalog.as_deref(),
                 &current_database,
@@ -711,7 +729,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     Ok(distributed)
 }
 
-fn rebuild_frozen_join_refresh_context(
+pub(crate) fn rebuild_frozen_mv_refresh_context(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -742,7 +760,7 @@ fn rebuild_frozen_join_refresh_context(
         || target_identity.table != target_name
     {
         return Err(
-            "MV first-refresh logical artifact target does not match its frozen write request"
+            "MV refresh logical artifact target does not match its frozen write request"
                 .to_string(),
         );
     }
@@ -761,14 +779,18 @@ fn rebuild_frozen_join_refresh_context(
     .map_err(|error| format!("reload MV join staging target: {error}"))?
     .table;
     if target_table.metadata().uuid().to_string() != facts.target_table_uuid {
-        return Err("MV first-refresh join target UUID drifted after preparation".to_string());
+        return Err(
+            "MV refresh logical artifact target UUID drifted after preparation".to_string(),
+        );
     }
     let actual_target_snapshot_id = target_table
         .metadata()
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());
     if actual_target_snapshot_id != expected_target_snapshot_id {
-        return Err("MV first-refresh join target snapshot drifted after preparation".to_string());
+        return Err(
+            "MV refresh logical artifact target snapshot drifted after preparation".to_string(),
+        );
     }
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let catalogs = state

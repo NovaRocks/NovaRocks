@@ -15141,6 +15141,119 @@ fn prepare_imv_change_stream_writer(
     )
 }
 
+/// Activate a value-only incremental refresh artifact after frontend intent
+/// persistence and exact-lease admission. Core rebuilds only provider-private
+/// scan and writer facts here; it returns a prepared result-free request and
+/// never advances MV metadata or executes an external commit.
+pub(crate) fn bind_prepared_mv_incremental_staging(
+    state: &Arc<StandaloneState>,
+    prepared: crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite,
+    exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+    let (request, facts, mode, evidence, provenance_properties) = prepared.into_parts();
+    if request.observed_binding != *exact_lease.binding_key() {
+        return Err("MV incremental write lease drifted from prepared binding".to_string());
+    }
+    let mut refresh_context =
+        crate::engine::mv_first_refresh_staging::rebuild_frozen_mv_refresh_context(
+            state,
+            request.current_catalog.as_deref(),
+            &request.current_database,
+            request.expected_target_snapshot_id,
+            &request.target_catalog,
+            &request.target_namespace,
+            &request.target_name,
+            &facts,
+        )?;
+    refresh_context.connector_context = Some(request.connector_context.clone());
+    let target = crate::engine::backend_resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: request.target_catalog,
+        namespace: request.target_namespace,
+        table: request.target_name,
+    };
+    let base_refs = refresh_context.rewrite.base_refs.iter().collect::<Vec<_>>();
+    let catalog = build_imv_refresh_catalog(state, &base_refs, &refresh_context.rewrite.pin)?;
+    let mut query = (*refresh_context.rewrite.canonical_select_query).clone();
+    let rewrite_evidence = match evidence {
+        crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::None => {
+            RewriteMergeRefreshEvidence::None
+        }
+        crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::Aggregate => {
+            RewriteMergeRefreshEvidence::Aggregate
+        }
+        crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::JoinAggregate => {
+            RewriteMergeRefreshEvidence::JoinAggregate
+        }
+        crate::sql::mv_refresh::incremental::MvIncrementalRewriteEvidence::BranchUnionAggregate => {
+            RewriteMergeRefreshEvidence::BranchUnionAggregate
+        }
+    };
+    if rewrite_evidence != RewriteMergeRefreshEvidence::None
+        && rewrite_evidence != RewriteMergeRefreshEvidence::BranchUnionAggregate
+    {
+        alias_aggregate_refresh_group_key_projection(&mut query, &refresh_context)?;
+    }
+    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
+    let imv_rewrite_input = IcebergImvRewriteInput::new(&refresh_context, rewrite_evidence);
+    let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+        &query,
+        &catalog,
+        &refresh_context.rewrite.current_database,
+        Some(&imv_rewrite_input),
+        execution,
+    )?;
+    let producer_branches = match mode {
+        crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::FastAppend => {
+            vec![ImvChangeStreamProducerBranch::FreshData]
+        }
+        crate::sql::mv_refresh::incremental::MvIncrementalWriteMode::RowDelta => vec![
+            ImvChangeStreamProducerBranch::DeleteDv,
+            ImvChangeStreamProducerBranch::ReuseData,
+            ImvChangeStreamProducerBranch::FreshData,
+        ],
+    };
+    let target_table = refresh_context
+        .target_bindings
+        .runtime()
+        .target_table()
+        .clone();
+    let ident = iceberg_mv_table_ident(&IcebergMvTarget {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+    })?;
+    let operation_id = request.operation_id;
+    let staging_branch = request.staging_branch;
+    let distributed = prepare_imv_change_stream_writer(
+        state,
+        &target,
+        &target_table,
+        &ident,
+        ImvRefreshPlannedChangeStream {
+            optimized_tree: planned_query.optimized_tree,
+            table_bindings: planned_query.table_bindings,
+            output_columns: planned_query.output_columns,
+            change_stream: planned_query.change_stream,
+            producer_branches,
+            mv_refresh_ctx: Some(&refresh_context),
+            snapshot_properties: provenance_properties,
+            connector_operation_id: operation_id,
+        },
+        &staging_branch,
+        exact_lease,
+        execution,
+    )?;
+    if distributed.write_operation_id() != operation_id
+        || distributed.write_cohort_id()
+            != novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id)
+    {
+        return Err("MV incremental distributed artifact identity mismatch".to_string());
+    }
+    Ok(distributed)
+}
+
 fn executed_change_stream_write_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
     commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
