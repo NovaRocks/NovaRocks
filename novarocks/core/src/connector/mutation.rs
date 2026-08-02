@@ -128,41 +128,6 @@ pub(crate) fn resolve_catalog_mutation(
 /// that acquired a planning generation may derive a mutation lease from it and
 /// must not silently acquire a newer current generation for the external
 /// mutation.
-pub(crate) fn resolve_catalog_mutation_with_lease(
-    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
-    operation_id: ConnectorMutationOperationId,
-    operation: ConnectorCatalogMutationOperation,
-    context: ConnectorRequestContext,
-) -> ResolvedCatalogMutation {
-    let request = ConnectorCatalogMutationRequest {
-        operation_id,
-        target: ConnectorExecutionBindingKey {
-            instance_id: lease.descriptor().instance_id.clone(),
-            incarnation: lease.incarnation(),
-        },
-        operation,
-        context: context.clone(),
-    };
-    let outcome = match lease.execute(request) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return ResolvedCatalogMutation::ContractFailure {
-                error,
-                dispatch: MutationDispatchState::PossiblyDispatched,
-            };
-        }
-    };
-    resolve_outcome(&lease, outcome, context)
-}
-
-/// Execute one catalog mutation through an already retained exact-generation
-/// lease. `CommitUnknown` is reconciled at most once through that same lease;
-/// callers receive the typed three-state result and must never replay the
-/// mutation.
-///
-/// This is the frontend application's narrow mutation boundary. It accepts no
-/// registry and therefore cannot accidentally reacquire a newer current
-/// connector generation after SQL preparation.
 pub fn resolve_catalog_mutation_with_lease(
     lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
     operation_id: ConnectorMutationOperationId,

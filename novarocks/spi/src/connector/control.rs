@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorCatalogMutationLease, ConnectorDataMutation, ConnectorDataMutationResolver,
+    ConnectorDataMutation, ConnectorDataMutationResolver,
     ConnectorError, ConnectorErrorKind,
     ConnectorExecutionDeclaration, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,

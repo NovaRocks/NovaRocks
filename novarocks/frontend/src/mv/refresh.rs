@@ -33,6 +33,7 @@ use novarocks::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, MvRepository, MvRepositoryError,
 };
 use novarocks::query_execution::ConnectorWriteCompletion;
+use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
 use novarocks::query_execution::service::QueryExecutionService;
 use novarocks::sql::mv_refresh::{
     MvRefreshFinalizeFacts, PreparedDistributedWriteRequest, PreparedMvRefresh,
@@ -60,6 +61,7 @@ pub(super) fn execute(
     dependencies: &FrontendMvRefreshDependencies,
     refresh: PreparedMvRefresh,
     connector_context: ConnectorRequestContext,
+    execution: &novarocks::query_execution::request_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
     let target_catalog = refresh
         .finalize
@@ -131,6 +133,7 @@ pub(super) fn execute(
             distributed_writes,
             base_snapshots,
             connector_context,
+            execution,
         ),
     }
 }
@@ -145,19 +148,20 @@ fn execute_data_refresh(
     distributed_writes: Vec<PreparedDistributedWriteRequest>,
     base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
+    execution: &novarocks::query_execution::request_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
     let [write] = distributed_writes.as_slice() else {
         return Err(invalid(
             "MV refresh data preparation must produce exactly one staged distributed write",
         ));
     };
-    if write.write_operation_id() != Some(attempt.write_operation_id) {
+    if write.write_operation_id() != attempt.write_operation_id {
         return Err(invalid(
             "SQL-prepared MV write does not use the frontend-preallocated operation ID",
         ));
     }
     let mutation_lease = planning_lease
-        .mutation_lease()
+        .derive_mutation_lease()
         .map_err(|error| unavailable(error.to_string()))?;
     let table = table_identity(&finalize, mutation_lease.descriptor().instance_id.clone());
 
@@ -184,17 +188,23 @@ fn execute_data_refresh(
         None,
     )?;
 
-    let request = distributed_writes
+    let write = distributed_writes
         .into_iter()
         .next()
-        .expect("checked one prepared MV distributed write")
-        .into_request_with_exact_write_lease(
-            &dependencies.query_execution,
-            planning_lease
-                .write_lease()
-                .map_err(|error| unavailable(error.to_string()))?,
-        )
-        .map_err(invalid)?;
+        .expect("checked one prepared MV distributed write");
+    let cohort_id = write.write_cohort_id();
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| unavailable(error.to_string()))?;
+    let session = dependencies
+        .query_execution
+        .begin_write_operation_with_lease(write.registration(), write_lease)
+        .map_err(|error| invalid(error.to_string()))?;
+    let registration = ConnectorWriteExecutionRegistration::try_new(session, cohort_id)
+        .map_err(|error| invalid(error.to_string()))?;
+    let request = write
+        .into_request(execution, registration)
+        .map_err(|error| invalid(error.to_string()))?;
     let outcome = dependencies
         .query_execution
         .execute(request)
@@ -315,8 +325,7 @@ fn new_ledger(
     let cohort_ids = match &refresh.work {
         PreparedMvRefreshWork::DataProducing { distributed_writes } => distributed_writes
             .iter()
-            .flat_map(PreparedDistributedWriteRequest::write_cohort_ids)
-            .map(|cohort| hex::encode(cohort.to_bytes()))
+            .map(|write| hex::encode(write.write_cohort_id().to_bytes()))
             .collect(),
         PreparedMvRefreshWork::NoOp | PreparedMvRefreshWork::MetadataOnly => Vec::new(),
     };

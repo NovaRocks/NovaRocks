@@ -732,8 +732,11 @@ impl PreparedIcebergWrite {
     /// through the same prepared inputs.
     pub(crate) fn into_prepared_distributed_write(
         self,
-    ) -> Result<crate::sql::mv_refresh::PreparedDistributedWriteRequest, String> {
+    ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
         let Self { executor, .. } = self;
+        let execution = executor.execution.as_ref().ok_or_else(|| {
+            "prepared distributed Iceberg write requires an admitted execution context".to_string()
+        })?;
         crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
             &executor.state,
             Some(&executor.target.catalog),
@@ -742,11 +745,9 @@ impl PreparedIcebergWrite {
             executor.sink_spec,
             None,
             None,
-            executor.execution.as_ref(),
+            execution,
             &executor.connector_context,
-            Some(crate::sql::mv_refresh::DistributedConnectorWrite::Begin(
-                executor.connector_write,
-            )),
+            executor.connector_write,
         )
     }
 

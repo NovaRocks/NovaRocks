@@ -35,6 +35,7 @@ use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_options::QueryOptions;
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
 };
@@ -4576,6 +4577,120 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     )
 }
 
+/// Freeze a native connector-write request without starting a writer. The
+/// application owner later seals it through the exact retained write lease.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    query_opts: Option<QueryOptions>,
+    root_distribution: Option<crate::sql::compiler::RootDistributionRequirement>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+) -> Result<PreparedDistributedWriteRequest, String> {
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let mut prepared_query = query.clone();
+    if has_time_travel_refs(&prepared_query) {
+        rewrite_time_travel_refs(
+            state,
+            current_catalog,
+            current_database,
+            &mut prepared_query,
+            connector_context,
+        )?;
+    }
+    let catalog_service_snapshot = catalog_service_snapshot(state);
+    let analyzer_provider = build_catalog_service_provider(
+        current_catalog,
+        &catalog_service_snapshot,
+        state.connector_control.as_ref(),
+        connector_context.clone(),
+        TableLookupMode::SchemaOnly,
+    );
+    let table_bindings = analyzer_provider.query_table_bindings();
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+        state,
+        table_bindings.clone(),
+    );
+    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+        .ok_or_else(|| "Iceberg write requires a non-empty admitted backend topology".to_string())?;
+    let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
+        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared_query)),
+        crate::sql::compiler::SqlCompileIntent::IcebergWrite {
+            root_distribution: root_distribution
+                .unwrap_or(crate::sql::compiler::RootDistributionRequirement::Any),
+        },
+        crate::sql::compiler::SqlSessionContext {
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
+            optimizer_settings: execution.optimizer_settings().clone(),
+        },
+        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        &catalog_snapshot,
+        &statistics,
+        crate::sql::functions::builtin_sql_function_catalog(),
+        None,
+        crate::sql::compiler::SqlCompileControl::new(
+            execution.deadline(),
+            execution.cancellation().clone(),
+        ),
+    );
+    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::sql::compiler::SqlCompiler::compile(compiler_request)
+            .map_err(|error| error.to_string())?
+    else {
+        return Err("Iceberg write intent did not produce optimized SQL facts".to_string());
+    };
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    let writer_input = match sink_spec.mode {
+        crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::PositionDeletes
+        | crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::DeletionVectors => {
+            crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::OutputOrdinals(
+                vec![0, 1],
+            )
+        }
+        _ => crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+    };
+    let distributed_plan =
+        crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+            physical_plan,
+            crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+                descriptor_database: current_database.to_string(),
+                spec: sink_spec,
+                input: writer_input,
+            },
+            &optimizer_settings,
+        )?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        state.connector_control.as_ref(),
+        connector_context,
+        Some(table_bindings.as_ref()),
+        None,
+        scan_preparation_options(&optimizer_settings),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let cohort_id = connector_write.cohort_id();
+    PreparedDistributedWriteRequest::new(
+        prepared,
+        native_bundle,
+        query_opts,
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
+            connector_write,
+        ),
+        cohort_id,
+    )
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChangeStreamWriteEntrypoint {
@@ -4795,14 +4910,18 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
             &maintenance_execution
         }
     };
-    let request = prepare_planned_iceberg_change_stream_write(
+    let prepared_request = prepare_planned_iceberg_change_stream_write(
         prepared,
         native_bundle,
         query_opts,
         execution,
         connector_write.map(DistributedConnectorWrite::Begin),
-    )?
-    .into_bound_request(&state.query_execution)?;
+    )?;
+    let request = bind_prepared_distributed_write_request(
+        &state.query_execution,
+        execution,
+        prepared_request,
+    )?;
     execute_bound_distributed_write_request(&state.query_execution, request)
 }
 
@@ -4824,6 +4943,64 @@ pub(crate) fn prepare_planned_iceberg_change_stream_write(
         execution,
         connector_write,
     )
+}
+
+fn prepare_distributed_write_request_with_execution(
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    query_options: Option<QueryOptions>,
+    _execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_write: Option<DistributedConnectorWrite>,
+) -> Result<PreparedDistributedWriteRequest, String> {
+    let Some(DistributedConnectorWrite::Begin(template)) = connector_write else {
+        return Err("prepared connector write requires an unsealed write template".to_string());
+    };
+    let cohort_id = template.cohort_id();
+    PreparedDistributedWriteRequest::new(
+        prepared,
+        native_bundle,
+        query_options,
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
+        cohort_id,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn bind_prepared_distributed_write_request(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    prepared: PreparedDistributedWriteRequest,
+) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
+    let cohort_id = prepared.write_cohort_id();
+    let session = query_execution
+        .begin_write_operation(prepared.registration())
+        .map_err(|error| error.to_string())?;
+    let registration = crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+        session,
+        cohort_id,
+    )
+    .map_err(|error| error.to_string())?;
+    prepared
+        .into_request(execution, registration)
+        .map_err(|error| error.to_string())
+}
+
+fn execute_bound_distributed_write_request(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    request: crate::query_execution::contract::DistributedQueryRequest,
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    let (query_result, write_commit, write_abort, connector_completion) = query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts_with_connector)
+        .map_err(|error| error.to_string())?;
+    Ok(crate::query_execution::outcome::QueryExecutionResult {
+        query_result,
+        write_commit,
+        write_abort,
+        connector_completion,
+        fragment_profiles: Vec::new(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

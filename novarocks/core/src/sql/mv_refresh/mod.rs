@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
 
 use crate::mv::model::MvTarget;
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
+pub use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 
 pub(crate) mod first_refresh;

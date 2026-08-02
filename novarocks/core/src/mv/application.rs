@@ -300,6 +300,7 @@ pub trait MvApplicationService: Send + Sync {
         &self,
         _refresh: PreparedMvRefresh,
         _connector_context: novarocks_spi::connector::ConnectorRequestContext,
+        _execution: &crate::query_execution::request_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
         Err(MvApplicationError::new(
             MvApplicationErrorKind::Unavailable,

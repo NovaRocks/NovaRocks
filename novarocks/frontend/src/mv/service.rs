@@ -80,6 +80,7 @@ impl MvApplicationService for FrontendMvService {
         &self,
         refresh_plan: PreparedMvRefresh,
         connector_context: ConnectorRequestContext,
+        execution: &novarocks::query_execution::request_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
         let dependencies = self.refresh.as_ref().ok_or_else(|| {
             MvApplicationError::new(
@@ -92,6 +93,7 @@ impl MvApplicationService for FrontendMvService {
             dependencies,
             refresh_plan,
             connector_context,
+            execution,
         )
     }
 }
