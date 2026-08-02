@@ -292,7 +292,17 @@ fn execute_data_refresh(
         .map_err(|error| {
             MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
         })?;
-    let (_result, _commit, abort, completion) = outcome.into_parts_with_connector();
+    let (result, direct_commit, abort, completion) = outcome.into_parts_with_connector();
+    if !result.columns.is_empty() || !result.chunks.is_empty() {
+        return Err(invalid(
+            "MV refresh connector staging terminal returned a client result payload",
+        ));
+    }
+    if direct_commit.is_some() {
+        return Err(invalid(
+            "MV refresh connector staging terminal returned a legacy direct commit payload",
+        ));
+    }
     if let Some(abort) = abort {
         record_action(
             repository,
@@ -313,6 +323,13 @@ fn execute_data_refresh(
     let completion = completion.ok_or_else(|| {
         invalid("MV refresh distributed write completed without connector terminal reports")
     })?;
+    let rows = i64::try_from(
+        completion
+            .staging_summary()
+            .map_err(|error| invalid(error.to_string()))?
+            .input_rows(),
+    )
+    .map_err(|_| invalid("MV refresh staged row count exceeds i64 range"))?;
     let receipt = resolve_write_commit(
         repository,
         attempt.refresh_id,
@@ -380,7 +397,7 @@ fn execute_data_refresh(
     repository
         .finalize_refresh(MvRefreshFinalizeRequest {
             refresh_id: attempt.refresh_id,
-            rows: 0,
+            rows,
             base_snapshots,
             base_table_uuids: finalize.base_table_uuids,
             target_snapshot_id: frontend_version.snapshot_id,
