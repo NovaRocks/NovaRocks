@@ -342,6 +342,13 @@ fn prepare_frontend_first_refresh_write(
         table: contract.target.name.clone(),
     };
     let definition = load_iceberg_mv_definition_by_target(state, &target)?;
+    let provenance_properties = frontend_refresh_provenance(
+        contract,
+        attempt,
+        definition.mv_id,
+        &definition.select_sql,
+        base_table_uuids,
+    )?;
     let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
         "Iceberg MV first-refresh requires a persisted schema contract".to_string()
     })?;
@@ -499,7 +506,8 @@ fn prepare_frontend_first_refresh_write(
             request,
             append,
             crate::engine::mv_first_refresh_staging::frozen_logical_context(&context),
-        );
+        )
+        .map(|prepared| prepared.with_provenance_properties(provenance_properties));
     }
     let (shape, physical_sql) = if capabilities.has_agg_state {
         let calls =
@@ -590,6 +598,44 @@ fn prepare_frontend_first_refresh_write(
         request,
         physical_sql,
     )
+    .map(|prepared| prepared.with_provenance_properties(provenance_properties))
+}
+
+fn frontend_refresh_provenance(
+    contract: &RefreshPlanContract,
+    attempt: &crate::sql::mv_refresh::MvRefreshAttemptIdentity,
+    mv_id: i64,
+    select_sql: &str,
+    base_table_uuids: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let snapshots = contract
+        .snapshot_pins
+        .iter()
+        .map(|(base, snapshot)| {
+            snapshot
+                .map(|snapshot| (base.clone(), snapshot))
+                .ok_or_else(|| format!("MV staging provenance has no pinned snapshot for {base}"))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let previous_snapshots = match &contract.state_baseline {
+        RefreshStateBaseline::SnapshotBacked {
+            previous_snapshot_ids,
+            ..
+        } => previous_snapshot_ids.clone(),
+        RefreshStateBaseline::Pinless => BTreeMap::new(),
+    };
+    build_mv_refresh_provenance(
+        &MvRefreshSnapshotMarker {
+            refresh_id: attempt.refresh_id,
+            mv_id,
+            token: attempt.marker_token.clone(),
+        },
+        RefreshTechnique::Full,
+        build_mv_refresh_provenance_bases(&snapshots, base_table_uuids, &previous_snapshots),
+        mv_definition_fingerprint(select_sql),
+        0,
+    )
+    .to_summary_properties()
 }
 
 /// Prepare the value-only non-join incremental handoff.  This is deliberately

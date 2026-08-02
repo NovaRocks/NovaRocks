@@ -357,6 +357,7 @@ pub struct PreparedMvFirstRefreshWrite {
     artifact: MvFirstRefreshExecutionArtifact,
     primary_cohort: ConnectorWriteCohortId,
     write_mode: MvStagedRefreshWriteMode,
+    provenance_properties: std::collections::BTreeMap<String, String>,
 }
 
 impl PreparedMvFirstRefreshWrite {
@@ -422,6 +423,18 @@ impl PreparedMvFirstRefreshWrite {
     pub(crate) fn into_full_overwrite(mut self) -> Self {
         self.write_mode = MvStagedRefreshWriteMode::FullOverwrite;
         self
+    }
+
+    pub(crate) fn with_provenance_properties(
+        mut self,
+        provenance_properties: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.provenance_properties = provenance_properties;
+        self
+    }
+
+    pub(crate) fn provenance_properties(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.provenance_properties
     }
 
     pub(crate) fn into_execution_artifact(self) -> MvFirstRefreshExecutionArtifact {
@@ -537,6 +550,7 @@ impl MvFirstRefreshWritePreparer {
             artifact,
             primary_cohort: ConnectorWriteCohortId::primary(operation_id),
             write_mode,
+            provenance_properties: std::collections::BTreeMap::new(),
         })
     }
 }

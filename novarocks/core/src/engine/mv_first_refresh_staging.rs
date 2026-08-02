@@ -526,7 +526,7 @@ fn mv_first_refresh_request(
 pub(crate) fn activate_mv_first_refresh_connector_write(
     state: &Arc<StandaloneState>,
     prepared: &PreparedMvFirstRefreshWrite,
-    provenance_properties: std::collections::BTreeMap<String, String>,
+    mut provenance_properties: std::collections::BTreeMap<String, String>,
     exact_lease: &ConnectorWriteLease,
 ) -> Result<
     (
@@ -537,6 +537,14 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
 > {
     if prepared.observed_binding() != exact_lease.binding_key() {
         return Err("MV first-refresh write lease drifted from prepared binding".to_string());
+    }
+    for (key, value) in prepared.provenance_properties() {
+        if provenance_properties
+            .insert(key.clone(), value.clone())
+            .is_some()
+        {
+            return Err("MV first-refresh provenance was supplied twice".to_string());
+        }
     }
     let operation_id: ConnectorWriteOperationId = prepared.operation_id();
     let target = crate::engine::backend_resolver::TargetBackend {
