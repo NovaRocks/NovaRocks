@@ -74,6 +74,14 @@ impl MvApplicationService for FrontendMvService {
                 create::handle_create(self.repository.as_ref(), engine, statement, context)
                     .map(Some)
             }
+            // REFRESH needs the immutable admitted execution context, which
+            // only the typed refresh entrypoint accepts.  Returning `None`
+            // here would let a caller silently fall through to the retired
+            // core lifecycle.
+            MvApplicationStatement::Refresh(_) => Err(MvApplicationError::new(
+                novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
+                "REFRESH MATERIALIZED VIEW requires the frontend refresh entrypoint",
+            )),
             MvApplicationStatement::Unhandled => Ok(None),
         }
     }
@@ -102,11 +110,17 @@ impl MvApplicationService for FrontendMvService {
     fn prepare_and_execute_refresh(
         &self,
         preparation: &dyn novarocks::sql::mv_refresh::MvRefreshPreparationService,
-        statement: novarocks::sql::mv_refresh::MvRefreshStatement,
+        statement: MvApplicationStatement,
         target: novarocks::mv::repository::MvTarget,
         connector_context: ConnectorRequestContext,
         execution: &novarocks::query_execution::request_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
+        let MvApplicationStatement::Refresh(statement) = statement else {
+            return Err(MvApplicationError::new(
+                novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
+                "frontend refresh entrypoint requires REFRESH MATERIALIZED VIEW",
+            ));
+        };
         let attempt = self.reserve_refresh_attempt()?;
         let prepared = preparation
             .prepare_step(novarocks::sql::mv_refresh::MvRefreshPreparationRequest {

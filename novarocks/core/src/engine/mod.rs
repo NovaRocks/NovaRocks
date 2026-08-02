@@ -3211,15 +3211,14 @@ pub(crate) fn dispatch_statement(
                 connector_context,
             )
         }
-        Statement::RefreshMaterializedView(stmt) => {
-            crate::engine::mv_flow::refresh_mv_with_connector_context(
-                state,
-                current_catalog,
-                current_database,
-                &stmt,
-                connector_context,
-            )
-        }
+        Statement::RefreshMaterializedView(stmt) => dispatch_frontend_mv_refresh(
+            state,
+            current_catalog,
+            current_database,
+            &stmt,
+            request_context,
+            connector_context,
+        ),
         Statement::ShowMaterializedViews(stmt) => {
             crate::engine::mv_flow::list_mvs(state, current_catalog, &stmt)
         }
@@ -3301,6 +3300,91 @@ pub(crate) fn dispatch_statement(
             },
         ),
     }
+}
+
+/// Execute every dependency-ordered `REFRESH MATERIALIZED VIEW` step through
+/// the frontend lifecycle.  Dependency discovery remains side-effect free;
+/// no step may fall back to the old `MvBackend` plan/execute/commit surface.
+fn dispatch_frontend_mv_refresh(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &crate::sql::parser::ast::RefreshMaterializedViewStmt,
+    request_context: &crate::query_execution::request_context::RequestContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let refresh_statement = crate::sql::mv_refresh::MvRefreshStatement::from(stmt);
+    refresh_statement.validate_supported()?;
+    let iceberg_target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+        current_catalog,
+        current_database,
+        &stmt.name,
+    )?;
+    let requested_object = crate::mv::dependency::model::iceberg_mv_dependency_ref(
+        &iceberg_target.catalog,
+        &iceberg_target.namespace,
+        &iceberg_target.table,
+    );
+    let steps =
+        crate::engine::mv::dependency::build_upstream_refresh_steps(state, &requested_object)?;
+    let mut last_result = None;
+
+    for step in steps {
+        if step.storage_engine != crate::mv::model::MvStorageEngine::Iceberg {
+            return Err(format!(
+                "REFRESH MATERIALIZED VIEW is only supported for Iceberg-backed materialized views: {}",
+                step.object.display_name().trim_start_matches("mv:")
+            ));
+        }
+        let step_statement = crate::sql::parser::ast::RefreshMaterializedViewStmt {
+            name: crate::sql::parser::ast::ObjectName {
+                parts: vec![step.target.database.clone(), step.target.name.clone()],
+            },
+            full: false,
+        };
+        let preparation =
+            crate::engine::mv::iceberg_refresh::StandaloneMvRefreshPreparationService::new(
+                state,
+                step.target.catalog.as_deref(),
+                &step.target.database,
+                &step_statement,
+                connector_context,
+            );
+        let result = state
+            .mv_application_service
+            .prepare_and_execute_refresh(
+                &preparation,
+                crate::mv::application::MvApplicationStatement::Refresh(
+                    crate::sql::mv_refresh::MvRefreshStatement::from(&step_statement),
+                ),
+                step.target.clone(),
+                connector_context.clone(),
+                request_context.execution(),
+            )
+            .map_err(|error| {
+                if step.object != requested_object {
+                    format!(
+                        "cannot refresh materialized view {}: upstream materialized view {} failed: {error}",
+                        requested_object.display_name().trim_start_matches("mv:"),
+                        step.object.display_name().trim_start_matches("mv:")
+                    )
+                } else {
+                    error.to_string()
+                }
+            })?;
+        last_result = Some(match result {
+            crate::mv::application::MvStatementResult::Ok => StatementResult::Ok,
+            crate::mv::application::MvStatementResult::Query(result) => {
+                StatementResult::Query(result)
+            }
+        });
+    }
+
+    let result = last_result.ok_or_else(|| {
+        "MV refresh dependency planning produced no target refresh step".to_string()
+    })?;
+    crate::engine::mv_maintenance::notify_refresh_completed(state);
+    Ok(result)
 }
 
 fn statistics_application_target(
@@ -3711,23 +3795,37 @@ fn connector_static_planning_metrics(
     Ok(metrics)
 }
 
-pub(crate) fn capture_maintenance_execution(
+pub(crate) fn capture_maintenance_request_context(
     state: &StandaloneState,
-) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<crate::query_execution::request_context::RequestContext, String> {
     let topology = state
         .backend_topology
         .snapshot()
         .map_err(|error| error.to_string())?;
     let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
     Ok(
-        crate::query_execution::request_context::QueryExecutionContext::new(
-            state.execution_role,
-            topology,
-            None,
-            cancellation.view(),
-            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        crate::query_execution::request_context::RequestContext::admit(
+            crate::query_execution::request_context::RequestAdmission::new(
+                current_catalog.map(str::to_string),
+                current_database.to_string(),
+                state.execution_role,
+                topology,
+                None,
+                cancellation.view(),
+                crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            ),
         ),
     )
+}
+
+pub(crate) fn capture_maintenance_execution(
+    state: &StandaloneState,
+) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+    Ok(capture_maintenance_request_context(state, None, "default")?
+        .execution()
+        .clone())
 }
 
 /// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`.
@@ -6827,6 +6925,47 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RefreshRouteRecordingMvApplicationService {
+        refreshes: Mutex<
+            Vec<(
+                MvApplicationStatement,
+                MvTarget,
+                crate::query_execution::request_context::QueryExecutionContext,
+            )>,
+        >,
+    }
+
+    impl MvApplicationService for RefreshRouteRecordingMvApplicationService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn MvEngine,
+            _statement: &MvApplicationStatement,
+            _context: MvRequestContext<'_>,
+        ) -> Result<Option<crate::mv::application::MvStatementResult>, MvApplicationError> {
+            Ok(None)
+        }
+
+        fn prepare_and_execute_refresh(
+            &self,
+            _preparation: &dyn crate::sql::mv_refresh::MvRefreshPreparationService,
+            statement: MvApplicationStatement,
+            target: MvTarget,
+            _connector_context: novarocks_spi::connector::ConnectorRequestContext,
+            execution: &crate::query_execution::request_context::QueryExecutionContext,
+        ) -> Result<crate::mv::application::MvStatementResult, MvApplicationError> {
+            self.refreshes.lock().expect("refresh route calls").push((
+                statement,
+                target,
+                execution.clone(),
+            ));
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Unavailable,
+                "recorded frontend refresh route",
+            ))
+        }
+    }
+
     struct PassthroughMvApplicationService;
 
     impl MvApplicationService for PassthroughMvApplicationService {
@@ -9006,6 +9145,48 @@ mysql_port = 47892
                 || err.contains("materialized view"),
             "unexpected dispatch error: {err}"
         );
+    }
+
+    #[test]
+    fn refresh_dispatch_uses_frontend_refresh_entrypoint_with_admitted_context() {
+        let service = Arc::new(RefreshRouteRecordingMvApplicationService::default());
+        let state = Arc::new(StandaloneState {
+            mv_application_service: service.clone(),
+            ..Default::default()
+        });
+        let request_context = super::test_request_context(Some("ice"), "analytics");
+
+        let error = dispatch_statement(
+            &state,
+            Some("ice"),
+            "analytics",
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(
+                crate::sql::parser::ast::RefreshMaterializedViewStmt {
+                    name: crate::sql::parser::ast::ObjectName {
+                        parts: vec!["orders_mv".to_string()],
+                    },
+                    full: false,
+                },
+            ),
+            &request_context,
+            &crate::connector::test_request_context(),
+        )
+        .expect_err("recording frontend service returns its route marker");
+
+        assert_eq!(error, "recorded frontend refresh route");
+        let refreshes = service.refreshes.lock().expect("refresh route calls");
+        assert_eq!(refreshes.len(), 1);
+        let (statement, target, execution) = &refreshes[0];
+        assert!(matches!(
+            statement,
+            MvApplicationStatement::Refresh(refresh)
+                if refresh.name_parts == ["orders_mv"] && !refresh.full
+        ));
+        assert_eq!(target.catalog.as_deref(), Some("ice"));
+        assert_eq!(target.database, "analytics");
+        assert_eq!(target.name, "orders_mv");
+        assert_eq!(execution.role(), request_context.execution().role());
+        assert_eq!(execution.topology(), request_context.execution().topology());
     }
 
     #[test]

@@ -729,18 +729,26 @@ impl MetadataRefreshExecutor {
 impl RefreshExecutor for MetadataRefreshExecutor {
     fn execute_refresh(&mut self, mv_id: i64) -> Result<(), String> {
         let target = load_refresh_execution_target(&self.state, mv_id)?;
-        let connector_context = crate::connector::connector_request_context(
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )?;
-        crate::engine::mv_flow::refresh_mv_with_connector_context(
+        let request_context = crate::engine::capture_maintenance_request_context(
             &self.state,
             target.current_catalog.as_deref(),
             &target.current_database,
-            &RefreshMaterializedViewStmt {
-                name: target.name,
-                full: false,
-            },
+        )?;
+        let connector_context = crate::connector::connector_request_context_for_execution(
+            None,
+            request_context.execution(),
+        )?;
+        crate::engine::dispatch_statement(
+            &self.state,
+            target.current_catalog.as_deref(),
+            &target.current_database,
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(
+                RefreshMaterializedViewStmt {
+                    name: target.name,
+                    full: false,
+                },
+            ),
+            &request_context,
             &connector_context,
         )?;
         Ok(())

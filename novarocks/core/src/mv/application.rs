@@ -152,6 +152,7 @@ impl From<&CreateMaterializedViewStmt> for MvCreateStatement {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MvApplicationStatement {
     Create(MvCreateStatement),
+    Refresh(MvRefreshStatement),
     Unhandled,
 }
 
@@ -159,6 +160,9 @@ pub(crate) fn project_statement(statement: &Statement) -> MvApplicationStatement
     match statement {
         Statement::CreateMaterializedView(statement) => {
             MvApplicationStatement::Create(MvCreateStatement::from(statement))
+        }
+        Statement::RefreshMaterializedView(statement) => {
+            MvApplicationStatement::Refresh(MvRefreshStatement::from(statement))
         }
         _ => MvApplicationStatement::Unhandled,
     }
@@ -320,7 +324,7 @@ pub trait MvApplicationService: Send + Sync {
     fn prepare_and_execute_refresh(
         &self,
         _preparation: &dyn MvRefreshPreparationService,
-        _statement: MvRefreshStatement,
+        _statement: MvApplicationStatement,
         _target: MvTarget,
         _connector_context: novarocks_spi::connector::ConnectorRequestContext,
         _execution: &crate::query_execution::request_context::QueryExecutionContext,
@@ -405,7 +409,10 @@ impl MvApplicationService for UnavailableMvApplicationService {
         statement: &MvApplicationStatement,
         _context: MvRequestContext<'_>,
     ) -> Result<Option<MvStatementResult>, MvApplicationError> {
-        if matches!(statement, MvApplicationStatement::Create(_)) {
+        if matches!(
+            statement,
+            MvApplicationStatement::Create(_) | MvApplicationStatement::Refresh(_)
+        ) {
             return Err(MvApplicationError::new(
                 MvApplicationErrorKind::Unavailable,
                 MV_REPOSITORY_UNAVAILABLE_MESSAGE,

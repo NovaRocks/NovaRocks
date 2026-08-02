@@ -569,6 +569,29 @@ fn unhandled_statement_is_left_for_the_core_route() {
 }
 
 #[test]
+fn refresh_statement_cannot_fall_through_the_generic_statement_handler() {
+    let engine = FakeEngine::new(vec![]);
+    let service = FrontendMvService::new(Arc::new(FakeRepository::new(None)));
+    let error = service
+        .try_handle_statement(
+            &engine,
+            &MvApplicationStatement::Refresh(novarocks::sql::mv_refresh::MvRefreshStatement {
+                name_parts: vec!["orders_mv".to_string()],
+                full: false,
+            }),
+            MvRequestContext {
+                current_catalog: Some("ice"),
+                current_database: "db",
+            },
+        )
+        .expect_err("refresh must use the typed frontend refresh entrypoint");
+
+    assert_eq!(error.kind(), MvApplicationErrorKind::InvalidRequest);
+    assert!(error.message().contains("frontend refresh entrypoint"));
+    assert!(engine.calls().is_empty());
+}
+
+#[test]
 fn create_without_state_store_fails_before_engine_work() {
     let engine = FakeEngine::new(vec![]);
     let service = FrontendMvService::new(Arc::new(UnavailableMvRepository));
