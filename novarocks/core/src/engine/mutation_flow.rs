@@ -2093,16 +2093,24 @@ fn run_one_cow_file_rewrite(
             plan.old_file, abort.reason
         ));
     }
-    if result
-        .write_commit
+    let staging = result
+        .connector_completion
         .as_ref()
-        .is_none_or(|commit| !write_commit_has_files(commit))
-    {
+        .expect("COW rewrite checked connector completion above")
+        .staging_summary()
+        .map_err(|error| {
+            format!(
+                "COW UPDATE rewrite for data file `{}` has an invalid connector staging summary: {error}",
+                plan.old_file
+            )
+        })?;
+    if staging.input_rows() == 0 || staging.artifact_count() == 0 {
         return Err(format!(
             "COW UPDATE rewrite for data file `{}` produced no replacement data files \
-             (rows={}, query={})",
+             (staged_rows={}, artifacts={}, query={})",
             plan.old_file,
-            result.query_result.row_count(),
+            staging.input_rows(),
+            staging.artifact_count(),
             plan.rewrite_query
         ));
     }
@@ -3849,12 +3857,15 @@ impl DistributedMergeExecutor {
                 abort.reason
             ));
         }
-        if result.connector_completion.is_none()
-            || result
-                .write_commit
-                .as_ref()
-                .is_none_or(|commit| !write_commit_has_files(commit))
-        {
+        let completion = result.connector_completion.as_ref().ok_or_else(|| {
+            "MERGE not-matched INSERT cohort completed without a connector completion".to_string()
+        })?;
+        let staging = completion.staging_summary().map_err(|error| {
+            format!(
+                "MERGE not-matched INSERT cohort has an invalid connector staging summary: {error}"
+            )
+        })?;
+        if staging.input_rows() == 0 || staging.artifact_count() == 0 {
             return Err("MERGE not-matched INSERT cohort produced no data files".to_string());
         }
         Ok(result)
