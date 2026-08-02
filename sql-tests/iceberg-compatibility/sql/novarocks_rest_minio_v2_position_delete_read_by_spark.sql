@@ -54,16 +54,22 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-read-nr-position-delete-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-SELECT id, region, score
+SELECT CASE
+  WHEN COUNT(*) = 2
+    AND SUM(CASE WHEN id = 1 AND region = 'east' AND score = 10 THEN 1 ELSE 0 END) = 1
+    AND SUM(CASE WHEN id = 3 AND region = 'west' AND score = 30 THEN 1 ELSE 0 END) = 1
+  THEN 'SPARK_POSITION_DELETE_OK'
+  ELSE 'SPARK_POSITION_DELETE_BAD'
+END AS status
 FROM ice_rest.nr_compat_${suite_uuid0}.nr_v2_pos_delete_${uuid0}
-ORDER BY id;
+;
 SPARK_SQL
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" \
-  | tr -s '[:space:]' ' ' \
-  | grep -F "1 east 10" >/dev/null
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" \
-  | tr -s '[:space:]' ' ' \
-  | grep -F "3 west 30" >/dev/null
+if ! spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" 2>&1)"; then
+  printf '%s\n' "$spark_out"
+  exit 1
+fi
+printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | grep -F "SPARK_POSITION_DELETE_OK" >/dev/null
 printf 'SPARK_POSITION_DELETE_OK\n'
 
 -- query 7

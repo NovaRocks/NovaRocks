@@ -24,11 +24,9 @@
 //! equivalence adapters are implemented.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, Int64Array, StringArray, UInt32Array};
-use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
     ConnectorBatchWriter, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
@@ -619,16 +617,7 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
                         format!("take Iceberg position-delete batch failed: {arrow_error}"),
                     )
                 })?;
-            let delete_batch = RecordBatch::try_new(
-                canonical_output_schema(),
-                part_batch.columns()[..2].to_vec(),
-            )
-            .map_err(|arrow_error| {
-                error(
-                    ConnectorErrorKind::Internal,
-                    format!("project Iceberg position-delete columns failed: {arrow_error}"),
-                )
-            })?;
+            let delete_batch = position_delete_storage_batch(&part_batch)?;
             let partition = self
                 .handle
                 .partitions
@@ -641,12 +630,11 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
                     )
                 })?;
             let path = self.next_path(&partition);
-            let storage_batch = position_delete_storage_batch(&part_batch)?;
             let written = write_parquet_file(
                 &path,
                 self.object_store_s3.as_ref(),
-                storage_batch.schema(),
-                &storage_batch,
+                delete_batch.schema(),
+                &delete_batch,
                 self.handle.compression,
             )
             .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
@@ -1096,22 +1084,7 @@ fn position_delete_storage_batch(batch: &RecordBatch) -> Result<RecordBatch, Con
             "Iceberg position-delete storage batch requires exactly two columns",
         ));
     }
-    let fields = input_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            Arc::new(field.as_ref().clone().with_name(match index {
-                0 => super::position_delete::FILE_PATH_COLUMN,
-                1 => super::position_delete::POS_COLUMN,
-                _ => unreachable!("position-delete schema arity was checked"),
-            }))
-        })
-        .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new_with_metadata(
-        fields,
-        input_schema.metadata().clone(),
-    ));
+    let schema = canonical_output_schema();
     RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|arrow_error| {
         error(
             ConnectorErrorKind::Internal,
@@ -1130,8 +1103,12 @@ mod tests {
 
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::position_delete_storage_batch;
+    use crate::connector::iceberg::position_delete_descriptor::{
+        ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+    };
 
     #[test]
     fn position_delete_storage_batch_uses_iceberg_column_names() {
@@ -1151,6 +1128,22 @@ mod tests {
 
         assert_eq!(stored.schema().field(0).name(), "file_path");
         assert_eq!(stored.schema().field(1).name(), "pos");
+        assert_eq!(
+            stored
+                .schema()
+                .field(0)
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY),
+            Some(&ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID.to_string())
+        );
+        assert_eq!(
+            stored
+                .schema()
+                .field(1)
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY),
+            Some(&ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string())
+        );
         assert_eq!(stored.column(0).as_ref(), input.column(0).as_ref());
         assert_eq!(stored.column(1).as_ref(), input.column(1).as_ref());
     }
