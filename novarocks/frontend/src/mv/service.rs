@@ -158,6 +158,18 @@ impl MvApplicationService for FrontendMvService {
         }
         self.execute_prepared_refresh(prepared, connector_context, execution)
     }
+
+    fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
+        let summary = self.recover_frontend_mv_refreshes();
+        tracing::info!(
+            candidates = summary.candidates,
+            resolved = summary.resolved,
+            unresolved = summary.unresolved,
+            cleanup_backlog = summary.cleanup_backlog,
+            "completed bounded frontend MV startup recovery pass"
+        );
+        Ok(())
+    }
 }
 
 impl FrontendMvService {

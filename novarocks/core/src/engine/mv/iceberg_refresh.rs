@@ -4617,7 +4617,6 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
         );
     };
     let _refresh_guard = acquire_mv_refresh_lock()?;
-    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)?;
 
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
@@ -8421,10 +8420,6 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
     crate::connector::validate_request_context(connector_context)
         .map_err(RefreshError::pre_commit)?;
     let _refresh_guard = acquire_mv_refresh_lock().map_err(RefreshError::pre_commit)?;
-    // Recovery may complete or roll back historical attempts before validating
-    // this plan. The no-write guarantee below applies to the current attempt.
-    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)
-        .map_err(RefreshError::pre_commit)?;
 
     let payload_target = resolve_refresh_target(
         plan.current_catalog.as_deref(),

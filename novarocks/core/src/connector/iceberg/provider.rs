@@ -6300,17 +6300,23 @@ mod tests {
 
     fn mutation_provider_without_catalog() -> IcebergControlProvider {
         let instance_id = ConnectorInstanceId::parse("ice.test").expect("instance ID");
+        let incarnation = ConnectorInstanceIncarnation::from_bytes([7; 16]);
         IcebergControlProvider {
             descriptor: ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse(PROVIDER_ID).expect("provider ID"),
                 instance_id: instance_id.clone(),
             },
+            binding_key: ConnectorExecutionBindingKey {
+                instance_id: instance_id.clone(),
+                incarnation,
+            },
             instance_id,
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation,
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
+            recovery_cleanup_outcomes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -6760,17 +6766,23 @@ mod tests {
             .expect("scan payload"),
         )
         .expect("scan handle");
+        let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
         let provider = IcebergControlProvider {
             descriptor: ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse(PROVIDER_ID).expect("provider"),
                 instance_id: instance_id.clone(),
             },
+            binding_key: ConnectorExecutionBindingKey {
+                instance_id: instance_id.clone(),
+                incarnation,
+            },
             instance_id,
-            incarnation: ConnectorInstanceIncarnation::from_bytes([0; 16]),
+            incarnation,
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
+            recovery_cleanup_outcomes: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let error = ConnectorScanPlanning::plan_splits(

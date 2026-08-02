@@ -3685,12 +3685,16 @@ fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String
     restore_iceberg_catalogs(state)?;
     // W4 statelessness: rediscover lake-native Iceberg MV packages that are
     // present on the lake but missing from a fresh `[metadata]` (SQLite) cache,
-    // and persist their rebuilt definitions. Runs after catalog attachments are
-    // installed and before refresh recovery (so W3b recovery sees the
-    // rediscovered target tables).
+    // and persist their rebuilt definitions.
     crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(state)?;
-    crate::engine::mv::iceberg_refresh::recover_iceberg_mv_refreshes(state)?;
     crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(state)?;
+    // Recovery is a frontend application decision. At this point catalog
+    // bindings and target descriptors have both been restored, so the service
+    // can acquire one current-generation inspection lease per fenced attempt.
+    state
+        .mv_application_service
+        .recover_startup_mv_refreshes()
+        .map_err(|error| format!("frontend MV startup recovery failed: {error}"))?;
     Ok(())
 }
 

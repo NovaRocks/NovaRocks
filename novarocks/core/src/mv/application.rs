@@ -334,6 +334,14 @@ pub trait MvApplicationService: Send + Sync {
             "frontend MV refresh lifecycle is unavailable",
         ))
     }
+
+    /// Run the bounded frontend-owned startup recovery pass after catalog
+    /// attachment and MV target restore.  The default is deliberately a
+    /// no-op for unavailable/test application services; production frontend
+    /// composition overrides it and retains unresolved attempts as fences.
+    fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
+        Ok(())
+    }
 }
 
 /// Core-owned provider activation and native fragment preparation for a
