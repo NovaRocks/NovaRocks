@@ -96,6 +96,8 @@ pub struct DecodedMvRecord<T> {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MvSequence {
     pub last_allocated_id: i64,
+    #[serde(default)]
+    pub last_refresh_id: i64,
 }
 
 /// Frontend-owned Avro wire representation. The core definition remains a

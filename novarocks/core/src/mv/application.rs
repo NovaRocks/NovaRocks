@@ -26,7 +26,10 @@ use crate::mv::repository::{
 };
 use crate::runtime::query_result::QueryResult;
 use crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
-use crate::sql::mv_refresh::{PreparedDistributedWriteRequest, PreparedMvRefresh};
+use crate::sql::mv_refresh::{
+    MvRefreshPreparationService, MvRefreshStatement, PreparedDistributedWriteRequest,
+    PreparedMvRefresh,
+};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
 };
@@ -300,6 +303,24 @@ pub trait MvApplicationService: Send + Sync {
     fn execute_prepared_refresh(
         &self,
         _refresh: PreparedMvRefresh,
+        _connector_context: novarocks_spi::connector::ConnectorRequestContext,
+        _execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<MvStatementResult, MvApplicationError> {
+        Err(MvApplicationError::new(
+            MvApplicationErrorKind::Unavailable,
+            "frontend MV refresh lifecycle is unavailable",
+        ))
+    }
+
+    /// Frontend-owned admission of a SQL-prepared refresh. The caller supplies
+    /// only the side-effect-free SQL preparation port; the frontend reserves
+    /// the attempt identity, persists durable intent, and owns every external
+    /// lifecycle phase.
+    fn prepare_and_execute_refresh(
+        &self,
+        _preparation: &dyn MvRefreshPreparationService,
+        _statement: MvRefreshStatement,
+        _target: MvTarget,
         _connector_context: novarocks_spi::connector::ConnectorRequestContext,
         _execution: &crate::query_execution::request_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {

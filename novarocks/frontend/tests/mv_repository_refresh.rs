@@ -162,6 +162,34 @@ fn frontend_action(
 }
 
 #[test]
+fn reserved_frontend_refresh_ids_share_the_legacy_high_water_mark() {
+    let (_temp, _runtime, _host, repository) = repository();
+    assert_eq!(
+        repository
+            .reserve_frontend_refresh_id()
+            .expect("reserve first frontend refresh ID"),
+        1
+    );
+    assert_eq!(
+        repository
+            .reserve_frontend_refresh_id()
+            .expect("reserve second frontend refresh ID"),
+        2
+    );
+
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("reserved_refresh_id"),
+        )
+        .expect("create definition");
+    let legacy = repository
+        .begin_refresh_intent(definition.mv_id, BTreeMap::new())
+        .expect("begin legacy refresh");
+    assert_eq!(legacy.refresh_id, 3);
+}
+
+#[test]
 fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
     let (_temp, _runtime, _host, repository) = repository();
     let definition = repository

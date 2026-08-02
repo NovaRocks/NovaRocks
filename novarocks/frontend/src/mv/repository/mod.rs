@@ -120,7 +120,7 @@ impl StateStoreMvRepository {
                 key::MvKeyKind::Sequence => {
                     let sequence: DecodedMvRecord<MvSequence> =
                         decode_record(&record.key, &record.value).map_err(corruption)?;
-                    if sequence.value.last_allocated_id < 0 {
+                    if sequence.value.last_allocated_id < 0 || sequence.value.last_refresh_id < 0 {
                         return Err(corruption("MV sequence must not be negative"));
                     }
                 }
@@ -396,15 +396,18 @@ impl StateStoreMvRepository {
                     Box::pin(async move {
                         let sequence_key = sequence_key().map_err(invalid_state_store)?;
                         let sequence_record = transaction.get(&sequence_key).await?;
-                        let last = match &sequence_record {
+                        let sequence = match &sequence_record {
                             Some(record) => {
                                 decode_record::<MvSequence>(&sequence_key, &record.value)
                                     .map_err(invalid_state_store)?
                                     .value
-                                    .last_allocated_id
                             }
-                            None => 0,
+                            None => MvSequence {
+                                last_allocated_id: 0,
+                                last_refresh_id: 0,
+                            },
                         };
+                        let last = sequence.last_allocated_id;
                         let mv_id =
                             match explicit_id {
                                 Some(value) => value,
@@ -428,6 +431,7 @@ impl StateStoreMvRepository {
                             operation_id,
                             &MvSequence {
                                 last_allocated_id: last.max(mv_id),
+                                last_refresh_id: sequence.last_refresh_id,
                             },
                         )
                         .map_err(invalid_state_store)?;
@@ -629,21 +633,25 @@ impl StateStoreMvRepository {
                     }
                     let key = sequence_key().map_err(invalid_state_store)?;
                     let current = transaction.get(&key).await?;
-                    let last = match &current {
+                    let sequence = match &current {
                         Some(record) => {
                             decode_record::<MvSequence>(&key, &record.value)
                                 .map_err(invalid_state_store)?
                                 .value
-                                .last_allocated_id
                         }
-                        None => 0,
+                        None => MvSequence {
+                            last_allocated_id: 0,
+                            last_refresh_id: 0,
+                        },
                     };
+                    let last = sequence.last_allocated_id;
                     if last < mv_id {
                         let value = encode_record(
                             MvRecordKind::Sequence,
                             operation_id,
                             &MvSequence {
                                 last_allocated_id: mv_id,
+                                last_refresh_id: sequence.last_refresh_id,
                             },
                         )
                         .map_err(invalid_state_store)?;
@@ -1135,7 +1143,8 @@ impl StateStoreMvRepository {
                             "mv definition {mv_id} already has refresh in progress"
                         )));
                     }
-                    let refresh_id = allocate_refresh_id(transaction, page_size).await?;
+                    let refresh_id =
+                        allocate_refresh_id(transaction, operation_id, page_size).await?;
                     definition.refresh_in_progress = true;
                     definition.active_refresh_id = Some(refresh_id);
                     definition.refresh_target_snapshots = target_snapshots.clone();
@@ -1186,7 +1195,8 @@ impl StateStoreMvRepository {
                             request.mv_id
                         )));
                     }
-                    let refresh_id = allocate_refresh_id(transaction, page_size).await?;
+                    let refresh_id =
+                        allocate_refresh_id(transaction, operation_id, page_size).await?;
                     definition.refresh_in_progress = true;
                     definition.active_refresh_id = Some(refresh_id);
                     definition.refresh_target_snapshots = request.base_snapshots.clone();
@@ -1307,6 +1317,24 @@ impl StateStoreMvRepository {
                     .await?;
                     Ok(refresh)
                 })
+            },
+        )
+        .await
+    }
+
+    pub async fn reserve_frontend_refresh_id_async(&self) -> Result<i64, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let page_size = self.store.limits().max_page_size;
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "reserve frontend-owned MV refresh ID",
+            move |transaction| {
+                Box::pin(
+                    async move { allocate_refresh_id(transaction, operation_id, page_size).await },
+                )
             },
         )
         .await
@@ -2244,6 +2272,9 @@ impl MvRepository for StateStoreMvRepository {
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
         self.blocking(self.begin_frontend_refresh_intent_async(request))
     }
+    fn reserve_frontend_refresh_id(&self) -> Result<i64, MvRepositoryError> {
+        self.blocking(self.reserve_frontend_refresh_id_async())
+    }
     fn record_frontend_refresh_action(
         &self,
         refresh_id: i64,
@@ -2454,6 +2485,7 @@ fn prevalidate_create_operation(
         operation_id,
         &MvSequence {
             last_allocated_id: mv_id,
+            last_refresh_id: 0,
         },
     )
     .map_err(invalid)?;
@@ -2642,15 +2674,29 @@ async fn put_partition_transaction(
 
 async fn allocate_refresh_id(
     transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
     page_size: usize,
 ) -> Result<i64, novarocks_spi::state_store::StateStoreError> {
+    let sequence_key = sequence_key().map_err(invalid_state_store)?;
+    let sequence_record = transaction.get(&sequence_key).await?;
+    let sequence = match &sequence_record {
+        Some(record) => {
+            decode_record::<MvSequence>(&sequence_key, &record.value)
+                .map_err(invalid_state_store)?
+                .value
+        }
+        None => MvSequence {
+            last_allocated_id: 0,
+            last_refresh_id: 0,
+        },
+    };
     let records = range_transaction_with_page_size(
         transaction,
         refresh_prefix().map_err(invalid_state_store)?,
         page_size,
     )
     .await?;
-    records
+    let existing_max = records
         .into_iter()
         .map(|record| {
             decode_record::<StoredMvRefresh>(&record.key, &record.value)
@@ -2660,10 +2706,32 @@ async fn allocate_refresh_id(
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let next = sequence
+        .last_refresh_id
+        .max(existing_max)
         .checked_add(1)
         .filter(|value| *value > 0)
-        .ok_or_else(|| invalid_state_store("MV refresh ID sequence overflow"))
+        .ok_or_else(|| invalid_state_store("MV refresh ID sequence overflow"))?;
+    let value = encode_record(
+        MvRecordKind::Sequence,
+        operation_id,
+        &MvSequence {
+            last_allocated_id: sequence.last_allocated_id,
+            last_refresh_id: next,
+        },
+    )
+    .map_err(invalid_state_store)?;
+    transaction
+        .put(
+            sequence_key,
+            value,
+            sequence_record
+                .map(|record| Precondition::Version(record.version))
+                .unwrap_or(Precondition::Absent),
+        )
+        .await?;
+    Ok(next)
 }
 
 async fn range_transaction_with_page_size(

@@ -251,6 +251,13 @@ pub trait MvRepository: Send + Sync {
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
         Err(MvRepositoryError::unavailable())
     }
+    /// Reserve a positive refresh identity before SQL preparation.  This is
+    /// intentionally separate from the v3 intent write: a failed preparation
+    /// may leave an unused identity, but it must never leave an active refresh
+    /// or an incomplete lifecycle ledger.
+    fn reserve_frontend_refresh_id(&self) -> Result<i64, MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
     fn record_frontend_refresh_action(
         &self,
         _refresh_id: i64,

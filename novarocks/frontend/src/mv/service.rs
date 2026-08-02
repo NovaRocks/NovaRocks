@@ -98,4 +98,63 @@ impl MvApplicationService for FrontendMvService {
             execution,
         )
     }
+
+    fn prepare_and_execute_refresh(
+        &self,
+        preparation: &dyn novarocks::sql::mv_refresh::MvRefreshPreparationService,
+        statement: novarocks::sql::mv_refresh::MvRefreshStatement,
+        target: novarocks::mv::repository::MvTarget,
+        connector_context: ConnectorRequestContext,
+        execution: &novarocks::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<MvStatementResult, MvApplicationError> {
+        let attempt = self.reserve_refresh_attempt()?;
+        let prepared = preparation
+            .prepare_step(novarocks::sql::mv_refresh::MvRefreshPreparationRequest {
+                statement,
+                target,
+                attempt: attempt.clone(),
+            })
+            .map_err(|error| {
+                MvApplicationError::new(
+                    novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
+                    error,
+                )
+            })?;
+        if prepared.attempt != attempt {
+            return Err(MvApplicationError::new(
+                novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
+                "MV refresh preparation changed the frontend-reserved attempt identity",
+            ));
+        }
+        self.execute_prepared_refresh(prepared, connector_context, execution)
+    }
+}
+
+impl FrontendMvService {
+    fn reserve_refresh_attempt(
+        &self,
+    ) -> Result<novarocks::sql::mv_refresh::MvRefreshAttemptIdentity, MvApplicationError> {
+        let refresh_id = self
+            .repository
+            .reserve_frontend_refresh_id()
+            .map_err(|error| {
+                MvApplicationError::new(
+                    novarocks::mv::application::MvApplicationErrorKind::Repository,
+                    error.to_string(),
+                )
+            })?;
+        let request_id = *uuid::Uuid::now_v7().as_bytes();
+        Ok(novarocks::sql::mv_refresh::MvRefreshAttemptIdentity {
+            refresh_id,
+            request_id,
+            staging_branch: format!("__novarocks_mv_refresh_{refresh_id}"),
+            marker_token: uuid::Uuid::now_v7().to_string(),
+            staging_create_operation_id: *uuid::Uuid::now_v7().as_bytes(),
+            write_operation_id: novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            ),
+            publication_operation_id: *uuid::Uuid::now_v7().as_bytes(),
+            staging_drop_operation_id: *uuid::Uuid::now_v7().as_bytes(),
+        })
+    }
 }
