@@ -60,6 +60,7 @@ use crate::connector::iceberg::commit::mv_refresh_ref::{
 
 pub const MV_PROVENANCE_V1_PROP: &str = "novarocks.mv.provenance.v1";
 pub const MV_PROVENANCE_VERSION: u16 = 1;
+pub const MV_REFRESH_ROW_COUNT_PROP: &str = "novarocks.mv.refresh.row_count";
 
 /// How this refresh derived the MV's new state from its bases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +144,17 @@ impl MvProvenanceV1 {
         Ok(hex_encode(&Sha256::digest(canonical_json.as_bytes())))
     }
 
+    /// Return the same immutable provenance identity with the row-count fact
+    /// observed from the committed Iceberg snapshot summary.
+    pub fn with_rows(&self, rows: i64) -> Result<Self, String> {
+        if rows < 0 {
+            return Err("MV provenance row count cannot be negative".to_string());
+        }
+        let mut updated = self.clone();
+        updated.rows = rows;
+        Ok(updated)
+    }
+
     /// Sha256 hex over a canonical JSON of just the watermark projection: a
     /// sorted list of `{table_fqn, uuid, to_snapshot}` from `bases`. This is
     /// the hash the W0 harness exposes as `WaterlineHash` — it changes
@@ -170,14 +182,14 @@ impl MvProvenanceV1 {
         Ok(hex_encode(&Sha256::digest(canonical_json.as_bytes())))
     }
 
-    fn to_canonical_json(&self) -> Result<String, String> {
+    pub(crate) fn to_canonical_json(&self) -> Result<String, String> {
         let value = serde_json::to_value(self)
             .map_err(|err| format!("failed to serialize MV provenance: {err}"))?;
         serde_json::to_string(&sort_json_value(value))
             .map_err(|err| format!("failed to render canonical MV provenance JSON: {err}"))
     }
 
-    fn from_json(s: &str) -> Result<Self, String> {
+    pub(crate) fn from_json(s: &str) -> Result<Self, String> {
         let record: Self = serde_json::from_str(s)
             .map_err(|err| format!("failed to parse MV provenance JSON: {err}"))?;
         if record.provenance_version != MV_PROVENANCE_VERSION {

@@ -43,23 +43,28 @@ use novarocks_spi::connector::{
     ConnectorExecutionDistribution, ConnectorExecutionInstaller, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReadSelector, ConnectorRefreshPublicationGuard, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
-    ConnectorStaticPredicateLiteral, ConnectorStatistics, ConnectorTableHandle,
-    ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy,
-    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
-    StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
-    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
-    StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
-    StatisticsMissingKind, StatisticsProvenance, StatisticsPublishPreparationRequest,
-    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
-    StatisticsReconcileRequest, StatisticsScanColumn, normalize_predicate_dispositions,
-    validate_static_predicates,
+    ConnectorMutationOperationId, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
+    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector, ConnectorRefAction,
+    ConnectorRefKind, ConnectorRefreshPublicationGuard, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
+    ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
+    ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
+    ConnectorStagedPublicationProof, ConnectorStagedPublicationRecovery,
+    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateDataType,
+    ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral, ConnectorStatistics,
+    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
+    CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
+    StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricState, StatisticsMetricValue,
+    StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
+    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
+    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsScanColumn,
+    normalize_predicate_dispositions, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -99,6 +104,7 @@ const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
 const ICEBERG_PROVIDER_STATISTICS_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_OPERATION_KIND: &str = "statistics-publish";
+const ICEBERG_STAGED_PUBLICATION_PROOF_VERSION: u16 = 1;
 fn statistics_data_version(
     table_uuid: &str,
     snapshot_id: Option<i64>,
@@ -726,8 +732,36 @@ pub(crate) struct IcebergControlProvider {
     descriptor: ConnectorInstanceDescriptor,
     instance_id: ConnectorInstanceId,
     incarnation: ConnectorInstanceIncarnation,
+    binding_key: ConnectorExecutionBindingKey,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
     snapshot_memberships: Arc<SnapshotMembershipCache>,
+    recovery_cleanup_outcomes: Arc<
+        Mutex<
+            HashMap<
+                ConnectorMutationOperationId,
+                ExternalMutationOutcome<ConnectorStagedPublicationCleanupReceipt>,
+            >,
+        >,
+    >,
+}
+
+/// Provider-private, bounded description of exactly the ref that an
+/// inspection proved safe to clean up. It is only carried back as opaque SPI
+/// proof; the frontend never interprets these fields.
+#[derive(Deserialize, Serialize)]
+struct IcebergStagedPublicationProofV1 {
+    version: u16,
+    descriptor_digest: Vec<u8>,
+    namespace: String,
+    table: String,
+    table_uuid: String,
+    staging_ref: String,
+    staging_snapshot_id: Option<i64>,
+    target_ref: String,
+    target_snapshot_id: Option<i64>,
+    refresh_id: i64,
+    mv_id: i64,
+    marker_token: String,
 }
 
 /// Provider-private, bounded evidence used only to decide an ambiguous
@@ -861,19 +895,21 @@ impl IcebergControlProvider {
             instance_id: instance_id.clone(),
         };
         let incarnation = ConnectorInstanceIncarnation::new();
-        let provider = Arc::new(Self {
-            descriptor: descriptor.clone(),
-            instance_id,
-            incarnation,
-            registry: Arc::clone(&registry),
-            snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
-                MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
-            )),
-        });
         let write_key = ConnectorExecutionBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };
+        let provider = Arc::new(Self {
+            descriptor: descriptor.clone(),
+            instance_id,
+            incarnation,
+            binding_key: write_key.clone(),
+            registry: Arc::clone(&registry),
+            snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
+                MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
+            )),
+            recovery_cleanup_outcomes: Arc::new(Mutex::new(HashMap::new())),
+        });
         let services = registry
             .read()
             .map_err(|error| internal(format!("Iceberg catalog registry read lock: {error}")))?
@@ -914,8 +950,9 @@ impl IcebergControlProvider {
             Some(metadata_maintenance),
             Some(distributed_rewrite),
             Some(write),
-            Some(provider),
-        )
+            Some(provider.clone()),
+        )?
+        .try_with_staged_publication_recovery(Some(provider))
     }
 
     fn entry(&self, catalog: &str) -> Result<IcebergCatalogEntry, ConnectorError> {
@@ -2273,6 +2310,381 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
         };
         reconcile_iceberg_mutation_evidence(self, &entry, decoded.target, request.evidence)
     }
+}
+
+impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.binding_key
+    }
+
+    fn inspect(
+        &self,
+        descriptor: ConnectorStagedPublicationDescriptor,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorStagedPublicationObservation, ConnectorError> {
+        self.validate_context(&context)?;
+        descriptor.validate()?;
+        if descriptor.table.instance_id != self.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "staged publication descriptor belongs to another Iceberg instance",
+            ));
+        }
+        let entry = self.entry(self.instance_id.as_str())?;
+        entry.invalidate_table_cache(&descriptor.table.namespace, &descriptor.table.table);
+        let loaded = load_table(&entry, &descriptor.table.namespace, &descriptor.table.table)
+            .map_err(map_iceberg_error)?;
+        let metadata = loaded.table.metadata();
+        let staging_snapshot_id = metadata
+            .refs()
+            .get(descriptor.staging_ref.as_ref())
+            .map(|reference| reference.snapshot_id);
+        let target_snapshot_id = if descriptor.target_ref.as_ref() == "main" {
+            metadata.current_snapshot_id()
+        } else {
+            metadata
+                .refs()
+                .get(descriptor.target_ref.as_ref())
+                .map(|reference| reference.snapshot_id)
+        };
+        let marker = crate::connector::iceberg::commit::MvRefreshSnapshotMarker {
+            refresh_id: descriptor.refresh_id,
+            mv_id: descriptor.mv_id,
+            token: descriptor.marker_token.to_string(),
+        };
+        let marker_for = |snapshot_id: i64| {
+            metadata
+                .snapshot_by_id(snapshot_id)
+                .is_some_and(|snapshot| {
+                    crate::connector::iceberg::commit::snapshot_matches_refresh_marker(
+                        snapshot, &marker,
+                    )
+                })
+        };
+        let main_ancestors = iceberg_main_ancestors(metadata);
+        let disposition = match (staging_snapshot_id, target_snapshot_id) {
+            (Some(staging), Some(target)) if staging == target => {
+                if marker_for(staging) {
+                    ConnectorStagedPublicationDisposition::CleanupPending
+                } else {
+                    ConnectorStagedPublicationDisposition::Ambiguous
+                }
+            }
+            (Some(staging), _) if main_ancestors.contains(&staging) => {
+                if marker_for(staging) {
+                    ConnectorStagedPublicationDisposition::Superseded
+                } else {
+                    ConnectorStagedPublicationDisposition::Ambiguous
+                }
+            }
+            (Some(staging), _) if marker_for(staging) => {
+                ConnectorStagedPublicationDisposition::Staged
+            }
+            (Some(_), _) => ConnectorStagedPublicationDisposition::Ambiguous,
+            (None, Some(target)) if marker_for(target) => {
+                ConnectorStagedPublicationDisposition::Published
+            }
+            (None, _) => ConnectorStagedPublicationDisposition::KnownUncommitted,
+        };
+        let observed_snapshot = match disposition {
+            ConnectorStagedPublicationDisposition::Published
+            | ConnectorStagedPublicationDisposition::CleanupPending => target_snapshot_id,
+            ConnectorStagedPublicationDisposition::Superseded
+            | ConnectorStagedPublicationDisposition::Staged => staging_snapshot_id,
+            ConnectorStagedPublicationDisposition::KnownUncommitted
+            | ConnectorStagedPublicationDisposition::Ambiguous => None,
+        };
+        let (committed_version, resulting_row_count, bases, definition_fingerprint) = if matches!(
+            disposition,
+            ConnectorStagedPublicationDisposition::Published
+                | ConnectorStagedPublicationDisposition::Superseded
+                | ConnectorStagedPublicationDisposition::CleanupPending
+        ) {
+            let snapshot_id = observed_snapshot.ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "published MV recovery observation has no snapshot",
+                )
+            })?;
+            let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "published MV recovery snapshot is missing",
+                )
+            })?;
+            let provenance = crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1::from_snapshot_summary(snapshot)
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?
+                    .filter(|provenance| {
+                        provenance.refresh_id == descriptor.refresh_id
+                            && provenance.mv_id == descriptor.mv_id
+                            && provenance.token == descriptor.marker_token.as_ref()
+                    })
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "published MV recovery snapshot lacks matching provenance",
+                        )
+                    })?;
+            let total_records = snapshot
+                .summary()
+                .additional_properties
+                .get("total-records")
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "published MV recovery snapshot lacks total-records",
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|error| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        format!("published MV recovery has invalid total-records: {error}"),
+                    )
+                })?;
+            if provenance.rows < 0
+                || (provenance.rows != 0 && provenance.rows as u64 != total_records)
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "published MV recovery provenance rows conflict with total-records",
+                ));
+            }
+            let bases = provenance
+                .bases
+                .into_iter()
+                .map(|base| ConnectorStagedPublicationBaseFact {
+                    table: Arc::from(base.table_fqn),
+                    uuid: Arc::from(base.uuid),
+                    from_version: base.from_snapshot,
+                    to_version: base.to_snapshot,
+                })
+                .collect::<Vec<_>>();
+            let version = ConnectorCommittedVersion::try_new(
+                Bytes::from(format!("iceberg/recovery/v1/{snapshot_id}")),
+                Some(snapshot_id),
+            )?;
+            (
+                Some(version),
+                Some(total_records),
+                bases,
+                Some(Arc::from(provenance.definition_fingerprint)),
+            )
+        } else {
+            (None, None, Vec::new(), None)
+        };
+        let proof = IcebergStagedPublicationProofV1 {
+            version: ICEBERG_STAGED_PUBLICATION_PROOF_VERSION,
+            descriptor_digest: descriptor.digest().to_vec(),
+            namespace: descriptor.table.namespace.to_string(),
+            table: descriptor.table.table.to_string(),
+            table_uuid: metadata.uuid().to_string(),
+            staging_ref: descriptor.staging_ref.to_string(),
+            staging_snapshot_id,
+            target_ref: descriptor.target_ref.to_string(),
+            target_snapshot_id,
+            refresh_id: descriptor.refresh_id,
+            mv_id: descriptor.mv_id,
+            marker_token: descriptor.marker_token.to_string(),
+        };
+        let proof = serde_json::to_vec(&proof)
+            .map(Bytes::from)
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
+            })?;
+        ConnectorStagedPublicationObservation::try_new(
+            disposition,
+            committed_version,
+            resulting_row_count,
+            bases,
+            definition_fingerprint,
+            staging_snapshot_id,
+            target_snapshot_id,
+            staging_snapshot_id.is_some(),
+            ConnectorStagedPublicationProof::try_new(proof)?,
+        )
+    }
+
+    fn cleanup(
+        &self,
+        request: ConnectorStagedPublicationCleanupRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorStagedPublicationCleanupReceipt>, ConnectorError>
+    {
+        self.validate_context(&request.context)?;
+        request.observation.validate()?;
+        if let Some(outcome) = self
+            .recovery_cleanup_outcomes
+            .lock()
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("Iceberg recovery cleanup outcome lock: {error}"),
+                )
+            })?
+            .get(&request.operation_id)
+            .cloned()
+        {
+            return Ok(outcome);
+        }
+        let proof: IcebergStagedPublicationProofV1 =
+            serde_json::from_slice(request.observation.proof.payload()).map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!("invalid Iceberg staged publication cleanup proof: {error}"),
+                )
+            })?;
+        if proof.version != ICEBERG_STAGED_PUBLICATION_PROOF_VERSION
+            || proof.descriptor_digest.as_slice() != request.descriptor_digest
+            || proof.staging_snapshot_id != request.observation.staging_snapshot_id
+            || proof.staging_snapshot_id.is_none()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg staged publication cleanup proof conflicts with observation",
+            ));
+        }
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: self.instance_id.clone(),
+            namespace: Arc::from(proof.namespace),
+            table: Arc::from(proof.table),
+        };
+        let entry = self.entry(self.instance_id.as_str())?;
+        entry.invalidate_table_cache(&table.namespace, &table.table);
+        let loaded =
+            load_table(&entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+        if loaded.table.metadata().uuid().to_string() != proof.table_uuid {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg staged publication cleanup table UUID drifted",
+            ));
+        }
+        if let Some(reference) = loaded.table.metadata().refs().get(&proof.staging_ref) {
+            if reference.snapshot_id != proof.staging_snapshot_id.expect("checked above")
+                || !reference.is_branch()
+            {
+                return Ok(ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Conflict,
+                        "Iceberg staged publication ref drifted before cleanup",
+                    ),
+                });
+            }
+        } else {
+            let outcome = ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: ConnectorStagedPublicationCleanupReceipt {
+                    descriptor_digest: request.descriptor_digest,
+                    observation_digest: request.observation.digest(),
+                },
+                finalization: ExternalMutationFinalization::Complete,
+            };
+            self.recovery_cleanup_outcomes
+                .lock()
+                .map_err(|error| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        format!("Iceberg recovery cleanup outcome lock: {error}"),
+                    )
+                })?
+                .insert(request.operation_id, outcome.clone());
+            return Ok(outcome);
+        }
+        let outcome = ConnectorCatalogMutation::execute(
+            self,
+            ConnectorCatalogMutationRequest {
+                operation_id: request.operation_id,
+                target: self.binding_key.clone(),
+                operation: ConnectorCatalogMutationOperation::AlterRef {
+                    table,
+                    action: ConnectorRefAction::Drop {
+                        kind: ConnectorRefKind::Branch,
+                        name: Arc::from(proof.staging_ref),
+                        policy: DropPolicy::NoOpIfMissing,
+                    },
+                },
+                context: request.context,
+            },
+        )?;
+        let outcome = match outcome {
+            ExternalMutationOutcome::KnownCommitted {
+                effect,
+                finalization,
+                ..
+            } => ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt: ConnectorStagedPublicationCleanupReceipt {
+                    descriptor_digest: request.descriptor_digest,
+                    observation_digest: request.observation.digest(),
+                },
+                finalization,
+            },
+            ExternalMutationOutcome::KnownUncommitted { failure } => {
+                ExternalMutationOutcome::KnownUncommitted { failure }
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+                ExternalMutationOutcome::CommitUnknown { failure, evidence }
+            }
+        };
+        self.recovery_cleanup_outcomes
+            .lock()
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("Iceberg recovery cleanup outcome lock: {error}"),
+                )
+            })?
+            .insert(request.operation_id, outcome.clone());
+        Ok(outcome)
+    }
+
+    fn reconcile_cleanup(
+        &self,
+        operation_id: ConnectorMutationOperationId,
+        evidence: ExternalMutationEvidence,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorStagedPublicationCleanupReceipt>, ConnectorError>
+    {
+        self.validate_context(&context)?;
+        if evidence.operation_id() != operation_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg staged publication cleanup evidence operation does not match",
+            ));
+        }
+        self.recovery_cleanup_outcomes
+            .lock()
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("Iceberg recovery cleanup outcome lock: {error}"),
+                )
+            })?
+            .get(&operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "Iceberg staged publication cleanup has no retained outcome to reconcile",
+                )
+            })
+    }
+}
+
+fn iceberg_main_ancestors(metadata: &iceberg::spec::TableMetadata) -> Vec<i64> {
+    let mut ancestors = Vec::new();
+    let mut cursor = metadata.current_snapshot_id();
+    while let Some(snapshot_id) = cursor {
+        if ancestors.len()
+            == novarocks_spi::connector::MAX_CONNECTOR_STAGED_PUBLICATION_LINEAGE_FACTS
+        {
+            break;
+        }
+        ancestors.push(snapshot_id);
+        cursor = metadata
+            .snapshot_by_id(snapshot_id)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    }
+    ancestors
 }
 
 fn known_uncommitted(

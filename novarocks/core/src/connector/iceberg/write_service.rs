@@ -411,11 +411,11 @@ impl IcebergWriteReportCommitter for IcebergFirstRefreshWriteReportCommitter {
                 cleanup,
             ));
         }
-        let mut provenance = self.provenance_properties.clone();
-        provenance.insert(
-            "novarocks.mv.refresh.row_count".to_string(),
-            row_count.to_string(),
-        );
+        // `merge_snapshot_summary_properties` derives provenance.rows and the
+        // compatibility row-count property from the committed snapshot's
+        // total-records.  The accepted BE reports remain an input-staging
+        // fact, never the frontend's final MV row count.
+        let provenance = self.provenance_properties.clone();
         self.executor
             .commit_iceberg_writer_reports_with_snapshot_properties(reports, provenance)
     }

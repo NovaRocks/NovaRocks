@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::collector::IcebergCommitCollector;
+use super::mv_provenance::{MV_PROVENANCE_V1_PROP, MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1};
 use super::types::CommitOutcome;
 
 pub struct CommitCtx<'a> {
@@ -53,14 +54,29 @@ pub(super) fn merge_snapshot_summary_properties(
     mut built_in: HashMap<String, String>,
     snapshot_properties: &BTreeMap<String, String>,
 ) -> Result<HashMap<String, String>, String> {
-    for key in snapshot_properties.keys() {
+    let mut provider_properties = snapshot_properties.clone();
+    if let Some(raw_provenance) = provider_properties.get(MV_PROVENANCE_V1_PROP).cloned() {
+        let total_records = built_in
+            .get("total-records")
+            .ok_or_else(|| "MV commit summary is missing total-records".to_string())?
+            .parse::<i64>()
+            .map_err(|error| format!("MV commit summary has invalid total-records: {error}"))?;
+        let provenance = MvProvenanceV1::from_json(&raw_provenance)?;
+        let canonical = provenance.with_rows(total_records)?.to_canonical_json()?;
+        provider_properties.insert(MV_PROVENANCE_V1_PROP.to_string(), canonical);
+        provider_properties.insert(
+            MV_REFRESH_ROW_COUNT_PROP.to_string(),
+            total_records.to_string(),
+        );
+    }
+    for key in provider_properties.keys() {
         if built_in.contains_key(key) {
             return Err(format!(
                 "snapshot property {key} conflicts with built-in summary field"
             ));
         }
     }
-    built_in.extend(snapshot_properties.clone());
+    built_in.extend(provider_properties);
     Ok(built_in)
 }
 

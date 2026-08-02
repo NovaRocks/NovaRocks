@@ -25,9 +25,9 @@ use super::{
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorRequestContext,
     ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorStagedPublicationRecovery, ConnectorTableHandle, ConnectorWriteControl,
-    ConnectorWriteLease, ConnectorWriteResolver,
+    ConnectorSplitPlanningResult, ConnectorStagedPublicationRecovery, ConnectorStatistics,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
