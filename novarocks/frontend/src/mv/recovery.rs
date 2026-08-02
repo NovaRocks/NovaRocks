@@ -85,6 +85,20 @@ pub(super) fn recover_once(
             Err(()) => summary.unresolved += 1,
         }
     }
+    let remaining = MAX_RECOVERY_CANDIDATES.saturating_sub(summary.candidates);
+    for refresh in repository
+        .list_unfinished_branch_staged_iceberg_refreshes()
+        .unwrap_or_default()
+        .into_iter()
+        .take(remaining)
+    {
+        summary.candidates += 1;
+        match recover_legacy_one(repository, dependencies, refresh) {
+            Ok(RecoveryResult::Resolved) => summary.resolved += 1,
+            Ok(RecoveryResult::CleanupPending) => summary.cleanup_backlog += 1,
+            Err(()) => summary.unresolved += 1,
+        }
+    }
     summary
 }
 
@@ -214,6 +228,133 @@ fn recover_one(
                 .map_err(|_| ())?;
             Ok(RecoveryResult::Resolved)
         }
+    }
+}
+
+fn recover_legacy_one(
+    repository: &dyn MvRepository,
+    dependencies: &FrontendMvRecoveryDependencies,
+    refresh: StoredMvRefresh,
+) -> Result<RecoveryResult, ()> {
+    if refresh.lifecycle_owner != MvRefreshLifecycleOwner::LegacyCore {
+        return Err(());
+    }
+    let instance =
+        ConnectorInstanceId::parse(refresh.target_catalog.as_deref().ok_or(())?).map_err(|_| ())?;
+    let lease = dependencies
+        .connector_control
+        .acquire_current(&instance)
+        .map_err(|_| ())?;
+    let recovery = lease.binding().staged_publication_recovery().ok_or(())?;
+    let descriptor = legacy_descriptor(&refresh, lease.binding().incarnation())?;
+    let context = recovery_context().map_err(|_| ())?;
+    let observation = recovery
+        .inspect(descriptor.clone(), context.clone())
+        .map_err(|_| ())?;
+    match observation.disposition {
+        ConnectorStagedPublicationDisposition::Ambiguous => Err(()),
+        ConnectorStagedPublicationDisposition::Published
+        | ConnectorStagedPublicationDisposition::Superseded
+        | ConnectorStagedPublicationDisposition::CleanupPending => {
+            finalize_legacy_published(repository, &refresh, &observation)?;
+            if observation.cleanup_required {
+                legacy_cleanup(recovery.as_ref(), &descriptor, observation, context)
+            } else {
+                Ok(RecoveryResult::Resolved)
+            }
+        }
+        ConnectorStagedPublicationDisposition::KnownUncommitted
+        | ConnectorStagedPublicationDisposition::Staged => {
+            if observation.cleanup_required {
+                match legacy_cleanup(recovery.as_ref(), &descriptor, observation, context)? {
+                    RecoveryResult::Resolved => {}
+                    pending => return Ok(pending),
+                }
+            }
+            repository
+                .clear_refresh_progress(refresh.mv_id)
+                .map_err(|_| ())?;
+            Ok(RecoveryResult::Resolved)
+        }
+    }
+}
+
+fn legacy_cleanup(
+    recovery: &dyn novarocks_spi::connector::ConnectorStagedPublicationRecovery,
+    descriptor: &ConnectorStagedPublicationDescriptor,
+    observation: ConnectorStagedPublicationObservation,
+    context: ConnectorRequestContext,
+) -> Result<RecoveryResult, ()> {
+    let operation_id = ConnectorMutationOperationId::new();
+    let outcome = recovery
+        .cleanup(ConnectorStagedPublicationCleanupRequest {
+            operation_id,
+            descriptor_digest: descriptor.digest(),
+            observation,
+            context: context.clone(),
+        })
+        .map_err(|_| ())?;
+    let outcome = match outcome {
+        ExternalMutationOutcome::CommitUnknown { failure, evidence } => recovery
+            .reconcile_cleanup(operation_id, evidence.clone(), context)
+            .unwrap_or(ExternalMutationOutcome::CommitUnknown { failure, evidence }),
+        outcome => outcome,
+    };
+    match outcome {
+        ExternalMutationOutcome::KnownCommitted { finalization, .. } => Ok(
+            if matches!(finalization, ExternalMutationFinalization::Complete) {
+                RecoveryResult::Resolved
+            } else {
+                RecoveryResult::CleanupPending
+            },
+        ),
+        ExternalMutationOutcome::KnownUncommitted { .. } => Err(()),
+        ExternalMutationOutcome::CommitUnknown { .. } => Ok(RecoveryResult::CleanupPending),
+    }
+}
+
+fn finalize_legacy_published(
+    repository: &dyn MvRepository,
+    refresh: &StoredMvRefresh,
+    observation: &ConnectorStagedPublicationObservation,
+) -> Result<(), ()> {
+    let rows = i64::try_from(observation.resulting_row_count.ok_or(())?).map_err(|_| ())?;
+    let snapshot = observation.target_snapshot_id.ok_or(())?;
+    let finalize = MvRefreshFinalizeRequest {
+        refresh_id: refresh.refresh_id,
+        rows,
+        base_snapshots: refresh.target_snapshots.clone(),
+        base_table_uuids: refresh.base_table_uuids.clone(),
+        target_snapshot_id: Some(snapshot),
+    };
+    use novarocks::mv::persistence::refresh::MvRefreshState;
+    match refresh.state {
+        MvRefreshState::IntentCreated => repository
+            .record_external_commit_and_finalize(
+                novarocks::mv::repository::RecordExternalCommitAndFinalizeRequest {
+                    refresh_id: refresh.refresh_id,
+                    external_outcome: novarocks::mv::persistence::refresh::RefreshExternalOutcome {
+                        target_snapshot_id: Some(snapshot),
+                        commit_id: format!("recovered-iceberg-snapshot-{snapshot}"),
+                    },
+                    finalize,
+                },
+            )
+            .map_err(|_| ()),
+        MvRefreshState::StagingCommitted => {
+            repository
+                .record_publish_commit(
+                    novarocks::mv::persistence::refresh::RecordPublishCommitRequest {
+                        refresh_id: refresh.refresh_id,
+                        published_snapshot_id: snapshot,
+                    },
+                )
+                .map_err(|_| ())?;
+            repository.finalize_refresh(finalize).map_err(|_| ())
+        }
+        MvRefreshState::PublishCommitted => repository.finalize_refresh(finalize).map_err(|_| ()),
+        MvRefreshState::Finalized => Ok(()),
+        _ => Err(()),
     }
 }
 
@@ -512,6 +653,76 @@ fn descriptor_from_refresh(
         bases,
     )
     .map_err(|error| error.to_string())
+}
+
+fn legacy_descriptor(
+    refresh: &StoredMvRefresh,
+    current_incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
+) -> Result<ConnectorStagedPublicationDescriptor, ()> {
+    let instance_id =
+        ConnectorInstanceId::parse(refresh.target_catalog.as_deref().ok_or(())?).map_err(|_| ())?;
+    let table = ConnectorTableIdentity {
+        instance_id: instance_id.clone(),
+        namespace: Arc::from(refresh.target_namespace.as_deref().ok_or(())?),
+        table: Arc::from(refresh.target_table.as_deref().ok_or(())?),
+    };
+    let marker = refresh.marker.as_ref().ok_or(())?;
+    let mut identity_hasher = Sha256::new();
+    identity_hasher.update(refresh.refresh_id.to_be_bytes());
+    identity_hasher.update(refresh.mv_id.to_be_bytes());
+    let identity: [u8; 32] = identity_hasher.finalize().into();
+    let operation_id =
+        ConnectorMutationOperationId::from_bytes(identity[..16].try_into().map_err(|_| ())?);
+    let cohort: [u8; 16] = identity[16..].try_into().map_err(|_| ())?;
+    let actions = [
+        ConnectorStagedPublicationPhase::StagingCreate,
+        ConnectorStagedPublicationPhase::Write,
+        ConnectorStagedPublicationPhase::Publication,
+        ConnectorStagedPublicationPhase::StagingDrop,
+    ]
+    .into_iter()
+    .map(|phase| ConnectorHistoricalPublicationAction {
+        phase,
+        state: ConnectorStagedPublicationPhaseState::Prepared,
+        operation_id,
+        committed_version: None,
+        evidence_digest: None,
+    })
+    .collect();
+    let bases = refresh
+        .target_snapshots
+        .iter()
+        .filter_map(|(table, to_version)| {
+            refresh
+                .base_table_uuids
+                .get(table)
+                .map(|uuid| ConnectorStagedPublicationBaseFact {
+                    table: Arc::from(table.as_str()),
+                    uuid: Arc::from(uuid.as_str()),
+                    from_version: None,
+                    to_version: *to_version,
+                })
+        })
+        .collect();
+    ConnectorStagedPublicationDescriptor::try_new(
+        novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id,
+            incarnation: current_incarnation,
+        },
+        table,
+        refresh.staging_branch.as_deref().ok_or(())?,
+        "main",
+        None,
+        refresh.refresh_id,
+        refresh.mv_id,
+        identity[..16].try_into().map_err(|_| ())?,
+        marker.token.clone(),
+        vec![cohort],
+        Sha256::digest(cohort).into(),
+        actions,
+        bases,
+    )
+    .map_err(|_| ())
 }
 
 fn connector_version(
