@@ -392,7 +392,22 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
         observed_binding,
         connector_context,
     )?;
-    MvFirstRefreshWritePreparer::prepare_join_logical(request, append)
+    MvFirstRefreshWritePreparer::prepare_join_logical(request, append, frozen_logical_context(ctx))
+}
+
+fn frozen_logical_context(
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+) -> crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext {
+    crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext {
+        mv_definition: (*ctx.rewrite.mv_definition).clone(),
+        canonical_select_query: (*ctx.rewrite.canonical_select_query).clone(),
+        base_refs: ctx.rewrite.base_refs.to_vec(),
+        pin: (*ctx.rewrite.pin).clone(),
+        previous_snapshot_ids: ctx.rewrite.previous_snapshot_ids.clone(),
+        previous_table_uuids: ctx.rewrite.previous_table_uuids.clone(),
+        target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
+        affected_partitions: ctx.affected_partitions.clone(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -684,7 +699,7 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
             let mv_refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
                 "MV first-refresh logical staging requires its frozen refresh context".to_string()
             })?;
-            let (logical_plan, factory) = logical.into_parts();
+            let (logical_plan, factory, _frozen_context) = logical.into_parts();
             execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context(
                 state,
                 logical_plan,

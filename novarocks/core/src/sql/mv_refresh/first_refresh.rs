@@ -34,6 +34,22 @@ use novarocks_spi::connector::{
 };
 use std::collections::BTreeSet;
 
+/// Value-only facts needed to reconstruct the provider-private scan binding
+/// for a typed join append after the frontend has admitted its exact lease.
+/// This deliberately excludes catalog entries, table handles and execution
+/// services: the Core activation adapter reloads those and validates them
+/// against these facts.
+pub(crate) struct MvFirstRefreshLogicalContext {
+    pub(crate) mv_definition: crate::mv::persistence::definition::StoredMvDefinition,
+    pub(crate) canonical_select_query: sqlparser::ast::Query,
+    pub(crate) base_refs: Vec<novarocks_catalog::identifier::TableIdentity>,
+    pub(crate) pin: RefreshSnapshotPin,
+    pub(crate) previous_snapshot_ids: std::collections::BTreeMap<String, i64>,
+    pub(crate) previous_table_uuids: std::collections::BTreeMap<String, String>,
+    pub(crate) target_table_uuid: String,
+    pub(crate) affected_partitions: crate::mv::model::AffectedTargetPartitions,
+}
+
 /// Immutable SQL artifact for a distributed first-refresh write.
 ///
 /// `root_hash_column` is the target contract's hidden apply key. The native
@@ -52,22 +68,31 @@ pub(crate) struct MvFirstRefreshLogicalArtifact {
     plan: LogicalPlanNode,
     factory: ColumnRefFactory,
     root_hash_column: String,
+    context: MvFirstRefreshLogicalContext,
 }
 
 impl MvFirstRefreshLogicalArtifact {
     pub(crate) fn from_join_append(
         append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+        context: MvFirstRefreshLogicalContext,
     ) -> Self {
         Self {
             plan: append.plan,
             factory: append.factory,
             root_hash_column: crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME
                 .to_string(),
+            context,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (LogicalPlanNode, ColumnRefFactory) {
-        (self.plan, self.factory)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LogicalPlanNode,
+        ColumnRefFactory,
+        MvFirstRefreshLogicalContext,
+    ) {
+        (self.plan, self.factory, self.context)
     }
 }
 
@@ -405,11 +430,12 @@ impl MvFirstRefreshWritePreparer {
     pub(crate) fn prepare_join_logical(
         request: MvFirstRefreshWriteRequest,
         append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+        context: MvFirstRefreshLogicalContext,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
         Self::prepare_artifact(
             request,
             MvFirstRefreshExecutionArtifact::Logical(
-                MvFirstRefreshLogicalArtifact::from_join_append(append),
+                MvFirstRefreshLogicalArtifact::from_join_append(append, context),
             ),
         )
     }
