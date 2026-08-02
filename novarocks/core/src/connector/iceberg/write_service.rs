@@ -602,6 +602,13 @@ impl IcebergWriteReportCommitter for IcebergChangeStreamWriteReportCommitter {
     fn recovery_evidence(&self) -> RecoveryEvidence {
         RecoveryEvidence::from_collector(&self.executor.collector)
     }
+
+    fn resulting_row_count(
+        &self,
+        outcome: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        committed_mv_row_count(&self.executor, outcome.new_snapshot_id).map(Some)
+    }
 }
 
 /// COW aggregate committer. It keeps each accepted report attached to the
@@ -1133,6 +1140,13 @@ impl IcebergWriteReportCommitter for IcebergCowWriteReportCommitter {
 
     fn recovery_evidence(&self) -> RecoveryEvidence {
         RecoveryEvidence::from_collector(&self.executor.collector)
+    }
+
+    fn resulting_row_count(
+        &self,
+        outcome: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        committed_mv_row_count(&self.executor, outcome.new_snapshot_id).map(Some)
     }
 }
 
