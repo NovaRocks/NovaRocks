@@ -285,18 +285,30 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
     fn recovery_evidence(&self) -> RecoveryEvidence;
 }
 
-/// First-refresh committer. It is the only place where the opaque provider
-/// payload becomes Iceberg snapshot provenance, and it derives row count from
-/// the complete accepted report set rather than any frontend result carrier.
+/// Empty-input policy for a single primary MV staging cohort. First refresh
+/// has no existing target data to replace; a full rebuild must instead commit
+/// an empty overwrite so the staging ref faithfully represents the rebuild.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IcebergMvPrimaryEmptyInputPolicy {
+    AbortWithoutSnapshot,
+    CommitEmptyOverwrite,
+}
+
+/// Single-primary MV staging committer. It is the only place where the opaque
+/// provider payload becomes Iceberg snapshot provenance, and it derives row
+/// count from the complete accepted report set rather than any frontend
+/// result carrier.
 pub(crate) struct IcebergFirstRefreshWriteReportCommitter {
     executor: Arc<IcebergWriteCommitExecutor>,
     provenance_properties: BTreeMap<String, String>,
+    empty_input_policy: IcebergMvPrimaryEmptyInputPolicy,
 }
 
 impl IcebergFirstRefreshWriteReportCommitter {
     pub(crate) fn new(
         executor: Arc<IcebergWriteCommitExecutor>,
         provenance_properties: BTreeMap<String, String>,
+        empty_input_policy: IcebergMvPrimaryEmptyInputPolicy,
     ) -> Result<Self, ConnectorError> {
         if provenance_properties.contains_key("novarocks.mv.refresh.row_count") {
             return Err(invalid(
@@ -306,6 +318,7 @@ impl IcebergFirstRefreshWriteReportCommitter {
         Ok(Self {
             executor,
             provenance_properties,
+            empty_input_policy,
         })
     }
 
@@ -354,11 +367,12 @@ impl IcebergWriteReportCommitter for IcebergFirstRefreshWriteReportCommitter {
                 CommitServiceError::invalid_input("first-refresh row count overflow".to_string())
             })
         })?;
-        // A first refresh targets an empty staging ref.  Empty input is an
-        // explicit no-op: do not manufacture an empty Iceberg snapshot.  The
-        // provider owns cleanup because it is the only layer that can decode
-        // the staged report payloads into object-store paths.
-        if row_count == 0 {
+        // A first refresh targets an empty staging ref. Empty input is an
+        // explicit no-op. A rebuild, however, must commit its overwrite even
+        // when the source is empty so the prior staging contents disappear.
+        if row_count == 0
+            && self.empty_input_policy == IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot
+        {
             let cleanup = self
                 .executor
                 .abort_iceberg_writer_reports(reports)

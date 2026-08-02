@@ -59,8 +59,8 @@ use crate::connector::iceberg::write_control::{
     IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
 };
 use crate::connector::iceberg::write_service::{
-    IcebergFirstRefreshWriteReportCommitter, IcebergWriteControlService,
-    IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
+    IcebergFirstRefreshWriteReportCommitter, IcebergMvPrimaryEmptyInputPolicy,
+    IcebergWriteControlService, IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
 };
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
@@ -441,6 +441,8 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
     writer_handle_payload: Bytes,
     payload: IcebergFirstRefreshWritePlanPayloadV2,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
+    intent: ConnectorWriteIntent,
+    empty_input_policy: IcebergMvPrimaryEmptyInputPolicy,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
@@ -485,6 +487,7 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
         IcebergFirstRefreshWriteReportCommitter::new(
             commit_executor,
             payload.provenance_properties.clone(),
+            empty_input_policy,
         )
         .map_err(|error| format!("build Iceberg first-refresh committer: {error}"))?,
     );
@@ -508,13 +511,7 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
         target,
         target_ref,
         operation_id,
-        vec![(
-            cohort_id,
-            ConnectorWriteIntent::Append,
-            input_schema,
-            provider_payload,
-            context,
-        )],
+        vec![(cohort_id, intent, input_schema, provider_payload, context)],
     )?;
     Ok(templates
         .pop()

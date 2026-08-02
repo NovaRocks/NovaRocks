@@ -626,6 +626,8 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         writer_handle_payload,
         payload,
         commit_executor,
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot,
         operation_id,
         prepared.connector_context().clone(),
         exact_lease,
