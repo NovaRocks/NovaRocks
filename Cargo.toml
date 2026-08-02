@@ -21,10 +21,8 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks/backend", "novarocks/catalog", "novarocks/compat", "novarocks/connector/starrocks", "novarocks/core", "novarocks/execution", "novarocks/frontend", "novarocks/fs", "novarocks/protocol", "novarocks/spi", "novarocks/state-store", "novarocks/types", "novarocks/version", "novarocks-server"]
-# Native development defaults to the server package and does not select the
-# optional compat dependency. `--workspace` intentionally includes
-# novarocks-compat, so reserve it for whole-workspace or compat validation.
+members = ["novarocks/backend", "novarocks/catalog", "novarocks/connector/starrocks", "novarocks/core", "novarocks/execution", "novarocks/frontend", "novarocks/fs", "novarocks/protocol", "novarocks/spi", "novarocks/state-store", "novarocks/types", "novarocks/version", "novarocks-server"]
+# Native development defaults to the server package.
 default-members = ["novarocks-server"]
 # Existing standalone crates under the workspace tree are excluded rather than
 # pulled in as members: they run independently via `--manifest-path`, and
