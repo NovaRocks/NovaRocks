@@ -11,7 +11,8 @@
 use std::collections::BTreeMap;
 
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorWriteOperationId,
+    ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorWriteCohortId,
+    ConnectorWriteOperationId,
 };
 
 use super::first_refresh::MvFirstRefreshLogicalContext;
@@ -100,6 +101,10 @@ pub struct PreparedMvIncrementalWrite {
 impl PreparedMvIncrementalWrite {
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
         self.request.operation_id
+    }
+
+    pub fn primary_cohort(&self) -> ConnectorWriteCohortId {
+        ConnectorWriteCohortId::primary(self.request.operation_id)
     }
 
     pub fn observed_binding(&self) -> &ConnectorExecutionBindingKey {

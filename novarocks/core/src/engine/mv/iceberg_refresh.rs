@@ -271,6 +271,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                     observed_binding.clone(),
                     self.connector_context.clone(),
                 )?],
+                incremental_writes: Vec::new(),
             },
             ExecutableRefreshDecision::Incremental => {
                 return Err(

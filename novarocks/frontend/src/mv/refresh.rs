@@ -199,6 +199,7 @@ pub(super) fn execute(
         PreparedMvRefreshWork::DataProducing {
             distributed_writes,
             first_refresh_writes,
+            incremental_writes,
         } => execute_data_refresh(
             repository,
             dependencies,
@@ -207,6 +208,7 @@ pub(super) fn execute(
             finalize,
             distributed_writes,
             first_refresh_writes,
+            incremental_writes,
             base_snapshots,
             connector_context,
             execution,
@@ -225,11 +227,12 @@ fn execute_data_refresh(
     first_refresh_writes: Vec<
         novarocks::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite,
     >,
+    incremental_writes: Vec<novarocks::sql::mv_refresh::incremental::PreparedMvIncrementalWrite>,
     base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
     execution: &novarocks::query_execution::request_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
-    if distributed_writes.len() + first_refresh_writes.len() != 1 {
+    if distributed_writes.len() + first_refresh_writes.len() + incremental_writes.len() != 1 {
         return Err(invalid(
             "MV refresh data preparation must produce exactly one staged distributed write",
         ));
@@ -268,9 +271,10 @@ fn execute_data_refresh(
     let write = match (
         distributed_writes.into_iter().next(),
         first_refresh_writes.into_iter().next(),
+        incremental_writes.into_iter().next(),
     ) {
-        (Some(write), None) => write,
-        (None, Some(first_refresh)) => {
+        (Some(write), None, None) => write,
+        (None, Some(first_refresh), None) => {
             if first_refresh.operation_id() != attempt.write_operation_id {
                 return Err(invalid(
                     "SQL-prepared MV first-refresh write does not use the frontend-preallocated operation ID",
@@ -281,6 +285,16 @@ fn execute_data_refresh(
                 &write_lease,
                 execution,
             )?
+        }
+        (None, None, Some(incremental)) => {
+            if incremental.operation_id() != attempt.write_operation_id {
+                return Err(invalid(
+                    "SQL-prepared MV incremental write does not use the frontend-preallocated operation ID",
+                ));
+            }
+            dependencies
+                .first_refresh_activator
+                .bind_incremental_write(incremental, &write_lease, execution)?
         }
         _ => unreachable!("checked exactly one prepared MV write"),
     };
@@ -437,11 +451,17 @@ fn new_ledger(
         PreparedMvRefreshWork::DataProducing {
             distributed_writes,
             first_refresh_writes,
+            incremental_writes,
         } => distributed_writes
             .iter()
             .map(|write| hex::encode(write.write_cohort_id().to_bytes()))
             .chain(
                 first_refresh_writes
+                    .iter()
+                    .map(|write| hex::encode(write.primary_cohort().to_bytes())),
+            )
+            .chain(
+                incremental_writes
                     .iter()
                     .map(|write| hex::encode(write.primary_cohort().to_bytes())),
             )

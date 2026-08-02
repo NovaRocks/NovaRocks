@@ -120,6 +120,10 @@ pub enum PreparedMvRefreshWork {
         /// native fragment preparation are deferred until the frontend holds
         /// the exact retained write lease.
         first_refresh_writes: Vec<first_refresh::PreparedMvFirstRefreshWrite>,
+        /// SQL-owned incremental change-stream artifacts whose provider
+        /// activation and native fragment preparation are deferred until the
+        /// frontend holds the exact retained write lease.
+        incremental_writes: Vec<incremental::PreparedMvIncrementalWrite>,
     },
 }
 
