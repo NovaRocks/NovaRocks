@@ -134,6 +134,15 @@ pub(crate) enum MvFirstRefreshShape {
     ComposedAggregate,
 }
 
+/// The provider commit semantics for a fresh MV staging artifact. A policy
+/// rebuild writes the same SQL-shaped rows as a first refresh, but its staging
+/// branch starts from the published target and therefore must overwrite it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvStagedRefreshWriteMode {
+    Append,
+    FullOverwrite,
+}
+
 /// Target facts frozen before a first-refresh writer is admitted.  It carries
 /// Arrow schema and field identities, never an Iceberg table/client or a
 /// provider decoder.
@@ -347,6 +356,7 @@ pub struct PreparedMvFirstRefreshWrite {
     request: MvFirstRefreshWriteRequest,
     artifact: MvFirstRefreshExecutionArtifact,
     primary_cohort: ConnectorWriteCohortId,
+    write_mode: MvStagedRefreshWriteMode,
 }
 
 impl PreparedMvFirstRefreshWrite {
@@ -402,6 +412,18 @@ impl PreparedMvFirstRefreshWrite {
         self.request.expected_target_snapshot_id()
     }
 
+    pub(crate) const fn write_mode(&self) -> MvStagedRefreshWriteMode {
+        self.write_mode
+    }
+
+    /// Reclassify a validated full-read artifact as a staging overwrite. This
+    /// is only valid for SQL preparation before the artifact is activated or
+    /// bound to an execution attempt.
+    pub(crate) fn into_full_overwrite(mut self) -> Self {
+        self.write_mode = MvStagedRefreshWriteMode::FullOverwrite;
+        self
+    }
+
     pub(crate) fn into_execution_artifact(self) -> MvFirstRefreshExecutionArtifact {
         self.artifact
     }
@@ -452,7 +474,25 @@ impl MvFirstRefreshWritePreparer {
         request: MvFirstRefreshWriteRequest,
         physical_sql: MvFirstRefreshPhysicalSql,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
-        Self::prepare_artifact(request, MvFirstRefreshExecutionArtifact::Sql(physical_sql))
+        Self::prepare_artifact(
+            request,
+            MvFirstRefreshExecutionArtifact::Sql(physical_sql),
+            MvStagedRefreshWriteMode::Append,
+        )
+    }
+
+    /// A policy-driven rebuild uses the pinned full-read physicalization but
+    /// replaces the staging ref contents instead of appending to its main-ref
+    /// base snapshot.
+    pub(crate) fn prepare_full_overwrite(
+        request: MvFirstRefreshWriteRequest,
+        physical_sql: MvFirstRefreshPhysicalSql,
+    ) -> Result<PreparedMvFirstRefreshWrite, String> {
+        Self::prepare_artifact(
+            request,
+            MvFirstRefreshExecutionArtifact::Sql(physical_sql),
+            MvStagedRefreshWriteMode::FullOverwrite,
+        )
     }
 
     /// Freeze a typed join append projection behind the same prepared artifact
@@ -467,12 +507,14 @@ impl MvFirstRefreshWritePreparer {
             MvFirstRefreshExecutionArtifact::Logical(
                 MvFirstRefreshLogicalArtifact::from_join_append(append, context),
             ),
+            MvStagedRefreshWriteMode::Append,
         )
     }
 
     fn prepare_artifact(
         request: MvFirstRefreshWriteRequest,
         artifact: MvFirstRefreshExecutionArtifact,
+        write_mode: MvStagedRefreshWriteMode,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
         if artifact.root_hash_column() != request.target_contract().hidden_hash_key() {
             return Err(
@@ -494,6 +536,7 @@ impl MvFirstRefreshWritePreparer {
             request,
             artifact,
             primary_cohort: ConnectorWriteCohortId::primary(operation_id),
+            write_mode,
         })
     }
 }

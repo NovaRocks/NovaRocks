@@ -282,12 +282,21 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                 observed_binding.clone(),
                 self.connector_context.clone(),
             )? {
-                Some(incremental) => PreparedMvRefreshWork::DataProducing {
-                    distributed_writes: Vec::new(),
-                    first_refresh_writes: Vec::new(),
-                    incremental_writes: vec![incremental],
-                },
-                None => PreparedMvRefreshWork::MetadataOnly,
+                PreparedIncrementalRefreshWork::ChangeStream(incremental) => {
+                    PreparedMvRefreshWork::DataProducing {
+                        distributed_writes: Vec::new(),
+                        first_refresh_writes: Vec::new(),
+                        incremental_writes: vec![incremental],
+                    }
+                }
+                PreparedIncrementalRefreshWork::FullRebuild(rebuild) => {
+                    PreparedMvRefreshWork::DataProducing {
+                        distributed_writes: Vec::new(),
+                        first_refresh_writes: vec![rebuild],
+                        incremental_writes: Vec::new(),
+                    }
+                }
+                PreparedIncrementalRefreshWork::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
             },
         };
         Ok(PreparedMvRefresh {
@@ -589,6 +598,12 @@ fn prepare_frontend_first_refresh_write(
 /// their explicit preparation boundary until their distinct physical artifacts
 /// are extracted; treating either as an append would be incorrect.
 #[allow(clippy::too_many_arguments)]
+enum PreparedIncrementalRefreshWork {
+    MetadataOnly,
+    ChangeStream(crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite),
+    FullRebuild(crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite),
+}
+
 fn prepare_frontend_incremental_write(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -597,7 +612,7 @@ fn prepare_frontend_incremental_write(
     attempt: &crate::sql::mv_refresh::MvRefreshAttemptIdentity,
     observed_binding: ConnectorExecutionBindingKey,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Option<crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite>, String> {
+) -> Result<PreparedIncrementalRefreshWork, String> {
     let target = IcebergMvTarget {
         catalog: contract.target.catalog.clone().ok_or_else(|| {
             "Iceberg MV incremental refresh target has no connector catalog".to_string()
@@ -766,7 +781,7 @@ fn prepare_frontend_incremental_write(
             !right_batch.inserts.is_empty() || right_has_delete_changes,
         );
         if branches.is_empty() {
-            return Ok(None);
+            return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
         }
         let join_mode = if is_aggregate {
             JoinIncrementalRefreshMode::Coalesce
@@ -832,7 +847,7 @@ fn prepare_frontend_incremental_write(
             },
             provenance_properties,
         )
-        .map(Some);
+        .map(PreparedIncrementalRefreshWork::ChangeStream);
     }
 
     let loaded_bases = context
@@ -894,11 +909,26 @@ fn prepare_frontend_incremental_write(
         )
         .collect::<Vec<_>>();
     let (mode, evidence) = match plan_non_join_incremental_changes(&changes)? {
-        NonJoinIncrementalChangePlan::MetadataOnly(_) => return Ok(None),
+        NonJoinIncrementalChangePlan::MetadataOnly(_) => {
+            return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
+        }
         NonJoinIncrementalChangePlan::FullRebuild { reason, .. } => {
-            return Err(format!(
-                "MV refresh SQL preparation has not yet extracted the full-rebuild staging artifact: {reason}"
-            ));
+            tracing::info!(
+                target = %context.rewrite.target.fqn(),
+                "MV refresh SQL preparation selected a distributed full-rebuild staging overwrite: {reason}"
+            );
+            let rebuild = prepare_frontend_first_refresh_write(
+                state,
+                current_catalog,
+                current_database,
+                contract,
+                attempt,
+                &context.rewrite.pin.to_table_uuid_map(),
+                observed_binding,
+                connector_context,
+            )?
+            .into_full_overwrite();
+            return Ok(PreparedIncrementalRefreshWork::FullRebuild(rebuild));
         }
         NonJoinIncrementalChangePlan::ChangeStream {
             has_delete_changes, ..
@@ -957,7 +987,7 @@ fn prepare_frontend_incremental_write(
         crate::sql::mv_refresh::incremental::MvIncrementalExecutionArtifact::CanonicalQuery,
         provenance_properties,
     )
-    .map(Some)
+    .map(PreparedIncrementalRefreshWork::ChangeStream)
 }
 
 fn explain_refresh_full_guard(full: bool) -> Result<(), String> {

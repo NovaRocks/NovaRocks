@@ -589,7 +589,14 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         &target_table,
         &ident,
         prepared.staging_branch(),
-        CommitOpKind::FastAppend,
+        match prepared.write_mode() {
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
+                CommitOpKind::FastAppend
+            }
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
+                CommitOpKind::Overwrite
+            }
+        },
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
@@ -626,8 +633,22 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         writer_handle_payload,
         payload,
         commit_executor,
-        novarocks_spi::connector::ConnectorWriteIntent::Append,
-        crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot,
+        match prepared.write_mode() {
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
+                novarocks_spi::connector::ConnectorWriteIntent::Append
+            }
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
+                novarocks_spi::connector::ConnectorWriteIntent::Overwrite
+            }
+        },
+        match prepared.write_mode() {
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
+                crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot
+            }
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
+                crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite
+            }
+        },
         operation_id,
         prepared.connector_context().clone(),
         exact_lease,
