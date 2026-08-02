@@ -17,6 +17,7 @@ pub use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 
 pub mod first_refresh;
+pub mod incremental;
 
 /// Typed SQL projection of `REFRESH MATERIALIZED VIEW`.
 ///
