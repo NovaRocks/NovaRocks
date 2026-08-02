@@ -2258,5 +2258,12 @@ mod tests {
             .expect("decode connector receipt"),
             42
         );
+        assert_eq!(
+            connector_write_receipt(42, Some(17))
+                .expect("receipt with committed row count")
+                .resulting_row_count(),
+            Some(17),
+            "the provider carries snapshot total-records without exposing its receipt payload"
+        );
     }
 }

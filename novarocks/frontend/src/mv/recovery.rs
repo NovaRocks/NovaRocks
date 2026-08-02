@@ -22,7 +22,6 @@
 //! truth, and may only perform proof-guarded staging cleanup. It never starts
 //! a writer or replays publication.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

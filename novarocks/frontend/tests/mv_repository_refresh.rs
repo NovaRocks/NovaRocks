@@ -11,12 +11,16 @@ use novarocks::mv::persistence::dependency::CreateMvDependencyRequest;
 use novarocks::mv::persistence::partition::ReplaceMvPartitionStatesRequest;
 use novarocks::mv::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
-    FrontendMvRefreshCommittedVersion, FrontendMvRefreshLedger, MvRefreshFinalizeRequest,
-    MvRefreshLifecycleOwner, MvRefreshState, RecordPublishCommitRequest,
+    FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
+    FrontendMvRefreshRecoveryBaseFact, FrontendMvRefreshRecoveryDisposition,
+    FrontendMvRefreshRecoveryObservation, FrontendMvRefreshRecoveryStatus,
+    MvRefreshFinalizeRequest, MvRefreshLifecycleOwner, MvRefreshState, RecordPublishCommitRequest,
     RecordStagingCommitRequest,
 };
 use novarocks::mv::repository::{
-    FinalizeMvRefreshWithPartitionsRequest, MvRepository, MvRepositoryErrorKind,
+    BeginFrontendMvRecoveryCycleRequest, FinalizeMvRefreshWithPartitionsRequest,
+    FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryErrorKind,
+    RecordFrontendMvRecoveryCleanupOutcomeRequest, RecordFrontendMvRecoveryObservationRequest,
 };
 use novarocks_frontend::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, StateStoreMvRepository,
@@ -26,6 +30,7 @@ use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
+use sha2::{Digest, Sha256};
 
 #[path = "mv_repository_definition.rs"]
 mod definition_support;
@@ -159,6 +164,146 @@ fn frontend_action(
         external_evidence: None,
         provider_finalized: false,
     }
+}
+
+fn recovery_evidence(payload: &[u8]) -> FrontendMvRefreshEvidence {
+    FrontendMvRefreshEvidence {
+        payload: payload.to_vec(),
+        digest: Sha256::digest(payload).to_vec(),
+    }
+}
+
+#[test]
+fn frontend_recovery_upgrades_v3_and_finalizes_published_truth_atomically() {
+    let (_temp, _runtime, _host, repository) = repository();
+    let definition = repository
+        .create(
+            uuid::Uuid::now_v7(),
+            definition_support::create_request("daily_frontend_recovery_v4"),
+        )
+        .expect("create definition");
+    let refresh = repository
+        .begin_frontend_refresh_intent(BeginFrontendMvRefreshIntentRequest {
+            refresh_id: 9010,
+            mv_id: definition.mv_id,
+            target_catalog: "ice".to_string(),
+            target_namespace: "sales".to_string(),
+            target_table: "daily_frontend_recovery_v4".to_string(),
+            staging_branch: "__nova_mv_recovery".to_string(),
+            expected_main_snapshot_id: Some(7),
+            base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
+            marker_token: "marker".to_string(),
+            prepare_external_actions: true,
+            ledger: frontend_ledger(),
+        })
+        .expect("persist frontend v3 intent");
+    let cleanup_operation_id = refresh
+        .frontend_recovery
+        .as_ref()
+        .expect("v3 intent preallocates v4 cleanup identity")
+        .cleanup_operation_id
+        .clone();
+    let cycle_id = uuid::Uuid::now_v7().into_bytes().to_vec();
+    repository
+        .begin_frontend_recovery_cycle(BeginFrontendMvRecoveryCycleRequest {
+            refresh_id: refresh.refresh_id,
+            cycle_id: cycle_id.clone(),
+            provider_id: "iceberg".to_string(),
+            instance_id: "rest".to_string(),
+            incarnation: uuid::Uuid::now_v7().into_bytes().to_vec(),
+            cleanup_operation_id,
+        })
+        .expect("upgrade v3 record and persist inspection intent");
+    let observation = FrontendMvRefreshRecoveryObservation {
+        disposition: FrontendMvRefreshRecoveryDisposition::Published,
+        digest: Sha256::digest(b"published observation").to_vec(),
+        proof: recovery_evidence(b"opaque provider proof"),
+        committed_version: Some(
+            FrontendMvRefreshCommittedVersion::try_new(b"snapshot-42".to_vec(), Some(42))
+                .expect("committed version"),
+        ),
+        resulting_row_count: Some(2),
+        bases: vec![FrontendMvRefreshRecoveryBaseFact {
+            table: "ice.sales.orders".to_string(),
+            uuid: "orders-uuid".to_string(),
+            from_snapshot: Some(9),
+            to_snapshot: 9,
+        }],
+        definition_fingerprint: Some("definition-v1".to_string()),
+        staging_snapshot_id: Some(42),
+        target_snapshot_id: Some(42),
+        cleanup_required: true,
+    };
+    repository
+        .record_frontend_recovery_observation(RecordFrontendMvRecoveryObservationRequest {
+            refresh_id: refresh.refresh_id,
+            observation: observation.clone(),
+        })
+        .expect("record published inspection");
+    repository
+        .record_frontend_recovery_observation(RecordFrontendMvRecoveryObservationRequest {
+            refresh_id: refresh.refresh_id,
+            observation: observation.clone(),
+        })
+        .expect("identical observation is idempotent");
+    let mut conflicting = observation.clone();
+    conflicting.digest = Sha256::digest(b"conflicting observation").to_vec();
+    assert_eq!(
+        repository
+            .record_frontend_recovery_observation(RecordFrontendMvRecoveryObservationRequest {
+                refresh_id: refresh.refresh_id,
+                observation: conflicting,
+            })
+            .expect_err("different proof must fail closed")
+            .kind(),
+        MvRepositoryErrorKind::Conflict
+    );
+    repository
+        .record_frontend_recovery_cleanup_outcome(RecordFrontendMvRecoveryCleanupOutcomeRequest {
+            refresh_id: refresh.refresh_id,
+            state: FrontendMvRefreshActionState::KnownCommitted,
+            evidence: None,
+            provider_finalized: true,
+        })
+        .expect("persist known cleanup");
+    let recovery = repository
+        .load_refresh(refresh.refresh_id)
+        .expect("load refresh")
+        .expect("refresh exists")
+        .frontend_recovery
+        .expect("v4 recovery ledger");
+    repository
+        .finalize_recovered_published_refresh(FinalizeRecoveredMvRefreshRequest {
+            finalize: MvRefreshFinalizeRequest {
+                refresh_id: refresh.refresh_id,
+                rows: 2,
+                base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
+                base_table_uuids: BTreeMap::from([(
+                    "ice.sales.orders".to_string(),
+                    "orders-uuid".to_string(),
+                )]),
+                target_snapshot_id: Some(42),
+            },
+            recovery,
+        })
+        .expect("atomically finalize recovered publication");
+    let stored = repository
+        .load_refresh(refresh.refresh_id)
+        .expect("load finalized recovery")
+        .expect("refresh exists");
+    assert_eq!(stored.state, MvRefreshState::Finalized);
+    assert_eq!(
+        stored.frontend_recovery.expect("recovery state").status,
+        FrontendMvRefreshRecoveryStatus::ResolvedPublished
+    );
+    let definition = repository
+        .load_by_id(definition.mv_id)
+        .expect("load definition")
+        .expect("definition exists");
+    assert_eq!(definition.active_refresh_id, None);
+    assert_eq!(definition.last_refresh_rows, Some(2));
+    assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(42));
+    assert_eq!(cycle_id.len(), 16);
 }
 
 #[test]
