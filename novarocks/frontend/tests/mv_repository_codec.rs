@@ -6,7 +6,7 @@ use novarocks::mv::persistence::definition::{StoredMvDefinition, StoredMvRefresh
 use novarocks::mv::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
     FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
-    MvRefreshLifecycleOwner, MvRefreshState, StoredMvRefresh,
+    FrontendMvRefreshRecoveryLedger, MvRefreshLifecycleOwner, MvRefreshState, StoredMvRefresh,
 };
 use novarocks::mv::repository::MvTargetLookup;
 use novarocks_frontend::mv::repository::catalog::schema_catalog;
@@ -225,7 +225,7 @@ fn mv_catalog_validates_all_historical_schemas_transitively() {
     );
     assert_eq!(
         catalog.latest("mv.refresh").expect("refresh schema").id(),
-        3
+        4
     );
     assert_eq!(
         catalog.latest("mv.sequence").expect("sequence schema").id(),
@@ -234,7 +234,7 @@ fn mv_catalog_validates_all_historical_schemas_transitively() {
 }
 
 #[test]
-fn refresh_v3_round_trips_frontend_owned_opaque_ledger() {
+fn refresh_v4_round_trips_frontend_owned_opaque_ledger_and_recovery() {
     let request_id = Uuid::now_v7().into_bytes().to_vec();
     let staging_create_operation_id = Uuid::now_v7().into_bytes().to_vec();
     let write_operation_id = Uuid::now_v7().into_bytes().to_vec();
@@ -323,6 +323,10 @@ fn refresh_v3_round_trips_frontend_owned_opaque_ledger() {
             ],
             cleanup_pending: false,
         }),
+        frontend_recovery: Some(
+            FrontendMvRefreshRecoveryLedger::pending(Uuid::now_v7().into_bytes().to_vec())
+                .expect("recovery ledger"),
+        ),
     };
     let key = Key::try_from(Bytes::from_static(
         b"novarocks/frontend/mv/v1/refresh/by-id/0000000000000007",

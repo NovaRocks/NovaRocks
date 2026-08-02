@@ -461,6 +461,7 @@ impl MvRepository for InMemoryMvRepository {
             external_outcome: None,
             lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
             frontend_ledger: None,
+            frontend_recovery: None,
         };
         state.refreshes.insert(refresh_id, refresh.clone());
         Ok(refresh)
@@ -510,6 +511,7 @@ impl MvRepository for InMemoryMvRepository {
             external_outcome: None,
             lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
             frontend_ledger: None,
+            frontend_recovery: None,
         };
         state.refreshes.insert(refresh_id, refresh.clone());
         Ok(refresh)

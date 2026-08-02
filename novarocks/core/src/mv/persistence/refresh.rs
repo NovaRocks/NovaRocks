@@ -76,6 +76,10 @@ pub struct StoredMvRefresh {
     pub lifecycle_owner: MvRefreshLifecycleOwner,
     #[serde(default)]
     pub frontend_ledger: Option<FrontendMvRefreshLedger>,
+    /// v4 recovery state is frontend-owned. v1-v3 records decode with no
+    /// value and are upgraded atomically before a startup inspection runs.
+    #[serde(default)]
+    pub frontend_recovery: Option<FrontendMvRefreshRecoveryLedger>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +174,153 @@ pub struct FrontendMvRefreshLedger {
     pub actions: Vec<FrontendMvRefreshAction>,
     #[serde(default)]
     pub cleanup_pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FrontendMvRefreshRecoveryStatus {
+    Pending,
+    Inspecting,
+    ResolvedAborted,
+    ResolvedPublished,
+    CleanupPending,
+    Unresolved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FrontendMvRefreshRecoveryDisposition {
+    KnownUncommitted,
+    Staged,
+    Published,
+    Superseded,
+    CleanupPending,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendMvRefreshRecoveryBaseFact {
+    pub table: String,
+    pub uuid: String,
+    #[serde(default)]
+    pub from_snapshot: Option<i64>,
+    pub to_snapshot: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendMvRefreshRecoveryObservation {
+    pub disposition: FrontendMvRefreshRecoveryDisposition,
+    pub digest: Vec<u8>,
+    pub proof: FrontendMvRefreshEvidence,
+    #[serde(default)]
+    pub committed_version: Option<FrontendMvRefreshCommittedVersion>,
+    #[serde(default)]
+    pub resulting_row_count: Option<i64>,
+    #[serde(default)]
+    pub bases: Vec<FrontendMvRefreshRecoveryBaseFact>,
+    #[serde(default)]
+    pub definition_fingerprint: Option<String>,
+    #[serde(default)]
+    pub staging_snapshot_id: Option<i64>,
+    #[serde(default)]
+    pub target_snapshot_id: Option<i64>,
+    #[serde(default)]
+    pub cleanup_required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendMvRefreshRecoveryLedger {
+    pub status: FrontendMvRefreshRecoveryStatus,
+    #[serde(default)]
+    pub cycle_id: Option<Vec<u8>>,
+    #[serde(default)]
+    pub inspection_provider_id: Option<String>,
+    #[serde(default)]
+    pub inspection_instance_id: Option<String>,
+    #[serde(default)]
+    pub inspection_incarnation: Option<Vec<u8>>,
+    pub cleanup_operation_id: Vec<u8>,
+    #[serde(default)]
+    pub observation: Option<FrontendMvRefreshRecoveryObservation>,
+    #[serde(default)]
+    pub cleanup_state: Option<FrontendMvRefreshActionState>,
+    #[serde(default)]
+    pub cleanup_evidence: Option<FrontendMvRefreshEvidence>,
+    #[serde(default)]
+    pub provider_finalized: bool,
+    #[serde(default)]
+    pub last_unresolved_reason: Option<String>,
+}
+
+impl FrontendMvRefreshRecoveryLedger {
+    pub fn pending(cleanup_operation_id: Vec<u8>) -> Result<Self, String> {
+        validate_identity("recovery cleanup_operation_id", &cleanup_operation_id)?;
+        Ok(Self {
+            status: FrontendMvRefreshRecoveryStatus::Pending,
+            cycle_id: None,
+            inspection_provider_id: None,
+            inspection_instance_id: None,
+            inspection_incarnation: None,
+            cleanup_operation_id,
+            observation: None,
+            cleanup_state: None,
+            cleanup_evidence: None,
+            provider_finalized: false,
+            last_unresolved_reason: None,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_identity("recovery cleanup_operation_id", &self.cleanup_operation_id)?;
+        if let Some(cycle_id) = &self.cycle_id {
+            validate_identity("recovery cycle_id", cycle_id)?;
+        }
+        if self
+            .inspection_provider_id
+            .as_ref()
+            .is_some_and(String::is_empty)
+            || self
+                .inspection_instance_id
+                .as_ref()
+                .is_some_and(String::is_empty)
+            || self
+                .inspection_incarnation
+                .as_ref()
+                .is_some_and(|value| value.len() != 16)
+        {
+            return Err("frontend MV refresh recovery has an invalid inspection identity".into());
+        }
+        if let Some(observation) = &self.observation {
+            if observation.digest.len() != 32 {
+                return Err(
+                    "frontend MV refresh recovery observation requires a 32-byte digest".into(),
+                );
+            }
+            validate_evidence(&observation.proof)?;
+            if observation.resulting_row_count.is_some_and(|rows| rows < 0) {
+                return Err("frontend MV refresh recovery row count cannot be negative".into());
+            }
+            if observation.bases.len() > 4096 {
+                return Err("frontend MV refresh recovery has too many base facts".into());
+            }
+            if let Some(version) = &observation.committed_version {
+                validate_committed_version(version)?;
+            }
+        }
+        if let Some(evidence) = &self.cleanup_evidence {
+            validate_evidence(evidence)?;
+        }
+        if self
+            .last_unresolved_reason
+            .as_ref()
+            .is_some_and(|reason| reason.len() > 4096)
+        {
+            return Err(
+                "frontend MV refresh recovery unresolved reason exceeds the bounded limit".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl FrontendMvRefreshLedger {
@@ -447,6 +598,22 @@ mod tests {
                 .validate()
                 .expect_err("oversized evidence must fail")
                 .contains("exceeds 64 KiB")
+        );
+    }
+
+    #[test]
+    fn frontend_recovery_ledger_requires_bounded_exact_identities() {
+        let recovery =
+            FrontendMvRefreshRecoveryLedger::pending(vec![8; 16]).expect("pending recovery ledger");
+        recovery.validate().expect("pending recovery is valid");
+
+        let mut invalid_recovery = recovery;
+        invalid_recovery.cycle_id = Some(vec![9; 15]);
+        assert!(
+            invalid_recovery
+                .validate()
+                .expect_err("short cycle identity must fail")
+                .contains("cycle_id")
         );
     }
 }

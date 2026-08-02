@@ -1,0 +1,42 @@
+{
+  "type": "record",
+  "name": "StoredMvRefresh",
+  "namespace": "novarocks.meta.mv",
+  "fields": [
+    { "name": "refresh_id", "type": "long" },
+    { "name": "mv_id", "type": "long" },
+    { "name": "operation_id", "type": ["null", "long"], "default": null },
+    { "name": "state", "type": { "type": "enum", "name": "MvRefreshState", "symbols": ["INTENT_CREATED", "STAGING_COMMITTED", "PUBLISH_COMMITTED", "FINALIZED", "ABORT_REQUESTED", "ABORTED", "COMMIT_UNKNOWN"] } },
+    { "name": "target_catalog", "type": ["null", "string"], "default": null },
+    { "name": "target_namespace", "type": ["null", "string"], "default": null },
+    { "name": "target_table", "type": ["null", "string"], "default": null },
+    { "name": "staging_branch", "type": ["null", "string"], "default": null },
+    { "name": "expected_main_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "staging_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "published_snapshot_id", "type": ["null", "long"], "default": null },
+    { "name": "target_snapshots", "type": { "type": "map", "values": "long" } },
+    { "name": "base_table_uuids", "type": { "type": "map", "values": "string" } },
+    { "name": "rows", "type": ["null", "long"], "default": null },
+    { "name": "marker", "type": ["null", { "type": "record", "name": "RefreshCommitMarker", "fields": [{ "name": "refresh_id", "type": "long" }, { "name": "mv_id", "type": "long" }, { "name": "token", "type": "string" }] }], "default": null },
+    { "name": "external_outcome", "type": ["null", { "type": "record", "name": "RefreshExternalOutcome", "fields": [{ "name": "target_snapshot_id", "type": ["null", "long"], "default": null }, { "name": "commit_id", "type": "string" }] }], "default": null },
+    { "name": "lifecycle_owner", "type": { "type": "enum", "name": "MvRefreshLifecycleOwnerV3", "symbols": ["LEGACY_CORE", "FRONTEND_CURRENT"] }, "default": "LEGACY_CORE" },
+    { "name": "frontend_ledger", "type": ["null", { "type": "record", "name": "FrontendMvRefreshLedgerV3", "fields": [
+      { "name": "request_id", "type": { "type": "array", "items": "int" } },
+      { "name": "provider_id", "type": "string" }, { "name": "instance_id", "type": "string" },
+      { "name": "incarnation", "type": { "type": "array", "items": "int" } },
+      { "name": "expected_target_version", "type": ["null", { "type": "record", "name": "FrontendMvRefreshCommittedVersionV3", "fields": [{ "name": "payload", "type": { "type": "array", "items": "int" } }, { "name": "digest", "type": { "type": "array", "items": "int" } }, { "name": "snapshot_id", "type": ["null", "long"], "default": null }] }], "default": null },
+      { "name": "staging_create_operation_id", "type": { "type": "array", "items": "int" } }, { "name": "write_operation_id", "type": { "type": "array", "items": "int" } }, { "name": "publication_operation_id", "type": { "type": "array", "items": "int" } }, { "name": "staging_drop_operation_id", "type": { "type": "array", "items": "int" } },
+      { "name": "cohort_ids", "type": { "type": "array", "items": "string" }, "default": [] },
+      { "name": "actions", "type": { "type": "array", "items": { "type": "record", "name": "FrontendMvRefreshActionV3", "fields": [{ "name": "phase", "type": { "type": "enum", "name": "FrontendMvRefreshActionPhaseV3", "symbols": ["STAGING_CREATE", "WRITE", "PUBLICATION", "STAGING_DROP"] } }, { "name": "state", "type": { "type": "enum", "name": "FrontendMvRefreshActionStateV3", "symbols": ["PREPARED", "KNOWN_UNCOMMITTED", "KNOWN_COMMITTED", "COMMIT_UNKNOWN"] } }, { "name": "operation_id", "type": { "type": "array", "items": "int" } }, { "name": "receipt", "type": ["null", { "type": "record", "name": "FrontendMvRefreshEvidenceV3", "fields": [{ "name": "payload", "type": { "type": "array", "items": "int" }, "default": [] }, { "name": "digest", "type": { "type": "array", "items": "int" }, "default": [] }] }], "default": null }, { "name": "committed_version", "type": ["null", "FrontendMvRefreshCommittedVersionV3"], "default": null }, { "name": "external_evidence", "type": ["null", "FrontendMvRefreshEvidenceV3"], "default": null }, { "name": "provider_finalized", "type": "boolean", "default": false }] } }, "default": [] },
+      { "name": "cleanup_pending", "type": "boolean", "default": false }
+    ] }], "default": null },
+    { "name": "frontend_recovery", "type": ["null", { "type": "record", "name": "FrontendMvRefreshRecoveryLedgerV4", "fields": [
+      { "name": "status", "type": { "type": "enum", "name": "FrontendMvRefreshRecoveryStatusV4", "symbols": ["PENDING", "INSPECTING", "RESOLVED_ABORTED", "RESOLVED_PUBLISHED", "CLEANUP_PENDING", "UNRESOLVED"] } },
+      { "name": "cycle_id", "type": ["null", { "type": "array", "items": "int" }], "default": null }, { "name": "inspection_provider_id", "type": ["null", "string"], "default": null }, { "name": "inspection_instance_id", "type": ["null", "string"], "default": null }, { "name": "inspection_incarnation", "type": ["null", { "type": "array", "items": "int" }], "default": null }, { "name": "cleanup_operation_id", "type": { "type": "array", "items": "int" } },
+      { "name": "observation", "type": ["null", { "type": "record", "name": "FrontendMvRefreshRecoveryObservationV4", "fields": [
+        { "name": "disposition", "type": { "type": "enum", "name": "FrontendMvRefreshRecoveryDispositionV4", "symbols": ["KNOWN_UNCOMMITTED", "STAGED", "PUBLISHED", "SUPERSEDED", "CLEANUP_PENDING", "AMBIGUOUS"] } }, { "name": "digest", "type": { "type": "array", "items": "int" } }, { "name": "proof", "type": "FrontendMvRefreshEvidenceV3" }, { "name": "committed_version", "type": ["null", "FrontendMvRefreshCommittedVersionV3"], "default": null }, { "name": "resulting_row_count", "type": ["null", "long"], "default": null }, { "name": "bases", "type": { "type": "array", "items": { "type": "record", "name": "FrontendMvRefreshRecoveryBaseFactV4", "fields": [{ "name": "table", "type": "string" }, { "name": "uuid", "type": "string" }, { "name": "from_snapshot", "type": ["null", "long"], "default": null }, { "name": "to_snapshot", "type": "long" }] } }, "default": [] }, { "name": "definition_fingerprint", "type": ["null", "string"], "default": null }, { "name": "staging_snapshot_id", "type": ["null", "long"], "default": null }, { "name": "target_snapshot_id", "type": ["null", "long"], "default": null }, { "name": "cleanup_required", "type": "boolean", "default": false }
+      ] }], "default": null },
+      { "name": "cleanup_state", "type": ["null", "FrontendMvRefreshActionStateV3"], "default": null }, { "name": "cleanup_evidence", "type": ["null", "FrontendMvRefreshEvidenceV3"], "default": null }, { "name": "provider_finalized", "type": "boolean", "default": false }, { "name": "last_unresolved_reason", "type": ["null", "string"], "default": null }
+    ] }], "default": null }
+  ]
+}

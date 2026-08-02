@@ -38,9 +38,11 @@ use crate::mv::persistence::partition::{
     UpdateMvPartitionContractRequest,
 };
 use crate::mv::persistence::refresh::{
-    BeginIcebergMvRefreshRequest, FrontendMvRefreshAction, FrontendMvRefreshLedger,
-    MvRefreshFinalizeRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
-    RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
+    BeginIcebergMvRefreshRequest, FrontendMvRefreshAction, FrontendMvRefreshActionState,
+    FrontendMvRefreshEvidence, FrontendMvRefreshLedger, FrontendMvRefreshRecoveryLedger,
+    FrontendMvRefreshRecoveryObservation, MvRefreshFinalizeRequest, RecordPublishCommitRequest,
+    RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvRefresh,
+    UpdateStarRocksMvRefreshSummaryRequest,
 };
 
 pub const MV_REPOSITORY_UNAVAILABLE_MESSAGE: &str =
@@ -186,6 +188,39 @@ pub struct BeginFrontendMvRefreshIntentRequest {
     pub ledger: FrontendMvRefreshLedger,
 }
 
+/// Atomically starts a frontend-owned recovery inspection. The inspection
+/// identity is current-generation only and never authorizes replay of the
+/// historical write or publication actions recorded by the refresh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeginFrontendMvRecoveryCycleRequest {
+    pub refresh_id: i64,
+    pub cycle_id: Vec<u8>,
+    pub provider_id: String,
+    pub instance_id: String,
+    pub incarnation: Vec<u8>,
+    pub cleanup_operation_id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordFrontendMvRecoveryObservationRequest {
+    pub refresh_id: i64,
+    pub observation: FrontendMvRefreshRecoveryObservation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordFrontendMvRecoveryCleanupOutcomeRequest {
+    pub refresh_id: i64,
+    pub state: FrontendMvRefreshActionState,
+    pub evidence: Option<FrontendMvRefreshEvidence>,
+    pub provider_finalized: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizeRecoveredMvRefreshRequest {
+    pub finalize: MvRefreshFinalizeRequest,
+    pub recovery: FrontendMvRefreshRecoveryLedger,
+}
+
 /// Synchronous consumer port used by core SQL and maintenance workers.
 ///
 /// Concrete repositories may bridge to an async store internally, but the
@@ -262,6 +297,48 @@ pub trait MvRepository: Send + Sync {
         &self,
         _refresh_id: i64,
         _action: FrontendMvRefreshAction,
+    ) -> Result<(), MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    /// Lists only frontend-owned records that remain fenced for recovery. The
+    /// legacy adapter must never receive these v3/v4 attempts.
+    fn list_frontend_recovery_candidates(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    fn begin_frontend_recovery_cycle(
+        &self,
+        _request: BeginFrontendMvRecoveryCycleRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    fn record_frontend_recovery_observation(
+        &self,
+        _request: RecordFrontendMvRecoveryObservationRequest,
+    ) -> Result<(), MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    fn record_frontend_recovery_unresolved(
+        &self,
+        _refresh_id: i64,
+        _reason: String,
+    ) -> Result<(), MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    fn record_frontend_recovery_cleanup_outcome(
+        &self,
+        _request: RecordFrontendMvRecoveryCleanupOutcomeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    fn finalize_recovered_published_refresh(
+        &self,
+        _request: FinalizeRecoveredMvRefreshRequest,
+    ) -> Result<(), MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    fn abort_recovered_uncommitted_refresh(
+        &self,
+        _refresh_id: i64,
     ) -> Result<(), MvRepositoryError> {
         Err(MvRepositoryError::unavailable())
     }

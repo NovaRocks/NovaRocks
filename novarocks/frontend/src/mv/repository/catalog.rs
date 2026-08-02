@@ -182,6 +182,11 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/mv.refresh/0003.avsc"),
         },
         SchemaSource {
+            subject: "mv.refresh",
+            id: 4,
+            raw_schema: include_str!("schemas/mv.refresh/0004.avsc"),
+        },
+        SchemaSource {
             subject: "mv.partition_state",
             id: 1,
             raw_schema: include_str!("schemas/mv.partition_state/0001.avsc"),

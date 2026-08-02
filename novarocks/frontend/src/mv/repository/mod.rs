@@ -35,16 +35,18 @@ use novarocks::mv::persistence::partition::{
 };
 use novarocks::mv::persistence::refresh::{
     BeginIcebergMvRefreshRequest, FrontendMvRefreshAction, FrontendMvRefreshActionPhase,
-    FrontendMvRefreshActionState, FrontendMvRefreshLedger, MvRefreshFinalizeRequest,
-    MvRefreshLifecycleOwner, MvRefreshState, RecordPublishCommitRequest,
-    RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome, StoredMvRefresh,
-    UpdateStarRocksMvRefreshSummaryRequest,
+    FrontendMvRefreshActionState, FrontendMvRefreshLedger, FrontendMvRefreshRecoveryLedger,
+    FrontendMvRefreshRecoveryStatus, MvRefreshFinalizeRequest, MvRefreshLifecycleOwner,
+    MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
+    RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::mv::repository::{
-    CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest,
-    FinalizeMvRefreshWithPartitionsRequest, MvRepository, MvRepositoryAvailability,
-    MvRepositoryError, MvRepositoryErrorKind, MvTarget, MvTargetLookup, RebuildMvRepositoryRequest,
-    RecordExternalCommitAndFinalizeRequest,
+    BeginFrontendMvRecoveryCycleRequest, CreateMvRepositoryRequest,
+    CreateMvRepositoryWithIdRequest, FinalizeMvRefreshWithPartitionsRequest,
+    FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryAvailability, MvRepositoryError,
+    MvRepositoryErrorKind, MvTarget, MvTargetLookup, RebuildMvRepositoryRequest,
+    RecordExternalCommitAndFinalizeRequest, RecordFrontendMvRecoveryCleanupOutcomeRequest,
+    RecordFrontendMvRecoveryObservationRequest,
 };
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, WriteTransaction,
@@ -1223,6 +1225,7 @@ impl StateStoreMvRepository {
                         external_outcome: None,
                         lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
                         frontend_ledger: None,
+                        frontend_recovery: None,
                     };
                     put_definition_transaction(
                         transaction,
@@ -1256,6 +1259,7 @@ impl StateStoreMvRepository {
         request.ledger.validate().map_err(invalid)?;
         self.require_definition_async(request.mv_id).await?;
         let operation_id = Uuid::now_v7();
+        let recovery_cleanup_operation_id = Uuid::now_v7().as_bytes().to_vec();
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -1264,6 +1268,7 @@ impl StateStoreMvRepository {
             "begin frontend-owned MV refresh",
             move |transaction| {
                 let request = request.clone();
+                let recovery_cleanup_operation_id = recovery_cleanup_operation_id.clone();
                 Box::pin(async move {
                     let (definition_record, mut definition) =
                         load_definition_transaction(transaction, request.mv_id).await?;
@@ -1300,6 +1305,10 @@ impl StateStoreMvRepository {
                         external_outcome: None,
                         lifecycle_owner: MvRefreshLifecycleOwner::FrontendCurrent,
                         frontend_ledger: Some(request.ledger),
+                        frontend_recovery: Some(
+                            FrontendMvRefreshRecoveryLedger::pending(recovery_cleanup_operation_id)
+                                .map_err(invalid_state_store)?,
+                        ),
                     };
                     put_definition_transaction(
                         transaction,
@@ -1869,6 +1878,355 @@ impl StateStoreMvRepository {
         Ok(refreshes)
     }
 
+    async fn list_frontend_recovery_candidates_async(
+        &self,
+    ) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+        let mut refreshes = self.list_refreshes_async().await?;
+        refreshes.retain(|refresh| {
+            refresh.lifecycle_owner == MvRefreshLifecycleOwner::FrontendCurrent
+                && (!matches!(
+                    refresh.state,
+                    MvRefreshState::Finalized | MvRefreshState::Aborted
+                ) || refresh.frontend_recovery.as_ref().is_some_and(|recovery| {
+                    recovery.status == FrontendMvRefreshRecoveryStatus::CleanupPending
+                }))
+        });
+        refreshes.sort_by_key(|refresh| refresh.refresh_id);
+        Ok(refreshes)
+    }
+
+    async fn begin_frontend_recovery_cycle_async(
+        &self,
+        request: BeginFrontendMvRecoveryCycleRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "begin frontend MV recovery inspection",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, request.refresh_id).await?;
+                    if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent {
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {} is not frontend-owned",
+                            request.refresh_id
+                        )));
+                    }
+                    let mut recovery = refresh.frontend_recovery.take().unwrap_or(
+                        FrontendMvRefreshRecoveryLedger::pending(request.cleanup_operation_id.clone())
+                            .map_err(invalid_state_store)?,
+                    );
+                    if recovery.cleanup_operation_id != request.cleanup_operation_id {
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {} recovery cleanup operation differs from the recorded value",
+                            request.refresh_id
+                        )));
+                    }
+                    recovery.status = FrontendMvRefreshRecoveryStatus::Inspecting;
+                    recovery.cycle_id = Some(request.cycle_id);
+                    recovery.inspection_provider_id = Some(request.provider_id);
+                    recovery.inspection_instance_id = Some(request.instance_id);
+                    recovery.inspection_incarnation = Some(request.incarnation);
+                    recovery.last_unresolved_reason = None;
+                    recovery.validate().map_err(invalid_state_store)?;
+                    refresh.frontend_recovery = Some(recovery);
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await?;
+                    Ok(refresh)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn record_frontend_recovery_observation_async(
+        &self,
+        request: RecordFrontendMvRecoveryObservationRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record frontend MV recovery observation",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, request.refresh_id).await?;
+                    let recovery = refresh.frontend_recovery.as_mut().ok_or_else(|| {
+                        conflict_state_store("frontend MV recovery has not begun")
+                    })?;
+                    if recovery.status != FrontendMvRefreshRecoveryStatus::Inspecting {
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {} is not awaiting a recovery observation",
+                            request.refresh_id
+                        )));
+                    }
+                    if let Some(existing) = &recovery.observation {
+                        if existing.digest == request.observation.digest
+                            && existing == &request.observation
+                        {
+                            return Ok(());
+                        }
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {} recovery observation conflicts with the recorded proof",
+                            request.refresh_id
+                        )));
+                    }
+                    recovery.observation = Some(request.observation);
+                    recovery.validate().map_err(invalid_state_store)?;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn record_frontend_recovery_unresolved_async(
+        &self,
+        refresh_id: i64,
+        reason: String,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record unresolved frontend MV recovery",
+            move |transaction| {
+                let reason = reason.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, refresh_id).await?;
+                    let recovery = refresh.frontend_recovery.as_mut().ok_or_else(|| {
+                        conflict_state_store("frontend MV recovery has not begun")
+                    })?;
+                    if recovery.status == FrontendMvRefreshRecoveryStatus::Unresolved
+                        && recovery.last_unresolved_reason.as_deref() == Some(reason.as_str())
+                    {
+                        return Ok(());
+                    }
+                    recovery.status = FrontendMvRefreshRecoveryStatus::Unresolved;
+                    recovery.last_unresolved_reason = Some(reason);
+                    recovery.validate().map_err(invalid_state_store)?;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn record_frontend_recovery_cleanup_outcome_async(
+        &self,
+        request: RecordFrontendMvRecoveryCleanupOutcomeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record frontend MV recovery cleanup outcome",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, request.refresh_id).await?;
+                    let recovery = refresh.frontend_recovery.as_mut().ok_or_else(|| {
+                        conflict_state_store("frontend MV recovery has not begun")
+                    })?;
+                    if recovery.cleanup_state.as_ref() == Some(&request.state)
+                        && recovery.cleanup_evidence == request.evidence
+                        && recovery.provider_finalized == request.provider_finalized
+                    {
+                        return Ok(());
+                    }
+                    recovery.cleanup_state = Some(request.state);
+                    recovery.cleanup_evidence = request.evidence;
+                    recovery.provider_finalized = request.provider_finalized;
+                    recovery.status = FrontendMvRefreshRecoveryStatus::CleanupPending;
+                    recovery.validate().map_err(invalid_state_store)?;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn finalize_recovered_published_refresh_async(
+        &self,
+        request: FinalizeRecoveredMvRefreshRequest,
+    ) -> Result<(), MvRepositoryError> {
+        request.recovery.validate().map_err(invalid)?;
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "finalize recovered published MV refresh",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (refresh_record, mut refresh) =
+                        load_refresh_transaction(transaction, request.finalize.refresh_id).await?;
+                    if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent {
+                        return Err(conflict_state_store("recovered refresh is not frontend-owned"));
+                    }
+                    let observation = request.recovery.observation.as_ref().ok_or_else(|| {
+                        conflict_state_store("recovered published refresh has no inspection observation")
+                    })?;
+                    if !matches!(
+                        observation.disposition,
+                        novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Published
+                            | novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Superseded
+                            | novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::CleanupPending
+                    ) {
+                        return Err(conflict_state_store("recovery observation does not prove publication"));
+                    }
+                    let (definition_record, mut definition) =
+                        load_definition_transaction(transaction, refresh.mv_id).await?;
+                    if definition.active_refresh_id != Some(refresh.refresh_id)
+                        && !matches!(refresh.state, MvRefreshState::Finalized)
+                    {
+                        return Err(conflict_state_store("recovered refresh is not the active MV fence"));
+                    }
+                    if !matches!(refresh.state, MvRefreshState::Finalized) {
+                        definition.last_refresh_rows = Some(request.finalize.rows);
+                        definition.last_refresh_snapshots = request.finalize.base_snapshots;
+                        definition.last_refresh_table_uuids = request.finalize.base_table_uuids;
+                        definition.last_refreshed_iceberg_snapshot_id = request.finalize.target_snapshot_id;
+                        definition.refresh_in_progress = false;
+                        definition.active_refresh_id = None;
+                        definition.refresh_target_snapshots.clear();
+                        refresh.state = MvRefreshState::Finalized;
+                        put_definition_transaction(
+                            transaction,
+                            operation_id,
+                            &definition,
+                            Precondition::Version(definition_record.version),
+                        )
+                        .await?;
+                    }
+                    let mut recovery = request.recovery;
+                    recovery.status = if recovery
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| observation.cleanup_required)
+                        && recovery.cleanup_state != Some(FrontendMvRefreshActionState::KnownCommitted)
+                    {
+                        FrontendMvRefreshRecoveryStatus::CleanupPending
+                    } else {
+                        FrontendMvRefreshRecoveryStatus::ResolvedPublished
+                    };
+                    refresh.frontend_recovery = Some(recovery);
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(refresh_record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn abort_recovered_uncommitted_refresh_async(
+        &self,
+        refresh_id: i64,
+    ) -> Result<(), MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "abort recovered uncommitted MV refresh",
+            move |transaction| {
+                Box::pin(async move {
+                    let (refresh_record, mut refresh) = load_refresh_transaction(transaction, refresh_id).await?;
+                    let recovery = refresh.frontend_recovery.as_mut().ok_or_else(|| {
+                        conflict_state_store("frontend MV recovery has not begun")
+                    })?;
+                    let disposition = recovery.observation.as_ref().map(|value| &value.disposition);
+                    if !matches!(
+                        disposition,
+                        Some(novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::KnownUncommitted)
+                            | Some(novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Staged)
+                    ) {
+                        return Err(conflict_state_store("recovery observation does not prove an uncommitted refresh"));
+                    }
+                    if recovery
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| observation.cleanup_required)
+                        && recovery.cleanup_state != Some(FrontendMvRefreshActionState::KnownCommitted)
+                    {
+                        return Err(conflict_state_store("uncommitted refresh cleanup is not known committed"));
+                    }
+                    let (definition_record, mut definition) =
+                        load_definition_transaction(transaction, refresh.mv_id).await?;
+                    if definition.active_refresh_id != Some(refresh.refresh_id) {
+                        return Err(conflict_state_store("recovered refresh is not the active MV fence"));
+                    }
+                    definition.refresh_in_progress = false;
+                    definition.active_refresh_id = None;
+                    definition.refresh_target_snapshots.clear();
+                    refresh.state = MvRefreshState::Aborted;
+                    recovery.status = FrontendMvRefreshRecoveryStatus::ResolvedAborted;
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(definition_record.version),
+                    )
+                    .await?;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(refresh_record.version),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
     async fn update_starrocks_refresh_summary_if_present_async(
         &self,
         request: UpdateStarRocksMvRefreshSummaryRequest,
@@ -2281,6 +2639,46 @@ impl MvRepository for StateStoreMvRepository {
         action: FrontendMvRefreshAction,
     ) -> Result<(), MvRepositoryError> {
         self.blocking(self.record_frontend_refresh_action_async(refresh_id, action))
+    }
+    fn list_frontend_recovery_candidates(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
+        self.blocking(self.list_frontend_recovery_candidates_async())
+    }
+    fn begin_frontend_recovery_cycle(
+        &self,
+        request: BeginFrontendMvRecoveryCycleRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        self.blocking(self.begin_frontend_recovery_cycle_async(request))
+    }
+    fn record_frontend_recovery_observation(
+        &self,
+        request: RecordFrontendMvRecoveryObservationRequest,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.record_frontend_recovery_observation_async(request))
+    }
+    fn record_frontend_recovery_unresolved(
+        &self,
+        refresh_id: i64,
+        reason: String,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.record_frontend_recovery_unresolved_async(refresh_id, reason))
+    }
+    fn record_frontend_recovery_cleanup_outcome(
+        &self,
+        request: RecordFrontendMvRecoveryCleanupOutcomeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.record_frontend_recovery_cleanup_outcome_async(request))
+    }
+    fn finalize_recovered_published_refresh(
+        &self,
+        request: FinalizeRecoveredMvRefreshRequest,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.finalize_recovered_published_refresh_async(request))
+    }
+    fn abort_recovered_uncommitted_refresh(
+        &self,
+        refresh_id: i64,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.abort_recovered_uncommitted_refresh_async(refresh_id))
     }
     fn record_staging_commit(
         &self,
@@ -2903,6 +3301,18 @@ async fn finalize_refresh_transaction(
     definition.active_refresh_id = None;
     definition.refresh_target_snapshots.clear();
     refresh.state = MvRefreshState::Finalized;
+    if let Some(recovery) = refresh.frontend_recovery.as_mut() {
+        recovery.status = if refresh
+            .frontend_ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.cleanup_pending)
+        {
+            FrontendMvRefreshRecoveryStatus::CleanupPending
+        } else {
+            FrontendMvRefreshRecoveryStatus::ResolvedPublished
+        };
+        recovery.validate().map_err(invalid_state_store)?;
+    }
     put_definition_transaction(
         transaction,
         operation_id,
@@ -2957,6 +3367,10 @@ async fn finalize_frontend_refresh_without_external_actions_transaction(
     definition.active_refresh_id = None;
     definition.refresh_target_snapshots.clear();
     refresh.state = MvRefreshState::Finalized;
+    if let Some(recovery) = refresh.frontend_recovery.as_mut() {
+        recovery.status = FrontendMvRefreshRecoveryStatus::ResolvedPublished;
+        recovery.validate().map_err(invalid_state_store)?;
+    }
     put_definition_transaction(
         transaction,
         operation_id,
@@ -2998,6 +3412,7 @@ fn new_refresh(
         external_outcome: None,
         lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
         frontend_ledger: None,
+        frontend_recovery: None,
     }
 }
 
