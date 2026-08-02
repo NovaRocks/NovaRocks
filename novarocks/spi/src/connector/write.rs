@@ -748,6 +748,7 @@ pub struct ConnectorWriteReceipt {
     payload: Bytes,
     digest: [u8; 32],
     committed_version: Option<ConnectorCommittedVersion>,
+    resulting_row_count: Option<u64>,
 }
 
 impl ConnectorWriteReceipt {
@@ -757,6 +758,7 @@ impl ConnectorWriteReceipt {
             digest: sha256(&payload),
             payload,
             committed_version: None,
+            resulting_row_count: None,
         })
     }
 
@@ -767,6 +769,16 @@ impl ConnectorWriteReceipt {
         let mut receipt = Self::try_new(payload)?;
         committed_version.validate()?;
         receipt.committed_version = Some(committed_version);
+        Ok(receipt)
+    }
+
+    pub fn try_new_with_committed_facts(
+        payload: Bytes,
+        committed_version: ConnectorCommittedVersion,
+        resulting_row_count: Option<u64>,
+    ) -> Result<Self, ConnectorError> {
+        let mut receipt = Self::try_new_with_committed_version(payload, committed_version)?;
+        receipt.resulting_row_count = resulting_row_count;
         Ok(receipt)
     }
 
@@ -792,6 +804,9 @@ impl ConnectorWriteReceipt {
     }
     pub fn committed_version(&self) -> Option<&ConnectorCommittedVersion> {
         self.committed_version.as_ref()
+    }
+    pub const fn resulting_row_count(&self) -> Option<u64> {
+        self.resulting_row_count
     }
 }
 

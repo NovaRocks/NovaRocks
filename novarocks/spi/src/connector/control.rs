@@ -26,7 +26,8 @@ use super::{
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorRequestContext,
     ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
+    ConnectorStagedPublicationRecovery, ConnectorTableHandle, ConnectorWriteControl,
+    ConnectorWriteLease, ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -71,6 +72,7 @@ pub struct ConnectorControlBinding {
     distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
+    staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
 }
 
 impl ConnectorControlBinding {
@@ -251,6 +253,7 @@ impl ConnectorControlBinding {
             distributed_rewrite: None,
             write,
             statistics,
+            staged_publication_recovery: None,
         })
     }
 
@@ -368,6 +371,30 @@ impl ConnectorControlBinding {
 
     pub fn statistics(&self) -> Option<&Arc<dyn ConnectorStatistics>> {
         self.statistics.as_ref()
+    }
+
+    /// Installs the provider-owned historical staged-publication inspector.
+    /// It is a builder to preserve existing control-binding constructors and
+    /// to keep recovery independent from ordinary write capability setup.
+    pub fn try_with_staged_publication_recovery(
+        mut self,
+        recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(recovery) = &recovery {
+            super::staged_publication_recovery::validate_staged_publication_recovery_owner(
+                &self.descriptor,
+                self.incarnation,
+                recovery.as_ref(),
+            )?;
+        }
+        self.staged_publication_recovery = recovery;
+        Ok(self)
+    }
+
+    pub fn staged_publication_recovery(
+        &self,
+    ) -> Option<&Arc<dyn ConnectorStagedPublicationRecovery>> {
+        self.staged_publication_recovery.as_ref()
     }
 
     pub fn execution_declaration(

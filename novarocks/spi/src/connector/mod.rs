@@ -30,6 +30,7 @@ mod mutation;
 mod predicate;
 mod read;
 mod read_session;
+mod staged_publication_recovery;
 mod statistics;
 mod write;
 
@@ -124,6 +125,16 @@ pub use read::{
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,
     ConnectorReadSessionOutcome,
+};
+pub use staged_publication_recovery::{
+    ConnectorHistoricalPublicationAction, ConnectorStagedPublicationBaseFact,
+    ConnectorStagedPublicationCleanupReceipt, ConnectorStagedPublicationCleanupRequest,
+    ConnectorStagedPublicationDescriptor, ConnectorStagedPublicationDisposition,
+    ConnectorStagedPublicationObservation, ConnectorStagedPublicationPhase,
+    ConnectorStagedPublicationPhaseState, ConnectorStagedPublicationProof,
+    ConnectorStagedPublicationRecovery, MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS,
+    MAX_CONNECTOR_STAGED_PUBLICATION_COHORTS, MAX_CONNECTOR_STAGED_PUBLICATION_LINEAGE_FACTS,
+    MAX_CONNECTOR_STAGED_PUBLICATION_PROOF_BYTES,
 };
 pub use statistics::{
     ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
