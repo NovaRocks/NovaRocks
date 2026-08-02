@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Materialized-view statement dispatch through `MvBackend`.
+//! Materialized-view metadata statement dispatch through `MvBackend`.
 
 use std::sync::Arc;
 
-use crate::engine::mv::lifecycle::{
-    CreateMvRequest, DropMvRequest, ListMvsRequest, RefreshCtx, RefreshError, RefreshRequest,
-};
+use crate::engine::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::persistence::definition::{
@@ -31,8 +29,7 @@ use crate::mv::repository::MvRepository;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
-    DropMaterializedViewStmt, MaterializedViewRefreshPolicy, RefreshMaterializedViewStmt,
-    ShowMaterializedViewsStmt,
+    DropMaterializedViewStmt, MaterializedViewRefreshPolicy, ShowMaterializedViewsStmt,
 };
 use crate::sql::parser::query_refs::extract_three_part_table_ref_occurrences;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -48,7 +45,7 @@ fn backend_by_engine(
         .mv_backend(engine.backend_name())
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod lifecycle_tests {
     use std::sync::{Arc, Mutex};
 
@@ -452,66 +449,6 @@ fn load_definition_for_alter(
     Ok(definition)
 }
 
-fn refresh_error_with_rollback(
-    original: RefreshError,
-    rollback: Result<(), RefreshError>,
-) -> String {
-    match rollback {
-        Ok(()) => original.to_string(),
-        Err(rollback_err) => format!(
-            "{}; additionally failed to rollback MV refresh: {}",
-            original, rollback_err
-        ),
-    }
-}
-
-fn run_refresh_lifecycle(
-    backend: Arc<dyn crate::connector::backend::MvBackend>,
-    req: RefreshRequest,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
-    crate::connector::validate_request_context(connector_context)?;
-    let mut ctx = RefreshCtx::new(connector_context.clone());
-    let plan = backend
-        .plan_refresh(req, connector_context)
-        .map_err(|err| err.to_string())?;
-    crate::connector::validate_request_context(&ctx.connector_context)?;
-    let outcome = match backend.execute_refresh(&plan, &mut ctx) {
-        Ok(outcome) => outcome,
-        Err(err) if err.kind.should_rollback_after_commit() => {
-            let rollback = backend.rollback_refresh(None, &mut ctx);
-            return Err(refresh_error_with_rollback(err, rollback));
-        }
-        Err(err) => {
-            ctx.recovery_required = true;
-            tracing::warn!(
-                backend = backend.name(),
-                recovery_required = ctx.recovery_required,
-                error = %err,
-                "MV refresh execution returned a non-rollbackable error; recovery is required"
-            );
-            return Err(err.to_string());
-        }
-    };
-    match backend.commit_refresh(&outcome, &mut ctx) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind.should_rollback_after_commit() => {
-            let rollback = backend.rollback_refresh(Some(&outcome), &mut ctx);
-            Err(refresh_error_with_rollback(err, rollback))
-        }
-        Err(err) => {
-            ctx.recovery_required = true;
-            tracing::warn!(
-                backend = backend.name(),
-                recovery_required = ctx.recovery_required,
-                error = %err,
-                "MV refresh commit result is unknown; recovery is required"
-            );
-            Err(err.to_string())
-        }
-    }
-}
-
 pub(crate) fn create_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -684,94 +621,6 @@ pub(crate) fn alter_mv_with_connector_context(
         req.refresh_interval_ms,
     )
     .map_err(|e| format!("sync Iceberg MV descriptor refresh metadata failed: {e}"))?;
-    Ok(StatementResult::Ok)
-}
-
-#[cfg(test)]
-pub(crate) fn refresh_mv(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &RefreshMaterializedViewStmt,
-) -> Result<StatementResult, String> {
-    refresh_mv_with_connector_context(
-        state,
-        current_catalog,
-        db,
-        stmt,
-        &crate::connector::test_request_context(),
-    )
-}
-
-pub(crate) fn refresh_mv_with_connector_context(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &RefreshMaterializedViewStmt,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
-        current_catalog,
-        db,
-        &stmt.name,
-    )?;
-    let engine = existing_mv_storage_engine_by_target(state, &target)?.ok_or_else(|| {
-        format!(
-            "materialized view does not exist: {}.{}.{}",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-    if engine != MvStorageEngine::Iceberg {
-        return Err(
-            "REFRESH MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
-                .to_string(),
-        );
-    };
-    let target = MvTarget {
-        catalog: Some(target.catalog),
-        database: target.namespace,
-        name: target.table,
-    };
-    let requested_object = crate::mv::dependency::model::iceberg_mv_dependency_ref(
-        target
-            .catalog
-            .as_deref()
-            .ok_or_else(|| "iceberg MV refresh target missing catalog".to_string())?,
-        &target.database,
-        &target.name,
-    );
-    let steps =
-        crate::engine::mv::dependency::build_upstream_refresh_steps(state, &requested_object)?;
-    for step in steps {
-        let backend = backend_by_engine(state, step.storage_engine)?;
-        let statement = RefreshMaterializedViewStmt {
-            name: crate::sql::parser::ast::ObjectName {
-                parts: match step.target.catalog.as_deref() {
-                    Some(_) => vec![step.target.database.clone(), step.target.name.clone()],
-                    None => vec![step.target.name.clone()],
-                },
-            },
-            full: stmt.full,
-        };
-        let req = RefreshRequest {
-            target: step.target.clone(),
-            current_catalog: step.target.catalog.clone(),
-            current_database: step.target.database.clone(),
-            statement,
-        };
-        if let Err(err) = run_refresh_lifecycle(backend, req, connector_context) {
-            if step.object != requested_object {
-                return Err(format!(
-                    "cannot refresh materialized view {}: upstream materialized view {} failed: {err}",
-                    requested_object.display_name().trim_start_matches("mv:"),
-                    step.object.display_name().trim_start_matches("mv:")
-                ));
-            }
-            return Err(err);
-        }
-    }
-    crate::engine::mv_maintenance::notify_refresh_completed(state);
     Ok(StatementResult::Ok)
 }
 

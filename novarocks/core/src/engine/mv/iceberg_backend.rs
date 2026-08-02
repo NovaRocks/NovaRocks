@@ -21,10 +21,7 @@ use std::sync::{Arc, Weak};
 
 use crate::connector::backend::MvBackend;
 use crate::engine::StandaloneState;
-use crate::engine::mv::lifecycle::{
-    BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
-    MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
-};
+use crate::engine::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow};
 use crate::mv::model::MvStorageEngine;
 
 pub(crate) struct IcebergMvBackend {
@@ -82,66 +79,5 @@ impl MvBackend for IcebergMvBackend {
             &req.stmt,
             Some(MvStorageEngine::Iceberg),
         )
-    }
-
-    fn plan_refresh(
-        &self,
-        req: RefreshRequest,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<RefreshPlan, RefreshError> {
-        let state = self.state().map_err(RefreshError::pre_commit)?;
-        crate::engine::mv::iceberg_refresh::plan_iceberg_mv_refresh_with_connector_context(
-            &state,
-            req.current_catalog.as_deref(),
-            &req.current_database,
-            &req.statement,
-            req.target,
-            connector_context,
-        )
-    }
-
-    fn execute_refresh(
-        &self,
-        plan: &RefreshPlan,
-        ctx: &mut RefreshCtx,
-    ) -> Result<RefreshOutcome, RefreshError> {
-        let BackendRefreshPlan::Iceberg(plan_payload) = &plan.backend_plan else {
-            return Err(RefreshError::user(
-                "iceberg backend received non-iceberg refresh plan",
-            ));
-        };
-        let state = self.state().map_err(RefreshError::pre_commit)?;
-        let outcome =
-            crate::engine::mv::iceberg_refresh::execute_iceberg_mv_refresh_with_connector_context(
-                &state,
-                plan_payload,
-                &plan.contract,
-                &ctx.connector_context,
-            )?;
-        Ok(RefreshOutcome {
-            mv_id: plan.contract.mv_id,
-            target: plan.contract.target.clone(),
-            rows: None,
-            base_snapshots: Default::default(),
-            base_table_uuids: Default::default(),
-            target_snapshot_id: None,
-            backend_outcome: BackendRefreshOutcome::Iceberg(outcome),
-        })
-    }
-
-    fn commit_refresh(
-        &self,
-        _outcome: &RefreshOutcome,
-        _ctx: &mut RefreshCtx,
-    ) -> Result<(), RefreshError> {
-        Ok(())
-    }
-
-    fn rollback_refresh(
-        &self,
-        _outcome: Option<&RefreshOutcome>,
-        _ctx: &mut RefreshCtx,
-    ) -> Result<(), RefreshError> {
-        Ok(())
     }
 }
