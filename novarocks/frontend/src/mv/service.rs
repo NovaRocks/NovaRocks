@@ -26,7 +26,7 @@ use novarocks::query_execution::service::QueryExecutionService;
 use novarocks::sql::mv_refresh::PreparedMvRefresh;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
-use super::{create, refresh};
+use super::{FrontendMvRecoverySummary, create, recovery, refresh};
 
 /// Frontend-owned application service for materialized-view statements.
 ///
@@ -35,6 +35,7 @@ use super::{create, refresh};
 pub struct FrontendMvService {
     repository: Arc<dyn MvRepository>,
     refresh: Option<refresh::FrontendMvRefreshDependencies>,
+    recovery: Option<recovery::FrontendMvRecoveryDependencies>,
 }
 
 impl FrontendMvService {
@@ -42,6 +43,7 @@ impl FrontendMvService {
         Self {
             repository,
             refresh: None,
+            recovery: None,
         }
     }
 
@@ -55,10 +57,24 @@ impl FrontendMvService {
             repository,
             refresh: Some(refresh::FrontendMvRefreshDependencies {
                 query_execution,
-                connector_control,
+                connector_control: Arc::clone(&connector_control),
                 first_refresh_activator,
             }),
+            recovery: Some(recovery::FrontendMvRecoveryDependencies { connector_control }),
         }
+    }
+
+    /// Run one bounded startup recovery pass. Failures are retained as MV
+    /// fences inside the repository and do not prevent unrelated SQL from
+    /// becoming ready.
+    pub fn recover_frontend_mv_refreshes(&self) -> FrontendMvRecoverySummary {
+        self.recovery.as_ref().map_or_else(
+            || FrontendMvRecoverySummary {
+                unresolved: 1,
+                ..Default::default()
+            },
+            |dependencies| recovery::recover_once(self.repository.as_ref(), dependencies),
+        )
     }
 }
 

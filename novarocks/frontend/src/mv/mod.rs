@@ -16,9 +16,11 @@
 // under the License.
 
 mod create;
+mod recovery;
 mod refresh;
 pub mod repository;
 mod service;
 
+pub use recovery::FrontendMvRecoverySummary;
 pub(crate) use refresh::FrontendMvFirstRefreshWriteActivatorPort;
 pub use service::FrontendMvService;
