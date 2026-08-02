@@ -628,6 +628,9 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     let operation_id = prepared.operation_id();
     let cohort_id = prepared.primary_cohort();
     let expected_target_snapshot_id = prepared.expected_target_snapshot_id();
+    let target_catalog = prepared.target_catalog().to_string();
+    let target_namespace = prepared.target_namespace().to_string();
+    let target_name = prepared.target_name().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
     let connector_context = prepared.connector_context().clone();
@@ -661,6 +664,9 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 current_catalog.as_deref(),
                 &current_database,
                 expected_target_snapshot_id,
+                &target_catalog,
+                &target_namespace,
+                &target_name,
                 &facts,
             )?;
             crate::engine::prepare_logical_plan_as_iceberg_write_with_connector_binding(
@@ -689,6 +695,9 @@ fn rebuild_frozen_join_refresh_context(
     current_catalog: Option<&str>,
     current_database: &str,
     expected_target_snapshot_id: Option<i64>,
+    target_catalog: &str,
+    target_namespace: &str,
+    target_name: &str,
     facts: &crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext,
 ) -> Result<crate::mv::refresh::execution_context::IcebergMvRefreshContext, String> {
     let target_identity =
@@ -707,6 +716,16 @@ fn rebuild_frozen_join_refresh_context(
                 "MV first-refresh logical artifact target has no table".to_string()
             })?,
         };
+    if target_identity.catalog != target_catalog
+        || target_identity.namespace != target_namespace
+        || target_identity.table != target_name
+    {
+        return Err(
+            "MV first-refresh logical artifact target does not match its frozen write request"
+                .to_string(),
+        );
+    }
+    validate_frozen_join_base_facts(state, facts)?;
     let entry = state
         .iceberg_catalogs
         .read()
@@ -755,6 +774,33 @@ fn rebuild_frozen_join_refresh_context(
         facts.affected_partitions.clone(),
         state.mv_refresh_pruning_limits,
     )
+}
+
+fn validate_frozen_join_base_facts(
+    state: &Arc<StandaloneState>,
+    facts: &crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext,
+) -> Result<(), String> {
+    if facts.base_refs.is_empty() || facts.pin.len() != facts.base_refs.len() {
+        return Err(
+            "MV first-refresh logical artifact has incomplete base snapshot pins".to_string(),
+        );
+    }
+    for base in &facts.base_refs {
+        let pinned_uuid = facts.pin.uuid(base).ok_or_else(|| {
+            format!(
+                "MV first-refresh logical artifact has no UUID pin for {}",
+                base.fqn()
+            )
+        })?;
+        let loaded = crate::engine::mv::refresh_io::load_current_iceberg_base_table(state, base)?;
+        if loaded.table.metadata().uuid().to_string() != pinned_uuid {
+            return Err(format!(
+                "MV first-refresh join base table identity drifted after preparation for {}",
+                base.fqn()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn execute_prepared_mv_first_refresh_staging(

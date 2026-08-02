@@ -411,29 +411,31 @@ fn prepare_frontend_first_refresh_write(
             namespace: target.namespace.clone(),
             table: target.table.clone(),
         };
-        let catalogs = state.iceberg_catalogs.read().map_err(|error| {
-            format!("read Iceberg catalog registry for join preparation: {error}")
-        })?;
-        let context = crate::mv::refresh::execution_context::IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
-            target_identity,
-            definition.mv_id,
-            current_catalog,
-            current_database,
-            Arc::new(definition.clone()),
-            Arc::new(query.clone()),
-            Arc::from(contract.base_refs.clone()),
-            Arc::new(pin.clone()),
-            previous_snapshot_ids.clone(),
-            previous_table_uuids.clone(),
-            expected_target_snapshot_id,
-            target_table_uuid.clone(),
-            &catalogs,
-            Arc::new(target_entry),
-            iceberg_catalog,
-            target_loaded.table.clone(),
-            contract.affected_partitions.clone(),
-            state.mv_refresh_pruning_limits,
-        )?;
+        let context = {
+            let catalogs = state.iceberg_catalogs.read().map_err(|error| {
+                format!("read Iceberg catalog registry for join preparation: {error}")
+            })?;
+            crate::mv::refresh::execution_context::IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
+                target_identity,
+                definition.mv_id,
+                current_catalog,
+                current_database,
+                Arc::new(definition.clone()),
+                Arc::new(query.clone()),
+                Arc::from(contract.base_refs.clone()),
+                Arc::new(pin.clone()),
+                previous_snapshot_ids.clone(),
+                previous_table_uuids.clone(),
+                expected_target_snapshot_id,
+                target_table_uuid.clone(),
+                &catalogs,
+                Arc::new(target_entry),
+                iceberg_catalog,
+                target_loaded.table.clone(),
+                contract.affected_partitions.clone(),
+                state.mv_refresh_pruning_limits,
+            )?
+        };
         let (plan, factory) =
             plan_canonical_select_for_imv(state, &context).map_err(|error| error.message)?;
         let (left_ref, right_ref) =
