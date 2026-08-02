@@ -326,12 +326,7 @@ fn prepare_frontend_first_refresh_write(
         "Iceberg MV first-refresh requires a persisted schema contract".to_string()
     })?;
     let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
-    if schema_contract.join.is_some() {
-        return Err(
-            "MV first-refresh join shapes require the typed logical distributed binder".to_string(),
-        );
-    }
-    let (_, _, target_loaded) = load_iceberg_mv_target(state, &target)?;
+    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     let target_schema = target_loaded.table.metadata().current_schema();
     let target_arrow_schema = iceberg::arrow::schema_to_arrow_schema(target_schema)
         .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
@@ -395,6 +390,95 @@ fn prepare_frontend_first_refresh_write(
         current_catalog,
         current_database,
     );
+    let expected_target_snapshot_id = match &contract.state_baseline {
+        RefreshStateBaseline::SnapshotBacked {
+            target_snapshot_id, ..
+        } => *target_snapshot_id,
+        RefreshStateBaseline::Pinless => None,
+    };
+    if schema_contract.join.is_some() && !capabilities.has_agg_state {
+        let RefreshStateBaseline::SnapshotBacked {
+            previous_snapshot_ids,
+            previous_table_uuids,
+            target_table_uuid,
+            ..
+        } = &contract.state_baseline
+        else {
+            return Err("MV first-refresh join requires a snapshot-backed baseline".to_string());
+        };
+        let target_identity = TableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        };
+        let catalogs = state.iceberg_catalogs.read().map_err(|error| {
+            format!("read Iceberg catalog registry for join preparation: {error}")
+        })?;
+        let context = crate::mv::refresh::execution_context::IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
+            target_identity,
+            definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(definition.clone()),
+            Arc::new(query.clone()),
+            Arc::from(contract.base_refs.clone()),
+            Arc::new(pin.clone()),
+            previous_snapshot_ids.clone(),
+            previous_table_uuids.clone(),
+            expected_target_snapshot_id,
+            target_table_uuid.clone(),
+            &catalogs,
+            Arc::new(target_entry),
+            iceberg_catalog,
+            target_loaded.table.clone(),
+            contract.affected_partitions.clone(),
+            state.mv_refresh_pruning_limits,
+        )?;
+        let (plan, factory) =
+            plan_canonical_select_for_imv(state, &context).map_err(|error| error.message)?;
+        let (left_ref, right_ref) =
+            join_base_refs_for_schema_contract(schema_contract, &contract.base_refs)?;
+        let append =
+            crate::mv::refresh::join_first_refresh::build_join_first_refresh_append_logical_plan(
+                &context.rewrite,
+                left_ref,
+                right_ref,
+                crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput {
+                    plan,
+                    factory,
+                },
+            )?;
+        let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+            &crate::engine::backend_resolver::TargetBackend {
+                backend_name: "iceberg",
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            &attempt.staging_branch,
+        )?;
+        let request = crate::sql::mv_refresh::first_refresh::MvFirstRefreshWriteRequest::try_new(
+            definition.select_sql.clone(),
+            crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Join,
+            target.catalog,
+            target.namespace,
+            target.table,
+            attempt.staging_branch.clone(),
+            current_catalog.map(str::to_string),
+            current_database.to_string(),
+            expected_target_snapshot_id,
+            table,
+            target_contract,
+            observed_binding,
+            attempt.write_operation_id,
+            connector_context,
+        )?;
+        return crate::sql::mv_refresh::first_refresh::MvFirstRefreshWritePreparer::prepare_join_logical(
+            request,
+            append,
+            crate::engine::mv_first_refresh_staging::frozen_logical_context(&context),
+        );
+    }
     let (shape, physical_sql) = if capabilities.has_agg_state {
         let calls =
             crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)?;
@@ -464,12 +548,6 @@ fn prepare_frontend_first_refresh_write(
         },
         &attempt.staging_branch,
     )?;
-    let expected_target_snapshot_id = match &contract.state_baseline {
-        RefreshStateBaseline::SnapshotBacked {
-            target_snapshot_id, ..
-        } => *target_snapshot_id,
-        RefreshStateBaseline::Pinless => None,
-    };
     let request = crate::sql::mv_refresh::first_refresh::MvFirstRefreshWriteRequest::try_new(
         definition.select_sql,
         shape,

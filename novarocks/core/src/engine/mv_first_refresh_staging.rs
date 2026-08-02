@@ -395,7 +395,7 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
     MvFirstRefreshWritePreparer::prepare_join_logical(request, append, frozen_logical_context(ctx))
 }
 
-fn frozen_logical_context(
+pub(crate) fn frozen_logical_context(
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
 ) -> crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext {
     crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext {
