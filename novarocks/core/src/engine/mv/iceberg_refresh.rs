@@ -263,7 +263,20 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
         let work = match plan.contract.decision {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
             ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
-            ExecutableRefreshDecision::FirstRefresh | ExecutableRefreshDecision::Incremental => {
+            ExecutableRefreshDecision::FirstRefresh => PreparedMvRefreshWork::DataProducing {
+                distributed_writes: Vec::new(),
+                first_refresh_writes: vec![prepare_frontend_first_refresh_write(
+                    self.state,
+                    self.current_catalog,
+                    self.current_database,
+                    &plan.contract,
+                    &request.attempt,
+                    &base_table_uuids,
+                    observed_binding.clone(),
+                    self.connector_context.clone(),
+                )?],
+            },
+            ExecutableRefreshDecision::Incremental => {
                 return Err(
                     "MV refresh data-producing SQL preparation is not yet extracted for this shape"
                         .to_string(),
@@ -286,6 +299,201 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             work,
         })
     }
+}
+
+/// Prepare the SQL-shaped first-refresh artifact from persisted MV facts.
+/// This deliberately re-reads metadata only while SQL preparation is active;
+/// it allocates no provider ref, write service, execution, or durable intent.
+/// Join first refresh remains behind its typed logical binder and therefore
+/// fails closed here rather than using the old frontend row-materialization
+/// implementation.
+#[allow(clippy::too_many_arguments)]
+fn prepare_frontend_first_refresh_write(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    contract: &RefreshPlanContract,
+    attempt: &crate::sql::mv_refresh::MvRefreshAttemptIdentity,
+    base_table_uuids: &BTreeMap<String, String>,
+    observed_binding: ConnectorExecutionBindingKey,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite, String> {
+    let target = IcebergMvTarget {
+        catalog: contract.target.catalog.clone().ok_or_else(|| {
+            "Iceberg MV first-refresh target has no connector catalog".to_string()
+        })?,
+        namespace: contract.target.database.clone(),
+        table: contract.target.name.clone(),
+    };
+    let definition = load_iceberg_mv_definition_by_target(state, &target)?;
+    let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
+        "Iceberg MV first-refresh requires a persisted schema contract".to_string()
+    })?;
+    let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
+    if schema_contract.join.is_some() {
+        return Err(
+            "MV first-refresh join shapes require the typed logical distributed binder".to_string(),
+        );
+    }
+    let (_, _, target_loaded) = load_iceberg_mv_target(state, &target)?;
+    let target_schema = target_loaded.table.metadata().current_schema();
+    let target_arrow_schema = iceberg::arrow::schema_to_arrow_schema(target_schema)
+        .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
+    let target_field_ids = target_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+    let partition_spec_id = schema_contract
+        .target
+        .partition
+        .as_ref()
+        .map(|partition| partition.target_spec_id)
+        .unwrap_or_else(|| target_loaded.table.metadata().default_partition_spec_id());
+    if target_loaded.table.metadata().default_partition_spec_id() != partition_spec_id {
+        return Err(
+            "MV first-refresh target partition spec drifted from its persisted contract"
+                .to_string(),
+        );
+    }
+    let target_contract =
+        crate::sql::mv_refresh::first_refresh::MvFirstRefreshTargetContract::try_new(
+            Arc::new(target_arrow_schema),
+            target_field_ids,
+            partition_spec_id,
+            schema_contract.target.hidden_apply_key.column_name.clone(),
+        )?;
+    let pin = RefreshSnapshotPin::from_captured_entries(
+        contract
+            .base_refs
+            .iter()
+            .map(|base| {
+                let snapshot_id = contract
+                    .snapshot_pins
+                    .get(&base.fqn())
+                    .and_then(|snapshot| *snapshot)
+                    .ok_or_else(|| {
+                        format!("MV first-refresh has no pinned snapshot for {}", base.fqn())
+                    })?;
+                let uuid = load_current_iceberg_base_table(state, base)?
+                    .table
+                    .metadata()
+                    .uuid()
+                    .to_string();
+                let expected_uuid = base_table_uuids.get(&base.fqn()).ok_or_else(|| {
+                    format!("MV first-refresh has no UUID fact for {}", base.fqn())
+                })?;
+                if &uuid != expected_uuid {
+                    return Err(format!(
+                        "MV first-refresh base table identity changed after planning for {}",
+                        base.fqn()
+                    ));
+                }
+                Ok::<_, String>((base.clone(), snapshot_id, uuid))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    let query = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&definition.select_sql)?,
+        current_catalog,
+        current_database,
+    );
+    let (shape, physical_sql) = if capabilities.has_agg_state {
+        let calls =
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)?;
+        if let Some(branch) = &schema_contract.branch {
+            (
+                crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::BranchUnionAggregate,
+                crate::sql::mv_refresh::first_refresh::prepare_branch_union_aggregate_first_refresh_write_sql(
+                    &definition.select_sql,
+                    branch.branch_count as usize,
+                    &calls,
+                    &pin,
+                    current_catalog,
+                    current_database,
+                )?,
+            )
+        } else if !schema_contract.bases.is_empty() {
+            (
+                crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::FanInAggregate,
+                crate::sql::mv_refresh::first_refresh::prepare_fan_in_aggregate_first_refresh_write_sql(
+                    &definition.select_sql,
+                    &calls,
+                    &pin,
+                    current_catalog,
+                    current_database,
+                )?,
+            )
+        } else {
+            (
+                crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Aggregate,
+                crate::sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql(
+                    &definition.select_sql,
+                    &calls,
+                    &pin,
+                    current_catalog,
+                    current_database,
+                )?,
+            )
+        }
+    } else if let Some(branch) = &schema_contract.branch {
+        (
+            crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::UnionProjection,
+            crate::sql::mv_refresh::first_refresh::prepare_union_projection_first_refresh_write_sql(
+                &definition.select_sql,
+                branch.branch_count as usize,
+                &pin,
+                current_catalog,
+                current_database,
+            )?,
+        )
+    } else {
+        (
+            crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Projection,
+            crate::sql::mv_refresh::first_refresh::prepare_projection_first_refresh_write_sql(
+                &definition.select_sql,
+                &pin,
+                current_catalog,
+                current_database,
+            )?,
+        )
+    };
+    let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+        &crate::engine::backend_resolver::TargetBackend {
+            backend_name: "iceberg",
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        &attempt.staging_branch,
+    )?;
+    let expected_target_snapshot_id = match &contract.state_baseline {
+        RefreshStateBaseline::SnapshotBacked {
+            target_snapshot_id, ..
+        } => *target_snapshot_id,
+        RefreshStateBaseline::Pinless => None,
+    };
+    let request = crate::sql::mv_refresh::first_refresh::MvFirstRefreshWriteRequest::try_new(
+        definition.select_sql,
+        shape,
+        target.catalog,
+        target.namespace,
+        target.table,
+        attempt.staging_branch.clone(),
+        current_catalog.map(str::to_string),
+        current_database.to_string(),
+        expected_target_snapshot_id,
+        table,
+        target_contract,
+        observed_binding,
+        attempt.write_operation_id,
+        connector_context,
+    )?;
+    crate::sql::mv_refresh::first_refresh::MvFirstRefreshWritePreparer::prepare(
+        request,
+        physical_sql,
+    )
 }
 
 fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
