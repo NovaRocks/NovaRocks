@@ -85,10 +85,6 @@ ci_suite_is_explicit_only() {
   esac
 
   if [ ! -f "$manifest" ]; then
-    if [ "$suite" = "starrocks-compat" ]; then
-      echo "error: required SQL suite metadata is missing: $manifest" >&2
-      return 2
-    fi
     return 1
   fi
 

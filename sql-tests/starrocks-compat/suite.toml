@@ -1,4 +1,0 @@
-explicit_only = true
-server_mode = "starrocks-compat"
-cluster_size = 3
-artifact_flavor = "compat"

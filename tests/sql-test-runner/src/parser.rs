@@ -417,9 +417,6 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 }
                 meta.be_log_exact_fragment_cancellation = Some(count);
             }
-            "compat_probe" => {
-                meta.compat_probes.push(raw_value);
-            }
             "sequential" => {
                 // Parsed here but ignored in merge_meta; handled at case level.
             }
@@ -585,11 +582,6 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         be_log_exact_fragment_cancellation: override_meta
             .be_log_exact_fragment_cancellation
             .or(base.be_log_exact_fragment_cancellation),
-        compat_probes: if override_meta.compat_probes.is_empty() {
-            base.compat_probes.clone()
-        } else {
-            override_meta.compat_probes.clone()
-        },
     }
 }
 
@@ -1351,22 +1343,21 @@ mod opt5_directive_tests {
     }
 
     #[test]
-    fn compat_directive_parser_collects_log_and_probe_directives() {
+    fn be_log_directive_parser_collects_log_directives() {
         let re = meta_re();
         let lines = vec![
-            "-- @be_log_contains=compat_ingress method=exec_batch_plan_fragments".to_string(),
+            "-- @be_log_contains=be_log_ingress method=exec_batch_plan_fragments".to_string(),
             "-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string(),
             "-- @be_log_count_at_least=runtime_filter_receive,2".to_string(),
-            "-- @be_log_be_count_at_least=compat_exchange_receive eos=true,2".to_string(),
+            "-- @be_log_be_count_at_least=exchange_receive eos=true,2".to_string(),
             "-- @be_log_exact_fragment_cancellation=3".to_string(),
-            "-- @compat_probe=malformed-runtime-filter".to_string(),
         ];
 
-        let meta = parse_meta(&lines, &re).expect("parse compatibility directives");
+        let meta = parse_meta(&lines, &re).expect("parse BE log directives");
 
         assert_eq!(
             meta.be_log_contains,
-            vec!["compat_ingress method=exec_batch_plan_fragments".to_string()]
+            vec!["be_log_ingress method=exec_batch_plan_fragments".to_string()]
         );
         assert_eq!(
             meta.be_log_not_contains,
@@ -1378,17 +1369,13 @@ mod opt5_directive_tests {
         );
         assert_eq!(
             meta.be_log_be_count_at_least,
-            vec![("compat_exchange_receive eos=true".to_string(), 2)]
+            vec![("exchange_receive eos=true".to_string(), 2)]
         );
         assert_eq!(meta.be_log_exact_fragment_cancellation, Some(3));
-        assert_eq!(
-            meta.compat_probes,
-            vec!["malformed-runtime-filter".to_string()]
-        );
     }
 
     #[test]
-    fn compat_directive_parser_rejects_invalid_log_count() {
+    fn be_log_directive_parser_rejects_invalid_log_count() {
         let re = meta_re();
         let lines = vec!["-- @be_log_count_at_least=runtime_filter_receive,zero".to_string()];
 
@@ -1414,22 +1401,20 @@ mod opt5_directive_tests {
     }
 
     #[test]
-    fn expected_error_parser_preserves_compat_directives_for_post_error_checks() {
+    fn expected_error_parser_preserves_be_log_directives_for_post_error_checks() {
         let re = meta_re();
         let lines = vec![
             "-- @expect_error=planned rejection".to_string(),
-            "-- @be_log_contains=compat_ingress rejected".to_string(),
-            "-- @compat_probe=malformed-plan".to_string(),
+            "-- @be_log_contains=be_log_ingress rejected".to_string(),
         ];
 
-        let meta = parse_meta(&lines, &re).expect("parse expected error with compat directives");
+        let meta = parse_meta(&lines, &re).expect("parse expected error with BE log directives");
 
         assert_eq!(meta.expect_error.as_deref(), Some("planned rejection"));
-        assert!(meta.has_compat_directives());
+        assert!(meta.has_be_log_directives());
         assert_eq!(
             meta.be_log_contains,
-            vec!["compat_ingress rejected".to_string()]
+            vec!["be_log_ingress rejected".to_string()]
         );
-        assert_eq!(meta.compat_probes, vec!["malformed-plan".to_string()]);
     }
 }

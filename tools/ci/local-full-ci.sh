@@ -35,7 +35,6 @@ CI_FROM_RUN_DIR=""
 ALL_DISCOVERED_REQUESTED="false"
 KEEP_RUNTIME="false"
 SKIP_CARGO_TEST="false"
-WITH_COMPAT="false"
 REQUESTED_SUITES=()
 CI_RUNTIME_PREPARED="false"
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
@@ -80,8 +79,6 @@ Options:
   --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
   --from <run-dir>      Reclassify an existing logs/ci-full run without rerun.
   --skip-cargo-test     Skip cargo test. Intended only for runner debugging.
-  --with-compat         Append compat clippy, artifact build, and real
-                        StarRocks FE + exactly 3 compat BE E2E coverage.
   --cluster-mode <mode> SQL runner cluster mode. Default: cross-process.
   --cluster-size <n>    Number of BE processes. Default: 3, or 1 for all-in-one.
   --keep-runtime        Keep this worktree's docker/iceberg-rest runtime entry.
@@ -162,10 +159,6 @@ parse_args() {
         ;;
       --skip-cargo-test)
         SKIP_CARGO_TEST="true"
-        shift
-        ;;
-      --with-compat)
-        WITH_COMPAT="true"
         shift
         ;;
       --cluster-mode)
@@ -325,7 +318,6 @@ prepare_runtime() {
     echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
     echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
     echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
-    echo "WITH_COMPAT=$WITH_COMPAT"
     echo "SQL_CLUSTER_MODE=$SQL_CLUSTER_MODE"
     echo "SQL_CLUSTER_SIZE=$SQL_CLUSTER_SIZE"
     echo "NOVA_CI_NATIVE_CROSS_PROCESS_CORE=$NOVA_CI_NATIVE_CROSS_PROCESS_CORE"
@@ -417,127 +409,6 @@ run_cargo_gates() {
   else
     run_fail_fast_stage "cargo test" "cargo-test.log" cargo test --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
   fi
-}
-
-run_compat_gates() {
-  if [ "$WITH_COMPAT" != "true" ]; then
-    ci_record_stage "cargo clippy compat" "SKIP" "0" ""
-    ci_record_stage "cargo build compat artifact" "SKIP" "0" ""
-    ci_record_stage "starrocks-compat E2E" "SKIP" "0" ""
-    ci_render_summary "RUNNING"
-    return
-  fi
-
-  run_fail_fast_stage "cargo clippy compat" "cargo-clippy-compat.log" \
-    cargo clippy -p novarocks-server -p novarocks --all-targets --features compat
-  run_fail_fast_stage "cargo build compat artifact" "cargo-build-compat-artifact.log" \
-    tools/ci/build-compat-artifact.sh \
-      --profile "$NOVA_CI_CARGO_PROFILE" \
-      --output-dir "$CI_RUN_DIR/compat-artifact"
-  run_fail_fast_stage "starrocks-compat E2E" "starrocks-compat-e2e.log" \
-    run_starrocks_compat_suite "$CI_RUN_DIR/compat-artifact/manifest.txt"
-}
-
-validate_starrocks_compat_suite_log() {
-  local log_path="$1"
-  local barrier_count
-  local cases
-  local total
-  local passed
-  local failed
-
-  barrier_count="$(awk '
-    index($0, "starrocks-compat topology barrier PASS: SHOW BACKENDS 3/3 Alive;") == 1 {
-      count++
-    }
-    END { print count + 0 }
-  ' "$log_path")"
-  if [ "$barrier_count" -ne 1 ]; then
-    echo "error: starrocks-compat E2E requires exactly one 3/3 Alive topology barrier; found $barrier_count" >&2
-    return 1
-  fi
-
-  cases="$(sed -n 's/^cases=\([0-9][0-9]*\)\([[:space:](].*\)\{0,1\}$/\1/p' "$log_path")"
-  total="$(sed -n 's/^total=\([0-9][0-9]*\)$/\1/p' "$log_path")"
-  passed="$(sed -n 's/^pass=\([0-9][0-9]*\)$/\1/p' "$log_path")"
-  failed="$(sed -n 's/^fail=\([0-9][0-9]*\)$/\1/p' "$log_path")"
-  if ! [[ "$cases" =~ ^[0-9]+$ ]] || [ "$cases" -eq 0 ]; then
-    echo "error: starrocks-compat E2E must execute a nonzero case count" >&2
-    return 1
-  fi
-  if ! [[ "$total" =~ ^[0-9]+$ ]] \
-    || ! [[ "$passed" =~ ^[0-9]+$ ]] \
-    || ! [[ "$failed" =~ ^[0-9]+$ ]] \
-    || [ "$total" -ne "$cases" ] \
-    || [ "$passed" -ne "$cases" ] \
-    || [ "$failed" -ne 0 ]; then
-    echo "error: starrocks-compat E2E did not report all nonzero cases passing" >&2
-    return 1
-  fi
-}
-
-run_starrocks_compat_suite() {
-  local manifest_path="$1"
-  local default_binary="${NOVA_CI_DEFAULT_BINARY:-$REPO_ROOT/$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")}"
-  local compat_binary
-  local default_sha
-  local compat_sha
-  local runner_output="$CI_RUN_DIR/starrocks-compat-runner.raw.log"
-  local runner_code
-  local -a runner_command
-
-  if [ ! -f "$manifest_path" ]; then
-    echo "error: compat artifact manifest does not exist: $manifest_path" >&2
-    return 1
-  fi
-  compat_binary="$(awk -F= '
-    $1 == "binary" { count++; value = substr($0, index($0, "=") + 1) }
-    END { if (count == 1) print value }
-  ' "$manifest_path")"
-  if [ -z "$compat_binary" ] || [ ! -x "$compat_binary" ]; then
-    echo "error: compat artifact manifest must identify one executable binary" >&2
-    return 1
-  fi
-  if [ ! -x "$default_binary" ]; then
-    echo "error: default NovaRocks binary is not executable: $default_binary" >&2
-    return 1
-  fi
-  default_sha="$(shasum -a 256 "$default_binary" | awk '{print $1}')"
-  compat_sha="$(shasum -a 256 "$compat_binary" | awk '{print $1}')"
-  if [ "$default_sha" = "$compat_sha" ]; then
-    echo "error: default and compat artifacts have identical SHA-256 identities" >&2
-    return 1
-  fi
-
-  if [ -n "${SCT_STARROCKS_COMPAT_RUNNER_HOOK:-}" ]; then
-    runner_command=("$SCT_STARROCKS_COMPAT_RUNNER_HOOK")
-  else
-    runner_command=(
-      cargo run
-      --manifest-path tests/sql-test-runner/Cargo.toml
-      --bin sql-tests
-      --profile "$NOVA_CI_CARGO_PROFILE"
-      --
-    )
-  fi
-
-  env \
-    NO_PROXY=127.0.0.1,localhost \
-    NOVAROCKS_BIN="$default_binary" \
-    NOVAROCKS_COMPAT_ARTIFACT_MANIFEST="$manifest_path" \
-    NOVAROCKS_COMPAT_ARTIFACT_PROFILE="$NOVA_CI_CARGO_PROFILE" \
-    "${runner_command[@]}" \
-      --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-      --suite starrocks-compat \
-      --mode verify \
-      --query-timeout "${SQL_QUERY_TIMEOUT_SECONDS:-300}" \
-      -j 1 >"$runner_output" 2>&1
-  runner_code=$?
-  cat "$runner_output"
-  if [ "$runner_code" -ne 0 ]; then
-    return "$runner_code"
-  fi
-  validate_starrocks_compat_suite_log "$runner_output"
 }
 
 start_server_stage() {
@@ -1185,7 +1056,6 @@ main() {
   fi
   run_sql_suites
   run_native_cross_process_sql_suites
-  run_compat_gates
 
   ci_render_summary "PASS"
   echo "PASS: $CI_SUMMARY"

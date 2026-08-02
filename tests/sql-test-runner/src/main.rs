@@ -17,8 +17,7 @@
 
 mod benchmark_bootstrap;
 mod cluster;
-mod compat_artifact;
-mod compat_directive;
+mod be_log_directive;
 mod config;
 mod fault_injection;
 mod imv_stateless;
@@ -28,7 +27,6 @@ mod results;
 mod runner;
 mod session;
 mod shell;
-mod starrocks_compat_cluster;
 mod suite_manifest;
 mod types;
 
@@ -36,7 +34,6 @@ use crate::benchmark_bootstrap::{
     BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
 };
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
-use crate::compat_artifact::CompatArtifact;
 use crate::config::{
     build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
     load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
@@ -53,7 +50,7 @@ use crate::runner::{
     error_message_matches, extract_engine_error_code, parse_selector_list, summarize_connection,
 };
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
-use crate::suite_manifest::{SuiteServerMode, select_suite_names};
+use crate::suite_manifest::select_suite_names;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -77,29 +74,6 @@ fn resolve_effective_target_port(
     match server_port {
         Some(port) => Ok(port.to_string()),
         None => resolve_target_port(cli_port, runner_config),
-    }
-}
-
-fn resolve_selected_cluster(
-    server_mode: SuiteServerMode,
-    manifest_cluster_size: usize,
-    cli_mode: ClusterMode,
-    cli_cluster_size: Option<usize>,
-) -> Result<(ClusterMode, usize)> {
-    match server_mode {
-        SuiteServerMode::Native => Ok((cli_mode, cli_cluster_size.unwrap_or(1))),
-        SuiteServerMode::StarRocksCompat => {
-            if let Some(cluster_size) = cli_cluster_size
-                && cluster_size != manifest_cluster_size
-            {
-                bail!(
-                    "starrocks-compat mode requires --cluster-size {} (got {})",
-                    manifest_cluster_size,
-                    cluster_size
-                );
-            }
-            Ok((ClusterMode::StarRocksCompat, manifest_cluster_size))
-        }
     }
 }
 
@@ -993,15 +967,15 @@ fn run_explain_directive_checks(
     Ok(())
 }
 
-fn run_compat_directives_for_successful_step(
+fn run_be_log_directives_for_successful_step(
     step: &SqlStep,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
-    snapshot: &compat_directive::BeLogSnapshot,
+    snapshot: &be_log_directive::BeLogSnapshot,
     log: &mut String,
 ) -> Result<(), String> {
     match server_handle.lock() {
-        Ok(server_handle) => compat_directive::run(step, server_handle.as_ref(), snapshot, log)
-            .map_err(|error| format!("compatibility directive failed: {error:#}")),
+        Ok(server_handle) => be_log_directive::run(step, server_handle.as_ref(), snapshot, log)
+            .map_err(|error| format!("BE log directive failed: {error:#}")),
         Err(_) => Err("server handle mutex is poisoned".to_string()),
     }
 }
@@ -1117,7 +1091,7 @@ fn finish_expected_error_step(
     matched_expected_error: bool,
     last_failure: &str,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
-    snapshot: &compat_directive::BeLogSnapshot,
+    snapshot: &be_log_directive::BeLogSnapshot,
     log: &mut String,
 ) -> bool {
     if !matched_expected_error {
@@ -1129,7 +1103,7 @@ fn finish_expected_error_step(
         return false;
     }
     if let Err(reason) =
-        run_compat_directives_for_successful_step(step, server_handle, snapshot, log)
+        run_be_log_directives_for_successful_step(step, server_handle, snapshot, log)
     {
         let _ = writeln!(log, "    ❌ FAIL: {reason}");
         return false;
@@ -1483,7 +1457,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             step.query_number, order_sensitive, epsilon
         );
 
-        let compat_deadline = compat_directive::step_evidence_deadline(&step.meta);
+        let be_log_deadline = be_log_directive::step_evidence_deadline(&step.meta);
         let resource_baseline = if fault_injection::has_fault(&step.meta) {
             match ctx.server_handle.lock() {
                 Ok(mut server_handle)
@@ -1546,21 +1520,21 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             Arc::clone(&ctx.server_handle),
         );
 
-        let compat_snapshot = match ctx.server_handle.lock() {
-            Ok(server_handle) => compat_directive::snapshot_with_deadline(
+        let be_log_snapshot = match ctx.server_handle.lock() {
+            Ok(server_handle) => be_log_directive::snapshot_with_deadline(
                 &step.meta,
                 server_handle.as_ref(),
-                compat_deadline,
+                be_log_deadline,
             ),
             Err(_) => Err(anyhow::anyhow!("server handle mutex is poisoned")),
         };
-        let compat_snapshot = match compat_snapshot {
+        let be_log_snapshot = match be_log_snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 case_failed = true;
                 let _ = writeln!(
                     log,
-                    "    ❌ failed to snapshot compatibility evidence before step {}: {error:#}",
+                    "    ❌ failed to snapshot BE log evidence before step {}: {error:#}",
                     step.query_number
                 );
                 break;
@@ -1594,7 +1568,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
-                            compat_snapshot.evidence_deadline(),
+                            be_log_snapshot.evidence_deadline(),
                         )
                     };
                     let elapsed = execution
@@ -1697,7 +1671,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         matched_expected_error,
                         &last_failure,
                         &ctx.server_handle,
-                        &compat_snapshot,
+                        &be_log_snapshot,
                         &mut log,
                     ) {
                         case_failed = true;
@@ -1726,13 +1700,13 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
-                        let compat_ok = run_compat_directives_for_successful_step(
+                        let be_log_ok = run_be_log_directives_for_successful_step(
                             step,
                             &ctx.server_handle,
-                            &compat_snapshot,
+                            &be_log_snapshot,
                             &mut log,
                         );
-                        let compat_ok = match compat_ok {
+                        let be_log_ok = match be_log_ok {
                             Ok(()) => true,
                             Err(reason) => {
                                 let _ = writeln!(log, "    ❌ FAIL: {reason}");
@@ -1797,7 +1771,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         } else {
                             true
                         };
-                        if explain_ok && compat_ok {
+                        if explain_ok && be_log_ok {
                             if !ctx.verify_enabled {
                                 let _ = writeln!(
                                     log,
@@ -1901,7 +1875,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 ctx.query_timeout,
                                 &step.sql,
                                 step.meta.db.as_deref(),
-                                compat_snapshot.evidence_deadline(),
+                                be_log_snapshot.evidence_deadline(),
                             )
                         }
                     } else if shell::is_shell_step(&step.sql) {
@@ -1962,12 +1936,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                let expected_error_compat_ok =
+                let expected_error_be_log_ok =
                     if matched_expected_error && ctx.record_from == RecordFrom::Target {
-                        match run_compat_directives_for_successful_step(
+                        match run_be_log_directives_for_successful_step(
                             step,
                             &ctx.server_handle,
-                            &compat_snapshot,
+                            &be_log_snapshot,
                             &mut log,
                         ) {
                             Ok(()) => true,
@@ -1982,7 +1956,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     };
 
                 if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
-                    if matched_expected_error && expected_error_compat_ok {
+                    if matched_expected_error && expected_error_be_log_ok {
                         let _ = writeln!(
                             log,
                             "    ✅ RECORDED EXPECTED ERROR: engine_error_code={} {}",
@@ -1993,7 +1967,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = writeln!(log, "    ❌ {}", last_failure);
                     }
                 } else if step.meta.expect_error.is_some() {
-                    if matched_expected_error && expected_error_compat_ok {
+                    if matched_expected_error && expected_error_be_log_ok {
                         let _ = writeln!(log, "    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
                     } else {
                         case_failed = true;
@@ -2025,11 +1999,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
-                        let compat_ok = if ctx.record_from == RecordFrom::Target {
-                            match run_compat_directives_for_successful_step(
+                        let be_log_ok = if ctx.record_from == RecordFrom::Target {
+                            match run_be_log_directives_for_successful_step(
                                 step,
                                 &ctx.server_handle,
-                                &compat_snapshot,
+                                &be_log_snapshot,
                                 &mut log,
                             ) {
                                 Ok(()) => true,
@@ -2043,7 +2017,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             true
                         };
                         // @explain_*: validate during record too.
-                        let explain_ok = compat_ok
+                        let explain_ok = be_log_ok
                             && if !step.meta.explain_contains.is_empty()
                                 || !step.meta.explain_not_contains.is_empty()
                             {
@@ -2118,7 +2092,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
-                            compat_snapshot.evidence_deadline(),
+                            be_log_snapshot.evidence_deadline(),
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
@@ -2179,7 +2153,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
-                            compat_snapshot.evidence_deadline(),
+                            be_log_snapshot.evidence_deadline(),
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
@@ -2235,7 +2209,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             ctx.query_timeout,
                             &step.sql,
                             step.meta.db.as_deref(),
-                            compat_snapshot.evidence_deadline(),
+                            be_log_snapshot.evidence_deadline(),
                         )
                     };
                     if !ok_t || execution_t.is_none() {
@@ -2854,22 +2828,8 @@ fn run() -> Result<i32> {
             return Ok(1);
         }
     };
-    let selected_manifest = &suite_configs
-        .get(&suite_names[0])
-        .expect("selected suite exists")
-        .manifest;
-    let (selected_cluster_mode, selected_cluster_size) = match resolve_selected_cluster(
-        selected_manifest.server_mode,
-        selected_manifest.cluster_size,
-        cli.cluster_mode,
-        cli.cluster_size,
-    ) {
-        Ok(selection) => selection,
-        Err(error) => {
-            println!("❌ ERROR: {error}");
-            return Ok(1);
-        }
-    };
+    let selected_cluster_mode = cli.cluster_mode;
+    let selected_cluster_size = cli.cluster_size.unwrap_or(1);
     if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
         println!("❌ ERROR: {error}");
         return Ok(1);
@@ -2921,17 +2881,11 @@ fn run() -> Result<i32> {
     } else {
         selected_cluster_size
     };
-    let compat_artifact = if launch_cluster_mode == ClusterMode::StarRocksCompat {
-        Some(CompatArtifact::resolve_expected(&base_dir)?)
-    } else {
-        None
-    };
     let server_handle = launch_server(
         launch_cluster_mode,
         launch_cluster_size,
         &base_dir,
         &runner_config,
-        compat_artifact,
         query_lifecycle_faults_enabled,
     )?;
     let launched_target_port = server_handle.target_port();
@@ -3181,7 +3135,7 @@ fn run() -> Result<i32> {
 
             for case in &cases {
                 for step in &case.steps {
-                    if let Err(error) = compat_directive::validate_record_source(
+                    if let Err(error) = be_log_directive::validate_record_source(
                         &step.meta,
                         cli.mode,
                         cli.record_from,
@@ -3193,7 +3147,7 @@ fn run() -> Result<i32> {
                         return Ok(1);
                     }
                     if let Err(error) =
-                        compat_directive::validate_execution_mode(&step.meta, cli.mode)
+                        be_log_directive::validate_execution_mode(&step.meta, cli.mode)
                     {
                         println!(
                             "❌ ERROR: suite {} case {} step {}: {error}",
@@ -3202,7 +3156,7 @@ fn run() -> Result<i32> {
                         return Ok(1);
                     }
                     if let Err(error) =
-                        compat_directive::validate_mode(&step.meta, selected_cluster_mode)
+                        be_log_directive::validate_mode(&step.meta, selected_cluster_mode)
                     {
                         println!(
                             "❌ ERROR: suite {} case {} step {}: {error}",
@@ -3287,7 +3241,6 @@ fn run() -> Result<i32> {
                 match selected_cluster_mode {
                     ClusterMode::AllInOne => "all-in-one",
                     ClusterMode::CrossProcess => "cross-process",
-                    ClusterMode::StarRocksCompat => "starrocks-compat",
                 }
             );
             println!("sql_dir={}", sql_dir.display());
@@ -3817,11 +3770,9 @@ mod tests {
         assert_eq!(annotate_failure_with_engine_error_code(msg, msg), msg);
     }
 
-    struct MissingCompatEvidenceServer {
-        endpoints: Vec<crate::types::CompatBeEndpoint>,
-    }
+    struct MissingBeLogEvidenceServer;
 
-    impl crate::cluster::ServerHandle for MissingCompatEvidenceServer {
+    impl crate::cluster::ServerHandle for MissingBeLogEvidenceServer {
         fn target_host(&self) -> Option<&str> {
             Some("127.0.0.1")
         }
@@ -3830,8 +3781,8 @@ mod tests {
             Some(9030)
         }
 
-        fn be_endpoints(&self) -> &[crate::types::CompatBeEndpoint] {
-            &self.endpoints
+        fn be_count(&self) -> usize {
+            1
         }
 
         fn be_log_count(&self, _index: usize, _needle: &str) -> anyhow::Result<usize> {
@@ -3840,28 +3791,18 @@ mod tests {
     }
 
     #[test]
-    fn expected_error_compat_directive_failure_prevents_pass_marker() {
+    fn expected_error_be_log_directive_failure_prevents_pass_marker() {
         let step = SqlStep {
             query_number: 1,
             sql: "SELECT rejected".to_string(),
             meta: QueryMeta {
                 expect_error: Some("planned rejection".to_string()),
-                be_log_contains: vec!["compat_ingress rejected".to_string()],
+                be_log_contains: vec!["be_log_ingress rejected".to_string()],
                 ..QueryMeta::default()
             },
         };
         let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
-            Arc::new(Mutex::new(Box::new(MissingCompatEvidenceServer {
-                endpoints: vec![crate::types::CompatBeEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    heartbeat_port: 19050,
-                    be_port: 19060,
-                    brpc_port: 18060,
-                    http_port: 18040,
-                    grpc_port: 18070,
-                    starlet_port: 19070,
-                }],
-            })));
+            Arc::new(Mutex::new(Box::new(MissingBeLogEvidenceServer)));
         let mut log = String::new();
 
         let passed = finish_expected_error_step(
@@ -3869,18 +3810,18 @@ mod tests {
             true,
             "planned rejection",
             &server_handle,
-            &crate::compat_directive::BeLogSnapshot::default(),
+            &crate::be_log_directive::BeLogSnapshot::default(),
             &mut log,
         );
 
         assert!(!passed, "directive failure must fail the step");
-        assert!(log.contains("compatibility directive failed"), "{log}");
+        assert!(log.contains("BE log directive failed"), "{log}");
         assert!(!log.contains("PASS (expected error matched)"), "{log}");
     }
 
-    struct PresentCompatEvidenceServer(MissingCompatEvidenceServer);
+    struct PresentBeLogEvidenceServer(MissingBeLogEvidenceServer);
 
-    impl crate::cluster::ServerHandle for PresentCompatEvidenceServer {
+    impl crate::cluster::ServerHandle for PresentBeLogEvidenceServer {
         fn target_host(&self) -> Option<&str> {
             self.0.target_host()
         }
@@ -3889,8 +3830,8 @@ mod tests {
             self.0.target_port()
         }
 
-        fn be_endpoints(&self) -> &[crate::types::CompatBeEndpoint] {
-            self.0.be_endpoints()
+        fn be_count(&self) -> usize {
+            self.0.be_count()
         }
 
         fn be_log_count(&self, _index: usize, _needle: &str) -> anyhow::Result<usize> {
@@ -3899,29 +3840,19 @@ mod tests {
     }
 
     #[test]
-    fn expected_error_runs_compat_directives_before_pass_marker() {
+    fn expected_error_runs_be_log_directives_before_pass_marker() {
         let step = SqlStep {
             query_number: 1,
             sql: "SELECT rejected".to_string(),
             meta: QueryMeta {
                 expect_error_code: Some("ProtocolDecodeError".to_string()),
-                be_log_contains: vec!["compat_ingress rejected".to_string()],
+                be_log_contains: vec!["be_log_ingress rejected".to_string()],
                 ..QueryMeta::default()
             },
         };
         let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
-            Arc::new(Mutex::new(Box::new(PresentCompatEvidenceServer(
-                MissingCompatEvidenceServer {
-                    endpoints: vec![crate::types::CompatBeEndpoint {
-                        host: "127.0.0.1".to_string(),
-                        heartbeat_port: 19050,
-                        be_port: 19060,
-                        brpc_port: 18060,
-                        http_port: 18040,
-                        grpc_port: 18070,
-                        starlet_port: 19070,
-                    }],
-                },
+            Arc::new(Mutex::new(Box::new(PresentBeLogEvidenceServer(
+                MissingBeLogEvidenceServer,
             ))));
         let mut log = String::new();
 
@@ -3930,7 +3861,7 @@ mod tests {
             true,
             "[ProtocolDecodeError] planned rejection",
             &server_handle,
-            &crate::compat_directive::BeLogSnapshot::default(),
+            &crate::be_log_directive::BeLogSnapshot::default(),
             &mut log,
         ));
 
@@ -4076,59 +4007,6 @@ mod tests {
             "cross-process",
         ]);
         assert_eq!(cli.cluster_mode, ClusterMode::CrossProcess);
-    }
-
-    #[test]
-    fn cli_cannot_select_internal_starrocks_compat_cluster_mode() {
-        let error = Cli::try_parse_from([
-            "sql-tests",
-            "--suite",
-            "ssb",
-            "--cluster-mode",
-            "star-rocks-compat",
-        ])
-        .expect_err("internal compatibility mode must not be a CLI escape hatch");
-        let message = error.to_string();
-        assert!(
-            message.contains("[possible values: all-in-one, cross-process]"),
-            "hidden mode leaked into CLI choices: {message}"
-        );
-    }
-
-    #[test]
-    fn selected_cluster_is_manifest_driven_for_starrocks_compat() {
-        let native = super::resolve_selected_cluster(
-            crate::suite_manifest::SuiteServerMode::Native,
-            1,
-            crate::cluster::ClusterMode::CrossProcess,
-            Some(2),
-        )
-        .expect("native CLI selection");
-        assert_eq!(native, (crate::cluster::ClusterMode::CrossProcess, 2));
-
-        for override_size in [None, Some(3)] {
-            let compat = super::resolve_selected_cluster(
-                crate::suite_manifest::SuiteServerMode::StarRocksCompat,
-                3,
-                crate::cluster::ClusterMode::AllInOne,
-                override_size,
-            )
-            .expect("manifest-selected compatibility cluster");
-            assert_eq!(compat, (crate::cluster::ClusterMode::StarRocksCompat, 3));
-        }
-        let error = super::resolve_selected_cluster(
-            crate::suite_manifest::SuiteServerMode::StarRocksCompat,
-            3,
-            crate::cluster::ClusterMode::CrossProcess,
-            Some(2),
-        )
-        .expect_err("compatibility cluster size override must be exactly three");
-        assert!(
-            error
-                .to_string()
-                .contains("starrocks-compat mode requires --cluster-size 3"),
-            "{error:#}"
-        );
     }
 
     struct CleanupFailureServer;

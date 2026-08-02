@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::compat_artifact::CompatArtifact;
 use crate::managed_process::{ManagedProcess, ReadyMarker};
-use crate::starrocks_compat_cluster::StarRocksCompatServerHandle;
-use crate::types::{CompatBeEndpoint, QueryLifecyclePhase, RunnerConfig};
+use crate::types::{QueryLifecyclePhase, RunnerConfig};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use mysql::prelude::Queryable;
@@ -38,8 +36,6 @@ use toml::Value;
 pub(crate) enum ClusterMode {
     AllInOne,
     CrossProcess,
-    #[value(skip)]
-    StarRocksCompat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,7 +616,7 @@ pub(crate) trait ServerHandle: Send {
         )
     }
     fn be_count(&self) -> usize {
-        self.be_endpoints().len()
+        0
     }
     fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
         bail!("scheduled fragment telemetry is unsupported by this server mode (index={index})")
@@ -645,10 +641,6 @@ pub(crate) trait ServerHandle: Send {
         bail!("fragment failure token is unsupported by this server mode (index={index})")
     }
     #[allow(dead_code)]
-    fn be_endpoints(&self) -> &[CompatBeEndpoint] {
-        &[]
-    }
-    #[allow(dead_code)]
     fn assert_be_log(&self, index: usize, _needle: &str) -> Result<()> {
         bail!("BE log assertions are unsupported by this server mode (index={index})")
     }
@@ -666,9 +658,6 @@ pub(crate) trait ServerHandle: Send {
         self.be_log_contents(index)
     }
     #[allow(dead_code)]
-    fn run_compat_probe(&self, probe: &str, _endpoint: &CompatBeEndpoint) -> Result<()> {
-        bail!("compatibility probes are unsupported by this server mode (probe={probe})")
-    }
     fn residual_process_ids(&self) -> Vec<u32> {
         Vec::new()
     }
@@ -682,7 +671,6 @@ pub(crate) fn launch_server(
     cluster_size: usize,
     repo_root: &Path,
     runner_config: &RunnerConfig,
-    compat_artifact: Option<CompatArtifact>,
     query_lifecycle_faults_enabled: bool,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
@@ -693,16 +681,6 @@ pub(crate) fn launch_server(
             runner_config,
             query_lifecycle_faults_enabled,
         )?)),
-        ClusterMode::StarRocksCompat => {
-            let artifact = compat_artifact.context(
-                "StarRocks compatibility cluster requires a proven compatibility artifact",
-            )?;
-            Ok(Box::new(StarRocksCompatServerHandle::launch(
-                repo_root,
-                runner_config,
-                artifact,
-            )?))
-        }
     }
 }
 
@@ -714,12 +692,6 @@ pub(crate) fn validate_cluster_args(mode: ClusterMode, cluster_size: usize) -> R
     if mode == ClusterMode::AllInOne && cluster_size > 1 {
         bail!(
             "all-in-one mode requires --cluster-size 1 (got {})",
-            cluster_size
-        );
-    }
-    if mode == ClusterMode::StarRocksCompat && cluster_size != 3 {
-        bail!(
-            "starrocks-compat mode requires --cluster-size 3 (got {})",
             cluster_size
         );
     }
@@ -3630,22 +3602,6 @@ exec_node_output = true
     fn validate_cluster_args_cross_process_size_2_ok() {
         validate_cluster_args(ClusterMode::CrossProcess, 2)
             .expect("cluster_size=2 should be valid for cross-process");
-    }
-
-    #[test]
-    fn validate_cluster_args_starrocks_compat_requires_exactly_three() {
-        validate_cluster_args(ClusterMode::StarRocksCompat, 3)
-            .expect("starrocks-compat requires exactly three BEs");
-        for invalid in [1, 2, 4] {
-            let error = validate_cluster_args(ClusterMode::StarRocksCompat, invalid)
-                .expect_err("non-three compatibility topology must fail");
-            assert!(
-                error
-                    .to_string()
-                    .contains("starrocks-compat mode requires --cluster-size 3"),
-                "{error:#}"
-            );
-        }
     }
 
     #[test]

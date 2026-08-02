@@ -1701,12 +1701,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "libc",
  "mysql",
  "rayon",
  "regex",
  "serde",
- "sha2",
  "toml",
 ]
 

@@ -1,8 +1,0 @@
--- query 3
-scalar_value
-1
-
--- query 8
-k	v	label
-1	10	one
-3	30	three

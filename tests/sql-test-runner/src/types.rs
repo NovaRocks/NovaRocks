@@ -153,8 +153,6 @@ pub struct QueryMeta {
     /// The value is the exact number of runner-owned BE logs that must contribute
     /// at least one accepted fragment for that query.
     pub be_log_exact_fragment_cancellation: Option<usize>,
-    /// Run a fresh external BRPC negative compatibility fixture after the SQL step.
-    pub compat_probes: Vec<String>,
 }
 
 /// Runner-visible QLC-3 startup boundaries. The backend and frontend consume
@@ -200,10 +198,6 @@ impl QueryMeta {
             || !self.be_log_be_count_at_least.is_empty()
             || self.be_log_exact_fragment_cancellation.is_some()
     }
-
-    pub fn has_compat_directives(&self) -> bool {
-        self.has_be_log_directives() || !self.compat_probes.is_empty()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,16 +232,6 @@ pub struct ConnectionConfig {
     pub db: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompatBeEndpoint {
-    pub host: String,
-    pub heartbeat_port: u16,
-    pub be_port: u16,
-    pub brpc_port: u16,
-    pub http_port: u16,
-    pub grpc_port: u16,
-    pub starlet_port: u16,
-}
 
 #[derive(Debug, Clone)]
 pub struct QueryExecution {

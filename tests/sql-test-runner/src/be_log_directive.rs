@@ -30,39 +30,20 @@ const LOG_EVIDENCE_TIMEOUT: Duration = Duration::from_millis(200);
 const LOG_EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const QUERY_LIFECYCLE_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
-const COMPAT_PROBES: &[&str] = &[
-    "malformed-plan",
-    "malformed-batch-plan",
-    "malformed-chunk",
-    "malformed-runtime-filter",
-    "malformed-lookup",
-    "terminal-fetch",
-    "stream-load",
-    "transaction-load",
-];
-
 pub(crate) fn has_directives(meta: &QueryMeta) -> bool {
-    meta.has_compat_directives()
+    meta.has_be_log_directives()
 }
 
 pub(crate) fn validate_mode(meta: &QueryMeta, mode: ClusterMode) -> Result<()> {
     if meta.has_be_log_directives() && mode == ClusterMode::AllInOne {
         bail!("BE log evidence directives require a runner-owned cross-process cluster");
     }
-    if !meta.compat_probes.is_empty() && mode != ClusterMode::StarRocksCompat {
-        bail!("compatibility probes require starrocks-compat mode");
-    }
-    for probe in &meta.compat_probes {
-        if !COMPAT_PROBES.contains(&probe.as_str()) {
-            bail!("unknown compatibility probe: {probe}");
-        }
-    }
     Ok(())
 }
 
 pub(crate) fn validate_execution_mode(meta: &QueryMeta, mode: Mode) -> Result<()> {
     if has_directives(meta) && !matches!(mode, Mode::Verify | Mode::Record) {
-        bail!("compatibility directives require verify or record mode (got {mode:?})");
+        bail!("BE log directives require verify or record mode (got {mode:?})");
     }
     Ok(())
 }
@@ -73,7 +54,7 @@ pub(crate) fn validate_record_source(
     record_from: RecordFrom,
 ) -> Result<()> {
     if has_directives(meta) && mode == Mode::Record && record_from == RecordFrom::Reference {
-        bail!("compatibility directives cannot run with record-from=reference");
+        bail!("BE log directives cannot run with record-from=reference");
     }
     Ok(())
 }
@@ -743,8 +724,8 @@ fn exact_fragment_cancellation_evidence(
     if acknowledgements_total == 0 {
         // Native QLC-4 stops final ReportExecStatus delivery. Its terminal
         // acknowledgement is query-scoped, immutable, and can arrive through
-        // either the stream or unary fallback. Compat continues to use the
-        // fragment-scoped legacy marker above.
+        // either the stream or unary fallback. The legacy marker above remains
+        // available for older native lifecycle evidence.
         let terminal_acks = logs
             .iter()
             .map(|log| parse_query_terminal_ack_markers(log))
@@ -1026,52 +1007,25 @@ pub(crate) fn run(
         }
     }
 
-    if !step.meta.compat_probes.is_empty() {
-        let endpoint = server_handle
-            .be_endpoints()
-            .first()
-            .context("compatibility probe requires a real BE BRPC endpoint")?;
-        for probe in &step.meta.compat_probes {
-            server_handle.run_compat_probe(probe, endpoint)?;
-            let _ = writeln!(log, "    @compat_probe PASS probe={probe}");
-        }
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CompatBeEndpoint, QueryMeta, SqlStep};
+    use crate::types::{QueryMeta, SqlStep};
     use anyhow::{Result, bail};
     use std::sync::{Arc, Mutex};
 
-    struct FakeCompatHandle {
-        endpoints: Vec<CompatBeEndpoint>,
+    struct FakeBeLogHandle {
         logs: Mutex<Vec<String>>,
-        probes: Mutex<Vec<(String, String, u16)>>,
         fragment_failure_token: Option<String>,
     }
 
-    impl FakeCompatHandle {
+    impl FakeBeLogHandle {
         fn new(logs: Vec<&str>) -> Self {
-            let endpoints = logs
-                .iter()
-                .enumerate()
-                .map(|(index, _)| CompatBeEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    heartbeat_port: 19050 + index as u16,
-                    be_port: 19060 + index as u16,
-                    brpc_port: 18060 + index as u16,
-                    http_port: 18040 + index as u16,
-                    grpc_port: 18070 + index as u16,
-                    starlet_port: 19070 + index as u16,
-                })
-                .collect();
             Self {
-                endpoints,
                 logs: Mutex::new(logs.into_iter().map(ToString::to_string).collect()),
-                probes: Mutex::new(Vec::new()),
                 fragment_failure_token: None,
             }
         }
@@ -1086,7 +1040,7 @@ mod tests {
         }
     }
 
-    impl ServerHandle for FakeCompatHandle {
+    impl ServerHandle for FakeBeLogHandle {
         fn target_host(&self) -> Option<&str> {
             Some("127.0.0.1")
         }
@@ -1095,8 +1049,8 @@ mod tests {
             Some(9030)
         }
 
-        fn be_endpoints(&self) -> &[CompatBeEndpoint] {
-            &self.endpoints
+        fn be_count(&self) -> usize {
+            self.logs.lock().expect("logs lock").len()
         }
 
         fn be_log_count(&self, index: usize, needle: &str) -> Result<usize> {
@@ -1121,22 +1075,10 @@ mod tests {
         }
 
         fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
-            if index >= self.endpoints.len() {
+            if index >= self.logs.lock().expect("logs lock").len() {
                 bail!("missing fake BE {index}");
             }
             Ok(self.fragment_failure_token.clone())
-        }
-
-        fn run_compat_probe(&self, probe: &str, endpoint: &CompatBeEndpoint) -> Result<()> {
-            if endpoint.brpc_port == 0 {
-                bail!("fake BRPC endpoint is invalid");
-            }
-            self.probes.lock().expect("probe lock").push((
-                probe.to_string(),
-                endpoint.host.clone(),
-                endpoint.brpc_port,
-            ));
-            Ok(())
         }
     }
 
@@ -1149,46 +1091,28 @@ mod tests {
     }
 
     #[test]
-    fn compat_directive_mode_rejects_native_and_all_in_one() {
+    fn be_log_directive_allows_record_but_rejects_diff_mode() {
         let meta = QueryMeta {
-            compat_probes: vec!["malformed-runtime-filter".to_string()],
-            ..QueryMeta::default()
-        };
-
-        for mode in [ClusterMode::CrossProcess, ClusterMode::AllInOne] {
-            let error = validate_mode(&meta, mode).expect_err("native modes must reject probes");
-            assert!(
-                error.to_string().contains("require starrocks-compat mode"),
-                "unexpected error for {mode:?}: {error:#}"
-            );
-        }
-        validate_mode(&meta, ClusterMode::StarRocksCompat)
-            .expect("starrocks-compat mode must allow probes");
-    }
-
-    #[test]
-    fn compat_directive_allows_record_but_rejects_diff_mode() {
-        let meta = QueryMeta {
-            be_log_contains: vec!["compat_ingress".to_string()],
+            be_log_contains: vec!["be_log_ingress".to_string()],
             ..QueryMeta::default()
         };
 
         validate_execution_mode(&meta, Mode::Record)
-            .expect("record mode writes goldens before verify executes compatibility directives");
+            .expect("record mode writes goldens before verify executes BE log directives");
         let error = validate_execution_mode(&meta, Mode::Diff)
-            .expect_err("diff mode must not silently skip compatibility directives");
+            .expect_err("diff mode must not silently skip BE log directives");
         assert!(
             error
                 .to_string()
-                .contains("compatibility directives require verify or record mode"),
+                .contains("BE log directives require verify or record mode"),
             "unexpected error: {error:#}"
         );
         validate_execution_mode(&meta, Mode::Verify)
-            .expect("verify mode must execute compatibility directives");
+            .expect("verify mode must execute BE log directives");
     }
 
     #[test]
-    fn native_cross_process_mode_allows_be_log_evidence_without_compat_probes() {
+    fn native_cross_process_mode_allows_be_log_evidence() {
         let meta = QueryMeta {
             be_log_contains: vec!["NOVAROCKS_FAILED_FRAGMENT_REPORT_ACK".to_string()],
             ..QueryMeta::default()
@@ -1196,21 +1120,19 @@ mod tests {
 
         validate_mode(&meta, ClusterMode::CrossProcess)
             .expect("runner-owned native BE logs must support evidence directives");
-        validate_mode(&meta, ClusterMode::StarRocksCompat)
-            .expect("compat BE logs must remain supported");
         validate_mode(&meta, ClusterMode::AllInOne)
             .expect_err("all-in-one has no runner-owned BE logs");
     }
 
     #[test]
-    fn compat_directive_rejects_reference_recording() {
+    fn be_log_directive_rejects_reference_recording() {
         let meta = QueryMeta {
-            be_log_contains: vec!["compat_ingress".to_string()],
+            be_log_contains: vec!["be_log_ingress".to_string()],
             ..QueryMeta::default()
         };
 
         validate_record_source(&meta, Mode::Record, RecordFrom::Target)
-            .expect("target recording can collect compatibility evidence");
+            .expect("target recording can collect BE log evidence");
         let error = validate_record_source(&meta, Mode::Record, RecordFrom::Reference)
             .expect_err("reference recording cannot collect target BE evidence");
 
@@ -1218,23 +1140,23 @@ mod tests {
     }
 
     #[test]
-    fn compat_directive_inspects_all_be_logs_and_sums_occurrences() {
-        let handle = FakeCompatHandle::new(vec!["old compat_ingress\n", "", "unrelated\n"]);
+    fn be_log_directive_inspects_all_be_logs_and_sums_occurrences() {
+        let handle = FakeBeLogHandle::new(vec!["old be_log_ingress\n", "", "unrelated\n"]);
         let step = step(QueryMeta {
-            be_log_contains: vec!["compat_ingress".to_string()],
+            be_log_contains: vec!["be_log_ingress".to_string()],
             be_log_count_at_least: vec![("runtime_filter_receive".to_string(), 3)],
             be_log_be_count_at_least: vec![("runtime_filter_receive".to_string(), 2)],
             ..QueryMeta::default()
         });
         let mut log = String::new();
         let before = snapshot(&step.meta, &handle).expect("pre-step snapshot");
-        handle.append_log(0, "compat_ingress\nruntime_filter_receive\n");
+        handle.append_log(0, "be_log_ingress\nruntime_filter_receive\n");
         handle.append_log(1, "runtime_filter_receive\nruntime_filter_receive\n");
 
         run(&step, &handle, &before, &mut log)
             .expect("directives should inspect post-step deltas across every BE log");
 
-        assert!(log.contains("@be_log_contains PASS pattern=\"compat_ingress\""));
+        assert!(log.contains("@be_log_contains PASS pattern=\"be_log_ingress\""));
         assert!(log.contains(
             "@be_log_count_at_least PASS pattern=\"runtime_filter_receive\" actual=3 required=3"
         ));
@@ -1245,7 +1167,7 @@ mod tests {
 
     #[test]
     fn negative_log_directive_is_scoped_to_post_step_delta() {
-        let handle = FakeCompatHandle::new(vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED old\n", "", ""]);
+        let handle = FakeBeLogHandle::new(vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED old\n", "", ""]);
         let step = step(QueryMeta {
             be_log_not_contains: vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string()],
             ..QueryMeta::default()
@@ -1263,7 +1185,7 @@ mod tests {
 
     #[test]
     fn negative_log_directive_rejects_post_step_marker() {
-        let handle = FakeCompatHandle::new(vec!["", "", ""]);
+        let handle = FakeBeLogHandle::new(vec!["", "", ""]);
         let step = step(QueryMeta {
             be_log_not_contains: vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string()],
             ..QueryMeta::default()
@@ -1282,7 +1204,7 @@ mod tests {
 
     #[test]
     fn exact_injected_query_cancellation_compares_per_be_identity_multisets() {
-        let handle = FakeCompatHandle::new(vec![
+        let handle = FakeBeLogHandle::new(vec![
             "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=1:2:1 backend_id=0 finst_id=00000000-0000-0003-0000-000000000004\n",
             "",
             "",
@@ -1326,7 +1248,7 @@ mod tests {
     #[test]
     fn exact_injected_query_cancellation_accepts_native_terminal_ack() {
         let handle =
-            FakeCompatHandle::new(vec!["", "", ""]).with_fragment_failure_token("terminal-token");
+            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("terminal-token");
         let step = step(QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             be_log_exact_fragment_cancellation: Some(3),
@@ -1353,7 +1275,7 @@ mod tests {
     #[test]
     fn exact_injected_query_cancellation_rejects_equal_counts_with_wrong_identity() {
         let handle =
-            FakeCompatHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
+            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
         let step = step(QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             be_log_exact_fragment_cancellation: Some(3),
@@ -1386,7 +1308,7 @@ mod tests {
     #[test]
     fn exact_injected_query_cancellation_compares_each_be_not_only_global_identity() {
         let handle =
-            FakeCompatHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
+            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
         let step = step(QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             be_log_exact_fragment_cancellation: Some(3),
@@ -1418,7 +1340,7 @@ mod tests {
     #[test]
     fn exact_injected_query_cancellation_binds_failure_and_ack_to_the_same_be() {
         let handle =
-            FakeCompatHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
+            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
         let step = step(QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             be_log_exact_fragment_cancellation: Some(3),
@@ -1448,7 +1370,7 @@ mod tests {
     #[test]
     fn exact_injected_query_cancellation_rejects_duplicate_identity_evidence() {
         let handle =
-            FakeCompatHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
+            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
         let step = step(QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             be_log_exact_fragment_cancellation: Some(3),
@@ -1481,7 +1403,7 @@ mod tests {
 
     #[test]
     fn exact_injected_query_cancellation_requires_declared_be_coverage() {
-        let handle = FakeCompatHandle::new(vec!["", ""]).with_fragment_failure_token("step-token");
+        let handle = FakeBeLogHandle::new(vec!["", ""]).with_fragment_failure_token("step-token");
         let step = step(QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             be_log_exact_fragment_cancellation: Some(3),
@@ -1498,7 +1420,7 @@ mod tests {
     #[test]
     fn exact_injected_query_cancellation_rejects_malformed_markers() {
         let handle =
-            FakeCompatHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
+            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
         let step = step(QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             be_log_exact_fragment_cancellation: Some(3),
@@ -1526,38 +1448,8 @@ mod tests {
     }
 
     #[test]
-    fn compat_directive_runs_each_probe_once_against_a_real_be_endpoint() {
-        let handle = FakeCompatHandle::new(vec!["ready", "ready", "ready"]);
-        let step = step(QueryMeta {
-            compat_probes: vec![
-                "malformed-runtime-filter".to_string(),
-                "terminal-fetch".to_string(),
-            ],
-            ..QueryMeta::default()
-        });
-        let mut log = String::new();
-        let before = snapshot(&step.meta, &handle).expect("pre-step snapshot");
-
-        run(&step, &handle, &before, &mut log).expect("probes should pass");
-
-        assert_eq!(
-            *handle.probes.lock().expect("probe lock"),
-            vec![
-                (
-                    "malformed-runtime-filter".to_string(),
-                    "127.0.0.1".to_string(),
-                    18060,
-                ),
-                ("terminal-fetch".to_string(), "127.0.0.1".to_string(), 18060,),
-            ]
-        );
-        assert!(log.contains("@compat_probe PASS probe=malformed-runtime-filter"));
-        assert!(log.contains("@compat_probe PASS probe=terminal-fetch"));
-    }
-
-    #[test]
     fn post_query_fragment_fault_starts_the_shared_evidence_deadline_before_execution() {
-        let handle = FakeCompatHandle::new(vec!["", "", ""]);
+        let handle = FakeBeLogHandle::new(vec!["", "", ""]);
         let meta = QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             ..QueryMeta::default()
@@ -1570,7 +1462,7 @@ mod tests {
 
     #[test]
     fn expired_shared_deadline_rejects_otherwise_satisfied_log_evidence() {
-        let handle = FakeCompatHandle::new(vec!["fresh-marker\n", "", ""]);
+        let handle = FakeBeLogHandle::new(vec!["fresh-marker\n", "", ""]);
         let step = step(QueryMeta {
             be_log_contains: vec!["fresh-marker".to_string()],
             ..QueryMeta::default()
@@ -1588,8 +1480,8 @@ mod tests {
     }
 
     #[test]
-    fn compat_directive_polls_bounded_post_step_deltas_for_async_evidence() {
-        let handle = Arc::new(FakeCompatHandle::new(vec!["old close\n", "", ""]));
+    fn be_log_directive_polls_bounded_post_step_deltas_for_async_evidence() {
+        let handle = Arc::new(FakeBeLogHandle::new(vec!["old close\n", "", ""]));
         let step = step(QueryMeta {
             be_log_be_count_at_least: vec![(
                 "lookup_close direction=receive status=ok".to_string(),
@@ -1650,9 +1542,9 @@ mod tests {
 
     #[test]
     fn stale_pre_step_log_marker_does_not_satisfy_directive() {
-        let handle = FakeCompatHandle::new(vec!["compat_ingress\n", "", ""]);
+        let handle = FakeBeLogHandle::new(vec!["be_log_ingress\n", "", ""]);
         let step = step(QueryMeta {
-            be_log_contains: vec!["compat_ingress".to_string()],
+            be_log_contains: vec!["be_log_ingress".to_string()],
             ..QueryMeta::default()
         });
         let before = snapshot(&step.meta, &handle).expect("pre-step snapshot");
@@ -1675,7 +1567,7 @@ mod tests {
         let be2 = format!(
             "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} backend_id=2 expected_fragments=0\n"
         );
-        let handle = FakeCompatHandle::new(vec![&be0, &be1, &be2]);
+        let handle = FakeBeLogHandle::new(vec![&be0, &be1, &be2]);
         let step = step(QueryMeta {
             query_control_fragment_backend_limit: Some(2),
             ..QueryMeta::default()
@@ -1700,7 +1592,7 @@ mod tests {
             terminal.replace("backend_id=0", "backend_id=1")
         );
         let be2 = terminal.replace("backend_id=0", "backend_id=2");
-        let handle = FakeCompatHandle::new(vec![&terminal, &be1, &be2]);
+        let handle = FakeBeLogHandle::new(vec![&terminal, &be1, &be2]);
         let step = step(QueryMeta {
             stop_query_control_heartbeat_be_index: Some(1),
             ..QueryMeta::default()
@@ -1723,7 +1615,7 @@ mod tests {
         let terminal = format!(
             "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={execution} backend_id=0 reason=CoordinatorStreamLost\nNOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} backend_id=0 reason=CoordinatorStreamLost expected_fragments=1\n"
         );
-        let handle = FakeCompatHandle::new(vec![
+        let handle = FakeBeLogHandle::new(vec![
             &terminal,
             &terminal.replace("backend_id=0", "backend_id=1"),
             &terminal.replace("backend_id=0", "backend_id=2"),
@@ -1746,7 +1638,7 @@ mod tests {
         let terminal = format!(
             "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} backend_id=0 reason=CoordinatorAbort expected_fragments=1\n"
         );
-        let handle = FakeCompatHandle::new(vec![
+        let handle = FakeBeLogHandle::new(vec![
             &terminal,
             &terminal.replace("backend_id=0", "backend_id=1"),
             &terminal.replace("backend_id=0", "backend_id=2"),

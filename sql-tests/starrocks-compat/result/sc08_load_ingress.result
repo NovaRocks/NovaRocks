@@ -1,8 +1,0 @@
--- query 2
-probe_status
-load ingress probes
-
--- query 3
-k	source
-7001	stream
-7002	transaction
