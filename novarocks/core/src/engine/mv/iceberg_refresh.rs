@@ -510,13 +510,30 @@ fn prepare_frontend_first_refresh_write(
         .map(|prepared| prepared.with_provenance_properties(provenance_properties));
     }
     let (shape, physical_sql) = if capabilities.has_agg_state {
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)?;
+        // A branch UNION ALL has no top-level GROUP BY. Its aggregate-state
+        // layout is defined by the first branch and CREATE-time validation
+        // guarantees the remaining branches share that layout.
+        let aggregate_query = if schema_contract.branch.is_some() {
+            crate::mv::rewrite::context::first_union_branch_query(&query)?
+        } else {
+            query.clone()
+        };
+        let calls = crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+            &aggregate_query,
+        )?;
+        // The analyzer attaches aggregate input types to a SELECT body.  A
+        // top-level branch UNION has no such body, while the first branch has
+        // the validated representative aggregate layout.
+        let aggregate_layout_sql = if schema_contract.branch.is_some() {
+            aggregate_query.to_string()
+        } else {
+            definition.select_sql.clone()
+        };
         let aggregate_layout = build_aggregate_layout_for_refresh_select_sql(
             state,
             current_catalog,
             current_database,
-            &definition.select_sql,
+            &aggregate_layout_sql,
             &calls,
             &connector_context,
         )?;

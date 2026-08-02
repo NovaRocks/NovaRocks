@@ -376,7 +376,7 @@ fn is_union_all_query(query: &sqlparser::ast::Query) -> bool {
 /// The first UNION ALL branch as a standalone `Query` (keeps the branch's own
 /// FROM — a scan, a join, or a fan-in union). Works off the AST so a composed
 /// branch is not classified.
-fn first_union_branch_query(
+pub(crate) fn first_union_branch_query(
     query: &sqlparser::ast::Query,
 ) -> Result<sqlparser::ast::Query, String> {
     fn first_branch_body(
