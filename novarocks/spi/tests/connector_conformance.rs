@@ -35,13 +35,14 @@ use novarocks_spi::connector::{
     ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPredicateDisposition,
     ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
     ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType,
-    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
-    ConnectorStatistics, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableRequest, ExternalMutationOutcome, StatisticsEvidence, StatisticsReadRequest,
+    ConnectorReadExecution, ConnectorReaderMetricsSnapshot, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateColumn,
+    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStatistics,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ExternalMutationOutcome, StatisticsEvidence, StatisticsReadRequest,
     normalize_predicate_dispositions, validate_static_predicates,
 };
 
@@ -77,6 +78,7 @@ impl ConnectorReadExecution for OwnerExecution {
             vec![ConnectorPreparedScanUnitDescriptor::try_new(
                 bytes::Bytes::from_static(b"owner-test-unit"),
                 split.estimated_bytes(),
+                missing_facts(),
             )?],
             &request,
         )
@@ -140,8 +142,13 @@ fn prepared_unit(
     ConnectorPreparedScanUnitDescriptor::try_new(
         bytes::Bytes::from_static(payload),
         estimated_bytes,
+        missing_facts(),
     )
     .expect("non-empty prepared unit")
+}
+
+fn missing_facts() -> ConnectorScanUnitDomainFacts {
+    ConnectorScanUnitDomainFacts::missing(ConnectorScanUnitFactsMissingReason::ProviderUnsupported)
 }
 
 fn prepared_split(
@@ -176,11 +183,13 @@ fn prepared_unit_set_is_sealed_bounded_and_cost_exact() {
             ConnectorPreparedScanUnitDescriptor::try_new(
                 bytes::Bytes::from_static(b"first"),
                 Some(4),
+                missing_facts(),
             )
             .expect("first unit"),
             ConnectorPreparedScanUnitDescriptor::try_new(
                 bytes::Bytes::from_static(b"second"),
                 Some(7),
+                missing_facts(),
             )
             .expect("second unit"),
         ],
@@ -201,6 +210,83 @@ fn prepared_unit_set_is_sealed_bounded_and_cost_exact() {
         [Some(4), Some(7)]
     );
     assert_eq!(set.membership_digest().len(), 32);
+    assert_eq!(
+        set.units()
+            .next()
+            .expect("first unit")
+            .domain_facts()
+            .missing_reason(),
+        Some(ConnectorScanUnitFactsMissingReason::ProviderUnsupported)
+    );
+}
+
+#[test]
+fn prepared_unit_facts_are_sealed_but_do_not_redefine_membership_identity() {
+    let execution = OwnerExecution::new("file");
+    let split = prepared_split(&execution, "split-a", Some(1));
+    let exact = ConnectorScanUnitDomainFacts::available(
+        1,
+        novarocks_spi::connector::ConnectorScanUnitFactsEvidence::Exact,
+        vec![
+            novarocks_spi::connector::ConnectorScanUnitColumnDomain::try_range(
+                novarocks_spi::connector::ConnectorScanUnitColumn::new(
+                    0,
+                    ConnectorScalarType::Int32,
+                    false,
+                ),
+                ConnectorScalarValue::Int32(7),
+                ConnectorScalarValue::Int32(7),
+                0,
+                1,
+            )
+            .expect("range"),
+        ],
+    )
+    .expect("available facts");
+    let missing = missing_facts();
+    let with_exact = ConnectorPreparedScanUnitSet::try_new(
+        execution.key.clone(),
+        &split,
+        bytes::Bytes::new(),
+        vec![
+            ConnectorPreparedScanUnitDescriptor::try_new(
+                bytes::Bytes::from_static(b"unit"),
+                Some(1),
+                exact.clone(),
+            )
+            .expect("exact descriptor"),
+        ],
+        &preparation_request(),
+    )
+    .expect("exact set");
+    let with_missing = ConnectorPreparedScanUnitSet::try_new(
+        execution.key.clone(),
+        &split,
+        bytes::Bytes::new(),
+        vec![
+            ConnectorPreparedScanUnitDescriptor::try_new(
+                bytes::Bytes::from_static(b"unit"),
+                Some(1),
+                missing,
+            )
+            .expect("missing descriptor"),
+        ],
+        &preparation_request(),
+    )
+    .expect("missing set");
+
+    assert_eq!(
+        with_exact.membership_digest(),
+        with_missing.membership_digest()
+    );
+    assert_eq!(
+        with_exact
+            .units()
+            .next()
+            .expect("exact unit")
+            .domain_facts(),
+        &exact
+    );
 }
 
 #[test]
@@ -218,8 +304,12 @@ fn prepared_unit_set_rejects_unknown_unit_cost_for_known_split_cost() {
         &split,
         bytes::Bytes::new(),
         vec![
-            ConnectorPreparedScanUnitDescriptor::try_new(bytes::Bytes::from_static(b"unit"), None)
-                .expect("unit"),
+            ConnectorPreparedScanUnitDescriptor::try_new(
+                bytes::Bytes::from_static(b"unit"),
+                None,
+                missing_facts(),
+            )
+            .expect("unit"),
         ],
         &preparation_request(),
     )
@@ -865,12 +955,12 @@ fn static_int_predicate(id: u32) -> ConnectorStaticPredicate {
         id: ConnectorStaticPredicateId(id),
         column: ConnectorStaticPredicateColumn {
             field_ordinal: 2,
-            data_type: ConnectorStaticPredicateDataType::Int32,
+            data_type: ConnectorScalarType::Int32,
             nullable: false,
         },
         kind: ConnectorStaticPredicateKind::Comparison {
             op: ConnectorStaticComparisonOp::Ge,
-            literal: ConnectorStaticPredicateLiteral::Int32(42),
+            literal: ConnectorScalarValue::Int32(42),
         },
     }
 }
@@ -939,7 +1029,7 @@ fn static_predicate_conformance_rejects_type_mismatch_and_invalid_planning_metri
     let mut predicate = static_int_predicate(4);
     predicate.kind = ConnectorStaticPredicateKind::Comparison {
         op: ConnectorStaticComparisonOp::Eq,
-        literal: ConnectorStaticPredicateLiteral::Int64(42),
+        literal: ConnectorScalarValue::Int64(42),
     };
     assert_eq!(
         validate_static_predicates(&[predicate])

@@ -21,9 +21,9 @@
 
 use arrow::datatypes::DataType;
 use novarocks_spi::connector::{
-    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateColumn,
-    ConnectorStaticPredicateDataType, ConnectorStaticPredicateId, ConnectorStaticPredicateKind,
-    ConnectorStaticPredicateLiteral, MAX_CONNECTOR_STATIC_PREDICATES, validate_static_predicates,
+    ConnectorScalarType, ConnectorScalarValue, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateId,
+    ConnectorStaticPredicateKind, MAX_CONNECTOR_STATIC_PREDICATES, validate_static_predicates,
 };
 
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
@@ -133,7 +133,7 @@ fn lower_static_predicate(
 #[derive(Clone)]
 struct LoweredColumn {
     column: ConnectorStaticPredicateColumn,
-    data_type: ConnectorStaticPredicateDataType,
+    data_type: ConnectorScalarType,
 }
 
 fn lower_column(
@@ -199,8 +199,8 @@ fn lower_column(
 
 fn lower_literal(
     expr: &TypedExpr,
-    expected_type: ConnectorStaticPredicateDataType,
-) -> Option<ConnectorStaticPredicateLiteral> {
+    expected_type: ConnectorScalarType,
+) -> Option<ConnectorScalarValue> {
     let expr = unnest(expr);
     if expr.nullable {
         return None;
@@ -212,55 +212,49 @@ fn lower_literal(
         return None;
     };
     match (expected_type, literal) {
-        (ConnectorStaticPredicateDataType::Boolean, LiteralValue::Bool(value)) => {
-            Some(ConnectorStaticPredicateLiteral::Boolean(*value))
+        (ConnectorScalarType::Boolean, LiteralValue::Bool(value)) => {
+            Some(ConnectorScalarValue::Boolean(*value))
         }
-        (ConnectorStaticPredicateDataType::Int8, LiteralValue::Int(value)) => i8::try_from(*value)
-            .ok()
-            .map(ConnectorStaticPredicateLiteral::Int8),
-        (ConnectorStaticPredicateDataType::Int16, LiteralValue::Int(value)) => {
-            i16::try_from(*value)
-                .ok()
-                .map(ConnectorStaticPredicateLiteral::Int16)
+        (ConnectorScalarType::Int8, LiteralValue::Int(value)) => {
+            i8::try_from(*value).ok().map(ConnectorScalarValue::Int8)
         }
-        (ConnectorStaticPredicateDataType::Int32, LiteralValue::Int(value)) => {
-            i32::try_from(*value)
-                .ok()
-                .map(ConnectorStaticPredicateLiteral::Int32)
+        (ConnectorScalarType::Int16, LiteralValue::Int(value)) => {
+            i16::try_from(*value).ok().map(ConnectorScalarValue::Int16)
         }
-        (ConnectorStaticPredicateDataType::Int64, LiteralValue::Int(value)) => {
-            Some(ConnectorStaticPredicateLiteral::Int64(*value))
+        (ConnectorScalarType::Int32, LiteralValue::Int(value)) => {
+            i32::try_from(*value).ok().map(ConnectorScalarValue::Int32)
         }
-        (ConnectorStaticPredicateDataType::Date32, LiteralValue::Int(value)) => {
-            i32::try_from(*value)
-                .ok()
-                .map(ConnectorStaticPredicateLiteral::Date32)
+        (ConnectorScalarType::Int64, LiteralValue::Int(value)) => {
+            Some(ConnectorScalarValue::Int64(*value))
         }
-        (ConnectorStaticPredicateDataType::TimestampMicros, LiteralValue::Int(value)) => {
-            Some(ConnectorStaticPredicateLiteral::TimestampMicros(*value))
+        (ConnectorScalarType::Date32, LiteralValue::Int(value)) => {
+            i32::try_from(*value).ok().map(ConnectorScalarValue::Date32)
         }
-        (ConnectorStaticPredicateDataType::TimestampNanos, LiteralValue::Int(value)) => {
-            Some(ConnectorStaticPredicateLiteral::TimestampNanos(*value))
+        (ConnectorScalarType::TimestampMicros, LiteralValue::Int(value)) => {
+            Some(ConnectorScalarValue::TimestampMicros(*value))
         }
-        (ConnectorStaticPredicateDataType::Utf8, LiteralValue::String(value)) => {
-            Some(ConnectorStaticPredicateLiteral::Utf8(value.clone()))
+        (ConnectorScalarType::TimestampNanos, LiteralValue::Int(value)) => {
+            Some(ConnectorScalarValue::TimestampNanos(*value))
         }
-        (ConnectorStaticPredicateDataType::Binary, LiteralValue::Binary(value)) => {
-            Some(ConnectorStaticPredicateLiteral::Binary(value.clone()))
+        (ConnectorScalarType::Utf8, LiteralValue::String(value)) => {
+            Some(ConnectorScalarValue::Utf8(value.clone()))
+        }
+        (ConnectorScalarType::Binary, LiteralValue::Binary(value)) => {
+            Some(ConnectorScalarValue::Binary(value.clone()))
         }
         _ => None,
     }
 }
 
-fn static_data_type(data_type: &DataType) -> Option<ConnectorStaticPredicateDataType> {
+fn static_data_type(data_type: &DataType) -> Option<ConnectorScalarType> {
     match data_type {
-        DataType::Boolean => Some(ConnectorStaticPredicateDataType::Boolean),
-        DataType::Int8 => Some(ConnectorStaticPredicateDataType::Int8),
-        DataType::Int16 => Some(ConnectorStaticPredicateDataType::Int16),
-        DataType::Int32 => Some(ConnectorStaticPredicateDataType::Int32),
-        DataType::Int64 => Some(ConnectorStaticPredicateDataType::Int64),
-        DataType::Date32 => Some(ConnectorStaticPredicateDataType::Date32),
-        DataType::Binary => Some(ConnectorStaticPredicateDataType::Binary),
+        DataType::Boolean => Some(ConnectorScalarType::Boolean),
+        DataType::Int8 => Some(ConnectorScalarType::Int8),
+        DataType::Int16 => Some(ConnectorScalarType::Int16),
+        DataType::Int32 => Some(ConnectorScalarType::Int32),
+        DataType::Int64 => Some(ConnectorScalarType::Int64),
+        DataType::Date32 => Some(ConnectorScalarType::Date32),
+        DataType::Binary => Some(ConnectorScalarType::Binary),
         // Core has no session collation contract and no cross-provider
         // timestamp semantic proof at this boundary. Preserve those
         // predicates as residuals even though the SPI vocabulary reserves
@@ -413,22 +407,22 @@ mod tests {
             actual[0].kind,
             ConnectorStaticPredicateKind::Comparison {
                 op: ConnectorStaticComparisonOp::Lt,
-                literal: ConnectorStaticPredicateLiteral::Int32(10)
+                literal: ConnectorScalarValue::Int32(10)
             }
         ));
         assert!(matches!(
             actual[1].kind,
             ConnectorStaticPredicateKind::Comparison {
                 op: ConnectorStaticComparisonOp::Ge,
-                literal: ConnectorStaticPredicateLiteral::Int32(3)
+                literal: ConnectorScalarValue::Int32(3)
             }
         ));
         assert!(matches!(
             actual[2].kind,
             ConnectorStaticPredicateKind::In { ref literals }
                 if literals == &vec![
-                    ConnectorStaticPredicateLiteral::Int32(4),
-                    ConnectorStaticPredicateLiteral::Int32(9),
+                    ConnectorScalarValue::Int32(4),
+                    ConnectorScalarValue::Int32(9),
                 ]
         ));
     }

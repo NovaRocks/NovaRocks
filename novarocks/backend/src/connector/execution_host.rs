@@ -452,7 +452,7 @@ mod tests {
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
         ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
         ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-        ConnectorReadExecution,
+        ConnectorReadExecution, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason,
     };
     use novarocks_types::QueryId;
 
@@ -487,6 +487,9 @@ mod tests {
                 vec![ConnectorPreparedScanUnitDescriptor::try_new(
                     Bytes::from_static(b"test-unit"),
                     split.estimated_bytes(),
+                    ConnectorScanUnitDomainFacts::missing(
+                        ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                    ),
                 )?],
                 &request,
             )

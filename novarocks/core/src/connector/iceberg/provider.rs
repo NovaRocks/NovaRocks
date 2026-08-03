@@ -50,24 +50,25 @@ use novarocks_spi::connector::{
     ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
     ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
     ConnectorReadSelector, ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard,
-    ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
-    ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
-    ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
-    ConnectorStagedPublicationProof, ConnectorStagedPublicationRecovery,
-    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateDataType,
-    ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral, ConnectorStatistics,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
-    CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
-    StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricState, StatisticsMetricValue,
-    StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsScanColumn,
-    normalize_predicate_dispositions, validate_static_predicates,
+    ConnectorScalarType, ConnectorScalarValue, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason,
+    ConnectorSplit, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorStagedPublicationBaseFact,
+    ConnectorStagedPublicationCleanupReceipt, ConnectorStagedPublicationCleanupRequest,
+    ConnectorStagedPublicationDescriptor, ConnectorStagedPublicationDisposition,
+    ConnectorStagedPublicationObservation, ConnectorStagedPublicationProof,
+    ConnectorStagedPublicationRecovery, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
+    ConnectorStaticPredicateKind, ConnectorStatistics, ConnectorTableHandle,
+    ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
+    StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
+    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
+    StatisticsMissingKind, StatisticsProvenance, StatisticsPublishPreparationRequest,
+    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
+    StatisticsReconcileRequest, StatisticsScanColumn, normalize_predicate_dispositions,
+    validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -737,6 +738,9 @@ impl IcebergReadOnlyConnectorInstance {
                         request.context.max_handle_payload_bytes(),
                     )?,
                     unit.estimated_bytes,
+                    ConnectorScanUnitDomainFacts::missing(
+                        ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                    ),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -5220,21 +5224,19 @@ fn static_predicate_to_physical(
     field_id: i32,
     column: &str,
 ) -> Option<IcebergPhysicalPredicate> {
-    use ConnectorStaticPredicateDataType::{Boolean, Date32, Int32, Int64};
+    use ConnectorScalarType::{Boolean, Date32, Int32, Int64};
 
-    let value = |literal: &ConnectorStaticPredicateLiteral| match literal {
-        ConnectorStaticPredicateLiteral::Boolean(value)
-            if predicate.column.data_type == Boolean =>
-        {
+    let value = |literal: &ConnectorScalarValue| match literal {
+        ConnectorScalarValue::Boolean(value) if predicate.column.data_type == Boolean => {
             Some(IcebergPhysicalPredicateValue::Boolean(*value))
         }
-        ConnectorStaticPredicateLiteral::Int32(value) if predicate.column.data_type == Int32 => {
+        ConnectorScalarValue::Int32(value) if predicate.column.data_type == Int32 => {
             Some(IcebergPhysicalPredicateValue::Int32(*value))
         }
-        ConnectorStaticPredicateLiteral::Int64(value) if predicate.column.data_type == Int64 => {
+        ConnectorScalarValue::Int64(value) if predicate.column.data_type == Int64 => {
             Some(IcebergPhysicalPredicateValue::Int64(*value))
         }
-        ConnectorStaticPredicateLiteral::Date32(value) if predicate.column.data_type == Date32 => {
+        ConnectorScalarValue::Date32(value) if predicate.column.data_type == Date32 => {
             Some(IcebergPhysicalPredicateValue::Date32(*value))
         }
         _ => None,
@@ -7404,12 +7406,12 @@ mod tests {
             id: novarocks_spi::connector::ConnectorStaticPredicateId(3),
             column: novarocks_spi::connector::ConnectorStaticPredicateColumn {
                 field_ordinal: 0,
-                data_type: ConnectorStaticPredicateDataType::Int32,
+                data_type: ConnectorScalarType::Int32,
                 nullable: false,
             },
             kind: ConnectorStaticPredicateKind::Comparison {
                 op: ConnectorStaticComparisonOp::Ge,
-                literal: ConnectorStaticPredicateLiteral::Int32(10),
+                literal: ConnectorScalarValue::Int32(10),
             },
         };
         let unsupported = ConnectorStaticPredicate {
@@ -7417,7 +7419,7 @@ mod tests {
             column: supported.column.clone(),
             kind: ConnectorStaticPredicateKind::Comparison {
                 op: ConnectorStaticComparisonOp::Ne,
-                literal: ConnectorStaticPredicateLiteral::Int32(11),
+                literal: ConnectorScalarValue::Int32(11),
             },
         };
 

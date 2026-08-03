@@ -30,8 +30,8 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
     ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
     ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
-    ConnectorRequestContext, ConnectorSplit, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason,
+    ConnectorSplit, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 use iceberg::spec::{SnapshotRetention, TableMetadata};
@@ -254,6 +254,9 @@ impl ConnectorReadExecution for IcebergMetadataExecution {
             vec![ConnectorPreparedScanUnitDescriptor::try_new(
                 split.payload().clone(),
                 None,
+                ConnectorScanUnitDomainFacts::missing(
+                    ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                ),
             )?],
             &request,
         )

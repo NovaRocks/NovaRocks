@@ -25,7 +25,8 @@ use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
     ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
     ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
+    ConnectorReadExecution, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
+    ConnectorScanUnitFactsMissingReason, ConnectorSplit,
 };
 
 use crate::STARROCKS_PROVIDER_ID;
@@ -198,6 +199,9 @@ impl ConnectorReadExecution for CompositeReadExecution {
             vec![ConnectorPreparedScanUnitDescriptor::try_new(
                 split.payload().clone(),
                 split.estimated_bytes(),
+                ConnectorScanUnitDomainFacts::missing(
+                    ConnectorScanUnitFactsMissingReason::NoPinnedStatistics,
+                ),
             )?],
             Some(leaf_kind),
             &request,

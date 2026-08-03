@@ -145,7 +145,8 @@ mod tests {
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
         ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
         ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-        ConnectorReadExecution, ConnectorSplit,
+        ConnectorReadExecution, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason,
+        ConnectorSplit,
     };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
@@ -319,6 +320,9 @@ mod tests {
                 vec![ConnectorPreparedScanUnitDescriptor::try_new(
                     bytes::Bytes::from_static(b"native-carrier-unit"),
                     split.estimated_bytes(),
+                    ConnectorScanUnitDomainFacts::missing(
+                        ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                    ),
                 )?],
                 &request,
             )
@@ -355,6 +359,9 @@ mod tests {
                 vec![ConnectorPreparedScanUnitDescriptor::try_new(
                     bytes::Bytes::from_static(b"schema-recording-unit"),
                     split.estimated_bytes(),
+                    ConnectorScanUnitDomainFacts::missing(
+                        ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                    ),
                 )?],
                 &request,
             )

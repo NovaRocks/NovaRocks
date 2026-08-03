@@ -26,7 +26,8 @@ use novarocks_spi::connector::{
     ConnectorInstanceIncarnation, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
     ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
     ConnectorProviderId, ConnectorReadExecution, ConnectorReaderMetricsSnapshot,
-    ConnectorRequestContext, ConnectorSplit,
+    ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason,
+    ConnectorSplit,
 };
 
 use super::runtime::{
@@ -110,6 +111,9 @@ impl ConnectorReadExecution for FailOnSplitRead {
             vec![ConnectorPreparedScanUnitDescriptor::try_new(
                 bytes::Bytes::from_static(b"scripted-unit"),
                 split.estimated_bytes(),
+                ConnectorScanUnitDomainFacts::missing(
+                    ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                ),
             )?],
             &request,
         )
@@ -150,6 +154,9 @@ impl ConnectorReadExecution for FakeRead {
                         split
                             .estimated_bytes()
                             .map(|bytes| if ordinal == 0 { bytes } else { 0 }),
+                        ConnectorScanUnitDomainFacts::missing(
+                            ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                        ),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,

@@ -21,6 +21,7 @@ mod control;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
+mod domain_facts;
 mod error;
 mod execution;
 mod handle;
@@ -31,6 +32,7 @@ mod mutation;
 mod predicate;
 mod read;
 mod read_session;
+mod scalar;
 mod staged_create;
 mod staged_publication_recovery;
 mod statistics;
@@ -83,6 +85,13 @@ pub use distribution::{
     ConnectorExecutionDeclaration, ConnectorInstanceIncarnation,
     MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES,
 };
+pub use domain_facts::{
+    ConnectorAvailableScanUnitDomainFacts, ConnectorScanUnitColumn, ConnectorScanUnitColumnDomain,
+    ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
+    ConnectorScanUnitFactsMissingReason, ConnectorScanUnitFactsSummary,
+    MAX_CONNECTOR_SCAN_UNIT_FACT_COLUMNS, MAX_CONNECTOR_SCAN_UNIT_FACT_PAYLOAD_BYTES,
+    MAX_CONNECTOR_SCAN_UNIT_FACT_VARIABLE_VALUE_BYTES,
+};
 pub use error::{ConnectorError, ConnectorErrorKind};
 pub use execution::{
     ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionInstaller,
@@ -127,11 +136,11 @@ pub use mutation::{
 };
 pub use predicate::{
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType,
-    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
-    MAX_CONNECTOR_STATIC_IN_LITERALS, MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATIC_PREDICATES, MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES,
-    normalize_predicate_dispositions, validate_static_predicates,
+    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateId,
+    ConnectorStaticPredicateKind, MAX_CONNECTOR_STATIC_IN_LITERALS,
+    MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES, MAX_CONNECTOR_STATIC_PREDICATES,
+    MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES, normalize_predicate_dispositions,
+    validate_static_predicates,
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
@@ -143,6 +152,7 @@ pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,
     ConnectorReadSessionOutcome,
 };
+pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use staged_create::{
     CONNECTOR_STAGED_CREATE_CONTRACT_VERSION, ConnectorStagedCreate,
     ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,

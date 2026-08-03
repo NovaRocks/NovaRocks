@@ -23,7 +23,8 @@ use sha2::{Digest, Sha256};
 use super::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorSplit, ConnectorWriteExecution,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
+    ConnectorWriteExecution,
 };
 
 /// A hard bound on the independently schedulable physical leaves carried by
@@ -44,10 +45,15 @@ pub struct ConnectorExecutionBindingKey {
 pub struct ConnectorPreparedScanUnitDescriptor {
     payload: Bytes,
     estimated_bytes: Option<u64>,
+    domain_facts: ConnectorScanUnitDomainFacts,
 }
 
 impl ConnectorPreparedScanUnitDescriptor {
-    pub fn try_new(payload: Bytes, estimated_bytes: Option<u64>) -> Result<Self, ConnectorError> {
+    pub fn try_new(
+        payload: Bytes,
+        estimated_bytes: Option<u64>,
+        domain_facts: ConnectorScanUnitDomainFacts,
+    ) -> Result<Self, ConnectorError> {
         if payload.is_empty() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -57,6 +63,7 @@ impl ConnectorPreparedScanUnitDescriptor {
         Ok(Self {
             payload,
             estimated_bytes,
+            domain_facts,
         })
     }
 
@@ -67,11 +74,16 @@ impl ConnectorPreparedScanUnitDescriptor {
     pub const fn estimated_bytes(&self) -> Option<u64> {
         self.estimated_bytes
     }
+
+    pub fn domain_facts(&self) -> &ConnectorScanUnitDomainFacts {
+        &self.domain_facts
+    }
 }
 
 struct PreparedScanUnitData {
     payload: Bytes,
     estimated_bytes: Option<u64>,
+    domain_facts: ConnectorScanUnitDomainFacts,
 }
 
 struct PreparedScanUnitSetInner {
@@ -207,6 +219,7 @@ impl ConnectorPreparedScanUnitSet {
             units.push(PreparedScanUnitData {
                 payload: descriptor.payload,
                 estimated_bytes: descriptor.estimated_bytes,
+                domain_facts: descriptor.domain_facts,
             });
         }
         match (all_costs_known, split.estimated_bytes()) {
@@ -333,6 +346,11 @@ impl ConnectorPreparedScanUnit {
 
     pub fn estimated_bytes(&self) -> Option<u64> {
         self.data().estimated_bytes
+    }
+
+    /// Immutable facts sealed with this exact local membership and reader payload.
+    pub fn domain_facts(&self) -> &ConnectorScanUnitDomainFacts {
+        &self.data().domain_facts
     }
 }
 

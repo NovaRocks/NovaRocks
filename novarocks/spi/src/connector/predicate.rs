@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{ConnectorError, ConnectorErrorKind};
+use super::{ConnectorError, ConnectorErrorKind, ConnectorScalarType, ConnectorScalarValue};
 
 pub const MAX_CONNECTOR_STATIC_PREDICATES: usize = 1024;
 pub const MAX_CONNECTOR_STATIC_IN_LITERALS: usize = 1024;
@@ -33,78 +33,12 @@ pub const MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ConnectorStaticPredicateId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ConnectorStaticPredicateDataType {
-    Boolean,
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    Date32,
-    TimestampMicros,
-    TimestampNanos,
-    Utf8,
-    Binary,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorStaticPredicateColumn {
     /// Stable ordinal in the table schema addressed by this scan request.
     pub field_ordinal: u32,
-    pub data_type: ConnectorStaticPredicateDataType,
+    pub data_type: ConnectorScalarType,
     pub nullable: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ConnectorStaticPredicateLiteral {
-    Boolean(bool),
-    Int8(i8),
-    Int16(i16),
-    Int32(i32),
-    Int64(i64),
-    Date32(i32),
-    TimestampMicros(i64),
-    TimestampNanos(i64),
-    Utf8(String),
-    Binary(Vec<u8>),
-}
-
-impl ConnectorStaticPredicateLiteral {
-    pub const fn data_type(&self) -> ConnectorStaticPredicateDataType {
-        match self {
-            Self::Boolean(_) => ConnectorStaticPredicateDataType::Boolean,
-            Self::Int8(_) => ConnectorStaticPredicateDataType::Int8,
-            Self::Int16(_) => ConnectorStaticPredicateDataType::Int16,
-            Self::Int32(_) => ConnectorStaticPredicateDataType::Int32,
-            Self::Int64(_) => ConnectorStaticPredicateDataType::Int64,
-            Self::Date32(_) => ConnectorStaticPredicateDataType::Date32,
-            Self::TimestampMicros(_) => ConnectorStaticPredicateDataType::TimestampMicros,
-            Self::TimestampNanos(_) => ConnectorStaticPredicateDataType::TimestampNanos,
-            Self::Utf8(_) => ConnectorStaticPredicateDataType::Utf8,
-            Self::Binary(_) => ConnectorStaticPredicateDataType::Binary,
-        }
-    }
-
-    fn payload_bytes(&self) -> usize {
-        match self {
-            Self::Boolean(_) | Self::Int8(_) => 1,
-            Self::Int16(_) => 2,
-            Self::Int32(_) | Self::Date32(_) => 4,
-            Self::Int64(_) | Self::TimestampMicros(_) | Self::TimestampNanos(_) => 8,
-            Self::Utf8(value) => value.len(),
-            Self::Binary(value) => value.len(),
-        }
-    }
-
-    fn variable_payload_bytes(&self) -> Option<usize> {
-        match self {
-            Self::Utf8(value) => Some(value.len()),
-            Self::Binary(value) => Some(value.len()),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,12 +57,12 @@ pub enum ConnectorStaticComparisonOp {
 pub enum ConnectorStaticPredicateKind {
     Comparison {
         op: ConnectorStaticComparisonOp,
-        literal: ConnectorStaticPredicateLiteral,
+        literal: ConnectorScalarValue,
     },
     IsNull,
     IsNotNull,
     In {
-        literals: Vec<ConnectorStaticPredicateLiteral>,
+        literals: Vec<ConnectorScalarValue>,
     },
 }
 
@@ -232,32 +166,31 @@ fn validate_predicate_kind(
     predicate: &ConnectorStaticPredicate,
     total_payload: &mut usize,
 ) -> Result<(), ConnectorError> {
-    let validate_literal = |literal: &ConnectorStaticPredicateLiteral,
-                            total_payload: &mut usize|
-     -> Result<(), ConnectorError> {
-        if literal.data_type() != predicate.column.data_type {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector static predicate literal type differs from its column type",
-            ));
-        }
-        if let Some(variable_bytes) = literal.variable_payload_bytes()
-            && variable_bytes > MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector static predicate variable literal exceeds the hard limit",
-            ));
-        }
-        *total_payload = total_payload.saturating_add(literal.payload_bytes());
-        if *total_payload > MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector static predicate literal payload exceeds the hard limit",
-            ));
-        }
-        Ok(())
-    };
+    let validate_literal =
+        |literal: &ConnectorScalarValue, total_payload: &mut usize| -> Result<(), ConnectorError> {
+            if literal.data_type() != predicate.column.data_type {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector static predicate literal type differs from its column type",
+                ));
+            }
+            if let Some(variable_bytes) = literal.variable_payload_bytes()
+                && variable_bytes > MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "connector static predicate variable literal exceeds the hard limit",
+                ));
+            }
+            *total_payload = total_payload.saturating_add(literal.payload_bytes());
+            if *total_payload > MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "connector static predicate literal payload exceeds the hard limit",
+                ));
+            }
+            Ok(())
+        };
 
     match &predicate.kind {
         ConnectorStaticPredicateKind::Comparison { literal, .. } => {
@@ -294,12 +227,12 @@ mod tests {
             id: ConnectorStaticPredicateId(id),
             column: ConnectorStaticPredicateColumn {
                 field_ordinal: 0,
-                data_type: ConnectorStaticPredicateDataType::Int32,
+                data_type: ConnectorScalarType::Int32,
                 nullable: false,
             },
             kind: ConnectorStaticPredicateKind::Comparison {
                 op: ConnectorStaticComparisonOp::Eq,
-                literal: ConnectorStaticPredicateLiteral::Int32(7),
+                literal: ConnectorScalarValue::Int32(7),
             },
         }
     }
