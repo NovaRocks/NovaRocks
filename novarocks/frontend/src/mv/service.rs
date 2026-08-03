@@ -581,6 +581,9 @@ fn execute_scheduled_refresh(
     cancellation: Option<novarocks::query_execution::cancellation::QueryCancellationView>,
 ) -> ScheduledRefreshDisposition {
     let cancellation = cancellation.unwrap_or_else(|| QueryCancellationSource::new().view());
+    if scheduled_refresh_test_barrier(&request.target, &cancellation) {
+        return ScheduledRefreshDisposition::ShutdownCancelled;
+    }
     let topology = match dependencies.topology.snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.to_string()),
@@ -643,6 +646,38 @@ fn execute_scheduled_refresh(
         }
     }
     ScheduledRefreshDisposition::Completed
+}
+
+/// Debug-only native-test seam for asserting that frontend scheduler permits
+/// bound actual refresh execution, rather than just queue admission.  Normal
+/// production builds do not inspect this environment variable.
+#[cfg(debug_assertions)]
+fn scheduled_refresh_test_barrier(
+    target: &novarocks::mv::repository::MvTarget,
+    cancellation: &novarocks::query_execution::cancellation::QueryCancellationView,
+) -> bool {
+    let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
+        return false;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let marker = directory.join(format!("mvx4-scheduler-admitted-{}.marker", target.name));
+    let _ = std::fs::write(marker, "admitted\n");
+    let hold = directory.join("mvx4-scheduler-hold.trigger");
+    while hold.exists() {
+        if cancellation.is_cancelled() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cancellation.is_cancelled()
+}
+
+#[cfg(not(debug_assertions))]
+fn scheduled_refresh_test_barrier(
+    _target: &novarocks::mv::repository::MvTarget,
+    _cancellation: &novarocks::query_execution::cancellation::QueryCancellationView,
+) -> bool {
+    false
 }
 
 fn reserve_refresh_attempt(

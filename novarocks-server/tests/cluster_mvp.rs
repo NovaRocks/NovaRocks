@@ -715,8 +715,6 @@ provider = "sqlite"
 path = "{}"
 cluster_id = "{cluster_id}"
 deployment_owner = "fe-1"
-
-{frontend_extra}
 "#,
             metadata_path.display(),
             state_store_path.display(),
@@ -1048,6 +1046,30 @@ fn wait_for_mv_rows(conn: &mut MysqlConn, sql: &str, expected: &[(i32, i64)], di
             "scheduled MV did not converge; expected={expected:?}; observed={rows:?}; {diagnostics}"
         );
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_scheduler_marker_count(directory: &Path, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let count = std::fs::read_dir(directory)
+            .expect("read MVX-4 scheduler barrier directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("mvx4-scheduler-admitted-")
+            })
+            .count();
+        if count == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {expected} frontend MV scheduler barrier markers, observed {count}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -3742,15 +3764,19 @@ fn cross_process_three_be_mv_state_store_restart() {
 /// Exercises the frontend-owned scheduler in the native deployment shape.
 ///
 /// The worker has no all-in-one branch: catalog facts are frozen by the FE and
-/// refreshes are submitted through the three live BEs.  The low configured
-/// limit forces the two independent MV refreshes through one scheduler permit;
-/// a debug barrier is required before this test can make timing-based
-/// assertions about the exact overlap bound.
+/// refreshes are submitted through the three live BEs.  A debug-only FE
+/// barrier holds the first admitted refresh, proving the configured permit is
+/// an execution bound rather than merely queue bookkeeping.
 #[cfg(unix)]
 #[test]
 #[ignore = "requires native 1FE+3BE processes and scheduler debug barriers"]
 fn cross_process_three_be_mvx4_scheduler_catches_up_and_bounds_concurrency() {
     let _guard = lock_cluster_mvp();
+    let barrier_dir = tempfile::tempdir_in(runtime_dir()).expect("create scheduler barrier dir");
+    let _barrier_environment =
+        EnvironmentValueGuard::set_path("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR", barrier_dir.path());
+    let hold_trigger = barrier_dir.path().join("mvx4-scheduler-hold.trigger");
+    std::fs::write(&hold_trigger, "hold\n").expect("arm scheduler concurrency barrier");
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
     let state_store_path = state_store_dir.path().join("frontend-mvx4.sqlite");
     let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
@@ -3796,8 +3822,25 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1_000
         "CREATE MATERIALIZED VIEW orders_mv_b DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
     )
     .expect("create second scheduled MV");
+    wait_for_scheduler_marker_count(barrier_dir.path(), 1);
+    std::thread::sleep(Duration::from_millis(300));
+    let admitted = std::fs::read_dir(barrier_dir.path())
+        .expect("read scheduler barrier directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("mvx4-scheduler-admitted-")
+        })
+        .count();
+    assert_eq!(
+        admitted, 1,
+        "max_concurrent_refreshes=1 must admit only one real scheduler refresh"
+    );
     conn.query_drop("INSERT INTO orders VALUES (1, 10), (2, 20)")
         .expect("seed scheduled MV base table");
+    std::fs::remove_file(&hold_trigger).expect("release scheduler concurrency barrier");
     let initial = [(1, 10), (2, 20)];
     wait_for_mv_rows(
         &mut conn,
@@ -3831,15 +3874,19 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1_000
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 }
 
-/// Verifies that a clean FE shutdown releases frontend worker ownership and a
-/// restart rebinds workers only after StateStore/catalog recovery.  The test
-/// deliberately asserts observable catch-up rather than inferring success
-/// from process survival.
+/// Verifies that a clean FE shutdown cancels a frontend-owned, pre-dispatch
+/// worker attempt and that restart rebinds only after StateStore/catalog
+/// recovery before catching the durable watermark up.
 #[cfg(unix)]
 #[test]
 #[ignore = "requires native 1FE+3BE processes and scheduler debug barriers"]
 fn cross_process_three_be_mvx4_shutdown_cancels_and_recovers_background_work() {
     let _guard = lock_cluster_mvp();
+    let barrier_dir = tempfile::tempdir_in(runtime_dir()).expect("create scheduler barrier dir");
+    let _barrier_environment =
+        EnvironmentValueGuard::set_path("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR", barrier_dir.path());
+    let hold_trigger = barrier_dir.path().join("mvx4-scheduler-hold.trigger");
+    std::fs::write(&hold_trigger, "hold\n").expect("arm scheduler shutdown barrier");
     let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
     let state_store_path = state_store_dir.path().join("frontend-mvx4.sqlite");
     let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
@@ -3881,17 +3928,12 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1_000
         "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
     )
     .expect("create scheduled MV for shutdown recovery");
+    wait_for_scheduler_marker_count(barrier_dir.path(), 1);
     conn.query_drop("INSERT INTO orders VALUES (1, 10), (2, 20)")
         .expect("seed recovery base table");
-    let initial = [(1, 10), (2, 20)];
-    wait_for_mv_rows(
-        &mut conn,
-        "SELECT k1, v2 FROM orders_mv ORDER BY k1",
-        &initial,
-        &diagnostics,
-    );
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    std::fs::remove_file(&hold_trigger).expect("release scheduler shutdown barrier");
     cluster.restart_fe();
 
     let mut conn = connect_mysql(cluster.fe_mysql_port());
@@ -3900,9 +3942,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1_000
         .expect("restore recovery catalog after FE restart");
     conn.query_drop("USE ns")
         .expect("restore recovery namespace after FE restart");
-    conn.query_drop("INSERT INTO orders VALUES (3, 30)")
-        .expect("mutate base table after frontend worker restart");
-    let caught_up = [(1, 10), (2, 20), (3, 30)];
+    let caught_up = [(1, 10), (2, 20)];
     wait_for_mv_rows(
         &mut conn,
         "SELECT k1, v2 FROM orders_mv ORDER BY k1",
