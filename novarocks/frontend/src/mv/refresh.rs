@@ -136,6 +136,13 @@ pub(super) fn execute(
     connector_context: ConnectorRequestContext,
     execution: &novarocks::query_execution::request_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
+    // A no-snapshot first observation is deliberately not a durable refresh.
+    // It has no external action and no base watermark that can be finalized;
+    // Treating it as a durable refresh would require a nonexistent watermark
+    // and incorrectly fence the MV before a later base-table commit is seen.
+    if matches!(&refresh.work, PreparedMvRefreshWork::NoOp) {
+        return Ok(MvStatementResult::Ok);
+    }
     let target_catalog = refresh
         .finalize
         .target

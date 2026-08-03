@@ -635,6 +635,10 @@ fn execute_scheduled_refresh(
             Ok(prepared) => prepared,
             Err(error) => return ScheduledRefreshDisposition::from_background_error(error),
         };
+        let no_op = matches!(
+            prepared.work,
+            novarocks::sql::mv_refresh::PreparedMvRefreshWork::NoOp
+        );
         if let Err(error) = refresh::execute(
             dependencies.repository.as_ref(),
             &dependencies.refresh,
@@ -643,6 +647,9 @@ fn execute_scheduled_refresh(
             context.execution(),
         ) {
             return application_disposition(error);
+        }
+        if no_op {
+            return ScheduledRefreshDisposition::NoOp;
         }
     }
     ScheduledRefreshDisposition::Completed
