@@ -2082,10 +2082,17 @@ emit_connector_reader_marker = true
     assert_eq!(row.get::<Option<i64>, usize>(3).flatten(), Some(300_000));
 
     let reader_output = cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN provider=iceberg",
+        "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED",
         Duration::from_secs(10),
     );
     for lines in &reader_output {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("facts_conservative_units=")
+                    && !line.contains("facts_conservative_units=0")),
+            "Iceberg deletion-vector reads must expose conservative prepared facts: {lines:?}"
+        );
         let source = lines
             .iter()
             .find(|line| line.contains("NOVAROCKS_CONNECTOR_READ_SOURCE"))

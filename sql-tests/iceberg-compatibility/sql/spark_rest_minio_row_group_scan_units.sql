@@ -50,6 +50,8 @@ WHERE content = 0;
 -- query 3
 -- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED
 -- @be_log_contains=shape=one_to_many leaf_kind=row_group
+-- @be_log_contains=facts_exact_units=
+-- @be_log_contains=facts_available_columns=
 -- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN
 -- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE
 SELECT count(*) AS rows
