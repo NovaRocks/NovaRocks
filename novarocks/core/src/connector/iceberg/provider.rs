@@ -5630,7 +5630,7 @@ fn scan_fact_columns(
             "Iceberg output schema does not match its frozen projection",
         ));
     }
-    indexes
+    let mut columns = indexes
         .into_iter()
         .zip(output_schema.fields())
         .map(|(ordinal, field)| {
@@ -5662,7 +5662,12 @@ fn scan_fact_columns(
                 nullable: field.is_nullable(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    // The projection preserves planner output order, which can differ from the
+    // frozen table schema. Domain facts are sealed in table-schema ordinal
+    // order so their constructor can reject duplicate or reordered entries.
+    columns.sort_by_key(|column| column.field_ordinal);
+    Ok(columns)
 }
 
 fn iceberg_scan_fact_scalar_type(data_type: &DataType) -> IcebergScanFactScalarTypeV1 {
