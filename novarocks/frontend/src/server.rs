@@ -26,6 +26,7 @@ use std::time::Duration;
 use novarocks::common::app_config::NovaRocksConfig;
 use novarocks_state_store::StateStoreHostConfig;
 
+use crate::mv::{maintenance::MaintenanceCoordinatorConfig, scheduler::FrontendMvSchedulerConfig};
 use crate::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
     FrontendApplicationHost, FrontendExecutionConfig,
@@ -90,6 +91,7 @@ fn standalone_open_services(
     .with_statistics_table_reader_sink(host.statistics_application_port())
     .with_statistics_attempt_executor_sink(host.statistics_application_port())
     .with_mv_first_refresh_write_activator_sink(host.mv_first_refresh_write_activator_sink())
+    .with_mv_background_engine_sink(host.mv_background_engine_sink())
 }
 
 /// Opens the frontend services once for an externally composed server. The
@@ -273,11 +275,39 @@ fn resolve_frontend_execution_config(
         NonZeroUsize::new(server.config.runtime.actual_exec_threads()).ok_or_else(|| {
             FrontendApplicationError::server("frontend runtime-filter worker count must be nonzero")
         })?;
-    Ok(FrontendExecutionConfig::new(
+    let mut execution = FrontendExecutionConfig::new(
         advertised.host,
         advertised.port,
         runtime_filter_worker_count,
-    ))
+    );
+    if let Some(standalone) = server.config.standalone_server.as_ref() {
+        let failure_backoff_ms = standalone.mv_refresh_scheduler_failure_backoff_ms.max(1);
+        execution = execution.with_mv_scheduler_config(FrontendMvSchedulerConfig {
+            enabled: standalone.mv_refresh_scheduler_enabled,
+            tick_interval_ms: standalone.mv_refresh_scheduler_interval_ms.max(1),
+            max_concurrent_refreshes: standalone.mv_refresh_scheduler_max_concurrent.max(1),
+            failure_backoff_ms,
+            max_failure_backoff_ms: standalone
+                .mv_refresh_scheduler_max_failure_backoff_ms
+                .max(failure_backoff_ms),
+        });
+        execution = execution.with_mv_maintenance_config(MaintenanceCoordinatorConfig {
+            enabled: standalone.iceberg_maintenance_enabled,
+            tick_interval_ms: standalone.iceberg_maintenance_tick_interval_ms.max(1),
+            max_concurrent: standalone.iceberg_maintenance_max_concurrent.max(1),
+            compaction_min_data_files: standalone
+                .iceberg_maintenance_compaction_min_data_files
+                .try_into()
+                .unwrap_or(i64::MAX),
+            dv_min_delete_files: standalone
+                .iceberg_maintenance_dv_min_delete_files
+                .try_into()
+                .unwrap_or(i64::MAX),
+            action_cooldown_ms: standalone.iceberg_maintenance_action_cooldown_ms,
+            max_consecutive_failures: standalone.iceberg_maintenance_max_consecutive_failures,
+        });
+    }
+    Ok(execution)
 }
 
 async fn run_frontend_server_until_shutdown_with_ports<

@@ -52,6 +52,7 @@ use sha2::{Digest, Sha256};
 /// Dependencies retained by the frontend composition root.  They have no
 /// provider catalog client or core lifecycle helper: all external work passes
 /// through the exact control lease and the distributed query service.
+#[derive(Clone)]
 pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -860,11 +861,20 @@ fn unavailable(message: impl Into<String>) -> MvApplicationError {
 
 fn repository_error(error: MvRepositoryError) -> MvApplicationError {
     let kind = match error.kind() {
+        novarocks::mv::repository::MvRepositoryErrorKind::Conflict => {
+            MvApplicationErrorKind::AlreadyActive
+        }
+        novarocks::mv::repository::MvRepositoryErrorKind::NotFound => {
+            MvApplicationErrorKind::TargetGone
+        }
+        novarocks::mv::repository::MvRepositoryErrorKind::Corruption => {
+            MvApplicationErrorKind::Corruption
+        }
         novarocks::mv::repository::MvRepositoryErrorKind::CommitUnknown => {
-            MvApplicationErrorKind::CommitUnknown
+            MvApplicationErrorKind::RecoveryRequired
         }
         novarocks::mv::repository::MvRepositoryErrorKind::KnownCommittedFinalizeFailed => {
-            MvApplicationErrorKind::KnownCommittedFinalizeFailed
+            MvApplicationErrorKind::RecoveryRequired
         }
         novarocks::mv::repository::MvRepositoryErrorKind::Unavailable => {
             MvApplicationErrorKind::Unavailable

@@ -66,11 +66,11 @@ pub mod insert_engine;
 pub mod mutation_engine;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
+pub(crate) mod mv_background;
 pub(crate) mod mv_first_refresh_staging;
 pub(crate) mod mv_flow;
 pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;
-pub(crate) mod mv_scheduler;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
@@ -310,11 +310,6 @@ pub(crate) struct StandaloneState {
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
     pub(crate) exchange_port: u16,
-    /// Wake-up channel for the iceberg maintenance coordinator; injected by
-    /// the server after the coordinator thread starts, None otherwise.
-    pub(crate) maintenance_signal_tx: std::sync::Mutex<
-        Option<std::sync::mpsc::Sender<crate::engine::mv_maintenance::MaintenanceSignal>>,
-    >,
     /// Frontend-owned view application service, injected at engine open.
     pub(crate) view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     /// Frontend-owned table-maintenance application service, injected at engine open.
@@ -366,7 +361,6 @@ impl Default for StandaloneState {
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
             exchange_port: 0,
-            maintenance_signal_tx: std::sync::Mutex::new(None),
             view_service: std::sync::Arc::new(crate::engine::view::EmptyViewService),
             table_maintenance_service: std::sync::Arc::new(
                 crate::engine::table_maintenance::EmptyTableMaintenanceService,
@@ -1163,6 +1157,10 @@ pub struct StandaloneOpenServices {
     /// durable and external refresh transition.
     pub mv_first_refresh_write_activator_sink:
         Option<std::sync::Arc<dyn crate::mv::application::MvFirstRefreshWriteActivatorSink>>,
+    /// Receives the provider-neutral MV background adapter after restore and
+    /// table-maintenance recovery. The frontend owns all worker lifecycle.
+    pub mv_background_engine_sink:
+        Option<std::sync::Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
     pub table_maintenance_service:
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
@@ -1220,6 +1218,7 @@ impl StandaloneOpenServices {
             statistics_table_reader_sink: None,
             statistics_attempt_executor_sink: None,
             mv_first_refresh_write_activator_sink: None,
+            mv_background_engine_sink: None,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -1283,6 +1282,14 @@ impl StandaloneOpenServices {
         sink: Option<std::sync::Arc<dyn crate::mv::application::MvFirstRefreshWriteActivatorSink>>,
     ) -> Self {
         self.mv_first_refresh_write_activator_sink = sink;
+        self
+    }
+
+    pub fn with_mv_background_engine_sink(
+        mut self,
+        sink: Option<std::sync::Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
+    ) -> Self {
+        self.mv_background_engine_sink = sink;
         self
     }
 }
@@ -1365,6 +1372,7 @@ impl StandaloneNovaRocks {
             statistics_table_reader_sink,
             statistics_attempt_executor_sink,
             mv_first_refresh_write_activator_sink,
+            mv_background_engine_sink,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -1406,7 +1414,6 @@ impl StandaloneNovaRocks {
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             iceberg_operation_repo: IcebergOperationRepository,
-            maintenance_signal_tx: std::sync::Mutex::new(None),
         });
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
@@ -1425,12 +1432,35 @@ impl StandaloneNovaRocks {
         }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
-        if let Err(error) = engine.inner.table_maintenance_service.start(engine_port) {
+        if let Err(error) = engine
+            .inner
+            .table_maintenance_service
+            .start(Arc::clone(&engine_port))
+        {
             let primary = format!("start table maintenance service failed: {error}");
             return match engine.inner.table_maintenance_service.shutdown() {
                 Ok(()) => Err(primary),
                 Err(cleanup_error) => Err(format!("{primary}; cleanup failed: {cleanup_error}")),
             };
+        }
+        if let Some(sink) = mv_background_engine_sink {
+            let bindings = crate::mv::background::MvBackgroundBindings {
+                engine: Arc::new(
+                    crate::engine::mv_background::StandaloneMvBackgroundEngine::new(Arc::clone(
+                        &engine.inner,
+                    )),
+                ),
+                table_maintenance_engine: engine_port,
+            };
+            if let Err(error) = sink.bind_mv_background_engine(bindings) {
+                let primary = format!("bind frontend MV background engine failed: {error}");
+                return match engine.inner.table_maintenance_service.shutdown() {
+                    Ok(()) => Err(primary),
+                    Err(cleanup_error) => {
+                        Err(format!("{primary}; cleanup failed: {cleanup_error}"))
+                    }
+                };
+            }
         }
         Ok(engine)
     }
@@ -3521,7 +3551,6 @@ fn dispatch_frontend_mv_refresh(
     let result = last_result.ok_or_else(|| {
         "MV refresh dependency planning produced no target refresh step".to_string()
     })?;
-    crate::engine::mv_maintenance::notify_refresh_completed(state);
     Ok(result)
 }
 

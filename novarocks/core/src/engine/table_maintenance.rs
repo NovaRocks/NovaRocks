@@ -23,6 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
@@ -35,6 +36,7 @@ use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
 use crate::query_execution::ConnectorWriteCompletion;
+use crate::query_execution::cancellation::QueryCancellationView;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::dialect::StarRocksDialect;
 use novarocks_spi::connector::{
@@ -51,6 +53,49 @@ pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance servi
 pub struct MaintenanceRequestContext<'a> {
     pub current_catalog: Option<&'a str>,
     pub current_database: &'a str,
+}
+
+/// Immutable worker-owned cancellation context for automatic maintenance.
+/// It crosses the Core-to-Frontend port without exposing a session, catalog,
+/// or provider object. Implementations must check it before every durable
+/// dispatch and preserve durable recovery state if cancellation races a
+/// dispatched external mutation.
+#[derive(Clone)]
+pub struct AutomaticMaintenanceContext {
+    cancellation: QueryCancellationView,
+    deadline: Option<Instant>,
+}
+
+impl AutomaticMaintenanceContext {
+    pub fn new(cancellation: QueryCancellationView) -> Self {
+        Self {
+            cancellation,
+            deadline: None,
+        }
+    }
+
+    pub fn with_deadline(cancellation: QueryCancellationView, deadline: Instant) -> Self {
+        Self {
+            cancellation,
+            deadline: Some(deadline),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    pub fn ensure_active(&self) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err("automatic maintenance cancelled before durable dispatch".to_string());
+        }
+        self.deadline
+            .is_none_or(|deadline| Instant::now() < deadline)
+            .then_some(())
+            .ok_or_else(|| {
+                "automatic maintenance deadline elapsed before durable dispatch".to_string()
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -330,11 +375,42 @@ pub trait TableMaintenanceService: Send + Sync {
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String>;
 
+    fn execute_automatic_action_with_context(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        request: MaintenanceActionRequest,
+        context: &AutomaticMaintenanceContext,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        context.ensure_active()?;
+        self.execute_automatic_action(engine, request)
+    }
+
     fn submit_automatic_optimize(
         &self,
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String>;
+
+    /// Execute an automatic OPTIMIZE as one complete durable job lifecycle.
+    /// Unlike submission, success means the job was claimed, executed and
+    /// terminally persisted before the caller releases its MV activity gate.
+    fn execute_automatic_optimize_durably(
+        &self,
+        _engine: &dyn TableMaintenanceEngine,
+        _target: MaintenanceTarget,
+    ) -> Result<OptimizeSubmission, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_owned())
+    }
+
+    fn execute_automatic_optimize_durably_with_context(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+        context: &AutomaticMaintenanceContext,
+    ) -> Result<OptimizeSubmission, String> {
+        context.ensure_active()?;
+        self.execute_automatic_optimize_durably(engine, target)
+    }
 
     fn shutdown(&self) -> Result<(), String>;
 }
@@ -368,6 +444,14 @@ impl TableMaintenanceService for EmptyTableMaintenanceService {
     }
 
     fn submit_automatic_optimize(
+        &self,
+        _engine: &dyn TableMaintenanceEngine,
+        _target: MaintenanceTarget,
+    ) -> Result<OptimizeSubmission, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_owned())
+    }
+
+    fn execute_automatic_optimize_durably(
         &self,
         _engine: &dyn TableMaintenanceEngine,
         _target: MaintenanceTarget,

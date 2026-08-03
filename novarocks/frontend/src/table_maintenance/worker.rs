@@ -238,7 +238,9 @@ async fn execute_claimed_job(
         .map_err(|error| format!("finish optimize job {job_id} failed: {error}"))
 }
 
-fn optimize_outcome(outcome: MaintenanceActionOutcome) -> Result<OptimizeJobOutcome, String> {
+pub(crate) fn optimize_outcome(
+    outcome: MaintenanceActionOutcome,
+) -> Result<OptimizeJobOutcome, String> {
     let MaintenanceActionOutcome::RewriteDataFiles {
         target_snapshot_id,
         rewritten_data_files_count,

@@ -186,6 +186,11 @@ pub enum MvApplicationErrorKind {
     Engine,
     Repository,
     Unavailable,
+    AlreadyActive,
+    TargetGone,
+    Corruption,
+    RecoveryRequired,
+    ShutdownCancelled,
     CommitUnknown,
     KnownCommittedFinalizeFailed,
 }

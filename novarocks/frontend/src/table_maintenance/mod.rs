@@ -1180,7 +1180,21 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 target,
                 older_than_ms,
             } => self.execute_durable_cleanup(engine, target, older_than_ms),
-            other => engine.execute_action(other),
+            MaintenanceActionRequest::ExpireSnapshots {
+                target,
+                older_than_ms,
+                retain_last,
+            } => self.execute_durable_metadata_action(
+                engine,
+                target,
+                MetadataMaintenanceIntent::expire_table_versions(older_than_ms, retain_last),
+                MetadataMaintenanceOperationKind::ExpireTableVersions,
+                None,
+                None,
+            ),
+            other => Err(format!(
+                "automatic maintenance action has no durable lifecycle route: {other:?}"
+            )),
         }
     }
 
@@ -1190,6 +1204,79 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String> {
         self.submit_automatic_optimize_inner(engine, target)
+    }
+
+    fn execute_automatic_optimize_durably(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+    ) -> Result<OptimizeSubmission, String> {
+        let repository = self
+            .repository
+            .as_ref()
+            .ok_or_else(|| AUTOMATIC_OPTIMIZE_STATE_STORE_REQUIRED.to_string())?;
+        let distributed_rewrite_repository = self
+            .distributed_rewrite_repository
+            .as_ref()
+            .ok_or_else(|| DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED.to_string())?;
+        let base_snapshot_id = engine.current_snapshot_id(&target)?;
+        let job = match self.block_on(repository.create(OptimizeJobCreate {
+            target: target.clone(),
+            base_snapshot_id,
+            created_at_ms: now_unix_millis(),
+        })) {
+            Ok(job) => job,
+            Err(error) if error.kind() == RepositoryErrorKind::AlreadyActive => {
+                return Ok(OptimizeSubmission::AlreadyActive);
+            }
+            Err(error) => return Err(format!("create automatic optimize job failed: {error}")),
+        };
+        let claimed = self
+            .block_on(repository.claim(job.job_id, now_unix_millis()))
+            .map_err(|error| {
+                format!(
+                    "claim automatic optimize job {} failed: {error}",
+                    job.job_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "automatic optimize job {} disappeared before claim",
+                    job.job_id
+                )
+            })?;
+        let outcome = Self::execute_optimize_distributed_rewrite(
+            &self.runtime,
+            Arc::clone(distributed_rewrite_repository),
+            engine,
+            target,
+            claimed.job_id,
+        );
+        match outcome {
+            Ok(outcome) => {
+                let outcome = worker::optimize_outcome(outcome)?;
+                self.block_on(repository.record_outcome(claimed.job_id, outcome))
+                    .map_err(|error| {
+                        format!("record automatic optimize outcome failed: {error}")
+                    })?;
+                self.block_on(repository.finish(claimed.job_id, now_unix_millis()))
+                    .map_err(|error| format!("finish automatic optimize job failed: {error}"))?;
+                Ok(OptimizeSubmission::Submitted {
+                    job_id: claimed.job_id,
+                })
+            }
+            Err(error) => {
+                // The rewrite application port deliberately does not reduce a
+                // failed external mutation to a string class here.  Leaving
+                // the claimed durable job non-terminal preserves recovery
+                // evidence for both commit-unknown and finalize failures;
+                // marking it failed would fabricate a safe terminal state.
+                Err(format!(
+                    "automatic optimize job {} requires recovery: {error}",
+                    claimed.job_id
+                ))
+            }
+        }
     }
 
     fn shutdown(&self) -> Result<(), String> {

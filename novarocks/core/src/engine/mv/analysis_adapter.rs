@@ -262,13 +262,8 @@ fn refresh_status_for_mv(
     if mv.refresh_in_progress {
         return Ok(("RUNNING".to_string(), retry_after_time));
     }
-    if mv
-        .last_scheduler_error
-        .as_ref()
-        .map(|err| err.trim_start().starts_with("USER_ERROR: "))
-        .unwrap_or(false)
-    {
-        return Ok(("FAILED_USER_ERROR".to_string(), retry_after_time));
+    if mv.last_scheduler_error.is_some() && mv.next_refresh_after_ms.is_none() {
+        return Ok(("BLOCKED_SCHEDULER".to_string(), retry_after_time));
     }
     if mv.last_scheduler_error.is_some()
         && mv

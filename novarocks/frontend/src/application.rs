@@ -30,6 +30,8 @@ use crate::connector::ConnectorControlHost;
 use crate::coordinator::{BackendQueryActivity, FrontendDistributedQueryCoordinator};
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::dml::{DmlService, StateStoreOperationJournal};
+use crate::mv::maintenance::MaintenanceCoordinatorConfig;
+use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{
     FrontendMvFirstRefreshWriteActivatorPort, FrontendMvService, repository::StateStoreMvRepository,
 };
@@ -109,7 +111,9 @@ pub struct FrontendApplicationHost {
         Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn novarocks::mv::repository::MvRepository>>,
     mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
+    mv_service: Option<Arc<FrontendMvService>>,
     mv_first_refresh_activator: Option<Arc<FrontendMvFirstRefreshWriteActivatorPort>>,
+    mv_background_engine_sink: Option<Arc<dyn novarocks::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
     query_control: novarocks::query_execution::control::QueryControlService,
@@ -123,6 +127,8 @@ pub struct FrontendExecutionConfig {
     advertised_report_host: String,
     configured_report_port: u16,
     runtime_filter_worker_count: NonZeroUsize,
+    mv_scheduler: FrontendMvSchedulerConfig,
+    mv_maintenance: MaintenanceCoordinatorConfig,
 }
 
 impl FrontendExecutionConfig {
@@ -135,7 +141,22 @@ impl FrontendExecutionConfig {
             advertised_report_host: advertised_report_host.into(),
             configured_report_port,
             runtime_filter_worker_count,
+            mv_scheduler: FrontendMvSchedulerConfig::default(),
+            mv_maintenance: MaintenanceCoordinatorConfig::default(),
         }
+    }
+
+    pub(crate) fn with_mv_scheduler_config(mut self, config: FrontendMvSchedulerConfig) -> Self {
+        self.mv_scheduler = config;
+        self
+    }
+
+    pub(crate) fn with_mv_maintenance_config(
+        mut self,
+        config: MaintenanceCoordinatorConfig,
+    ) -> Self {
+        self.mv_maintenance = config;
+        self
     }
 }
 
@@ -155,7 +176,9 @@ impl FrontendApplicationHost {
             table_maintenance_service: None,
             mv_repository: None,
             mv_application_service: None,
+            mv_service: None,
             mv_first_refresh_activator: None,
+            mv_background_engine_sink: None,
             state_store_host: None,
             query_execution: None,
             query_control: FrontendQueryControl::service(),
@@ -239,7 +262,7 @@ impl FrontendApplicationHost {
         // context consumed by frontend application services. Install it before
         // constructing those services so MV refresh never observes an
         // all-in-one-only direct execution fallback.
-        if let Err(error) = host.open_coordinator(execution) {
+        if let Err(error) = host.open_coordinator(execution.clone()) {
             return Err(host.cleanup_open_error(error).await);
         }
         match host.state_store() {
@@ -250,13 +273,26 @@ impl FrontendApplicationHost {
                             repository;
                         let first_refresh_activator =
                             Arc::new(FrontendMvFirstRefreshWriteActivatorPort::new());
-                        host.mv_application_service =
-                            Some(Arc::new(FrontendMvService::with_refresh_dependencies(
-                                Arc::clone(&repository),
-                                host.query_execution_service(),
-                                host.connector_control_registry(),
-                                Arc::clone(&first_refresh_activator),
-                            )));
+                        let service = Arc::new(FrontendMvService::with_refresh_dependencies(
+                            Arc::clone(&repository),
+                            host.query_execution_service(),
+                            host.connector_control_registry(),
+                            Arc::clone(&first_refresh_activator),
+                            host.execution_role,
+                            host.backend_topology_port(),
+                            execution.mv_scheduler.clone(),
+                            execution.mv_maintenance.clone(),
+                            host.table_maintenance_service(),
+                        ));
+                        host.mv_background_engine_sink = Some(
+                            FrontendMvService::background_engine_sink(Arc::clone(&service)),
+                        );
+                        let application_service: Arc<
+                            dyn novarocks::mv::application::MvApplicationService,
+                        > = Arc::clone(&service)
+                            as Arc<dyn novarocks::mv::application::MvApplicationService>;
+                        host.mv_application_service = Some(application_service);
+                        host.mv_service = Some(service);
                         host.mv_repository = Some(repository);
                         host.mv_first_refresh_activator = Some(first_refresh_activator);
                     }
@@ -381,6 +417,12 @@ impl FrontendApplicationHost {
             Arc::clone(port)
                 as Arc<dyn novarocks::mv::application::MvFirstRefreshWriteActivatorSink>
         })
+    }
+
+    pub fn mv_background_engine_sink(
+        &self,
+    ) -> Option<Arc<dyn novarocks::mv::background::MvBackgroundEngineSink>> {
+        self.mv_background_engine_sink.as_ref().map(Arc::clone)
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
@@ -544,11 +586,28 @@ impl FrontendApplicationHost {
     async fn release_resources(&mut self) -> Result<(), String> {
         // The worker owns durable attempt activity and must stop before the
         // coordinator/topology/StateStore it depends on are released.
+        let mv_worker_error = self
+            .mv_service
+            .as_ref()
+            .and_then(|service| service.shutdown_background_workers().err())
+            .map(|error| format!("shutdown frontend MV background workers failed: {error}"));
         let statistics_worker_error = self
             .statistics_application_port
             .as_ref()
             .and_then(|port| port.shutdown_worker().err())
             .map(|error| format!("shutdown statistics analyze worker failed: {error}"));
+        let mut primary_error = mv_worker_error;
+        if primary_error.is_some() {
+            // The MV workers still own request/topology/StateStore references.
+            // Preserve them so a caller sees the explicit shutdown failure
+            // rather than pretending that teardown completed.
+            return Err(primary_error.expect("MV worker shutdown error is present"));
+        }
+        let table_maintenance_error = self
+            .table_maintenance_service
+            .as_ref()
+            .and_then(|service| service.shutdown().err())
+            .map(|error| format!("shutdown frontend table-maintenance service failed: {error}"));
         self.query_execution.take();
         self.coordinator.take();
         let heartbeat_result = self
@@ -560,12 +619,7 @@ impl FrontendApplicationHost {
             topology.detach_query_events();
         }
         self.topology.take();
-        let table_maintenance_error = self
-            .table_maintenance_service
-            .as_ref()
-            .and_then(|service| service.shutdown().err())
-            .map(|error| format!("shutdown frontend table-maintenance service failed: {error}"));
-        let mut primary_error = heartbeat_result.err();
+        primary_error = heartbeat_result.err();
         if let Some(statistics_worker_error) = statistics_worker_error {
             if let Some(primary) = primary_error.as_mut() {
                 primary.push_str(&format!("; cleanup failed: {statistics_worker_error}"));
@@ -590,7 +644,9 @@ impl FrontendApplicationHost {
         self.statistics_application_service.take();
         self.view_service.take();
         self.mv_application_service.take();
+        self.mv_service.take();
         self.mv_first_refresh_activator.take();
+        self.mv_background_engine_sink.take();
         self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             if let Err(error) = host

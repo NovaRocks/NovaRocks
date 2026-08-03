@@ -53,21 +53,16 @@ PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT k1, v2 FROM orders;
 
 -- query 2
--- Let the scheduler observe the baseline snapshot before creating a new one.
--- @skip_result_check=true
-shell: sleep 2
-
--- query 3
 -- @skip_result_check=true
 INSERT INTO ice_mv_sched_change_${uuid0}.ns_${uuid0}.orders VALUES
   (3, 30);
 
--- query 4
+-- query 3
 -- @retry_count=30
 -- @retry_interval_ms=500
 SELECT k1, v2 FROM orders_change_mv_${uuid0} ORDER BY k1;
 
--- query 5
+-- query 4
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_change_mv_${uuid0};
 DROP TABLE ice_mv_sched_change_${uuid0}.ns_${uuid0}.orders FORCE;

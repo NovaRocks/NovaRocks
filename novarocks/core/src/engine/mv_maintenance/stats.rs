@@ -25,7 +25,26 @@ use std::sync::Arc;
 use crate::engine::StandaloneState;
 use crate::mv::persistence::definition::StoredMvDefinition;
 
-use super::policy::{SnapshotInfo, TableMaintenanceStats};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotInfo {
+    pub(crate) snapshot_id: i64,
+    pub(crate) timestamp_ms: i64,
+}
+
+/// Provider facts only. Frontend owns every policy decision and retry state.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TableMaintenanceStats {
+    pub(crate) current_snapshot_id: Option<i64>,
+    pub(crate) snapshots: Vec<SnapshotInfo>,
+    pub(crate) total_data_files: Option<u64>,
+    pub(crate) max_compactable_data_files: Option<u64>,
+    pub(crate) total_files_size_bytes: Option<u64>,
+    pub(crate) total_delete_files: Option<u64>,
+    pub(crate) properties: HashMap<String, String>,
+    pub(crate) non_main_ref_count: usize,
+    pub(crate) downstream_floor_ts_ms: Option<i64>,
+    pub(crate) downstream_floor_unknown: bool,
+}
 
 /// Iceberg snapshot-summary keys (string literals: the constants in
 /// vendor/iceberg-0.9.0/src/spec/snapshot_summary.rs are private).
@@ -118,7 +137,7 @@ pub(crate) fn collect_table_stats(
         .collect();
     let snapshot_ts_by_id: BTreeMap<i64, i64> = snapshots
         .iter()
-        .map(|s| (s.snapshot_id, s.timestamp_ms))
+        .map(|snapshot| (snapshot.snapshot_id, snapshot.timestamp_ms))
         .collect();
 
     let summary = metadata

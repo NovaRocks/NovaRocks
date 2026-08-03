@@ -109,7 +109,7 @@ pub(crate) fn connector_request_context_for_query(
 /// Derive connector admission from the immutable query execution captured by
 /// the frontend. A request deadline is authoritative; only requests without an
 /// admission deadline use the bounded connector fallback.
-pub(crate) fn connector_request_context_for_execution(
+pub fn connector_request_context_for_execution(
     query_options: Option<&crate::runtime::query_options::QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<ConnectorRequestContext, String> {

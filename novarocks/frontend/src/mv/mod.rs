@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod activity;
 mod create;
+pub(crate) mod maintenance;
+pub(crate) mod maintenance_worker;
 mod recovery;
 mod refresh;
 pub mod repository;
+pub(crate) mod scheduler;
 mod service;
 
 pub use recovery::FrontendMvRecoverySummary;

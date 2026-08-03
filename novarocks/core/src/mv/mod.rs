@@ -18,6 +18,7 @@
 pub(crate) mod aggregate_state;
 pub(crate) mod analysis;
 pub mod application;
+pub mod background;
 pub mod dependency;
 pub(crate) mod model;
 pub(crate) mod partition;
