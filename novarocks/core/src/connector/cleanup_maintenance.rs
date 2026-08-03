@@ -20,7 +20,7 @@
 //! This module owns exact-generation lease lifetime and the one-way dispatch
 //! barrier only. Candidate discovery, immutable artifacts, object identity,
 //! deletion, receipts, and reconciliation remain provider responsibilities.
-//! Design: ADR-0034 (docs/adr/ADR-0034-connector-orphan-cleanup-reconcile-contract.md)
+//! Design: ADR-0035 (docs/adr/ADR-0035-connector-orphan-cleanup-reconcile-contract.md)
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;

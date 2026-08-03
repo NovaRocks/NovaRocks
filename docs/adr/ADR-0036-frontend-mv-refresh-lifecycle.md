@@ -1,5 +1,5 @@
 ---
-id: ADR-0028
+id: ADR-0036
 title: "Frontend-owned MV refresh lifecycle"
 domain: [frontend-mv, provider-spi]
 status: active

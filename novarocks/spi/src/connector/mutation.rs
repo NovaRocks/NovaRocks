@@ -36,7 +36,7 @@ pub const MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES: usize = 64 * 1024;
 
 /// Bounded provider-produced commit fact that an application owner may persist
 /// and pass back to the provider without understanding its payload.
-/// Design: ADR-0028 (docs/adr/ADR-0028-frontend-mv-refresh-lifecycle.md)
+/// Design: ADR-0036 (docs/adr/ADR-0036-frontend-mv-refresh-lifecycle.md)
 ///
 /// `snapshot_id` is deliberately optional: snapshot-oriented providers can
 /// expose the existing typed fact needed by MV bookkeeping, while other
