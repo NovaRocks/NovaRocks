@@ -17,11 +17,13 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use arrow::array::{Array, Int32Array, StringArray};
 use novarocks_fs::{
     CacheOptions, DataCacheManager, DataCachePageCacheOptions, FileErrorKind, FileFormat,
     FileProjection, FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection,
-    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, inspect_parquet_layout,
+    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata,
     open_file_reader,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -29,7 +31,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use common::{Fixture, collect};
 
 #[test]
-fn parquet_layout_inspection_reports_stable_footer_facts() {
+fn parquet_metadata_inspection_reports_stable_footer_facts() {
     let fixture = Fixture::parquet();
     let request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     let expected = {
@@ -51,30 +53,65 @@ fn parquet_layout_inspection_reports_stable_footer_facts() {
             .collect::<Vec<_>>()
     };
 
-    let first = inspect_parquet_layout(fixture.file.clone(), None, request.context.clone())
+    let first = inspect_parquet_metadata(fixture.file.clone(), None, request.context.clone())
         .expect("inspect fixture footer");
-    let second = inspect_parquet_layout(fixture.file.clone(), None, request.context)
+    let second = inspect_parquet_metadata(fixture.file.clone(), None, request.context)
         .expect("inspect fixture footer again");
 
-    assert_eq!(first, second, "footer inspection must be stable");
-    assert_eq!(first.len(), 2, "fixture has two real row groups");
+    assert_eq!(
+        first.schema(),
+        second.schema(),
+        "footer schema must be stable"
+    );
+    assert_eq!(
+        first.physical_columns(),
+        second.physical_columns(),
+        "physical descriptors must be stable"
+    );
+    assert_eq!(
+        first.row_groups(),
+        second.row_groups(),
+        "layout must be stable"
+    );
+    assert_eq!(
+        first.row_groups().len(),
+        2,
+        "fixture has two real row groups"
+    );
     assert_eq!(
         first
+            .row_groups()
             .iter()
             .map(|layout| (layout.ordinal, layout.compressed_bytes, layout.row_count))
             .collect::<Vec<_>>(),
         expected
     );
-    assert!(first.iter().all(|layout| layout.compressed_bytes > 0));
+    assert!(
+        first
+            .row_groups()
+            .iter()
+            .all(|layout| layout.compressed_bytes > 0)
+    );
     assert_eq!(
-        first.iter().map(|layout| layout.row_count).sum::<u64>(),
+        first
+            .row_groups()
+            .iter()
+            .map(|layout| layout.row_count)
+            .sum::<u64>(),
         8,
         "layout preserves total fixture row coverage"
     );
+    assert_eq!(first.physical_columns().len(), 2);
+    let id_stats = first
+        .column_statistics(0, 0)
+        .expect("fixture writes id statistics");
+    assert_eq!(id_stats.null_count(), Some(0));
+    assert!(id_stats.min_is_exact());
+    assert!(id_stats.max_is_exact());
 }
 
 #[test]
-fn parquet_layout_inspection_rejects_corrupt_footer() {
+fn parquet_metadata_inspection_rejects_corrupt_footer() {
     let fixture = Fixture::parquet();
     let path = fixture.file.location().path();
     let mut bytes = std::fs::read(path).expect("read fixture");
@@ -82,7 +119,7 @@ fn parquet_layout_inspection_rejects_corrupt_footer() {
     std::fs::write(path, bytes).expect("corrupt footer marker");
     let request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
 
-    let error = inspect_parquet_layout(fixture.file.clone(), None, request.context)
+    let error = inspect_parquet_metadata(fixture.file.clone(), None, request.context)
         .expect_err("corrupt footer must not produce a layout");
 
     assert_eq!(error.kind(), FileErrorKind::Corrupt);
@@ -91,6 +128,28 @@ fn parquet_layout_inspection_rejects_corrupt_footer() {
             .to_string()
             .contains("inspect Parquet metadata failed"),
         "inspection keeps a typed footer failure boundary: {error}"
+    );
+}
+
+#[test]
+fn parquet_metadata_inspection_honors_cancel_and_deadline_before_footer_io() {
+    let fixture = Fixture::parquet();
+    let cancelled = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    cancelled.context.cancellation.cancel();
+    assert_eq!(
+        inspect_parquet_metadata(fixture.file.clone(), None, cancelled.context)
+            .expect_err("cancelled inspection must not load a footer")
+            .kind(),
+        FileErrorKind::Cancelled
+    );
+
+    let mut expired = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    expired.context.deadline = Some(Instant::now() - Duration::from_millis(1));
+    assert_eq!(
+        inspect_parquet_metadata(fixture.file.clone(), None, expired.context)
+            .expect_err("expired inspection must not load a footer")
+            .kind(),
+        FileErrorKind::DeadlineExceeded
     );
 }
 

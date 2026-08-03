@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorReaderMetricsSnapshot, ConnectorSplit,
+    ConnectorReaderMetricsSnapshot, ConnectorScanUnitFactsSummary, ConnectorSplit,
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -488,14 +488,20 @@ fn prepare_units(
             ));
         }
         if crate::common::config::debug_emit_connector_reader_marker() {
+            let facts = set.facts_summary();
             println!(
-                "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED instance={} split_id={} unit_count={} shape={} leaf_kind={} membership_digest={}",
+                "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED instance={} split_id={} unit_count={} shape={} leaf_kind={} membership_digest={} facts_exact_units={} facts_conservative_units={} facts_missing_units={} facts_available_columns={} facts_missing_columns={}",
                 binding.key().instance_id.as_str(),
                 set.split_id(),
                 set.len(),
                 set.preparation_shape(),
                 set.preparation_leaf_kind().unwrap_or("opaque"),
                 hex::encode(set.membership_digest()),
+                facts.exact_units(),
+                facts.conservative_units(),
+                facts.missing_units(),
+                facts.available_columns(),
+                facts.missing_columns(),
             );
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
@@ -924,19 +930,51 @@ impl ScanOp for ConnectorReadScanOp {
                 .read()
                 .map_err(|_| "SPI connector split state lock poisoned".to_string())?
                 .scheduled
-                .len();
+                .clone();
             let mut reported = self
                 .prepared_profile_reported
                 .lock()
                 .map_err(|_| "SPI connector prepared profile lock poisoned".to_string())?;
-            let newly_prepared = prepared.saturating_sub(*reported);
+            let newly_prepared = prepared.len().saturating_sub(*reported);
             if newly_prepared > 0 {
                 profile.counter_add(
                     "ConnectorScanUnitsPrepared",
                     ProfileUnit::Unit,
                     newly_prepared as i64,
                 );
-                *reported = prepared;
+                let facts = prepared[*reported..].iter().fold(
+                    ConnectorScanUnitFactsSummary::default(),
+                    |mut summary, unit| {
+                        summary.combine(unit.unit().domain_facts().summary());
+                        summary
+                    },
+                );
+                profile.counter_add(
+                    "ConnectorScanUnitFactsExactUnits",
+                    ProfileUnit::Unit,
+                    facts.exact_units() as i64,
+                );
+                profile.counter_add(
+                    "ConnectorScanUnitFactsConservativeUnits",
+                    ProfileUnit::Unit,
+                    facts.conservative_units() as i64,
+                );
+                profile.counter_add(
+                    "ConnectorScanUnitFactsMissingUnits",
+                    ProfileUnit::Unit,
+                    facts.missing_units() as i64,
+                );
+                profile.counter_add(
+                    "ConnectorScanUnitFactsAvailableColumns",
+                    ProfileUnit::Unit,
+                    facts.available_columns() as i64,
+                );
+                profile.counter_add(
+                    "ConnectorScanUnitFactsMissingColumns",
+                    ProfileUnit::Unit,
+                    facts.missing_columns() as i64,
+                );
+                *reported = prepared.len();
             }
         }
         if self.request.context.cancellation().is_cancelled() {

@@ -206,13 +206,6 @@ impl ConnectorReadExecution for CompositeReadExecution {
             Some(leaf_kind),
             &request,
         )?;
-        tracing::info!(
-            split_id = prepared.split_id(),
-            unit_count = prepared.len(),
-            shape = "single",
-            leaf_kind,
-            "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED"
-        );
         Ok(prepared)
     }
 
@@ -609,6 +602,15 @@ mod tests {
         prepared.units().next().unwrap()
     }
 
+    fn assert_missing_pinned_statistics(unit: &ConnectorPreparedScanUnit) {
+        assert!(matches!(
+            unit.domain_facts(),
+            ConnectorScanUnitDomainFacts::Missing(
+                ConnectorScanUnitFactsMissingReason::NoPinnedStatistics
+            )
+        ));
+    }
+
     struct Reader {
         batch: Option<RecordBatch>,
     }
@@ -699,6 +701,7 @@ mod tests {
         let read = installed.read().unwrap();
         let unit = prepare_single_unit(read, &split);
         assert_eq!(unit.ordinal(), 0);
+        assert_missing_pinned_statistics(&unit);
         assert!(matches!(
             decode_split(unit.payload()).unwrap().strategy_payload,
             StrategyPayload::Rpc { .. }
@@ -739,6 +742,7 @@ mod tests {
             .unwrap();
         let read = installed.read().unwrap();
         let unit = prepare_single_unit(read, &split);
+        assert_missing_pinned_statistics(&unit);
         let error = match read.open_unit_reader(
             &unit,
             ConnectorOpenReaderRequest {
@@ -776,6 +780,7 @@ mod tests {
         let read = installed.read().unwrap();
         let unit = prepare_single_unit(read, &split);
         assert_eq!(unit.ordinal(), 0);
+        assert_missing_pinned_statistics(&unit);
         assert!(matches!(
             decode_split(unit.payload()).unwrap().strategy_payload,
             StrategyPayload::SharedDataDirect { .. }

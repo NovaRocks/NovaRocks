@@ -32,4 +32,10 @@ pub fn open_file_reader(request: FileReadRequest) -> FileResult<Box<dyn FileBatc
     Ok(Box::new(budget::BudgetedFileReader::new(reader, budget)))
 }
 
-pub use parquet::{ParquetRowGroupLayout, inspect_parquet_layout};
+pub use parquet::{
+    MAX_PARQUET_INSPECTION_PHYSICAL_COLUMNS, MAX_PARQUET_INSPECTION_ROW_GROUPS,
+    MAX_PARQUET_INSPECTION_STATISTIC_CELLS, MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES,
+    ParquetColumnStatistics, ParquetMetadataInspection, ParquetPhysicalColumn, ParquetPhysicalType,
+    ParquetRowGroupLayout, ParquetStatisticsSortOrder, ParquetStatisticsValue,
+    inspect_parquet_metadata,
+};

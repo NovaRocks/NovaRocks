@@ -43,7 +43,13 @@ pub use cache::{
     validate_non_negative_i64,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
-pub use physical_reader::{ParquetRowGroupLayout, inspect_parquet_layout, open_file_reader};
+pub use physical_reader::{
+    MAX_PARQUET_INSPECTION_PHYSICAL_COLUMNS, MAX_PARQUET_INSPECTION_ROW_GROUPS,
+    MAX_PARQUET_INSPECTION_STATISTIC_CELLS, MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES,
+    ParquetColumnStatistics, ParquetMetadataInspection, ParquetPhysicalColumn, ParquetPhysicalType,
+    ParquetRowGroupLayout, ParquetStatisticsSortOrder, ParquetStatisticsValue,
+    inspect_parquet_metadata, open_file_reader,
+};
 pub use predicate::{
     MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,
     ScanPredicateDomain, ScanPredicateSource,

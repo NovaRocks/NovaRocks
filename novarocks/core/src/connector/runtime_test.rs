@@ -464,6 +464,26 @@ fn read_scan_profile_counts_prepared_units_before_reader_open() {
     .collect::<Result<Vec<_>, _>>()
     .expect("consume first unit");
     assert_eq!(profile.counter_value("ConnectorScanUnitsPrepared"), Some(3));
+    assert_eq!(
+        profile.counter_value("ConnectorScanUnitFactsExactUnits"),
+        Some(0)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorScanUnitFactsConservativeUnits"),
+        Some(0)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorScanUnitFactsMissingUnits"),
+        Some(3)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorScanUnitFactsAvailableColumns"),
+        Some(0)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorScanUnitFactsMissingColumns"),
+        Some(0)
+    );
     assert_eq!(profile.counter_value("ConnectorUnitReadersOpened"), Some(1));
 }
 

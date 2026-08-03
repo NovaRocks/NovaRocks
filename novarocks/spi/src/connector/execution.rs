@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use super::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
-    ConnectorWriteExecution,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
+    ConnectorScanUnitFactsSummary, ConnectorSplit, ConnectorWriteExecution,
 };
 
 /// A hard bound on the independently schedulable physical leaves carried by
@@ -286,6 +286,16 @@ impl ConnectorPreparedScanUnitSet {
 
     pub fn is_empty(&self) -> bool {
         false
+    }
+
+    /// Summarizes immutable domain-fact availability without exposing or
+    /// interpreting any provider value range.
+    pub fn facts_summary(&self) -> ConnectorScanUnitFactsSummary {
+        let mut summary = ConnectorScanUnitFactsSummary::default();
+        for unit in self.units() {
+            summary.combine(unit.domain_facts().summary());
+        }
+        summary
     }
 
     pub fn units(&self) -> impl ExactSizeIterator<Item = ConnectorPreparedScanUnit> + '_ {

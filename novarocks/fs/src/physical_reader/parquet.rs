@@ -28,6 +28,7 @@ use parquet::arrow::arrow_reader::{
     ParquetRecordBatchReaderBuilder, RowSelection,
 };
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
+use parquet::basic::{SortOrder, Type as ParquetType};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
@@ -37,6 +38,14 @@ use crate::{
     FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange, FileReadRequest,
     FileResult, MinMaxPredicateOp, MinMaxPredicateValue, ScanPredicate, ScanPredicateDomain,
 };
+
+/// Upper bounds for a footer inspection. They cap metadata retained before a
+/// connector has chosen any scan units and deliberately do not depend on a
+/// connector's own facts budget.
+pub const MAX_PARQUET_INSPECTION_ROW_GROUPS: usize = 65_536;
+pub const MAX_PARQUET_INSPECTION_PHYSICAL_COLUMNS: usize = 4_096;
+pub const MAX_PARQUET_INSPECTION_STATISTIC_CELLS: usize = 1_048_576;
+pub const MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES: usize = 64 * 1024;
 
 /// Connector-neutral physical layout of one Parquet row group.
 ///
@@ -49,17 +58,182 @@ pub struct ParquetRowGroupLayout {
     pub row_count: u64,
 }
 
-/// Read the Parquet footer through the normal authorized file and metadata
-/// cache path. This is deliberately separate from `open_file_reader`: callers
-/// can plan bounded physical leaves without opening a decoder or reading data
-/// pages.
-pub fn inspect_parquet_layout(
+/// A primitive Parquet leaf from the immutable footer schema.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParquetPhysicalColumn {
+    ordinal: u32,
+    path: Vec<String>,
+    field_id: Option<i32>,
+    physical_type: ParquetPhysicalType,
+    sort_order: ParquetStatisticsSortOrder,
+}
+
+impl ParquetPhysicalColumn {
+    pub fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    pub fn field_id(&self) -> Option<i32> {
+        self.field_id
+    }
+
+    pub fn physical_type(&self) -> ParquetPhysicalType {
+        self.physical_type
+    }
+
+    pub fn sort_order(&self) -> ParquetStatisticsSortOrder {
+        self.sort_order
+    }
+}
+
+/// The primitive physical representation used by a Parquet leaf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParquetPhysicalType {
+    Boolean,
+    Int32,
+    Int64,
+    Int96,
+    Float,
+    Double,
+    ByteArray,
+    FixedLenByteArray,
+}
+
+/// The ordering declared by the Parquet schema for statistics aggregation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParquetStatisticsSortOrder {
+    Signed,
+    Unsigned,
+    Undefined,
+}
+
+/// A decoded value from a Parquet footer statistic. This deliberately retains
+/// physical values only; connector-specific logical coercion belongs above FS.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParquetStatisticsValue {
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    Int96([u32; 3]),
+    Float(f32),
+    Double(f64),
+    ByteArray(Vec<u8>),
+    FixedLenByteArray(Vec<u8>),
+}
+
+/// Raw footer statistics for one row-group/physical-column cell.
+///
+/// `min` and `max` remain absent when the writer did not provide usable
+/// values. Exactness and ordering are surfaced separately so consumers cannot
+/// silently treat truncated or legacy bounds as exact facts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParquetColumnStatistics {
+    null_count: Option<u64>,
+    min: Option<ParquetStatisticsValue>,
+    max: Option<ParquetStatisticsValue>,
+    min_is_exact: bool,
+    max_is_exact: bool,
+    min_max_deprecated: bool,
+    min_max_backwards_compatible: bool,
+    sort_order: ParquetStatisticsSortOrder,
+}
+
+impl ParquetColumnStatistics {
+    pub fn null_count(&self) -> Option<u64> {
+        self.null_count
+    }
+
+    pub fn min(&self) -> Option<&ParquetStatisticsValue> {
+        self.min.as_ref()
+    }
+
+    pub fn max(&self) -> Option<&ParquetStatisticsValue> {
+        self.max.as_ref()
+    }
+
+    pub fn min_is_exact(&self) -> bool {
+        self.min_is_exact
+    }
+
+    pub fn max_is_exact(&self) -> bool {
+        self.max_is_exact
+    }
+
+    pub fn min_max_deprecated(&self) -> bool {
+        self.min_max_deprecated
+    }
+
+    pub fn min_max_backwards_compatible(&self) -> bool {
+        self.min_max_backwards_compatible
+    }
+
+    pub fn sort_order(&self) -> ParquetStatisticsSortOrder {
+        self.sort_order
+    }
+}
+
+/// Immutable, bounded snapshot of one authorized Parquet footer.
+///
+/// The private reader metadata keeps the exact footer snapshot alive. Public
+/// accessors expose only copied schema/layout/statistics facts and never open
+/// data pages or construct a decoder.
+#[derive(Clone, Debug)]
+pub struct ParquetMetadataInspection {
+    footer: Arc<ArrowReaderMetadata>,
+    schema: SchemaRef,
+    physical_columns: Vec<ParquetPhysicalColumn>,
+    row_groups: Vec<ParquetRowGroupLayout>,
+    statistics: Vec<Vec<Option<ParquetColumnStatistics>>>,
+}
+
+impl ParquetMetadataInspection {
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    pub fn physical_columns(&self) -> &[ParquetPhysicalColumn] {
+        &self.physical_columns
+    }
+
+    pub fn row_groups(&self) -> &[ParquetRowGroupLayout] {
+        &self.row_groups
+    }
+
+    /// Returns the footer statistics for a physical column in one row group.
+    /// Unknown ordinals and cells without a statistics struct both return
+    /// `None`; callers must therefore retain their requested identities.
+    pub fn column_statistics(
+        &self,
+        row_group_ordinal: u32,
+        physical_column_ordinal: u32,
+    ) -> Option<&ParquetColumnStatistics> {
+        self.statistics
+            .get(usize::try_from(row_group_ordinal).ok()?)?
+            .get(usize::try_from(physical_column_ordinal).ok()?)?
+            .as_ref()
+    }
+
+    /// Internal readers use this only to ensure the inspection owns the same
+    /// immutable footer snapshot for its full lifetime.
+    #[allow(dead_code)]
+    pub(crate) fn footer(&self) -> &ArrowReaderMetadata {
+        &self.footer
+    }
+}
+
+/// Read and freeze the Parquet footer through the normal authorized file and
+/// metadata-cache path. This is deliberately separate from `open_file_reader`:
+/// callers can plan bounded physical leaves without opening a decoder or
+/// reading data pages.
+pub fn inspect_parquet_metadata(
     file: BoundFile,
     cache: Option<DataCacheContext>,
     context: FileReadContext,
-) -> FileResult<Vec<ParquetRowGroupLayout>> {
-    const MAX_PARQUET_ROW_GROUPS: usize = 65_536;
-
+) -> FileResult<ParquetMetadataInspection> {
     context.check_active()?;
     let cache_enabled = cache
         .as_ref()
@@ -85,16 +259,65 @@ pub fn inspect_parquet_layout(
     };
     context.check_active()?;
     let parquet = metadata.metadata();
-    if parquet.num_row_groups() > MAX_PARQUET_ROW_GROUPS {
+    if parquet.num_row_groups() > MAX_PARQUET_INSPECTION_ROW_GROUPS {
         return Err(FileError::new(
             FileErrorKind::ResourceExhausted,
             format!(
-                "Parquet row-group count {} exceeds inspection bound {MAX_PARQUET_ROW_GROUPS}",
+                "Parquet row-group count {} exceeds inspection bound {MAX_PARQUET_INSPECTION_ROW_GROUPS}",
                 parquet.num_row_groups()
             ),
         ));
     }
-    parquet
+    let schema_descriptor = parquet.file_metadata().schema_descr();
+    if schema_descriptor.num_columns() > MAX_PARQUET_INSPECTION_PHYSICAL_COLUMNS {
+        return Err(FileError::new(
+            FileErrorKind::ResourceExhausted,
+            format!(
+                "Parquet physical-column count {} exceeds inspection bound {MAX_PARQUET_INSPECTION_PHYSICAL_COLUMNS}",
+                schema_descriptor.num_columns()
+            ),
+        ));
+    }
+    let statistic_cells = parquet
+        .num_row_groups()
+        .checked_mul(schema_descriptor.num_columns())
+        .ok_or_else(|| {
+            FileError::new(
+                FileErrorKind::ResourceExhausted,
+                "Parquet statistic-cell count overflows inspection accounting",
+            )
+        })?;
+    if statistic_cells > MAX_PARQUET_INSPECTION_STATISTIC_CELLS {
+        return Err(FileError::new(
+            FileErrorKind::ResourceExhausted,
+            format!(
+                "Parquet statistic-cell count {statistic_cells} exceeds inspection bound {MAX_PARQUET_INSPECTION_STATISTIC_CELLS}",
+            ),
+        ));
+    }
+
+    let physical_columns = schema_descriptor
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, column)| {
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                FileError::new(
+                    FileErrorKind::ResourceExhausted,
+                    "Parquet physical-column ordinal does not fit u32",
+                )
+            })?;
+            let basic = column.self_type().get_basic_info();
+            Ok(ParquetPhysicalColumn {
+                ordinal,
+                path: column.path().parts().to_vec(),
+                field_id: basic.has_id().then(|| basic.id()),
+                physical_type: parquet_physical_type(column.physical_type()),
+                sort_order: parquet_sort_order(column.sort_order()),
+            })
+        })
+        .collect::<FileResult<Vec<_>>>()?;
+    let row_groups = parquet
         .row_groups()
         .iter()
         .enumerate()
@@ -124,7 +347,49 @@ pub fn inspect_parquet_layout(
                 row_count,
             })
         })
-        .collect()
+        .collect::<FileResult<Vec<_>>>()?;
+    let statistics = parquet
+        .row_groups()
+        .iter()
+        .map(|row_group| {
+            context.check_active()?;
+            if row_group.columns().len() != physical_columns.len() {
+                return Err(FileError::new(
+                    FileErrorKind::Corrupt,
+                    "Parquet row group physical-column count disagrees with footer schema",
+                ));
+            }
+            row_group
+                .columns()
+                .iter()
+                .zip(&physical_columns)
+                .map(|(column, physical)| {
+                    context.check_active()?;
+                    let descriptor = column.column_descr();
+                    if descriptor.path().parts() != physical.path() {
+                        return Err(FileError::new(
+                            FileErrorKind::Corrupt,
+                            "Parquet row group physical-column path disagrees with footer schema",
+                        ));
+                    }
+                    column
+                        .statistics()
+                        .map(|statistics| {
+                            extract_parquet_column_statistics(statistics, physical.sort_order())
+                        })
+                        .transpose()
+                })
+                .collect::<FileResult<Vec<_>>>()
+        })
+        .collect::<FileResult<Vec<_>>>()?;
+    let schema = metadata.schema().clone();
+    Ok(ParquetMetadataInspection {
+        footer: Arc::new(metadata),
+        schema,
+        physical_columns,
+        row_groups,
+        statistics,
+    })
 }
 
 pub(crate) struct ParquetPhysicalReader {
@@ -872,36 +1137,152 @@ fn predicate_may_match(statistics: &Statistics, domain: &ScanPredicateDomain) ->
 fn statistic_bounds(
     statistics: &Statistics,
 ) -> Option<(MinMaxPredicateValue, MinMaxPredicateValue)> {
-    match statistics {
-        Statistics::Boolean(value) => Some((
-            MinMaxPredicateValue::Boolean(*value.min_opt()?),
-            MinMaxPredicateValue::Boolean(*value.max_opt()?),
-        )),
-        Statistics::Int32(value) => Some((
-            MinMaxPredicateValue::Int32(*value.min_opt()?),
-            MinMaxPredicateValue::Int32(*value.max_opt()?),
-        )),
-        Statistics::Int64(value) => Some((
-            MinMaxPredicateValue::Int64(*value.min_opt()?),
-            MinMaxPredicateValue::Int64(*value.max_opt()?),
-        )),
-        Statistics::Float(value) => Some((
-            MinMaxPredicateValue::Float(*value.min_opt()?),
-            MinMaxPredicateValue::Float(*value.max_opt()?),
-        )),
-        Statistics::Double(value) => Some((
-            MinMaxPredicateValue::Double(*value.min_opt()?),
-            MinMaxPredicateValue::Double(*value.max_opt()?),
-        )),
-        Statistics::ByteArray(value) => Some((
-            MinMaxPredicateValue::ByteArray(value.min_opt()?.data().to_vec()),
-            MinMaxPredicateValue::ByteArray(value.max_opt()?.data().to_vec()),
-        )),
-        Statistics::FixedLenByteArray(value) => Some((
-            MinMaxPredicateValue::FixedLenByteArray(value.min_opt()?.data().to_vec()),
-            MinMaxPredicateValue::FixedLenByteArray(value.max_opt()?.data().to_vec()),
-        )),
+    let extracted =
+        extract_parquet_column_statistics(statistics, ParquetStatisticsSortOrder::Undefined)
+            .ok()?;
+    Some((
+        predicate_value(extracted.min()?)?,
+        predicate_value(extracted.max()?)?,
+    ))
+}
+
+/// Decode the primitive values published in a Parquet statistics footer. The
+/// same helper backs static physical pruning and metadata inspection, so their
+/// byte decoding cannot drift. Logical interpretation is intentionally left to
+/// connector owners.
+fn extract_parquet_column_statistics(
+    statistics: &Statistics,
+    sort_order: ParquetStatisticsSortOrder,
+) -> FileResult<ParquetColumnStatistics> {
+    let (min, max) = parquet_statistics_values(statistics)?;
+    Ok(ParquetColumnStatistics {
+        null_count: statistics.null_count_opt(),
+        min,
+        max,
+        min_is_exact: statistics.min_is_exact(),
+        max_is_exact: statistics.max_is_exact(),
+        min_max_deprecated: statistics.is_min_max_deprecated(),
+        min_max_backwards_compatible: statistics.is_min_max_backwards_compatible(),
+        sort_order,
+    })
+}
+
+fn parquet_statistics_values(
+    statistics: &Statistics,
+) -> FileResult<(
+    Option<ParquetStatisticsValue>,
+    Option<ParquetStatisticsValue>,
+)> {
+    let values = match statistics {
+        Statistics::Boolean(value) => (
+            value
+                .min_opt()
+                .copied()
+                .map(ParquetStatisticsValue::Boolean),
+            value
+                .max_opt()
+                .copied()
+                .map(ParquetStatisticsValue::Boolean),
+        ),
+        Statistics::Int32(value) => (
+            value.min_opt().copied().map(ParquetStatisticsValue::Int32),
+            value.max_opt().copied().map(ParquetStatisticsValue::Int32),
+        ),
+        Statistics::Int64(value) => (
+            value.min_opt().copied().map(ParquetStatisticsValue::Int64),
+            value.max_opt().copied().map(ParquetStatisticsValue::Int64),
+        ),
+        Statistics::Int96(value) => (
+            value.min_opt().map(|value| {
+                ParquetStatisticsValue::Int96(value.data().try_into().expect("INT96 has 3 words"))
+            }),
+            value.max_opt().map(|value| {
+                ParquetStatisticsValue::Int96(value.data().try_into().expect("INT96 has 3 words"))
+            }),
+        ),
+        Statistics::Float(value) => (
+            value.min_opt().copied().map(ParquetStatisticsValue::Float),
+            value.max_opt().copied().map(ParquetStatisticsValue::Float),
+        ),
+        Statistics::Double(value) => (
+            value.min_opt().copied().map(ParquetStatisticsValue::Double),
+            value.max_opt().copied().map(ParquetStatisticsValue::Double),
+        ),
+        Statistics::ByteArray(value) => (
+            value
+                .min_opt()
+                .map(|value| ParquetStatisticsValue::ByteArray(value.data().to_vec())),
+            value
+                .max_opt()
+                .map(|value| ParquetStatisticsValue::ByteArray(value.data().to_vec())),
+        ),
+        Statistics::FixedLenByteArray(value) => (
+            value
+                .min_opt()
+                .map(|value| ParquetStatisticsValue::FixedLenByteArray(value.data().to_vec())),
+            value
+                .max_opt()
+                .map(|value| ParquetStatisticsValue::FixedLenByteArray(value.data().to_vec())),
+        ),
+    };
+    for value in [&values.0, &values.1].into_iter().flatten() {
+        if let Some(length) = parquet_statistics_value_len(value)
+            && length > MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES
+        {
+            return Err(FileError::new(
+                FileErrorKind::ResourceExhausted,
+                format!(
+                    "Parquet statistic value length {length} exceeds inspection bound {MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES}",
+                ),
+            ));
+        }
+    }
+    Ok(values)
+}
+
+fn parquet_statistics_value_len(value: &ParquetStatisticsValue) -> Option<usize> {
+    match value {
+        ParquetStatisticsValue::ByteArray(value)
+        | ParquetStatisticsValue::FixedLenByteArray(value) => Some(value.len()),
         _ => None,
+    }
+}
+
+fn predicate_value(value: &ParquetStatisticsValue) -> Option<MinMaxPredicateValue> {
+    match value {
+        ParquetStatisticsValue::Boolean(value) => Some(MinMaxPredicateValue::Boolean(*value)),
+        ParquetStatisticsValue::Int32(value) => Some(MinMaxPredicateValue::Int32(*value)),
+        ParquetStatisticsValue::Int64(value) => Some(MinMaxPredicateValue::Int64(*value)),
+        ParquetStatisticsValue::Float(value) => Some(MinMaxPredicateValue::Float(*value)),
+        ParquetStatisticsValue::Double(value) => Some(MinMaxPredicateValue::Double(*value)),
+        ParquetStatisticsValue::ByteArray(value) => {
+            Some(MinMaxPredicateValue::ByteArray(value.clone()))
+        }
+        ParquetStatisticsValue::FixedLenByteArray(value) => {
+            Some(MinMaxPredicateValue::FixedLenByteArray(value.clone()))
+        }
+        ParquetStatisticsValue::Int96(_) => None,
+    }
+}
+
+fn parquet_physical_type(value: ParquetType) -> ParquetPhysicalType {
+    match value {
+        ParquetType::BOOLEAN => ParquetPhysicalType::Boolean,
+        ParquetType::INT32 => ParquetPhysicalType::Int32,
+        ParquetType::INT64 => ParquetPhysicalType::Int64,
+        ParquetType::INT96 => ParquetPhysicalType::Int96,
+        ParquetType::FLOAT => ParquetPhysicalType::Float,
+        ParquetType::DOUBLE => ParquetPhysicalType::Double,
+        ParquetType::BYTE_ARRAY => ParquetPhysicalType::ByteArray,
+        ParquetType::FIXED_LEN_BYTE_ARRAY => ParquetPhysicalType::FixedLenByteArray,
+    }
+}
+
+fn parquet_sort_order(value: SortOrder) -> ParquetStatisticsSortOrder {
+    match value {
+        SortOrder::SIGNED => ParquetStatisticsSortOrder::Signed,
+        SortOrder::UNSIGNED => ParquetStatisticsSortOrder::Unsigned,
+        SortOrder::UNDEFINED => ParquetStatisticsSortOrder::Undefined,
     }
 }
 
