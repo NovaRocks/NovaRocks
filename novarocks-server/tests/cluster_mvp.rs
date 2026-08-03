@@ -476,6 +476,22 @@ impl MultiBeClusterHarness {
         fe_extra: &str,
         default_state_store: bool,
     ) -> Self {
+        Self::start_n_be_with_options_and_standalone_extra(
+            n,
+            be_debug,
+            fe_extra,
+            default_state_store,
+            "",
+        )
+    }
+
+    fn start_n_be_with_options_and_standalone_extra(
+        n: usize,
+        be_debug: &str,
+        fe_extra: &str,
+        default_state_store: bool,
+        standalone_server_extra: &str,
+    ) -> Self {
         assert!(n >= 1, "must spawn at least one BE");
 
         // Reserve all ports up front before releasing any of them.
@@ -570,6 +586,7 @@ grpc_port = {fe_grpc_port}
 
 [standalone_server]
 mysql_port = {fe_mysql_port}
+{standalone_server_extra}
 
 [cluster]
 role = "fe"
@@ -661,6 +678,22 @@ deployment_owner = "fe-1"
         cluster_id: &str,
         be_extra: &str,
     ) -> Self {
+        Self::start_three_be_sqlite_state_store_with_metadata_and_extras(
+            state_store_path,
+            metadata_path,
+            cluster_id,
+            be_extra,
+            "",
+        )
+    }
+
+    fn start_three_be_sqlite_state_store_with_metadata_and_extras(
+        state_store_path: &Path,
+        metadata_path: &Path,
+        cluster_id: &str,
+        be_extra: &str,
+        frontend_extra: &str,
+    ) -> Self {
         assert!(
             state_store_path.is_absolute(),
             "SQLite StateStore path must be absolute: {}",
@@ -682,11 +715,19 @@ provider = "sqlite"
 path = "{}"
 cluster_id = "{cluster_id}"
 deployment_owner = "fe-1"
+
+{frontend_extra}
 "#,
             metadata_path.display(),
             state_store_path.display(),
         );
-        Self::start_n_be_with_options(3, be_extra, &fe_extra, false)
+        Self::start_n_be_with_options_and_standalone_extra(
+            3,
+            be_extra,
+            &fe_extra,
+            false,
+            frontend_extra,
+        )
     }
 
     fn start_three_be_sqlite_state_store_with_metadata_and_fault_dir(
@@ -990,6 +1031,21 @@ fn assert_exact_live_backends(conn: &mut MysqlConn, expected: usize) {
         assert!(
             Instant::now() < deadline,
             "expected exactly {expected} Live backends; rows={rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_mv_rows(conn: &mut MysqlConn, sql: &str, expected: &[(i32, i64)], diagnostics: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let rows: Result<Vec<(i32, i64)>, mysql::Error> = conn.query(sql);
+        if matches!(&rows, Ok(rows) if rows.as_slice() == expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduled MV did not converge; expected={expected:?}; observed={rows:?}; {diagnostics}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3681,6 +3737,181 @@ fn cross_process_three_be_mv_state_store_restart() {
     runtime
         .block_on(host.shutdown())
         .expect("inspection host shutdown");
+}
+
+/// Exercises the frontend-owned scheduler in the native deployment shape.
+///
+/// The worker has no all-in-one branch: catalog facts are frozen by the FE and
+/// refreshes are submitted through the three live BEs.  The low configured
+/// limit forces the two independent MV refreshes through one scheduler permit;
+/// a debug barrier is required before this test can make timing-based
+/// assertions about the exact overlap bound.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires native 1FE+3BE processes and scheduler debug barriers"]
+fn cross_process_three_be_mvx4_scheduler_catches_up_and_bounds_concurrency() {
+    let _guard = lock_cluster_mvp();
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-mvx4.sqlite");
+    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
+    let scheduler_config = r#"
+mv_refresh_scheduler_enabled = true
+mv_refresh_scheduler_interval_ms = 100
+mv_refresh_scheduler_max_concurrent = 1
+mv_refresh_scheduler_failure_backoff_ms = 100
+mv_refresh_scheduler_max_failure_backoff_ms = 1_000
+"#;
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
+            &state_store_path,
+            &metadata_path,
+            "mvx4-scheduler",
+            "",
+            scheduler_config,
+        );
+    let diagnostics = cluster.log_diagnostics();
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create MVX-4 warehouse");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        "CREATE EXTERNAL CATALOG mvx4_sched_ice PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
+        warehouse.path().display(),
+    ))
+    .expect("create MVX-4 scheduler catalog");
+    conn.query_drop("CREATE DATABASE mvx4_sched_ice.ns")
+        .expect("create MVX-4 scheduler namespace");
+    conn.query_drop("SET CATALOG mvx4_sched_ice")
+        .expect("select MVX-4 scheduler catalog");
+    conn.query_drop("USE ns")
+        .expect("select MVX-4 scheduler namespace");
+    conn.query_drop(
+        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\")",
+    )
+    .expect("create MVX-4 scheduler base table");
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_mv_a DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create first scheduled MV");
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_mv_b DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create second scheduled MV");
+    conn.query_drop("INSERT INTO orders VALUES (1, 10), (2, 20)")
+        .expect("seed scheduled MV base table");
+    let initial = [(1, 10), (2, 20)];
+    wait_for_mv_rows(
+        &mut conn,
+        "SELECT k1, v2 FROM orders_mv_a ORDER BY k1",
+        &initial,
+        &diagnostics,
+    );
+    wait_for_mv_rows(
+        &mut conn,
+        "SELECT k1, v2 FROM orders_mv_b ORDER BY k1",
+        &initial,
+        &diagnostics,
+    );
+    conn.query_drop("INSERT INTO orders VALUES (3, 30)")
+        .expect("mutate scheduled MV base table");
+    let caught_up = [(1, 10), (2, 20), (3, 30)];
+    wait_for_mv_rows(
+        &mut conn,
+        "SELECT k1, v2 FROM orders_mv_a ORDER BY k1",
+        &caught_up,
+        &diagnostics,
+    );
+    wait_for_mv_rows(
+        &mut conn,
+        "SELECT k1, v2 FROM orders_mv_b ORDER BY k1",
+        &caught_up,
+        &diagnostics,
+    );
+    assert_exact_live_backends(&mut conn, 3);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+}
+
+/// Verifies that a clean FE shutdown releases frontend worker ownership and a
+/// restart rebinds workers only after StateStore/catalog recovery.  The test
+/// deliberately asserts observable catch-up rather than inferring success
+/// from process survival.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires native 1FE+3BE processes and scheduler debug barriers"]
+fn cross_process_three_be_mvx4_shutdown_cancels_and_recovers_background_work() {
+    let _guard = lock_cluster_mvp();
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-mvx4.sqlite");
+    let metadata_path = state_store_dir.path().join("frontend-metadata.sqlite");
+    let scheduler_config = r#"
+mv_refresh_scheduler_enabled = true
+mv_refresh_scheduler_interval_ms = 100
+mv_refresh_scheduler_max_concurrent = 1
+mv_refresh_scheduler_failure_backoff_ms = 100
+mv_refresh_scheduler_max_failure_backoff_ms = 1_000
+"#;
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_extras(
+            &state_store_path,
+            &metadata_path,
+            "mvx4-shutdown-recovery",
+            "",
+            scheduler_config,
+        );
+    let diagnostics = cluster.log_diagnostics();
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create MVX-4 warehouse");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        "CREATE EXTERNAL CATALOG mvx4_recovery_ice PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
+        warehouse.path().display(),
+    ))
+    .expect("create MVX-4 recovery catalog");
+    conn.query_drop("CREATE DATABASE mvx4_recovery_ice.ns")
+        .expect("create MVX-4 recovery namespace");
+    conn.query_drop("SET CATALOG mvx4_recovery_ice")
+        .expect("select MVX-4 recovery catalog");
+    conn.query_drop("USE ns")
+        .expect("select MVX-4 recovery namespace");
+    conn.query_drop(
+        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\")",
+    )
+    .expect("create MVX-4 recovery base table");
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create scheduled MV for shutdown recovery");
+    conn.query_drop("INSERT INTO orders VALUES (1, 10), (2, 20)")
+        .expect("seed recovery base table");
+    let initial = [(1, 10), (2, 20)];
+    wait_for_mv_rows(
+        &mut conn,
+        "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+        &initial,
+        &diagnostics,
+    );
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    cluster.restart_fe();
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop("SET CATALOG mvx4_recovery_ice")
+        .expect("restore recovery catalog after FE restart");
+    conn.query_drop("USE ns")
+        .expect("restore recovery namespace after FE restart");
+    conn.query_drop("INSERT INTO orders VALUES (3, 30)")
+        .expect("mutate base table after frontend worker restart");
+    let caught_up = [(1, 10), (2, 20), (3, 30)];
+    wait_for_mv_rows(
+        &mut conn,
+        "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+        &caught_up,
+        &diagnostics,
+    );
+    assert_exact_live_backends(&mut conn, 3);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 }
 
 /// Exercises the two crash windows that startup recovery must converge without
