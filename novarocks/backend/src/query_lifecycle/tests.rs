@@ -126,6 +126,25 @@ impl QueryTerminalFallbackTransport for RejectedTerminalFallback {
     }
 }
 
+struct GoneTerminalFallback;
+
+impl QueryTerminalFallbackTransport for GoneTerminalFallback {
+    fn report_query_terminal(
+        &self,
+        _endpoint: &QueryControlEndpoint,
+        _snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
+        _timeout: Duration,
+    ) -> Result<
+        QueryTerminalReportAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Ok(QueryTerminalReportAck::new(
+            QueryTerminalReportOutcome::RejectedGone,
+            "injected stale terminal ingress",
+        ))
+    }
+}
+
 impl RecordingMetricsSink {
     fn last_snapshot(&self) -> BackendQueryLifecycleMetricsSnapshot {
         *self
@@ -324,7 +343,7 @@ fn terminal_fallback_conflict_releases_bounded_delivery_record() {
         Arc::new(runtime),
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        metrics,
+        metrics.clone(),
         Arc::new(RejectedTerminalFallback),
     );
     let fragment_instance_id = UniqueId::new(863, 1);
@@ -351,11 +370,61 @@ fn terminal_fallback_conflict_releases_bounded_delivery_record() {
         if registry.metrics_snapshot().terminal_retained == 0
             && registry.metrics_snapshot().terminal_fallback_rejected > 0
         {
+            assert_eq!(metrics.last_snapshot().terminal_retained, 0);
             return;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
     panic!("terminal conflict did not release the retained delivery record");
+}
+
+#[test]
+fn terminal_fallback_gone_releases_bounded_delivery_record() {
+    let runtime = RecordingLocalRuntime::default();
+    let clock = Arc::new(ManualClock::default());
+    let metrics = Arc::new(RecordingMetricsSink::default());
+    let mut config = registry_config(8);
+    config.terminal_ack_timeout = Duration::from_millis(1);
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    let registry = QueryLifecycleRegistry::new_with_clock_metrics_and_terminal_fallback(
+        LOCAL_BACKEND_ID,
+        LOCAL_START_EPOCH,
+        Arc::new(runtime),
+        config,
+        Arc::clone(&clock) as Arc<dyn MonotonicClock>,
+        metrics.clone(),
+        Arc::new(GoneTerminalFallback),
+    );
+    let fragment_instance_id = UniqueId::new(864, 1);
+    let request = fragment_init_request_fixture(864, &[fragment_instance_id]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _control = attach_control(&registry, &request);
+    registry
+        .admit_fragment(execution_id, fragment_instance_id)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+    registry
+        .abort_query(
+            QueryAbortRequest::new(execution_id, request.digest(), "stale terminal ingress")
+                .expect("valid abort"),
+        )
+        .expect("abort is accepted");
+
+    for _ in 0..100 {
+        if registry.metrics_snapshot().terminal_retained == 0
+            && registry.metrics_snapshot().terminal_fallback_rejected > 0
+        {
+            assert_eq!(metrics.last_snapshot().terminal_retained, 0);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("gone terminal fallback did not release the retained delivery record");
 }
 
 fn registry_with(

@@ -2449,7 +2449,11 @@ impl QueryLifecycleRegistry {
                                 detail = %ack.detail(),
                                 "query terminal fallback was rejected"
                             );
-                            if ack.outcome() == QueryTerminalReportOutcome::RejectedConflict {
+                            if matches!(
+                                ack.outcome(),
+                                QueryTerminalReportOutcome::RejectedConflict
+                                    | QueryTerminalReportOutcome::RejectedGone
+                            ) {
                                 registry.discard_terminal_record(
                                     &entry,
                                     snapshot.execution_id(),
@@ -2574,6 +2578,7 @@ impl QueryLifecycleRegistry {
         };
         entry.terminal_delivery_completed.notify_all();
         self.release_terminal_record(execution_id);
+        self.publish_metrics();
         self.publish_tombstone(entry, execution_id, reason);
     }
 

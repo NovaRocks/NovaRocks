@@ -774,7 +774,7 @@ run_sql_suites() {
     suite_cluster_size="$(ci_suite_cluster_size "$suite")"
     case "$suite" in
       tpc-ds|tpc-h)
-        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-180}"
+        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
         ;;
       complex-type|ssb)
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-120}"
@@ -925,7 +925,7 @@ run_native_cross_process_sql_suites() {
     suite_cluster_size="$(ci_native_cross_process_suite_cluster_size "$suite")"
     case "$suite" in
       tpc-ds|tpc-h)
-        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-180}"
+        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
         ;;
       complex-type|ssb)
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-120}"

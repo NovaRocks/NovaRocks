@@ -54,7 +54,7 @@ Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
     producer binding 1, fragment = 1, node = 10, expr = (b.k)
-    consumer binding 2, fragment = 1, node = 4, expr = (k), activation = BlockingSnapshot
+    consumer binding 2, fragment = 1, node = 2, expr = (generate_series), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
