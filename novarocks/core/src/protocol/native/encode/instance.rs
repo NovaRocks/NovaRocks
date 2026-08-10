@@ -20,10 +20,10 @@
 use std::collections::HashMap;
 
 use crate::common::types::UniqueId;
-use crate::exec::spill::{SpillConfig, SpillMode};
 use crate::query_execution::schedule::FragmentInstancePlacement;
-use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::scan_range;
+use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
+use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{common, novarocks};
 

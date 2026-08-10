@@ -19,6 +19,10 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::stats_assembler::FileSketchSet;
+use novarocks_execution::runtime::fragment::io::{
+    FragmentCommitLease, FragmentCommitPort, FragmentCommitReport, FragmentSinkLoadStats,
+    TabletCommitInfo as ExecutionTabletCommitInfo, TabletFailInfo as ExecutionTabletFailInfo,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SinkLoadStats {
@@ -58,6 +62,126 @@ impl SinkCommitReportSnapshot {
     ) -> Self {
         self.connector_staged_report_frames = frames;
         self
+    }
+}
+
+/// Temporary Core host adapter for fragment admission.
+///
+/// Query lifecycle retains the legacy store until the Backend composition cut;
+/// execution reaches it exclusively through the neutral port.
+#[derive(Debug, Default)]
+pub struct CoreSinkCommitPort;
+
+impl FragmentCommitPort for CoreSinkCommitPort {
+    fn acquire(
+        &self,
+        fragment_instance_id: UniqueId,
+    ) -> Result<Box<dyn FragmentCommitLease>, String> {
+        if !try_register(fragment_instance_id) {
+            return Err(format!(
+                "sink commit already registered for fragment instance {fragment_instance_id}"
+            ));
+        }
+        Ok(Box::new(CoreSinkCommitLease {
+            fragment_instance_id,
+            active: true,
+        }))
+    }
+}
+
+struct CoreSinkCommitLease {
+    fragment_instance_id: UniqueId,
+    active: bool,
+}
+
+impl CoreSinkCommitLease {
+    fn snapshot(&self) -> FragmentCommitReport {
+        let snapshot = report_snapshot(self.fragment_instance_id);
+        FragmentCommitReport {
+            connector_staged_report_frames: snapshot.connector_staged_report_frames,
+            tablet_commit_infos: snapshot
+                .tablet_commit_infos
+                .into_iter()
+                .map(|info| ExecutionTabletCommitInfo {
+                    tablet_id: info.tablet_id,
+                    backend_id: info.backend_id,
+                })
+                .collect(),
+            tablet_fail_infos: snapshot
+                .tablet_fail_infos
+                .into_iter()
+                .map(|info| ExecutionTabletFailInfo {
+                    tablet_id: info.tablet_id,
+                    backend_id: info.backend_id,
+                })
+                .collect(),
+            load_stats: FragmentSinkLoadStats {
+                loaded_rows: snapshot.load_stats.loaded_rows,
+                loaded_bytes: snapshot.load_stats.loaded_bytes,
+                filtered_rows: snapshot.load_stats.filtered_rows,
+            },
+        }
+    }
+}
+
+impl FragmentCommitLease for CoreSinkCommitLease {
+    fn add_load_stats(&mut self, stats: FragmentSinkLoadStats) {
+        add_load_stats(
+            self.fragment_instance_id,
+            stats.loaded_rows,
+            stats.loaded_bytes,
+            stats.filtered_rows,
+        );
+    }
+
+    fn add_tablet_commit_info(&mut self, info: ExecutionTabletCommitInfo) {
+        add_tablet_commit_info(
+            self.fragment_instance_id,
+            TabletCommitInfo {
+                tablet_id: info.tablet_id,
+                backend_id: info.backend_id,
+            },
+        );
+    }
+
+    fn add_tablet_fail_info(&mut self, info: ExecutionTabletFailInfo) {
+        add_tablet_fail_info(
+            self.fragment_instance_id,
+            TabletFailInfo {
+                tablet_id: info.tablet_id,
+                backend_id: info.backend_id,
+            },
+        );
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<FragmentCommitReport, String> {
+        let snapshot = self.snapshot();
+        if self.active {
+            unregister(self.fragment_instance_id);
+            self.active = false;
+        }
+        Ok(snapshot)
+    }
+
+    fn handoff(mut self: Box<Self>) -> Result<(), String> {
+        self.active = false;
+        Ok(())
+    }
+
+    fn rollback(mut self: Box<Self>) -> Result<(), String> {
+        if self.active {
+            unregister(self.fragment_instance_id);
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CoreSinkCommitLease {
+    fn drop(&mut self) {
+        if self.active {
+            unregister(self.fragment_instance_id);
+        }
     }
 }
 

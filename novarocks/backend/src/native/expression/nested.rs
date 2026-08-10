@@ -20,8 +20,8 @@
 use arrow::datatypes::DataType;
 
 use super::{decode_expr_at, decode_expr_type_at};
-use novarocks::exec::expr::{ExprArena, ExprId};
 use novarocks::protocol::FieldPath;
+use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_protocol::expr;
 
 use super::NativeExpressionInputLayout;

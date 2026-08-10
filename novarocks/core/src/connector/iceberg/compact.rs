@@ -43,8 +43,8 @@ use crate::engine::iceberg_writer::{
     run_select_to_chunks,
 };
 use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
-use crate::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 use novarocks_connector_iceberg::commit::AbortLog;
+use novarocks_execution::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WholeTableRewriteTarget {
@@ -410,7 +410,7 @@ fn validate_base_snapshot(
     Ok(())
 }
 
-fn chunk_row_count(chunks: &[crate::exec::chunk::Chunk]) -> Result<i64, String> {
+fn chunk_row_count(chunks: &[novarocks_execution::exec::chunk::Chunk]) -> Result<i64, String> {
     chunks.iter().try_fold(0_i64, |sum, chunk| {
         let rows = i64::try_from(chunk.batch.num_rows())
             .map_err(|_| "iceberg optimize selected row count overflow".to_string())?;
@@ -426,7 +426,7 @@ fn chunk_row_count(chunks: &[crate::exec::chunk::Chunk]) -> Result<i64, String> 
 /// `SELECT *, _row_id, _last_updated_sequence_number FROM …` and are
 /// expected to carry both columns at the end of the schema in that order.
 fn chunks_to_row_lineage_batches(
-    chunks: &[crate::exec::chunk::Chunk],
+    chunks: &[novarocks_execution::exec::chunk::Chunk],
 ) -> Result<Vec<RowLineageWriteBatch>, String> {
     use arrow::array::Int64Array;
     use arrow::datatypes::Schema;

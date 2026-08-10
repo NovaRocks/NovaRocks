@@ -22,8 +22,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
-use novarocks::exec::expr::function::date::eval_date_function;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use novarocks_execution::exec::expr::function::date::eval_date_function;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -45,10 +45,10 @@ fn date32_from_ymd(year: i32, month: u32, day: u32) -> i32 {
 
 fn date_eval_ts(
     name: &str,
-    arena: &novarocks::exec::expr::ExprArena,
-    expr: novarocks::exec::expr::ExprId,
-    args: &[novarocks::exec::expr::ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    arena: &novarocks_execution::exec::expr::ExprArena,
+    expr: novarocks_execution::exec::expr::ExprId,
+    args: &[novarocks_execution::exec::expr::ExprId],
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> i64 {
     let arr = eval_date_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr
@@ -60,10 +60,10 @@ fn date_eval_ts(
 
 fn date_eval_i64(
     name: &str,
-    arena: &novarocks::exec::expr::ExprArena,
-    expr: novarocks::exec::expr::ExprId,
-    args: &[novarocks::exec::expr::ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    arena: &novarocks_execution::exec::expr::ExprArena,
+    expr: novarocks_execution::exec::expr::ExprId,
+    args: &[novarocks_execution::exec::expr::ExprId],
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> i64 {
     let arr = eval_date_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -72,10 +72,10 @@ fn date_eval_i64(
 
 fn date_eval_date32(
     name: &str,
-    arena: &novarocks::exec::expr::ExprArena,
-    expr: novarocks::exec::expr::ExprId,
-    args: &[novarocks::exec::expr::ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    arena: &novarocks_execution::exec::expr::ExprArena,
+    expr: novarocks_execution::exec::expr::ExprId,
+    args: &[novarocks_execution::exec::expr::ExprId],
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> i32 {
     let arr = eval_date_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Date32Array>().unwrap();
@@ -84,10 +84,10 @@ fn date_eval_date32(
 
 fn date_eval_str(
     name: &str,
-    arena: &novarocks::exec::expr::ExprArena,
-    expr: novarocks::exec::expr::ExprId,
-    args: &[novarocks::exec::expr::ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    arena: &novarocks_execution::exec::expr::ExprArena,
+    expr: novarocks_execution::exec::expr::ExprId,
+    args: &[novarocks_execution::exec::expr::ExprId],
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> String {
     let arr = eval_date_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
@@ -754,7 +754,9 @@ fn test_timestamp_logic() {
 
 #[test]
 fn test_tera_datetime_parser_basic_patterns() {
-    use novarocks::exec::expr::function::date::{compile_tera_format, parse_tera_datetime};
+    use novarocks_execution::exec::expr::function::date::{
+        compile_tera_format, parse_tera_datetime,
+    };
     let fmt = compile_tera_format("yyyy/mm/dd hh24:mi:ss").expect("compile format");
     let dt = parse_tera_datetime("1988/04/08 2:3:4", &fmt).expect("parse datetime");
     assert_eq!(
@@ -778,7 +780,9 @@ fn test_tera_datetime_parser_basic_patterns() {
 
 #[test]
 fn test_tera_datetime_parser_am_pm() {
-    use novarocks::exec::expr::function::date::{compile_tera_format, parse_tera_datetime};
+    use novarocks_execution::exec::expr::function::date::{
+        compile_tera_format, parse_tera_datetime,
+    };
     let fmt = compile_tera_format("yyyy/mm/dd hh pm:mi:ss").expect("compile format");
     let dt = parse_tera_datetime("1988/04/08 02 pm:3:4", &fmt).expect("parse pm datetime");
     assert_eq!(
@@ -795,7 +799,7 @@ fn test_tera_datetime_parser_am_pm() {
 
 #[test]
 fn test_tera_datetime_format_validation() {
-    use novarocks::exec::expr::function::date::compile_tera_format;
+    use novarocks_execution::exec::expr::function::date::compile_tera_format;
     let err = compile_tera_format(";YYYYmm:dd").expect_err("format should be invalid");
     assert_eq!(err, "The format parameter ;YYYYmm:dd is invalid format");
 }
@@ -1026,7 +1030,7 @@ fn test_from_days_logic() {
 
 #[test]
 fn test_from_days_out_of_calendar_range_returns_zero_date_sentinel() {
-    use novarocks::exec::expr::function::date::{
+    use novarocks_execution::exec::expr::function::date::{
         FROM_DAYS_MAX_VALID, from_days_value, zero_date_sentinel_date32,
     };
     let sentinel = zero_date_sentinel_date32();
@@ -1038,7 +1042,7 @@ fn test_from_days_out_of_calendar_range_returns_zero_date_sentinel() {
 
 #[test]
 fn test_from_days_out_of_i32_range_returns_null() {
-    use novarocks::exec::expr::function::date::from_days_value;
+    use novarocks_execution::exec::expr::function::date::from_days_value;
     assert_eq!(from_days_value(i32::MAX as i64 + 1), None);
     assert_eq!(from_days_value(i32::MIN as i64 - 1), None);
 }
@@ -1086,7 +1090,7 @@ fn test_makedate_logic() {
 
 #[test]
 fn test_makedate_bounds_and_year_zero() {
-    use novarocks::exec::expr::function::date::eval_makedate;
+    use novarocks_execution::exec::expr::function::date::eval_makedate;
     let mut arena = ExprArena::default();
     let year_over = arena.push_typed(
         ExprNode::Literal(LiteralValue::Int64(2020)),
@@ -1163,7 +1167,7 @@ fn test_sec_to_time_logic() {
 
 #[test]
 fn test_sec_to_time_boundaries() {
-    use novarocks::exec::expr::function::date::format_sec_to_time;
+    use novarocks_execution::exec::expr::function::date::format_sec_to_time;
     assert_eq!(format_sec_to_time(-1), "-00:00:01");
     assert_eq!(format_sec_to_time(0), "00:00:00");
     assert_eq!(format_sec_to_time(90061), "25:01:01");
@@ -1284,7 +1288,7 @@ fn test_time_to_sec_logic() {
 
 #[test]
 fn test_time_to_sec_duration_parser() {
-    use novarocks::exec::expr::function::date::parse_hms_duration_to_seconds;
+    use novarocks_execution::exec::expr::function::date::parse_hms_duration_to_seconds;
     assert_eq!(parse_hms_duration_to_seconds("00:00:00"), Some(0));
     assert_eq!(parse_hms_duration_to_seconds("23:59:59"), Some(86399));
     assert_eq!(parse_hms_duration_to_seconds("25:00:00"), Some(90000));
@@ -1295,7 +1299,9 @@ fn test_time_to_sec_duration_parser() {
 
 #[test]
 fn test_time_to_sec_recovers_from_failed_cast_time_literal() {
-    use novarocks::exec::expr::function::date::{eval_time_to_sec, parse_from_cast_source};
+    use novarocks_execution::exec::expr::function::date::{
+        eval_time_to_sec, parse_from_cast_source,
+    };
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr_i64: ExprId = common::typed_null(&mut arena, DataType::Int64);
@@ -1318,7 +1324,7 @@ fn test_time_to_sec_recovers_from_failed_cast_time_literal() {
 
 #[test]
 fn test_time_to_sec_cast_string_with_datetime_prefix_returns_null() {
-    use novarocks::exec::expr::function::date::eval_time_to_sec;
+    use novarocks_execution::exec::expr::function::date::eval_time_to_sec;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr_i64: ExprId = common::typed_null(&mut arena, DataType::Int64);
@@ -1337,7 +1343,7 @@ fn test_time_to_sec_cast_string_with_datetime_prefix_returns_null() {
 
 #[test]
 fn test_time_to_sec_explicit_datetime_cast_preserves_time_part() {
-    use novarocks::exec::expr::function::date::eval_time_to_sec;
+    use novarocks_execution::exec::expr::function::date::eval_time_to_sec;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr_i64: ExprId = common::typed_null(&mut arena, DataType::Int64);
@@ -1361,8 +1367,8 @@ fn test_time_to_sec_explicit_datetime_cast_preserves_time_part() {
 
 #[test]
 fn test_time_to_sec_sec_to_time_negative_roundtrip() {
-    use novarocks::exec::expr::function::FunctionKind;
-    use novarocks::exec::expr::function::date::eval_time_to_sec;
+    use novarocks_execution::exec::expr::function::FunctionKind;
+    use novarocks_execution::exec::expr::function::date::eval_time_to_sec;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr_i64: ExprId = common::typed_null(&mut arena, DataType::Int64);
@@ -1385,8 +1391,8 @@ fn test_time_to_sec_sec_to_time_negative_roundtrip() {
 
 #[test]
 fn test_time_to_sec_sec_to_time_negative_clamps_like_sec_to_time() {
-    use novarocks::exec::expr::function::FunctionKind;
-    use novarocks::exec::expr::function::date::eval_time_to_sec;
+    use novarocks_execution::exec::expr::function::FunctionKind;
+    use novarocks_execution::exec::expr::function::date::eval_time_to_sec;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr_i64: ExprId = common::typed_null(&mut arena, DataType::Int64);
@@ -1467,7 +1473,7 @@ fn test_unix_timestamp_logic() {
 
 #[test]
 fn test_parse_datetime_rejects_second_60() {
-    use novarocks::exec::expr::function::date::parse_datetime;
+    use novarocks_execution::exec::expr::function::date::parse_datetime;
     // second=60 is a chrono leap-second; StarRocks treats it as invalid → None.
     assert!(parse_datetime("2024-01-01 01:30:60").is_none());
     assert!(parse_datetime("2024-01-01T01:30:60").is_none());
@@ -1479,7 +1485,7 @@ fn test_parse_datetime_rejects_second_60() {
 
 #[test]
 fn parse_datetime_accepts_lenient_second_field_width() {
-    use novarocks::exec::expr::function::date::parse_datetime;
+    use novarocks_execution::exec::expr::function::date::parse_datetime;
     let dt = parse_datetime("2023-08-17 08:00:006").expect("parse datetime");
     assert_eq!(
         dt,
@@ -1492,7 +1498,7 @@ fn parse_datetime_accepts_lenient_second_field_width() {
 
 #[test]
 fn parse_datetime_accepts_compact_timestamp() {
-    use novarocks::exec::expr::function::date::parse_datetime;
+    use novarocks_execution::exec::expr::function::date::parse_datetime;
     let dt = parse_datetime("20230817T080006").expect("parse compact datetime");
     assert_eq!(
         dt,
@@ -2158,7 +2164,9 @@ fn test_unix_timestamp_and_from_unixtime() {
 
 #[test]
 fn test_to_days_and_from_days() {
-    use novarocks::exec::expr::function::date::common::{BC_EPOCH_JULIAN, julian_from_date};
+    use novarocks_execution::exec::expr::function::date::common::{
+        BC_EPOCH_JULIAN, julian_from_date,
+    };
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr_i64 = common::typed_null(&mut arena, DataType::Int64);
@@ -2453,7 +2461,7 @@ fn test_substitute_identity() {
 #[test]
 fn test_current_and_utc() {
     use chrono::Utc;
-    use novarocks::exec::expr::function::date::common::naive_to_date32;
+    use novarocks_execution::exec::expr::function::date::common::naive_to_date32;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr_ts = common::typed_null(&mut arena, DataType::Timestamp(TimeUnit::Microsecond, None));

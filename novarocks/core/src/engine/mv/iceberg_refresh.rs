@@ -11224,9 +11224,9 @@ fn prepare_first_refresh_chunks_or_abort<F>(
     state: &Arc<StandaloneState>,
     refresh_id: i64,
     prepare: F,
-) -> Result<Vec<crate::exec::chunk::Chunk>, IcebergMvRefreshExecutionError>
+) -> Result<Vec<novarocks_execution::exec::chunk::Chunk>, IcebergMvRefreshExecutionError>
 where
-    F: FnOnce() -> Result<Vec<crate::exec::chunk::Chunk>, String>,
+    F: FnOnce() -> Result<Vec<novarocks_execution::exec::chunk::Chunk>, String>,
 {
     match prepare() {
         Ok(chunks) => Ok(chunks),
@@ -11259,7 +11259,7 @@ fn commit_first_refresh_iceberg_mv(
     refresh_id: i64,
     snapshots: BTreeMap<String, i64>,
     table_uuids: BTreeMap<String, String>,
-    chunks: Vec<crate::exec::chunk::Chunk>,
+    chunks: Vec<novarocks_execution::exec::chunk::Chunk>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
     let target = &application_target;
@@ -11570,7 +11570,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    chunks: Vec<crate::exec::chunk::Chunk>,
+    chunks: Vec<novarocks_execution::exec::chunk::Chunk>,
     refresh_label: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
@@ -11883,7 +11883,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
 }
 
 struct FullRefreshChunkPayload {
-    chunks: Vec<crate::exec::chunk::Chunk>,
+    chunks: Vec<novarocks_execution::exec::chunk::Chunk>,
     base_snapshots: BTreeMap<String, i64>,
     base_table_uuids: BTreeMap<String, String>,
 }
@@ -14940,7 +14940,8 @@ mod aggregate_refresh_rewrite_validation_tests {
         ImvChangeStreamDescriptor {
             aggregate: Some(AggregateChangeStreamDescriptor {
                 action_column_id: ColumnId::new_for_test(1),
-                action_column_name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                action_column_name: novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
+                    .to_string(),
                 shape: AggregateChangeStreamShape::UnionChangeStream,
                 target_state: TargetStateProof { present: true },
                 signed_state_aggregate: SignedStateAggregateProof { present: true },
@@ -16031,7 +16032,7 @@ fn build_empty_join_delta_target_locator_table_def(
     )?;
     table_def
         .iceberg_row_lineage_metadata_columns
-        .retain(|column| column.name != crate::exec::change_op::CHANGE_OP_COLUMN);
+        .retain(|column| column.name != novarocks_execution::exec::change_op::CHANGE_OP_COLUMN);
     Ok(table_def)
 }
 
@@ -16810,7 +16811,7 @@ fn ensure_imv_change_stream_effect(
         ImvChangeStreamEffectMode::ByRowLineage => Some(
             output_column_by_name(
                 &refresh_plan.output_columns,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
                 "reuse/fresh route row-lineage column",
             )?
             .clone(),
@@ -17120,7 +17121,7 @@ fn imv_change_op_output_ordinal(
 fn is_imv_change_op_output_column(column: &OutputColumn) -> bool {
     column
         .name
-        .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+        .eq_ignore_ascii_case(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
         && column.data_type == DataType::Int8
         && !column.nullable
 }
@@ -17165,7 +17166,7 @@ fn build_imv_change_stream_routes(
                     )?;
                     let file_ordinal = output_ordinal_by_name(
                         output_columns,
-                        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                        novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
                         "DV file locator",
                     )?;
                     (sink, vec![file_ordinal])
@@ -18072,7 +18073,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
 /// columns by field-id metadata by default).
 pub(crate) async fn write_chunks_as_iceberg_data_files(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
-    chunks: &[crate::exec::chunk::Chunk],
+    chunks: &[novarocks_execution::exec::chunk::Chunk],
 ) -> Result<Vec<novarocks_connector_iceberg::iceberg::spec::DataFile>, String> {
     write_record_batches_as_data_files(table, chunks.iter().map(|chunk| chunk.batch.clone())).await
 }
@@ -18706,7 +18707,7 @@ mod tests {
     fn imv_change_stream_write_recognizes_physical_change_op_by_reserved_shape() {
         let output = OutputColumn {
             column_id: ColumnId(17),
-            name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+            name: novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string(),
             data_type: DataType::Int8,
             nullable: false,
             is_internal: false,
@@ -19337,10 +19338,10 @@ mod tests {
             JOIN_APPLY_KEY_COLUMN_NAME,
             "__pending_insert_count",
             "__pending_delete_count",
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
-            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
+            novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
+            novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+            novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
         ] {
             assert!(
                 watched_names.contains(expected),
@@ -20699,14 +20700,14 @@ mod tests {
             join_coalesce_factory_test_column(80, "id", DataType::Int32, false, false);
         let action = join_coalesce_factory_test_column(
             4,
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
             DataType::Int8,
             false,
             true,
         );
         let action_output = join_coalesce_factory_test_column(
             91,
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
             DataType::Int8,
             false,
             true,
@@ -20737,14 +20738,14 @@ mod tests {
             right_base_fqn: "ice.sales.right_orders".to_string(),
             left_row_id_column: join_coalesce_factory_test_column(
                 2,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             right_row_id_column: join_coalesce_factory_test_column(
                 3,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
@@ -20894,10 +20895,10 @@ mod tests {
     fn is_join_coalesce_factory_locator_output(name: &str) -> bool {
         matches!(
             name,
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL
-                | crate::exec::row_position::ICEBERG_ROW_POS_COL
-                | crate::exec::row_position::ICEBERG_ROW_ID_COL
-                | crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL
+                | novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL
+                | novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
+                | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
         )
     }
 
@@ -22128,7 +22129,7 @@ mod tests {
         refreshes
     }
 
-    fn single_int_chunk(values: &[i32]) -> Vec<crate::exec::chunk::Chunk> {
+    fn single_int_chunk(values: &[i32]) -> Vec<novarocks_execution::exec::chunk::Chunk> {
         let arrow_schema = StdArc::new(ArrowSchema::new(vec![Field::new(
             "k",
             DataType::Int32,
@@ -22139,18 +22140,18 @@ mod tests {
             vec![StdArc::new(Int32Array::from(values.to_vec()))],
         )
         .expect("record batch");
-        let chunk_schema_ref = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            &arrow_schema,
-            &[novarocks_types::SlotId(0)],
-        )
-        .expect("chunk schema");
-        vec![crate::exec::chunk::Chunk::new_with_chunk_schema(
-            batch,
-            chunk_schema_ref,
-        )]
+        let chunk_schema_ref =
+            novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                &arrow_schema,
+                &[novarocks_types::SlotId(0)],
+            )
+            .expect("chunk schema");
+        vec![
+            novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema_ref),
+        ]
     }
 
-    fn id_name_chunk(rows: &[(i32, &str)]) -> Vec<crate::exec::chunk::Chunk> {
+    fn id_name_chunk(rows: &[(i32, &str)]) -> Vec<novarocks_execution::exec::chunk::Chunk> {
         let arrow_schema = StdArc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
@@ -22171,19 +22172,19 @@ mod tests {
             ],
         )
         .expect("record batch");
-        let chunk_schema_ref = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            &arrow_schema,
-            &[
-                novarocks_types::SlotId(0),
-                novarocks_types::SlotId(1),
-                novarocks_types::SlotId(2),
-            ],
-        )
-        .expect("chunk schema");
-        vec![crate::exec::chunk::Chunk::new_with_chunk_schema(
-            batch,
-            chunk_schema_ref,
-        )]
+        let chunk_schema_ref =
+            novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                &arrow_schema,
+                &[
+                    novarocks_types::SlotId(0),
+                    novarocks_types::SlotId(1),
+                    novarocks_types::SlotId(2),
+                ],
+            )
+            .expect("chunk schema");
+        vec![
+            novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema_ref),
+        ]
     }
 
     fn seed_active_staging_refresh(
@@ -29005,14 +29006,17 @@ mod tests {
 
             // Build a Chunk by deriving ChunkSchema from the RecordBatch arrow schema
             // and synthetic slot ids.
-            use crate::exec::chunk::ChunkSchema;
+            use novarocks_execution::exec::chunk::ChunkSchema;
             use novarocks_types::SlotId;
             let chunk_schema_ref = ChunkSchema::try_ref_from_schema_and_slot_ids(
                 &arrow_schema,
                 &[SlotId(0), SlotId(1)],
             )
             .expect("chunk schema");
-            let chunk = crate::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema_ref);
+            let chunk = novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(
+                batch,
+                chunk_schema_ref,
+            );
 
             let written = write_chunks_as_iceberg_data_files(&table, &[chunk])
                 .await
@@ -29547,14 +29551,17 @@ mod tests {
             )
             .unwrap();
 
-            use crate::exec::chunk::ChunkSchema;
+            use novarocks_execution::exec::chunk::ChunkSchema;
             use novarocks_types::SlotId;
             let chunk_schema_ref = ChunkSchema::try_ref_from_schema_and_slot_ids(
                 &arrow_schema,
                 &[SlotId(0), SlotId(1)],
             )
             .expect("chunk schema");
-            let chunk = crate::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema_ref);
+            let chunk = novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(
+                batch,
+                chunk_schema_ref,
+            );
 
             let written = write_chunks_as_iceberg_data_files(&table, &[chunk])
                 .await

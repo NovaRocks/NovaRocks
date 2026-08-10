@@ -119,8 +119,8 @@ impl PartialEq<&str> for NativeFragmentLeafDecodeError {
 #[derive(Debug)]
 pub(crate) enum NativeFragmentDecodeError {
     Protocol(ProtocolError),
-    Plan(novarocks::exec::fragment::error::ExecPlanBuildError),
-    Binding(novarocks::exec::fragment::error::FragmentBindingError),
+    Plan(novarocks_execution::exec::fragment::error::ExecPlanBuildError),
+    Binding(novarocks_execution::exec::fragment::error::FragmentBindingError),
 }
 
 impl NativeFragmentDecodeError {
@@ -210,14 +210,18 @@ impl From<ProtocolError> for NativeFragmentDecodeError {
     }
 }
 
-impl From<novarocks::exec::fragment::error::ExecPlanBuildError> for NativeFragmentDecodeError {
-    fn from(error: novarocks::exec::fragment::error::ExecPlanBuildError) -> Self {
+impl From<novarocks_execution::exec::fragment::error::ExecPlanBuildError>
+    for NativeFragmentDecodeError
+{
+    fn from(error: novarocks_execution::exec::fragment::error::ExecPlanBuildError) -> Self {
         Self::Plan(error)
     }
 }
 
-impl From<novarocks::exec::fragment::error::FragmentBindingError> for NativeFragmentDecodeError {
-    fn from(error: novarocks::exec::fragment::error::FragmentBindingError) -> Self {
+impl From<novarocks_execution::exec::fragment::error::FragmentBindingError>
+    for NativeFragmentDecodeError
+{
+    fn from(error: novarocks_execution::exec::fragment::error::FragmentBindingError) -> Self {
         Self::Binding(error)
     }
 }

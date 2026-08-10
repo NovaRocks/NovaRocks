@@ -28,7 +28,6 @@ use novarocks_spi::connector::ConnectorExecutionDeclaration;
 use sha2::{Digest, Sha256};
 
 use crate::common::types::UniqueId;
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{
@@ -49,13 +48,14 @@ use crate::query_execution::schedule::{
 };
 use crate::query_execution::write_plan::{ConnectorWriteManifest, ConnectorWritePlanAttachment};
 use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
     FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind, PartitionKind,
 };
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_protocol::plan::RuntimeFilterBindingTable;
 use novarocks_types::SlotId;
 
@@ -2145,10 +2145,10 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-    use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::sql::planner::distributed::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
     fn placement(
         fragment_id: u32,

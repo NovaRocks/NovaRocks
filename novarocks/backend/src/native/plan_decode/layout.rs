@@ -27,9 +27,9 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use super::error::NativeFragmentLeafDecodeError;
 #[cfg(test)]
 use crate::native::type_decode::decode_field_type;
-#[cfg(test)]
-use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks::protocol::ProtocolErrorKind;
+#[cfg(test)]
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_protocol::common;
 use novarocks_types::SlotId;
 

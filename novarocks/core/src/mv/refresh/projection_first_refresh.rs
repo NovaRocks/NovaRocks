@@ -23,12 +23,12 @@
 
 use std::collections::HashSet;
 
-use crate::exec::chunk::Chunk;
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use crate::mv::refresh::target_apply::{
     iceberg_mv_physical_select_sql, validate_reserved_projection_output_names,
 };
 use crate::sql::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
+use novarocks_execution::exec::chunk::Chunk;
 
 pub(crate) fn prepare_projection_full_read_sql(
     select_sql: &str,

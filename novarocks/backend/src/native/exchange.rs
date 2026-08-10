@@ -19,8 +19,8 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use novarocks_execution::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
 use novarocks_protocol::plan;
 
 use super::layout::chunk_schema_from_output_columns;
@@ -118,7 +118,7 @@ mod tests {
                 .expect("decode exchange contract");
 
         let schema = contracts
-            .get(&novarocks::exec::fragment::program::FragmentNodeId::new(7))
+            .get(&novarocks_execution::exec::fragment::program::FragmentNodeId::new(7))
             .expect("exchange contract for node");
         assert_eq!(schema.expected_schema().slots().len(), 1);
         assert_eq!(

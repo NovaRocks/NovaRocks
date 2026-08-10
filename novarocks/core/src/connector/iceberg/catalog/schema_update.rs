@@ -2895,8 +2895,10 @@ fn reject_reserved_change(change: &IcebergSchemaChange) -> Result<(), String> {
         }
     };
     for name in names {
-        if crate::exec::row_position::is_iceberg_row_id(name)
-            || crate::exec::row_position::is_iceberg_last_updated_sequence_number(name)
+        if novarocks_execution::exec::row_position::is_iceberg_row_id(name)
+            || novarocks_execution::exec::row_position::is_iceberg_last_updated_sequence_number(
+                name,
+            )
         {
             return Err(format!(
                 "Iceberg schema evolution cannot modify reserved column `{name}`"

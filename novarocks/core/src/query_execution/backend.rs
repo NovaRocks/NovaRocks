@@ -21,7 +21,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
 /// Frontend-owned topology and backend-management boundary consumed by core.
 ///

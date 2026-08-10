@@ -29,7 +29,7 @@ use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolF
 use novarocks::query_execution::lifecycle::{
     QueryExecutionId, QueryLifecycleError, QueryLifecycleErrorCode, RuntimeFilterContribution,
 };
-use novarocks::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{
     ConsumerActivation, RuntimeFilterBindingId, RuntimeFilterChannelId,
     RuntimeFilterConsumerContract, RuntimeFilterExecutionContract,

@@ -28,13 +28,13 @@ use crate::sql::planner::vocabulary::ApplyKeySource;
 
 use std::collections::BTreeSet;
 
-use crate::exec::chunk::Chunk;
 use crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout;
 use crate::mv::model::{MvPartitionKey, MvPartitionKeyField};
 use crate::mv::persistence::schema as mv_schema;
 #[cfg(test)]
 use crate::runtime::query_result::record_batch_to_chunk;
 use mv_schema::{ExpressionKind, MvSchemaContract};
+use novarocks_execution::exec::chunk::Chunk;
 
 /// Reasons aggregate-delta partition derivation can refuse a delta batch.
 /// Every variant carries enough context for the refresh error message to
@@ -817,7 +817,6 @@ mod tests {
 
     // --- Test fixtures for bind/evaluate tests (copied verbatim from aggregate_delta.rs) ---
 
-    use crate::exec::chunk::Chunk;
     use crate::mv::aggregate_state::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
     };
@@ -827,6 +826,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_catalog::schema::SqlType;
+    use novarocks_execution::exec::chunk::Chunk;
     use std::sync::Arc as StdArcFixture;
 
     fn count_layout_with_group_key(

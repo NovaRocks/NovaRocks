@@ -19,9 +19,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Decimal128Array};
 use arrow::datatypes::DataType;
 
-use novarocks::exec::expr::ExprId;
-use novarocks::exec::expr::agg;
-use novarocks::exec::node::aggregate::{AggFunction, AggTypeSignature};
+use novarocks_execution::exec::expr::ExprId;
+use novarocks_execution::exec::expr::agg;
+use novarocks_execution::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
 #[test]
 fn test_avg_decimal_round_half_up_positive() {

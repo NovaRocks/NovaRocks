@@ -20,9 +20,9 @@
 use arrow::datatypes::DataType;
 
 use super::{collection, lower_expr_list};
-use novarocks::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::FieldPath;
+use novarocks_execution::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::expr;
 
 use super::NativeExpressionInputLayout;

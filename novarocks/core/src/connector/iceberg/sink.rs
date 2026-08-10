@@ -48,13 +48,13 @@ use crate::connector::iceberg::report::IcebergColumnStats;
 use crate::connector::iceberg::sink_plan::{
     IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan, PositionDeleteDataFilePartition,
 };
-use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
-use crate::exec::row_position::{
+use crate::runtime::global_async_runtime::data_block_on;
+use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
+use novarocks_execution::exec::row_position::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
-use crate::runtime::global_async_runtime::data_block_on;
 
 pub(crate) fn build_position_delete_data_file_partition_index(
     metadata: &TableMetadata,

@@ -28,7 +28,7 @@ use novarocks::query_execution::lifecycle::{
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationReason,
     RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
 };
-use novarocks::runtime::fragment::{
+use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;

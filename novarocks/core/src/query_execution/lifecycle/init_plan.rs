@@ -24,7 +24,7 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, ResolvedQueryOptions,
 };
 use crate::query_execution::schedule::FragmentLifecycleProjection;
-use crate::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 use super::manifest::{
@@ -556,13 +556,13 @@ mod tests {
             BTreeMap::from([
                 (
                     0,
-                    crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
+                    novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
                         backend(0).endpoint(),
                     ),
                 ),
                 (
                     1,
-                    crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
+                    novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
                         backend(1).endpoint(),
                     ),
                 ),
@@ -646,7 +646,9 @@ mod tests {
             BTreeMap::from([(0, BTreeSet::from([UniqueId::new(10, 1)]))]),
             BTreeMap::from([(
                 0,
-                crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr(backend(0).endpoint()),
+                novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
+                    backend(0).endpoint(),
+                ),
             )]),
             Vec::new(),
         )

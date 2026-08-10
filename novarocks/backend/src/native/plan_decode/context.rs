@@ -23,15 +23,15 @@ use std::sync::Arc;
 
 use crate::native::expression::NativeExpressionInputLayout;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::exec::expr::{ExprArena, ExprId};
-use novarocks::exec::fragment::program::FragmentNodeId;
-use novarocks::exec::node::scan::BoundScanRanges;
 use novarocks::protocol::FieldPath;
-use novarocks::runtime::exchange::ExchangeKey;
-use novarocks::runtime::fragment::{
+use novarocks::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::exec::expr::{ExprArena, ExprId};
+use novarocks_execution::exec::fragment::program::FragmentNodeId;
+use novarocks_execution::exec::node::scan::BoundScanRanges;
+use novarocks_execution::runtime::exchange::ExchangeKey;
+use novarocks_execution::runtime::fragment::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
-use novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{common, expr};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};

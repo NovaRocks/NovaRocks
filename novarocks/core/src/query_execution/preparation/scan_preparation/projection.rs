@@ -113,10 +113,10 @@ fn projected_target_state_column_names(
         push_unique_projected_name(&mut names, &scope.branch_id_column_name);
     }
     for name in [
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
     ] {
         push_unique_projected_name(&mut names, name);
     }
@@ -131,10 +131,10 @@ fn projected_target_locator_column_names(
         push_unique_projected_name(&mut names, branch_id_column);
     }
     for name in [
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
     ] {
         push_unique_projected_name(&mut names, name);
     }

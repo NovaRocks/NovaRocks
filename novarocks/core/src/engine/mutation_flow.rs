@@ -71,12 +71,12 @@ fn row_lineage_input_request(
             .collect(),
         row_identity_fields: vec![
             ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
             )),
             ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
                 DataType::Int64,
                 true,
             )),
@@ -90,12 +90,12 @@ fn deletion_vector_input_request() -> novarocks_spi::connector::ConnectorWriteIn
     ConnectorWriteInputRequest::DeletionVector {
         identity_fields: vec![
             ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
                 DataType::Utf8,
                 false,
             )),
             ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-                crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
                 DataType::Int64,
                 false,
             )),
@@ -1258,7 +1258,7 @@ fn build_update_mor_change_stream_write_plan(
     )?;
     plan.pre_expand_keyed_assert = Some(DmlPreExpandKeyedAssert {
         key_column_name: "__nr_row_id".to_string(),
-        key_label: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
         message_prefix: "MOR UPDATE matched target row".to_string(),
     });
     Ok(plan)
@@ -1361,13 +1361,13 @@ fn build_update_mor_change_event_expand_plan(
         };
 
     let file_output = alloc_output(
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
         arrow::datatypes::DataType::Utf8,
         true,
         true,
     );
     let pos_output = alloc_output(
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
         arrow::datatypes::DataType::Int64,
         true,
         true,
@@ -1385,13 +1385,13 @@ fn build_update_mor_change_event_expand_plan(
         ));
     }
     let row_id_output = alloc_output(
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
         arrow::datatypes::DataType::Int64,
         true,
         true,
     );
     let last_sequence_output = alloc_output(
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
         arrow::datatypes::DataType::Int64,
         true,
         true,
@@ -1562,13 +1562,13 @@ fn build_merge_mor_change_event_expand_plan(
         };
 
     let file_output = alloc_output(
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
         arrow::datatypes::DataType::Utf8,
         true,
         true,
     );
     let pos_output = alloc_output(
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
         arrow::datatypes::DataType::Int64,
         true,
         true,
@@ -1586,13 +1586,13 @@ fn build_merge_mor_change_event_expand_plan(
         ));
     }
     let row_id_output = alloc_output(
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
         arrow::datatypes::DataType::Int64,
         true,
         true,
     );
     let last_sequence_output = alloc_output(
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
         arrow::datatypes::DataType::Int64,
         true,
         true,
@@ -2316,7 +2316,7 @@ fn build_cow_rewrite_query_local_overlay(
     if !materialization
         .iceberg_row_lineage_metadata_columns
         .iter()
-        .any(|c| crate::exec::row_position::is_iceberg_row_id(&c.name))
+        .any(|c| novarocks_execution::exec::row_position::is_iceberg_row_id(&c.name))
     {
         return Err(format!(
             "COW UPDATE synthetic scan for table {}.{} does not expose _row_id; \
@@ -2374,8 +2374,8 @@ fn build_cow_rewrite_query(
     }
     let scan_alias = "__nr_cow_t";
     let match_alias = "__nr_cow_m";
-    let row_id_col = crate::exec::row_position::ICEBERG_ROW_ID_COL;
-    let last_seq_col = crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL;
+    let row_id_col = novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL;
+    let last_seq_col = novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL;
 
     // VALUES relation of the matched new rows in this file: (_row_id, <user
     // columns...>). Values are typed literals read positionally from the
@@ -4408,7 +4408,7 @@ fn build_merge_mor_change_stream_write_plan(
             // a generated negative row number so fresh-only rows do not
             // collide under the same NULL key before expansion.
             key_column_name: "__nr_merge_assert_key".to_string(),
-            key_label: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
             message_prefix: "MOR MERGE matched target row".to_string(),
         });
     }
@@ -4603,7 +4603,10 @@ fn build_merge_unmatched_insert_query(
     );
     let mut predicates = vec![format!(
         "{} IS NULL",
-        qualify_column(target_alias, crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        qualify_column(
+            target_alias,
+            novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
+        )
     )];
     if let Some(predicate) = not_matched.predicate.as_ref() {
         predicates.push(format!("({predicate})"));

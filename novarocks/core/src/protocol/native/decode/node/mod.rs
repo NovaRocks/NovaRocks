@@ -45,23 +45,23 @@ use std::sync::Arc;
 use self::common::*;
 
 use super::layout::Layout;
-use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::expr::ExprArena;
-use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-use crate::exec::node::limit::LimitNode;
-use crate::exec::node::scan::BoundScanRanges;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native::test_assembly::{
     NativeExpressionDecoder, NativeExpressionInputLayout, NativeOutputLayout,
     NativeOutputLayoutDecoder,
 };
-use crate::runtime::exchange::ExchangeKey;
-use crate::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
-};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
+use novarocks_execution::exec::node::limit::LimitNode;
+use novarocks_execution::exec::node::scan::BoundScanRanges;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_execution::runtime::exchange::ExchangeKey;
+use novarocks_execution::runtime::fragment::instance::{
+    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
+};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{novarocks, plan};
 
@@ -202,7 +202,7 @@ impl NativePlanDecodeContext {
         path: FieldPath,
         arena: &mut ExprArena,
         layout: &Layout,
-    ) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
+    ) -> Result<novarocks_execution::exec::expr::ExprId, super::NativeFragmentDecodeError> {
         let Some(decoder) = self.expression_decoder.as_ref() else {
             #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             {
@@ -824,28 +824,30 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::ExecNodeKind;
-    use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
-    use crate::exec::node::set_op::SetOpKind;
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::assert::{AssertNumRowsMode, Assertion};
+    use novarocks_execution::exec::node::set_op::SetOpKind;
     use novarocks_protocol::{common, expr, plan};
     use novarocks_types::SlotId;
 
     struct DummyScanOp;
 
-    impl crate::exec::node::scan::ScanOp for DummyScanOp {
+    impl novarocks_execution::exec::node::scan::ScanOp for DummyScanOp {
         fn execute_iter(
             &self,
-            _morsel: crate::exec::node::scan::ScanMorsel,
+            _morsel: novarocks_execution::exec::node::scan::ScanMorsel,
             _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
-            _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
-        ) -> Result<crate::exec::node::BoxedExecIter, String> {
+            _runtime_filters: Option<&novarocks_execution::exec::node::scan::RuntimeFilterContext>,
+        ) -> Result<novarocks_execution::exec::node::BoxedExecIter, String> {
             Ok(Box::new(std::iter::empty()))
         }
 
-        fn build_morsels(&self) -> Result<crate::exec::node::scan::ScanMorsels, String> {
-            Ok(crate::exec::node::scan::ScanMorsels::default())
+        fn build_morsels(
+            &self,
+        ) -> Result<novarocks_execution::exec::node::scan::ScanMorsels, String> {
+            Ok(novarocks_execution::exec::node::scan::ScanMorsels::default())
         }
     }
 
@@ -1288,7 +1290,7 @@ mod tests {
         );
         assert!(matches!(
             join.join_type,
-            crate::exec::node::join::JoinType::Inner
+            novarocks_execution::exec::node::join::JoinType::Inner
         ));
     }
 

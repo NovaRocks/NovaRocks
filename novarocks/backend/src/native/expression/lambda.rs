@@ -19,8 +19,8 @@
 
 use super::{decode_type, lower_required_child};
 use arrow::datatypes::DataType;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::FieldPath;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::expr;
 use novarocks_types::SlotId;
 
@@ -81,7 +81,7 @@ pub(crate) fn lower_lambda(
 mod tests {
     use super::super::tests::{col, lower, lower_with_slots, scalar_expr, type_desc};
     use arrow::datatypes::{DataType, Field};
-    use novarocks::exec::expr::{ExprNode, function::FunctionKind};
+    use novarocks_execution::exec::expr::{ExprNode, function::FunctionKind};
     use novarocks_protocol::expr;
     use novarocks_types::SlotId;
     use std::sync::Arc;

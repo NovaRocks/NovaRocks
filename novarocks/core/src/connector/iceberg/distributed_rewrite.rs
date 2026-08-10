@@ -1842,8 +1842,8 @@ fn rewrite_cohort_preparation(
                 .filter(|field| {
                     matches!(
                         field.field().name().as_str(),
-                        crate::exec::row_position::ICEBERG_ROW_ID_COL
-                            | crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+                        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
+                            | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
                     )
                 })
                 .cloned()
@@ -1853,8 +1853,8 @@ fn rewrite_cohort_preparation(
                 .filter(|field| {
                     !matches!(
                         field.field().name().as_str(),
-                        crate::exec::row_position::ICEBERG_ROW_ID_COL
-                            | crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+                        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
+                            | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
                     )
                 })
                 .collect();
@@ -1912,12 +1912,12 @@ pub(crate) fn rewrite_input_schema(
             let mut fields = physical_schema.fields().to_vec();
             fields.extend([
                 Arc::new(Field::new(
-                    crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                    novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
                     DataType::Int64,
                     false,
                 )),
                 Arc::new(Field::new(
-                    crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
                     DataType::Int64,
                     true,
                 )),

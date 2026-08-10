@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-use novarocks::exec::chunk::ChunkSchema;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use novarocks_execution::exec::chunk::ChunkSchema;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use novarocks_execution::exec::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 
 #[derive(Clone, Copy)]
 enum Comparison {

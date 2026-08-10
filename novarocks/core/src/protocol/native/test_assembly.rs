@@ -27,16 +27,18 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::fragment::program::{ExchangeInputContract, FragmentNodeId, ScanSourceContract};
 use crate::protocol::ProtocolError;
 use crate::protocol::{FieldPath, ProtocolErrorKind, ProtocolFamily};
-use crate::runtime::fragment::instance::{
-    BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentSinkAssignment,
-};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::expr::{ExprArena, ExprId};
+use novarocks_execution::exec::fragment::program::{
+    ExchangeInputContract, FragmentNodeId, ScanSourceContract,
+};
+use novarocks_execution::runtime::fragment::instance::{
+    BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentSinkAssignment,
+};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::expr;
 use novarocks_protocol::novarocks;

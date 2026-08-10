@@ -6062,7 +6062,6 @@ mod tests {
     };
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
-    use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::mv::application::{
         MvApplicationError, MvApplicationErrorKind, MvApplicationService, MvApplicationStatement,
         MvEngine, MvRequestContext,
@@ -6076,6 +6075,7 @@ mod tests {
     use crate::query_execution::service::QueryExecutionService;
     use arrow::array::{Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
     use novarocks_execution::runtime::query_options::QueryOptions;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;

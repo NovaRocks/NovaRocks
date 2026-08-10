@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;
-use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::runtime::endpoint::FragmentDestination;
 
 #[derive(Clone, Debug)]
 pub(crate) struct FragmentExecParams {

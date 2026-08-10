@@ -23,9 +23,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::exec::chunk::Chunk;
-use novarocks::exec::expr::function::map::eval_map_function;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::expr::function::map::eval_map_function;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use novarocks_types::SlotId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,11 +45,12 @@ fn typed_null(arena: &mut ExprArena, data_type: DataType) -> ExprId {
 fn make_chunk_from_arrays(fields: Vec<Field>, arrays: Vec<ArrayRef>, slot_ids: &[u32]) -> Chunk {
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
     let ids: Vec<SlotId> = slot_ids.iter().map(|&id| SlotId::new(id)).collect();
-    let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &ids,
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &ids,
+        )
+        .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -382,7 +383,7 @@ fn single_map_chunk() -> (Chunk, DataType) {
 }
 
 fn build_lambda_identity_map(arena: &mut ExprArena) -> ExprId {
-    use novarocks::exec::expr::function::FunctionKind;
+    use novarocks_execution::exec::expr::function::FunctionKind;
     let list_i64 = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     let map_i64_i64 = map_type_i64_i64();
 
@@ -462,7 +463,7 @@ fn test_map_apply_lambda_output_must_be_map() {
 
 #[test]
 fn test_map_apply_transform_values_alias() {
-    use novarocks::exec::expr::function::FunctionKind;
+    use novarocks_execution::exec::expr::function::FunctionKind;
     let (chunk, map_type) = single_map_chunk();
     let mut arena = ExprArena::default();
     let list_i64 = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
@@ -515,7 +516,7 @@ fn test_map_apply_transform_values_alias() {
 // Tests from element_at.rs
 // ---------------------------------------------------------------------------
 
-use novarocks::exec::expr::function::map::eval_element_at;
+use novarocks_execution::exec::expr::function::map::eval_element_at;
 
 #[test]
 fn test_element_at_found() {
@@ -740,7 +741,7 @@ fn test_arrays_zip_basic_and_padding() {
 // Tests from map_from_arrays.rs
 // ---------------------------------------------------------------------------
 
-use novarocks::exec::expr::function::map::eval_map_from_arrays;
+use novarocks_execution::exec::expr::function::map::eval_map_from_arrays;
 
 #[test]
 fn test_map_from_arrays_basic() {
@@ -866,11 +867,11 @@ fn test_map_from_arrays_keeps_null_key_entries() {
 // Tests from dispatch.rs
 // ---------------------------------------------------------------------------
 
-use novarocks::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::function::FunctionKind;
 
 #[test]
 fn test_register_map_functions() {
-    use novarocks::exec::expr::function::map::register;
+    use novarocks_execution::exec::expr::function::map::register;
     use std::collections::HashMap as StdHashMap;
 
     let mut m = StdHashMap::new();

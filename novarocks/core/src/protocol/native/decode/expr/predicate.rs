@@ -20,9 +20,9 @@
 use arrow::datatypes::DataType;
 
 use super::{lower_expr_list, lower_required_child};
-use crate::exec::expr::function::FunctionKind;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::expr;
 use novarocks_types::comparison_common_type;
 
@@ -247,9 +247,9 @@ mod tests {
     use super::super::tests::{
         col, int_lit, lower_err_with_slots, lower_with_slots, make_i64_chunk, scalar_expr,
     };
-    use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{Array, BooleanArray};
     use arrow::datatypes::DataType;
+    use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     use novarocks_protocol::expr;
     use novarocks_types::SlotId;
 

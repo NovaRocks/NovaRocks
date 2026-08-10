@@ -27,9 +27,9 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use super::decode_field_type;
 use super::error::NativeFragmentLeafDecodeError;
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::protocol::common::error::ProtocolErrorKind;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use novarocks_protocol::common;
 use novarocks_types::SlotId;

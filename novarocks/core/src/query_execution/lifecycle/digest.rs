@@ -17,7 +17,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::exec::spill::SpillMode;
+use novarocks_execution::exec::spill::SpillMode;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 use super::manifest::{
@@ -245,13 +245,13 @@ mod tests {
 
     use super::digest_v1;
     use crate::common::types::UniqueId;
-    use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::identity::{AttemptId, QueryExecutionId};
     use crate::query_execution::lifecycle::manifest::{
         ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions, ParticipantRole,
         QueryControlEndpoint,
     };
+    use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
     use novarocks_execution::runtime::query_options::QueryOptions;
 
     fn manifest_with_orders(

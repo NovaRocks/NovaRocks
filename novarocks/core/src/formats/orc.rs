@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 
-use crate::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_fs::DataCacheContext;
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";

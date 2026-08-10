@@ -10,12 +10,18 @@ use novarocks_types::UniqueId;
 
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
 use crate::service::internal_rpc;
+use novarocks_execution::runtime::fragment::io::{
+    ExchangeReceiverPort, UnavailableExchangeReceiverPort,
+};
 use novarocks_protocol as proto;
+use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
-pub struct NativeDataPlaneKernel {}
+pub struct NativeDataPlaneKernel {
+    exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+}
 
 impl std::fmt::Debug for NativeDataPlaneKernel {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,14 +39,22 @@ impl Default for NativeDataPlaneKernel {
 
 impl NativeDataPlaneKernel {
     pub fn query_scoped() -> Self {
-        Self {}
+        Self::with_exchange_receiver_port(Arc::new(UnavailableExchangeReceiverPort))
+    }
+
+    pub fn with_exchange_receiver_port(
+        exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+    ) -> Self {
+        Self {
+            exchange_receiver_port,
+        }
     }
 
     pub fn exchange(
         &self,
         request: proto::novarocks::ExchangeRequest,
     ) -> proto::novarocks::ExchangeResponse {
-        internal_rpc::handle_transmit_chunk(request)
+        internal_rpc::handle_transmit_chunk(self.exchange_receiver_port.as_ref(), request)
     }
 
     pub fn lookup(&self, request: proto::filter::LookupRequest) -> proto::filter::LookupResponse {

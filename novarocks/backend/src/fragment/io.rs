@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use novarocks::runtime::fragment::{
+use novarocks_execution::runtime::fragment::io::{
     ExchangeFrame, ExchangeFrameTransmitter, FragmentIoError, FragmentIoErrorKind,
     FragmentIoOperation,
 };

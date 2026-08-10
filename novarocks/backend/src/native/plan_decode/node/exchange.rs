@@ -22,12 +22,12 @@ use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
 use novarocks::common::config::exchange_wait_ms;
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::node::exchange_source::ExchangeSourceNode;
-use novarocks::exec::node::limit::LimitNode;
-use novarocks::exec::node::sort::{SortNode, SortTopNType};
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
+use novarocks_execution::exec::node::limit::LimitNode;
+use novarocks_execution::exec::node::sort::{SortNode, SortTopNType};
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_exchange_receiver(

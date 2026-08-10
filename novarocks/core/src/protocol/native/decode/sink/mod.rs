@@ -22,19 +22,19 @@ use std::time::Instant;
 
 use super::error::NativeFragmentLeafDecodeError;
 use super::node::NativePlanDecodeContext;
-use crate::exec::expr::ExprArena;
-use crate::exec::fragment::sink::DataStreamPartitionType;
-use crate::exec::fragment::sink::{
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use crate::runtime::query_context::{QueryId, query_context_manager};
+use arrow::datatypes::{Schema, SchemaRef};
+use bytes::Bytes;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
+use novarocks_execution::exec::fragment::sink::{
     ConnectorWriteSinkProgram, DataStreamSinkBranchProgram, FragmentSinkProgram,
     MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     build_change_stream_split_predicate,
 };
-use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::fragment::instance::FragmentSinkAssignment;
-use crate::runtime::query_context::{QueryId, query_context_manager};
-use arrow::datatypes::{Schema, SchemaRef};
-use bytes::Bytes;
+use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_execution::runtime::fragment::instance::FragmentSinkAssignment;
 use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_protocol::{common, expr, novarocks, plan};
 use novarocks_spi::connector::ConnectorRowMutationEffect;
@@ -174,7 +174,10 @@ pub(crate) fn decode_fragment_sink_program_with_context(
 
 fn decode_statistics_sink(
     sink: &plan::StatisticsSink,
-) -> Result<crate::exec::fragment::sink::StatisticsSinkProgram, NativeFragmentLeafDecodeError> {
+) -> Result<
+    novarocks_execution::exec::fragment::sink::StatisticsSinkProgram,
+    NativeFragmentLeafDecodeError,
+> {
     let mut metrics = Vec::with_capacity(sink.metrics.len());
     for (index, metric) in sink.metrics.iter().enumerate() {
         let path = format!("statistics metric[{index}]");
@@ -222,7 +225,7 @@ fn decode_statistics_sink(
         });
     }
     StatisticsMetricRequest::try_new(metrics)
-        .map(crate::exec::fragment::sink::StatisticsSinkProgram::new)
+        .map(novarocks_execution::exec::fragment::sink::StatisticsSinkProgram::new)
         .map_err(|error| {
             NativeFragmentLeafDecodeError::at_collection(ProtocolErrorKind::InvalidValue, error)
         })
@@ -869,7 +872,7 @@ fn decode_sink_expression(
     layout: &super::layout::Layout,
     context: Option<&NativePlanDecodeContext>,
     path: FieldPath,
-) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
+) -> Result<novarocks_execution::exec::expr::ExprId, super::NativeFragmentDecodeError> {
     let context = context.ok_or_else(|| {
         super::NativeFragmentDecodeError::unsupported(
             path.clone(),

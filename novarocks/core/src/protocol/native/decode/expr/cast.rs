@@ -20,8 +20,8 @@
 use arrow::datatypes::DataType;
 
 use super::{decode_expr_at, decode_type, nested};
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::{common, expr};
 
 use super::super::layout::Layout;
@@ -143,8 +143,8 @@ mod tests {
     use super::super::tests::{
         col, lower_err_with_slots, lower_with_slots, map_string_json_type, scalar_expr, type_desc,
     };
-    use crate::exec::expr::ExprNode;
     use arrow::datatypes::{DataType, TimeUnit};
+    use novarocks_execution::exec::expr::ExprNode;
     use novarocks_protocol::expr;
 
     #[test]

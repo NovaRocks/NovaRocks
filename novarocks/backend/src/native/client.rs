@@ -26,8 +26,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use novarocks::common::network::format_host_for_url;
-use novarocks::runtime::endpoint::RuntimeEndpoint;
 use novarocks::runtime::global_async_runtime::data_block_on;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_protocol::{filter, novarocks as proto};
 use novarocks_types::identity::UniqueId;
 use tonic::Request;

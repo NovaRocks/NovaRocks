@@ -22,12 +22,12 @@ use arrow::datatypes::DataType;
 use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::expr::ExprArena;
-use crate::exec::node::change_event_expand::{
+use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
-use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_types::SlotId;
@@ -171,7 +171,7 @@ mod tests {
 
     use super::super::tests::{one_col_values_node, output_column, physical_node};
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::exec::expr::ExprArena;
+    use novarocks_execution::exec::expr::ExprArena;
     use novarocks_protocol::plan;
 
     #[test]

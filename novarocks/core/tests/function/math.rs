@@ -19,8 +19,8 @@
 use crate::common;
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field};
-use novarocks::exec::expr::function::math::eval_math_function;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use novarocks_execution::exec::expr::function::math::eval_math_function;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ fn math_eval_f64(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> f64 {
     let arr = eval_math_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -44,7 +44,7 @@ fn math_eval_i64(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> i64 {
     let arr = eval_math_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -56,7 +56,7 @@ fn math_eval_str(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> String {
     let arr = eval_math_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
@@ -364,7 +364,7 @@ fn eval_single(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> f64 {
     let out = eval_math_function(name, arena, expr, args, chunk).unwrap();
     let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -445,7 +445,7 @@ fn test_conv_logic() {
 // Tests from equiwidth_bucket.rs
 // ---------------------------------------------------------------------------
 
-use novarocks::exec::expr::function::math::eval_equiwidth_bucket;
+use novarocks_execution::exec::expr::function::math::eval_equiwidth_bucket;
 
 #[test]
 fn test_equiwidth_bucket_basic() {
@@ -554,14 +554,14 @@ fn test_cbrt_specific_values() {
 // Tests from abs.rs
 // ---------------------------------------------------------------------------
 
-use novarocks::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::function::FunctionKind;
 use novarocks_types::largeint;
 
-fn create_test_chunk_int(values: Vec<i64>) -> novarocks::exec::chunk::Chunk {
+fn create_test_chunk_int(values: Vec<i64>) -> novarocks_execution::exec::chunk::Chunk {
     use arrow::array::{ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -575,14 +575,14 @@ fn create_test_chunk_int(values: Vec<i64>) -> novarocks::exec::chunk::Chunk {
     let chunk_schema =
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
             .expect("chunk schema");
-    novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
+    novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
-fn create_test_chunk_float(values: Vec<f64>) -> novarocks::exec::chunk::Chunk {
+fn create_test_chunk_float(values: Vec<f64>) -> novarocks_execution::exec::chunk::Chunk {
     use arrow::array::{ArrayRef, Float64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -596,7 +596,7 @@ fn create_test_chunk_float(values: Vec<f64>) -> novarocks::exec::chunk::Chunk {
     let chunk_schema =
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
             .expect("chunk schema");
-    novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
+    novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
 #[test]

@@ -21,16 +21,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks::connector::ConnectorRegistry;
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::fragment::program::{
+use novarocks::protocol::FieldPath;
+use novarocks::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::fragment::program::{
     FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
     ScanSourceContract,
 };
-use novarocks::exec::node::ExecPlan;
-use novarocks::protocol::FieldPath;
-use novarocks::runtime::fragment::FragmentSubmission;
-use novarocks::runtime::fragment::{FragmentInstanceSpec, FragmentRuntimeOptions, ScanAssignments};
-use novarocks::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::exec::node::ExecPlan;
+use novarocks_execution::runtime::fragment::{
+    FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
+};
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 
@@ -116,10 +117,10 @@ pub(crate) fn decode_fragment_submission(
         decode_fragment_sink_program_with_context(fragment, &decoded_root.layout, Some(&context))?;
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
-    let plan = novarocks::exec::node::ExecPlanBuilder::new(arena, decoded_root.node)
+    let plan = novarocks_execution::exec::node::ExecPlanBuilder::new(arena, decoded_root.node)
         .finish()
         .map_err(NativeFragmentDecodeError::from)?;
-    let program = novarocks::exec::fragment::program::FragmentProgramBuilder::new(
+    let program = novarocks_execution::exec::fragment::program::FragmentProgramBuilder::new(
         plan,
         sink_spec,
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
@@ -154,8 +155,14 @@ pub(crate) fn decode_fragment_submission(
 }
 
 fn validate_raw_scan_range_nodes(
-    contracts: &BTreeMap<novarocks::exec::fragment::program::FragmentNodeId, ScanSourceContract>,
-    raw_ranges: &BTreeMap<novarocks::exec::fragment::program::FragmentNodeId, Vec<ScanRangeParams>>,
+    contracts: &BTreeMap<
+        novarocks_execution::exec::fragment::program::FragmentNodeId,
+        ScanSourceContract,
+    >,
+    raw_ranges: &BTreeMap<
+        novarocks_execution::exec::fragment::program::FragmentNodeId,
+        Vec<ScanRangeParams>,
+    >,
     path: FieldPath,
 ) -> Result<(), NativeFragmentDecodeError> {
     for node_id in raw_ranges.keys() {

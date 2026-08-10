@@ -18,7 +18,7 @@
 //! Fragment dispatcher port and native submission DTO.
 
 use crate::common::types::UniqueId;
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 
 /// Opaque data-plane batch returned by a fragment dispatcher.
 ///
@@ -65,7 +65,7 @@ pub fn decode_fetched_query_batch(
     payload: &[u8],
     expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
 ) -> Result<FetchedQueryBatch, String> {
-    let mut chunks = crate::runtime::exchange::decode_root_result_chunks(
+    let mut chunks = novarocks_execution::runtime::exchange::decode_root_result_chunks(
         payload,
         expected_output_schema.map(|view| view.chunk_schema()),
     )?;

@@ -23,15 +23,15 @@ use arrow::datatypes::{DataType, Field, Fields};
 use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::analytic::{
+use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::node::analytic::{
     AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
     WindowFunctionSpec, WindowType,
 };
-use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
-use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{expr, plan};
 use novarocks_types::SlotId;
 
@@ -634,9 +634,9 @@ fn validate_window_frame(
 }
 
 fn pack_window_function_inputs(
-    args: Vec<crate::exec::expr::ExprId>,
+    args: Vec<novarocks_execution::exec::expr::ExprId>,
     arena: &mut ExprArena,
-) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+) -> Result<Vec<novarocks_execution::exec::expr::ExprId>, String> {
     if args.len() <= 1 {
         return Ok(args);
     }
@@ -657,7 +657,7 @@ fn pack_window_function_inputs(
 
 fn validate_window_function_signature(
     kind: &WindowFunctionKind,
-    args: &[crate::exec::expr::ExprId],
+    args: &[novarocks_execution::exec::expr::ExprId],
     return_type: &DataType,
     arena: &ExprArena,
 ) -> Result<(), String> {
@@ -800,7 +800,7 @@ fn validate_window_function_signature(
 }
 
 fn validate_window_arg_matches_return(
-    arg: crate::exec::expr::ExprId,
+    arg: novarocks_execution::exec::expr::ExprId,
     return_type: &DataType,
     arena: &ExprArena,
 ) -> Result<(), String> {
@@ -821,9 +821,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::ExecNodeKind;
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_protocol::{common, expr, plan};
     use novarocks_types::SlotId;
 
@@ -957,7 +957,7 @@ mod tests {
         assert_eq!(analytic.functions.len(), 1);
         assert!(matches!(
             analytic.functions[0].kind,
-            crate::exec::node::analytic::WindowFunctionKind::RowNumber
+            novarocks_execution::exec::node::analytic::WindowFunctionKind::RowNumber
         ));
         assert_eq!(analytic.order_by_exprs.len(), 1);
         assert_eq!(
@@ -1035,7 +1035,7 @@ mod tests {
         assert_eq!(second.functions.len(), 1);
         assert!(matches!(
             second.functions[0].kind,
-            crate::exec::node::analytic::WindowFunctionKind::Rank
+            novarocks_execution::exec::node::analytic::WindowFunctionKind::Rank
         ));
         assert_eq!(
             second.output_chunk_schema.slot_ids(),
@@ -1056,7 +1056,7 @@ mod tests {
         assert_eq!(first.functions.len(), 1);
         assert!(matches!(
             first.functions[0].kind,
-            crate::exec::node::analytic::WindowFunctionKind::RowNumber
+            novarocks_execution::exec::node::analytic::WindowFunctionKind::RowNumber
         ));
         assert_eq!(
             first.output_chunk_schema.slot_ids(),

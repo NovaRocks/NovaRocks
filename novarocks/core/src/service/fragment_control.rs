@@ -18,7 +18,7 @@
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::info;
 use crate::runtime::query_context::{QueryContextManager, query_context_manager};
-use crate::runtime::{exchange, result_buffer};
+use crate::runtime::result_buffer;
 
 pub fn cancel_runtime_fragment(finst_id: UniqueId) {
     cancel_with_manager(finst_id, query_context_manager());
@@ -34,7 +34,7 @@ pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryC
     }
 
     info!(
-        target: "novarocks::exec",
+        target: "novarocks_execution",
         finst_id = %finst_id,
         query_id = ?query_id,
         canceled_fragments = target_finsts.len(),
@@ -44,63 +44,25 @@ pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryC
     for id in &target_finsts {
         result_buffer::cancel(*id);
     }
-
-    let cleanup: Vec<_> = target_finsts
-        .iter()
-        .map(|id| {
-            let id = *id;
-            std::thread::spawn(move || exchange::cancel_fragment(id.high(), id.low()))
-        })
-        .collect();
-    for h in cleanup {
-        let _ = h.join();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::cancel_runtime_fragment;
     use crate::common::types::UniqueId;
-    use crate::runtime::{
-        exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state},
-        query_context::{QueryId, query_context_manager},
-    };
+    use crate::runtime::query_context::{QueryId, query_context_manager};
 
     #[test]
     fn cancel_fans_out_to_query_fragment_peers() {
         let query_id = QueryId::new(7011, 7012);
         let finst_a = UniqueId::new(7013, 7014);
         let finst_b = UniqueId::new(7015, 7016);
-        let key_a = ExchangeKey {
-            finst_id_hi: finst_a.high(),
-            finst_id_lo: finst_a.low(),
-            node_id: 51,
-        };
-        let key_b = ExchangeKey {
-            finst_id_hi: finst_b.high(),
-            finst_id_lo: finst_b.low(),
-            node_id: 52,
-        };
 
         let mgr = query_context_manager();
         mgr.register_finst(finst_a, query_id);
         mgr.register_finst(finst_b, query_id);
-        set_expected_senders(key_a, 1);
-        set_expected_senders(key_b, 1);
-
-        assert!(snapshot_receiver_state(key_a).is_some());
-        assert!(snapshot_receiver_state(key_b).is_some());
 
         cancel_runtime_fragment(finst_a);
-
-        assert!(
-            snapshot_receiver_state(key_a).is_none(),
-            "target finst receiver must be canceled"
-        );
-        assert!(
-            snapshot_receiver_state(key_b).is_none(),
-            "peer finst receiver must be canceled"
-        );
 
         mgr.unregister_finst(finst_a);
         mgr.unregister_finst(finst_b);

@@ -1,0 +1,562 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use arrow::array::ArrayRef;
+use arrow::datatypes::DataType;
+
+use crate::exec::node::aggregate::AggFunction;
+
+use super::{AggInputView, AggSpec, AggStatePtr};
+
+#[derive(Clone, Debug)]
+pub(super) enum AggKind {
+    Count,
+    CountState,
+    CountStateSigned,
+    BoolState,
+    BoolStateSigned,
+    MinState,
+    MaxState,
+    MinStateSigned,
+    MaxStateSigned,
+    CountDistinct,
+    CountIf,
+    SumInt,
+    SumLargeInt,
+    SumFloat,
+    SumDecimal128,
+    SumDecimal256,
+    SumStateInt64,
+    SumStateDecimal128,
+    CountStateMerge,
+    AvgStateMerge,
+    MinStateMerge,
+    MaxStateMerge,
+    BoolAndStateMerge,
+    BoolOrStateMerge,
+    CountDistinctStateMerge,
+    ApproxCountDistinctStateMerge,
+    SumStateMerge,
+    SumStateSignedInt64,
+    SumStateSignedDecimal128,
+    MinInt,
+    MaxInt,
+    MinFloat,
+    MaxFloat,
+    MinBool,
+    MaxBool,
+    MinUtf8,
+    MaxUtf8,
+    MinDate32,
+    MaxDate32,
+    MinTimestamp,
+    MaxTimestamp,
+    MinLargeInt,
+    MaxLargeInt,
+    MinDecimal128,
+    MaxDecimal128,
+    MinDecimal256,
+    MaxDecimal256,
+    AvgInt,
+    AvgFloat,
+    AvgDecimal128,
+    AvgDecimal256,
+    VariancePop,
+    VarianceSamp,
+    StddevPop,
+    StddevSamp,
+    AnyValue,
+    BoolOr,
+    BoolAnd,
+    CovarPop,
+    CovarSamp,
+    Corr,
+    MaxBy,
+    MinBy,
+    MaxByV2,
+    MinByV2,
+    GroupConcat {
+        is_distinct: bool,
+        is_asc_order: Vec<bool>,
+        nulls_first: Vec<bool>,
+        max_len: i64,
+    },
+    MultiDistinctSum,
+    MapAgg,
+    SumMap,
+    ArrayAgg {
+        is_distinct: bool,
+        is_asc_order: Vec<bool>,
+        nulls_first: Vec<bool>,
+    },
+    ArrayUniqueAgg,
+    Retention,
+    WindowFunnel,
+    Histogram,
+    HistogramHllNdv,
+    MannWhitneyUTest,
+    DictMerge,
+    BitmapAgg,
+    BitmapUnionInt,
+    PercentileUnion,
+    PercentileApprox,
+    PercentileApproxWeighted,
+    PercentileCont,
+    PercentileDisc,
+    PercentileDiscLc,
+    ApproxTopK,
+    HllRawHash,
+    HllRawMerge,
+    HllUnionCount,
+    DsHllHash,
+    DsHllMerge,
+    DsHllCount,
+    MinN,
+    MaxN,
+}
+
+mod any_value;
+mod approx_top_k;
+mod array_agg;
+mod avg;
+mod bitmap_union_int;
+mod bool_and;
+mod bool_or;
+pub mod common;
+mod corr_covar;
+mod count;
+mod count_distinct;
+mod count_if;
+mod dict_merge;
+mod ds_hll;
+mod ds_theta;
+mod group_concat;
+mod histogram;
+pub mod hll_raw;
+mod mann_whitney_u_test;
+mod map_agg;
+mod max;
+mod max_by;
+mod min;
+mod minmax_n;
+mod multi_distinct_sum;
+mod percentile;
+mod percentile_placeholder;
+mod retention;
+mod state_combinators;
+mod sum;
+mod sum_map;
+mod variance;
+mod window_funnel;
+
+use any_value::AnyValueAgg;
+use approx_top_k::ApproxTopKAgg;
+use array_agg::ArrayAggAgg;
+use avg::AvgAgg;
+use bitmap_union_int::BitmapUnionIntAgg;
+use bool_and::BoolAndAgg;
+use bool_or::BoolOrAgg;
+use corr_covar::CovarCorrAgg;
+use count::CountAgg;
+use count_distinct::CountDistinctAgg;
+use count_if::CountIfAgg;
+use dict_merge::DictMergeAgg;
+use ds_hll::DsHllAgg;
+use ds_theta::DsThetaAgg;
+use group_concat::GroupConcatAgg;
+use histogram::{HistogramAgg, HistogramHllNdvAgg};
+use hll_raw::HllRawAgg;
+use mann_whitney_u_test::MannWhitneyUTestAgg;
+use map_agg::MapAggAgg;
+use max::MaxAgg;
+use max_by::MaxMinByAgg;
+use min::MinAgg;
+use minmax_n::MinMaxNAgg;
+use multi_distinct_sum::MultiDistinctSumAgg;
+use percentile::PercentileAgg;
+use percentile_placeholder::PercentilePlaceholderAgg;
+use retention::RetentionAgg;
+use state_combinators::approx_count_distinct::{
+    ApproxCountDistinctStateAgg, ApproxCountDistinctStateSignedAgg,
+};
+use state_combinators::avg::{AvgStateAgg, AvgStateSignedAgg};
+use state_combinators::bool_or_and::{BoolStateAgg, BoolStateSignedAgg};
+use state_combinators::count::{CountStateAgg, CountStateSignedAgg};
+use state_combinators::count_distinct::{CountDistinctStateAgg, CountDistinctStateSignedAgg};
+use state_combinators::min_max::{MinMaxStateAgg, MinMaxStateSignedAgg};
+use state_combinators::opaque_merge::OpaqueStateMergeAgg;
+use state_combinators::sum::{SumStateAgg, SumStateMergeAgg, SumStateSignedAgg};
+use sum::SumAgg;
+use sum_map::SumMapAgg;
+use variance::VarStdAgg;
+use window_funnel::WindowFunnelAgg;
+
+pub(super) trait AggregateFunction {
+    fn build_spec_from_type(
+        &self,
+        func: &AggFunction,
+        input_type: Option<&DataType>,
+        input_is_intermediate: bool,
+    ) -> Result<AggSpec, String>;
+
+    fn state_layout_for(&self, kind: &AggKind) -> (usize, usize);
+
+    fn build_input_view<'a>(
+        &self,
+        spec: &AggSpec,
+        array: &'a Option<ArrayRef>,
+    ) -> Result<AggInputView<'a>, String>;
+
+    fn build_merge_view<'a>(
+        &self,
+        spec: &AggSpec,
+        array: &'a Option<ArrayRef>,
+    ) -> Result<AggInputView<'a>, String>;
+
+    fn init_state(&self, spec: &AggSpec, ptr: *mut u8);
+    fn drop_state(&self, spec: &AggSpec, ptr: *mut u8);
+
+    fn update_batch(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        state_ptrs: &[AggStatePtr],
+        input: &AggInputView,
+    ) -> Result<(), String>;
+
+    fn merge_batch(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        state_ptrs: &[AggStatePtr],
+        input: &AggInputView,
+    ) -> Result<(), String>;
+
+    fn build_array(
+        &self,
+        spec: &AggSpec,
+        offset: usize,
+        group_states: &[AggStatePtr],
+        output_intermediate: bool,
+    ) -> Result<ArrayRef, String>;
+}
+
+static COUNT: CountAgg = CountAgg;
+static COUNT_STATE: CountStateAgg = CountStateAgg;
+static COUNT_STATE_SIGNED: CountStateSignedAgg = CountStateSignedAgg;
+static COUNT_DISTINCT_STATE: CountDistinctStateAgg = CountDistinctStateAgg;
+static COUNT_DISTINCT_STATE_SIGNED: CountDistinctStateSignedAgg = CountDistinctStateSignedAgg;
+static APPROX_COUNT_DISTINCT_STATE: ApproxCountDistinctStateAgg = ApproxCountDistinctStateAgg;
+static APPROX_COUNT_DISTINCT_STATE_SIGNED: ApproxCountDistinctStateSignedAgg =
+    ApproxCountDistinctStateSignedAgg;
+static BOOL_STATE: BoolStateAgg = BoolStateAgg;
+static BOOL_STATE_SIGNED: BoolStateSignedAgg = BoolStateSignedAgg;
+static MIN_MAX_STATE: MinMaxStateAgg = MinMaxStateAgg;
+static MIN_MAX_STATE_SIGNED: MinMaxStateSignedAgg = MinMaxStateSignedAgg;
+static COUNT_DISTINCT: CountDistinctAgg = CountDistinctAgg;
+static COUNT_IF: CountIfAgg = CountIfAgg;
+static GROUP_CONCAT: GroupConcatAgg = GroupConcatAgg;
+static SUM: SumAgg = SumAgg;
+static COUNT_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "count_state_merge",
+    AggKind::CountStateMerge,
+    crate::exec::expr::function::mv_state::count_state_union,
+);
+static AVG_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "avg_state_merge",
+    AggKind::AvgStateMerge,
+    crate::exec::expr::function::mv_state::avg_state_union,
+);
+static MIN_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "min_state_merge",
+    AggKind::MinStateMerge,
+    crate::exec::expr::function::mv_state::min_state_union,
+);
+static MAX_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "max_state_merge",
+    AggKind::MaxStateMerge,
+    crate::exec::expr::function::mv_state::max_state_union,
+);
+static BOOL_AND_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "bool_and_state_merge",
+    AggKind::BoolAndStateMerge,
+    crate::exec::expr::function::mv_state::bool_and_state_union,
+);
+static BOOL_OR_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "bool_or_state_merge",
+    AggKind::BoolOrStateMerge,
+    crate::exec::expr::function::mv_state::bool_or_state_union,
+);
+static COUNT_DISTINCT_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "count_distinct_state_merge",
+    AggKind::CountDistinctStateMerge,
+    crate::exec::expr::function::mv_state::count_distinct_state_union,
+);
+static APPROX_COUNT_DISTINCT_STATE_MERGE: OpaqueStateMergeAgg = OpaqueStateMergeAgg::new(
+    "approx_count_distinct_state_merge",
+    AggKind::ApproxCountDistinctStateMerge,
+    crate::exec::expr::function::mv_state::approx_count_distinct_state_union,
+);
+static SUM_STATE: SumStateAgg = SumStateAgg;
+static SUM_STATE_MERGE: SumStateMergeAgg = SumStateMergeAgg;
+static SUM_STATE_SIGNED: SumStateSignedAgg = SumStateSignedAgg;
+static MIN: MinAgg = MinAgg;
+static MAX: MaxAgg = MaxAgg;
+static AVG: AvgAgg = AvgAgg;
+static AVG_STATE: AvgStateAgg = AvgStateAgg;
+static AVG_STATE_SIGNED: AvgStateSignedAgg = AvgStateSignedAgg;
+static ARRAY_AGG: ArrayAggAgg = ArrayAggAgg;
+static VAR_STD: VarStdAgg = VarStdAgg;
+static ANY_VALUE: AnyValueAgg = AnyValueAgg;
+static BOOL_OR: BoolOrAgg = BoolOrAgg;
+static BOOL_AND: BoolAndAgg = BoolAndAgg;
+static COVAR_CORR: CovarCorrAgg = CovarCorrAgg;
+static MAX_MIN_BY: MaxMinByAgg = MaxMinByAgg;
+static MULTI_DISTINCT_SUM: MultiDistinctSumAgg = MultiDistinctSumAgg;
+static MAP_AGG: MapAggAgg = MapAggAgg;
+static SUM_MAP: SumMapAgg = SumMapAgg;
+static RETENTION: RetentionAgg = RetentionAgg;
+static WINDOW_FUNNEL: WindowFunnelAgg = WindowFunnelAgg;
+static HISTOGRAM: HistogramAgg = HistogramAgg;
+static HISTOGRAM_HLL_NDV: HistogramHllNdvAgg = HistogramHllNdvAgg;
+static MANN_WHITNEY: MannWhitneyUTestAgg = MannWhitneyUTestAgg;
+static DICT_MERGE: DictMergeAgg = DictMergeAgg;
+static DS_HLL: DsHllAgg = DsHllAgg;
+static DS_THETA: DsThetaAgg = DsThetaAgg;
+static BITMAP_UNION_INT: BitmapUnionIntAgg = BitmapUnionIntAgg;
+static PERCENTILE: PercentileAgg = PercentileAgg;
+static PERCENTILE_PLACEHOLDER: PercentilePlaceholderAgg = PercentilePlaceholderAgg;
+static APPROX_TOP_K: ApproxTopKAgg = ApproxTopKAgg;
+static HLL_RAW: HllRawAgg = HllRawAgg;
+static MIN_MAX_N: MinMaxNAgg = MinMaxNAgg;
+
+fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction, String> {
+    match canonical_agg_name(func.name.as_str()) {
+        "count" => Ok(&COUNT),
+        "count_state" => Ok(&COUNT_STATE),
+        "count_state_signed" => Ok(&COUNT_STATE_SIGNED),
+        "count_distinct_state" => Ok(&COUNT_DISTINCT_STATE),
+        "count_distinct_state_signed" => Ok(&COUNT_DISTINCT_STATE_SIGNED),
+        "approx_count_distinct_state" => Ok(&APPROX_COUNT_DISTINCT_STATE),
+        "approx_count_distinct_state_signed" => Ok(&APPROX_COUNT_DISTINCT_STATE_SIGNED),
+        "bool_or_state" | "bool_and_state" => Ok(&BOOL_STATE),
+        "bool_or_state_signed" | "bool_and_state_signed" => Ok(&BOOL_STATE_SIGNED),
+        "min_state" | "max_state" => Ok(&MIN_MAX_STATE),
+        "min_state_signed" | "max_state_signed" => Ok(&MIN_MAX_STATE_SIGNED),
+        "count_distinct" | "multi_distinct_count" => Ok(&COUNT_DISTINCT),
+        "count_if" => Ok(&COUNT_IF),
+        "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
+        "sum" => Ok(&SUM),
+        "count_state_merge" => Ok(&COUNT_STATE_MERGE),
+        "avg_state_merge" => Ok(&AVG_STATE_MERGE),
+        "min_state_merge" => Ok(&MIN_STATE_MERGE),
+        "max_state_merge" => Ok(&MAX_STATE_MERGE),
+        "bool_and_state_merge" => Ok(&BOOL_AND_STATE_MERGE),
+        "bool_or_state_merge" => Ok(&BOOL_OR_STATE_MERGE),
+        "count_distinct_state_merge" => Ok(&COUNT_DISTINCT_STATE_MERGE),
+        "approx_count_distinct_state_merge" => Ok(&APPROX_COUNT_DISTINCT_STATE_MERGE),
+        "sum_state" => Ok(&SUM_STATE),
+        "sum_state_merge" => Ok(&SUM_STATE_MERGE),
+        "sum_state_signed" => Ok(&SUM_STATE_SIGNED),
+        "min" => Ok(&MIN),
+        "max" => Ok(&MAX),
+        "avg" => Ok(&AVG),
+        "avg_state" => Ok(&AVG_STATE),
+        "avg_state_signed" => Ok(&AVG_STATE_SIGNED),
+        "array_agg" | "array_agg_distinct" | "array_unique_agg" => Ok(&ARRAY_AGG),
+        "variance" | "variance_pop" | "var_pop" | "variance_samp" | "var_samp" | "stddev"
+        | "stddev_pop" | "stddev_samp" | "std" => Ok(&VAR_STD),
+        "any_value" => Ok(&ANY_VALUE),
+        "percentile_union" | "percentile_approx" | "percentile_approx_weighted" => Ok(&PERCENTILE),
+        "percentile_disc" | "percentile_cont" | "percentile_disc_lc" => Ok(&PERCENTILE_PLACEHOLDER),
+        "bool_or" | "boolor_agg" => Ok(&BOOL_OR),
+        "bool_and" | "booland_agg" => Ok(&BOOL_AND),
+        "covar_pop" | "covar_samp" | "corr" => Ok(&COVAR_CORR),
+        "max_by" | "min_by" | "max_by_v2" | "min_by_v2" => Ok(&MAX_MIN_BY),
+        "multi_distinct_sum" => Ok(&MULTI_DISTINCT_SUM),
+        "map_agg" => Ok(&MAP_AGG),
+        "sum_map" => Ok(&SUM_MAP),
+        "retention" => Ok(&RETENTION),
+        "window_funnel" => Ok(&WINDOW_FUNNEL),
+        "histogram" => Ok(&HISTOGRAM),
+        "histogram_hll_ndv" => Ok(&HISTOGRAM_HLL_NDV),
+        "mann_whitney_u_test" => Ok(&MANN_WHITNEY),
+        "dict_merge" => Ok(&DICT_MERGE),
+        "bitmap_agg" | "bitmap_union" | "bitmap_union_count" => Ok(&BITMAP_UNION_INT),
+        "bitmap_union_int" => Ok(&BITMAP_UNION_INT),
+        "approx_top_k" => Ok(&APPROX_TOP_K),
+        "min_n" | "max_n" => Ok(&MIN_MAX_N),
+        "ds_theta_count_distinct" => Ok(&DS_THETA),
+        "ds_hll_count_distinct"
+        | "ds_hll_count_distinct_union"
+        | "ds_hll_count_distinct_merge"
+        | "approx_count_distinct_hll_sketch" => Ok(&DS_HLL),
+        "hll_union"
+        | "hll_raw_agg"
+        | "hll_raw"
+        | "hll_union_agg"
+        | "ndv"
+        | "approx_count_distinct" => Ok(&HLL_RAW),
+        other => Err(format!("unsupported agg function: {}", other)),
+    }
+}
+
+fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
+    match kind {
+        AggKind::Count => &COUNT,
+        AggKind::CountState => &COUNT_STATE,
+        AggKind::CountStateSigned => &COUNT_STATE_SIGNED,
+        AggKind::BoolState => &BOOL_STATE,
+        AggKind::BoolStateSigned => &BOOL_STATE_SIGNED,
+        AggKind::MinState | AggKind::MaxState => &MIN_MAX_STATE,
+        AggKind::MinStateSigned | AggKind::MaxStateSigned => &MIN_MAX_STATE_SIGNED,
+        AggKind::CountDistinct => &COUNT_DISTINCT,
+        AggKind::CountIf => &COUNT_IF,
+        AggKind::GroupConcat { .. } => &GROUP_CONCAT,
+        AggKind::SumInt
+        | AggKind::SumLargeInt
+        | AggKind::SumFloat
+        | AggKind::SumDecimal128
+        | AggKind::SumDecimal256 => &SUM,
+        AggKind::CountStateMerge => &COUNT_STATE_MERGE,
+        AggKind::AvgStateMerge => &AVG_STATE_MERGE,
+        AggKind::MinStateMerge => &MIN_STATE_MERGE,
+        AggKind::MaxStateMerge => &MAX_STATE_MERGE,
+        AggKind::BoolAndStateMerge => &BOOL_AND_STATE_MERGE,
+        AggKind::BoolOrStateMerge => &BOOL_OR_STATE_MERGE,
+        AggKind::CountDistinctStateMerge => &COUNT_DISTINCT_STATE_MERGE,
+        AggKind::ApproxCountDistinctStateMerge => &APPROX_COUNT_DISTINCT_STATE_MERGE,
+        AggKind::SumStateInt64 | AggKind::SumStateDecimal128 => &SUM_STATE,
+        AggKind::SumStateMerge => &SUM_STATE_MERGE,
+        AggKind::SumStateSignedInt64 | AggKind::SumStateSignedDecimal128 => &SUM_STATE_SIGNED,
+        AggKind::MinInt
+        | AggKind::MinFloat
+        | AggKind::MinBool
+        | AggKind::MinUtf8
+        | AggKind::MinDate32
+        | AggKind::MinTimestamp
+        | AggKind::MinLargeInt
+        | AggKind::MinDecimal128
+        | AggKind::MinDecimal256 => &MIN,
+        AggKind::MaxInt
+        | AggKind::MaxFloat
+        | AggKind::MaxBool
+        | AggKind::MaxUtf8
+        | AggKind::MaxDate32
+        | AggKind::MaxTimestamp
+        | AggKind::MaxLargeInt
+        | AggKind::MaxDecimal128
+        | AggKind::MaxDecimal256 => &MAX,
+        AggKind::AvgInt | AggKind::AvgFloat | AggKind::AvgDecimal128 | AggKind::AvgDecimal256 => {
+            &AVG
+        }
+        AggKind::ArrayAgg { .. } | AggKind::ArrayUniqueAgg => &ARRAY_AGG,
+        AggKind::VariancePop | AggKind::VarianceSamp | AggKind::StddevPop | AggKind::StddevSamp => {
+            &VAR_STD
+        }
+        AggKind::AnyValue => &ANY_VALUE,
+        AggKind::BoolOr => &BOOL_OR,
+        AggKind::BoolAnd => &BOOL_AND,
+        AggKind::CovarPop | AggKind::CovarSamp | AggKind::Corr => &COVAR_CORR,
+        AggKind::MaxBy | AggKind::MinBy | AggKind::MaxByV2 | AggKind::MinByV2 => &MAX_MIN_BY,
+        AggKind::MultiDistinctSum => &MULTI_DISTINCT_SUM,
+        AggKind::MapAgg => &MAP_AGG,
+        AggKind::SumMap => &SUM_MAP,
+        AggKind::Retention => &RETENTION,
+        AggKind::WindowFunnel => &WINDOW_FUNNEL,
+        AggKind::Histogram => &HISTOGRAM,
+        AggKind::HistogramHllNdv => &HISTOGRAM_HLL_NDV,
+        AggKind::MannWhitneyUTest => &MANN_WHITNEY,
+        AggKind::DictMerge => &DICT_MERGE,
+        AggKind::DsHllHash | AggKind::DsHllMerge | AggKind::DsHllCount => &DS_HLL,
+        AggKind::BitmapAgg => &BITMAP_UNION_INT,
+        AggKind::BitmapUnionInt => &BITMAP_UNION_INT,
+        AggKind::PercentileUnion
+        | AggKind::PercentileApprox
+        | AggKind::PercentileApproxWeighted => &PERCENTILE,
+        AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::PercentileDiscLc => {
+            &PERCENTILE_PLACEHOLDER
+        }
+        AggKind::ApproxTopK => &APPROX_TOP_K,
+        AggKind::HllRawHash | AggKind::HllRawMerge | AggKind::HllUnionCount => &HLL_RAW,
+        AggKind::MinN | AggKind::MaxN => &MIN_MAX_N,
+    }
+}
+
+fn canonical_agg_name(name: &str) -> &str {
+    name.split_once('|').map(|(base, _)| base).unwrap_or(name)
+}
+
+pub(super) fn build_spec_from_type(
+    func: &AggFunction,
+    input_type: Option<&DataType>,
+    input_is_intermediate: bool,
+) -> Result<AggSpec, String> {
+    resolve_by_func(func)?.build_spec_from_type(func, input_type, input_is_intermediate)
+}
+
+pub(in crate::exec::expr::agg) fn state_layout_for_kind(kind: &AggKind) -> (usize, usize) {
+    resolve_by_kind(kind).state_layout_for(kind)
+}
+
+pub(in crate::exec::expr::agg) fn build_input_view<'a>(
+    spec: &AggSpec,
+    array: &'a Option<ArrayRef>,
+) -> Result<AggInputView<'a>, String> {
+    resolve_by_kind(&spec.kind).build_input_view(spec, array)
+}
+
+pub(in crate::exec::expr::agg) fn build_merge_view<'a>(
+    spec: &AggSpec,
+    array: &'a Option<ArrayRef>,
+) -> Result<AggInputView<'a>, String> {
+    resolve_by_kind(&spec.kind).build_merge_view(spec, array)
+}
+
+pub(in crate::exec::expr::agg) fn init_state(spec: &AggSpec, ptr: *mut u8) {
+    resolve_by_kind(&spec.kind).init_state(spec, ptr)
+}
+
+pub(in crate::exec::expr::agg) fn drop_state(spec: &AggSpec, ptr: *mut u8) {
+    resolve_by_kind(&spec.kind).drop_state(spec, ptr)
+}
+
+pub(in crate::exec::expr::agg) fn update_batch(
+    spec: &AggSpec,
+    offset: usize,
+    state_ptrs: &[AggStatePtr],
+    input: &AggInputView,
+) -> Result<(), String> {
+    resolve_by_kind(&spec.kind).update_batch(spec, offset, state_ptrs, input)
+}
+
+pub(in crate::exec::expr::agg) fn merge_batch(
+    spec: &AggSpec,
+    offset: usize,
+    state_ptrs: &[AggStatePtr],
+    input: &AggInputView,
+) -> Result<(), String> {
+    resolve_by_kind(&spec.kind).merge_batch(spec, offset, state_ptrs, input)
+}
+
+pub(in crate::exec::expr::agg) fn build_array(
+    spec: &AggSpec,
+    offset: usize,
+    group_states: &[AggStatePtr],
+    output_intermediate: bool,
+) -> Result<ArrayRef, String> {
+    resolve_by_kind(&spec.kind).build_array(spec, offset, group_states, output_intermediate)
+}

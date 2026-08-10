@@ -21,15 +21,15 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
-use novarocks::exec::fragment::program::FragmentNodeId;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
-use novarocks::runtime::fragment::{
-    BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
-};
 use novarocks::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
     ScanRange, ScanRangeParams,
+};
+use novarocks_execution::exec::fragment::program::FragmentNodeId;
+use novarocks_execution::runtime::fragment::{
+    BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{common, novarocks as proto};

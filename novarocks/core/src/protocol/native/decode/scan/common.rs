@@ -22,12 +22,12 @@ use arrow::datatypes::DataType;
 
 use super::super::layout::Layout;
 use super::super::node::NativePlanDecodeContext;
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::{ExprArena, ExprNode};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_fs::ObjectStoreConfig;
 use novarocks_protocol::{common, plan};
 use novarocks_types::SlotId;
@@ -278,7 +278,7 @@ pub(super) fn lower_scan_predicate(
     arena: &mut ExprArena,
     layout: &super::super::layout::Layout,
     ctx: &NativePlanDecodeContext,
-) -> Result<Option<crate::exec::expr::ExprId>, NativeFragmentLeafDecodeError> {
+) -> Result<Option<novarocks_execution::exec::expr::ExprId>, NativeFragmentLeafDecodeError> {
     let mut predicate = None;
     for (idx, expr) in scan.predicates.iter().enumerate() {
         let expr_id = ctx

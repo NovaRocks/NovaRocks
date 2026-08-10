@@ -22,9 +22,9 @@ use arrow::array::{
     MapArray, StringArray, StructArray,
 };
 use arrow::datatypes::DataType;
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::function::string::{eval_split, eval_string_function};
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_execution::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::function::string::{eval_split, eval_string_function};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -34,9 +34,9 @@ use std::sync::Arc;
 fn string_eval_str(
     name: &str,
     arena: &ExprArena,
-    expr: novarocks::exec::expr::ExprId,
-    args: &[novarocks::exec::expr::ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    expr: novarocks_execution::exec::expr::ExprId,
+    args: &[novarocks_execution::exec::expr::ExprId],
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> String {
     let arr = eval_string_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
@@ -46,9 +46,9 @@ fn string_eval_str(
 fn string_eval_i64(
     name: &str,
     arena: &ExprArena,
-    expr: novarocks::exec::expr::ExprId,
-    args: &[novarocks::exec::expr::ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    expr: novarocks_execution::exec::expr::ExprId,
+    args: &[novarocks_execution::exec::expr::ExprId],
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> i64 {
     let arr = eval_string_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -58,9 +58,9 @@ fn string_eval_i64(
 fn string_eval_i32(
     name: &str,
     arena: &ExprArena,
-    expr: novarocks::exec::expr::ExprId,
-    args: &[novarocks::exec::expr::ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    expr: novarocks_execution::exec::expr::ExprId,
+    args: &[novarocks_execution::exec::expr::ExprId],
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> i32 {
     let arr = eval_string_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -70,9 +70,9 @@ fn string_eval_i32(
 fn string_eval_bool(
     name: &str,
     arena: &ExprArena,
-    expr: novarocks::exec::expr::ExprId,
-    args: &[novarocks::exec::expr::ExprId],
-    chunk: &novarocks::exec::chunk::Chunk,
+    expr: novarocks_execution::exec::expr::ExprId,
+    args: &[novarocks_execution::exec::expr::ExprId],
+    chunk: &novarocks_execution::exec::chunk::Chunk,
 ) -> bool {
     let arr = eval_string_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -477,8 +477,8 @@ fn crc32_utf8_values_match_zlib() {
     use arrow::array::Int64Array;
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::exec::chunk::Chunk;
-    use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::chunk::Chunk;
+    use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -619,7 +619,7 @@ fn test_char_length_logic() {
 
 #[test]
 fn test_length_respects_int_return_type() {
-    use novarocks::exec::expr::function::string::eval_string_function;
+    use novarocks_execution::exec::expr::function::string::eval_string_function;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr_i32 = common::typed_null(&mut arena, DataType::Int32);
@@ -685,8 +685,8 @@ fn test_money_format_logic() {
 fn murmur_hash3_32_known_vectors() {
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::exec::chunk::Chunk;
-    use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::chunk::Chunk;
+    use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -733,8 +733,8 @@ fn murmur_hash3_32_known_vectors() {
 fn murmur_hash3_32_null_propagation() {
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::exec::chunk::Chunk;
-    use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::chunk::Chunk;
+    use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -1026,7 +1026,7 @@ fn test_space_logic() {
 
 #[test]
 fn test_split_basic() {
-    use novarocks::exec::expr::function::string::eval_split;
+    use novarocks_execution::exec::expr::function::string::eval_split;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let s = common::literal_string(&mut arena, "a,b,c");
@@ -1135,10 +1135,10 @@ fn test_unhex_invalid_input_returns_empty_string() {
 // Tests migrated from string/upper.rs
 // ---------------------------------------------------------------------------
 
-fn create_test_chunk_string(values: Vec<String>) -> novarocks::exec::chunk::Chunk {
+fn create_test_chunk_string(values: Vec<String>) -> novarocks_execution::exec::chunk::Chunk {
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -1148,7 +1148,7 @@ fn create_test_chunk_string(values: Vec<String>) -> novarocks::exec::chunk::Chun
     let chunk_schema =
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
             .expect("chunk schema");
-    novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
+    novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
 #[test]
@@ -1157,7 +1157,7 @@ fn test_upper_lowercase() {
     let lit = arena.push(ExprNode::Literal(LiteralValue::Utf8("hello".to_string())));
     let upper = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Upper,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Upper,
             args: vec![lit],
         },
         DataType::Utf8,
@@ -1179,7 +1179,7 @@ fn test_upper_mixed_case() {
     )));
     let upper = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Upper,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Upper,
             args: vec![lit],
         },
         DataType::Utf8,
@@ -1199,7 +1199,7 @@ fn test_upper_already_uppercase() {
     let lit = arena.push(ExprNode::Literal(LiteralValue::Utf8("HELLO".to_string())));
     let upper = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Upper,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Upper,
             args: vec![lit],
         },
         DataType::Utf8,
@@ -1219,7 +1219,7 @@ fn test_upper_empty_string() {
     let lit = arena.push(ExprNode::Literal(LiteralValue::Utf8("".to_string())));
     let upper = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Upper,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Upper,
             args: vec![lit],
         },
         DataType::Utf8,
@@ -1239,7 +1239,7 @@ fn test_upper_utf8() {
     let lit = arena.push(ExprNode::Literal(LiteralValue::Utf8("café".to_string())));
     let upper = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Upper,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Upper,
             args: vec![lit],
         },
         DataType::Utf8,
@@ -1261,7 +1261,7 @@ fn test_upper_with_numbers() {
     )));
     let upper = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Upper,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Upper,
             args: vec![lit],
         },
         DataType::Utf8,
@@ -1393,7 +1393,7 @@ fn test_raise_error_null_returns_null() {
 }
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::exec::chunk::Chunk;
+use novarocks_execution::exec::chunk::Chunk;
 /// Integration tests for SUBSTRING/SUBSTR function.
 ///
 /// Tests verify that SUBSTRING properly extracts substrings from strings
@@ -1405,11 +1405,12 @@ fn create_test_chunk() -> Chunk {
     let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = arrow::array::Int64Array::from(vec![1]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -1623,11 +1624,12 @@ fn test_substring_multiple_rows() {
     let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = arrow::array::Int64Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
     let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
 
     let result = arena.eval(func_id, &chunk).unwrap();

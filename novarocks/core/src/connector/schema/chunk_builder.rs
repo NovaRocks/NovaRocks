@@ -24,7 +24,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SchemaValue {

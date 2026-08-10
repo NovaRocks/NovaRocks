@@ -59,7 +59,7 @@ fn version_scan_without_required_columns_rejects_unmaterializable_planner_output
 
 #[test]
 fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
-    use crate::exec::row_position::{
+    use novarocks_execution::exec::row_position::{
         ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
         ICEBERG_ROW_POS_COL,
     };
@@ -141,7 +141,7 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
 
 #[test]
 fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
-    use crate::exec::row_position::{
+    use novarocks_execution::exec::row_position::{
         ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
         ICEBERG_ROW_POS_COL,
     };

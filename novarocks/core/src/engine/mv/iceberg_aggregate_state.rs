@@ -22,13 +22,13 @@ use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::change_op::{ChangeOp, change_op_array, change_op_field};
-use crate::exec::chunk::Chunk;
 use crate::mv::aggregate_state::mv_agg_state::{
     AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
 };
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::runtime::query_result::record_batch_to_chunk;
+use novarocks_execution::exec::change_op::{ChangeOp, change_op_array, change_op_field};
+use novarocks_execution::exec::chunk::Chunk;
 
 pub(crate) struct IcebergAggregateMergeResult {
     pub(crate) delete_row_ids: Vec<String>,
@@ -431,12 +431,12 @@ mod tests {
         AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
     };
     use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
-    use crate::mv::aggregate_state::state_codec::encode_count_state;
     use crate::mv::model::AggregateStateRole;
     use crate::sql::mv_refresh::AggregateFunctionKind;
     use novarocks_catalog::schema::SqlType;
+    use novarocks_execution::exec::mv::state_codec::encode_count_state;
 
-    fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {
+    fn chunk(batch: RecordBatch) -> novarocks_execution::exec::chunk::Chunk {
         record_batch_to_chunk(batch).expect("chunk")
     }
 
@@ -550,12 +550,12 @@ mod tests {
                 Field::new("c", DataType::Int64, false),
                 Field::new("__agg_state_c", DataType::LargeBinary, false),
                 Field::new(
-                    crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                    novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
                     DataType::Utf8,
                     false,
                 ),
                 Field::new(
-                    crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                    novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
                     DataType::Int64,
                     false,
                 ),
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(field.is_nullable(), nullable);
     }
 
-    fn row_ids_from_chunks(chunks: &[crate::exec::chunk::Chunk]) -> Vec<String> {
+    fn row_ids_from_chunks(chunks: &[novarocks_execution::exec::chunk::Chunk]) -> Vec<String> {
         let mut row_ids = Vec::new();
         for chunk in chunks {
             let row_id_array = chunk
@@ -696,7 +696,7 @@ mod tests {
             .expect("delete op");
         assert_eq!(
             delete_ops.value(0),
-            crate::exec::change_op::CHANGE_OP_DELETE
+            novarocks_execution::exec::change_op::CHANGE_OP_DELETE
         );
 
         let insert_batch = &chunks[1].batch;
@@ -720,7 +720,7 @@ mod tests {
             .expect("insert op");
         assert_eq!(
             insert_ops.value(0),
-            crate::exec::change_op::CHANGE_OP_INSERT
+            novarocks_execution::exec::change_op::CHANGE_OP_INSERT
         );
     }
 
@@ -761,13 +761,13 @@ mod tests {
         );
         assert_field(
             delete_fields[4].as_ref(),
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
             &DataType::Utf8,
             false,
         );
         assert_field(
             delete_fields[5].as_ref(),
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
             &DataType::Int64,
             false,
         );
@@ -796,7 +796,7 @@ mod tests {
             .expect("delete op");
         assert_eq!(
             delete_ops.value(0),
-            crate::exec::change_op::CHANGE_OP_DELETE
+            novarocks_execution::exec::change_op::CHANGE_OP_DELETE
         );
 
         let insert_batch = &chunks[1].batch;

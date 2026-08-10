@@ -20,9 +20,9 @@
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
-use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use novarocks_protocol::{common, expr};
 
 pub(crate) fn lower_literal(
@@ -321,10 +321,10 @@ pub(super) fn push_zero_literal(
 #[cfg(test)]
 mod tests {
     use super::super::tests::{bool_lit, int_lit, lower, scalar_expr, string_lit};
-    use crate::exec::expr::{ExprNode, LiteralValue};
     use crate::protocol::common::error::ProtocolErrorKind;
     use arrow::datatypes::DataType;
     use arrow_buffer::i256;
+    use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     use novarocks_protocol::{common, expr};
 
     fn literal_error(

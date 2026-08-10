@@ -327,7 +327,7 @@ impl IcebergDataBatchWriter {
     fn append_row_lineage_batch(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         let row_id_idx = batch
             .schema()
-            .index_of(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+            .index_of(novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL)
             .map_err(|_| {
                 error(
                     ConnectorErrorKind::InvalidRequest,

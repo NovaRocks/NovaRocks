@@ -17,7 +17,7 @@
 //! Integration tests for runtime components (exchange, query context, etc.).
 
 use crate::common::{TestConfig, test_query_id};
-use novarocks::runtime::exchange::{self, ExchangeKey};
+use novarocks_execution::runtime::exchange::{ExchangeKey, ExecutionExchangeRegistry};
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_types::UniqueId;
 
@@ -35,8 +35,9 @@ fn sample_exchange_key(node_id: i32) -> ExchangeKey {
 #[test]
 fn test_runtime_module_structure() {
     let key = sample_exchange_key(1);
-    exchange::set_expected_senders(key, 2);
-    exchange::cancel_fragment(key.finst_id_hi, key.finst_id_lo);
+    let registry = ExecutionExchangeRegistry::default();
+    registry.set_expected_senders(key, 2);
+    registry.cancel_fragment(key.finst_id_hi, key.finst_id_lo);
 }
 
 #[test]

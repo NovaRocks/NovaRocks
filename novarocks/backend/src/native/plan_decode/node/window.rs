@@ -23,15 +23,15 @@ use arrow::datatypes::{DataType, Field, Fields};
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks::exec::expr::{ExprArena, ExprNode};
-use novarocks::exec::node::analytic::{
+use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::node::analytic::{
     AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
     WindowFunctionSpec, WindowType,
 };
-use novarocks::exec::node::sort::{SortExpression, SortNode, SortTopNType};
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{expr, plan};
 use novarocks_types::SlotId;
 
@@ -634,9 +634,9 @@ fn validate_window_frame(
 }
 
 fn pack_window_function_inputs(
-    args: Vec<novarocks::exec::expr::ExprId>,
+    args: Vec<novarocks_execution::exec::expr::ExprId>,
     arena: &mut ExprArena,
-) -> Result<Vec<novarocks::exec::expr::ExprId>, String> {
+) -> Result<Vec<novarocks_execution::exec::expr::ExprId>, String> {
     if args.len() <= 1 {
         return Ok(args);
     }
@@ -657,7 +657,7 @@ fn pack_window_function_inputs(
 
 fn validate_window_function_signature(
     kind: &WindowFunctionKind,
-    args: &[novarocks::exec::expr::ExprId],
+    args: &[novarocks_execution::exec::expr::ExprId],
     return_type: &DataType,
     arena: &ExprArena,
 ) -> Result<(), String> {
@@ -800,7 +800,7 @@ fn validate_window_function_signature(
 }
 
 fn validate_window_arg_matches_return(
-    arg: novarocks::exec::expr::ExprId,
+    arg: novarocks_execution::exec::expr::ExprId,
     return_type: &DataType,
     arena: &ExprArena,
 ) -> Result<(), String> {

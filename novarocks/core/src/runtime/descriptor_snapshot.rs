@@ -19,10 +19,10 @@ use std::collections::HashMap;
 
 use arrow::datatypes::Field;
 
-use crate::exec::node::scan::HdfsScanFileFormat;
-use crate::exec::row_position::RowPositionDescriptor;
-use crate::exec::row_position::RowPositionType;
 use crate::formats::{FileFormatConfig, parquet::ParquetScanConfig};
+use novarocks_execution::exec::node::scan::HdfsScanFileFormat;
+use novarocks_execution::exec::row_position::RowPositionDescriptor;
+use novarocks_execution::exec::row_position::RowPositionType;
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -45,20 +45,6 @@ impl IcebergTableLocationMap {
     pub fn to_hash_map(&self) -> HashMap<i64, String> {
         self.0.clone()
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LookupNodeInfo {
-    pub id: i64,
-    pub option: i64,
-    pub host: String,
-    pub async_internal_port: u16,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LookupNodesInfo {
-    pub version: i64,
-    pub nodes: Vec<LookupNodeInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,7 +277,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::*;
-    use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
+    use novarocks_execution::exec::row_position::{RowPositionDescriptor, RowPositionType};
     use novarocks_types::SlotId;
 
     fn descriptor_slot(tuple_id: i32, slot_id: u32, name: &str) -> DescriptorSlot {

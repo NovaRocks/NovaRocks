@@ -23,12 +23,12 @@ use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::values::materialize_values_chunk_with_context;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::ExprArena;
-use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
-use crate::exec::node::values::ValuesNode;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
+use novarocks_execution::exec::node::values::ValuesNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{common as proto_common, expr, plan};
 use novarocks_types::SlotId;
 
@@ -200,11 +200,11 @@ mod tests {
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
-    use crate::exec::expr::ExprArena;
     use crate::protocol::native::test_assembly::{
         NativeExpressionDecoder, NativeExpressionInputLayout,
     };
     use crate::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+    use novarocks_execution::exec::expr::ExprArena;
 
     struct RejectingBackendExpressionDecoder;
 
@@ -215,7 +215,7 @@ mod tests {
             path: FieldPath,
             _arena: &mut ExprArena,
             _input: &NativeExpressionInputLayout,
-        ) -> Result<crate::exec::expr::ExprId, ProtocolError> {
+        ) -> Result<novarocks_execution::exec::expr::ExprId, ProtocolError> {
             Err(ProtocolError::new(
                 ProtocolFamily::Native,
                 path,

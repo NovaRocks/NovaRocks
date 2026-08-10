@@ -6,14 +6,45 @@ edition = "2024"
 [lib]
 doctest = false
 
+[features]
+core-pipeline-integration = []
+
 [dependencies]
 arrow = { version = "58.2.0" }
+arrow-buffer = { version = "58.2.0" }
+arrow-data = { version = "58.2.0" }
+async-trait = "0.1"
+base64 = "0.22"
 bytes = "1"
+chrono = "0.4"
+chrono-tz = "0.10"
+crc32c = "0.6"
 datasketches = "0.2.0"
+hashbrown = { version = "0.14", features = ["raw"] }
+hex = "0.4"
+libm = "0.2"
+md-5 = "0.10"
 novarocks-types = { path = "../types" }
 novarocks-spi = { path = "../spi" }
+num-traits = "0.2"
+once_cell = "1.19"
+openssl = "0.10"
+rand = "0.8"
+regex = "1.10"
+ryu = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+sm3 = "0.4"
+parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
+prometheus = "0.13"
+threadpool = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+twox-hash = "2.1"
+url = "2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
 futures = "0.3"
+tempfile = "3"

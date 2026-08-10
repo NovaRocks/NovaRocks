@@ -29,23 +29,23 @@ fn assert_type_accessible<T: 'static>() {
 
 #[test]
 fn test_exec_module_structure() {
-    assert_type_accessible::<novarocks::exec::chunk::Chunk>();
+    assert_type_accessible::<novarocks_execution::exec::chunk::Chunk>();
 }
 
 #[test]
 fn test_chunk_module() {
-    let chunk = novarocks::exec::chunk::Chunk::default();
+    let chunk = novarocks_execution::exec::chunk::Chunk::default();
     assert_eq!(chunk.len(), 0);
 }
 
 #[test]
 fn test_expr_module() {
-    assert_type_accessible::<novarocks::exec::expr::ExprArena>();
+    assert_type_accessible::<novarocks_execution::exec::expr::ExprArena>();
 }
 
 #[test]
 fn test_node_module() {
-    assert_type_accessible::<novarocks::exec::node::ExecNode>();
+    assert_type_accessible::<novarocks_execution::exec::node::ExecNode>();
 }
 
 #[test]

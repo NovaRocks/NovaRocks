@@ -24,9 +24,9 @@ use super::super::context::NativePlanDecodeContext;
 use super::super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use super::super::layout::Layout;
 use crate::native::type_decode::{decode_field_type, decode_type};
-use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::{FieldPath, ProtocolErrorKind};
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::{common, plan};
 use novarocks_types::SlotId;
 

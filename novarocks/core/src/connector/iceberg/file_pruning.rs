@@ -17,13 +17,15 @@
 
 use std::collections::HashMap;
 
-use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue};
 use crate::common::scan_predicate::{
     MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
 };
 use novarocks_connector_iceberg::scan_model::{
     IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue, IcebergPhysicalPredicate,
     IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
+};
+use novarocks_execution::exec::min_max_predicate::{
+    MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

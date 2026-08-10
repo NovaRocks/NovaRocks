@@ -18,9 +18,9 @@
 use super::DecodedNode;
 use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64};
 use crate::native::plan_decode::error::NativeFragmentLeafDecodeError;
-use novarocks::exec::node::limit::LimitNode;
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_execution::exec::node::limit::LimitNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_limit_node(

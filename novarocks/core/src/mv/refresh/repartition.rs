@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use novarocks_connector_iceberg::iceberg::TableIdent;
 
 use crate::connector::iceberg::commit::CommitOpKind;
-use crate::exec::chunk::Chunk;
 use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
 use crate::mv::refresh::aggregate_first_refresh::{
     AggregateStateRead, prepare_aggregate_first_refresh_chunks,
@@ -31,6 +30,7 @@ use crate::mv::refresh::projection_first_refresh::{
 use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_execution::exec::chunk::Chunk;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RepartitionShape {
@@ -306,7 +306,7 @@ mod tests {
         }
     }
 
-    fn chunk(values: Vec<i64>) -> crate::exec::chunk::Chunk {
+    fn chunk(values: Vec<i64>) -> novarocks_execution::exec::chunk::Chunk {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
             vec![Arc::new(Int64Array::from(values))],

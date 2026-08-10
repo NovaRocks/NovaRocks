@@ -18,8 +18,8 @@
 //! Backend-owned native sink-assignment DTO decoding.
 
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
-use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks::runtime::fragment::FragmentSinkAssignment;
+use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_types::UniqueId;
 

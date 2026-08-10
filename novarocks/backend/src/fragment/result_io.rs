@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use novarocks::common::types::FetchResult;
-use novarocks::runtime::exchange;
-use novarocks::runtime::fragment::{
-    FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
-    FragmentResultWriter, ResultAbort, ResultPresentation, ResultWriteSpec, build_result_batch,
-};
 use novarocks::runtime::result_buffer::ResultBufferWriteHandle;
+use novarocks::runtime::result_format::build_result_batch;
+use novarocks_execution::runtime::exchange;
+use novarocks_execution::runtime::fragment::io::{
+    FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
+    FragmentResultWriter, ResultAbort, ResultPresentation, ResultWriteSpec,
+};
 
 pub(crate) fn native_result_writer() -> Arc<dyn FragmentResultWriter> {
     Arc::new(NativeFragmentResultWriter)
@@ -45,7 +46,7 @@ struct NativeFragmentResultSession {
 }
 
 impl FragmentResultSession for NativeFragmentResultSession {
-    fn write(&self, chunk: novarocks::exec::chunk::Chunk) -> Result<(), FragmentIoError> {
+    fn write(&self, chunk: novarocks_execution::exec::chunk::Chunk) -> Result<(), FragmentIoError> {
         if chunk.is_empty() {
             return Ok(());
         }

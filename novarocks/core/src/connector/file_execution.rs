@@ -20,9 +20,9 @@
 //! `novarocks-fs`. They describe only protocol-owned raw file access; table
 //! format correctness belongs to the connector that owns its opaque split.
 
-use crate::cache::ExternalDataCacheRangeOptions;
 use crate::novarocks_logging::debug;
 use bytes::Bytes;
+use novarocks_execution::runtime::cache::ExternalDataCacheRangeOptions;
 use novarocks_execution::runtime::profile::RuntimeProfile;
 use novarocks_fs::{
     BoundFile, FileBytesFuture, FileCancellation, FileError, FileErrorKind, FileFormat,

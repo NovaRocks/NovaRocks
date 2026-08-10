@@ -13,9 +13,12 @@ use novarocks::query_execution::lifecycle::{
     QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
 use novarocks::service::MetricsHttpServer;
-use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_execution::runtime::execution_runtime::{
+    ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
+use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
     NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
@@ -26,6 +29,7 @@ use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
+use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -107,6 +111,7 @@ struct BackendApplicationServices {
     query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_host: Arc<crate::ConnectorExecutionHost>,
     execution_runtime: Arc<ExecutionRuntime>,
+    exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
 }
 
@@ -221,11 +226,14 @@ fn compose_backend_application_services(
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let execution_runtime = Arc::new(
-        ExecutionRuntime::new(execution_runtime_config(&config.runtime)).map_err(|error| {
+        ExecutionRuntime::new(execution_runtime_config(config)).map_err(|error| {
             BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
         })?,
     );
     let controls = Arc::new(FragmentControlRegistry::default());
+    let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
+        BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
+    );
     let execution_host = Arc::new(crate::ConnectorExecutionHost::new());
     let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(
         Arc::clone(&controls),
@@ -247,16 +255,19 @@ fn compose_backend_application_services(
                 )
             })?;
     }
-    let native_fragment_service = Arc::new(NativeFragmentService::new_with_controls(
-        grpc_exchange_transmitter(),
-        grpc_fragment_lookup_client(),
-        native_result_writer(),
-        Arc::clone(&controls),
-        Arc::clone(&query_lifecycle_registry),
-        connector_registry,
-        Arc::clone(&execution_host),
-        Arc::clone(&execution_runtime),
-    ));
+    let native_fragment_service = Arc::new(
+        NativeFragmentService::new_with_controls(
+            grpc_exchange_transmitter(),
+            grpc_fragment_lookup_client(),
+            native_result_writer(),
+            Arc::clone(&controls),
+            Arc::clone(&query_lifecycle_registry),
+            connector_registry,
+            Arc::clone(&execution_host),
+            Arc::clone(&execution_runtime),
+        )
+        .with_exchange_receiver_port(Arc::clone(&exchange_receiver_port)),
+    );
     controls.publish_resource_snapshot();
     execution_host.publish_resource_snapshot();
     novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()
@@ -271,6 +282,7 @@ fn compose_backend_application_services(
         query_lifecycle_registry,
         execution_host,
         execution_runtime,
+        exchange_receiver_port,
         query_lifecycle_ingress,
     })
 }
@@ -400,6 +412,7 @@ impl BackendApplicationHost {
                 services.query_lifecycle_ingress.clone(),
                 terminal_ingress,
                 runtime_filter_ingress,
+                Arc::clone(&services.exchange_receiver_port),
             ),
         )
         .map_err(|error| {
@@ -441,9 +454,8 @@ impl BackendApplicationHost {
     }
 }
 
-fn execution_runtime_config(
-    runtime: &novarocks::common::app_config::RuntimeConfig,
-) -> ExecutionRuntimeConfig {
+fn execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig {
+    let runtime = &config.runtime;
     let spill_io_threads = if runtime.spill_io_threads == 0 {
         runtime.actual_exec_threads()
     } else {
@@ -455,8 +467,36 @@ fn execution_runtime_config(
         scan_queue_capacity: runtime.pipeline_scan_thread_pool_queue_size.max(1),
         spill_io_threads,
         spill_io_queue_capacity: runtime.spill_io_queue_size.max(1),
+        spill_storage: ExecutionSpillStorageConfig {
+            enabled: config.spill.enable,
+            local_dirs: if config.spill.local_dirs.is_empty() {
+                vec![
+                    std::env::temp_dir()
+                        .join("novarocks-spill")
+                        .to_string_lossy()
+                        .into_owned(),
+                ]
+            } else {
+                config.spill.local_dirs.clone()
+            },
+            dir_max_bytes: config.spill.dir_max_bytes,
+            block_size_bytes: config.spill.block_size_bytes.max(1),
+            ipc_compression: config.spill.ipc_compression.clone(),
+        },
         exchange_io_threads: runtime.exchange_io_threads.max(1),
         exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),
+        exchange_max_transmit_batched_bytes: runtime.exchange_max_transmit_batched_bytes.max(1),
+        operator_buffer_chunks: runtime.operator_buffer_chunks.max(1),
+        local_exchange_buffer_mem_limit_per_driver: runtime
+            .local_exchange_buffer_mem_limit_per_driver
+            .max(1),
+        local_exchange_max_buffered_rows: runtime.local_exchange_max_buffered_rows.max(1),
+        connector_io_tasks_per_scan_operator: runtime.connector_io_tasks_per_scan_operator.max(1),
+        scan_submit_fail_max: runtime.scan_submit_fail_max.max(1),
+        scan_submit_fail_timeout_ms: runtime.scan_submit_fail_timeout_ms.max(1),
+        runtime_filter_scan_wait_time_ms_override: runtime
+            .runtime_filter_scan_wait_time_ms_override,
+        runtime_filter_wait_timeout_ms_override: runtime.runtime_filter_wait_timeout_ms_override,
         sink_io_worker_threads: runtime.execution_services.actual_sink_io_worker_threads(),
         sink_io_max_blocking_threads: runtime
             .execution_services

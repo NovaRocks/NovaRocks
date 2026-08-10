@@ -21,11 +21,11 @@ use super::super::NativeFragmentDecodeError;
 use super::super::error::NativeFragmentLeafDecodeError;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::join::JoinType;
-use crate::exec::node::project::ProjectNode;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::node::join::JoinType;
+use novarocks_execution::exec::node::project::ProjectNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{common as proto_common, plan};
 
 pub(crate) fn unsupported<T>(kind: &str) -> Result<T, String> {

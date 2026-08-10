@@ -21,8 +21,8 @@ mod variant_path;
 
 use super::node::{DecodedNode, NativePlanDecodeContext};
 use super::{NativeFragmentDecodeError, error::NativeFragmentLeafDecodeError};
-use crate::exec::expr::ExprArena;
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_execution::exec::expr::ExprArena;
 use novarocks_protocol::plan;
 
 pub(crate) fn lower_scan_node(
@@ -99,13 +99,13 @@ mod tests {
     use super::super::node::{NativePlanDecodeContext, decode_node};
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
-    use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::node::ExecNodeKind;
-    use crate::exec::node::scan::ScanMorsel;
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
     use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use novarocks_connector_iceberg::delta::DeltaSourceRole;
+    use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::scan::ScanMorsel;
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_protocol::{common, expr, novarocks, plan};
     use novarocks_types::SlotId;
@@ -784,7 +784,7 @@ mod tests {
         else {
             panic!("expected file range");
         };
-        file.change_op = Some(crate::exec::change_op::CHANGE_OP_DELETE.into());
+        file.change_op = Some(novarocks_execution::exec::change_op::CHANGE_OP_DELETE.into());
         file.file_pruning_min_max_values = HashMap::from([(
             0,
             novarocks::FilePruningMinMaxValue {

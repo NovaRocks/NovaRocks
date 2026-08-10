@@ -155,7 +155,10 @@ fn cast_list_struct_to_map_for_local_schema(
     let values = if list.values().data_type() == target_entries.data_type() {
         list.values().clone()
     } else {
-        crate::exec::expr::cast_with_special_rules(list.values(), target_entries.data_type())?
+        novarocks_execution::exec::expr::cast_with_special_rules(
+            list.values(),
+            target_entries.data_type(),
+        )?
     };
     let entries = values
         .as_any()
@@ -256,15 +259,24 @@ fn cast_array_for_local_schema(
             )) as ArrayRef)
         }
         (source_type, DataType::Date32) if is_numeric_datetime_source(source_type) => {
-            crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
+            novarocks_execution::exec::expr::cast_with_special_rules(
+                source_col,
+                target_field.data_type(),
+            )
         }
         (source_type, DataType::Timestamp(_, _)) if is_numeric_datetime_source(source_type) => {
-            crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
+            novarocks_execution::exec::expr::cast_with_special_rules(
+                source_col,
+                target_field.data_type(),
+            )
         }
         (_, DataType::FixedSizeBinary(width))
             if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
-            crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
+            novarocks_execution::exec::expr::cast_with_special_rules(
+                source_col,
+                target_field.data_type(),
+            )
         }
         (DataType::List(source_field), DataType::Map(target_entries, ordered))
             if matches!(source_field.data_type(), DataType::Struct(_)) =>
@@ -272,7 +284,10 @@ fn cast_array_for_local_schema(
             cast_list_struct_to_map_for_local_schema(source_col, target_entries, *ordered)
         }
         (_, DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)) => {
-            crate::exec::expr::cast_with_special_rules(source_col, target_field.data_type())
+            novarocks_execution::exec::expr::cast_with_special_rules(
+                source_col,
+                target_field.data_type(),
+            )
         }
         _ => arrow::compute::cast(source_col, target_field.data_type()).map_err(|e| format!("{e}")),
     }

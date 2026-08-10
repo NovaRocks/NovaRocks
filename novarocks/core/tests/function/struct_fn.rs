@@ -22,11 +22,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields};
 use arrow::record_batch::RecordBatch;
-use novarocks::exec::chunk::{Chunk, ChunkSchema};
-use novarocks::exec::expr::ExprId;
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::function::struct_fn::eval_struct_function;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+use novarocks_execution::exec::expr::ExprId;
+use novarocks_execution::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::function::struct_fn::eval_struct_function;
+use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use novarocks_types::SlotId;
 use std::sync::Arc;
 
@@ -69,7 +69,7 @@ fn decimal_array(values: Vec<i128>, precision: u8, scale: i8) -> ArrayRef {
 
 #[test]
 fn test_struct_register() {
-    use novarocks::exec::expr::function::struct_fn::register;
+    use novarocks_execution::exec::expr::function::struct_fn::register;
     use std::collections::HashMap;
     let mut m = HashMap::new();
     register(&mut m);

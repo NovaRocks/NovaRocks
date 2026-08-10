@@ -22,13 +22,13 @@ use arrow::datatypes::{DataType, Field};
 use super::super::NativeFragmentDecodeError;
 use super::common::{concat_layouts, proto_join_type};
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::exec::node::join::{
+use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
+use novarocks_execution::exec::node::join::{
     JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
 };
-use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 use novarocks_types::SlotId;
 use novarocks_types::wider_type;
@@ -433,7 +433,7 @@ mod tests {
         column_ref, lower, one_col_values_node_with, one_col_values_node_with_nullable,
         output_column_with_nullable, physical_node,
     };
-    use crate::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_protocol::plan;
     use novarocks_types::SlotId;
 
@@ -504,7 +504,7 @@ mod tests {
         };
         assert_eq!(
             join_node.distribution_mode,
-            crate::exec::node::join::JoinDistributionMode::Partitioned
+            novarocks_execution::exec::node::join::JoinDistributionMode::Partitioned
         );
 
         let plan::distributed_node::Payload::Physical(physical) =
@@ -523,7 +523,7 @@ mod tests {
         };
         assert_eq!(
             join_node.distribution_mode,
-            crate::exec::node::join::JoinDistributionMode::Broadcast
+            novarocks_execution::exec::node::join::JoinDistributionMode::Broadcast
         );
     }
 }

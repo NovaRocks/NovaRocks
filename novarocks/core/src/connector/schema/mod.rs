@@ -29,18 +29,18 @@ pub trait SchemaLoadProvider: Send + Sync {
     fn fetch_load_rows(
         &self,
         context: &SchemaScanContext,
-        endpoint: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
+        endpoint: Option<&novarocks_execution::runtime::endpoint::RuntimeEndpoint>,
     ) -> Result<Vec<SchemaRow>, String>;
     fn fetch_tracking_load_log_rows(
         &self,
         context: &SchemaScanContext,
-        endpoint: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
+        endpoint: Option<&novarocks_execution::runtime::endpoint::RuntimeEndpoint>,
     ) -> Result<Vec<SchemaRow>, String>;
     fn fetch_fe_table_rows(
         &self,
         table: &SchemaTable,
         context: &SchemaScanContext,
-        endpoint: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
+        endpoint: Option<&novarocks_execution::runtime::endpoint::RuntimeEndpoint>,
     ) -> Result<Vec<SchemaRow>, String>;
 }
 pub use context::SchemaScanContext;

@@ -28,85 +28,10 @@ use chrono::{DateTime, Datelike, NaiveDate};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
+pub use novarocks_types::FieldRenderSchema;
 use novarocks_types::PrimitiveType;
-use novarocks_types::arrow_primitive::arrow_field_to_primitive;
 use novarocks_types::largeint;
-use novarocks_types::logical::{LogicalType, logical_type_of_field};
 use novarocks_types::value::variant::VariantValue;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FieldRenderSchema {
-    primitive: Option<PrimitiveType>,
-    json_value: bool,
-    children: Vec<FieldRenderSchema>,
-}
-
-impl FieldRenderSchema {
-    pub fn scalar(primitive: Option<PrimitiveType>) -> Self {
-        Self {
-            primitive,
-            json_value: primitive.is_some_and(PrimitiveType::is_json),
-            children: Vec::new(),
-        }
-    }
-
-    pub fn complex(children: Vec<FieldRenderSchema>) -> Self {
-        Self {
-            primitive: None,
-            json_value: false,
-            children,
-        }
-    }
-
-    pub fn from_field(field: &Field) -> Self {
-        let children = match field.data_type() {
-            DataType::Struct(fields) => fields
-                .iter()
-                .map(|child| Self::from_field(child.as_ref()))
-                .collect(),
-            DataType::List(item) | DataType::LargeList(item) => {
-                vec![Self::from_field(item.as_ref())]
-            }
-            DataType::Map(entries, _) => {
-                if let DataType::Struct(fields) = entries.data_type() {
-                    fields
-                        .iter()
-                        .take(2)
-                        .map(|child| Self::from_field(child.as_ref()))
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            _ => Vec::new(),
-        };
-        Self {
-            primitive: arrow_field_to_primitive(field),
-            json_value: matches!(logical_type_of_field(field), Some(LogicalType::Json)),
-            children,
-        }
-    }
-
-    fn struct_child(&self, idx: usize) -> Option<&FieldRenderSchema> {
-        self.children.get(idx)
-    }
-
-    fn list_item(&self) -> Option<&FieldRenderSchema> {
-        self.children.first()
-    }
-
-    fn map_key(&self) -> Option<&FieldRenderSchema> {
-        self.children.first()
-    }
-
-    fn map_value(&self) -> Option<&FieldRenderSchema> {
-        self.children.get(1)
-    }
-
-    pub(crate) fn renders_opaque_binary(&self) -> bool {
-        self.primitive.is_some_and(is_opaque_binary_primitive)
-    }
-}
 
 fn format_date32_for_mysql(days: i32) -> String {
     let Some(date) = NaiveDate::from_num_days_from_ce_opt(719163 + days) else {
@@ -136,7 +61,7 @@ fn effective_primitive_type(
         primitive
     } else {
         field_schema
-            .and_then(|schema| schema.primitive)
+            .and_then(FieldRenderSchema::primitive)
             .unwrap_or(PrimitiveType::Invalid)
     }
 }
@@ -431,7 +356,7 @@ fn append_http_json_value_with_schema(
     }
 
     let primitive = effective_primitive_type(primitive, field_schema);
-    let json_semantic = field_schema.is_some_and(|schema| schema.json_value);
+    let json_semantic = field_schema.is_some_and(FieldRenderSchema::is_json_value);
 
     match col.data_type() {
         DataType::Null => out.push_str("null"),
@@ -940,7 +865,7 @@ pub(crate) fn format_mysql_container_value_with_schema(
         return Ok("null".to_string());
     }
     let primitive = field_schema
-        .and_then(|schema| schema.primitive)
+        .and_then(FieldRenderSchema::primitive)
         .unwrap_or(PrimitiveType::Invalid);
     match col.data_type() {
         DataType::Null => Ok("null".to_string()),
@@ -1125,7 +1050,7 @@ pub(crate) fn format_mysql_container_value_with_schema(
                 if i > start {
                     out.push(',');
                 }
-                if item_schema.json_value {
+                if item_schema.is_json_value() {
                     out.push_str(&format_mysql_container_json_value_with_schema(
                         values,
                         i,
@@ -1160,7 +1085,7 @@ pub(crate) fn format_mysql_container_value_with_schema(
                 if i > start {
                     out.push(',');
                 }
-                if item_schema.json_value {
+                if item_schema.is_json_value() {
                     out.push_str(&format_mysql_container_json_value_with_schema(
                         values,
                         i,
@@ -1208,7 +1133,7 @@ pub(crate) fn format_mysql_container_value_with_schema(
                     entry_idx,
                     Some(key_schema.as_ref()),
                 )?;
-                let value = if value_schema.json_value {
+                let value = if value_schema.is_json_value() {
                     format_mysql_container_json_value_with_schema(
                         values,
                         entry_idx,
@@ -1246,7 +1171,7 @@ pub(crate) fn format_mysql_container_value_with_schema(
                     field_schema.and_then(|schema| schema.struct_child(idx)),
                     field.as_ref(),
                 );
-                let value = if child_schema.json_value {
+                let value = if child_schema.is_json_value() {
                     format_mysql_container_json_value_with_schema(
                         child,
                         row,

@@ -18,10 +18,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use crate::exec::row_position::{
-    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
-};
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use novarocks_connector_iceberg::iceberg::arrow::{
@@ -38,6 +34,10 @@ use novarocks_connector_iceberg::iceberg::writer::file_writer::location_generato
 };
 use novarocks_connector_iceberg::iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use novarocks_connector_iceberg::iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use novarocks_execution::exec::row_position::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
+};
 use parquet::file::properties::WriterProperties;
 
 use super::variant_write::{
@@ -1271,13 +1271,15 @@ fn reannotate_array(
         // errors out, preserving CLAUDE.md rule #2 (fail fast on structural
         // mismatches).
         (a, b) if !is_nested_dtype(a) && !is_nested_dtype(b) => {
-            crate::exec::expr::cast_with_special_rules(array, target_dtype).map_err(|e| {
-                format!(
-                    "reannotate_array: coerce scalar {:?} to {:?} failed: {e}",
-                    array.data_type(),
-                    target_dtype
-                )
-            })
+            novarocks_execution::exec::expr::cast_with_special_rules(array, target_dtype).map_err(
+                |e| {
+                    format!(
+                        "reannotate_array: coerce scalar {:?} to {:?} failed: {e}",
+                        array.data_type(),
+                        target_dtype
+                    )
+                },
+            )
         }
         (a, b) => Err(format!(
             "reannotate_array: incompatible data types: array={a:?}, target={b:?}"

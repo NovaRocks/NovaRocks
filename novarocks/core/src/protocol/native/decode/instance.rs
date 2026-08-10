@@ -19,12 +19,12 @@ use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;
 use crate::protocol::common::error::FieldPath;
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
     ScanRange, ScanRangeParams,
 };
+use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::novarocks;
 

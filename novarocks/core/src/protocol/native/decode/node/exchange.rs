@@ -21,13 +21,13 @@ use super::super::NativeFragmentDecodeError;
 use super::common::parse_optional_nonnegative_i64;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::common::config::exchange_wait_ms;
-use crate::exec::expr::ExprArena;
-use crate::exec::node::exchange_source::ExchangeSourceNode;
-use crate::exec::node::limit::LimitNode;
-use crate::exec::node::sort::{SortNode, SortTopNType};
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native::decode::layout::Layout;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
+use novarocks_execution::exec::node::limit::LimitNode;
+use novarocks_execution::exec::node::sort::{SortNode, SortTopNType};
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_exchange_receiver(
@@ -177,10 +177,10 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::ExecNodeKind;
     use crate::protocol::native::type_mapping::encode_type;
-    use crate::runtime::exchange::ExchangeKey;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::runtime::exchange::ExchangeKey;
     use novarocks_protocol::{common, expr, plan};
     use novarocks_types::SlotId;
 

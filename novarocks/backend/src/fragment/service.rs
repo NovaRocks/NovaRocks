@@ -28,14 +28,17 @@ use novarocks::novarocks_logging::error;
 #[cfg(test)]
 use novarocks::novarocks_logging::warn;
 use novarocks::query_execution::lifecycle::StageFragment;
-use novarocks::runtime::fragment::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
+use novarocks::runtime::sink_commit::CoreSinkCommitPort;
+use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_execution::runtime::fragment::io::{
+    ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort, FragmentResultWriter,
+    UnavailableExchangeReceiverPort,
 };
-use novarocks::runtime::fragment::{
+use novarocks_execution::runtime::fragment::io::{FragmentEventSink, FragmentLookupClient};
+use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
-use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
@@ -74,8 +77,18 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
             scan_queue_capacity: 1,
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
+            spill_storage: novarocks_execution::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
             exchange_io_threads: 1,
             exchange_io_max_inflight_bytes: 1,
+            exchange_max_transmit_batched_bytes: 1,
+            operator_buffer_chunks: 1,
+            local_exchange_buffer_mem_limit_per_driver: 1,
+            local_exchange_max_buffered_rows: 1,
+            connector_io_tasks_per_scan_operator: 1,
+            scan_submit_fail_max: 1,
+            scan_submit_fail_timeout_ms: 1,
+            runtime_filter_scan_wait_time_ms_override: None,
+            runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
             sink_io_max_blocking_threads: 1,
         })
@@ -120,6 +133,8 @@ pub struct NativeFragmentService {
     connector_registry: Arc<ConnectorRegistry>,
     execution_host: Arc<ConnectorExecutionHost>,
     execution_runtime: Arc<ExecutionRuntime>,
+    commit_port: Arc<dyn FragmentCommitPort>,
+    exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -178,6 +193,8 @@ impl NativeFragmentService {
             connector_registry,
             execution_host,
             execution_runtime,
+            commit_port: Arc::new(CoreSinkCommitPort),
+            exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             lifecycle_observer: None,
             #[cfg(test)]
             after_lifecycle_admission: None,
@@ -186,6 +203,14 @@ impl NativeFragmentService {
             #[cfg(test)]
             submission_count: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn with_exchange_receiver_port(
+        mut self,
+        exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+    ) -> Self {
+        self.exchange_receiver_port = exchange_receiver_port;
+        self
     }
 
     #[cfg(test)]
@@ -336,6 +361,8 @@ impl NativeFragmentService {
                     Arc::clone(&self.result_writer),
                     event_sink,
                 )
+                .with_fragment_commit_port(Arc::clone(&self.commit_port))
+                .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
                 .with_execution_runtime(Arc::clone(&self.execution_runtime)),
         )
         .map_err(NativeFragmentIngressError::new)?;
@@ -486,6 +513,8 @@ impl NativeFragmentService {
                     Arc::clone(&self.result_writer),
                     event_sink,
                 )
+                .with_fragment_commit_port(Arc::clone(&self.commit_port))
+                .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
                 .with_execution_runtime(Arc::clone(&self.execution_runtime)),
         )
         .map_err(NativeFragmentIngressError::new)?;
@@ -529,7 +558,7 @@ impl NativeFragmentService {
             .spawn(move || {
                 if start_rx.recv().is_err() {
                     let error = "native fragment start signal was dropped".to_string();
-                    error!(target: "novarocks::exec", finst_id = %fragment_instance_id, %error, "native fragment start signal was dropped");
+                    error!(target: "novarocks_execution", finst_id = %fragment_instance_id, %error, "native fragment start signal was dropped");
                     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
                     queries.finish_fragment(execution_id);
                     token.complete();
@@ -711,7 +740,7 @@ fn consume_terminal_fact(
     let fact = running.join();
     let fragment_instance_id = fact.fragment_instance_id();
     if let FragmentOutcome::Failed(execution_error) = fact.outcome() {
-        error!(target: "novarocks::exec", finst_id = %fragment_instance_id, error = %execution_error, "native fragment execution failed");
+        error!(target: "novarocks_execution", finst_id = %fragment_instance_id, error = %execution_error, "native fragment execution failed");
     }
     let sink = novarocks::runtime::sink_commit::report_snapshot(fragment_instance_id)
         .with_connector_staged_report_frames(running.take_connector_staged_report_frames());
@@ -764,7 +793,9 @@ mod tests {
         ParticipantRole, QueryControlAttach, QueryControlAttachment, QueryControlEndpoint,
         QueryExecutionId, QueryInitOutcome, QueryInitRequest,
     };
-    use novarocks::runtime::fragment::{DormantFragmentHandle, FragmentOutcome, prepare_fragment};
+    use novarocks_execution::runtime::fragment::{
+        DormantFragmentHandle, FragmentOutcome, prepare_fragment,
+    };
     use novarocks_protocol as proto;
     use novarocks_types::QueryId as ExecutionQueryId;
     use novarocks_types::QueryId;
@@ -984,17 +1015,21 @@ mod tests {
             .expect("native fragment admission");
         prepare_fragment(
             request.into_submission(),
-            admission.into_prepare_context(
-                None,
-                Arc::clone(&service.exchange_transmitter),
-                Arc::clone(&service.lookup_client),
-                Arc::clone(&service.result_writer),
-                crate::fragment::lifecycle_fragment_event_sink(
-                    Arc::clone(&service.lifecycle),
-                    execution_id,
+            admission
+                .into_prepare_context(
                     None,
-                ),
-            ),
+                    Arc::clone(&service.exchange_transmitter),
+                    Arc::clone(&service.lookup_client),
+                    Arc::clone(&service.result_writer),
+                    crate::fragment::lifecycle_fragment_event_sink(
+                        Arc::clone(&service.lifecycle),
+                        execution_id,
+                        None,
+                    ),
+                )
+                .with_fragment_commit_port(Arc::clone(&service.commit_port))
+                .with_exchange_receiver_port(Arc::clone(&service.exchange_receiver_port))
+                .with_execution_runtime(Arc::clone(&service.execution_runtime)),
         )
         .expect("native fragment prepares")
     }

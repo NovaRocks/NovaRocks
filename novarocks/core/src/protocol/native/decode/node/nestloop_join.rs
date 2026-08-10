@@ -22,11 +22,11 @@ use super::super::layout::Layout;
 use super::common::concat_layouts;
 use super::hash_join;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::chunk::ChunkSchema;
-use crate::exec::expr::ExprArena;
-use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::ChunkSchema;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_nest_loop_join_node(
@@ -152,7 +152,7 @@ mod tests {
         bool_literal, lower, one_col_values_node_with, one_col_values_node_with_nullable,
         output_column, output_column_with_nullable, physical_node,
     };
-    use crate::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_protocol::plan;
     use novarocks_types::SlotId;
 
@@ -212,7 +212,7 @@ mod tests {
         };
         assert!(matches!(
             join.join_type,
-            crate::exec::node::nljoin::NestedLoopJoinType::LeftSemi
+            novarocks_execution::exec::node::nljoin::NestedLoopJoinType::LeftSemi
         ));
         assert_eq!(join.left_chunk_schema.slot_ids(), &[SlotId::new(2)]);
         assert_eq!(join.right_chunk_schema.slot_ids(), &[SlotId::new(1)]);

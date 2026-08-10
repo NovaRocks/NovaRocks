@@ -27,7 +27,7 @@ use novarocks::query_execution::lifecycle::{
     ParticipantRole, QueryControlEndpoint, QueryExecutionId, QueryLifecycleErrorCode,
     RuntimeFilterContribution,
 };
-use novarocks::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_types::QueryId;
 
 fn request_with_runtime_filter() -> QueryInitRequest {

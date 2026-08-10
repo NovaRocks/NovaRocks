@@ -23,13 +23,13 @@ use super::common::build_slot_projection;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::exec::chunk::ChunkSchema;
-use novarocks::exec::expr::{ExprArena, ExprNode};
-use novarocks::exec::node::aggregate::{
+use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::ChunkSchema;
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::node::aggregate::{
     AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
 };
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 use novarocks_types::SlotId;
 use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
@@ -341,7 +341,7 @@ fn lower_aggregate_update_inputs(
     child: &DecodedNode,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
-) -> Result<Vec<novarocks::exec::expr::ExprId>, NativeFragmentDecodeError> {
+) -> Result<Vec<novarocks_execution::exec::expr::ExprId>, NativeFragmentDecodeError> {
     if call.name.eq_ignore_ascii_case("count_if") && !call.order_by.is_empty() {
         return Err(NativeFragmentDecodeError::unsupported(
             path.clone().field("order_by"),
@@ -392,9 +392,9 @@ fn aggregate_order_spec(call: &plan::PlanAggregateCall) -> AggOrderSpec {
 fn select_aggregate_inputs(
     fn_name: &str,
     is_merge: bool,
-    args: Vec<novarocks::exec::expr::ExprId>,
+    args: Vec<novarocks_execution::exec::expr::ExprId>,
     arena: &mut ExprArena,
-) -> Result<Vec<novarocks::exec::expr::ExprId>, String> {
+) -> Result<Vec<novarocks_execution::exec::expr::ExprId>, String> {
     if is_merge {
         return args
             .into_iter()
@@ -413,9 +413,9 @@ fn select_aggregate_inputs(
 }
 
 fn pack_struct_inputs(
-    args: Vec<novarocks::exec::expr::ExprId>,
+    args: Vec<novarocks_execution::exec::expr::ExprId>,
     arena: &mut ExprArena,
-) -> Result<Vec<novarocks::exec::expr::ExprId>, String> {
+) -> Result<Vec<novarocks_execution::exec::expr::ExprId>, String> {
     if args.len() <= 1 {
         return Ok(args);
     }

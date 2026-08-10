@@ -22,12 +22,14 @@ use std::sync::Arc;
 use chrono::NaiveDateTime;
 use regex::Regex;
 
-use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, ScanSource};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::backend_id;
-use crate::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::node::BoxedExecIter;
+use novarocks_execution::exec::node::scan::{
+    BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, ScanSource,
+};
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
 use super::be_compaction_stats_store;
 use super::be_tablet_write_log_store;
@@ -635,7 +637,7 @@ impl ScanOp for SchemaScanOp {
         &self,
         morsel: ScanMorsel,
         _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
-        _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
+        _runtime_filters: Option<&novarocks_execution::exec::node::scan::RuntimeFilterContext>,
     ) -> Result<BoxedExecIter, String> {
         match morsel {
             ScanMorsel::Schema { .. } => {}
@@ -730,7 +732,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
-    use crate::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_types::SlotId;
 
     fn ctx(table_name: &str) -> SchemaScanContext {
@@ -766,8 +768,9 @@ mod tests {
 
     #[test]
     fn schema_scan_op_accepts_runtime_endpoint_in_every_build() {
-        let endpoint = crate::runtime::endpoint::RuntimeEndpoint::new("fe.internal", 9030)
-            .expect("runtime endpoint");
+        let endpoint =
+            novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("fe.internal", 9030)
+                .expect("runtime endpoint");
 
         let _op = SchemaScanOp::new(
             SchemaTable::Be(BeSchemaTable::TabletWriteLog),

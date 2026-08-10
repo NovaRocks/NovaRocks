@@ -21,9 +21,9 @@ use arrow::datatypes::DataType;
 
 use super::layout::Layout;
 use super::{decode_field_type, decode_type};
-use crate::exec::chunk::ChunkFieldSchema;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::ChunkFieldSchema;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::expr;
 use novarocks_types::SlotId;
 
@@ -603,9 +603,11 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::exec::chunk::Chunk;
-    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue, function::FunctionKind};
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::chunk::Chunk;
+    use novarocks_execution::exec::expr::{
+        ExprArena, ExprNode, LiteralValue, function::FunctionKind,
+    };
     use novarocks_protocol::{common, expr};
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
@@ -701,14 +703,14 @@ pub(crate) mod tests {
     pub(crate) fn lower_with_slots(
         e: &expr::Expr,
         slots: &[u32],
-    ) -> (ExprArena, crate::exec::expr::ExprId) {
+    ) -> (ExprArena, novarocks_execution::exec::expr::ExprId) {
         let mut arena = ExprArena::default();
         let layout = layout_for_slots(slots);
         let id = decode_expr(e, &mut arena, &layout).expect("lower proto expr");
         (arena, id)
     }
 
-    pub(crate) fn lower(e: &expr::Expr) -> (ExprArena, crate::exec::expr::ExprId) {
+    pub(crate) fn lower(e: &expr::Expr) -> (ExprArena, novarocks_execution::exec::expr::ExprId) {
         lower_with_slots(e, &[1, 7, 42])
     }
 
@@ -726,11 +728,12 @@ pub(crate) mod tests {
             vec![Arc::new(Int64Array::from(values))],
         )
         .unwrap();
-        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[slot],
-        )
-        .expect("chunk schema");
+        let chunk_schema =
+            novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[slot],
+            )
+            .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 

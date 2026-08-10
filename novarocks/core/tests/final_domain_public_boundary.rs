@@ -109,6 +109,21 @@ fn compile_external(source: &str) -> Output {
     fs::write(&source_path, source).expect("external caller source");
     let rlib = current_novarocks_rlib();
     let deps = rlib.parent().expect("rlib profile directory").join("deps");
+    let execution_rlib = fs::read_dir(&deps)
+        .expect("read dependency artifacts")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("libnovarocks_execution-")
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "rlib")
+                })
+        })
+        .expect("novarocks-execution rlib must be available beside novarocks");
     let metadata_path = workspace.path().join("external.rmeta");
 
     Command::new("rustc")
@@ -122,6 +137,8 @@ fn compile_external(source: &str) -> Output {
         .arg(format!("dependency={}", deps.display()))
         .arg("--extern")
         .arg(format!("novarocks={}", rlib.display()))
+        .arg("--extern")
+        .arg(format!("novarocks_execution={}", execution_rlib.display()))
         .output()
         .expect("run rustc for external caller")
 }
@@ -162,9 +179,9 @@ fn external_callers_cannot_open_aggregate_final_domain_sessions() {
 #[test]
 fn fragment_kernel_exposes_only_the_canonical_construction_and_runtime_paths() {
     let output = compile_external(
-        "use novarocks::exec::fragment::FragmentProgramBuilder;\n\
-         use novarocks::exec::node::ExecPlanBuilder;\n\
-         use novarocks::runtime::fragment::{FragmentInstanceSpec, FragmentSubmission};\n\
+        "use novarocks_execution::exec::fragment::FragmentProgramBuilder;\n\
+         use novarocks_execution::exec::node::ExecPlanBuilder;\n\
+         use novarocks_execution::runtime::fragment::{FragmentInstanceSpec, FragmentSubmission};\n\
          fn main() {\n\
              let _ = core::mem::size_of::<ExecPlanBuilder>();\n\
              let _ = core::mem::size_of::<FragmentProgramBuilder>();\n\

@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use novarocks::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{RuntimeFilterBindingId, RuntimeFilterChannelId};
 use novarocks_types::UniqueId;
 

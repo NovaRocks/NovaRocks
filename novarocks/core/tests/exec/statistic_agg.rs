@@ -19,9 +19,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array};
 use arrow::datatypes::DataType;
 
-use novarocks::exec::expr::ExprId;
-use novarocks::exec::expr::agg;
-use novarocks::exec::node::aggregate::{AggFunction, AggTypeSignature};
+use novarocks_execution::exec::expr::ExprId;
+use novarocks_execution::exec::expr::agg;
+use novarocks_execution::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
 fn run_two_phase_i64(name: &str, part1: Vec<Option<i64>>, part2: Vec<Option<i64>>) -> Option<f64> {
     let func = AggFunction {

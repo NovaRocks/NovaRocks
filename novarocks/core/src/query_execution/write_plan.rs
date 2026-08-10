@@ -343,7 +343,7 @@ mod tests {
 
     use super::*;
     use crate::query_execution::schedule::FragmentInstancePlacement;
-    use crate::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_spi::connector::{ConnectorInstanceId, ConnectorInstanceIncarnation};
 
     fn placement(

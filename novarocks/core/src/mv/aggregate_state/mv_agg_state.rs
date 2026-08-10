@@ -31,31 +31,33 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::chunk::Chunk;
-use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array, build_agg_scalar_array};
-use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
-use crate::exec::expr::function::mv_state::{
-    approx_count_distinct_state_union, approx_count_distinct_state_visible, avg_state_union,
-    bool_and_state_union, bool_and_state_visible, bool_or_state_union, bool_or_state_visible,
-    count_distinct_state_union, count_distinct_state_visible, count_state_union,
-    count_state_visible, max_state_union, max_state_visible_key_value, min_state_union,
-    min_state_visible_key_value, sum_state_union,
-};
 use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
 use crate::mv::aggregate_state::mv_shape::{AggregateInput, AggregateMvShape};
 use crate::mv::aggregate_state::physical_column::{
     StarRocksPhysicalColumn, starrocks_physical_column,
 };
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
-use crate::mv::aggregate_state::state_codec::{
-    KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
-    decode_sum_int64,
-};
 use crate::mv::model::AggregateStateRole;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use novarocks_catalog::schema::SqlType;
+use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::expr::agg::{
+    AggScalarValue, agg_scalar_from_array, build_agg_scalar_array,
+};
+use novarocks_execution::exec::expr::decimal::{div_round_i128, pow10_i128};
+use novarocks_execution::exec::expr::function::mv_state::{
+    approx_count_distinct_state_union, approx_count_distinct_state_visible, avg_state_union,
+    bool_and_state_union, bool_and_state_visible, bool_or_state_union, bool_or_state_visible,
+    count_distinct_state_union, count_distinct_state_visible, count_state_union,
+    count_state_visible, max_state_union, max_state_visible_key_value, min_state_union,
+    min_state_visible_key_value, sum_state_union,
+};
+use novarocks_execution::exec::mv::state_codec::{
+    KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
+    decode_sum_int64,
+};
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
 pub(crate) const AGG_STATE_PREFIX: &str = "__agg_state_";
@@ -950,27 +952,6 @@ fn compute_batch_col_indexes(
     (group_key_batch_col, state_col_batch_col)
 }
 
-pub(crate) fn aggregate_group_row_id_array(columns: &[ArrayRef]) -> Result<ArrayRef, String> {
-    let rows = columns.first().map(|column| column.len()).unwrap_or(0);
-    for (idx, column) in columns.iter().enumerate() {
-        if column.len() != rows {
-            return Err(format!(
-                "aggregate MV row id group key column {idx} length mismatch: {} vs {rows}",
-                column.len()
-            ));
-        }
-    }
-    let mut row_ids = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let mut cells = Vec::with_capacity(columns.len());
-        for array in columns {
-            cells.push(hex_encode(&encoded_cell(array, row)?));
-        }
-        row_ids.push(cells.join("|"));
-    }
-    Ok(Arc::new(StringArray::from(row_ids)))
-}
-
 fn build_row_id_array(
     batch: &RecordBatch,
     group_key_batch_cols: &[usize],
@@ -979,7 +960,7 @@ fn build_row_id_array(
         .iter()
         .map(|&column_index| batch.column(column_index).clone())
         .collect::<Vec<_>>();
-    aggregate_group_row_id_array(&columns)
+    novarocks_execution::exec::mv::group_row_id::aggregate_group_row_id_array(&columns)
 }
 
 fn load_aggregate_physical_rows_from_batch(
@@ -1241,13 +1222,12 @@ fn physical_row_id_from_visible_group_keys(
     row: usize,
     layout: &AggregateMvLayout,
 ) -> Result<String, String> {
-    let mut cells = Vec::with_capacity(layout.group_key_source_indexes.len());
+    let mut columns = Vec::with_capacity(layout.group_key_source_indexes.len());
     for &source_index in &layout.group_key_source_indexes {
         let column_index = 1 + source_index;
-        let array = batch.column(column_index);
-        cells.push(hex_encode(&encoded_cell(array, row)?));
+        columns.push(batch.column(column_index).clone());
     }
-    Ok(cells.join("|"))
+    novarocks_execution::exec::mv::group_row_id::aggregate_group_row_id_at(&columns, row)
 }
 
 fn validate_loaded_count_state(
@@ -1454,76 +1434,6 @@ pub(crate) fn sanitize_state_column_name(name: &str) -> String {
     }
 }
 
-fn encoded_cell(array: &ArrayRef, row: usize) -> Result<Vec<u8>, String> {
-    match array.data_type() {
-        DataType::Boolean => encode_typed_cell::<BooleanArray, _>(array, row, "boolean", |arr| {
-            vec![u8::from(arr.value(row))]
-        }),
-        DataType::Int8 => encode_typed_cell::<Int8Array, _>(array, row, "int8", |arr| {
-            arr.value(row).to_le_bytes().to_vec()
-        }),
-        DataType::Int16 => encode_typed_cell::<Int16Array, _>(array, row, "int16", |arr| {
-            arr.value(row).to_le_bytes().to_vec()
-        }),
-        DataType::Int32 => encode_typed_cell::<Int32Array, _>(array, row, "int32", |arr| {
-            arr.value(row).to_le_bytes().to_vec()
-        }),
-        DataType::Date32 => encode_typed_cell::<Date32Array, _>(array, row, "date32", |arr| {
-            arr.value(row).to_le_bytes().to_vec()
-        }),
-        DataType::Int64 => encode_typed_cell::<Int64Array, _>(array, row, "int64", |arr| {
-            arr.value(row).to_le_bytes().to_vec()
-        }),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            encode_typed_cell::<TimestampMicrosecondArray, _>(
-                array,
-                row,
-                "timestamp_microsecond",
-                |arr| arr.value(row).to_le_bytes().to_vec(),
-            )
-        }
-        DataType::Utf8 => encode_typed_cell::<StringArray, _>(array, row, "utf8", |arr| {
-            arr.value(row).as_bytes().to_vec()
-        }),
-        DataType::Decimal128(precision, scale) => {
-            let type_name = format!("decimal128({precision},{scale})");
-            encode_typed_cell::<Decimal128Array, _>(array, row, &type_name, |arr| {
-                arr.value(row).to_le_bytes().to_vec()
-            })
-        }
-        other => Err(format!(
-            "aggregate MV row id does not support group key type {:?}",
-            other
-        )),
-    }
-}
-
-fn encode_typed_cell<A, F>(
-    array: &ArrayRef,
-    row: usize,
-    type_name: &str,
-    value_bytes: F,
-) -> Result<Vec<u8>, String>
-where
-    A: Array + 'static,
-    F: FnOnce(&A) -> Vec<u8>,
-{
-    let typed = array
-        .as_any()
-        .downcast_ref::<A>()
-        .ok_or_else(|| format!("aggregate MV row id downcast failed for {type_name}"))?;
-    let mut out = Vec::new();
-    out.extend_from_slice(type_name.as_bytes());
-    out.push(b':');
-    if typed.is_null(row) {
-        out.extend_from_slice(b"N");
-    } else {
-        out.extend_from_slice(b"V:");
-        out.extend_from_slice(&value_bytes(typed));
-    }
-    Ok(out)
-}
-
 /// Derive visible column values from the current VARBINARY state values after a merge step.
 fn update_visible_values_from_state(
     row: &mut AggregatePhysicalRow,
@@ -1676,26 +1586,16 @@ fn key_value_to_agg_scalar(value: KeyValue) -> AggScalarValue {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mv::aggregate_state::mv_shape::{IncrementalMvShape, classify_incremental_mv_query};
-    use crate::mv::aggregate_state::state_codec::{
-        encode_count_state, encode_sum_decimal128, encode_sum_int64,
-    };
     use crate::sql::column_id::ColumnId;
     use arrow::array::{
         Array, BinaryBuilder, Int64Array, LargeBinaryArray, LargeBinaryBuilder, StringArray,
+    };
+    use novarocks_execution::exec::mv::state_codec::{
+        encode_count_state, encode_sum_decimal128, encode_sum_int64,
     };
 
     fn test_shape() -> AggregateMvShape {

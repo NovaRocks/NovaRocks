@@ -29,17 +29,17 @@ use novarocks_spi::connector::ConnectorCancellation;
 
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
-use crate::exec::node::scan::ConnectorRowPositionLookup;
-use crate::exec::node::scan::ScanOp;
-use crate::exec::operators::scan::ScanDispatchState;
 use crate::query_execution::lifecycle::QueryExecutionId;
-use crate::runtime::fragment::FragmentPrepareContext;
-use crate::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
-    ScanRegistrationPort,
-};
 use crate::runtime::query_context::{
     QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
+};
+use novarocks_execution::exec::node::scan::ConnectorRowPositionLookup;
+use novarocks_execution::exec::node::scan::ScanOp;
+use novarocks_execution::exec::operators::scan::ScanDispatchState;
+use novarocks_execution::runtime::fragment::FragmentPrepareContext;
+use novarocks_execution::runtime::fragment::io::{
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+    ScanRegistrationPort,
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
@@ -357,6 +357,8 @@ impl NativeFragmentAdmissionResources {
             event_sink,
         )
         .with_scan_registration_port(self.scan_registration)
+        .with_fragment_commit_port(Arc::new(crate::runtime::sink_commit::CoreSinkCommitPort))
+        .with_debug_exec_node_output(crate::common::config::debug_exec_node_output())
     }
 }
 

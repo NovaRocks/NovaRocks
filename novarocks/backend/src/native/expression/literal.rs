@@ -21,8 +21,8 @@ use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
 use super::error::NativeExpressionLeafDecodeError;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use novarocks::protocol::{FieldPath, ProtocolErrorKind};
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use novarocks_protocol::{common, expr};
 
 pub(crate) fn lower_literal(
@@ -326,8 +326,8 @@ mod tests {
     use super::super::tests::{bool_lit, int_lit, lower, scalar_expr, string_lit};
     use arrow::datatypes::DataType;
     use arrow_buffer::i256;
-    use novarocks::exec::expr::{ExprNode, LiteralValue};
     use novarocks::protocol::common::error::ProtocolErrorKind;
+    use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     use novarocks_protocol::{common, expr};
 
     fn literal_error(

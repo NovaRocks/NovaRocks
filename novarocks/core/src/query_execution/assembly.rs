@@ -25,7 +25,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{ConnectorSplit, ConnectorWriterHandle};
 
-use crate::exec::chunk::Chunk;
 use crate::novarocks_logging::debug;
 use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::preparation::{
@@ -35,6 +34,7 @@ use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
+use novarocks_execution::exec::chunk::Chunk;
 
 pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
@@ -71,7 +71,7 @@ fn align_fetch_chunk_to_output_columns(
     for (idx, output) in output_columns.iter().enumerate() {
         let array =
             align_typed_root_array(idx, chunk.batch.column(idx).clone(), &output.data_type)?;
-        if let Err(mismatch) = crate::exec::chunk::type_compatibility::check_exact(
+        if let Err(mismatch) = novarocks_execution::exec::chunk::type_compatibility::check_exact(
             &output.data_type,
             array.data_type(),
         ) {
@@ -115,13 +115,18 @@ fn align_typed_root_array(
     array: ArrayRef,
     output_type: &DataType,
 ) -> Result<ArrayRef, String> {
-    if crate::exec::chunk::type_compatibility::check_exact(output_type, array.data_type()).is_ok() {
+    if novarocks_execution::exec::chunk::type_compatibility::check_exact(
+        output_type,
+        array.data_type(),
+    )
+    .is_ok()
+    {
         return Ok(array);
     }
     if !same_unit_timestamp_metadata_mismatch(output_type, array.data_type()) {
         return Ok(array);
     }
-    crate::exec::chunk::type_compatibility::retag_column(&array, output_type).map_err(|mismatch| {
+    novarocks_execution::exec::chunk::type_compatibility::retag_column(&array, output_type).map_err(|mismatch| {
         format!(
             "typed root result column {idx} timestamp metadata retag failed: output={:?} chunk={:?} ({:?})",
             output_type,
@@ -680,10 +685,12 @@ fn patch_native_change_stream_router_sink_in_place(
             destinations: dests
                 .iter()
                 .map(|placement| {
-                    native_stream_destination(&crate::runtime::endpoint::FragmentDestination::new(
-                        placement.finst_id,
-                        placement.endpoint.clone(),
-                    ))
+                    native_stream_destination(
+                        &novarocks_execution::runtime::endpoint::FragmentDestination::new(
+                            placement.finst_id,
+                            placement.endpoint.clone(),
+                        ),
+                    )
                 })
                 .collect(),
         });
@@ -709,7 +716,10 @@ pub(crate) fn patch_native_cte_multicast_sink(
         Vec<i32>,
         Vec<ColumnId>,
     )],
-    consumer_dests: &BTreeMap<FragmentId, Vec<crate::runtime::endpoint::FragmentDestination>>,
+    consumer_dests: &BTreeMap<
+        FragmentId,
+        Vec<novarocks_execution::runtime::endpoint::FragmentDestination>,
+    >,
 ) -> Result<(), String> {
     if consumers.is_empty() {
         return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
@@ -765,7 +775,7 @@ pub(crate) fn patch_native_cte_multicast_sink(
 }
 
 fn native_stream_destination(
-    src: &crate::runtime::endpoint::FragmentDestination,
+    src: &novarocks_execution::runtime::endpoint::FragmentDestination,
 ) -> novarocks_protocol::plan::StreamDestination {
     novarocks_protocol::plan::StreamDestination {
         finst_id: Some(novarocks_protocol::common::UniqueId {
@@ -928,9 +938,9 @@ mod tests {
 
     use super::*;
     use crate::common::types::UniqueId;
-    use crate::exec::chunk::ChunkSchema;
-    use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
     use crate::sql::planner::distributed::{DataPartition, FragmentStreamKind};
+    use novarocks_execution::exec::chunk::ChunkSchema;
+    use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
     use novarocks_protocol::plan as native_plan;
     use novarocks_types::SlotId;
 

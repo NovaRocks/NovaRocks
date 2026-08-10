@@ -37,9 +37,9 @@ use novarocks_spi::connector::{
 use novarocks_connector_iceberg::iceberg::spec::{SnapshotRetention, TableMetadata};
 
 use crate::connector::runtime::ConnectorReadScanSource;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use crate::exec::node::scan::ScanSource;
 use crate::runtime::query_context::{QueryId, query_context_manager};
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+use novarocks_execution::exec::node::scan::ScanSource;
 use novarocks_execution::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks_types::SlotId;
 

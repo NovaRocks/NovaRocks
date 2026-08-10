@@ -173,11 +173,11 @@ macro_rules! assert_err {
 // ---------------------------------------------------------------------------
 
 /// Create a single-row Chunk for use in function unit tests.
-pub fn chunk_len_1() -> novarocks::exec::chunk::Chunk {
+pub fn chunk_len_1() -> novarocks_execution::exec::chunk::Chunk {
     use arrow::array::{ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -191,41 +191,41 @@ pub fn chunk_len_1() -> novarocks::exec::chunk::Chunk {
     let chunk_schema =
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
             .expect("chunk schema");
-    novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
+    novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
 /// Push an Int64 literal into the arena and return its ExprId.
 pub fn literal_i64(
-    arena: &mut novarocks::exec::expr::ExprArena,
+    arena: &mut novarocks_execution::exec::expr::ExprArena,
     v: i64,
-) -> novarocks::exec::expr::ExprId {
-    use novarocks::exec::expr::{ExprNode, LiteralValue};
+) -> novarocks_execution::exec::expr::ExprId {
+    use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     arena.push(ExprNode::Literal(LiteralValue::Int64(v)))
 }
 
 /// Push a Float64 literal into the arena and return its ExprId.
 pub fn literal_f64(
-    arena: &mut novarocks::exec::expr::ExprArena,
+    arena: &mut novarocks_execution::exec::expr::ExprArena,
     v: f64,
-) -> novarocks::exec::expr::ExprId {
-    use novarocks::exec::expr::{ExprNode, LiteralValue};
+) -> novarocks_execution::exec::expr::ExprId {
+    use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     arena.push(ExprNode::Literal(LiteralValue::Float64(v)))
 }
 
 /// Push a UTF-8 string literal into the arena and return its ExprId.
 pub fn literal_string(
-    arena: &mut novarocks::exec::expr::ExprArena,
+    arena: &mut novarocks_execution::exec::expr::ExprArena,
     v: &str,
-) -> novarocks::exec::expr::ExprId {
-    use novarocks::exec::expr::{ExprNode, LiteralValue};
+) -> novarocks_execution::exec::expr::ExprId {
+    use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     arena.push(ExprNode::Literal(LiteralValue::Utf8(v.to_string())))
 }
 
 /// Push a typed NULL literal into the arena and return its ExprId.
 pub fn typed_null(
-    arena: &mut novarocks::exec::expr::ExprArena,
+    arena: &mut novarocks_execution::exec::expr::ExprArena,
     data_type: arrow::datatypes::DataType,
-) -> novarocks::exec::expr::ExprId {
-    use novarocks::exec::expr::{ExprNode, LiteralValue};
+) -> novarocks_execution::exec::expr::ExprId {
+    use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     arena.push_typed(ExprNode::Literal(LiteralValue::Null), data_type)
 }

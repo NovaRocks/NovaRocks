@@ -20,12 +20,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::common::types::UniqueId;
-use crate::exec::expr::ExprArena;
-use crate::exec::fragment::program::{
-    ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
-    FragmentProgramOptions, FragmentSinkSpec, ScanSourceContract,
-};
-use crate::exec::node::ExecPlan;
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native::test_assembly::{
     NativeExchangeContractDecoder, NativeExpressionDecoder, NativeFragmentEnvelopeDecoder,
@@ -34,12 +28,18 @@ use crate::protocol::native::test_assembly::{
 };
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
-use crate::runtime::fragment::instance::{
+use crate::runtime::query_context::QueryId;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::fragment::program::{
+    ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
+    FragmentProgramOptions, FragmentSinkSpec, ScanSourceContract,
+};
+use novarocks_execution::exec::node::ExecPlan;
+use novarocks_execution::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
     FragmentInstanceSpec, FragmentRuntimeOptions, ScanAssignments,
 };
-use crate::runtime::fragment::submission::FragmentSubmission;
-use crate::runtime::query_context::QueryId;
+use novarocks_execution::runtime::fragment::submission::FragmentSubmission;
 use novarocks_protocol::{novarocks, plan};
 
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
@@ -203,7 +203,7 @@ where
     F: FnOnce(
         &plan::DataSink,
     ) -> Result<
-        crate::runtime::fragment::instance::FragmentSinkAssignment,
+        novarocks_execution::runtime::fragment::instance::FragmentSinkAssignment,
         NativeFragmentDecodeError,
     >,
 {
@@ -288,13 +288,14 @@ where
     // the instance's scan assignments (`materialize_scan_bindings` binds these).
     let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
         .map_err(NativeFragmentDecodeError::Binding)?;
-    let plan = crate::exec::node::ExecPlanBuilder::new(arena, decoded_root.node).finish()?;
+    let plan =
+        novarocks_execution::exec::node::ExecPlanBuilder::new(arena, decoded_root.node).finish()?;
     let sink_program =
         decode_fragment_sink_program_with_context(fragment, &decoded_root.layout, Some(&context))?;
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let exchange_inputs = decode_exchange_contracts(root, root_path)?;
-    let program = crate::exec::fragment::program::FragmentProgramBuilder::new(
+    let program = novarocks_execution::exec::fragment::program::FragmentProgramBuilder::new(
         plan,
         sink_spec,
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
@@ -633,14 +634,15 @@ mod tests {
 
     use super::*;
     use crate::common::types::UniqueId;
-    use crate::exec::fragment::program::FragmentSinkKind;
-    use crate::exec::node::ExecNodeKind;
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
-    use crate::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
+    use crate::runtime::fragment_test_io_exchange::test_exchange_snapshot;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+    use novarocks_execution::exec::fragment::program::FragmentSinkKind;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::runtime::exchange::ExchangeKey;
     use novarocks_protocol::{common, novarocks, plan};
 
     static NEXT_TEST_ID: AtomicI64 = AtomicI64::new(8_600_000_000_000_000_000);
@@ -716,7 +718,7 @@ mod tests {
             panic!("missing result buffer entry must return an error");
         };
         assert!(matches!(error.kind, FetchErrorKind::NotFound));
-        assert!(snapshot_receiver_state(exchange_key).is_none());
+        assert!(test_exchange_snapshot(exchange_key).is_none());
         assert!(
             RuntimeFilterLifecycleRegistry::global()
                 .snapshot(rf_key)
@@ -944,7 +946,7 @@ mod tests {
         };
         assert_eq!(
             binding.target(),
-            crate::exec::fragment::error::FragmentBindingTarget::ExchangeNode(99)
+            novarocks_execution::exec::fragment::error::FragmentBindingTarget::ExchangeNode(99)
         );
     }
 

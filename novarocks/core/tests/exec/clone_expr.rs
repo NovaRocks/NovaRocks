@@ -14,8 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use novarocks::exec::chunk::Chunk;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
 /// Integration tests for CloneExpr functionality.
 ///
 /// Tests verify that CloneExpr properly creates independent column copies
@@ -31,11 +31,12 @@ fn create_test_chunk(values: Vec<i64>) -> Chunk {
     let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let batch =
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(values))]).unwrap();
-    let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 

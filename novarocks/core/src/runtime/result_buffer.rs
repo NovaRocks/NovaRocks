@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::common::result_batch::ResultBatch;
 use crate::common::types::{FetchResult, UniqueId};
-use crate::runtime::fragment::io::ResultAbort;
+use novarocks_execution::runtime::fragment::io::ResultAbort;
 use novarocks_execution::runtime::mem_tracker::{MemTracker, TrackedBytes};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -768,8 +768,8 @@ pub fn fetch_wait_timeout_ms(finst_id: UniqueId) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::fragment::io::ResultAbort;
     use crate::runtime::query_context::{QueryId, query_context_manager};
+    use novarocks_execution::runtime::fragment::io::ResultAbort;
 
     #[test]
     fn fragment_result_session_writes_twenty_plus_seventeen_rows_and_finishes_once() {

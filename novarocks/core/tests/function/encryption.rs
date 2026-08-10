@@ -19,10 +19,10 @@
 use crate::common;
 use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, StringArray};
 use arrow::datatypes::DataType;
-use novarocks::exec::expr::ExprId;
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::function::encryption::eval_encryption_function;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_execution::exec::expr::ExprId;
+use novarocks_execution::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::function::encryption::eval_encryption_function;
+use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 #[test]
 fn test_register_encryption_functions() {
-    use novarocks::exec::expr::function::encryption::register;
+    use novarocks_execution::exec::expr::function::encryption::register;
     let mut m = HashMap::new();
     register(&mut m);
     assert_eq!(m.get("md5"), Some(&FunctionKind::Encryption("md5")));

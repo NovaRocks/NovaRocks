@@ -16,14 +16,12 @@
 // under the License.
 pub mod backend_id;
 pub mod descriptor_snapshot;
-pub mod endpoint;
-pub mod exchange;
-pub mod exec_env;
-pub mod fragment;
 pub(crate) mod fragment_exec_params;
 pub(crate) mod fragment_output;
-pub mod global_async_runtime;
-pub mod io;
+#[cfg(test)]
+pub(crate) mod fragment_test_io_exchange;
+#[cfg(test)]
+pub(crate) mod fragment_test_io_result;
 pub mod lookup;
 pub mod native_fragment_query;
 pub(crate) mod profile_codec;
@@ -31,12 +29,11 @@ pub(crate) mod query_context;
 pub mod query_result;
 pub mod user_variable;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
-pub(crate) mod connector_write_report;
+pub mod global_async_runtime;
 #[allow(dead_code)]
 pub mod result_buffer;
+pub mod result_format;
 pub mod runtime_filter_observability;
-pub mod runtime_state;
-pub mod scan_executor;
 pub mod scan_range;
 pub mod sink_commit;
 pub mod start_epoch;

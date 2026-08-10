@@ -196,8 +196,8 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
          GROUP BY {payload_group_by} \
          HAVING SUM({}) <> 0 \
          AND assert_true(abs(SUM({})) <= 1, 'join delta per-payload net change exceeds 1'))",
-        crate::exec::change_op::CHANGE_OP_COLUMN,
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
     );
     let key_shape_cte = format!(
         "__nr_join_delta_key_shape AS (\
@@ -286,8 +286,8 @@ fn wrap_join_apply_key_query(
     ));
     items.push(format!(
         "CAST({} AS TINYINT) AS {}",
-        crate::exec::change_op::CHANGE_OP_COLUMN,
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
     ));
     let sql = format!(
         "SELECT {} FROM (SELECT 1 AS {placeholder_name}) AS {source_alias}",
@@ -407,7 +407,7 @@ fn is_reserved_payload_projection_name(normalized: &str) -> bool {
             | "__nr_join_delta_target_locator"
             | "_file"
             | "_pos"
-    ) || normalized == crate::exec::change_op::CHANGE_OP_COLUMN
+    ) || normalized == novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
         || normalized == JOIN_LEFT_ROW_ID_COLUMN
         || normalized == JOIN_RIGHT_ROW_ID_COLUMN
         || normalized == crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
@@ -435,7 +435,7 @@ fn change_stream_select_list(
         JOIN_RIGHT_ROW_ID_COLUMN,
         crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
     ));
-    items.push(crate::exec::change_op::CHANGE_OP_COLUMN.to_string());
+    items.push(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string());
     items.join(", ")
 }
 
@@ -444,7 +444,7 @@ fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> S
     items.extend(payload_columns.iter().map(|ident| ident.to_string()));
     items.push(format!(
         "SUM({}) AS net",
-        crate::exec::change_op::CHANGE_OP_COLUMN
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
     ));
     items.join(", ")
 }
@@ -484,9 +484,9 @@ fn final_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Str
     items.push(format!("coalesced.{key} AS {key}"));
     items.push(format!(
         "CAST(CASE WHEN coalesced.net > 0 THEN {} ELSE {} END AS TINYINT) AS {}",
-        crate::exec::change_op::CHANGE_OP_INSERT,
-        crate::exec::change_op::CHANGE_OP_DELETE,
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_INSERT,
+        novarocks_execution::exec::change_op::CHANGE_OP_DELETE,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
     ));
     items.push("tgt._file AS _file".to_string());
     items.push("tgt._pos AS _pos".to_string());
@@ -693,8 +693,8 @@ fn append_join_hidden_projection(
 fn change_op_alias(alias: &sqlparser::ast::Ident) -> sqlparser::ast::SelectItem {
     qualified_alias(
         alias,
-        crate::exec::change_op::CHANGE_OP_COLUMN,
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
     )
 }
 

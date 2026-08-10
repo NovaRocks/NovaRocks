@@ -37,6 +37,7 @@ use novarocks::query_execution::lifecycle::{
     decode_query_terminal_snapshot,
 };
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
+use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
@@ -75,13 +76,14 @@ impl NativeBackendGrpcService {
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
+        exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     ) -> Self {
         Self {
             native_fragment_ingress,
             query_lifecycle_ingress,
             query_control_shutdown: None,
             terminal_ingress,
-            data_plane: NativeDataPlaneKernel::query_scoped(),
+            data_plane: NativeDataPlaneKernel::with_exchange_receiver_port(exchange_receiver_port),
             runtime_filter_ingress,
         }
     }

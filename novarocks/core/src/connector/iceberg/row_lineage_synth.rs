@@ -35,7 +35,7 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::Schema;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::exec::row_position::{
+use novarocks_execution::exec::row_position::{
     ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, ICEBERG_RESERVED_FIELD_ID_ROW_ID,
 };
 

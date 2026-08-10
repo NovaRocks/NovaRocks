@@ -165,7 +165,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     );
     let mut iceberg_row_lineage_metadata_columns = iceberg_row_lineage_metadata_columns();
     iceberg_row_lineage_metadata_columns.push(ColumnDef {
-        name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+        name: novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string(),
         data_type: arrow::datatypes::DataType::Int8,
         nullable: false,
         write_default: None,

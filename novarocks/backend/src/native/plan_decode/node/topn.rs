@@ -19,10 +19,10 @@ use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonneg
 use super::sort::{lower_sort_items_with_context, parse_sort_topn_type};
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::node::sort::SortNode;
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::sort::SortNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_topn_node(

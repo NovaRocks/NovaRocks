@@ -53,8 +53,9 @@ pub struct ResolvedQueryOptions {
 impl ResolvedQueryOptions {
     pub(crate) fn from_upstream(options: Option<QueryOptions>) -> Self {
         let mut runtime = options.unwrap_or_default();
-        let pipeline_dop =
-            crate::runtime::exec_env::calc_pipeline_dop(runtime.pipeline_dop.unwrap_or_default());
+        let pipeline_dop = novarocks_execution::runtime::exec_env::calc_pipeline_dop(
+            runtime.pipeline_dop.unwrap_or_default(),
+        );
         debug_assert!(pipeline_dop > 0, "resolved pipeline DOP must be positive");
         runtime.pipeline_dop = Some(pipeline_dop);
         Self { runtime }

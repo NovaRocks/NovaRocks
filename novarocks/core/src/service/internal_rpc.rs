@@ -16,11 +16,13 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::runtime::exchange;
 use crate::runtime::lookup::{
     decode_column_ipc, encode_column_ipc, execute_position_lookup_request,
 };
 use crate::runtime::query_context::QueryId;
+use novarocks_execution::runtime::fragment::io::{
+    ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
+};
 use novarocks_protocol as proto;
 use novarocks_types::SlotId;
 fn ok_common_status() -> proto::common::Status {
@@ -38,6 +40,7 @@ fn error_common_status(message: impl Into<String>) -> proto::common::Status {
 }
 
 pub fn handle_transmit_chunk(
+    receiver_port: &dyn ExchangeReceiverPort,
     params: proto::novarocks::ExchangeRequest,
 ) -> proto::novarocks::ExchangeResponse {
     let mut response = proto::novarocks::ExchangeResponse {
@@ -45,37 +48,25 @@ pub fn handle_transmit_chunk(
         status: Some(ok_common_status()),
     };
 
-    let decode_start = std::time::Instant::now();
-    let key = exchange::ExchangeKey {
-        finst_id_hi: params.finst_id_hi,
-        finst_id_lo: params.finst_id_lo,
+    let key = ExchangeReceiverKey {
+        fragment_instance_id: novarocks_types::UniqueId::new(
+            params.finst_id_hi,
+            params.finst_id_lo,
+        ),
         node_id: params.node_id,
     };
-    let chunks = match exchange::decode_chunks_for_sender(
-        key,
-        params.sender_id,
-        params.be_number,
-        &params.payload,
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            response.status = Some(error_common_status(format!(
-                "exchange decode failed: {err}"
-            )));
-            return response;
-        }
+    let frame = ExchangeReceiverFrame {
+        sender_id: params.sender_id,
+        backend_number: params.be_number,
+        sequence: params.sequence,
+        eos: params.eos,
+        payload: params.payload,
     };
-    let decode_ns = decode_start.elapsed().as_nanos();
-
-    exchange::push_chunks_with_stats(
-        key,
-        params.sender_id,
-        params.be_number,
-        chunks,
-        params.eos,
-        params.payload.len(),
-        decode_ns,
-    );
+    if let Err(err) = receiver_port.push(key, frame) {
+        response.status = Some(error_common_status(format!(
+            "exchange ingress failed: {err}"
+        )));
+    }
     response
 }
 

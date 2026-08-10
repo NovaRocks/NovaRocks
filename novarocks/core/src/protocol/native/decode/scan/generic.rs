@@ -32,15 +32,15 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
-use crate::exec::chunk::ChunkSchema;
-use crate::exec::expr::ExprArena;
-use crate::exec::node::scan::BoundScanRanges;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::runtime::query_context::{QueryId, query_context_manager};
+use novarocks_execution::exec::chunk::ChunkSchema;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::scan::BoundScanRanges;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_protocol::plan;
 use novarocks_types::SlotId;
@@ -272,7 +272,7 @@ pub(super) fn lower_connector_read_scan(
         })?,
     );
     ctx.capture_scan_ranges(node.node_id, BoundScanRanges::None);
-    let scan_node = crate::exec::node::scan::ScanNode::new(source)
+    let scan_node = novarocks_execution::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_schema.clone())
         .with_limit(parse_scan_limit(node.limit)?)

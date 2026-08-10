@@ -22,12 +22,12 @@ use arrow::datatypes::DataType;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::node::change_event_expand::{
+use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_types::SlotId;

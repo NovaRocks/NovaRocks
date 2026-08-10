@@ -16,10 +16,10 @@
 // under the License.
 
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::expr::ExprArena;
-use crate::exec::node::filter::FilterNode;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::filter::FilterNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_filter_node(
@@ -58,8 +58,8 @@ mod tests {
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
-    use crate::exec::expr::ExprArena;
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
     use novarocks_protocol::{common, expr, plan};
     use novarocks_types::SlotId;
 

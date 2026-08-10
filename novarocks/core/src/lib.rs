@@ -22,7 +22,6 @@ pub(crate) mod catalog_attachment;
 pub mod common;
 pub mod connector;
 pub mod engine;
-pub mod exec;
 pub mod formats;
 pub mod fs;
 pub mod meta;

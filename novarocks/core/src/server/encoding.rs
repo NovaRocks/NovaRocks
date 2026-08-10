@@ -34,8 +34,8 @@ use opensrv_mysql::{Column, ColumnFlags, ColumnType, QueryResultWriter, ToMysqlV
 use tokio::io::AsyncWrite;
 
 use crate::common::util::{FieldRenderSchema, format_mysql_container_value_with_schema};
-use crate::exec::chunk::Chunk;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
+use novarocks_execution::exec::chunk::Chunk;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum StandaloneMysqlValue {
@@ -416,7 +416,7 @@ fn downcast_array<'a, T: 'static>(column: &'a ArrayRef, expected: &str) -> Resul
 }
 
 fn date32_to_mysql_value(days: i32) -> Result<StandaloneMysqlValue, String> {
-    if days == crate::exec::expr::function::date::zero_date_sentinel_date32() {
+    if days == novarocks_execution::exec::expr::function::date::zero_date_sentinel_date32() {
         return Ok(StandaloneMysqlValue::Bytes(b"0000-00-00".to_vec()));
     }
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
@@ -566,7 +566,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
@@ -615,7 +615,7 @@ mod tests {
             ))),
             true,
         );
-        let array = crate::exec::chunk::type_compatibility::retag_column(
+        let array = novarocks_execution::exec::chunk::type_compatibility::retag_column(
             &raw_array,
             payload_field.data_type(),
         )

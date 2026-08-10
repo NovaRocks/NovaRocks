@@ -27,9 +27,9 @@ use crate::common::types::UniqueId;
 use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle::{ExchangeRouteManifest, QueryInitPlanHeader};
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::planner::distributed::FragmentId;
+use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_spi::connector::ConnectorSplit;
 
 /// Placement information for one fragment instance.

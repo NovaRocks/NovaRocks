@@ -19,8 +19,8 @@
 
 use std::collections::BTreeSet;
 
-use novarocks::exec::fragment::program::{RuntimeFilterContract, RuntimeFilterId};
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use novarocks_execution::exec::fragment::program::{RuntimeFilterContract, RuntimeFilterId};
 use novarocks_protocol::plan;
 
 pub(crate) fn decode_runtime_filter_contract(

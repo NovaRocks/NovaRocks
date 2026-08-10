@@ -20,12 +20,12 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::exec::row_position::{
+use crate::runtime::descriptor_snapshot::{DescriptorIcebergSchema, DescriptorIcebergSchemaField};
+use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
+use novarocks_execution::exec::row_position::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
-use crate::runtime::descriptor_snapshot::{DescriptorIcebergSchema, DescriptorIcebergSchemaField};
-use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
 pub const ICEBERG_INITIAL_DEFAULT_META_KEY: &str = "novarocks.iceberg.initial_default";
@@ -279,7 +279,7 @@ fn build_reserved_row_lineage_projected_field(
 ) -> Result<Option<Field>, String> {
     if column
         .name
-        .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+        .eq_ignore_ascii_case(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
     {
         if !matches!(column.data_type, DataType::Int8) {
             return Err(format!(
@@ -564,7 +564,7 @@ mod tests {
                     nullable: false,
                 },
                 IcebergArrowColumn {
-                    name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                    name: novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string(),
                     data_type: DataType::Int8,
                     nullable: false,
                 },
@@ -574,7 +574,7 @@ mod tests {
         .expect("schema");
 
         let change_op = projected
-            .field_with_name(crate::exec::change_op::CHANGE_OP_COLUMN)
+            .field_with_name(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
             .expect("change op field");
         assert_eq!(change_op.data_type(), &DataType::Int8);
         assert!(!change_op.is_nullable());

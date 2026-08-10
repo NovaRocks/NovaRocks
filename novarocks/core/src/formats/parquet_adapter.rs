@@ -36,9 +36,6 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-pub use crate::common::min_max_predicate::{
-    MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
-};
 use crate::common::runtime_scan_predicate::{
     RuntimeScanPredicateBindings, RuntimeScanPredicateCounters, RuntimeScanPredicateOptions,
     runtime_filters_to_scan_predicates as build_runtime_scan_predicates,
@@ -46,9 +43,12 @@ use crate::common::runtime_scan_predicate::{
 use crate::common::scan_predicate::{
     MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
 };
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::cast_with_special_rules;
-use crate::exec::node::scan::RuntimeFilterContext;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::expr::cast_with_special_rules;
+pub(crate) use novarocks_execution::exec::min_max_predicate::{
+    MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
+};
+use novarocks_execution::exec::node::scan::RuntimeFilterContext;
 use novarocks_fs::DataCacheContext;
 use novarocks_types::SlotId;
 pub use variant_pruning::VariantPathPruningPredicate;
@@ -102,7 +102,7 @@ pub struct ParquetScanConfig {
     pub profile_label: Option<String>,
     pub iceberg_output_schema: Option<SchemaRef>,
     pub variant_path_columns: Vec<VariantPathSpec>,
-    pub query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
+    pub query_global_dicts: novarocks_execution::exec::dict_encode::QueryGlobalDictEncodeMap,
 }
 
 pub(crate) struct FoundationParquetAdapter {
@@ -123,7 +123,7 @@ impl FoundationParquetAdapter {
         } else {
             let output = materialized_chunk_schema.arrow_schema_ref();
             let (scan, has_dict) =
-                crate::exec::dict_encode::build_scan_schema_for_global_dict_encoding(
+                novarocks_execution::exec::dict_encode::build_scan_schema_for_global_dict_encoding(
                     &output,
                     &materialized_chunk_schema,
                     &cfg.query_global_dicts,
@@ -166,7 +166,7 @@ impl FoundationParquetAdapter {
             .and_then(|batch| normalize_batch_to_chunk_schema(batch, &self.scan_read_chunk_schema))
             .and_then(|batch| {
                 if self.has_dict_encoded_output {
-                    crate::exec::dict_encode::encode_batch_with_query_global_dicts(
+                    novarocks_execution::exec::dict_encode::encode_batch_with_query_global_dicts(
                         batch,
                         &self.materialized_chunk_schema.arrow_schema_ref(),
                         &self.materialized_chunk_schema,

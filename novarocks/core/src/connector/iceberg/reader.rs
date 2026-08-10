@@ -891,7 +891,7 @@ fn align_batch_to_schema(
                     source.data_type(),
                     target.data_type(),
                 ) {
-                    crate::exec::chunk::type_compatibility::retag_column(
+                    novarocks_execution::exec::chunk::type_compatibility::retag_column(
                             &source,
                             target.data_type(),
                         )

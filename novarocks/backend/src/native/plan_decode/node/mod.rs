@@ -48,19 +48,21 @@ use crate::native::plan_decode::runtime_filter_binding::{
     DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
     NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
 };
-use novarocks::exec::chunk::ChunkSchemaRef;
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-use novarocks::exec::node::aggregate::{
+use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
+use novarocks_execution::exec::node::aggregate::{
     AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding,
 };
-use novarocks::exec::node::join::{JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding};
-use novarocks::exec::node::limit::LimitNode;
-use novarocks::exec::node::runtime_filter::{
+use novarocks_execution::exec::node::join::{
+    JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding,
+};
+use novarocks_execution::exec::node::limit::LimitNode;
+use novarocks_execution::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
 };
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 #[derive(Clone, Debug)]
@@ -616,7 +618,7 @@ fn set_native_scan_specs(
 
 fn find_exchange_source_mut(
     node: &mut ExecNode,
-) -> Option<&mut novarocks::exec::node::exchange_source::ExchangeSourceNode> {
+) -> Option<&mut novarocks_execution::exec::node::exchange_source::ExchangeSourceNode> {
     match &mut node.kind {
         ExecNodeKind::ExchangeSource(exchange) => Some(exchange),
         ExecNodeKind::Limit(limit) => find_exchange_source_mut(&mut limit.input),
@@ -703,11 +705,12 @@ fn attach_hash_join_producers(
             ),
         ));
     }
-    let build_input_index = if join.join_type == novarocks::exec::node::join::JoinType::RightSemi {
-        0
-    } else {
-        1
-    };
+    let build_input_index =
+        if join.join_type == novarocks_execution::exec::node::join::JoinType::RightSemi {
+            0
+        } else {
+            1
+        };
     let (build_layout, build_schema) = &direct_inputs[build_input_index];
     let mut producers = Vec::with_capacity(bindings.len());
     for binding in bindings {
@@ -759,7 +762,7 @@ fn attach_hash_join_producers(
             ));
         }
         let (raw_build, raw_build_path) =
-            if join.join_type == novarocks::exec::node::join::JoinType::RightSemi {
+            if join.join_type == novarocks_execution::exec::node::join::JoinType::RightSemi {
                 (condition.left.as_ref(), join_key_path.clone().field("left"))
             } else {
                 (
@@ -979,7 +982,7 @@ fn attach_hash_aggregate_producers(
 fn find_hash_aggregate_mut(
     node: &mut ExecNode,
     node_id: i32,
-) -> Option<&mut novarocks::exec::node::aggregate::AggregateNode> {
+) -> Option<&mut novarocks_execution::exec::node::aggregate::AggregateNode> {
     match &mut node.kind {
         ExecNodeKind::Aggregate(aggregate) if aggregate.node_id == node_id => Some(aggregate),
         ExecNodeKind::Limit(limit) if limit.node_id == node_id => {
@@ -995,7 +998,7 @@ fn find_hash_aggregate_mut(
 fn find_hash_join_mut(
     node: &mut ExecNode,
     node_id: i32,
-) -> Option<&mut novarocks::exec::node::join::JoinNode> {
+) -> Option<&mut novarocks_execution::exec::node::join::JoinNode> {
     match &mut node.kind {
         ExecNodeKind::Join(join) if join.node_id == node_id => Some(join),
         ExecNodeKind::Limit(limit) if limit.node_id == node_id => {
@@ -1010,7 +1013,7 @@ fn find_hash_join_mut(
 
 fn consumer_spec(
     binding: &DecodedRuntimeFilterBinding,
-    expr_id: novarocks::exec::expr::ExprId,
+    expr_id: novarocks_execution::exec::expr::ExprId,
 ) -> Result<RuntimeFilterConsumerBinding, String> {
     let DecodedBindingRole::Consumer { contract, target } = &binding.role else {
         return Err(format!(
@@ -1046,7 +1049,7 @@ fn lower_binding_expression(
     schema: &ChunkSchemaRef,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
-) -> Result<novarocks::exec::expr::ExprId, NativeFragmentDecodeError> {
+) -> Result<novarocks_execution::exec::expr::ExprId, NativeFragmentDecodeError> {
     let expression_path = binding.expression_path.clone();
     validate_column_refs_exact(
         binding.binding_id,
@@ -1115,10 +1118,12 @@ fn validate_column_refs_exact(
                 ),
             )
         })?;
-        let expected_schema = novarocks::exec::chunk::ChunkFieldSchema::from_field(expected)
-            .map_err(|error| NativeFragmentDecodeError::inconsistent(column_path.clone(), error))?;
-        let actual_schema =
-            novarocks::exec::chunk::ChunkFieldSchema::from_field(&actual).map_err(|error| {
+        let expected_schema = novarocks_execution::exec::chunk::ChunkFieldSchema::from_field(
+            expected,
+        )
+        .map_err(|error| NativeFragmentDecodeError::inconsistent(column_path.clone(), error))?;
+        let actual_schema = novarocks_execution::exec::chunk::ChunkFieldSchema::from_field(&actual)
+            .map_err(|error| {
                 NativeFragmentDecodeError::invalid_value(path.clone().field("type"), error)
             })?;
         if expected.data_type() != actual.data_type()

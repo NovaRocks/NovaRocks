@@ -1669,7 +1669,6 @@ mod tests {
         encode_query_stage_response, encode_query_start_request, encode_query_start_response,
         encode_query_terminal_snapshot,
     };
-    use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::identity::{AttemptId, QueryExecutionId};
     use crate::query_execution::lifecycle::manifest::{
@@ -1681,6 +1680,7 @@ mod tests {
         QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
     };
     use crate::runtime::sink_commit::SinkCommitReportSnapshot;
+    use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
     use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
     use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
 

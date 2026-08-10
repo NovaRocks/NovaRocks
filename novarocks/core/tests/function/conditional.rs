@@ -22,15 +22,15 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use novarocks::exec::chunk::Chunk;
-use novarocks::exec::chunk::ChunkSchema;
-use novarocks::exec::expr::ExprId;
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::function::conditional::{
+use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::chunk::ChunkSchema;
+use novarocks_execution::exec::expr::ExprId;
+use novarocks_execution::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::function::conditional::{
     eval_assert_true, eval_coalesce, eval_if, eval_ifnull, eval_is_not_null, eval_is_null,
     eval_nullif,
 };
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use novarocks_types::SlotId;
 use std::sync::Arc;
 
@@ -158,7 +158,7 @@ fn test_coalesce_two_args_first_not_null() {
     let lit2 = arena.push(ExprNode::Literal(LiteralValue::Int64(20)));
     let coalesce = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Coalesce,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Coalesce,
             args: vec![lit1, lit2],
         },
         DataType::Int64,
@@ -179,7 +179,7 @@ fn test_coalesce_two_args_first_null() {
     let lit2 = arena.push(ExprNode::Literal(LiteralValue::Int64(20)));
     let coalesce = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Coalesce,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Coalesce,
             args: vec![lit1, lit2],
         },
         DataType::Int64,
@@ -201,7 +201,7 @@ fn test_coalesce_three_args() {
     let lit3 = arena.push(ExprNode::Literal(LiteralValue::Int64(30)));
     let coalesce = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Coalesce,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Coalesce,
             args: vec![lit1, lit2, lit3],
         },
         DataType::Int64,
@@ -222,7 +222,7 @@ fn test_coalesce_all_null() {
     let lit2 = arena.push(ExprNode::Literal(LiteralValue::Null));
     let coalesce = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Coalesce,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Coalesce,
             args: vec![lit1, lit2],
         },
         DataType::Int64,
@@ -243,7 +243,7 @@ fn test_coalesce_string() {
     let lit2 = arena.push(ExprNode::Literal(LiteralValue::Utf8("hello".to_string())));
     let coalesce = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::Coalesce,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Coalesce,
             args: vec![lit1, lit2],
         },
         DataType::Utf8,
@@ -305,7 +305,7 @@ fn if_then_int_else_null_ok() {
 
     let if_expr = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::If,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::If,
             args: vec![cond, then_v, else_v],
         },
         DataType::Int8,
@@ -330,7 +330,7 @@ fn if_null_condition_treated_as_false() {
 
     let if_expr = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::If,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::If,
             args: vec![cond, then_v, else_v],
         },
         DataType::Int64,
@@ -388,7 +388,7 @@ fn if_does_not_eagerly_eval_then_branch() {
 
     let if_expr = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::If,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::If,
             args: vec![cond, then_div, else_v],
         },
         DataType::Decimal128(7, 2),

@@ -23,12 +23,12 @@ use arrow::datatypes::DataType;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use novarocks::exec::expr::{ExprArena, ExprNode};
-use novarocks::exec::node::project::ProjectNode;
-use novarocks::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::node::project::ProjectNode;
+use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{common as proto_common, expr, plan};
 use novarocks_types::SlotId;
 

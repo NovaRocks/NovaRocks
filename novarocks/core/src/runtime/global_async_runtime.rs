@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::runtime::{Handle, Runtime};
 
 use crate::common::config::{data_runtime_max_blocking_threads, data_runtime_worker_threads};
-use crate::novarocks_logging::info;
+use tracing::info;
 
 /// Worker thread stack size for Tokio runtimes that run SQL workloads.
 ///

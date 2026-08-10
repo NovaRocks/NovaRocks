@@ -702,7 +702,7 @@ fn resolver_failure_precedes_invalid_physical_projection() {
 
 #[test]
 fn target_state_and_locator_reject_equality_deletes() {
-    use crate::exec::row_position::{
+    use novarocks_execution::exec::row_position::{
         ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
         ICEBERG_ROW_POS_COL,
     };

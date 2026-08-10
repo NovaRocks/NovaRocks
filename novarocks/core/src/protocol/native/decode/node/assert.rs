@@ -17,10 +17,10 @@
 
 use super::DecodedNode;
 use super::common::parse_optional_nonnegative_i64;
-use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_execution::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_assert_one_row_node(
@@ -153,10 +153,10 @@ fn lower_row_count_assertion(value: i32) -> Result<Assertion, NativeFragmentLeaf
 #[cfg(test)]
 mod tests {
     use super::super::tests::{lower, one_col_values_node, physical_node};
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::ExecNodeKind;
-    use crate::exec::node::assert::AssertNumRowsMode;
     use crate::protocol::common::error::ProtocolErrorKind;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::assert::AssertNumRowsMode;
     use novarocks_protocol::plan;
     use novarocks_types::SlotId;
 

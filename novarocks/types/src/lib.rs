@@ -20,6 +20,7 @@ mod arithmetic;
 pub mod arrow_primitive;
 pub mod coercion;
 pub mod decimal;
+pub mod field_render_schema;
 pub mod identity;
 pub mod largeint;
 pub mod logical;
@@ -33,6 +34,7 @@ pub use arithmetic::{
     decimal_arithmetic_result_type,
 };
 pub use coercion::{comparison_common_type, wider_type};
+pub use field_render_schema::FieldRenderSchema;
 pub use identity::{QueryId, UniqueId, format_uuid};
 pub use primitive::PrimitiveType;
 pub use slot_id::SlotId;

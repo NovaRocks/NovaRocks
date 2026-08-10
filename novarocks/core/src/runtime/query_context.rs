@@ -22,12 +22,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cache::CacheOptions;
-use crate::exec::node::scan::ConnectorRowPositionLookup;
-use crate::exec::node::scan::IncrementalScanRange;
-use crate::exec::node::scan::ScanOp;
-use crate::exec::operators::scan::dispatch::ScanDispatchState;
-use crate::exec::row_position::RowPositionDescriptor;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
+use novarocks_execution::exec::node::scan::ConnectorRowPositionLookup;
+use novarocks_execution::exec::node::scan::IncrementalScanRange;
+use novarocks_execution::exec::node::scan::ScanOp;
+use novarocks_execution::exec::operators::scan::dispatch::ScanDispatchState;
+use novarocks_execution::exec::row_position::RowPositionDescriptor;
+use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
 use novarocks_types::SlotId;
 use novarocks_types::UniqueId;
@@ -439,6 +440,7 @@ struct QueryContextManagerInner {
     active: HashMap<QueryId, QueryContext>,
     second_chance: HashMap<QueryId, QueryContext>,
     finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
+    exchange_receiver_ports: HashMap<UniqueId, Arc<dyn ExchangeReceiverPort>>,
     incremental_scan_nodes: HashMap<UniqueId, HashMap<i32, Arc<IncrementalScanNodeHandle>>>,
     pending_incremental_scan_ranges: HashMap<UniqueId, HashMap<i32, Vec<IncrementalScanRange>>>,
     incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
@@ -1078,6 +1080,21 @@ impl QueryContextManager {
             .insert(finst_id, QueryExecutionKey::native(query_id));
     }
 
+    /// Associates a fragment with the application-owned exchange capability
+    /// used by ingress and operators. Cancellation snapshots this capability
+    /// under the manager lock, then invokes it only after releasing the lock.
+    pub(crate) fn register_exchange_receiver_port(
+        &self,
+        finst_id: UniqueId,
+        port: Arc<dyn ExchangeReceiverPort>,
+    ) {
+        self.inner
+            .lock()
+            .expect("query context manager lock")
+            .exchange_receiver_ports
+            .insert(finst_id, port);
+    }
+
     pub(crate) fn register_native_finst_execution(
         &self,
         finst_id: UniqueId,
@@ -1146,6 +1163,7 @@ impl QueryContextManager {
     pub(crate) fn unregister_finst(&self, finst_id: UniqueId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);
+        guard.exchange_receiver_ports.remove(&finst_id);
         guard.incremental_scan_nodes.remove(&finst_id);
         guard.pending_incremental_scan_ranges.remove(&finst_id);
         guard.incremental_change_op_slots.remove(&finst_id);
@@ -1178,6 +1196,7 @@ impl QueryContextManager {
             }
 
             guard.finst_to_query.remove(&finst_id);
+            guard.exchange_receiver_ports.remove(&finst_id);
             let remove_empty_context = {
                 let context = guard
                     .active
@@ -1247,6 +1266,7 @@ impl QueryContextManager {
             return;
         }
         guard.finst_to_query.remove(&finst_id);
+        guard.exchange_receiver_ports.remove(&finst_id);
         guard.incremental_scan_nodes.remove(&finst_id);
         guard.pending_incremental_scan_ranges.remove(&finst_id);
         guard.incremental_change_op_slots.remove(&finst_id);
@@ -1306,7 +1326,7 @@ impl QueryContextManager {
 
     #[allow(dead_code)]
     pub(crate) fn abort_query(&self, query_id: QueryId) -> Vec<UniqueId> {
-        let (cancellation, finsts) = {
+        let (cancellation, finsts, exchange_ports) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let cancellation =
                 Self::prepare_runtime_filter_query_cancellation(&mut guard, query_id, None, None);
@@ -1316,18 +1336,30 @@ impl QueryContextManager {
                 .filter_map(|(finst_id, execution)| {
                     (execution.query_id() == query_id).then_some(*finst_id)
                 })
-                .collect();
-            (cancellation, finsts)
+                .collect::<Vec<_>>();
+            let exchange_ports = finsts
+                .iter()
+                .filter_map(|finst| {
+                    guard
+                        .exchange_receiver_ports
+                        .get(finst)
+                        .map(|port| (*finst, Arc::clone(port)))
+                })
+                .collect::<Vec<_>>();
+            (cancellation, finsts, exchange_ports)
         };
         if let Err(payload) = self.execute_runtime_filter_query_cancellation(query_id, cancellation)
         {
             std::panic::resume_unwind(payload);
         }
+        for (fragment_instance_id, port) in exchange_ports {
+            port.cancel_fragment(fragment_instance_id);
+        }
         finsts
     }
 
     pub(crate) fn cancel_query(&self, query_id: QueryId, err: String) -> Vec<UniqueId> {
-        let (cancellation, finsts) = {
+        let (cancellation, finsts, exchange_ports) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
                 &mut guard,
@@ -1342,14 +1374,26 @@ impl QueryContextManager {
                 .filter_map(|(finst_id, execution)| {
                     (execution.query_id() == query_id).then_some(*finst_id)
                 })
-                .collect();
-            (cancellation, finsts)
+                .collect::<Vec<_>>();
+            let exchange_ports = finsts
+                .iter()
+                .filter_map(|finst| {
+                    guard
+                        .exchange_receiver_ports
+                        .get(finst)
+                        .map(|port| (*finst, Arc::clone(port)))
+                })
+                .collect::<Vec<_>>();
+            (cancellation, finsts, exchange_ports)
         };
 
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(query_id, cancellation);
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
+        }
+        for (fragment_instance_id, port) in exchange_ports {
+            port.cancel_fragment(fragment_instance_id);
         }
         finsts
     }
@@ -1425,13 +1469,25 @@ impl QueryContextManager {
                 .iter()
                 .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
                 .collect::<Vec<_>>();
-            (query_id, cancellation, finsts)
+            let exchange_ports = finsts
+                .iter()
+                .filter_map(|finst| {
+                    guard
+                        .exchange_receiver_ports
+                        .get(finst)
+                        .map(|port| (*finst, Arc::clone(port)))
+                })
+                .collect::<Vec<_>>();
+            (query_id, cancellation, finsts, exchange_ports)
         };
-        let (query_id, cancellation, finsts) = collected;
+        let (query_id, cancellation, finsts, exchange_ports) = collected;
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(query_id, cancellation);
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
+        }
+        for (fragment_instance_id, port) in exchange_ports {
+            port.cancel_fragment(fragment_instance_id);
         }
         if finsts.is_empty() {
             return FinstCancelResult {
@@ -1463,17 +1519,8 @@ impl QueryContextManager {
     pub(crate) fn propagate_sender_error(&self, finst_id: UniqueId, err: String) -> Vec<UniqueId> {
         let result = self.cancel_finst(finst_id, format!("exchange send failed: {err}"));
         match result.query_id {
-            Some(_) => {
-                let finsts = result.finsts;
-                for id in &finsts {
-                    crate::runtime::exchange::cancel_fragment(id.high(), id.low());
-                }
-                finsts
-            }
-            None => {
-                crate::runtime::exchange::cancel_fragment(finst_id.high(), finst_id.low());
-                vec![finst_id]
-            }
+            Some(_) => result.finsts,
+            None => vec![finst_id],
         }
     }
 
@@ -1571,7 +1618,7 @@ impl QueryContextManager {
 #[cfg(test)]
 mod fragment_cancellation_boundary_tests {
     use crate::common::types::UniqueId;
-    use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
+    use novarocks_execution::exec::pipeline::global_driver_executor::FragmentCompletion;
 
     use super::{QueryContextManager, QueryId};
 
@@ -1737,7 +1784,6 @@ mod sender_error_tests {
 
     use super::{QueryContextManager, QueryContextManagerInner, QueryId};
     use crate::common::types::UniqueId;
-    use crate::runtime::exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state};
 
     fn test_manager() -> QueryContextManager {
         QueryContextManager {
@@ -1752,53 +1798,27 @@ mod sender_error_tests {
         let qid = QueryId::new(11, 22);
         let finst_a = UniqueId::new(101, 201);
         let finst_b = UniqueId::new(102, 202);
-        let key_a = ExchangeKey {
-            finst_id_hi: finst_a.high(),
-            finst_id_lo: finst_a.low(),
-            node_id: 301,
-        };
-        let key_b = ExchangeKey {
-            finst_id_hi: finst_b.high(),
-            finst_id_lo: finst_b.low(),
-            node_id: 302,
-        };
 
         mgr.get_or_register(qid, false, Duration::from_secs(1), Duration::from_secs(5))
             .expect("query context must be created");
         mgr.register_finst(finst_a, qid);
         mgr.register_finst(finst_b, qid);
-        set_expected_senders(key_a, 1);
-        set_expected_senders(key_b, 1);
-
-        assert!(snapshot_receiver_state(key_a).is_some());
-        assert!(snapshot_receiver_state(key_b).is_some());
 
         let mut finsts = mgr.propagate_sender_error(finst_a, "connection refused".into());
         finsts.sort_by_key(|id| (id.high(), id.low()));
 
         assert_eq!(finsts, vec![finst_a, finst_b]);
         assert!(mgr.is_query_canceled(qid));
-        assert!(snapshot_receiver_state(key_a).is_none());
-        assert!(snapshot_receiver_state(key_b).is_none());
     }
 
     #[test]
     fn unmapped_finst_cancels_its_own_receiver_only() {
         let mgr = test_manager();
         let finst = UniqueId::new(201, 202);
-        let key = ExchangeKey {
-            finst_id_hi: finst.high(),
-            finst_id_lo: finst.low(),
-            node_id: 401,
-        };
-
-        set_expected_senders(key, 1);
-        assert!(snapshot_receiver_state(key).is_some());
 
         let finsts = mgr.propagate_sender_error(finst, "broken pipe".into());
 
         assert_eq!(finsts, vec![finst]);
-        assert!(snapshot_receiver_state(key).is_none());
     }
 }
 
@@ -2016,7 +2036,7 @@ mod incremental_scan_domain_tests {
 
     use super::{QueryContextManager, QueryContextManagerInner, QueryId};
     use crate::common::types::UniqueId;
-    use crate::exec::node::scan::IncrementalScanRange;
+    use novarocks_execution::exec::node::scan::IncrementalScanRange;
     use novarocks_types::SlotId;
 
     fn manager() -> QueryContextManager {

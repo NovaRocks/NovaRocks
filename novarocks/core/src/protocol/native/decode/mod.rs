@@ -50,9 +50,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{NativePlanDecodeContext, decode_node};
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::ExecNodeKind;
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_protocol::{common, expr, plan};
     use novarocks_types::SlotId;
 

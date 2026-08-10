@@ -25,8 +25,8 @@ use std::collections::BTreeSet;
 use sha2::{Digest, Sha256};
 
 use crate::common::types::UniqueId;
-use crate::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
+use novarocks_execution::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_protocol::novarocks;
 

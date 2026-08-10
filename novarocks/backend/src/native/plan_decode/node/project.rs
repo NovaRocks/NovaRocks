@@ -21,11 +21,13 @@ use std::sync::Arc;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentLeafDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::exec::chunk::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::node::project::ProjectNode;
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_execution::exec::chunk::{
+    ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
+};
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::project::ProjectNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{expr, plan};
 use novarocks_types::SlotId;
 

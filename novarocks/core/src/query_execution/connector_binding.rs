@@ -284,7 +284,7 @@ fn connector_writer_fragment_instance_bytes(value: crate::common::types::UniqueI
 }
 
 fn placement_socket_addr(
-    endpoint: &crate::runtime::endpoint::RuntimeEndpoint,
+    endpoint: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
 ) -> Result<SocketAddr, DistributedQueryError> {
     let ip = endpoint.host().parse::<IpAddr>().map_err(|_| {
         contract_error(format!(

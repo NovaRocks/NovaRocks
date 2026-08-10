@@ -513,7 +513,7 @@ pub fn render_metrics_json() -> Result<String, String> {
 
 fn refresh_backend_gauges() {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL);
-    crate::runtime::fragment::io::exchange_metrics::ensure_exchange_metrics_registered();
+    novarocks_execution::runtime::fragment::io::exchange_metrics::ensure_exchange_metrics_registered();
     Lazy::force(&HEARTBEAT_RTT_SECONDS);
     Lazy::force(&LIVE_BACKENDS);
     Lazy::force(&BACKENDS_BY_STATE);
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn rendered_metrics_include_cluster_core_names() {
         observe_fragments_scheduled(1);
-        crate::runtime::fragment::io::exchange_metrics::observe_exchange_shuffle_bytes(7);
+        novarocks_execution::runtime::fragment::io::exchange_metrics::observe_exchange_shuffle_bytes(7);
         observe_backend_heartbeat_rtt(Duration::from_millis(5));
 
         let body = render_metrics().expect("render metrics");

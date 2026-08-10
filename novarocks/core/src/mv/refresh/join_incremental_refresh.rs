@@ -193,7 +193,7 @@ pub(crate) fn allocate_join_coalesce_locator_column_ids(
         file: factory
             .create(
                 None,
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+                novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
                 arrow::datatypes::DataType::Utf8,
                 true,
             )
@@ -201,7 +201,7 @@ pub(crate) fn allocate_join_coalesce_locator_column_ids(
         pos: factory
             .create(
                 None,
-                crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+                novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
                 arrow::datatypes::DataType::Int64,
                 true,
             )
@@ -209,7 +209,7 @@ pub(crate) fn allocate_join_coalesce_locator_column_ids(
         row_id: factory
             .create(
                 None,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
                 arrow::datatypes::DataType::Int64,
                 true,
             )
@@ -217,7 +217,7 @@ pub(crate) fn allocate_join_coalesce_locator_column_ids(
         last_updated_sequence_number: factory
             .create(
                 None,
-                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 arrow::datatypes::DataType::Int64,
                 true,
             )

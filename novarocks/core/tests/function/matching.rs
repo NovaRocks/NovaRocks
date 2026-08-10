@@ -18,8 +18,10 @@
 use crate::common;
 use arrow::array::BooleanArray;
 use arrow::datatypes::DataType;
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::expr::function::matching::{eval_ilike, eval_like, eval_regexp, register};
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::expr::function::matching::{
+    eval_ilike, eval_like, eval_regexp, register,
+};
 
 // ---------------------------------------------------------------------------
 // like tests (testing like_match via public eval_like)
@@ -158,7 +160,7 @@ fn test_regexp_partial_match() {
 
 #[test]
 fn test_register_matching_functions() {
-    use novarocks::exec::expr::function::FunctionKind;
+    use novarocks_execution::exec::expr::function::FunctionKind;
     use std::collections::HashMap;
 
     let mut m = HashMap::new();

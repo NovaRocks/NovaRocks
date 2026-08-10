@@ -19,10 +19,10 @@ use super::super::NativeFragmentDecodeError;
 use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64};
 use super::sort::{lower_sort_items_with_context, parse_sort_topn_type};
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::expr::ExprArena;
-use crate::exec::node::sort::SortNode;
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::sort::SortNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_topn_node(
@@ -113,9 +113,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::exec::expr::ExprArena;
-    use crate::exec::node::ExecNodeKind;
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_protocol::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

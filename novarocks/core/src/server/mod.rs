@@ -43,9 +43,9 @@ use tokio::task::{self, JoinSet};
 use tracing::{info, warn};
 
 use crate::common::engine_error::{EngineError, EngineErrorCode};
-use crate::common::failpoint::{self, FailPointMode};
 use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
+use novarocks_execution::exec::failpoint::{self, FailPointMode};
 
 use self::encoding::write_query_result;
 use crate::engine::statement::{

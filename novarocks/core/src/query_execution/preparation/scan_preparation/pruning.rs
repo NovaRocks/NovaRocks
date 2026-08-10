@@ -17,7 +17,7 @@
 
 pub(super) fn native_scan_min_max_predicates(
     predicates: &[crate::sql::analysis::TypedExpr],
-) -> Vec<crate::common::min_max_predicate::MinMaxPredicate> {
+) -> Vec<novarocks_execution::exec::min_max_predicate::MinMaxPredicate> {
     let mut out = Vec::new();
     for predicate in predicates {
         collect_native_min_max_predicates(predicate, &mut out);
@@ -27,7 +27,7 @@ pub(super) fn native_scan_min_max_predicates(
 
 fn collect_native_min_max_predicates(
     expr: &crate::sql::analysis::TypedExpr,
-    out: &mut Vec<crate::common::min_max_predicate::MinMaxPredicate>,
+    out: &mut Vec<novarocks_execution::exec::min_max_predicate::MinMaxPredicate>,
 ) {
     use crate::sql::analysis::{BinOp, ExprKind};
 
@@ -69,9 +69,9 @@ fn native_min_max_comparison(
     column: &crate::sql::analysis::TypedExpr,
     op: crate::sql::analysis::BinOp,
     literal: &crate::sql::analysis::TypedExpr,
-) -> Option<crate::common::min_max_predicate::MinMaxPredicate> {
-    use crate::common::min_max_predicate::MinMaxPredicate;
+) -> Option<novarocks_execution::exec::min_max_predicate::MinMaxPredicate> {
     use crate::sql::analysis::{BinOp, ExprKind};
+    use novarocks_execution::exec::min_max_predicate::MinMaxPredicate;
 
     let ExprKind::ColumnRef { column: name, .. } = &column.kind else {
         return None;
@@ -107,10 +107,10 @@ fn native_min_max_comparison(
 
 fn native_min_max_literal(
     expr: &crate::sql::analysis::TypedExpr,
-) -> Option<crate::common::min_max_predicate::MinMaxPredicateValue> {
-    use crate::common::min_max_predicate::MinMaxPredicateValue;
+) -> Option<novarocks_execution::exec::min_max_predicate::MinMaxPredicateValue> {
     use crate::sql::analysis::{ExprKind, LiteralValue};
     use arrow::datatypes::{DataType, TimeUnit};
+    use novarocks_execution::exec::min_max_predicate::MinMaxPredicateValue;
 
     let ExprKind::Literal(literal) = &expr.kind else {
         return None;

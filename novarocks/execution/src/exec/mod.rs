@@ -17,5 +17,23 @@
 
 //! Single-fragment execution kernels with no application-owner dependency.
 
+pub mod change_op;
+pub mod chunk;
+pub mod dict_encode;
+pub mod expr;
+pub mod failpoint;
+pub mod fragment;
+pub mod hash_table;
+pub mod hll;
+pub mod lookup;
+pub mod min_max_predicate;
 pub mod mv;
+pub mod node;
+pub mod operators;
+pub mod percentile;
+pub mod pipeline;
+pub mod row_position;
+pub mod runtime_filter;
+pub mod sketch_hash;
+pub mod spill;
 pub mod statistics;

@@ -23,9 +23,9 @@ use parquet::basic::Compression;
 
 use crate::connector::iceberg::commit::EqualityDeleteColumn;
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorBinding;
-use crate::exec::expr::{ExprArena, ExprId};
 use crate::fs::object_store_credentials::ObjectStoreCredentials;
 use novarocks_connector_iceberg::delete_file::IcebergFileFormat;
+use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_fs::ObjectStoreConfig;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

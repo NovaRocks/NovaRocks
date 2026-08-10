@@ -28,9 +28,9 @@ use novarocks_spi::connector::{
     ConnectorReaderMetricsSnapshot, ConnectorScanUnitFactsSummary, ConnectorSplit,
 };
 
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::node::ExecResult;
-use crate::exec::node::scan::{
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
+use novarocks_execution::exec::node::ExecResult;
+use novarocks_execution::exec::node::scan::{
     BoundScanRanges, ConnectorRowPosition, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
     ScanMorsels, ScanOp, ScanSource,
 };
@@ -927,7 +927,7 @@ impl ScanOp for ConnectorReadScanOp {
         morsel: ScanMorsel,
         profile: Option<RuntimeProfile>,
         _runtime_filters: Option<&RuntimeFilterContext>,
-    ) -> Result<crate::exec::node::BoxedExecIter, String> {
+    ) -> Result<novarocks_execution::exec::node::BoxedExecIter, String> {
         let index = match morsel {
             ScanMorsel::ConnectorScanUnit { index, .. } => index,
             _ => {

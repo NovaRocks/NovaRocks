@@ -395,7 +395,9 @@ pub(crate) fn acquire_metadata_planning_lease(
     metadata_binding(controls, catalog)
 }
 
-pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
+pub(crate) use novarocks_execution::exec::min_max_predicate::{
+    MinMaxPredicate, MinMaxPredicateValue,
+};
 
 pub use crate::connector::file_execution::FileScanRange;
 pub use crate::formats::FileFormatConfig;

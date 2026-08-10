@@ -20,8 +20,8 @@
 use arrow::datatypes::DataType;
 
 use super::lower_required_child;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::expr;
 
 use super::super::layout::Layout;

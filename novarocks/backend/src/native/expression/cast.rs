@@ -20,8 +20,8 @@
 use arrow::datatypes::DataType;
 
 use super::{decode_expr_at, decode_type, nested};
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::FieldPath;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::{common, expr};
 
 use super::NativeExpressionInputLayout;
@@ -144,7 +144,7 @@ mod tests {
         col, lower_err_with_slots, lower_with_slots, map_string_json_type, scalar_expr, type_desc,
     };
     use arrow::datatypes::{DataType, TimeUnit};
-    use novarocks::exec::expr::ExprNode;
+    use novarocks_execution::exec::expr::ExprNode;
     use novarocks_protocol::expr;
 
     #[test]

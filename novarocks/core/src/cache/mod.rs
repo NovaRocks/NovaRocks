@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use novarocks_execution::runtime::cache::ExternalDataCacheRangeOptions;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 /// Returns whether the process currently has a data-cache block store.
@@ -24,14 +25,6 @@ pub fn datacache_block_cache_available() -> bool {
     novarocks_fs::DataCacheManager::instance()
         .block_cache()
         .is_some()
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ExternalDataCacheRangeOptions {
-    pub modification_time: Option<i64>,
-    pub enable_populate_datacache: Option<bool>,
-    pub datacache_priority: Option<i32>,
-    pub candidate_node: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,7 +95,12 @@ impl CacheOptions {
         range_options: Option<&ExternalDataCacheRangeOptions>,
     ) -> Result<Self, String> {
         let file_range_options =
-            range_options.map(novarocks_fs::ExternalDataCacheRangeOptions::from);
+            range_options.map(|options| novarocks_fs::ExternalDataCacheRangeOptions {
+                modification_time: options.modification_time,
+                enable_populate_datacache: options.enable_populate_datacache,
+                datacache_priority: options.datacache_priority,
+                candidate_node: options.candidate_node.clone(),
+            });
         let effective = self
             .to_file_cache_options()
             .with_external_range_options(file_range_options.as_ref())?;
@@ -140,17 +138,6 @@ impl From<CacheOptions> for novarocks_fs::CacheOptions {
 impl From<&CacheOptions> for novarocks_fs::CacheOptions {
     fn from(options: &CacheOptions) -> Self {
         options.to_file_cache_options()
-    }
-}
-
-impl From<&ExternalDataCacheRangeOptions> for novarocks_fs::ExternalDataCacheRangeOptions {
-    fn from(options: &ExternalDataCacheRangeOptions) -> Self {
-        Self {
-            modification_time: options.modification_time,
-            enable_populate_datacache: options.enable_populate_datacache,
-            datacache_priority: options.datacache_priority,
-            candidate_node: options.candidate_node.clone(),
-        }
     }
 }
 

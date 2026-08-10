@@ -23,12 +23,12 @@ use arrow::datatypes::DataType;
 use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::project::ProjectNode;
-use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
-use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::node::project::ProjectNode;
+use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{common as proto_common, expr, plan};
 use novarocks_types::SlotId;
 
@@ -432,8 +432,8 @@ mod tests {
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
-    use crate::exec::expr::ExprArena;
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
     use novarocks_protocol::{common, expr, plan};
     use novarocks_types::SlotId;
 

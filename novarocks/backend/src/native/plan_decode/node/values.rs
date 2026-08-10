@@ -25,11 +25,11 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use novarocks::exec::expr::{ExprArena, cast_array_to_target};
-use novarocks::exec::node::values::ValuesNode;
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use novarocks_execution::exec::expr::{ExprArena, cast_array_to_target};
+use novarocks_execution::exec::node::values::ValuesNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{common as proto_common, plan};
 
 pub(super) fn lower_values_node(

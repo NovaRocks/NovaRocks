@@ -18,9 +18,9 @@
 //! Lambda expression lowering.
 
 use super::{decode_type, lower_required_child};
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::protocol::common::error::FieldPath;
 use arrow::datatypes::DataType;
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_protocol::expr;
 use novarocks_types::SlotId;
 
@@ -80,8 +80,8 @@ pub(crate) fn lower_lambda(
 #[cfg(test)]
 mod tests {
     use super::super::tests::{col, lower, lower_with_slots, scalar_expr, type_desc};
-    use crate::exec::expr::{ExprNode, function::FunctionKind};
     use arrow::datatypes::{DataType, Field};
+    use novarocks_execution::exec::expr::{ExprNode, function::FunctionKind};
     use novarocks_protocol::expr;
     use novarocks_types::SlotId;
     use std::sync::Arc;

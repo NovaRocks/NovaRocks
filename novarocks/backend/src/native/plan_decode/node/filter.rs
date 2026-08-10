@@ -16,10 +16,10 @@
 // under the License.
 
 use super::{DecodedNode, NativePlanDecodeContext};
-use novarocks::exec::expr::ExprArena;
-use novarocks::exec::node::filter::FilterNode;
-use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::node::filter::FilterNode;
+use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::plan;
 
 pub(super) fn lower_filter_node(

@@ -1239,7 +1239,7 @@ mod tests {
     use std::time::Duration;
 
     use novarocks::query_execution::lifecycle::AttemptId;
-    use novarocks::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_execution::runtime_filter::{
         RuntimeFilterBindOutcome, RuntimeFilterConsumerContract, RuntimeFilterSubscriptionHandle,
         RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome,

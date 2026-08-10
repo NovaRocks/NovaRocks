@@ -22,12 +22,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::exec::chunk::{Chunk, ChunkSchema};
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::function::object::{
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+use novarocks_execution::exec::expr::function::FunctionKind;
+use novarocks_execution::exec::expr::function::object::{
     eval_hll_hash, eval_object_function, eval_percentile_hash, eval_to_bitmap, register,
 };
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use novarocks_types::SlotId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -203,7 +203,7 @@ fn to_bitmap_ignores_negative_values() {
 
 #[test]
 fn percentile_hash_encodes_value_and_empty_state() {
-    use novarocks::common::percentile;
+    use novarocks_execution::exec::percentile;
 
     let mut arena = ExprArena::default();
     let arg = arena.push_typed(ExprNode::SlotId(SlotId(1)), DataType::Int32);

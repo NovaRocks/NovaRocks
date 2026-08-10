@@ -29,7 +29,7 @@ use novarocks::cache::CacheOptions;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
-use novarocks::runtime::fragment::FragmentSubmission;
+use novarocks_execution::runtime::fragment::FragmentSubmission;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::QueryId as ExecutionQueryId;
@@ -169,7 +169,7 @@ impl NativeFragmentRequest {
     }
     pub(crate) fn uses_result_sink(&self) -> bool {
         self.submission.program().sink().kind()
-            == novarocks::exec::fragment::program::FragmentSinkKind::Result
+            == novarocks_execution::exec::fragment::program::FragmentSinkKind::Result
     }
     pub(crate) fn root_plan_node_id(&self) -> i32 {
         self.submission.program().root_plan_node_id().get()

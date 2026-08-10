@@ -17,7 +17,9 @@
 
 use std::cmp::Ordering;
 
-use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue};
+use novarocks_execution::exec::min_max_predicate::{
+    MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -548,13 +550,13 @@ fn min_max_predicate_from_parts(
 
 #[cfg(test)]
 mod tests {
-    use crate::common::min_max_predicate::{
-        MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
-    };
     use crate::common::scan_predicate::{
         ColumnStats, MembershipPredicate, PruneVerdict, ScanLayer, ScanPredicate,
         ScanPredicateDomain, ScanPredicateDomainKind, ScanPredicateSource, ScanPruner, UnitId,
         prune_units,
+    };
+    use novarocks_execution::exec::min_max_predicate::{
+        MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
     };
 
     #[test]

@@ -69,7 +69,7 @@ pub(crate) fn build_join_first_refresh_append_logical_plan(
     // and is intentionally omitted by the projection builder below.
     let action_column_id = factory.create(
         None,
-        crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string(),
         DataType::Int8,
         false,
     );
@@ -82,7 +82,7 @@ pub(crate) fn build_join_first_refresh_append_logical_plan(
     );
     let action_column = join_full_refresh_output_column(
         action_column_id,
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
         DataType::Int8,
         false,
         true,
@@ -148,7 +148,7 @@ pub(crate) fn build_join_first_refresh_logical_plan(
     );
     let action_column_id = factory.create(
         None,
-        crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string(),
         DataType::Int8,
         false,
     );
@@ -161,7 +161,7 @@ pub(crate) fn build_join_first_refresh_logical_plan(
     );
     let action_column = join_full_refresh_output_column(
         action_column_id,
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+        novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
         DataType::Int8,
         false,
         true,
@@ -405,7 +405,7 @@ fn join_full_refresh_row_id_column(
 ) -> Result<OutputColumn, String> {
     let column = find_unique_scan_output_column(
         &scan.output_columns,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
         &format!("{role} row-id"),
     )?;
     if column.data_type != DataType::Int64 || column.nullable {
@@ -416,7 +416,7 @@ fn join_full_refresh_row_id_column(
     }
     Ok(join_full_refresh_output_column(
         column.column_id,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
         DataType::Int64,
         false,
         true,
@@ -760,7 +760,7 @@ mod tests {
             output_column(
                 factory,
                 qualifier,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
@@ -921,7 +921,7 @@ mod tests {
         assert!(
             outputs
                 .iter()
-                .any(|column| column.name == crate::exec::change_op::CHANGE_OP_COLUMN)
+                .any(|column| column.name == novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
         );
     }
 
@@ -945,7 +945,7 @@ mod tests {
         assert!(
             outputs
                 .iter()
-                .all(|column| column.name != crate::exec::change_op::CHANGE_OP_COLUMN)
+                .all(|column| column.name != novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
         );
     }
 

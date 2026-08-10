@@ -110,7 +110,7 @@ fn execute_connector_lookup_request(
         .collect::<Result<Vec<_>, _>>()?;
     let row_id_index = lookup_metas
         .iter()
-        .position(|meta| crate::exec::row_position::is_row_id(&meta.name));
+        .position(|meta| novarocks_execution::exec::row_position::is_row_id(&meta.name));
     let mut provider_fields = lookup_metas
         .iter()
         .map(|meta| meta.field.as_ref().clone())

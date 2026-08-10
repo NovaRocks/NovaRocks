@@ -22,8 +22,8 @@ use arrow::array::{
     StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
-use novarocks::exec::expr::function::array::*;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_execution::exec::expr::function::array::*;
+use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -1176,7 +1176,7 @@ fn test_array_intersect_preserves_decimalv2_hash_order() {
 
 #[test]
 fn test_array_join_ignore_null() {
-    use novarocks::exec::expr::ExprId;
+    use novarocks_execution::exec::expr::ExprId;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
@@ -1200,7 +1200,7 @@ fn test_array_join_ignore_null() {
 
 #[test]
 fn test_array_join_replace_null() {
-    use novarocks::exec::expr::ExprId;
+    use novarocks_execution::exec::expr::ExprId;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
@@ -1284,12 +1284,13 @@ fn test_array_length_const_cast_json_array() {
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
     let chunk = {
         let batch = batch;
-        let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId::new(1)],
-        )
-        .expect("chunk schema");
-        novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
+        let chunk_schema =
+            novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+        novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
     };
 
     let out = eval_array_length(&arena, expr, &[cast_expr], &chunk).unwrap();
@@ -1338,7 +1339,7 @@ fn eval_array_map_with_lambda() {
 
     let func = arena.push_typed(
         ExprNode::FunctionCall {
-            kind: novarocks::exec::expr::function::FunctionKind::ArrayMap,
+            kind: novarocks_execution::exec::expr::function::FunctionKind::ArrayMap,
             args: vec![lambda, arr1, arr2, arr3],
         },
         list_type.clone(),
@@ -1372,12 +1373,13 @@ fn eval_array_map_with_lambda() {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![col1, col2, col3]).unwrap();
     let chunk = {
         let batch = batch;
-        let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId::new(10), SlotId::new(11), SlotId::new(12)],
-        )
-        .expect("chunk schema");
-        novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
+        let chunk_schema =
+            novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(10), SlotId::new(11), SlotId::new(12)],
+            )
+            .expect("chunk schema");
+        novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
     };
 
     let result = arena.eval(func, &chunk).unwrap();
@@ -2046,7 +2048,7 @@ fn test_arrays_overlap() {
 
 #[test]
 fn test_element_at_returns_value() {
-    use novarocks::exec::expr::ExprId;
+    use novarocks_execution::exec::expr::ExprId;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let item_type = DataType::Int64;
@@ -2123,7 +2125,7 @@ fn test_element_at_out_of_bounds_errors_with_check() {
 
 #[test]
 fn test_register_array_functions() {
-    use novarocks::exec::expr::function::FunctionKind;
+    use novarocks_execution::exec::expr::function::FunctionKind;
     use std::collections::HashMap;
     let mut m = HashMap::new();
     register(&mut m);

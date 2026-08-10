@@ -518,10 +518,10 @@ fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<
                     "iceberg delta source file {} ({}) missing {}",
                     idx,
                     file.path,
-                    crate::exec::change_op::CHANGE_OP_COLUMN
+                    novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
                 )
             })?;
-            crate::exec::change_op::validate_change_op_value(op)?;
+            novarocks_execution::exec::change_op::validate_change_op_value(op)?;
             Ok(op)
         })
         .collect()
@@ -535,11 +535,11 @@ fn stamp_delta_table_def_change_ops(
 ) -> Result<(), String> {
     if table_def.columns.iter().any(|col| {
         col.name
-            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            .eq_ignore_ascii_case(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
     }) {
         return Err(format!(
             "iceberg delta source base table already has reserved column {}",
-            crate::exec::change_op::CHANGE_OP_COLUMN
+            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
         ));
     }
     if table_def
@@ -547,16 +547,16 @@ fn stamp_delta_table_def_change_ops(
         .iter()
         .any(|col| {
             col.name
-                .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+                .eq_ignore_ascii_case(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
         })
     {
         return Err(format!(
             "iceberg delta source metadata already contains reserved column {}",
-            crate::exec::change_op::CHANGE_OP_COLUMN
+            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
         ));
     }
 
-    let field = crate::exec::change_op::change_op_field();
+    let field = novarocks_execution::exec::change_op::change_op_field();
     table_def
         .iceberg_row_lineage_metadata_columns
         .push(ColumnDef {

@@ -709,7 +709,7 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-    use crate::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
     struct NeverCancelled;
 
