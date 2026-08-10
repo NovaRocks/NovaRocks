@@ -22,7 +22,7 @@ use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildStore {
@@ -153,7 +153,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_execution::runtime::mem_tracker::MemTracker;
     use novarocks_types::SlotId;
 
     use super::*;

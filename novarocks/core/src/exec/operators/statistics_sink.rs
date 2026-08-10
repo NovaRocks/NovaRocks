@@ -26,12 +26,12 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
+use novarocks_execution::exec::statistics::StatisticsBatchCollector;
 use novarocks_spi::connector::StatisticsMetricRequest;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::query_execution::statistics::StatisticsBatchCollector;
 use crate::runtime::runtime_state::RuntimeState;
 
 /// Read-only completion handle retained by the fragment host. A terminal

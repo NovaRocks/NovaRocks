@@ -38,8 +38,8 @@ use crate::runtime::fragment::io::exchange::{ExchangeFrame, ExchangeFrameTransmi
 use crate::runtime::fragment::io::exchange_queue::{
     ExchangeSendTask, ExchangeSendTracker, exchange_send_queue,
 };
-use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use arrow::datatypes::DataType;
+use novarocks_execution::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use novarocks_types::SlotId;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -50,8 +50,8 @@ use std::sync::{Mutex, OnceLock};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::profile::{ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use novarocks_execution::runtime::profile::{ProfileUnit, clamp_u128_to_i64};
 
 const NEED_INPUT_LOG_EVERY: u64 = 1;
 
@@ -1201,7 +1201,7 @@ struct DataStreamSinkOperator {
     error_state: Option<Arc<RuntimeErrorState>>,
     finish_state: Arc<DataStreamSinkFinishState>,
     profile_initialized: bool,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
     pending_chunks_mem_tracker: Option<Arc<MemTracker>>,
     pending_payload_mem_tracker: Option<Arc<MemTracker>>,
     send_queue_mem_tracker: Option<Arc<MemTracker>>,
@@ -1242,7 +1242,7 @@ impl Operator for DataStreamSinkOperator {
         self.send_queue_mem_tracker = Some(send_queue);
     }
 
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
+    fn set_profiles(&mut self, profiles: novarocks_execution::runtime::profile::OperatorProfiles) {
         self.profiles = Some(profiles);
     }
 

@@ -39,6 +39,9 @@ pub(crate) use parser::ast::{
     ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
 pub use parser::dialect::substitute_user_variables;
+pub fn extract_allow_throw_exception_hint(sql: &str) -> bool {
+    parser::set_var_hint::extract_allow_throw_exception(sql)
+}
 
 #[cfg(test)]
 mod common_tests {

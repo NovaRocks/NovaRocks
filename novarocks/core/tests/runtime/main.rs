@@ -18,7 +18,7 @@
 
 use crate::common::{TestConfig, test_query_id};
 use novarocks::runtime::exchange::{self, ExchangeKey};
-use novarocks::runtime::profile::Profiler;
+use novarocks_execution::runtime::profile::Profiler;
 use novarocks_types::UniqueId;
 
 #[path = "../common/mod.rs"]

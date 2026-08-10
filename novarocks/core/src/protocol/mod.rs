@@ -27,7 +27,7 @@ pub use common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFam
 /// to the core assembly kernel.
 pub fn decode_native_query_options(
     src: &novarocks_protocol::novarocks::QueryOptions,
-) -> Result<crate::runtime::query_options::QueryOptions, ProtocolError> {
+) -> Result<novarocks_execution::runtime::query_options::QueryOptions, ProtocolError> {
     native::query_options_contract::decode_query_options(src)
 }
 

@@ -26,12 +26,12 @@ use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolF
 use novarocks::runtime::fragment::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
-use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
     ScanRange, ScanRangeParams,
 };
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{common, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;

@@ -49,8 +49,8 @@ use crate::exec::spill::spiller::{SpillFile, Spiller};
 use crate::exec::spill::{SpillConfig, SpillMode, SpillProfile};
 use crate::novarocks_logging::debug;
 use crate::novarocks_logging::warn;
-use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_types::SlotId;
 
 static NEXT_EXCHANGE_ID: AtomicUsize = AtomicUsize::new(1);

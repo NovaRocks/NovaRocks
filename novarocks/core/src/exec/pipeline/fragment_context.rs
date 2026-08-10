@@ -34,9 +34,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use crate::exec::pipeline::schedule::event_scheduler::EventScheduler;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::io::{FragmentEventSink, NoopFragmentEventSink};
-use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::profile::Profiler;
 
 /// Fragment-scoped runtime context shared across drivers and operator instances.
 pub struct FragmentContext {

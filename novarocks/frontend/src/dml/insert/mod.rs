@@ -29,7 +29,7 @@ use novarocks::engine::statistics::{
     StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
 use crate::dml::service::DmlService;

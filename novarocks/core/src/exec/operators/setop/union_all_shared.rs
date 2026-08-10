@@ -32,8 +32,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 struct UnionAllState {
     buffer: VecDeque<Chunk>,

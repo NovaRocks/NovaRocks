@@ -46,9 +46,9 @@ use crate::exec::node::join::{JoinDistributionMode, JoinType};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::novarocks_logging::debug;
-use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
-use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::{MemTracker, TrackedBytes};
+use novarocks_execution::runtime::profile::clamp_u128_to_i64;
 
 /// Factory for hash-join build sinks that construct build-side hash structures.
 pub struct HashJoinBuildSinkFactory {
@@ -270,7 +270,7 @@ struct HashJoinBuildSinkOperator {
     build_null_key_rows: Option<Vec<u32>>,
     logged_first_input: bool,
     profile_initialized: bool,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
     input_rows: u64,
     input_chunks: u64,
     build_input_chunks_mem_tracker: Option<Arc<MemTracker>>,
@@ -300,7 +300,7 @@ impl Operator for HashJoinBuildSinkOperator {
         self.refresh_build_key_batches_accounting();
     }
 
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
+    fn set_profiles(&mut self, profiles: novarocks_execution::runtime::profile::OperatorProfiles) {
         self.profiles = Some(profiles);
     }
 
@@ -765,7 +765,7 @@ mod tests {
     use crate::exec::expr::{ExprNode, LiteralValue};
     use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind;
     use crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory;
-    use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
+    use novarocks_execution::runtime::profile::{OperatorProfiles, RuntimeProfile};
     use novarocks_execution::runtime_filter as execution;
     use novarocks_types::SlotId;
 

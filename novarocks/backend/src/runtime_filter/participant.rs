@@ -30,7 +30,7 @@ use std::time::Duration;
 use novarocks::query_execution::lifecycle::{
     QueryExecutionId, QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminationReason,
 };
-use novarocks::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
     RuntimeFilterBindOutcome, RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
     RuntimeFilterExecutionContract, RuntimeFilterFinalDomain, RuntimeFilterFinalDomainCompletion,

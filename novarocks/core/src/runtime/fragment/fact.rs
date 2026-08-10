@@ -17,8 +17,8 @@
 
 use crate::common::types::UniqueId;
 use crate::runtime::fragment::error::FragmentExecutionError;
-use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_context::QueryId;
+use novarocks_execution::runtime::profile::RuntimeProfileTree;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FragmentCancelReason {

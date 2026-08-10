@@ -104,9 +104,9 @@ mod tests {
     use crate::exec::node::scan::ScanMorsel;
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
-    use crate::runtime::query_options::QueryOptions;
     use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use novarocks_connector_iceberg::delta::DeltaSourceRole;
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_protocol::{common, expr, novarocks, plan};
     use novarocks_types::SlotId;
 

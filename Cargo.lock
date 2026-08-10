@@ -3295,6 +3295,8 @@ name = "novarocks-execution"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bytes",
+ "datasketches",
  "novarocks-spi",
  "novarocks-types",
  "sha2",
@@ -3315,6 +3317,7 @@ dependencies = [
  "novarocks",
  "novarocks-catalog",
  "novarocks-connector-starrocks",
+ "novarocks-execution",
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-state-store",

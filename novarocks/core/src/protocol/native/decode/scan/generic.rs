@@ -41,7 +41,7 @@ use crate::formats::parquet::{
 };
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::runtime::query_context::{QueryId, query_context_manager};
-use crate::runtime::query_options::query_expire_durations;
+use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_protocol::plan;
 use novarocks_types::SlotId;
 

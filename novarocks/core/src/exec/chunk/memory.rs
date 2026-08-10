@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{Array, ArrayData, RecordBatch};
 use arrow::buffer::Buffer;
 
-use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 /// Estimate RecordBatch size by summing unique buffers inside the batch.
 ///

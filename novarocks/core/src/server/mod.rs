@@ -1886,8 +1886,8 @@ mod legacy {
         runtime_filter_scan_wait_time_ms: Option<i64>,
         runtime_filter_wait_timeout_ms: Option<i32>,
         allow_throw_exception: bool,
-    ) -> crate::runtime::query_options::QueryOptions {
-        crate::runtime::query_options::QueryOptions {
+    ) -> novarocks_execution::runtime::query_options::QueryOptions {
+        novarocks_execution::runtime::query_options::QueryOptions {
             group_concat_max_len: Some(group_concat_max_len),
             query_timeout: query_timeout_secs.and_then(|secs| i32::try_from(secs).ok()),
             pipeline_dop,
@@ -2395,7 +2395,7 @@ mod legacy {
                 Some(5_000),
                 true,
             );
-            let expected = crate::runtime::query_options::QueryOptions {
+            let expected = novarocks_execution::runtime::query_options::QueryOptions {
                 group_concat_max_len: Some(65_535),
                 query_timeout: Some(60),
                 pipeline_dop: Some(8),

@@ -25,7 +25,7 @@ use crate::query_execution::contract::{
 };
 use crate::query_execution::schedule::FragmentLifecycleProjection;
 use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 use super::manifest::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,

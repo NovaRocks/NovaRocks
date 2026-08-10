@@ -52,8 +52,8 @@ use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::RuntimeFilterProducerFailure;
 use novarocks_types::SlotId;
 

@@ -156,9 +156,9 @@ mod tests {
         BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
-    use crate::runtime::profile::RuntimeProfile;
     use crate::runtime::query_context::QueryId;
-    use crate::runtime::query_options::QueryOptions;
+    use novarocks_execution::runtime::profile::RuntimeProfile;
+    use novarocks_execution::runtime::query_options::QueryOptions;
 
     use super::materialize_scan_bindings;
 

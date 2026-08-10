@@ -42,9 +42,9 @@ use crate::runtime::fragment::runtime_state::{
 use crate::runtime::fragment::scan::materialize_scan_bindings;
 use crate::runtime::fragment::sink::materialize_fragment_sink_with_result;
 use crate::runtime::fragment::submission::FragmentSubmission;
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 pub struct FragmentPrepareContext {
@@ -609,8 +609,8 @@ mod tests {
     };
     use crate::runtime::fragment::submission::FragmentSubmission;
     use crate::runtime::query_context::QueryId;
-    use crate::runtime::query_options::QueryOptions;
     use crate::runtime::{result_buffer, sink_commit};
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_types::SlotId;
 
     use super::StartFailurePoint;

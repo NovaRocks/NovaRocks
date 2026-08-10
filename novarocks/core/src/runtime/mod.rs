@@ -26,11 +26,9 @@ pub(crate) mod fragment_output;
 pub mod global_async_runtime;
 pub mod io;
 pub mod lookup;
-pub mod mem_tracker;
 pub mod native_fragment_query;
-pub mod profile;
+pub(crate) mod profile_codec;
 pub(crate) mod query_context;
-pub mod query_options;
 pub mod query_result;
 pub mod user_variable;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.

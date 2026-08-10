@@ -25,7 +25,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
-use crate::runtime::profile::clamp_u128_to_i64;
+use novarocks_execution::runtime::profile::clamp_u128_to_i64;
 
 pub(crate) const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
 

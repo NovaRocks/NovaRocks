@@ -28,11 +28,11 @@ use crate::exec::node::runtime_filter::{
 };
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::profile::{
-    OperatorProfiles, ProfileUnit, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS,
-};
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::compute::filter_record_batch;
+use novarocks_execution::runtime::profile::{
+    OperatorProfiles, ProfileUnit, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS,
+};
 
 pub(crate) struct NativeOrderedLiveConsumerSet {
     inner: Arc<NativeOrderedLiveConsumerInner>,

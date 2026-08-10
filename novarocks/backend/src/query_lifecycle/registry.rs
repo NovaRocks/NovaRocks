@@ -35,8 +35,8 @@ use novarocks::query_execution::lifecycle::{
     RuntimeFilterContribution, StageDigest, StageDigestVersion,
 };
 use novarocks::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
-use novarocks::runtime::profile::RuntimeProfileTree;
 use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
+use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_types::UniqueId;
 use prost::Message;

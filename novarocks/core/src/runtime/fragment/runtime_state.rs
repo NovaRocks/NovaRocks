@@ -23,11 +23,11 @@ use crate::common::config::{
 };
 use crate::common::types::UniqueId;
 use crate::exec::spill::QuerySpillManager;
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
-use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::profile::Profiler;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 pub(crate) struct RuntimeStateInputs {

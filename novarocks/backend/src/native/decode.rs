@@ -156,7 +156,9 @@ impl NativeFragmentRequest {
         self.query_options().runtime_profile_report_interval()
     }
     pub(crate) fn query_expire_durations(&self) -> (Duration, Duration) {
-        novarocks::runtime::query_options::query_expire_durations(Some(self.query_options()))
+        novarocks_execution::runtime::query_options::query_expire_durations(Some(
+            self.query_options(),
+        ))
     }
     pub(crate) fn cache_options(&self) -> Result<CacheOptions, NativeFragmentIngressError> {
         CacheOptions::from_query_options(Some(self.query_options()))
@@ -176,7 +178,7 @@ impl NativeFragmentRequest {
         self.submission
     }
 
-    fn query_options(&self) -> &novarocks::runtime::query_options::QueryOptions {
+    fn query_options(&self) -> &novarocks_execution::runtime::query_options::QueryOptions {
         self.submission.instance().runtime_options().query_options()
     }
 }

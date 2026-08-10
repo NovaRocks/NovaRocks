@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::runtime::profile::RuntimeProfile;
+use novarocks_execution::runtime::profile::RuntimeProfile;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct QueryKey {
@@ -422,7 +422,7 @@ fn format_drop_reasons(reasons: &[RfDropReason]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::profile::RuntimeProfile;
+    use novarocks_execution::runtime::profile::RuntimeProfile;
     use std::thread;
 
     #[test]

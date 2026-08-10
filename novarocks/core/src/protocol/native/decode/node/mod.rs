@@ -61,8 +61,8 @@ use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use crate::runtime::query_context::QueryId;
-use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{novarocks, plan};
 
 #[derive(Clone, Debug)]
@@ -838,7 +838,7 @@ mod tests {
         fn execute_iter(
             &self,
             _morsel: crate::exec::node::scan::ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
             _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
         ) -> Result<crate::exec::node::BoxedExecIter, String> {
             Ok(Box::new(std::iter::empty()))

@@ -370,7 +370,7 @@ mod tests {
     };
     use crate::runtime::fragment::io::ExchangeFrameTransmitter;
     use crate::runtime::query_context::QueryId;
-    use crate::runtime::query_options::QueryOptions;
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_types::SlotId;
 
     use super::{materialize_fragment_sink, materialize_fragment_sink_components};

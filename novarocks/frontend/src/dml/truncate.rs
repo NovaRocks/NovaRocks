@@ -29,7 +29,7 @@ use novarocks::engine::truncate_engine::{
     TruncatePlanError, TruncatePlanFacts, TruncateReceipt,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorDataMutationPlanSummary, ConnectorDataMutationReceipt, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationOperationId,

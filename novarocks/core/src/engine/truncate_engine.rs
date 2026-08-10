@@ -36,8 +36,8 @@ use crate::connector::data_mutation::{
 };
 use crate::engine::StandaloneState;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::runtime::query_options::QueryOptions;
 use crate::sql::parser::ast::{ObjectName, Statement};
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TruncateCommand {

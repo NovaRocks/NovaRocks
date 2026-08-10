@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 /// Returns whether the process currently has a data-cache block store.
 ///
@@ -184,7 +184,7 @@ fn parse_non_negative_i64(name: &str, value: i64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::CacheOptions;
-    use crate::runtime::query_options::{QueryCacheOptions, QueryOptions};
+    use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
 
     #[test]
     fn cache_switches_are_disabled_when_query_options_missing() {

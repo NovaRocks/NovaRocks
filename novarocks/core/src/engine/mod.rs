@@ -32,10 +32,10 @@ use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::novarocks_config;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
 };
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRepository};
 use crate::connector::{IcebergCatalogRegistry, iceberg_namespace_exists};
@@ -6074,9 +6074,9 @@ mod tests {
         DistributedQueryRequest,
     };
     use crate::query_execution::service::QueryExecutionService;
-    use crate::runtime::query_options::QueryOptions;
     use arrow::array::{Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;

@@ -31,7 +31,7 @@ use novarocks::query_execution::lifecycle::{
 use novarocks::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
-use novarocks::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{common, filter, novarocks as proto_novarocks, plan};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;

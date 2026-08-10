@@ -34,8 +34,8 @@ use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::statistics::StatisticsEngine;
 use crate::engine::{StandaloneState, iceberg_writer};
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
-use crate::runtime::query_options::QueryOptions;
 use crate::sql::parser::ast::{Literal, ObjectName};
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 /// Parse one statement through NovaRocks' StarRocks normalizer and return its
 /// raw INSERT AST.

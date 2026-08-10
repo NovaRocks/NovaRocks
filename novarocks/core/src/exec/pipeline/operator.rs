@@ -31,10 +31,10 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::FragmentEventSink;
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::datatypes::DataType;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::profile::OperatorProfiles;
 use novarocks_types::SlotId;
 use std::sync::Arc;
 

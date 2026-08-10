@@ -43,10 +43,12 @@ use crate::novarocks_logging::{debug, error};
 use crate::runtime::fragment::io::{
     FragmentEvent, FragmentEventSink, FragmentProgress, NoopFragmentEventSink,
 };
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
-use crate::runtime::profile::{CounterRef, OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::profile::Profiler;
+use novarocks_execution::runtime::profile::{
+    CounterRef, OperatorProfiles, ProfileUnit, clamp_u128_to_i64,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Runtime state for a single pipeline driver.

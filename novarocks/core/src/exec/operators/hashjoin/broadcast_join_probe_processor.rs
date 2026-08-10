@@ -173,7 +173,7 @@ struct BroadcastJoinProbeProcessorOperator {
     input_chunks: usize,
     buffered_rows: usize,
     profile_initialized: bool,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
 }
 
 impl Operator for BroadcastJoinProbeProcessorOperator {
@@ -181,7 +181,7 @@ impl Operator for BroadcastJoinProbeProcessorOperator {
         &self.name
     }
 
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
+    fn set_profiles(&mut self, profiles: novarocks_execution::runtime::profile::OperatorProfiles) {
         self.profiles = Some(profiles);
     }
 

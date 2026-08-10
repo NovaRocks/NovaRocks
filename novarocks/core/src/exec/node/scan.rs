@@ -23,7 +23,7 @@ use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
-use crate::runtime::profile::RuntimeProfile;
+use novarocks_execution::runtime::profile::RuntimeProfile;
 use novarocks_spi::connector::{
     ConnectorExecutionBinding, ConnectorPreparedScanUnit, ConnectorSplit,
 };

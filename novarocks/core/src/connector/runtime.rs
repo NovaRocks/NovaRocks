@@ -34,7 +34,7 @@ use crate::exec::node::scan::{
     BoundScanRanges, ConnectorRowPosition, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
     ScanMorsels, ScanOp, ScanSource,
 };
-use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
+use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 
 pub(crate) struct ConnectorBatchReaderIter {
     reader: Option<Box<dyn ConnectorBatchReader>>,

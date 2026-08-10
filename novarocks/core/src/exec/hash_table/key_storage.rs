@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowKey {

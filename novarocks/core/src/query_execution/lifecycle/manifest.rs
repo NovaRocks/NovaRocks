@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::common::types::UniqueId;
 use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 use super::contract::{QueryLifecycleError, QueryLifecycleErrorCode};
 use super::digest::digest_v1;
@@ -458,7 +458,7 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::contract::QueryLifecycleErrorCode;
     use crate::query_execution::lifecycle::identity::{AttemptId, QueryExecutionId};
-    use crate::runtime::query_options::QueryOptions;
+    use novarocks_execution::runtime::query_options::QueryOptions;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(

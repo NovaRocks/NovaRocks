@@ -26,7 +26,7 @@ use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId};
 use crate::exec::node::scan::BoundScanRanges;
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::query_context::QueryId;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FragmentInstanceId(UniqueId);
@@ -284,8 +284,8 @@ mod tests {
     use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::query_context::QueryId;
-    use crate::runtime::query_options::QueryOptions;
     use crate::runtime::scan_range::{FileFormat, ScanRange, ScanRangeParams};
+    use novarocks_execution::runtime::query_options::QueryOptions;
 
     use super::*;
 

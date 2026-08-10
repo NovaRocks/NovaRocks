@@ -17,37 +17,36 @@
 
 use std::time::Duration;
 
-use crate::exec::spill::SpillConfig;
+use crate::runtime::spill_config::SpillConfig;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct QueryOptions {
-    pub(crate) batch_size: Option<i32>,
-    pub(crate) query_timeout: Option<i32>,
-    pub(crate) query_delivery_timeout: Option<i32>,
-    pub(crate) enable_profile: bool,
-    pub(crate) runtime_profile_report_interval: Option<i64>,
-    pub(crate) pipeline_dop: Option<i32>,
-    pub(crate) exec_mem_limit: Option<i64>,
-    pub(crate) connector_io_tasks_per_scan_operator: Option<i32>,
-    pub(crate) orc_use_column_names: bool,
-    pub(crate) enable_file_metacache: bool,
-    pub(crate) enable_file_pagecache: bool,
-    pub(crate) enable_parquet_reader_page_index: bool,
-    pub(crate) runtime_filter_scan_wait_time_ms: Option<i64>,
-    pub(crate) runtime_filter_wait_timeout_ms: Option<i32>,
-    pub(crate) allow_throw_exception: bool,
-    pub(crate) group_concat_max_len: Option<i64>,
-    pub(crate) enable_join_runtime_bitset_filter: Option<bool>,
-    pub(crate) global_runtime_filter_build_max_size: Option<i64>,
-    pub(crate) cache: QueryCacheOptions,
-    pub(crate) spill: Option<SpillConfig>,
+    pub batch_size: Option<i32>,
+    pub query_timeout: Option<i32>,
+    pub query_delivery_timeout: Option<i32>,
+    pub enable_profile: bool,
+    pub runtime_profile_report_interval: Option<i64>,
+    pub pipeline_dop: Option<i32>,
+    pub exec_mem_limit: Option<i64>,
+    pub connector_io_tasks_per_scan_operator: Option<i32>,
+    pub orc_use_column_names: bool,
+    pub enable_file_metacache: bool,
+    pub enable_file_pagecache: bool,
+    pub enable_parquet_reader_page_index: bool,
+    pub runtime_filter_scan_wait_time_ms: Option<i64>,
+    pub runtime_filter_wait_timeout_ms: Option<i32>,
+    pub allow_throw_exception: bool,
+    pub group_concat_max_len: Option<i64>,
+    pub enable_join_runtime_bitset_filter: Option<bool>,
+    pub global_runtime_filter_build_max_size: Option<i64>,
+    pub cache: QueryCacheOptions,
+    pub spill: Option<SpillConfig>,
 }
 
 /// Protocol-neutral query execution options captured at an ingress boundary.
 ///
-/// The execution kernel keeps its `QueryOptions` representation private; an
-/// adapter constructs it through this value object instead of mutating runtime
-/// state field-by-field.
+/// An ingress adapter can construct `QueryOptions` through this value object
+/// without coupling to a protocol or application owner.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct QueryOptionsParts {
     pub batch_size: Option<i32>,
@@ -73,12 +72,9 @@ pub struct QueryOptionsParts {
 }
 
 impl QueryOptions {
-    /// Applies the per-statement optimizer hints that affect runtime
-    /// expression semantics. These hints must be attached before a query is
-    /// prepared so that every distributed fragment receives the same options.
-    pub fn apply_sql_hints(&mut self, sql: &str) {
-        self.allow_throw_exception =
-            crate::sql::parser::set_var_hint::extract_allow_throw_exception(sql);
+    /// Records an SQL-owner decision already parsed at the ingress boundary.
+    pub fn set_allow_throw_exception(&mut self, enabled: bool) {
+        self.allow_throw_exception = enabled;
     }
 
     pub fn from_parts(parts: QueryOptionsParts) -> Self {

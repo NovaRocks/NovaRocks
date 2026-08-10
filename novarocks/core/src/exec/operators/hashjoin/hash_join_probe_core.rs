@@ -49,7 +49,7 @@ use super::join_probe_utils::cross_join_batches;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
-use crate::runtime::profile::{CounterRef, clamp_u128_to_i64};
+use novarocks_execution::runtime::profile::{CounterRef, clamp_u128_to_i64};
 
 fn concat_compatible_batches(
     schema: &SchemaRef,

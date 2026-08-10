@@ -8,6 +8,8 @@ doctest = false
 
 [dependencies]
 arrow = { version = "58.2.0" }
+bytes = "1"
+datasketches = "0.2.0"
 novarocks-types = { path = "../types" }
 novarocks-spi = { path = "../spi" }
 sha2 = "0.10"

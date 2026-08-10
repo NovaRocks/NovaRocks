@@ -251,7 +251,7 @@ pub(super) fn output_column_data_type(
 }
 
 pub(super) fn scan_batch_size(
-    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
 ) -> Result<usize, NativeFragmentLeafDecodeError> {
     let Some(value) = query_options.and_then(|opts| opts.batch_size) else {
         return Ok(4096);

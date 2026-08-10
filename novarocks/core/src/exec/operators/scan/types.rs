@@ -29,8 +29,8 @@
 
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};

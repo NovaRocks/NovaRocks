@@ -32,8 +32,8 @@ use std::sync::Arc;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 use super::nljoin_shared::{NlJoinBuildArtifact, NlJoinSharedState};
 

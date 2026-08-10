@@ -43,9 +43,9 @@ use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::RowPositionSpec;
 use crate::novarocks_logging::debug;
 use crate::runtime::fragment::{FragmentEvent, FragmentEventSink};
-use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array};
 use arrow::compute::filter_record_batch;
+use novarocks_execution::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use novarocks_execution::runtime_filter::scan_domain::{
     RuntimeFilterScanUnitDecision, RuntimeFilterScanUnitInput, evaluate_scan_unit,
 };
@@ -126,7 +126,7 @@ pub(super) struct ScanAsyncRunner {
     conjunct_predicate: Option<ExprId>,
     conjunct_encoding_policy: Option<FilterEncodingPolicy>,
     arena: Arc<ExprArena>,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
     event_sink: Arc<dyn FragmentEventSink>,
     last_progress: Instant,
     last_log: Instant,
@@ -151,7 +151,7 @@ impl ScanAsyncRunner {
         native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
         native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
         arena: Arc<ExprArena>,
-        profiles: Option<crate::runtime::profile::OperatorProfiles>,
+        profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
         event_sink: Arc<dyn FragmentEventSink>,
         driver_id: i32,
     ) -> Self {
@@ -702,10 +702,10 @@ mod tests {
         RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter, RuntimeEmptyFilter,
         RuntimeFilterType, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
-    use crate::runtime::profile::{OperatorProfiles, Profiler};
     use arrow::array::{Array, DictionaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_execution::runtime::profile::{OperatorProfiles, Profiler};
     use novarocks_types::SlotId;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
@@ -720,7 +720,7 @@ mod tests {
         fn execute_iter(
             &self,
             _morsel: ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
             _runtime_filters: Option<&RuntimeFilterContext>,
         ) -> Result<BoxedExecIter, String> {
             Ok(Box::new(std::iter::empty()))
@@ -745,7 +745,7 @@ mod tests {
         fn execute_iter(
             &self,
             _morsel: ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
             _runtime_filters: Option<&RuntimeFilterContext>,
         ) -> Result<BoxedExecIter, String> {
             let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
@@ -782,7 +782,7 @@ mod tests {
         fn execute_iter(
             &self,
             _morsel: ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
             _runtime_filters: Option<&RuntimeFilterContext>,
         ) -> Result<BoxedExecIter, String> {
             Ok(Box::new(std::iter::once(Ok(self.chunk.clone()))))

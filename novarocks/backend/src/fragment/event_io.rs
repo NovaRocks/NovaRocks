@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use novarocks::query_execution::lifecycle::QueryExecutionId;
 use novarocks::runtime::fragment::{FragmentEvent, FragmentEventSink};
-use novarocks::runtime::profile::Profiler;
+use novarocks_execution::runtime::profile::Profiler;
 
 use crate::query_lifecycle::QueryLifecycleRegistry;
 

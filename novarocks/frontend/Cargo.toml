@@ -21,6 +21,7 @@ futures = "0.3"
 hex = "0.4"
 novarocks = { path = "../core" }
 novarocks-catalog = { path = "../catalog" }
+novarocks-execution = { path = "../execution" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 novarocks-state-store = { path = "../state-store" }

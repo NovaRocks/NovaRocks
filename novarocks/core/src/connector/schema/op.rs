@@ -634,7 +634,7 @@ impl ScanOp for SchemaScanOp {
     fn execute_iter(
         &self,
         morsel: ScanMorsel,
-        _profile: Option<crate::runtime::profile::RuntimeProfile>,
+        _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
         _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
     ) -> Result<BoxedExecIter, String> {
         match morsel {

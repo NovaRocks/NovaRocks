@@ -33,7 +33,7 @@ use super::driver::PipelineDriver;
 use super::fragment_context::FragmentContext;
 use super::operator_factory::OperatorFactory;
 use crate::novarocks_logging::debug;
-use crate::runtime::profile::OperatorProfiles;
+use novarocks_execution::runtime::profile::OperatorProfiles;
 
 /// One pipeline definition containing ordered operator factories and dependency links.
 pub struct Pipeline {

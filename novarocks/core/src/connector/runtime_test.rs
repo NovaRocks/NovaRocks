@@ -331,7 +331,7 @@ impl ConnectorBatchReader for MetricsReader {
 
 #[test]
 fn file_read_profile_receives_metrics_deltas_once() {
-    let profile = crate::runtime::profile::RuntimeProfile::new("file-read");
+    let profile = novarocks_execution::runtime::profile::RuntimeProfile::new("file-read");
     let reader = MetricsReader {
         step: 0,
         metrics: ConnectorReaderMetricsSnapshot::default(),
@@ -451,7 +451,7 @@ fn read_scan_profile_counts_prepared_units_before_reader_open() {
     )
     .expect("prepare source");
     let op = source.bind(BoundScanRanges::None).expect("bind source");
-    let profile = crate::runtime::profile::RuntimeProfile::new("connector");
+    let profile = novarocks_execution::runtime::profile::RuntimeProfile::new("connector");
     op.execute_iter(
         ScanMorsel::ConnectorScanUnit {
             index: 0,

@@ -42,7 +42,7 @@ use novarocks::query_execution::lifecycle::{
     QueryLifecycleIngress, QueryTerminalAck, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution,
 };
-use novarocks::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{filter, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;

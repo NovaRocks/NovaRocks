@@ -43,7 +43,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CtasCommand {

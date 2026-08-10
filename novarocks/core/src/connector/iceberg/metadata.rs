@@ -40,7 +40,7 @@ use crate::connector::runtime::ConnectorReadScanSource;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::ScanSource;
 use crate::runtime::query_context::{QueryId, query_context_manager};
-use crate::runtime::query_options::{QueryOptions, query_expire_durations};
+use novarocks_execution::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks_types::SlotId;
 
 /// Decode the JSON payload that the planner stamps onto

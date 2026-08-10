@@ -21,31 +21,10 @@ pub mod spill_channel;
 pub mod spill_stream;
 pub mod spiller;
 
-use crate::runtime::profile::{CounterRef, Profiler, RuntimeProfile};
+use novarocks_execution::runtime::profile::{CounterRef, Profiler, RuntimeProfile};
+pub use novarocks_execution::runtime::spill_config::{SpillConfig, SpillMode};
 
 pub use spill_channel::{SpillChannelHandle, SpillIoExecutor, SpillTask};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpillMode {
-    None,
-    Force,
-    Auto,
-    Random,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SpillConfig {
-    pub enable_spill: bool,
-    pub spill_mode: SpillMode,
-    pub spill_mem_limit_threshold: Option<f64>,
-    pub spill_operator_min_bytes: Option<i64>,
-    pub spill_operator_max_bytes: Option<i64>,
-    pub spill_encode_level: Option<i32>,
-    pub enable_spill_buffer_read: Option<bool>,
-    pub max_spill_read_buffer_bytes_per_driver: Option<i64>,
-    pub spill_mem_table_size: Option<i32>,
-    pub spill_mem_table_num: Option<i32>,
-}
 
 #[derive(Clone)]
 pub struct SpillContext {

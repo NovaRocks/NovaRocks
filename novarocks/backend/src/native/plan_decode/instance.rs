@@ -19,12 +19,12 @@ use std::collections::BTreeMap;
 
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
     ScanRange, ScanRangeParams,
 };
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_types::UniqueId;
 
 use novarocks_protocol::novarocks as native_proto;

@@ -129,7 +129,7 @@ struct ExchangeSourceOperator {
     logged_first_none: bool,
     arena: Arc<ExprArena>,
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
     receiver_mem_tracker_ready: bool,
 }
 
@@ -138,7 +138,7 @@ impl Operator for ExchangeSourceOperator {
         &self.name
     }
 
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
+    fn set_profiles(&mut self, profiles: novarocks_execution::runtime::profile::OperatorProfiles) {
         self.profiles = Some(profiles);
     }
 

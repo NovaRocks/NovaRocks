@@ -32,7 +32,7 @@ use novarocks::exec::fragment::sink::{
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks::runtime::fragment::FragmentSinkAssignment;
-use novarocks::runtime::query_options::query_expire_durations;
+use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_protocol::novarocks as native_proto;
 use novarocks_protocol::{common, expr, plan};
 use novarocks_spi::connector::{

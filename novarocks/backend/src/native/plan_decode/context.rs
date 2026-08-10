@@ -31,8 +31,8 @@ use novarocks::runtime::exchange::ExchangeKey;
 use novarocks::runtime::fragment::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
-use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::{common, expr};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 use novarocks_types::QueryId;

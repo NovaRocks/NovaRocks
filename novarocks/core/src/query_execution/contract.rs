@@ -32,7 +32,7 @@ use crate::query_execution::request_context::QueryExecutionContext;
 pub use crate::query_execution::statistics::StatisticsCollectionProgram;
 pub use crate::query_execution::statistics::StatisticsExecutionMode;
 pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorWriteCohortId,
     ConnectorWriteExecutionId, ConnectorWriteLease, ConnectorWriteOperationId,
@@ -79,7 +79,9 @@ impl ResolvedQueryOptions {
 
     pub fn runtime_filter_lifecycle(&self) -> RuntimeFilterLifecycleView {
         let (delivery_expire, query_expire) =
-            crate::runtime::query_options::query_expire_durations(Some(&self.runtime));
+            novarocks_execution::runtime::query_options::query_expire_durations(Some(
+                &self.runtime,
+            ));
         RuntimeFilterLifecycleView {
             delivery_expire,
             query_expire,

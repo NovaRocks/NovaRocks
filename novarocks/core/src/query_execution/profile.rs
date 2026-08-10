@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime::profile::{
+use novarocks_execution::runtime::profile::{
     ProfileNode, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS, RuntimeProfileTree,
 };
 use std::collections::HashMap;
@@ -303,7 +303,7 @@ pub(crate) struct DistributedProfileSummary {
 }
 
 #[cfg(test)]
-use crate::runtime::profile::Profiler;
+use novarocks_execution::runtime::profile::Profiler;
 
 #[cfg(test)]
 pub(crate) fn collect_actuals_by_plan_node_id(profiler: &Profiler) -> HashMap<i32, ActualMetrics> {
@@ -316,7 +316,7 @@ pub(crate) fn collect_actuals_by_plan_node_id_multi(
 ) -> HashMap<i32, ActualMetrics> {
     let trees = profilers
         .iter()
-        .map(crate::runtime::profile::merge_pipeline_profiles)
+        .map(novarocks_execution::runtime::profile::merge_pipeline_profiles)
         .map(|profiler| profiler.to_native_tree())
         .collect::<Vec<_>>();
     collect_actuals_by_plan_node_id_from_profile_trees(&trees)
@@ -646,7 +646,7 @@ mod tests {
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
-    use crate::runtime::profile::{ProfileUnit, Profiler, RuntimeProfileTree};
+    use novarocks_execution::runtime::profile::{ProfileUnit, Profiler, RuntimeProfileTree};
 
     #[test]
     fn native_runtime_filter_apply_sums_common_metrics_across_fragments() {
@@ -840,7 +840,8 @@ mod tests {
             .child("PipelineDriver (id=0)");
         add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 10, 5, 64);
         add_dictionary_metrics(&driver, "SCAN (plan_node_id=2)", 101, 4, 81, 3, 21, 2, 5);
-        let tree = crate::runtime::profile::merge_pipeline_profiles(&profiler).to_native_tree();
+        let tree = novarocks_execution::runtime::profile::merge_pipeline_profiles(&profiler)
+            .to_native_tree();
 
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
         let metrics = actuals.get(&2).expect("node 2 metrics");
@@ -1057,7 +1058,8 @@ mod tests {
             .child("Pipeline (id=0)")
             .child("PipelineDriver (id=0)");
         add_operator_metrics(&driver, "HASH JOIN (plan_node_id=4)", 8, 900_000, 4096);
-        let tree = crate::runtime::profile::merge_pipeline_profiles(&profiler).to_native_tree();
+        let tree = novarocks_execution::runtime::profile::merge_pipeline_profiles(&profiler)
+            .to_native_tree();
 
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
 
@@ -1081,7 +1083,8 @@ mod tests {
             .child("Pipeline (id=0)")
             .child("PipelineDriver (id=0)");
         add_operator_metrics(&driver, "HASH JOIN (plan_node_id=4)", 8, 900_000, 4096);
-        let tree = crate::runtime::profile::merge_pipeline_profiles(&profiler).to_native_tree();
+        let tree = novarocks_execution::runtime::profile::merge_pipeline_profiles(&profiler)
+            .to_native_tree();
 
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
 

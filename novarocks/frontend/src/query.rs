@@ -50,10 +50,10 @@ use novarocks::query_execution::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
-use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use tokio::task;
 
 use crate::dml::DmlService;
@@ -560,7 +560,8 @@ impl FrontendQuerySession {
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let mut query_options = state.execution_settings.query_options();
-        query_options.apply_sql_hints(&sql);
+        query_options
+            .set_allow_throw_exception(novarocks::sql::extract_allow_throw_exception_hint(&sql));
         let is_query = is_query_statement(&sql);
         let worker = task::spawn_blocking(move || {
             #[cfg(feature = "mv-first-refresh-staging-test-support")]

@@ -28,7 +28,7 @@ use crate::exec::node::scan::ScanOp;
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
-use crate::runtime::mem_tracker::{self, MemTracker};
+use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
 use novarocks_types::SlotId;
 use novarocks_types::UniqueId;
 

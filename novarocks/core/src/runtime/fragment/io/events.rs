@@ -1,5 +1,5 @@
 use crate::common::types::UniqueId;
-use crate::runtime::profile::RuntimeProfileTree;
+use novarocks_execution::runtime::profile::RuntimeProfileTree;
 
 #[derive(Clone, Debug)]
 pub enum FragmentEvent {

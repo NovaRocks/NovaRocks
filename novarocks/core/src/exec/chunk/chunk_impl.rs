@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
 
-use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_types::SlotId;
 
 use super::memory::{ChunkAccounting, chunk_bytes_i64, record_batch_bytes};

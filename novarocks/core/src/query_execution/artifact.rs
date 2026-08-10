@@ -1418,7 +1418,7 @@ fn populate_sender_counts(
 /// Owned core input for per-placement native submission assembly.
 pub struct NativeSubmissionContext {
     pub(crate) query_id: QueryId,
-    pub(crate) options: crate::runtime::query_options::QueryOptions,
+    pub(crate) options: novarocks_execution::runtime::query_options::QueryOptions,
 }
 
 impl NativeSubmissionContext {

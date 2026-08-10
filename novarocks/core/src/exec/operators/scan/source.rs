@@ -239,7 +239,7 @@ struct ScanSourceOperator {
     arena: Arc<ExprArena>,
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
     event_sink: Arc<dyn FragmentEventSink>,
     async_state: Arc<ScanAsyncState>,
     async_runners: Arc<Mutex<Vec<ScanAsyncRunner>>>,
@@ -573,7 +573,7 @@ impl Operator for ScanSourceOperator {
         &self.name
     }
 
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
+    fn set_profiles(&mut self, profiles: novarocks_execution::runtime::profile::OperatorProfiles) {
         self.profiles = Some(profiles);
     }
 
@@ -788,7 +788,7 @@ mod tests {
         fn execute_iter(
             &self,
             _morsel: ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
             _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
         ) -> Result<crate::exec::node::BoxedExecIter, String> {
             Ok(Box::new(std::iter::empty()))
@@ -804,7 +804,7 @@ mod tests {
         fn execute_iter(
             &self,
             morsel: ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
             _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
         ) -> Result<crate::exec::node::BoxedExecIter, String> {
             let ScanMorsel::FileRange { path, .. } = morsel else {
@@ -857,7 +857,7 @@ mod tests {
         fn execute_iter(
             &self,
             _morsel: ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
             _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
         ) -> Result<crate::exec::node::BoxedExecIter, String> {
             let dictionary = Arc::new(

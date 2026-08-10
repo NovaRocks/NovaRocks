@@ -35,7 +35,7 @@ use crate::exec::hash_table::key_builder::{
 };
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::operators::hashjoin::join_hash_table::{JoinHashTable, row_has_forbidden_null};
-use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 const DIRECT_RANGE_ROW_MULTIPLIER: u64 = 8;
 const DIRECT_RANGE_MAX_LEN: u64 = 16 * 1024 * 1024;
@@ -1143,7 +1143,7 @@ mod tests {
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::operators::hashjoin::join_hash_map::search::SearchStats;
-    use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_execution::runtime::mem_tracker::MemTracker;
     use novarocks_types::SlotId;
 
     const KEY_SLOT_ID: SlotId = SlotId(1);

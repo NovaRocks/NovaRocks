@@ -33,9 +33,9 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::profile::OperatorProfiles;
 
 use super::DataStreamSinkFactory;
 use crate::exec::fragment::sink::DataStreamSinkFactoryInput;

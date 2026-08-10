@@ -31,7 +31,7 @@ use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, ret
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::debug;
-use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_types::SlotId;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]

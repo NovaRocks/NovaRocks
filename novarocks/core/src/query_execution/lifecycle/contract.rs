@@ -32,7 +32,7 @@ use super::stage::{
 };
 use super::terminal::{QueryTerminalSnapshot, QueryTerminalSnapshotDigest};
 use crate::common::types::UniqueId;
-use crate::runtime::profile::RuntimeProfileTree;
+use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_protocol::{common, filter, novarocks};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1111,7 +1111,9 @@ pub fn encode_fragment_live_observation(
         input_rows: observation.input_rows(),
         output_rows: observation.output_rows(),
         elapsed_ms: observation.elapsed_ms(),
-        profile: observation.profile().map(RuntimeProfileTree::to_proto),
+        profile: observation
+            .profile()
+            .map(crate::runtime::profile_codec::encode_runtime_profile_tree),
     }
 }
 
@@ -1121,7 +1123,7 @@ pub fn decode_fragment_live_observation(
     let profile = observation
         .profile
         .as_ref()
-        .map(RuntimeProfileTree::from_proto)
+        .map(crate::runtime::profile_codec::decode_runtime_profile_tree)
         .transpose()
         .map_err(QueryLifecycleError::invalid_manifest)?;
     FragmentLiveObservation::new(
@@ -1203,7 +1205,9 @@ pub fn encode_query_terminal_snapshot(
                     loaded_bytes: fragment.sink().load_stats.loaded_bytes,
                     filtered_rows: fragment.sink().load_stats.filtered_rows,
                 }),
-                profile: fragment.profile().map(|profile| profile.to_proto()),
+                profile: fragment
+                    .profile()
+                    .map(crate::runtime::profile_codec::encode_runtime_profile_tree),
                 statistics_payload: fragment.statistics_payload().to_vec(),
             }
         })
@@ -1286,7 +1290,7 @@ pub fn decode_query_terminal_snapshot(
             let profile = fragment
                 .profile
                 .as_ref()
-                .map(crate::runtime::profile::RuntimeProfileTree::from_proto)
+                .map(crate::runtime::profile_codec::decode_runtime_profile_tree)
                 .transpose()
                 .map_err(QueryLifecycleError::invalid_manifest)?;
             super::terminal::FragmentTerminalSnapshot::new(
@@ -1676,9 +1680,9 @@ mod tests {
         QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
         QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
     };
-    use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
-    use crate::runtime::query_options::{QueryCacheOptions, QueryOptions};
     use crate::runtime::sink_commit::SinkCommitReportSnapshot;
+    use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
+    use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(

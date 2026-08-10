@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 
 use crate::common::types::UniqueId;
 use crate::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
-use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
+use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_protocol::novarocks;
 
 use super::{
@@ -490,14 +490,20 @@ fn put_profile(bytes: &mut Vec<u8>, profile: &RuntimeProfileTree) {
     put_profile_node(bytes, &profile.root);
 }
 
-fn put_profile_node(bytes: &mut Vec<u8>, node: &crate::runtime::profile::ProfileNode) {
+fn put_profile_node(
+    bytes: &mut Vec<u8>,
+    node: &novarocks_execution::runtime::profile::ProfileNode,
+) {
     put_string(bytes, &node.name);
     put_i32(bytes, node.node_id);
     put_u64(bytes, node.counters.len() as u64);
     for counter in &node.counters {
         put_string(bytes, &counter.name);
         put_string(bytes, &counter.parent_name);
-        put_i32(bytes, counter.unit.to_proto() as i32);
+        put_i32(
+            bytes,
+            crate::runtime::profile_codec::encode_profile_unit_value(counter.unit),
+        );
         put_i64(bytes, counter.value);
         put_optional_i64(bytes, counter.min_value);
         put_optional_i64(bytes, counter.max_value);
@@ -554,7 +560,7 @@ mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::{AttemptId, QueryControlEndpoint};
-    use crate::runtime::profile::{
+    use novarocks_execution::runtime::profile::{
         CounterStrategy, ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree,
     };
 
@@ -651,7 +657,7 @@ mod tests {
                     parent_name: String::new(),
                     unit: ProfileUnit::Unit,
                     strategy: CounterStrategy::new(
-                        crate::runtime::profile::CounterAggregateType::Sum,
+                        novarocks_execution::runtime::profile::CounterAggregateType::Sum,
                     ),
                     value: 11,
                     min_value: Some(3),

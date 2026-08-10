@@ -600,7 +600,7 @@ mod tests {
         QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitRequest,
         QueryTerminationReason,
     };
-    use novarocks::runtime::query_options::QueryOptions;
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_protocol::novarocks::{
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
         InitQueryRequest as ProtoInitQueryRequest,

@@ -20,12 +20,12 @@ use std::collections::BTreeMap;
 use crate::common::types::UniqueId;
 use crate::protocol::common::error::FieldPath;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
     ScanRange, ScanRangeParams,
 };
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::novarocks;
 
 use super::NativeFragmentDecodeError;
@@ -286,7 +286,7 @@ mod tests {
     use super::*;
     use crate::protocol::common::error::{ProtocolErrorKind, ProtocolFamily};
     use crate::protocol::native::encode::instance::encode_query_options;
-    use crate::runtime::query_options::QueryCacheOptions;
+    use novarocks_execution::runtime::query_options::QueryCacheOptions;
 
     #[test]
     fn query_options_decode_is_owned_by_native_protocol() {

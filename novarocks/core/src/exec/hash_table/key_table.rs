@@ -29,8 +29,8 @@ use crate::exec::hash_table::key_column::{KeyColumn, key_column_from_type};
 use crate::exec::hash_table::key_layout::{CompressedKeyContext, build_compressed_key_context};
 use crate::exec::hash_table::key_storage::{RowKey, RowStorage};
 use crate::exec::hash_table::key_strategy::{GroupKeyStrategy, pick_group_key_strategy};
-use crate::runtime::mem_tracker::MemTracker;
 use hashbrown::hash_map::DefaultHashBuilder;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 #[derive(Clone, Copy, Debug)]
 struct KeyEntry {

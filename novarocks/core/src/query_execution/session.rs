@@ -29,7 +29,7 @@ use async_trait::async_trait;
 
 use crate::engine::StatementResult;
 use crate::query_execution::cancellation::QueryCancellationReason;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuerySessionOpenRequest {

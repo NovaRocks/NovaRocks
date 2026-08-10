@@ -50,9 +50,9 @@ use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, Frag
 use crate::runtime::fragment::io::{NoopFragmentEventSink, UnavailableFragmentLookupClient};
 use crate::runtime::fragment::prepare_fragment;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-use crate::runtime::profile::Profiler;
-use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
+use novarocks_execution::runtime::profile::Profiler;
+use novarocks_execution::runtime::query_options::query_expire_durations;
 
 static NEXT_TEST_QUERY_ID: AtomicI64 = AtomicI64::new(1);
 const TEST_QUERY_ID_HIGH: i64 = i64::MIN + 0x4e52;

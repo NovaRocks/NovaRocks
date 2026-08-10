@@ -28,7 +28,7 @@ use novarocks::engine::ctas_engine::{
     PreparedCtasTarget, PreparedCtasWrite,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationOperationId, ConnectorStagedCreateAbortOutcome,
     ConnectorStagedCreatePublishOutcome, ConnectorStagedCreateReceipt,

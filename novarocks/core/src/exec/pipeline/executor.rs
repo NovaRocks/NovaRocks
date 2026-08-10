@@ -49,7 +49,7 @@ use crate::runtime::fragment::io::{
     FragmentEventSink, FragmentLookupClient, UnavailableFragmentLookupClient,
 };
 
-use crate::runtime::profile::{Profiler, ScopedTimer};
+use novarocks_execution::runtime::profile::{Profiler, ScopedTimer};
 
 /// A fully materialized pipeline that has not submitted any drivers to the global executor.
 pub(crate) struct PreparedPipelineExecution {
@@ -545,8 +545,8 @@ mod tests {
     use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
     use crate::exec::pipeline::schedule::observer::Observable;
     use crate::runtime::query_context::{QueryId, query_context_manager};
-    use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_types::SlotId;
 
     use super::{

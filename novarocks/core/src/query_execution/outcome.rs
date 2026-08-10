@@ -24,8 +24,8 @@ use crate::query_execution::statistics::StatisticsCollectionProgram;
 use crate::query_execution::write::{ConnectorWriteCommitInput, WriteAbortInput, WriteCommitInput};
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
-use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_result::QueryResult;
+use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_spi::connector::ConnectorError;
 
 /// Role-neutral execution data assembled by core engine flows before intent

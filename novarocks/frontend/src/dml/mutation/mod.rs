@@ -25,7 +25,7 @@ use novarocks::engine::mutation_engine::{
     PrepareMutationRequest, PreparedMutation, parse_merge_statement, parse_update_statement,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};

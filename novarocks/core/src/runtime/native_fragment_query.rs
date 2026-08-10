@@ -34,11 +34,11 @@ use crate::runtime::fragment::FragmentPrepareContext;
 use crate::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{
     QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
 };
+use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 #[derive(Clone)]

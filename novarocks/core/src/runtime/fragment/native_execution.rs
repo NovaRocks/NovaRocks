@@ -33,8 +33,8 @@ use crate::runtime::fragment::runtime_state::{
 use crate::runtime::fragment::sink::materialize_fragment_sink;
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::fragment_output::FragmentOutput;
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 #[cfg(test)]
@@ -328,9 +328,9 @@ mod tests {
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
     use crate::runtime::fragment::submission::FragmentSubmission;
-    use crate::runtime::profile::Profiler;
     use crate::runtime::query_context::QueryId;
-    use crate::runtime::query_options::QueryOptions;
+    use novarocks_execution::runtime::profile::Profiler;
+    use novarocks_execution::runtime::query_options::QueryOptions;
 
     use super::{
         NativeExecutionContext, execute_native_submission, native_execution_readiness_channel,

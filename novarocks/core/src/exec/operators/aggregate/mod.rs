@@ -55,8 +55,8 @@ use novarocks_types::SlotId;
 use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
-use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 use self::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
@@ -595,7 +595,7 @@ struct AggregateProcessorOperator {
     output_chunk_schema: ChunkSchemaRef,
     observed_group_key_nullable: Vec<bool>,
     profile_initialized: bool,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter_execution: AggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
@@ -626,7 +626,7 @@ impl Operator for AggregateProcessorOperator {
         self.key_table_mem_tracker = Some(key_table);
     }
 
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
+    fn set_profiles(&mut self, profiles: novarocks_execution::runtime::profile::OperatorProfiles) {
         self.profiles = Some(profiles);
     }
 

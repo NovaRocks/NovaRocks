@@ -35,7 +35,7 @@ use novarocks::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-use novarocks::runtime::profile::Profiler;
+use novarocks_execution::runtime::profile::Profiler;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
 };
@@ -897,27 +897,26 @@ mod tests {
         expected_fragments: impl IntoIterator<Item = UniqueId>,
     ) -> QueryControlAttachment {
         let execution_id = request.execution_id();
-        let manifest =
-            ParticipantManifest::new(
-                execution_id,
-                ParticipantBackendIdentity::new(
-                    7,
-                    QueryControlEndpoint::new("127.0.0.1", 19030).expect("control endpoint"),
-                    1,
-                )
-                .expect("backend identity"),
-                [ParticipantRole::FragmentExecutor],
-                expected_fragments,
-                ParticipantQueryOptions::new(
-                    novarocks::runtime::query_options::QueryOptions::default(),
-                ),
-                u64::MAX,
-                [],
-                None,
-                Duration::from_secs(30),
-                QueryControlEndpoint::new("127.0.0.1", 19031).expect("report endpoint"),
+        let manifest = ParticipantManifest::new(
+            execution_id,
+            ParticipantBackendIdentity::new(
+                7,
+                QueryControlEndpoint::new("127.0.0.1", 19030).expect("control endpoint"),
+                1,
             )
-            .expect("fragment participant manifest");
+            .expect("backend identity"),
+            [ParticipantRole::FragmentExecutor],
+            expected_fragments,
+            ParticipantQueryOptions::new(
+                novarocks_execution::runtime::query_options::QueryOptions::default(),
+            ),
+            u64::MAX,
+            [],
+            None,
+            Duration::from_secs(30),
+            QueryControlEndpoint::new("127.0.0.1", 19031).expect("report endpoint"),
+        )
+        .expect("fragment participant manifest");
         let init = QueryInitRequest::from_manifest(manifest);
         assert_eq!(
             service.lifecycle.init_query(init.clone()).outcome(),

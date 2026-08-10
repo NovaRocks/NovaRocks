@@ -33,9 +33,9 @@ use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::fragment::instance::FragmentSinkAssignment;
 use crate::runtime::query_context::{QueryId, query_context_manager};
-use crate::runtime::query_options::query_expire_durations;
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
+use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_protocol::{common, expr, novarocks, plan};
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_spi::connector::{

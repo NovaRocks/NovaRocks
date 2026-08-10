@@ -73,10 +73,11 @@ impl ConnectorCancellation for QueryConnectorCancellation {
 }
 
 fn build_connector_request_context(
-    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
     cancellation: Arc<dyn ConnectorCancellation>,
 ) -> Result<ConnectorRequestContext, String> {
-    let (_, query_expire) = crate::runtime::query_options::query_expire_durations(query_options);
+    let (_, query_expire) =
+        novarocks_execution::runtime::query_options::query_expire_durations(query_options);
     ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
         cancellation,
@@ -87,7 +88,7 @@ fn build_connector_request_context(
 }
 
 pub(crate) fn connector_request_context(
-    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
     cancellation_signal: Arc<AtomicBool>,
 ) -> Result<ConnectorRequestContext, String> {
     build_connector_request_context(
@@ -99,7 +100,7 @@ pub(crate) fn connector_request_context(
 }
 
 pub(crate) fn connector_request_context_for_query(
-    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
     cancellation: crate::query_execution::cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
     build_connector_request_context(
@@ -112,7 +113,7 @@ pub(crate) fn connector_request_context_for_query(
 /// the frontend. A request deadline is authoritative; only requests without an
 /// admission deadline use the bounded connector fallback.
 pub fn connector_request_context_for_execution(
-    query_options: Option<&crate::runtime::query_options::QueryOptions>,
+    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<ConnectorRequestContext, String> {
     let cancellation: Arc<dyn ConnectorCancellation> = Arc::new(QueryConnectorCancellation {

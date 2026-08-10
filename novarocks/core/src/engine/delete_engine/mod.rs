@@ -27,7 +27,7 @@ use crate::connector::iceberg::commit::CommitServiceError;
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::engine::StandaloneState;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 /// DELETE statements recognized by the frontend command router.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

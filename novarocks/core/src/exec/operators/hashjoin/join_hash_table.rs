@@ -37,7 +37,7 @@ use arrow::datatypes::DataType;
 use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 const ROW_NONE: u32 = u32::MAX;

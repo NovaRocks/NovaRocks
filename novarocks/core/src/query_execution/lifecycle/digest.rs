@@ -18,7 +18,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::exec::spill::SpillMode;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 use super::manifest::{
     ExchangeRouteManifest, ParticipantManifest, ParticipantManifestDigest, ParticipantRole,
@@ -252,7 +252,7 @@ mod tests {
         ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions, ParticipantRole,
         QueryControlEndpoint,
     };
-    use crate::runtime::query_options::QueryOptions;
+    use novarocks_execution::runtime::query_options::QueryOptions;
 
     fn manifest_with_orders(
         attempt: u64,

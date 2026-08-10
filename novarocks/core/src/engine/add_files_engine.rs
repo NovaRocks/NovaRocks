@@ -38,8 +38,8 @@ use crate::connector::data_mutation::{
 };
 use crate::engine::StandaloneState;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::runtime::query_options::QueryOptions;
 use crate::sql::parser::dialect::add_files::classify_add_files;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 pub use crate::sql::parser::dialect::add_files::AddFilesCommand;
 

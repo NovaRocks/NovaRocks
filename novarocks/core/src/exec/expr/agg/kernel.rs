@@ -20,7 +20,7 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 
 use crate::exec::node::aggregate::AggFunction;
-use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 
 use super::functions;
 use super::*;

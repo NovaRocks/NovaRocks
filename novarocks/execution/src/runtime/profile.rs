@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::runtime::mem_tracker::MemTracker;
-use novarocks_protocol::novarocks;
 
 #[derive(Clone, Debug)]
 struct CounterSnapshot {
@@ -39,12 +38,6 @@ pub struct RuntimeProfile {
 }
 
 pub type Profiler = RuntimeProfile;
-
-/// Encodes the execution-domain profile into the native report DTO without
-/// exposing profile internals to a role-specific transport crate.
-pub fn encode_native_runtime_profile(profiler: &Profiler) -> novarocks::RuntimeProfileTree {
-    profiler.to_proto()
-}
 
 /// Merges driver-level pipeline profiles into the fragment-level profile shape
 /// consumed by report transports. This is execution-domain logic; protocol
@@ -86,8 +79,8 @@ pub fn merge_pipeline_profiles(profiler: &Profiler) -> Profiler {
     merged
 }
 
-pub(crate) const RUNTIME_FILTER_INPUT_ROWS: &str = "RuntimeFilterInputRows";
-pub(crate) const RUNTIME_FILTER_OUTPUT_ROWS: &str = "RuntimeFilterOutputRows";
+pub const RUNTIME_FILTER_INPUT_ROWS: &str = "RuntimeFilterInputRows";
+pub const RUNTIME_FILTER_OUTPUT_ROWS: &str = "RuntimeFilterOutputRows";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProfileUnit {
@@ -98,38 +91,6 @@ pub enum ProfileUnit {
     TimeMs,
     TimeS,
     None,
-}
-
-impl ProfileUnit {
-    pub(crate) fn to_proto(self) -> novarocks::ProfileUnit {
-        match self {
-            Self::Unit => novarocks::ProfileUnit::Unit,
-            Self::CpuTicks => novarocks::ProfileUnit::CpuTicks,
-            Self::Bytes => novarocks::ProfileUnit::Bytes,
-            Self::TimeNs => novarocks::ProfileUnit::TimeNs,
-            Self::TimeMs => novarocks::ProfileUnit::TimeMs,
-            Self::TimeS => novarocks::ProfileUnit::TimeS,
-            Self::None => novarocks::ProfileUnit::None,
-        }
-    }
-
-    pub(crate) fn from_proto(unit: i32) -> Result<Self, String> {
-        match novarocks::ProfileUnit::try_from(unit) {
-            Ok(novarocks::ProfileUnit::Unit) => Ok(Self::Unit),
-            Ok(novarocks::ProfileUnit::CpuTicks) => Ok(Self::CpuTicks),
-            Ok(novarocks::ProfileUnit::Bytes) => Ok(Self::Bytes),
-            Ok(novarocks::ProfileUnit::TimeNs) => Ok(Self::TimeNs),
-            Ok(novarocks::ProfileUnit::TimeMs) => Ok(Self::TimeMs),
-            Ok(novarocks::ProfileUnit::TimeS) => Ok(Self::TimeS),
-            Ok(novarocks::ProfileUnit::None) => Ok(Self::None),
-            Ok(novarocks::ProfileUnit::Unspecified) => {
-                Err("ProfileUnit is unspecified in native runtime profile".to_string())
-            }
-            Err(_) => Err(format!(
-                "unknown ProfileUnit value {unit} in native runtime profile"
-            )),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,24 +179,6 @@ pub struct RuntimeProfileTree {
     pub root: ProfileNode,
 }
 
-impl RuntimeProfileTree {
-    pub(crate) fn to_proto(&self) -> novarocks::RuntimeProfileTree {
-        novarocks::RuntimeProfileTree {
-            root: Some(self.root.to_proto()),
-        }
-    }
-
-    pub(crate) fn from_proto(tree: &novarocks::RuntimeProfileTree) -> Result<Self, String> {
-        let root = tree
-            .root
-            .as_ref()
-            .ok_or_else(|| "RuntimeProfileTree missing root".to_string())?;
-        Ok(Self {
-            root: ProfileNode::from_proto(root)?,
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileNode {
     pub name: String,
@@ -243,40 +186,6 @@ pub struct ProfileNode {
     pub counters: Vec<ProfileCounter>,
     pub info_strings: BTreeMap<String, String>,
     pub children: Vec<ProfileNode>,
-}
-
-impl ProfileNode {
-    fn to_proto(&self) -> novarocks::ProfileNode {
-        novarocks::ProfileNode {
-            name: self.name.clone(),
-            node_id: self.node_id,
-            counters: self.counters.iter().map(ProfileCounter::to_proto).collect(),
-            info_strings: self.info_strings.clone().into_iter().collect(),
-            children: self.children.iter().map(ProfileNode::to_proto).collect(),
-        }
-    }
-
-    fn from_proto(node: &novarocks::ProfileNode) -> Result<Self, String> {
-        Ok(Self {
-            name: node.name.clone(),
-            node_id: node.node_id,
-            counters: node
-                .counters
-                .iter()
-                .map(ProfileCounter::from_proto)
-                .collect::<Result<Vec<_>, _>>()?,
-            info_strings: node
-                .info_strings
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-            children: node
-                .children
-                .iter()
-                .map(ProfileNode::from_proto)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,32 +197,6 @@ pub struct ProfileCounter {
     pub value: i64,
     pub min_value: Option<i64>,
     pub max_value: Option<i64>,
-}
-
-impl ProfileCounter {
-    fn to_proto(&self) -> novarocks::Counter {
-        novarocks::Counter {
-            name: self.name.clone(),
-            parent_name: self.parent_name.clone(),
-            unit: self.unit.to_proto() as i32,
-            value: self.value,
-            min_value: self.min_value,
-            max_value: self.max_value,
-        }
-    }
-
-    fn from_proto(counter: &novarocks::Counter) -> Result<Self, String> {
-        let unit = ProfileUnit::from_proto(counter.unit)?;
-        Ok(Self {
-            name: counter.name.clone(),
-            parent_name: counter.parent_name.clone(),
-            unit,
-            strategy: default_counter_strategy(unit),
-            value: counter.value,
-            min_value: counter.min_value,
-            max_value: counter.max_value,
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -583,11 +466,11 @@ impl RuntimeProfile {
         self.counter_set(name, ProfileUnit::Bytes, value);
     }
 
-    pub(crate) fn counter_value(&self, name: &str) -> Option<i64> {
+    pub fn counter_value(&self, name: &str) -> Option<i64> {
         self.counter_snapshot(name).map(|snapshot| snapshot.value)
     }
 
-    pub(crate) fn counter_value_min_max(&self, name: &str) -> Option<(i64, i64, i64)> {
+    pub fn counter_value_min_max(&self, name: &str) -> Option<(i64, i64, i64)> {
         self.counter_snapshot(name).map(|snapshot| {
             let value = snapshot.value;
             (
@@ -619,10 +502,6 @@ impl RuntimeProfile {
         RuntimeProfileTree {
             root: self.to_native_node(),
         }
-    }
-
-    pub(crate) fn to_proto(&self) -> novarocks::RuntimeProfileTree {
-        self.to_native_tree().to_proto()
     }
 
     pub fn merge_isomorphic_profiles(profiles: &[RuntimeProfile]) -> RuntimeProfile {
@@ -930,33 +809,8 @@ fn merge_counter_values(strategy: &CounterStrategy, values: &[i64]) -> (i64, i64
 mod tests {
     use super::{
         CounterAggregateType, CounterMergeType, CounterMinMaxType, CounterStrategy, ProfileUnit,
-        ROOT_COUNTER, RuntimeProfile, RuntimeProfileTree, default_counter_strategy,
+        ROOT_COUNTER, RuntimeProfile, default_counter_strategy,
     };
-    use novarocks_protocol::novarocks;
-
-    #[test]
-    fn native_profile_unit_roundtrips_proto_values() {
-        let cases = [
-            (ProfileUnit::Unit, novarocks::ProfileUnit::Unit),
-            (ProfileUnit::CpuTicks, novarocks::ProfileUnit::CpuTicks),
-            (ProfileUnit::Bytes, novarocks::ProfileUnit::Bytes),
-            (ProfileUnit::TimeNs, novarocks::ProfileUnit::TimeNs),
-            (ProfileUnit::TimeMs, novarocks::ProfileUnit::TimeMs),
-            (ProfileUnit::TimeS, novarocks::ProfileUnit::TimeS),
-            (ProfileUnit::None, novarocks::ProfileUnit::None),
-        ];
-        for (unit, proto) in cases {
-            assert_eq!(
-                ProfileUnit::from_proto(proto as i32).expect("valid unit converts"),
-                unit
-            );
-            assert_eq!(unit.to_proto(), proto);
-        }
-        assert!(
-            ProfileUnit::from_proto(novarocks::ProfileUnit::Unspecified as i32).is_err(),
-            "unspecified proto unit must not silently become a runtime unit"
-        );
-    }
 
     #[test]
     fn native_counter_strategy_defaults_match_existing_merge_behavior() {
@@ -1019,24 +873,6 @@ mod tests {
         assert_eq!(tree.root.children[0].name, "Child");
         assert_eq!(tree.root.children[0].node_id, 20);
         assert_eq!(tree.root.children[0].counters[0].unit, ProfileUnit::TimeNs);
-    }
-
-    #[test]
-    fn native_profile_tree_from_proto_rebuilds_default_strategy() {
-        let profile = RuntimeProfile::new("Root");
-        profile.counter_set("ScanTime", ProfileUnit::TimeNs, 5);
-        let proto = profile.to_native_tree().to_proto();
-
-        let tree = RuntimeProfileTree::from_proto(&proto).expect("native profile proto decodes");
-        let counter = tree
-            .root
-            .counters
-            .iter()
-            .find(|counter| counter.name == "ScanTime")
-            .expect("ScanTime counter");
-
-        assert_eq!(counter.unit, ProfileUnit::TimeNs);
-        assert_eq!(counter.strategy.aggregate_type(), CounterAggregateType::Avg);
     }
 
     #[test]

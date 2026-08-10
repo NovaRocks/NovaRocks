@@ -40,13 +40,13 @@ use crate::query_execution::statistics::{
     StatisticsExecutionMode, StatisticsExecutionPolicy, ThetaSketchPartial,
 };
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
-use crate::runtime::query_options::QueryOptions;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
 };
 use crate::sql::planner::payload::PlanValuesNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use bytes::Bytes;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -646,7 +646,8 @@ fn connector_staging_rejects_a_legacy_direct_commit_payload() {
 
 #[test]
 fn profile_outcome_preserves_fragment_profiles() {
-    let profile = crate::runtime::profile::Profiler::new("fragment-7").to_native_tree();
+    let profile =
+        novarocks_execution::runtime::profile::Profiler::new("fragment-7").to_native_tree();
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::build_string_query_result(

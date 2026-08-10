@@ -79,7 +79,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         destinations: vec![destination],
         per_exch_num_senders,
     };
-    let query_options = crate::runtime::query_options::QueryOptions {
+    let query_options = novarocks_execution::runtime::query_options::QueryOptions {
         batch_size: Some(4096),
         query_timeout: Some(60),
         query_delivery_timeout: Some(30),
@@ -94,7 +94,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         group_concat_max_len: Some(65_535),
         enable_join_runtime_bitset_filter: Some(false),
         global_runtime_filter_build_max_size: Some(1 << 19),
-        cache: crate::runtime::query_options::QueryCacheOptions {
+        cache: novarocks_execution::runtime::query_options::QueryCacheOptions {
             enable_scan_datacache: true,
             enable_populate_datacache: true,
             enable_datacache_async_populate_mode: true,

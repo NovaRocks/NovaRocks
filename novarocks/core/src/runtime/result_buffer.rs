@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::common::result_batch::ResultBatch;
 use crate::common::types::{FetchResult, UniqueId};
 use crate::runtime::fragment::io::ResultAbort;
-use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
+use novarocks_execution::runtime::mem_tracker::{MemTracker, TrackedBytes};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ResultBufferMode {

@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use crate::connector::iceberg::commit::CommitServiceError;
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 const PREPARED: u8 = 0;
 const STAGED: u8 = 1;

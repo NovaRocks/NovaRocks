@@ -95,7 +95,7 @@ impl FragmentSubmission {
         self.instance.backend_num().get()
     }
 
-    pub fn query_options(&self) -> &crate::runtime::query_options::QueryOptions {
+    pub fn query_options(&self) -> &novarocks_execution::runtime::query_options::QueryOptions {
         self.instance.runtime_options().query_options()
     }
 
@@ -611,9 +611,9 @@ mod tests {
         BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
         FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
-    use crate::runtime::profile::RuntimeProfile;
-    use crate::runtime::query_options::QueryOptions;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use novarocks_execution::runtime::profile::RuntimeProfile;
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_types::QueryId;
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};

@@ -26,7 +26,7 @@ use novarocks::engine::delete_engine::{
     PreparedDelete, parse_delete_statement, parse_equality_delete_statement,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};

@@ -36,8 +36,8 @@ use crate::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentSinkAssignment,
 };
 use crate::runtime::query_context::QueryId;
-use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::expr;
 use novarocks_protocol::novarocks;
 use novarocks_protocol::plan;

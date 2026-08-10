@@ -106,7 +106,7 @@ mod tests {
     use novarocks::exec::node::ExecNodeKind;
     use novarocks::exec::node::scan::ScanMorsel;
     use novarocks::protocol::ProtocolErrorKind;
-    use novarocks::runtime::query_options::{QueryOptions, QueryOptionsParts};
+    use novarocks_execution::runtime::query_options::{QueryOptions, QueryOptionsParts};
     use novarocks_execution::runtime_filter::{
         RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     };

@@ -214,7 +214,7 @@ struct SortProcessorOperator {
     finishing: bool,
     finished: bool,
     profile_initialized: bool,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
+    profiles: Option<novarocks_execution::runtime::profile::OperatorProfiles>,
 }
 
 #[derive(Debug)]
@@ -236,7 +236,7 @@ impl Operator for SortProcessorOperator {
         &self.name
     }
 
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
+    fn set_profiles(&mut self, profiles: novarocks_execution::runtime::profile::OperatorProfiles) {
         self.profiles = Some(profiles);
     }
 

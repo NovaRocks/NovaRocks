@@ -73,7 +73,7 @@ mod tests {
         FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
     use crate::runtime::query_context::QueryId;
-    use crate::runtime::query_options::QueryOptions;
+    use novarocks_execution::runtime::query_options::QueryOptions;
 
     use super::materialize_exchange_bindings;
 

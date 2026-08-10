@@ -24,9 +24,9 @@ use crate::common::types::UniqueId;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::{debug, error};
 use crate::runtime::io::io_executor;
-use crate::runtime::mem_tracker::TrackedBytes;
-use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use novarocks_execution::runtime::mem_tracker::TrackedBytes;
+use novarocks_execution::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 
 use super::exchange::{ExchangeFrame, ExchangeFrameTransmitter};
 use super::exchange_metrics::observe_exchange_shuffle_bytes;
