@@ -37,8 +37,8 @@ use tokio::task::JoinHandle;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::execution_services::IoExecutor;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use novarocks_execution::runtime::execution_services::IoExecutor;
 
 /// Minimal async backend implemented by concrete sinks. The wrapper drives it.
 #[async_trait::async_trait]

@@ -29,4 +29,5 @@ mod runner;
 mod source;
 mod types;
 
+pub(crate) use dispatch::ScanDispatchState;
 pub use source::ScanSourceFactory;

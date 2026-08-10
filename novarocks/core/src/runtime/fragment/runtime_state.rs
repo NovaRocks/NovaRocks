@@ -23,8 +23,10 @@ use crate::common::config::{
 };
 use crate::common::types::UniqueId;
 use crate::exec::spill::QuerySpillManager;
+use crate::runtime::fragment::io::ScanRegistrationPort;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -39,6 +41,8 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) runtime_filter_session: Option<RuntimeFilterSessionRef>,
     pub(crate) connector_staged_report_collector:
         Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
+    pub(crate) execution_runtime: Option<Arc<ExecutionRuntime>>,
+    pub(crate) scan_registration: Option<Arc<dyn ScanRegistrationPort>>,
 }
 
 pub(crate) fn apply_query_option_overrides(
@@ -77,6 +81,8 @@ pub(crate) fn build_runtime_state(
             inputs.mem_tracker,
             spill_config,
             spill_manager,
+            inputs.execution_runtime,
+            inputs.scan_registration,
         )
         .with_runtime_filter_session(inputs.runtime_filter_session)
         .with_connector_staged_report_collector(inputs.connector_staged_report_collector),

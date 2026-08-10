@@ -2255,7 +2255,18 @@ mod tests {
     #[test]
     fn bind_runtime_state_uses_backend_num_as_be_number() {
         let mut op = make_test_operator();
-        let state = RuntimeState::new(None, None, None, None, Some(7), None, None, None);
+        let state = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            Some(7),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         Operator::bind_runtime_state(&mut op, &state).expect("bind runtime state");
 

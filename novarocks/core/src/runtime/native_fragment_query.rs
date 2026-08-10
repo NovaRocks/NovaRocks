@@ -29,10 +29,14 @@ use novarocks_spi::connector::ConnectorCancellation;
 
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
+use crate::exec::node::scan::ConnectorRowPositionLookup;
+use crate::exec::node::scan::ScanOp;
+use crate::exec::operators::scan::ScanDispatchState;
 use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::runtime::fragment::FragmentPrepareContext;
 use crate::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+    ScanRegistrationPort,
 };
 use crate::runtime::query_context::{
     QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
@@ -40,10 +44,38 @@ use crate::runtime::query_context::{
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+use novarocks_types::SlotId;
 
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
     manager: Arc<QueryContextManager>,
+}
+
+struct QueryContextScanRegistrationPort {
+    manager: Arc<QueryContextManager>,
+}
+
+impl ScanRegistrationPort for QueryContextScanRegistrationPort {
+    fn register_row_position_lookup(
+        &self,
+        query_id: QueryId,
+        row_source_slot: SlotId,
+        lookup: ConnectorRowPositionLookup,
+    ) -> Result<(), String> {
+        self.manager
+            .register_connector_glm(query_id, row_source_slot, lookup)
+    }
+
+    fn register_incremental_scan(
+        &self,
+        fragment_instance_id: UniqueId,
+        node_id: i32,
+        op: Arc<dyn ScanOp>,
+        dispatch: Arc<ScanDispatchState>,
+    ) -> Result<(), String> {
+        self.manager
+            .register_incremental_scan_node(fragment_instance_id, node_id, op, dispatch)
+    }
 }
 
 struct NativeExecutionConnectorCancellation {
@@ -58,6 +90,12 @@ impl ConnectorCancellation for NativeExecutionConnectorCancellation {
 }
 
 impl NativeFragmentQueryRuntime {
+    pub fn scan_registration_port(&self) -> Arc<dyn ScanRegistrationPort> {
+        Arc::new(QueryContextScanRegistrationPort {
+            manager: Arc::clone(&self.manager),
+        })
+    }
+
     pub fn publish_resource_snapshot(&self) {
         let snapshot = self.manager.native_execution_resource_snapshot();
         crate::service::publish_backend_query_execution_resource(
@@ -111,6 +149,7 @@ impl NativeFragmentQueryRuntime {
             query_mem_tracker,
             fragment_mem_tracker,
             runtime_filter,
+            scan_registration: self.scan_registration_port(),
         };
         self.publish_resource_snapshot();
         Ok(resources)
@@ -170,6 +209,7 @@ impl NativeFragmentQueryRuntime {
             query_mem_tracker,
             fragment_mem_tracker,
             runtime_filter,
+            scan_registration: self.scan_registration_port(),
         })
     }
 
@@ -287,6 +327,7 @@ pub struct NativeFragmentAdmissionResources {
     query_mem_tracker: Arc<MemTracker>,
     fragment_mem_tracker: Arc<MemTracker>,
     runtime_filter: Option<RuntimeFilterSessionRef>,
+    scan_registration: Arc<dyn ScanRegistrationPort>,
 }
 
 impl NativeFragmentAdmissionResources {
@@ -315,6 +356,7 @@ impl NativeFragmentAdmissionResources {
             result_writer,
             event_sink,
         )
+        .with_scan_registration_port(self.scan_registration)
     }
 }
 

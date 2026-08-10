@@ -31,7 +31,7 @@ use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
-    ResultPresentation, ResultWriteSpec,
+    ResultPresentation, ResultWriteSpec, ScanRegistrationPort,
 };
 #[cfg(test)]
 use crate::runtime::fragment::io::{NoopFragmentEventSink, UnavailableFragmentLookupClient};
@@ -43,6 +43,7 @@ use crate::runtime::fragment::scan::materialize_scan_bindings;
 use crate::runtime::fragment::sink::materialize_fragment_sink_with_result;
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
+use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
@@ -58,6 +59,8 @@ pub struct FragmentPrepareContext {
     result_spec: Option<ResultWriteSpec>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
+    execution_runtime: Option<Arc<ExecutionRuntime>>,
+    scan_registration: Option<Arc<dyn ScanRegistrationPort>>,
     #[cfg(test)]
     prepare_failure: Option<PrepareFailurePoint>,
     #[cfg(test)]
@@ -81,6 +84,8 @@ impl Default for FragmentPrepareContext {
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
+            execution_runtime: None,
+            scan_registration: None,
             #[cfg(test)]
             prepare_failure: None,
             #[cfg(test)]
@@ -112,6 +117,8 @@ impl FragmentPrepareContext {
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
+            execution_runtime: None,
+            scan_registration: None,
             #[cfg(test)]
             prepare_failure: None,
             #[cfg(test)]
@@ -119,6 +126,16 @@ impl FragmentPrepareContext {
             #[cfg(test)]
             start_failure: None,
         }
+    }
+
+    pub fn with_execution_runtime(mut self, runtime: Arc<ExecutionRuntime>) -> Self {
+        self.execution_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_scan_registration_port(mut self, port: Arc<dyn ScanRegistrationPort>) -> Self {
+        self.scan_registration = Some(port);
+        self
     }
 
     /// Builds a context for callers that do not participate in native
@@ -164,6 +181,8 @@ impl FragmentPrepareContext {
             result_spec,
             root_sink_dop,
             group_execution_scan_dop,
+            execution_runtime: None,
+            scan_registration: None,
             #[cfg(test)]
             prepare_failure: None,
             #[cfg(test)]
@@ -514,6 +533,8 @@ pub fn prepare_fragment(
                     .sink()
                     .program()
                     .connector_staged_report_collector(),
+                execution_runtime: context.execution_runtime.clone(),
+                scan_registration: context.scan_registration.clone(),
             },
             context.profiler.as_ref(),
         )
@@ -959,6 +980,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(!priming_state.should_report_exec_state());
         std::thread::sleep(Duration::from_millis(1_050));
@@ -988,6 +1011,8 @@ mod tests {
         query_options.runtime_profile_report_interval = Some(1);
         let priming_state = crate::runtime::runtime_state::RuntimeState::new(
             Some(query_options.clone()),
+            None,
+            None,
             None,
             None,
             None,

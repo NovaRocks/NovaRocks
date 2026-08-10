@@ -258,7 +258,7 @@ mod tests {
         .expect("metrics");
         let (factory, handle) =
             StatisticsSinkFactory::try_new(schema.clone(), metrics, Some(7)).expect("factory");
-        let state = RuntimeState::new(None, None, None, None, None, None, None, None);
+        let state = RuntimeState::new(None, None, None, None, None, None, None, None, None, None);
         let mut first = factory.create(2, 0);
         let mut second = factory.create(2, 1);
         first

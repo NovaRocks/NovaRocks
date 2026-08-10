@@ -1,4 +1,8 @@
 use std::fmt;
+use std::sync::Arc;
+
+use crate::runtime::execution_services::ExecutionServices;
+use crate::runtime::mem_tracker::MemTracker;
 
 /// Frozen process-local settings used to construct one execution runtime.
 ///
@@ -37,7 +41,7 @@ impl ExecutionRuntimeConfig {
             ),
         ] {
             if value == 0 {
-                return Err(ExecutionRuntimeConfigError { field: name });
+                return Err(ExecutionRuntimeConfigError::invalid_field(name));
             }
         }
         Ok(())
@@ -52,27 +56,49 @@ impl ExecutionRuntimeConfig {
 #[derive(Clone, Debug)]
 pub struct ExecutionRuntime {
     config: ExecutionRuntimeConfig,
+    services: Arc<ExecutionServices>,
+    mem_root: Arc<MemTracker>,
 }
 
 impl ExecutionRuntime {
     pub fn new(config: ExecutionRuntimeConfig) -> Result<Self, ExecutionRuntimeConfigError> {
         config.validate()?;
-        Ok(Self { config })
+        let services = ExecutionServices::new(&config)
+            .map_err(|error| ExecutionRuntimeConfigError::runtime(error))?;
+        Ok(Self {
+            config,
+            services: Arc::new(services),
+            mem_root: MemTracker::new_root("execution"),
+        })
     }
 
     pub const fn config(&self) -> &ExecutionRuntimeConfig {
         &self.config
     }
+
+    pub fn services(&self) -> &ExecutionServices {
+        &self.services
+    }
+
+    pub fn mem_root(&self) -> Arc<MemTracker> {
+        Arc::clone(&self.mem_root)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRuntimeConfigError {
-    field: &'static str,
+    message: String,
 }
 
 impl ExecutionRuntimeConfigError {
-    pub const fn field(&self) -> &'static str {
-        self.field
+    fn invalid_field(field: &'static str) -> Self {
+        Self {
+            message: format!("{field} must be non-zero"),
+        }
+    }
+
+    fn runtime(message: String) -> Self {
+        Self { message }
     }
 }
 
@@ -80,8 +106,8 @@ impl fmt::Display for ExecutionRuntimeConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "execution runtime config {} must be non-zero",
-            self.field
+            "execution runtime configuration error: {}",
+            self.message
         )
     }
 }
@@ -111,7 +137,10 @@ mod tests {
         let mut config = config();
         config.scan_queue_capacity = 0;
         let error = ExecutionRuntime::new(config).expect_err("zero queue must be rejected");
-        assert_eq!(error.field(), "scan_queue_capacity");
+        assert_eq!(
+            error.to_string(),
+            "execution runtime configuration error: scan_queue_capacity must be non-zero"
+        );
     }
 
     #[test]

@@ -22,11 +22,15 @@ use crate::common::config;
 use crate::common::types::UniqueId;
 use crate::exec::spill::{QuerySpillManager, SpillConfig};
 use crate::novarocks_logging::debug;
+use crate::runtime::fragment::io::ScanRegistrationPort;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
-use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::clamp_u128_to_i64;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::{
+    execution_runtime::ExecutionRuntime, execution_services::IoExecutor,
+};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
@@ -47,6 +51,8 @@ pub struct RuntimeState {
     runtime_filter_session: Option<RuntimeFilterSessionRef>,
     connector_staged_report_collector:
         Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
+    execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
+    scan_registration: Option<std::sync::Arc<dyn ScanRegistrationPort>>,
 }
 
 impl std::fmt::Debug for RuntimeState {
@@ -93,6 +99,8 @@ impl Default for RuntimeState {
             spill_manager: None,
             runtime_filter_session: None,
             connector_staged_report_collector: None,
+            execution_runtime: None,
+            scan_registration: None,
         }
     }
 }
@@ -114,6 +122,8 @@ impl Clone for RuntimeState {
             spill_manager: self.spill_manager.clone(),
             runtime_filter_session: self.runtime_filter_session.clone(),
             connector_staged_report_collector: self.connector_staged_report_collector.clone(),
+            execution_runtime: self.execution_runtime.clone(),
+            scan_registration: self.scan_registration.clone(),
         }
     }
 }
@@ -128,12 +138,15 @@ impl RuntimeState {
         mem_tracker: Option<std::sync::Arc<MemTracker>>,
         spill_config: Option<SpillConfig>,
         spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
+        execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
+        scan_registration: Option<std::sync::Arc<dyn ScanRegistrationPort>>,
     ) -> Self {
         let mem_tracker = mem_tracker.or_else(|| {
+            let execution_runtime = execution_runtime.as_ref()?;
             if query_id.is_none() && fragment_instance_id.is_none() {
                 return None;
             }
-            let process = mem_tracker::process_mem_tracker();
+            let process = execution_runtime.mem_root();
             let query_label = query_id
                 .map(|id| format!("query_{:x}_{:x}", id.high(), id.low()))
                 .unwrap_or_else(|| "query_unknown".to_string());
@@ -156,6 +169,8 @@ impl RuntimeState {
             spill_manager,
             runtime_filter_session: None,
             connector_staged_report_collector: None,
+            execution_runtime,
+            scan_registration,
         }
     }
 
@@ -192,6 +207,10 @@ impl RuntimeState {
 
     pub(crate) fn runtime_filter_session(&self) -> Option<&RuntimeFilterSessionRef> {
         self.runtime_filter_session.as_ref()
+    }
+
+    pub(crate) fn scan_registration(&self) -> Option<&std::sync::Arc<dyn ScanRegistrationPort>> {
+        self.scan_registration.as_ref()
     }
 
     #[allow(dead_code)]
@@ -358,11 +377,11 @@ impl RuntimeState {
     ///
     /// Operators reach this via `&RuntimeState` in `bind_runtime_state` /
     /// `push_chunk` so they never grab the shared `data_runtime` directly.
-    pub fn sink_io_executor(
-        &self,
-    ) -> Result<crate::runtime::execution_services::IoExecutor, String> {
-        crate::runtime::execution_services::execution_services()
-            .map(|services| services.sink_io().clone())
+    pub fn sink_io_executor(&self) -> Result<IoExecutor, String> {
+        self.execution_runtime
+            .as_ref()
+            .map(|runtime| runtime.services().sink_io().clone())
+            .ok_or_else(|| "fragment runtime is unavailable".to_string())
     }
 
     pub fn error(&self) -> Option<String> {
@@ -418,6 +437,7 @@ fn monotonic_now_ns() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
 
     #[test]
     fn construction_does_not_register_sink_commit_side_effect() {
@@ -434,6 +454,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
 
         assert!(
@@ -444,7 +466,32 @@ mod tests {
 
     #[test]
     fn sink_io_executor_from_default_state_runs_on_sink_runtime() {
-        let state = RuntimeState::default();
+        let runtime = std::sync::Arc::new(
+            ExecutionRuntime::new(ExecutionRuntimeConfig {
+                driver_threads: 1,
+                scan_threads: 1,
+                scan_queue_capacity: 1,
+                spill_io_threads: 1,
+                spill_io_queue_capacity: 1,
+                exchange_io_threads: 1,
+                exchange_io_max_inflight_bytes: 1,
+                sink_io_worker_threads: 1,
+                sink_io_max_blocking_threads: 1,
+            })
+            .expect("test runtime"),
+        );
+        let state = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(runtime),
+            None,
+        );
         let exec = state.sink_io_executor().expect("sink_io executor");
         let handle = exec.spawn(async {
             std::thread::current()

@@ -19,27 +19,27 @@
 //! Responsibilities:
 //! - Defines explicit execution-service classes so write-path I/O does not
 //!   share the query `data_runtime` directly.
-//! - In this branch only `sink_io` is a real dedicated tokio runtime; the rest
-//!   alias `data_runtime` via the same `IoExecutor` handle type so a later
-//!   cutover requires no call-site changes.
+//! - Every service is explicitly owned by an `ExecutionRuntime`; no lookup
+//!   reaches an application configuration singleton or a shared global runtime.
 //!
 //! Key exported interfaces:
 //! - Types: `ExecutorKind`, `IoExecutor`, `IoExecutorMetrics`, `ExecutionServices`.
-//! - Functions: `execution_services`.
+//! - Types: `ExecutorKind`, `IoExecutor`, `IoExecutorMetrics`, `ExecutionServices`.
 
+use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
-use crate::common::config::{sink_io_max_blocking_threads, sink_io_worker_threads};
-use crate::novarocks_logging::info;
-use crate::runtime::global_async_runtime::{WORKER_STACK_SIZE_BYTES, data_runtime_handle};
+use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
 
 const SINK_IO_THREAD_NAME: &str = "novarocks-sink-io";
+const SHARED_IO_THREAD_NAME: &str = "novarocks-execution-io";
+const WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Identifies an execution-service class for metrics/logging.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,8 +96,6 @@ impl IoExecutorMetrics {
 enum Spawner {
     /// Owns a dedicated runtime (sink_io).
     Owned(Arc<Runtime>),
-    /// Borrows another runtime's handle (alias to data_runtime).
-    Borrowed(Handle),
 }
 
 /// A uniform handle to one execution service. Cloneable; cheap to pass around.
@@ -132,7 +130,6 @@ impl IoExecutor {
     {
         match &self.spawner {
             Spawner::Owned(rt) => rt.spawn(fut),
-            Spawner::Borrowed(handle) => handle.spawn(fut),
         }
     }
 
@@ -193,7 +190,7 @@ impl IoExecutor {
     }
 }
 
-/// Process-global execution services. Mirrors `data_runtime()` / `global_driver_executor()`.
+/// I/O services owned by one explicit execution runtime.
 pub struct ExecutionServices {
     scan_io: IoExecutor,
     sink_io: IoExecutor,
@@ -201,7 +198,40 @@ pub struct ExecutionServices {
     commit: IoExecutor,
 }
 
+impl fmt::Debug for ExecutionServices {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecutionServices")
+            .finish_non_exhaustive()
+    }
+}
+
 impl ExecutionServices {
+    pub fn new(config: &ExecutionRuntimeConfig) -> Result<Self, String> {
+        let sink_rt = build_runtime(
+            SINK_IO_THREAD_NAME,
+            config.sink_io_worker_threads,
+            config.sink_io_max_blocking_threads,
+        )?;
+        let shared_io_rt = build_runtime(
+            SHARED_IO_THREAD_NAME,
+            config.scan_threads,
+            config.scan_queue_capacity,
+        )?;
+        Ok(Self {
+            scan_io: IoExecutor::new(
+                ExecutorKind::ScanIo,
+                Spawner::Owned(Arc::clone(&shared_io_rt)),
+            ),
+            sink_io: IoExecutor::new(ExecutorKind::SinkIo, Spawner::Owned(sink_rt)),
+            metadata_io: IoExecutor::new(
+                ExecutorKind::MetadataIo,
+                Spawner::Owned(Arc::clone(&shared_io_rt)),
+            ),
+            commit: IoExecutor::new(ExecutorKind::Commit, Spawner::Owned(shared_io_rt)),
+        })
+    }
+
     pub fn scan_io(&self) -> &IoExecutor {
         &self.scan_io
     }
@@ -216,70 +246,45 @@ impl ExecutionServices {
     }
 }
 
-static EXECUTION_SERVICES: OnceLock<Result<ExecutionServices, String>> = OnceLock::new();
-
-fn build_sink_io_runtime() -> Result<Arc<Runtime>, String> {
-    let worker_threads = sink_io_worker_threads().max(1);
-    let max_blocking_threads = sink_io_max_blocking_threads().max(1);
+fn build_runtime(
+    thread_name: &'static str,
+    worker_threads: usize,
+    max_blocking_threads: usize,
+) -> Result<Arc<Runtime>, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(worker_threads)
         .max_blocking_threads(max_blocking_threads)
-        .thread_name(SINK_IO_THREAD_NAME)
+        .thread_name(thread_name)
         .thread_stack_size(WORKER_STACK_SIZE_BYTES)
         .build()
-        .map_err(|e| format!("init sink_io tokio runtime failed: {e}"))?;
-    info!(
-        worker_threads,
-        max_blocking_threads,
-        thread_name = SINK_IO_THREAD_NAME,
-        "sink_io execution service initialized"
-    );
+        .map_err(|e| format!("init execution I/O runtime {thread_name} failed: {e}"))?;
     Ok(Arc::new(runtime))
-}
-
-fn build_services() -> Result<ExecutionServices, String> {
-    // Real dedicated runtime for sink I/O.
-    let sink_rt = build_sink_io_runtime()?;
-    let sink_io = IoExecutor::new(ExecutorKind::SinkIo, Spawner::Owned(sink_rt));
-    // The rest alias data_runtime for now (same handle type → zero-churn cutover later).
-    let data_handle = data_runtime_handle()?;
-    let scan_io = IoExecutor::new(ExecutorKind::ScanIo, Spawner::Borrowed(data_handle.clone()));
-    let metadata_io = IoExecutor::new(
-        ExecutorKind::MetadataIo,
-        Spawner::Borrowed(data_handle.clone()),
-    );
-    let commit = IoExecutor::new(ExecutorKind::Commit, Spawner::Borrowed(data_handle));
-    Ok(ExecutionServices {
-        scan_io,
-        sink_io,
-        metadata_io,
-        commit,
-    })
-}
-
-/// Access the process-global execution services.
-pub fn execution_services() -> Result<&'static ExecutionServices, String> {
-    match EXECUTION_SERVICES.get_or_init(build_services) {
-        Ok(services) => Ok(services),
-        Err(err) => Err(err.clone()),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
 
-    #[test]
-    fn services_singleton_is_stable() {
-        let a = execution_services().expect("services");
-        let b = execution_services().expect("services");
-        assert!(std::ptr::eq(a, b));
+    fn services() -> ExecutionServices {
+        ExecutionServices::new(&ExecutionRuntimeConfig {
+            driver_threads: 1,
+            scan_threads: 1,
+            scan_queue_capacity: 1,
+            spill_io_threads: 1,
+            spill_io_queue_capacity: 1,
+            exchange_io_threads: 1,
+            exchange_io_max_inflight_bytes: 1,
+            sink_io_worker_threads: 1,
+            sink_io_max_blocking_threads: 1,
+        })
+        .expect("execution services")
     }
 
     #[test]
     fn sink_io_runs_on_dedicated_runtime() {
-        let services = execution_services().expect("services");
+        let services = services();
         let handle = services.sink_io().spawn(async {
             std::thread::current()
                 .name()
@@ -294,8 +299,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_io_aliases_data_runtime() {
-        let services = execution_services().expect("services");
+    fn metadata_io_runs_on_runtime_owned_shared_io() {
+        let services = services();
         let handle = services.metadata_io().spawn(async {
             std::thread::current()
                 .name()
@@ -304,19 +309,14 @@ mod tests {
         });
         let name = futures::executor::block_on(handle).expect("join");
         assert!(
-            name.contains("novarocks-data-runtime"),
-            "metadata_io should alias data_runtime, ran on: {name}"
+            name.contains(SHARED_IO_THREAD_NAME),
+            "metadata_io ran on unexpected runtime: {name}"
         );
     }
 
     #[test]
     fn spawn_accounts_submit_start_complete() {
-        // Use an isolated metrics counter so parallel tests sharing the global
-        // sink_io service cannot inflate these exact-delta assertions.
-        let executor = execution_services()
-            .expect("services")
-            .sink_io()
-            .with_isolated_metrics();
+        let executor = services().sink_io().with_isolated_metrics();
         let before = executor.metrics().snapshot();
         let handle = executor.spawn(async { 42_u32 });
         let value = futures::executor::block_on(handle).expect("join");
@@ -329,11 +329,7 @@ mod tests {
 
     #[test]
     fn spawn_fallible_counts_errors() {
-        // Isolated metrics: see `spawn_accounts_submit_start_complete`.
-        let executor = execution_services()
-            .expect("services")
-            .sink_io()
-            .with_isolated_metrics();
+        let executor = services().sink_io().with_isolated_metrics();
         let before = executor.metrics().snapshot();
         let handle = executor.spawn_fallible(async { Err::<(), String>("boom".to_string()) });
         let out = futures::executor::block_on(handle).expect("join");

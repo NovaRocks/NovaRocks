@@ -13,6 +13,7 @@ use novarocks::query_execution::lifecycle::{
     QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
 use novarocks::service::MetricsHttpServer;
+use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 use crate::fragment::control::FragmentControlRegistry;
@@ -87,6 +88,7 @@ pub struct BackendApplicationHost {
     _native_fragment_service: Arc<NativeFragmentService>,
     _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_host: Arc<crate::ConnectorExecutionHost>,
+    _execution_runtime: Arc<ExecutionRuntime>,
     query_lifecycle_sweep: QueryLifecycleSweepTask,
     metrics_http_server: MetricsHttpServer,
 }
@@ -104,6 +106,7 @@ struct BackendApplicationServices {
     native_fragment_service: Arc<NativeFragmentService>,
     query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_host: Arc<crate::ConnectorExecutionHost>,
+    execution_runtime: Arc<ExecutionRuntime>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
 }
 
@@ -217,6 +220,11 @@ fn compose_backend_application_services(
     config: &NovaRocksConfig,
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
+    let execution_runtime = Arc::new(
+        ExecutionRuntime::new(execution_runtime_config(&config.runtime)).map_err(|error| {
+            BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+        })?,
+    );
     let controls = Arc::new(FragmentControlRegistry::default());
     let execution_host = Arc::new(crate::ConnectorExecutionHost::new());
     let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(
@@ -247,6 +255,7 @@ fn compose_backend_application_services(
         Arc::clone(&query_lifecycle_registry),
         connector_registry,
         Arc::clone(&execution_host),
+        Arc::clone(&execution_runtime),
     ));
     controls.publish_resource_snapshot();
     execution_host.publish_resource_snapshot();
@@ -261,6 +270,7 @@ fn compose_backend_application_services(
         native_fragment_service,
         query_lifecycle_registry,
         execution_host,
+        execution_runtime,
         query_lifecycle_ingress,
     })
 }
@@ -424,9 +434,34 @@ impl BackendApplicationHost {
             _native_fragment_service: native_fragment_service,
             _query_lifecycle_registry: services.query_lifecycle_registry,
             execution_host: services.execution_host,
+            _execution_runtime: services.execution_runtime,
             query_lifecycle_sweep,
             metrics_http_server,
         })
+    }
+}
+
+fn execution_runtime_config(
+    runtime: &novarocks::common::app_config::RuntimeConfig,
+) -> ExecutionRuntimeConfig {
+    let spill_io_threads = if runtime.spill_io_threads == 0 {
+        runtime.actual_exec_threads()
+    } else {
+        runtime.spill_io_threads
+    };
+    ExecutionRuntimeConfig {
+        driver_threads: runtime.actual_exec_threads(),
+        scan_threads: runtime.actual_scan_threads(),
+        scan_queue_capacity: runtime.pipeline_scan_thread_pool_queue_size.max(1),
+        spill_io_threads,
+        spill_io_queue_capacity: runtime.spill_io_queue_size.max(1),
+        exchange_io_threads: runtime.exchange_io_threads.max(1),
+        exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),
+        sink_io_worker_threads: runtime.execution_services.actual_sink_io_worker_threads(),
+        sink_io_max_blocking_threads: runtime
+            .execution_services
+            .sink_io_max_blocking_threads
+            .max(1),
     }
 }
 

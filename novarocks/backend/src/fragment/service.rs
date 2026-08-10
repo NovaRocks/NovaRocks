@@ -35,6 +35,7 @@ use novarocks::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
+use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
@@ -63,6 +64,24 @@ pub(super) enum NativeFragmentLifecycleEvent {
 }
 
 type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>;
+
+#[cfg(test)]
+fn test_execution_runtime() -> Arc<ExecutionRuntime> {
+    Arc::new(
+        ExecutionRuntime::new(ExecutionRuntimeConfig {
+            driver_threads: 1,
+            scan_threads: 1,
+            scan_queue_capacity: 1,
+            spill_io_threads: 1,
+            spill_io_queue_capacity: 1,
+            exchange_io_threads: 1,
+            exchange_io_max_inflight_bytes: 1,
+            sink_io_worker_threads: 1,
+            sink_io_max_blocking_threads: 1,
+        })
+        .expect("test execution runtime"),
+    )
+}
 
 #[cfg(debug_assertions)]
 fn runner_stage_prepare_failure(
@@ -100,6 +119,7 @@ pub struct NativeFragmentService {
     result_writer: Arc<dyn FragmentResultWriter>,
     connector_registry: Arc<ConnectorRegistry>,
     execution_host: Arc<ConnectorExecutionHost>,
+    execution_runtime: Arc<ExecutionRuntime>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -134,6 +154,7 @@ impl NativeFragmentService {
             lifecycle,
             connector_registry,
             Arc::new(ConnectorExecutionHost::new()),
+            test_execution_runtime(),
         )
     }
 
@@ -145,6 +166,7 @@ impl NativeFragmentService {
         lifecycle: Arc<QueryLifecycleRegistry>,
         connector_registry: Arc<ConnectorRegistry>,
         execution_host: Arc<ConnectorExecutionHost>,
+        execution_runtime: Arc<ExecutionRuntime>,
     ) -> Self {
         Self {
             controls,
@@ -155,6 +177,7 @@ impl NativeFragmentService {
             result_writer,
             connector_registry,
             execution_host,
+            execution_runtime,
             lifecycle_observer: None,
             #[cfg(test)]
             after_lifecycle_admission: None,
@@ -179,6 +202,7 @@ impl NativeFragmentService {
             lifecycle,
             Arc::new(ConnectorRegistry::new()),
             Arc::new(ConnectorExecutionHost::new()),
+            test_execution_runtime(),
         );
         service.lifecycle_observer = Some(Arc::new(observer));
         service
@@ -304,13 +328,15 @@ impl NativeFragmentService {
         );
         let dormant = prepare_fragment(
             request.into_submission(),
-            admission.into_prepare_context(
-                profiler.clone(),
-                Arc::clone(&self.exchange_transmitter),
-                Arc::clone(&self.lookup_client),
-                Arc::clone(&self.result_writer),
-                event_sink,
-            ),
+            admission
+                .into_prepare_context(
+                    profiler.clone(),
+                    Arc::clone(&self.exchange_transmitter),
+                    Arc::clone(&self.lookup_client),
+                    Arc::clone(&self.result_writer),
+                    event_sink,
+                )
+                .with_execution_runtime(Arc::clone(&self.execution_runtime)),
         )
         .map_err(NativeFragmentIngressError::new)?;
         self.observe(NativeFragmentLifecycleEvent::Prepared);
@@ -452,13 +478,15 @@ impl NativeFragmentService {
         );
         let dormant = prepare_fragment(
             request.into_submission(),
-            admission.into_prepare_context(
-                profiler.clone(),
-                Arc::clone(&self.exchange_transmitter),
-                Arc::clone(&self.lookup_client),
-                Arc::clone(&self.result_writer),
-                event_sink,
-            ),
+            admission
+                .into_prepare_context(
+                    profiler.clone(),
+                    Arc::clone(&self.exchange_transmitter),
+                    Arc::clone(&self.lookup_client),
+                    Arc::clone(&self.result_writer),
+                    event_sink,
+                )
+                .with_execution_runtime(Arc::clone(&self.execution_runtime)),
         )
         .map_err(NativeFragmentIngressError::new)?;
         self.observe(NativeFragmentLifecycleEvent::Prepared);

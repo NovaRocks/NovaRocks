@@ -267,7 +267,10 @@ impl ScanSourceOperator {
             let query_id = state
                 .query_id()
                 .ok_or_else(|| "row position requires query_id".to_string())?;
-            crate::runtime::query_context::query_context_manager().register_connector_glm(
+            let registration = state
+                .scan_registration()
+                .ok_or_else(|| "row position requires scan registration port".to_string())?;
+            registration.register_row_position_lookup(
                 query_id,
                 spec.row_source_slot,
                 lookup.clone(),
@@ -297,7 +300,10 @@ impl ScanSourceOperator {
         let Some(dispatch) = self.current_dispatch()? else {
             return Ok(());
         };
-        crate::runtime::query_context::query_context_manager().register_incremental_scan_node(
+        let registration = state
+            .scan_registration()
+            .ok_or_else(|| "incremental scan requires scan registration port".to_string())?;
+        registration.register_incremental_scan(
             finst_id,
             node_id,
             Arc::clone(&self.op),

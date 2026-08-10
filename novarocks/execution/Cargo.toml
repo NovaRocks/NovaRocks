@@ -13,3 +13,7 @@ datasketches = "0.2.0"
 novarocks-types = { path = "../types" }
 novarocks-spi = { path = "../spi" }
 sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+futures = "0.3"

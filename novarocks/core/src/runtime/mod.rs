@@ -19,7 +19,6 @@ pub mod descriptor_snapshot;
 pub mod endpoint;
 pub mod exchange;
 pub mod exec_env;
-pub mod execution_services;
 pub mod fragment;
 pub(crate) mod fragment_exec_params;
 pub(crate) mod fragment_output;

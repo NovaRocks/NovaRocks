@@ -797,6 +797,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         ));
         let observable = Arc::new(Observable::new());
         let ready = Arc::new(AtomicBool::new(false));
@@ -877,6 +879,8 @@ mod tests {
             None,
             None,
             Some(query_id),
+            None,
+            None,
             None,
             None,
             None,

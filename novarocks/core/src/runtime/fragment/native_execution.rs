@@ -239,6 +239,8 @@ pub(crate) fn execute_native_submission(
                 .sink()
                 .program()
                 .connector_staged_report_collector(),
+            execution_runtime: None,
+            scan_registration: None,
         },
         context.profiler.as_ref(),
     )

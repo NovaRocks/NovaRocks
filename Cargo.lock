@@ -3297,9 +3297,11 @@ dependencies = [
  "arrow",
  "bytes",
  "datasketches",
+ "futures",
  "novarocks-spi",
  "novarocks-types",
  "sha2",
+ "tokio",
 ]
 
 [[package]]
