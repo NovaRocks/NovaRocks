@@ -26,13 +26,13 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
-use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
 use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::debug;
 use crate::runtime::mem_tracker::MemTracker;
+use novarocks_types::SlotId;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExchangeKey {
@@ -1451,8 +1451,8 @@ mod tests {
         decode_chunks_for_sender, decode_root_result_chunks, encode_chunks, get_receiver_handle,
         push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+    use novarocks_types::SlotId;
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
         SlotId::new(33),

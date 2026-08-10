@@ -27,11 +27,11 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use super::error::NativeFragmentLeafDecodeError;
 #[cfg(test)]
 use crate::native::type_decode::decode_field_type;
-use novarocks::common::ids::SlotId;
 #[cfg(test)]
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks::protocol::ProtocolErrorKind;
 use novarocks_protocol::common;
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Layout {
@@ -247,8 +247,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields};
 
     use super::*;
-    use novarocks::common::ids::SlotId;
     use novarocks_protocol::common;
+    use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn scalar_type(primitive: common::PrimitiveType) -> common::TypeDesc {

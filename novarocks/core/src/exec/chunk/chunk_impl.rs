@@ -20,8 +20,8 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
 
-use crate::common::ids::SlotId;
 use crate::runtime::mem_tracker::MemTracker;
+use novarocks_types::SlotId;
 
 use super::memory::{ChunkAccounting, chunk_bytes_i64, record_batch_bytes};
 use super::schema::{
@@ -231,8 +231,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type};
 
     use super::{Chunk, ChunkSchema};
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSlotSchema;
+    use novarocks_types::SlotId;
 
     fn dict_utf8() -> ArrayRef {
         Arc::new(

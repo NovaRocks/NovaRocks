@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSchemaRef};
 use crate::exec::fragment::error::{
     FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
@@ -31,6 +30,7 @@ use crate::exec::fragment::program::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
+use novarocks_types::SlotId;
 
 #[derive(Debug)]
 pub struct FragmentSubmission {
@@ -572,7 +572,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
     use crate::exec::chunk::{
         Chunk, ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
@@ -616,6 +615,7 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use novarocks_types::QueryId;
+    use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     use super::*;

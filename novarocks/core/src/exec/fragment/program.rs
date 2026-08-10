@@ -437,7 +437,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprId};
     use crate::exec::fragment::sink::DataStreamPartitionType;
@@ -448,6 +447,7 @@ mod tests {
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use novarocks_types::SlotId;
 
     use super::*;
 

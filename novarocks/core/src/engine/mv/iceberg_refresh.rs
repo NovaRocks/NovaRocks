@@ -22141,7 +22141,7 @@ mod tests {
         .expect("record batch");
         let chunk_schema_ref = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
             &arrow_schema,
-            &[crate::common::ids::SlotId(0)],
+            &[novarocks_types::SlotId(0)],
         )
         .expect("chunk schema");
         vec![crate::exec::chunk::Chunk::new_with_chunk_schema(
@@ -22174,9 +22174,9 @@ mod tests {
         let chunk_schema_ref = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
             &arrow_schema,
             &[
-                crate::common::ids::SlotId(0),
-                crate::common::ids::SlotId(1),
-                crate::common::ids::SlotId(2),
+                novarocks_types::SlotId(0),
+                novarocks_types::SlotId(1),
+                novarocks_types::SlotId(2),
             ],
         )
         .expect("chunk schema");
@@ -29005,8 +29005,8 @@ mod tests {
 
             // Build a Chunk by deriving ChunkSchema from the RecordBatch arrow schema
             // and synthetic slot ids.
-            use crate::common::ids::SlotId;
             use crate::exec::chunk::ChunkSchema;
+            use novarocks_types::SlotId;
             let chunk_schema_ref = ChunkSchema::try_ref_from_schema_and_slot_ids(
                 &arrow_schema,
                 &[SlotId(0), SlotId(1)],
@@ -29547,8 +29547,8 @@ mod tests {
             )
             .unwrap();
 
-            use crate::common::ids::SlotId;
             use crate::exec::chunk::ChunkSchema;
+            use novarocks_types::SlotId;
             let chunk_schema_ref = ChunkSchema::try_ref_from_schema_and_slot_ids(
                 &arrow_schema,
                 &[SlotId(0), SlotId(1)],

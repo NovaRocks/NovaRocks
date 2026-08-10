@@ -22,7 +22,6 @@ use arrow::datatypes::{DataType, Field};
 use super::super::NativeFragmentDecodeError;
 use super::common::{concat_layouts, proto_join_type};
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::join::{
@@ -31,6 +30,7 @@ use crate::exec::node::join::{
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 use novarocks_types::wider_type;
 
 pub(super) fn lower_hash_join_node(
@@ -433,9 +433,9 @@ mod tests {
         column_ref, lower, one_col_values_node_with, one_col_values_node_with_nullable,
         output_column_with_nullable, physical_node,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::node::ExecNodeKind;
     use novarocks_protocol::plan;
+    use novarocks_types::SlotId;
 
     #[test]
     fn hash_join_output_schema_uses_plan_output_nullability() {

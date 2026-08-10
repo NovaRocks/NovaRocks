@@ -31,7 +31,6 @@ use novarocks_spi::connector::{
     ConnectorScanHandle, ConnectorSplit,
 };
 
-use crate::common::ids::SlotId;
 use crate::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::ExprArena;
@@ -44,6 +43,7 @@ use crate::protocol::common::error::ProtocolErrorKind;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::query_expire_durations;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit};

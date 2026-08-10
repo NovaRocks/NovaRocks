@@ -23,7 +23,6 @@ use arrow::datatypes::DataType;
 use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
@@ -31,6 +30,7 @@ use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSl
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
 use novarocks_protocol::{common as proto_common, expr, plan};
+use novarocks_types::SlotId;
 
 pub(super) fn lower_table_function_node(
     node: &plan::DistributedNode,
@@ -432,10 +432,10 @@ mod tests {
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::protocol::native::type_mapping::encode_type;
     use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

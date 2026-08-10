@@ -97,7 +97,6 @@ mod tests {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::super::node::{NativePlanDecodeContext, decode_node};
-    use crate::common::ids::SlotId;
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
     use crate::exec::expr::{ExprArena, ExprNode};
@@ -109,6 +108,7 @@ mod tests {
     use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use novarocks_connector_iceberg::delta::DeltaSourceRole;
     use novarocks_protocol::{common, expr, novarocks, plan};
+    use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

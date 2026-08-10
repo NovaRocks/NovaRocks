@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use novarocks_types::PrimitiveType;
 
-use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::common::util::FieldRenderSchema;
 use crate::exec::chunk::Chunk;
+use novarocks_types::SlotId;
 
 use super::FragmentIoError;
 

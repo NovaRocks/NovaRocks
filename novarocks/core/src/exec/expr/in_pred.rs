@@ -983,7 +983,6 @@ fn json_value_from_text_or_variant(text: &str) -> Option<JsonValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{
         DictionaryArray, Int32Builder, Int64Array, Int64Builder, LargeStringDictionaryBuilder,
@@ -991,6 +990,7 @@ mod tests {
     };
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{Field, Int8Type, Int32Type, Schema};
+    use novarocks_types::SlotId;
     use std::collections::HashMap;
 
     fn create_test_map_array(rows: &[Option<&[(i32, i64)]>]) -> MapArray {

@@ -48,7 +48,7 @@ pub fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String> {
     let slot_ids = (1..=batch.num_columns())
         .map(|idx| {
             u32::try_from(idx)
-                .map(crate::common::ids::SlotId::new)
+                .map(novarocks_types::SlotId::new)
                 .map_err(|_| "too many output columns".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -113,7 +113,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::common::ids::SlotId;
+    use novarocks_types::SlotId;
 
     #[test]
     fn record_batch_to_chunk_preserves_batch_and_assigns_one_based_slots() {

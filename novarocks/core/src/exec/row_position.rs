@@ -16,7 +16,7 @@
 // under the License.
 use arrow::datatypes::Field;
 
-use crate::common::ids::SlotId;
+use novarocks_types::SlotId;
 
 // Iceberg virtual column names (no trailing underscore)
 pub const ROW_SOURCE_ID_COL: &str = "_row_source_id";

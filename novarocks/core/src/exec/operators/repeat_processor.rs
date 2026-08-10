@@ -30,13 +30,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::array::{Int64Array, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
+use novarocks_types::SlotId;
 
 /// Factory for repeat processors that expand rows for grouping-set style execution.
 pub struct RepeatProcessorFactory {

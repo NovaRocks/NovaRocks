@@ -22,13 +22,13 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{Chunk, ChunkSchema};
 use novarocks::exec::expr::function::FunctionKind;
 use novarocks::exec::expr::function::object::{
     eval_hll_hash, eval_object_function, eval_percentile_hash, eval_to_bitmap, register,
 };
 use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_types::SlotId;
 use std::collections::HashMap;
 use std::sync::Arc;
 

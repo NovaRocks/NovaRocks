@@ -19,11 +19,11 @@ use std::collections::HashMap;
 
 use arrow::datatypes::Field;
 
-use crate::common::ids::SlotId;
 use crate::exec::node::scan::HdfsScanFileFormat;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::exec::row_position::RowPositionType;
 use crate::formats::{FileFormatConfig, parquet::ParquetScanConfig};
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IcebergTableLocationMap(HashMap<i64, String>);
@@ -291,8 +291,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
+    use novarocks_types::SlotId;
 
     fn descriptor_slot(tuple_id: i32, slot_id: u32, name: &str) -> DescriptorSlot {
         DescriptorSlot {

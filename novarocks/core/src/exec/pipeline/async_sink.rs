@@ -285,11 +285,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::exec::pipeline::operator::BlockedReason;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     fn make_chunk(rows: usize) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, true)]));

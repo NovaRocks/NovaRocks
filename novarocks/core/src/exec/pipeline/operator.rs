@@ -27,7 +27,6 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -36,6 +35,7 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::datatypes::DataType;
+use novarocks_types::SlotId;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,12 +212,12 @@ mod tests {
     use super::{
         Chunk, Operator, ProcessorOperator, dictionary_carrier_stats, hydrate_for_downstream,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::runtime::runtime_state::RuntimeState;
     use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
 
     struct StubOp;
 

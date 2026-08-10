@@ -153,12 +153,12 @@ fn lower_row_count_assertion(value: i32) -> Result<Assertion, NativeFragmentLeaf
 #[cfg(test)]
 mod tests {
     use super::super::tests::{lower, one_col_values_node, physical_node};
-    use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::assert::AssertNumRowsMode;
     use crate::protocol::common::error::ProtocolErrorKind;
     use novarocks_protocol::plan;
+    use novarocks_types::SlotId;
 
     fn decode_error(
         node: &plan::DistributedNode,

@@ -16,11 +16,11 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::ExecNode;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::runtime::descriptor_snapshot::LookupNodesInfo;
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
 pub struct FetchNode {

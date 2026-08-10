@@ -22,7 +22,6 @@ use std::time::Instant;
 
 use super::error::NativeFragmentLeafDecodeError;
 use super::node::NativePlanDecodeContext;
-use crate::common::ids::SlotId;
 use crate::exec::expr::ExprArena;
 use crate::exec::fragment::sink::DataStreamPartitionType;
 use crate::exec::fragment::sink::{
@@ -45,6 +44,7 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, ConnectorWriterHandle, ConnectorWriterIdentity, StatisticsMetric,
     StatisticsMetricRequest,
 };
+use novarocks_types::SlotId;
 
 struct NativeWriterCancellation {
     query_id: QueryId,

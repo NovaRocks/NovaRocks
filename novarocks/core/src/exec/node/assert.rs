@@ -16,7 +16,7 @@
 // under the License.
 use crate::exec::node::ExecNode;
 
-use crate::common::ids::SlotId;
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
 pub enum Assertion {

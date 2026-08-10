@@ -23,7 +23,6 @@ use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::values::materialize_values_chunk_with_context;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
@@ -31,6 +30,7 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
 use novarocks_protocol::{common as proto_common, expr, plan};
+use novarocks_types::SlotId;
 
 pub(super) fn lower_generate_series_node(
     node: &plan::DistributedNode,

@@ -149,8 +149,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use novarocks_types::SlotId;
 
     fn one_row_chunk() -> Chunk {
         let field = Field::new("v", DataType::Int32, false);

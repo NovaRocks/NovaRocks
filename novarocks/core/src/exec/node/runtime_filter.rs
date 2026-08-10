@@ -110,8 +110,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode};
+    use novarocks_types::SlotId;
 
     #[test]
     fn consumer_carrier_retains_only_kernel_coordinate_and_execution_contract() {

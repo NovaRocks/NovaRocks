@@ -202,12 +202,12 @@ fn condition_array_to_bool(array: &ArrayRef) -> Result<BooleanArray, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     fn make_i32_chunk(slot: SlotId, values: Vec<Option<i32>>) -> Chunk {

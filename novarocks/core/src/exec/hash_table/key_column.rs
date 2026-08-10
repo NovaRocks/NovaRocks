@@ -1209,10 +1209,10 @@ pub(crate) fn build_output_schema_from_kernels(
 #[cfg(test)]
 mod tests {
     use super::{KeyColumn, build_output_schema_from_kernels};
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type};
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     #[test]

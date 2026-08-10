@@ -2924,9 +2924,9 @@ fn scalar_f64(array: &dyn Array, row: usize) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use arrow::array::{Int32Array, Int64Array};
+    use novarocks_types::SlotId;
 
     fn int32_chunk_schema() -> ChunkSchemaRef {
         Arc::new(

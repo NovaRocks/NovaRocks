@@ -22,7 +22,6 @@ use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::fragment::sink::DataStreamPartitionType;
 use novarocks::exec::fragment::sink::{
@@ -42,6 +41,7 @@ use novarocks_spi::connector::{
     ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
     ConnectorWriterIdentity, StatisticsMetric, StatisticsMetricRequest,
 };
+use novarocks_types::SlotId;
 
 use super::context::NativePlanDecodeContext;
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};

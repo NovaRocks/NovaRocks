@@ -22,13 +22,13 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, new_null_array};
 use arrow::compute::{concat, filter};
 use arrow::datatypes::DataType;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, cast_array_to_target};
 use crate::exec::node::change_event_expand::ChangeEventRuntimeSpec;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_types::SlotId;
 
 /// Factory for runtime ChangeEventExpand processors.
 pub struct ChangeEventExpandProcessorFactory {
@@ -414,7 +414,6 @@ mod tests {
     use novarocks_spi::connector::ConnectorRowMutationEffect;
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::node::change_event_expand::{
@@ -422,6 +421,7 @@ mod tests {
     };
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     const INPUT_SLOT: SlotId = SlotId::new(10);
     const EFFECT_SLOT: SlotId = SlotId::new(20);

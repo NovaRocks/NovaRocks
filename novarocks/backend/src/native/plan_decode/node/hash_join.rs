@@ -22,7 +22,6 @@ use arrow::datatypes::{DataType, Field};
 use super::common::{concat_layouts, proto_join_type};
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::exec::node::join::{
@@ -31,6 +30,7 @@ use novarocks::exec::node::join::{
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 use novarocks_types::wider_type;
 
 pub(super) fn lower_hash_join_node(

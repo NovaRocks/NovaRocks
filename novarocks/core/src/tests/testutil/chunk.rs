@@ -17,7 +17,7 @@
 
 use arrow::datatypes::Field;
 
-use crate::common::ids::SlotId;
+use novarocks_types::SlotId;
 
 #[cfg(test)]
 pub fn field_with_slot_id(field: Field, slot_id: SlotId) -> Field {

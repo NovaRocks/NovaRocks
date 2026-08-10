@@ -824,13 +824,13 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
     use crate::exec::node::set_op::SetOpKind;
     use crate::protocol::native::type_mapping::encode_type;
     use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
 
     struct DummyScanOp;
 

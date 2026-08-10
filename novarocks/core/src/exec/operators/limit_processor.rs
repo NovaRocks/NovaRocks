@@ -185,10 +185,10 @@ impl ProcessorOperator for LimitProcessorOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     fn make_chunk(start: i32, rows: usize) -> Chunk {

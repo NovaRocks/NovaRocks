@@ -200,10 +200,10 @@ mod tests {
 
     use super::build_fetch_result_batch_for_chunk;
     use super::{ResultProjection, ResultSinkConfig};
-    use crate::common::ids::SlotId;
     use crate::common::util::FieldRenderSchema;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use novarocks_types::PrimitiveType;
+    use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     fn chunk_with_stale_field_schema(field: Field, column: ArrayRef) -> Result<Chunk, String> {

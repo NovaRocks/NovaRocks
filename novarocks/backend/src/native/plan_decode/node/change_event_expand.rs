@@ -22,7 +22,6 @@ use arrow::datatypes::DataType;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
@@ -31,6 +30,7 @@ use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
 use novarocks_protocol::plan;
 use novarocks_spi::connector::ConnectorRowMutationEffect;
+use novarocks_types::SlotId;
 
 pub(super) fn lower_change_event_expand_node(
     node: &plan::DistributedNode,

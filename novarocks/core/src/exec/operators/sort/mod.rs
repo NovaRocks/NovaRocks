@@ -320,10 +320,10 @@ pub(crate) fn append_stable_row_index_sort_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
     use arrow::array::{Int32Builder, ListBuilder, StringArray};
     use arrow::compute::lexsort_to_indices;
+    use novarocks_types::SlotId;
 
     fn decimal_chunk(precision: u8, scale: i8, value: i128) -> Chunk {
         let data_type = DataType::Decimal128(precision, scale);

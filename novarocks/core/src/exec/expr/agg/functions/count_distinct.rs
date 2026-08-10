@@ -676,7 +676,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{AggregateFunction, CountDistinctAgg, DistinctSet};
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::agg::{AggInputView, AggStatePtr};
     use crate::exec::expr::{ExprArena, ExprNode};
@@ -687,6 +686,7 @@ mod tests {
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)

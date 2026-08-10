@@ -39,12 +39,12 @@ use arrow::compute::take;
 use arrow::datatypes::{DataType, Field};
 use arrow_data::transform::MutableArrayData;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::table_function::TableFunctionOutputSlot;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_types::SlotId;
 use novarocks_types::largeint;
 use novarocks_types::value::bitmap;
 

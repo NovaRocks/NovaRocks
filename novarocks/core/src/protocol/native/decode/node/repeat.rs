@@ -22,13 +22,13 @@ use arrow::datatypes::{DataType, Field};
 
 use super::super::layout::Layout;
 use super::DecodedNode;
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 
 pub(super) fn lower_repeat_node(
     node: &plan::DistributedNode,

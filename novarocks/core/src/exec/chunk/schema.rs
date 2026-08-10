@@ -17,11 +17,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use novarocks_types::SlotId;
 use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -528,8 +528,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{ChunkSchema, ChunkSlotSchema};
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
+    use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     #[test]

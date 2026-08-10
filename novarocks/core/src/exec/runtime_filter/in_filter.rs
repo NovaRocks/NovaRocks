@@ -37,9 +37,9 @@ use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
 use hashbrown::HashSet;
 
-use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicateValue;
 use crate::exec::chunk::Chunk;
+use novarocks_types::SlotId;
 use novarocks_types::largeint;
 
 #[derive(Clone, Debug)]
@@ -1067,7 +1067,7 @@ impl RuntimeInFilter {
 impl RuntimeInFilter {
     pub(crate) fn new_for_test(
         filter_id: i32,
-        slot_id: crate::common::ids::SlotId,
+        slot_id: novarocks_types::SlotId,
         data_type: &arrow::datatypes::DataType,
     ) -> Result<Self, String> {
         Ok(Self {
@@ -1166,8 +1166,8 @@ impl RuntimeInFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::common::min_max_predicate::MinMaxPredicateValue;
+    use novarocks_types::SlotId;
 
     #[test]
     fn runtime_in_filter_discrete_values_are_bounded() {

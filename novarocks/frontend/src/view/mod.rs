@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::common::ids::SlotId;
 use novarocks::engine::view::{
     ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult,
 };
@@ -32,6 +31,7 @@ use novarocks::exec::chunk::{Chunk, ChunkSchema};
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::state_store::StateStore;
+use novarocks_types::SlotId;
 use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Statement};
 use sqlparser::parser::Parser;
 use tokio::runtime::Handle;

@@ -50,11 +50,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{NativePlanDecodeContext, decode_node};
-    use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::protocol::native::type_mapping::encode_type;
     use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
 
     fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
         common::OutputColumn {

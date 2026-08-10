@@ -22,7 +22,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::Chunk;
 use novarocks::exec::chunk::ChunkSchema;
 use novarocks::exec::expr::ExprId;
@@ -32,6 +31,7 @@ use novarocks::exec::expr::function::conditional::{
     eval_nullif,
 };
 use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_types::SlotId;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------

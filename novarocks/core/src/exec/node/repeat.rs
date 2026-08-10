@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::ids::SlotId;
+use novarocks_types::SlotId;
 
 use super::ExecNode;
 

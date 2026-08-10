@@ -1190,10 +1190,10 @@ mod tests {
     use novarocks_spi::connector::ConnectorScalarValue;
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprNode;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     struct Int32MembershipQuery {
         accepted: i32,

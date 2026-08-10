@@ -561,8 +561,8 @@ fn create_test_chunk_int(values: Vec<i64>) -> novarocks::exec::chunk::Chunk {
     use arrow::array::{ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     let array = Arc::new(Int64Array::from(values)) as ArrayRef;
@@ -582,8 +582,8 @@ fn create_test_chunk_float(values: Vec<f64>) -> novarocks::exec::chunk::Chunk {
     use arrow::array::{ArrayRef, Float64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     let array = Arc::new(Float64Array::from(values)) as ArrayRef;

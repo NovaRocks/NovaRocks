@@ -1051,11 +1051,11 @@ pub fn eval_mod(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Decimal128Array, FixedSizeBinaryArray, Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use novarocks_types::largeint;
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {

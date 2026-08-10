@@ -21,7 +21,7 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
-use crate::common::ids::SlotId;
+use novarocks_types::SlotId;
 
 use super::{Chunk, ChunkSchema};
 
@@ -118,8 +118,8 @@ mod tests {
     use super::{
         assert_no_dictionary, hydrate_dictionary_columns, hydrate_dictionary_columns_except,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
+    use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     fn dict_utf8_with_nulls_and_empty() -> ArrayRef {

@@ -761,13 +761,13 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind;
     use crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory;
     use crate::runtime::profile::{OperatorProfiles, RuntimeProfile};
     use novarocks_execution::runtime_filter as execution;
+    use novarocks_types::SlotId;
 
     #[derive(Default)]
     struct TestBuildState {

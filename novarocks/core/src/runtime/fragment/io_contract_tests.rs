@@ -8,10 +8,10 @@ use super::io::events::{
 };
 use super::io::exchange::{ExchangeFrame, ExchangeFrameTransmitter};
 use super::io::lookup::{LookupColumn, LookupKind, LookupRequest, LookupTarget};
-use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_context::QueryId;
+use novarocks_types::SlotId;
 
 #[test]
 fn fragment_io_contract_error_preserves_operation_and_kind() {

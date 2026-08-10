@@ -586,7 +586,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 
-    use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprArena;
@@ -612,6 +611,7 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::{result_buffer, sink_commit};
+    use novarocks_types::SlotId;
 
     use super::StartFailurePoint;
     use super::{FragmentPrepareContext, PrepareFailurePoint, prepare_fragment};

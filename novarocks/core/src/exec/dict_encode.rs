@@ -20,13 +20,13 @@
 //! They are shared here so the Iceberg/HDFS Parquet scan path can reuse them
 //! without creating a `formats → connector` dependency cycle.
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::novarocks_logging::info;
 use arrow::array::{Array, ArrayRef, Int32Builder, LargeStringArray, ListArray, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use novarocks_types::SlotId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -317,8 +317,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use novarocks_types::SlotId;
 
     #[test]
     fn file_read_dictionary_adapter_maps_utf8_to_ids() {

@@ -247,11 +247,11 @@ mod tests {
     use super::super::tests::{
         col, int_lit, lower_err_with_slots, lower_with_slots, make_i64_chunk, scalar_expr,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{Array, BooleanArray};
     use arrow::datatypes::DataType;
     use novarocks_protocol::expr;
+    use novarocks_types::SlotId;
 
     #[test]
     fn in_list_casts_numeric_candidates_to_string_operand_type() {

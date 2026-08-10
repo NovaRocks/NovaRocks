@@ -22,7 +22,6 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
@@ -31,6 +30,7 @@ use crate::runtime::endpoint::FragmentDestination;
 use novarocks_spi::connector::{
     ConnectorExecutionBinding, ConnectorOpenWriterRequest, StatisticsMetricRequest,
 };
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
@@ -790,13 +790,13 @@ mod tests {
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
         MultiCastDataStreamSinkProgram,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprId, ExprNode};
     use crate::exec::fragment::error::ExecPlanInvariant;
     use crate::exec::fragment::program::{
         FragmentSinkAssignmentKind, FragmentSinkAssignmentRequirement, FragmentSinkSpec,
     };
     use crate::exec::fragment::sink::DataStreamPartitionType;
+    use novarocks_types::SlotId;
 
     #[test]
     fn static_data_stream_program_contains_no_destinations() {

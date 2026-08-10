@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use arrow::array::ArrayRef;
+use novarocks_types::SlotId;
 
 pub fn eval_slot_id(slot_id: SlotId, chunk: &Chunk) -> Result<ArrayRef, String> {
     chunk.column_by_slot_id(slot_id)

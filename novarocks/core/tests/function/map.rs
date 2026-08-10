@@ -23,10 +23,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::Chunk;
 use novarocks::exec::expr::function::map::eval_map_function;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use novarocks_types::SlotId;
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -23,7 +23,6 @@ use super::common::build_slot_projection;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::ChunkSchema;
 use novarocks::exec::expr::{ExprArena, ExprNode};
 use novarocks::exec::node::aggregate::{
@@ -32,6 +31,7 @@ use novarocks::exec::node::aggregate::{
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
 pub(super) fn lower_hash_aggregate_node(

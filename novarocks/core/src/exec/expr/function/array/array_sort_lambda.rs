@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::{
@@ -26,6 +25,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
+use novarocks_types::SlotId;
 use std::cmp::Ordering;
 use std::sync::Arc;
 

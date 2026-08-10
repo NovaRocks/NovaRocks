@@ -16,7 +16,7 @@
 // under the License.
 use arrow::datatypes::Field;
 
-use crate::common::ids::SlotId;
+use novarocks_types::SlotId;
 
 pub const FIELD_META_SLOT_ID: &str = "novarocks.slot_id";
 pub const FIELD_META_STARROCKS_COLUMN_ID: &str = "starrocks.format.column.id";

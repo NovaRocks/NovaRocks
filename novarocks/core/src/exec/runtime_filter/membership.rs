@@ -30,9 +30,9 @@
 use arrow::array::{ArrayRef, BooleanArray};
 use arrow::compute::{filter, filter_record_batch};
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use novarocks_types::SlotId;
 
 use super::RuntimeFilterType;
 use super::bitset::RuntimeBitsetFilter;

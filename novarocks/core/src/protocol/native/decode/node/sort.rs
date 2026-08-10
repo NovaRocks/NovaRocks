@@ -235,12 +235,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::sort::SortTopNType;
     use crate::protocol::native::type_mapping::encode_type;
     use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

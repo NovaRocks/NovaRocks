@@ -27,7 +27,6 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::program::{ExchangeInputContract, FragmentNodeId, ScanSourceContract};
@@ -42,6 +41,7 @@ use crate::runtime::scan_range::ScanRangeParams;
 use novarocks_protocol::expr;
 use novarocks_protocol::novarocks;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 
 /// Immutable input-slot value supplied to backend expression decoders.
 ///
@@ -85,8 +85,8 @@ impl NativeExpressionInputLayout {
 #[cfg(test)]
 mod expression_layout_tests {
     use super::NativeExpressionInputLayout;
-    use crate::common::ids::SlotId;
     use crate::protocol::FieldPath;
+    use novarocks_types::SlotId;
 
     #[test]
     fn preserves_unknown_column_error_contract() {

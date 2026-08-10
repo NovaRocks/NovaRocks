@@ -107,12 +107,12 @@ pub fn eval_struct_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::expr::ExprNode;
     use arrow::array::{Array, Int32Array, Int64Array, ListArray};
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{Field, Fields, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
 
     #[test]
     fn struct_expr_casts_field_to_declared_type() {

@@ -20,7 +20,7 @@ use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::schema::types::{ColumnDescriptor, Type};
 
-use crate::common::ids::SlotId;
+use novarocks_types::SlotId;
 
 use super::variant_read::object_key_path;
 use super::{MinMaxPredicate, VariantPathSpec};
@@ -201,8 +201,8 @@ mod tests {
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    use crate::common::ids::SlotId;
     use crate::formats::parquet::{MinMaxPredicate, MinMaxPredicateValue};
+    use novarocks_types::SlotId;
 
     use super::*;
 

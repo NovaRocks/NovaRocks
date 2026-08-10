@@ -927,12 +927,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
     use crate::exec::chunk::ChunkSchema;
     use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
     use crate::sql::planner::distributed::{DataPartition, FragmentStreamKind};
     use novarocks_protocol::plan as native_plan;
+    use novarocks_types::SlotId;
 
     fn placement(fragment_id: FragmentId, instance_lo: i64) -> FragmentInstancePlacement {
         FragmentInstancePlacement {

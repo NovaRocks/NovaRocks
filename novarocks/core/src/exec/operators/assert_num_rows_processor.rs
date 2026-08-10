@@ -32,12 +32,12 @@ use std::collections::HashSet;
 use arrow::array::Array;
 use arrow::util::display::array_value_to_string;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_types::SlotId;
 
 /// Factory for processors that enforce ASSERT NUM ROWS runtime constraints.
 pub struct AssertNumRowsProcessorFactory {
@@ -442,8 +442,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    use crate::common::ids::SlotId;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     fn make_key_chunk(values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new(

@@ -30,12 +30,12 @@ mod slot;
 mod struct_expr;
 pub use cast::cast_with_special_rules;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::chunk::ChunkFieldSchema;
 use arrow::array::{ArrayRef, new_null_array};
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
+use novarocks_types::SlotId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -414,11 +414,11 @@ pub fn cast_array_to_target(array: &ArrayRef, target_type: &DataType) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     #[test]

@@ -22,10 +22,10 @@ use arrow::array::{Array, ArrayRef, DictionaryArray};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Int32Type};
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use novarocks_types::SlotId;
 
 pub(crate) fn is_supported_i32_string_dictionary(data_type: &DataType) -> bool {
     matches!(
@@ -252,10 +252,10 @@ mod tests {
     use arrow::array::{Array, ArrayRef, DictionaryArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type};
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+    use novarocks_types::SlotId;
 
     use super::{
         expr_can_peel_from_slot, is_supported_i32_string_dictionary, referenced_slots,

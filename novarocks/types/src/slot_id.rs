@@ -14,13 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use std::fmt;
 use std::str::FromStr;
 
-/// Slot id in novarocks's internal representation.
+/// Slot id in the carrier-neutral execution representation.
 ///
-/// This is derived from StarRocks FE's `TSlotId` during plan lowering, but the execution layer
-/// should not depend on StarRocks Thrift types directly.
+/// SQL and native protocol adapters lower their external slot identifiers to
+/// this value before they enter construction or execution code.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SlotId(pub u32);
 
@@ -50,18 +51,18 @@ impl TryFrom<i32> for SlotId {
     type Error = String;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
-        let v = u32::try_from(value).map_err(|_| format!("invalid slot id: {}", value))?;
-        Ok(Self(v))
+        let value = u32::try_from(value).map_err(|_| format!("invalid slot id: {value}"))?;
+        Ok(Self(value))
     }
 }
 
 impl FromStr for SlotId {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v = s
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
             .parse::<u32>()
-            .map_err(|e| format!("invalid slot id string '{}': {}", s, e))?;
-        Ok(Self(v))
+            .map(Self)
+            .map_err(|error| format!("invalid slot id string '{value}': {error}"))
     }
 }

@@ -741,12 +741,12 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanNode, ScanOp};
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::io::io_executor;
+    use novarocks_types::SlotId;
 
     use super::ScanSourceFactory;
     use std::thread;

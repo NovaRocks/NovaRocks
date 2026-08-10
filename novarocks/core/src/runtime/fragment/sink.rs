@@ -349,7 +349,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
 
-    use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprArena;
@@ -372,6 +371,7 @@ mod tests {
     use crate::runtime::fragment::io::ExchangeFrameTransmitter;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
+    use novarocks_types::SlotId;
 
     use super::{materialize_fragment_sink, materialize_fragment_sink_components};
 

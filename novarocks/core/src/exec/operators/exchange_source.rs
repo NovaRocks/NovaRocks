@@ -360,12 +360,12 @@ mod tests {
     use novarocks_spi::connector::ConnectorScalarValue;
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
     use crate::exec::pipeline::binding::ExchangeBinding;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     fn int32_chunk(values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));

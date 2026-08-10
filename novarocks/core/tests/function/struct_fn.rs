@@ -22,12 +22,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields};
 use arrow::record_batch::RecordBatch;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{Chunk, ChunkSchema};
 use novarocks::exec::expr::ExprId;
 use novarocks::exec::expr::function::FunctionKind;
 use novarocks::exec::expr::function::struct_fn::eval_struct_function;
 use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_types::SlotId;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------

@@ -477,9 +477,9 @@ fn crc32_utf8_values_match_zlib() {
     use arrow::array::Int64Array;
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::Chunk;
     use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     let mut arena = ExprArena::default();
@@ -685,9 +685,9 @@ fn test_money_format_logic() {
 fn murmur_hash3_32_known_vectors() {
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::Chunk;
     use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     let mut arena = ExprArena::default();
@@ -733,9 +733,9 @@ fn murmur_hash3_32_known_vectors() {
 fn murmur_hash3_32_null_propagation() {
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::Chunk;
     use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     let mut arena = ExprArena::default();
@@ -1138,8 +1138,8 @@ fn test_unhex_invalid_input_returns_empty_string() {
 fn create_test_chunk_string(values: Vec<String>) -> novarocks::exec::chunk::Chunk {
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     let array = Arc::new(StringArray::from(values)) as ArrayRef;
@@ -1393,12 +1393,12 @@ fn test_raise_error_null_returns_null() {
 }
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks::exec::chunk::Chunk;
 /// Integration tests for SUBSTRING/SUBSTR function.
 ///
 /// Tests verify that SUBSTRING properly extracts substrings from strings
 /// and aligns with StarRocks BE's substring behavior.
-use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::Chunk;
+use novarocks_types::SlotId;
 
 /// Helper function to create a test chunk with a dummy column
 fn create_test_chunk() -> Chunk {

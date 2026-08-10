@@ -28,7 +28,6 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::common::config::exchange_max_transmit_batched_bytes;
-use crate::common::ids::SlotId;
 use crate::common::types::{UniqueId, format_uuid};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -41,6 +40,7 @@ use crate::runtime::fragment::io::exchange_queue::{
 };
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use arrow::datatypes::DataType;
+use novarocks_types::SlotId;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -2337,7 +2337,7 @@ mod tests {
         let batch = arrow::array::RecordBatch::try_new(schema, vec![array.clone()]).unwrap();
         let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
             batch.schema().as_ref(),
-            &[crate::common::ids::SlotId::new(1)],
+            &[novarocks_types::SlotId::new(1)],
         )
         .unwrap();
         let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);

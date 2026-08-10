@@ -34,9 +34,9 @@ use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use novarocks_types::SlotId;
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -385,12 +385,12 @@ impl ProcessorOperator for FilterProcessorOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Array, ArrayRef, DictionaryArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
 
     fn dict_utf8_type() -> DataType {
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))

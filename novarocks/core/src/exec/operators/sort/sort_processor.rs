@@ -1131,13 +1131,13 @@ mod tests {
     /// Expected: partition 1 keeps o=[10,20], partition 2 keeps o=[5,6]  → 4 rows
     #[test]
     fn partition_topn_rank_limit_none_routes_per_partition_not_global() {
-        use crate::common::ids::SlotId;
         use crate::exec::chunk::{Chunk, ChunkSchema};
         use crate::exec::expr::{ExprArena, ExprNode};
         use crate::exec::node::sort::{SortExpression, SortTopNType};
         use arrow::array::{Array, Int32Array};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
+        use novarocks_types::SlotId;
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![
@@ -1260,13 +1260,13 @@ mod tests {
     ///   partition 1 keeps o=[10,20]; partition 2 keeps o=[5,6]
     #[test]
     fn build_topn_sorter_uses_partition_path_and_yields_per_partition_result() {
-        use crate::common::ids::SlotId;
         use crate::exec::chunk::{Chunk, ChunkSchema};
         use crate::exec::expr::{ExprArena, ExprNode};
         use crate::exec::node::sort::{SortExpression, SortTopNType};
         use arrow::array::{Array, Int32Array};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
+        use novarocks_types::SlotId;
         use std::sync::Arc;
 
         // Build a two-column chunk: col 0 = partition key (SlotId 1), col 1 = order key (SlotId 2).

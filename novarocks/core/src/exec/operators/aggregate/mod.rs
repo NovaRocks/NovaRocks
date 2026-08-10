@@ -42,7 +42,6 @@ use novarocks_execution::runtime_filter as execution;
 use novarocks_execution::runtime_filter::RuntimeFilterProducerFailure;
 
 use crate::common::failpoint;
-use crate::common::ids::SlotId;
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
@@ -51,6 +50,7 @@ use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use novarocks_types::SlotId;
 
 use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
@@ -1717,11 +1717,11 @@ mod tests {
         is_compatible_aggregate_data_type, is_compatible_aggregate_group_data_type,
         normalize_aggregate_group_arrays,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
     const GROUP_SLOT: SlotId = SlotId::new(1);
 
     #[derive(Default)]
@@ -2464,9 +2464,9 @@ mod tests {
 
     #[test]
     fn aggregate_encoded_gate_accepts_only_single_direct_group_slot() {
-        use crate::common::ids::SlotId;
         use crate::exec::expr::{ExprArena, ExprNode};
         use crate::exec::node::aggregate::AggFunction;
+        use novarocks_types::SlotId;
 
         let slot = SlotId::new(7);
         let other_slot = SlotId::new(8);

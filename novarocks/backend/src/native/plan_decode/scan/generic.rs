@@ -31,7 +31,6 @@ use novarocks_spi::connector::{
     ConnectorScanHandle, ConnectorSplit,
 };
 
-use novarocks::common::ids::SlotId;
 use novarocks::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
 use novarocks::exec::chunk::ChunkSchema;
 use novarocks::exec::expr::ExprArena;
@@ -43,6 +42,7 @@ use novarocks::formats::parquet::{
 use novarocks::protocol::ProtocolErrorKind;
 use novarocks::runtime::query_options::query_expire_durations;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 
 use super::super::context::NativePlanDecodeContext;
 use super::super::error::NativeFragmentLeafDecodeError;

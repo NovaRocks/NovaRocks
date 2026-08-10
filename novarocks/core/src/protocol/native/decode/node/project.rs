@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
@@ -28,6 +27,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 use novarocks_protocol::{expr, plan};
+use novarocks_types::SlotId;
 
 pub(super) fn lower_project_node(
     node: &plan::DistributedNode,

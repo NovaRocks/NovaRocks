@@ -16,13 +16,13 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::common::ids::SlotId;
 use crate::runtime::exchange;
 use crate::runtime::lookup::{
     decode_column_ipc, encode_column_ipc, execute_position_lookup_request,
 };
 use crate::runtime::query_context::QueryId;
 use novarocks_protocol as proto;
+use novarocks_types::SlotId;
 fn ok_common_status() -> proto::common::Status {
     proto::common::Status {
         code: 0,

@@ -33,7 +33,6 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int32Array, UInt32Array};
 use arrow::compute::{concat, take};
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -43,6 +42,7 @@ use crate::runtime::fragment::io::{
     FragmentLookupClient, LookupColumn, LookupKind, LookupRequest, LookupTarget,
 };
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_types::SlotId;
 
 /// Factory for fetch processors that resolve deferred row/slot materialization.
 pub struct FetchProcessorFactory {

@@ -21,11 +21,11 @@ use arrow::datatypes::DataType;
 
 use self::error::NativeExpressionDecodeError;
 use super::type_decode::{decode_field_type, decode_type};
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::ChunkFieldSchema;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks::protocol::FieldPath;
 use novarocks_protocol::expr;
+use novarocks_types::SlotId;
 
 mod binary;
 mod case;
@@ -633,10 +633,10 @@ pub(crate) mod tests {
 
     use super::super::type_decode::encode_type;
     use super::*;
-    use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::Chunk;
     use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue, function::FunctionKind};
     use novarocks_protocol::{common, expr};
+    use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     pub(crate) fn type_desc(data_type: &DataType) -> common::TypeDesc {

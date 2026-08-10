@@ -121,11 +121,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::common::ids::SlotId;
     use crate::engine::mv::iceberg_join_coalesce::stable_join_row_key;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::function::lookup_function;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+    use novarocks_types::SlotId;
 
     fn chunk_len_1() -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new(

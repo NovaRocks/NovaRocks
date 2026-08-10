@@ -1,8 +1,8 @@
 use arrow::array::ArrayRef;
 
-use crate::common::ids::SlotId;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_context::QueryId;
+use novarocks_types::SlotId;
 
 use super::FragmentIoError;
 

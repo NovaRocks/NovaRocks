@@ -93,9 +93,9 @@ impl ChunksSorter for ChunksSorterFullSort {
 mod tests {
     use super::*;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::ExprNode;
+    use novarocks_types::SlotId;
 
     use arrow::array::{Array, Decimal128Array, Int32Array, make_array};
     use arrow::datatypes::{DataType, Field, Schema};

@@ -37,7 +37,6 @@ use arrow::datatypes::SchemaRef;
 use crate::common::config::{
     local_exchange_buffer_mem_limit_per_driver, local_exchange_max_buffered_rows,
 };
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::operators::data_stream_sink::{
@@ -52,6 +51,7 @@ use crate::novarocks_logging::debug;
 use crate::novarocks_logging::warn;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use novarocks_types::SlotId;
 
 static NEXT_EXCHANGE_ID: AtomicUsize = AtomicUsize::new(1);
 const LOCAL_EXCHANGE_NOTIFY_LOG_EVERY: u64 = 1024;

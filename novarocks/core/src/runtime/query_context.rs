@@ -22,7 +22,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cache::CacheOptions;
-use crate::common::ids::SlotId;
 use crate::exec::node::scan::ConnectorRowPositionLookup;
 use crate::exec::node::scan::IncrementalScanRange;
 use crate::exec::node::scan::ScanOp;
@@ -30,6 +29,7 @@ use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::mem_tracker::{self, MemTracker};
+use novarocks_types::SlotId;
 use novarocks_types::UniqueId;
 
 pub(crate) use novarocks_types::QueryId;
@@ -2015,9 +2015,9 @@ mod incremental_scan_domain_tests {
     use std::sync::atomic::AtomicBool;
 
     use super::{QueryContextManager, QueryContextManagerInner, QueryId};
-    use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
     use crate::exec::node::scan::IncrementalScanRange;
+    use novarocks_types::SlotId;
 
     fn manager() -> QueryContextManager {
         QueryContextManager {

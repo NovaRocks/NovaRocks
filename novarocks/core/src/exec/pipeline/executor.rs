@@ -526,7 +526,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
@@ -548,6 +547,7 @@ mod tests {
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     use super::{
         PreparedPipelineExecution, execute_native_plan_with_pipeline, prepare_pipeline_execution,

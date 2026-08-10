@@ -730,8 +730,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
 
     fn ctx(table_name: &str) -> SchemaScanContext {
         SchemaScanContext {

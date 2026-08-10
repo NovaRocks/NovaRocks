@@ -463,7 +463,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::join::JoinDistributionMode;
@@ -475,6 +474,7 @@ mod tests {
     use crate::exec::pipeline::operator::ProcessorOperator;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     use super::PartitionedJoinProbeProcessorFactory;
 

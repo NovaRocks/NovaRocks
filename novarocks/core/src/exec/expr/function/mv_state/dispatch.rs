@@ -257,10 +257,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
     use crate::exec::expr::{ExprNode, LiteralValue};
+    use novarocks_types::SlotId;
 
     #[test]
     fn state_all_zero_is_registered_as_mv_state_function() {

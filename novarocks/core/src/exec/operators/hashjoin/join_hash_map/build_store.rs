@@ -152,9 +152,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_types::SlotId;
 
     use super::*;
 

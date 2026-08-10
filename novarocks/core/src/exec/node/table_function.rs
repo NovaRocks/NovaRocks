@@ -16,9 +16,9 @@
 // under the License.
 use arrow::datatypes::DataType;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::ExecNode;
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
 pub enum TableFunctionOutputSlot {

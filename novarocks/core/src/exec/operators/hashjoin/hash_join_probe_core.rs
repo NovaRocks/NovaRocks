@@ -1747,10 +1747,10 @@ mod tests {
 
     use super::build_requirements::required_build_components;
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::ExprNode;
     use crate::exec::operators::hashjoin::join_hash_map::build_store::BuildStore;
+    use novarocks_types::SlotId;
 
     const LEFT_K_SLOT_ID: SlotId = SlotId::new(1);
     const LEFT_V_SLOT_ID: SlotId = SlotId::new(2);

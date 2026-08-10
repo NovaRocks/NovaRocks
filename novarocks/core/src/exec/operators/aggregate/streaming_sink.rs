@@ -42,7 +42,6 @@ use super::{
     normalize_aggregate_group_arrays,
 };
 use crate::common::failpoint;
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -56,6 +55,7 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_execution::runtime_filter::RuntimeFilterProducerFailure;
+use novarocks_types::SlotId;
 
 use super::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,

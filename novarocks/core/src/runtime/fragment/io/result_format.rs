@@ -232,11 +232,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::build_statistic_result_batch;
-    use crate::common::ids::SlotId;
     use crate::common::util::FieldRenderSchema;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::runtime::fragment::io::ResultProjection;
     use novarocks_types::PrimitiveType;
+    use novarocks_types::SlotId;
 
     fn statistic_chunk(versions: Vec<i32>) -> Chunk {
         let rows = versions.len();

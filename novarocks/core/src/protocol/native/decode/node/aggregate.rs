@@ -23,7 +23,6 @@ use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::common::build_slot_projection;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{
@@ -32,6 +31,7 @@ use crate::exec::node::aggregate::{
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
 use novarocks_protocol::plan;
+use novarocks_types::SlotId;
 use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
 pub(super) fn lower_hash_aggregate_node(
@@ -439,10 +439,10 @@ mod tests {
 
     use super::super::tests::*;
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use novarocks_protocol::plan;
+    use novarocks_types::SlotId;
 
     #[test]
     fn hash_aggregate_derives_output_columns_from_layout_sidecar() {

@@ -1707,7 +1707,6 @@ pub fn eval_not(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<Array
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{
         BooleanArray, Decimal128Array, DictionaryArray, Int32Array, Int32Builder, Int64Array,
@@ -1717,6 +1716,7 @@ mod tests {
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{Field, Fields, Int8Type, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use novarocks_types::largeint;
     use std::collections::HashMap;
 

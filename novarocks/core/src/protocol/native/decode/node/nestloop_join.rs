@@ -152,9 +152,9 @@ mod tests {
         bool_literal, lower, one_col_values_node_with, one_col_values_node_with_nullable,
         output_column, output_column_with_nullable, physical_node,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::node::ExecNodeKind;
     use novarocks_protocol::plan;
+    use novarocks_types::SlotId;
 
     #[test]
     fn nested_loop_join_output_schema_uses_plan_output_nullability() {

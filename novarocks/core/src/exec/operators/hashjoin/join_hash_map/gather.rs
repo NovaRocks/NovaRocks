@@ -363,8 +363,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
+    use novarocks_types::SlotId;
 
     use super::{
         MAX_JOIN_OUTPUT_ROWS_PER_BATCH, gather_join_batches, gather_left_with_null_right,

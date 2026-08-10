@@ -14,13 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use novarocks::exec::chunk::Chunk;
+use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
 /// Integration tests for CloneExpr functionality.
 ///
 /// Tests verify that CloneExpr properly creates independent column copies
 /// and aligns with StarRocks BE's CloneExpr behavior.
-use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::Chunk;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_types::SlotId;
 
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};

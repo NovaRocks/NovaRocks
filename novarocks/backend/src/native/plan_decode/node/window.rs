@@ -23,7 +23,6 @@ use arrow::datatypes::{DataType, Field, Fields};
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks::exec::expr::{ExprArena, ExprNode};
 use novarocks::exec::node::analytic::{
@@ -34,6 +33,7 @@ use novarocks::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::common::error::FieldPath;
 use novarocks_protocol::{expr, plan};
+use novarocks_types::SlotId;
 
 pub(super) fn lower_window_node(
     node: &plan::DistributedNode,

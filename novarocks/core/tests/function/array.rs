@@ -1265,7 +1265,7 @@ fn test_array_length_null() {
 fn test_array_length_const_cast_json_array() {
     use arrow::array::ArrayRef;
     use arrow::record_batch::RecordBatch;
-    use novarocks::common::ids::SlotId;
+    use novarocks_types::SlotId;
     let mut arena = ExprArena::default();
     let expr = common::typed_null(&mut arena, DataType::Int64);
     let lit = arena.push_typed(
@@ -1308,7 +1308,7 @@ fn test_array_length_const_cast_json_array() {
 fn eval_array_map_with_lambda() {
     use arrow::array::{ArrayRef, Int64Builder, ListBuilder};
     use arrow::record_batch::RecordBatch;
-    use novarocks::common::ids::SlotId;
+    use novarocks_types::SlotId;
 
     let mut arena = ExprArena::default();
     let item_field = Arc::new(Field::new("item", DataType::Int64, true));
@@ -1810,7 +1810,7 @@ fn test_array_sort_null_first() {
 #[test]
 fn test_array_sort_lambda_descending() {
     use arrow::array::Int64Array;
-    use novarocks::common::ids::SlotId;
+    use novarocks_types::SlotId;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let item_type = DataType::Int64;

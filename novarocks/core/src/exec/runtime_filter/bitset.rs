@@ -35,8 +35,8 @@ use arrow::array::{
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
+use novarocks_types::SlotId;
 
 use super::min_max::RuntimeMinMaxFilter;
 use super::{RuntimeDecimalWidth, RuntimeFilterType};

@@ -23,7 +23,6 @@ use arrow::datatypes::{DataType, Field, Fields};
 use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::analytic::{
@@ -34,6 +33,7 @@ use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
 use novarocks_protocol::{expr, plan};
+use novarocks_types::SlotId;
 
 pub(super) fn lower_window_node(
     node: &plan::DistributedNode,
@@ -821,11 +821,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::protocol::native::type_mapping::encode_type;
     use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

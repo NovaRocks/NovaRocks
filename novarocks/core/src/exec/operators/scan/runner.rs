@@ -689,7 +689,6 @@ pub(super) fn run_scan_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
@@ -707,6 +706,7 @@ mod tests {
     use arrow::array::{Array, DictionaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)

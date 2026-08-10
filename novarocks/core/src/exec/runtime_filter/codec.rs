@@ -30,7 +30,7 @@
 
 use hashbrown::HashSet;
 
-use crate::common::ids::SlotId;
+use novarocks_types::SlotId;
 
 use super::{
     RuntimeBitsetFilter, RuntimeBloomFilter, RuntimeDecimalWidth, RuntimeEmptyFilter,
@@ -953,12 +953,12 @@ mod tests {
         decode_starrocks_membership_filter, encode_starrocks_bitset_filter,
         encode_starrocks_in_filter, runtime_type_from_starrocks_primitive, sr_primitive,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::runtime_filter::min_max::MinMaxValue;
     use crate::exec::runtime_filter::{
         RuntimeBitsetFilter, RuntimeDecimalWidth, RuntimeFilterType, RuntimeInFilter,
         RuntimeInFilterValues, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
+    use novarocks_types::SlotId;
 
     #[test]
     fn legacy_string_family_primitives_map_to_utf8_runtime_type() {

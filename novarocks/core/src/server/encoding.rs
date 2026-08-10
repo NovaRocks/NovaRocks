@@ -566,8 +566,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     #[test]

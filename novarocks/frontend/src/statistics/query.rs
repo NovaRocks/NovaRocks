@@ -4,9 +4,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{Chunk, ChunkSchema};
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
+use novarocks_types::SlotId;
 use sqlparser::ast as sqlast;
 
 use super::FrontendStatisticsService;

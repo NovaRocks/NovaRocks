@@ -189,13 +189,13 @@ fn field_with_actual_nullability(field: &Arc<Field>, array: &ArrayRef) -> Arc<Fi
 
 #[cfg(test)]
 mod tests {
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Array, Int32Array, MapArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     fn one_row_chunk() -> Chunk {

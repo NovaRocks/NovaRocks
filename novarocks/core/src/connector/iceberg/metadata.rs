@@ -36,12 +36,12 @@ use novarocks_spi::connector::{
 
 use novarocks_connector_iceberg::iceberg::spec::{SnapshotRetention, TableMetadata};
 
-use crate::common::ids::SlotId;
 use crate::connector::runtime::ConnectorReadScanSource;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::ScanSource;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
+use novarocks_types::SlotId;
 
 /// Decode the JSON payload that the planner stamps onto
 /// `IcebergMetadataScanConfig::serialized_table` back into an iceberg-rust
@@ -1762,9 +1762,9 @@ fn build_entries_chunks(
 #[cfg(test)]
 mod tests {
     use super::{IcebergMetadataTableType, normalize_metadata_output_type};
-    use crate::common::ids::SlotId;
     use arrow::array::{Array, MapArray};
     use arrow::datatypes::{DataType, Field};
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     #[test]

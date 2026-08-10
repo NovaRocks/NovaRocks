@@ -297,8 +297,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
 
     #[derive(Default)]
     struct NeverCancelled;

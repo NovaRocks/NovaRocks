@@ -243,9 +243,9 @@ mod tests {
     };
     use arrow::array::{Array, BooleanArray};
     use arrow::datatypes::DataType;
-    use novarocks::common::ids::SlotId;
     use novarocks::exec::expr::{ExprNode, LiteralValue};
     use novarocks_protocol::expr;
+    use novarocks_types::SlotId;
 
     #[test]
     fn in_list_casts_numeric_candidates_to_string_operand_type() {

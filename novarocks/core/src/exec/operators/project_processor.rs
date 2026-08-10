@@ -33,13 +33,13 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, new_empty_array};
 use arrow::datatypes::{DataType, Field};
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::dict_peel::{
     expr_can_peel_from_slot, is_supported_i32_string_dictionary, referenced_slots,
     try_peel_dict_expr,
 };
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, cast_array_to_target};
+use novarocks_types::SlotId;
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -619,12 +619,12 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::ProjectProcessorOperator;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::LiteralValue;
     use crate::exec::expr::function::FunctionKind;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::pipeline::operator::ProcessorOperator;
+    use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {

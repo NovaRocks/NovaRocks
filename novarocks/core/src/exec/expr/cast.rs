@@ -3882,7 +3882,6 @@ fn parse_variant(variant_arr: &LargeBinaryArray, row: usize) -> Option<VariantVa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{
@@ -3891,6 +3890,7 @@ mod tests {
     };
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use novarocks_types::largeint;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
     use std::sync::Arc;

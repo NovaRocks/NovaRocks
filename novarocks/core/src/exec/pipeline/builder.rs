@@ -420,7 +420,7 @@ fn shuffle_by_hash_on_input_slots(
     mut build: PipelineBuildResult,
     ctx: &mut PipelineBuildContext,
     owner_node_id: i32,
-    partition_slot_ids: Vec<crate::common::ids::SlotId>,
+    partition_slot_ids: Vec<novarocks_types::SlotId>,
     distribution_keys: Vec<crate::exec::expr::ExprId>,
     partition_count: usize,
 ) -> PipelineBuildResult {
@@ -499,7 +499,7 @@ fn ensure_hash_on_input_slots(
     build: PipelineBuildResult,
     ctx: &mut PipelineBuildContext,
     owner_node_id: i32,
-    partition_slot_ids: Vec<crate::common::ids::SlotId>,
+    partition_slot_ids: Vec<novarocks_types::SlotId>,
     distribution_keys: Vec<ExprId>,
     partitions: usize,
 ) -> PipelineBuildResult {
@@ -566,7 +566,7 @@ pub(crate) fn output_chunk_schema_for_node(
 fn keyed_assert_distribution_keys(
     ctx: &mut PipelineBuildContext,
     input: &ExecNode,
-    key_slots: &[crate::common::ids::SlotId],
+    key_slots: &[novarocks_types::SlotId],
 ) -> Result<Vec<ExprId>, String> {
     let output_schema = output_chunk_schema_for_node(input).ok_or_else(|| {
         "keyed assert_num_rows local hash requires child output schema".to_string()
@@ -593,7 +593,7 @@ fn keyed_assert_distribution_keys(
 fn existing_hash_distribution_keys_for_slots(
     ctx: &PipelineBuildContext,
     stream: &StreamDesc,
-    key_slots: &[crate::common::ids::SlotId],
+    key_slots: &[novarocks_types::SlotId],
     partitions: usize,
 ) -> Option<Vec<ExprId>> {
     let Distribution::Hash {
@@ -1948,7 +1948,6 @@ mod tests {
         build_native_pipeline_graph_for_exec_plan_with_dop,
         build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{
@@ -1959,6 +1958,7 @@ mod tests {
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::dependency::DependencyManager;
+    use novarocks_types::SlotId;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)

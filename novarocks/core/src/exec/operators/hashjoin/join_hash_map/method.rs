@@ -1140,11 +1140,11 @@ mod tests {
         BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions, JoinHashMapBuildPurpose,
         JoinHashMapMethodKind,
     };
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::operators::hashjoin::join_hash_map::search::SearchStats;
     use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_types::SlotId;
 
     const KEY_SLOT_ID: SlotId = SlotId(1);
 

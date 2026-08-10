@@ -34,9 +34,9 @@ use super::runtime::{
     ConnectorBatchReaderIter, ConnectorReadScanSource, ConnectorSplitAppend,
     IncrementalConnectorSplitAdapter,
 };
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::{BoundScanRanges, IncrementalScanRange, ScanMorsel, ScanSource};
+use novarocks_types::SlotId;
 
 struct FakeReader {
     batches: Vec<Result<Option<RecordBatch>, ConnectorError>>,

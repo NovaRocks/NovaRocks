@@ -232,9 +232,9 @@ mod tests {
     use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::pipeline::operator::Operator;
+    use novarocks_types::SlotId;
 
     fn chunk(schema: SchemaRef, values: Vec<i64>) -> Chunk {
         let batch = RecordBatch::try_new(

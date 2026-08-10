@@ -559,7 +559,6 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::runtime_filter::{
@@ -570,6 +569,7 @@ mod tests {
         Array, ArrayRef, DictionaryArray, Int32Array, LargeStringArray, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use novarocks_types::SlotId;
     use std::collections::HashMap;
     use std::sync::Arc;
 

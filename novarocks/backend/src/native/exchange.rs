@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(schema.expected_schema().slots().len(), 1);
         assert_eq!(
             schema.expected_schema().slots()[0].slot_id(),
-            novarocks::common::ids::SlotId::new(3)
+            novarocks_types::SlotId::new(3)
         );
     }
 

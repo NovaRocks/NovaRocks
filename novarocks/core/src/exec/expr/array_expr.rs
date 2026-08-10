@@ -176,12 +176,12 @@ pub fn eval_array_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
 
     fn one_row_chunk() -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));

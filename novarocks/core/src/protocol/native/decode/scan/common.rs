@@ -22,7 +22,6 @@ use arrow::datatypes::DataType;
 
 use super::super::layout::Layout;
 use super::super::node::NativePlanDecodeContext;
-use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::protocol::common::error::FieldPath;
@@ -31,6 +30,7 @@ use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 use novarocks_fs::ObjectStoreConfig;
 use novarocks_protocol::{common, plan};
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
 pub(super) struct ProvenancedOutputColumn {

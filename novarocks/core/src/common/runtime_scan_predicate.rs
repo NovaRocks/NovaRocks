@@ -17,10 +17,10 @@
 
 use std::collections::HashMap;
 
-use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::common::scan_predicate::{ScanPredicate, ScanPredicateSource};
 use crate::exec::node::scan::RuntimeFilterContext;
+use novarocks_types::SlotId;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RuntimeScanPredicateBindings {
@@ -161,11 +161,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::common::min_max_predicate::MinMaxPredicateValue;
     use crate::common::scan_predicate::{ScanPredicateDomain, ScanPredicateSource};
     use crate::exec::node::scan::RuntimeFilterContext;
     use crate::exec::runtime_filter::RuntimeInFilter;
+    use novarocks_types::SlotId;
 
     fn int_in_filter(filter_id: i32, slot_id: u32, values: &[i32]) -> RuntimeInFilter {
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));

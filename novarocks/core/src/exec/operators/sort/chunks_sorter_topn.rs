@@ -491,11 +491,11 @@ pub(crate) fn sort_chunks_partition_topn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode};
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use std::sync::Arc;
 
     /// Build a two-column Chunk: col 0 = partition key (SlotId 1), col 1 = order key (SlotId 2).

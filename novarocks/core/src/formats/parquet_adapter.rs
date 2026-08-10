@@ -36,7 +36,6 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::common::ids::SlotId;
 pub use crate::common::min_max_predicate::{
     MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
 };
@@ -51,6 +50,7 @@ use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::scan::RuntimeFilterContext;
 use novarocks_fs::DataCacheContext;
+use novarocks_types::SlotId;
 pub use variant_pruning::VariantPathPruningPredicate;
 pub use variant_read::{
     collapse_variant_struct_to_largebinary, convert_variant_columns, is_variant_struct_data_type,

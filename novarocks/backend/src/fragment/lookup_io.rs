@@ -129,10 +129,9 @@ fn decode_response(
                 "lookup response column missing data",
             ));
         }
-        let slot_id =
-            novarocks::common::ids::SlotId::try_from(column.slot_id).map_err(|error| {
-                lookup_error(FragmentIoErrorKind::InvalidResponse, error.to_string())
-            })?;
+        let slot_id = novarocks_types::SlotId::try_from(column.slot_id).map_err(|error| {
+            lookup_error(FragmentIoErrorKind::InvalidResponse, error.to_string())
+        })?;
         let values = novarocks::runtime::lookup::decode_column_ipc(&column.data)
             .map_err(|error| lookup_error(FragmentIoErrorKind::InvalidResponse, error))?;
         columns.push(LookupColumn::new(slot_id, values));

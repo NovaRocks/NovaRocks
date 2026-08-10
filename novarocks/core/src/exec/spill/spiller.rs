@@ -261,11 +261,11 @@ fn resolve_codec(default_codec: SpillCodec, spill_encode_level: Option<i32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSchema;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
     use tempfile::tempdir;
 
     #[test]

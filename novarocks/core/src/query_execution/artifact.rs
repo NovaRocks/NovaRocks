@@ -27,7 +27,6 @@ use arrow::datatypes::Field;
 use novarocks_spi::connector::ConnectorExecutionDeclaration;
 use sha2::{Digest, Sha256};
 
-use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::protocol::native::encode::NativeFragmentBundle;
@@ -58,6 +57,7 @@ use crate::sql::planner::distributed::{
     FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind, PartitionKind,
 };
 use novarocks_protocol::plan::RuntimeFilterBindingTable;
+use novarocks_types::SlotId;
 
 pub use crate::query_execution::connector_binding::{
     ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,

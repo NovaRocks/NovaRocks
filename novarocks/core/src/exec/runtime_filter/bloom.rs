@@ -35,8 +35,8 @@ use arrow::array::{
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::DataType;
 
-use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
+use novarocks_types::SlotId;
 
 use super::RuntimeFilterType;
 use super::codec::{read_i32_le, read_u32_le};

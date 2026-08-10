@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::ArrayRef;
 
-use crate::common::ids::SlotId;
 use crate::novarocks_logging::warn;
+use novarocks_types::SlotId;
 
 use super::RuntimeFilterType;
 use super::bloom::RuntimeBloomFilter;
@@ -387,7 +387,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::common::ids::SlotId;
+    use novarocks_types::SlotId;
 
     #[test]
     fn add_partial_records_drop_when_in_filter_exceeds_limit() {
