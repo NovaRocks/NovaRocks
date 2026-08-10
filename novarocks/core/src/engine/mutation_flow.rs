@@ -2900,7 +2900,7 @@ fn cow_selection_from_matched_and_insert(
                     )
                 })?;
             columns.push(
-                crate::exec::expr::cast_array_to_target(
+                novarocks_execution::exec::expr::cast_array_to_target(
                     old_rows.column(ordinal),
                     field.field().data_type(),
                 )
@@ -2924,7 +2924,7 @@ fn cow_selection_from_matched_and_insert(
                     )
                 })?;
             columns.push(
-                crate::exec::expr::cast_array_to_target(
+                novarocks_execution::exec::expr::cast_array_to_target(
                     new_rows.column(ordinal),
                     field.field().data_type(),
                 )
@@ -2977,7 +2977,7 @@ fn cow_selection_from_matched_and_insert(
                     )
                 })?;
             columns.push(
-                crate::exec::expr::cast_array_to_target(
+                novarocks_execution::exec::expr::cast_array_to_target(
                     insert_batch.column(ordinal),
                     field.field().data_type(),
                 )

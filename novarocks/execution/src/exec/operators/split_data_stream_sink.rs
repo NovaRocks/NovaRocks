@@ -412,12 +412,12 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::split_chunk_by_exprs;
-    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
     use crate::exec::pipeline::schedule::observer::Observable;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_types::SlotId;
 
     use super::{InnerSinkRuntime, SplitDataStreamSinkOperator};
 

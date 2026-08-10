@@ -6856,8 +6856,8 @@ fn iceberg_cow_rewrite_input(
 ) -> Result<ConnectorWriteInputShape, ConnectorError> {
     let contract = preparation.match_contract();
     let lineage = [
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+        novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
     ]
     .into_iter()
     .map(|name| {

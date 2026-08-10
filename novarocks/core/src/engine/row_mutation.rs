@@ -32,7 +32,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::fragment_transport::FetchedQueryBatch;
-use crate::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions;
 
 const DELETE_EFFECT_TAG: i8 = 1;
 const REPLACE_EFFECT_TAG: i8 = 2;

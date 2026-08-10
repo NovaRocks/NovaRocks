@@ -422,7 +422,8 @@ fn decode_connector_write_output_expressions(
     output_exprs: &[expr::Expr],
     layout: &Layout,
     context: &NativePlanDecodeContext,
-) -> Result<(ExprArena, Vec<novarocks::exec::expr::ExprId>), NativeFragmentLeafDecodeError> {
+) -> Result<(ExprArena, Vec<novarocks_execution::exec::expr::ExprId>), NativeFragmentLeafDecodeError>
+{
     let mut arena = ExprArena::default();
     let exprs = output_exprs
         .iter()

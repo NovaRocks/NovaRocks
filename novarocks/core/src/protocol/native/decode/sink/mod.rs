@@ -439,7 +439,8 @@ fn decode_connector_write_output_expressions(
     output_exprs: &[expr::Expr],
     layout: &super::layout::Layout,
     context: &NativePlanDecodeContext,
-) -> Result<(ExprArena, Vec<crate::exec::expr::ExprId>), NativeFragmentLeafDecodeError> {
+) -> Result<(ExprArena, Vec<novarocks_execution::exec::expr::ExprId>), NativeFragmentLeafDecodeError>
+{
     let mut arena = ExprArena::default();
     let exprs = output_exprs
         .iter()
@@ -1057,8 +1058,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 
     fn binary_to_variant_expression(column_id: u32) -> expr::Expr {
         let operand = expr::Expr {

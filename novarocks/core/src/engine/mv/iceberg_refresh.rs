@@ -14208,24 +14208,24 @@ fn admit_mv_change_stream_write_targets(
 
     let row_identity_fields = vec![
         ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
             DataType::Int64,
             false,
         )),
         ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
             DataType::Int64,
             true,
         )),
     ];
     let deletion_identity_fields = vec![
         ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
             DataType::Utf8,
             false,
         )),
         ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
             DataType::Int64,
             false,
         )),
