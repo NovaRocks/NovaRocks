@@ -92,10 +92,34 @@ impl IoExecutorMetrics {
     }
 }
 
+struct OwnedRuntime {
+    runtime: Option<Runtime>,
+}
+
+impl OwnedRuntime {
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("owned execution I/O runtime is available while referenced")
+    }
+}
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            // `Runtime`'s normal Drop blocks, which Tokio forbids from an
+            // asynchronous task. The application owns this runtime, but
+            // fragment/test teardown can release its final Arc on either side
+            // of that boundary, so shutdown must be non-blocking here.
+            runtime.shutdown_background();
+        }
+    }
+}
+
 #[derive(Clone)]
 enum Spawner {
     /// Owns a dedicated runtime (sink_io).
-    Owned(Arc<Runtime>),
+    Owned(Arc<OwnedRuntime>),
 }
 
 /// A uniform handle to one execution service. Cloneable; cheap to pass around.
@@ -129,7 +153,7 @@ impl IoExecutor {
         F::Output: Send + 'static,
     {
         match &self.spawner {
-            Spawner::Owned(rt) => rt.spawn(fut),
+            Spawner::Owned(rt) => rt.runtime().spawn(fut),
         }
     }
 
@@ -250,7 +274,7 @@ fn build_runtime(
     thread_name: &'static str,
     worker_threads: usize,
     max_blocking_threads: usize,
-) -> Result<Arc<Runtime>, String> {
+) -> Result<Arc<OwnedRuntime>, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(worker_threads)
@@ -259,7 +283,9 @@ fn build_runtime(
         .thread_stack_size(WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|e| format!("init execution I/O runtime {thread_name} failed: {e}"))?;
-    Ok(Arc::new(runtime))
+    Ok(Arc::new(OwnedRuntime {
+        runtime: Some(runtime),
+    }))
 }
 
 #[cfg(test)]
@@ -347,5 +373,19 @@ mod tests {
         assert!(out.is_err());
         let after = executor.metrics().snapshot();
         assert_eq!(after.errors, before.errors + 1);
+    }
+
+    #[test]
+    fn services_can_drop_from_an_async_context() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let services = services();
+            let handle = services.sink_io().spawn(async { 7_u8 });
+            assert_eq!(handle.await.expect("join"), 7);
+            drop(services);
+        });
     }
 }

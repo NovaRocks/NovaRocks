@@ -93,7 +93,7 @@ impl ExecutionRuntimeConfig {
                 return Err(ExecutionRuntimeConfigError::invalid_field(name));
             }
         }
-        if self.local_exchange_max_buffered_rows <= 0 {
+        if self.local_exchange_max_buffered_rows == 0 {
             return Err(ExecutionRuntimeConfigError::invalid_field(
                 "local_exchange_max_buffered_rows",
             ));
@@ -272,5 +272,12 @@ mod tests {
         let config = config();
         let runtime = ExecutionRuntime::new(config.clone()).expect("valid runtime config");
         assert_eq!(runtime.config(), &config);
+    }
+
+    #[test]
+    fn accepts_negative_one_for_unbounded_local_exchange_rows() {
+        let mut config = config();
+        config.local_exchange_max_buffered_rows = -1;
+        ExecutionRuntime::new(config).expect("-1 preserves the unlimited local exchange contract");
     }
 }

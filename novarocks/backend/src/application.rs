@@ -490,7 +490,10 @@ fn execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig 
         local_exchange_buffer_mem_limit_per_driver: runtime
             .local_exchange_buffer_mem_limit_per_driver
             .max(1),
-        local_exchange_max_buffered_rows: runtime.local_exchange_max_buffered_rows.max(1),
+        // `-1` is the established unlimited sentinel. It must cross the
+        // application/execution boundary unchanged so local exchanges do not
+        // accidentally become one-row buffers.
+        local_exchange_max_buffered_rows: runtime.local_exchange_max_buffered_rows,
         connector_io_tasks_per_scan_operator: runtime.connector_io_tasks_per_scan_operator.max(1),
         scan_submit_fail_max: runtime.scan_submit_fail_max.max(1),
         scan_submit_fail_timeout_ms: runtime.scan_submit_fail_timeout_ms.max(1),

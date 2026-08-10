@@ -396,7 +396,7 @@ fn prepare_pipeline_execution_inner(
         runtime_state
             .execution_runtime()
             .map(|runtime| runtime.config().local_exchange_max_buffered_rows)
-            .unwrap_or(i64::MAX),
+            .unwrap_or(-1),
     )?;
 
     let ctx = Arc::new(if report_neutral {
