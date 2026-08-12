@@ -1240,6 +1240,7 @@ mod tests {
                         base_snapshot_id: None,
                         base_sequence_number: 0,
                         staging_dir: "file:///warehouse/db/t/data".to_string(),
+                        manifest_cleanup_token: None,
                     },
                 ));
             }

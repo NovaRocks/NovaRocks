@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+#[cfg(test)]
 use crate::connector::iceberg::catalog::load_table;
 use crate::engine::StandaloneState;
 use crate::engine::mv_flow::execute_query_for_mv_refresh_with_catalog;
@@ -51,6 +52,7 @@ pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, 
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn load_current_iceberg_base_table(
     state: &Arc<StandaloneState>,
     table_ref: &TableIdentity,

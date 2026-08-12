@@ -782,6 +782,7 @@ mod tests {
                 base_snapshot_id: Some(15),
                 base_sequence_number: 4,
                 staging_dir: staging_dir.clone(),
+                manifest_cleanup_token: None,
             },
         );
 

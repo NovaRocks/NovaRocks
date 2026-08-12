@@ -53,7 +53,7 @@ use novarocks_spi::connector::{
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct IcebergMvStorageObservationAdapter {
+pub struct IcebergMvStorageObservationAdapter {
     inspector: IcebergStorageInspector,
 }
 

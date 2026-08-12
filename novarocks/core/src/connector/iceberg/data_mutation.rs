@@ -1155,6 +1155,7 @@ fn recovery_evidence(
         base_snapshot_id: payload.base_snapshot_id,
         base_sequence_number: 0,
         staging_dir: String::new(),
+        manifest_cleanup_token: None,
     }
 }
 

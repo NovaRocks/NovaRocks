@@ -283,6 +283,7 @@ fn frontend_recovery_upgrades_v3_and_finalizes_published_truth_atomically() {
                     "orders-uuid".to_string(),
                 )]),
                 target_snapshot_id: Some(42),
+                partition_spec: None,
             },
             recovery,
         })
@@ -524,6 +525,7 @@ fn frontend_noop_refresh_persists_no_synthetic_external_actions() {
                 "uuid".to_string(),
             )]),
             target_snapshot_id: Some(7),
+            partition_spec: None,
         })
         .expect("finalize no-op frontend refresh");
     let finalized = repository
@@ -582,6 +584,7 @@ fn refresh_lifecycle_persists_transitions_and_finalizes_definition() {
                 "uuid-1".to_string(),
             )]),
             target_snapshot_id: Some(44),
+            partition_spec: None,
         })
         .expect("finalize refresh");
     assert_eq!(
@@ -670,6 +673,7 @@ fn list_refreshes_pages_and_includes_finalized_and_aborted_records() {
             base_snapshots: BTreeMap::new(),
             base_table_uuids: BTreeMap::new(),
             target_snapshot_id: Some(1),
+            partition_spec: None,
         })
         .expect("finalize refresh");
 
@@ -758,6 +762,7 @@ fn dropping_a_finalized_mv_removes_refresh_and_partition_records_before_reopen()
             base_snapshots: BTreeMap::new(),
             base_table_uuids: BTreeMap::new(),
             target_snapshot_id: Some(2),
+            partition_spec: None,
         })
         .expect("finalize refresh");
     repository
@@ -846,6 +851,7 @@ fn dropping_paged_mv_records_removes_all_dependencies_and_refresh_history() {
                 base_snapshots: BTreeMap::new(),
                 base_table_uuids: BTreeMap::new(),
                 target_snapshot_id: Some(snapshot_id),
+                partition_spec: None,
             })
             .expect("finalize refresh");
         refresh_ids.push(refresh.refresh_id);
@@ -928,6 +934,7 @@ fn finalize_with_partitions_returns_not_found_for_missing_partition_mv() {
                 base_snapshots: BTreeMap::new(),
                 base_table_uuids: BTreeMap::new(),
                 target_snapshot_id: Some(1),
+                partition_spec: None,
             },
             partitions: Some(ReplaceMvPartitionStatesRequest {
                 mv_id: 99,

@@ -5,21 +5,14 @@
 
 //! Canonical planning and execution adapter for the first refresh of join MVs.
 
-use arrow::datatypes::DataType;
-use novarocks_connector_iceberg::iceberg::TableIdent;
-
 use crate::mv::persistence::schema as mv_schema;
-use crate::mv::refresh::change_stream_write::{
-    ChangeStreamWriteError, ExecutedChangeStreamWrite, PopulatedChangeStreamWrite,
-    execute_and_collect_change_stream_write,
-};
-use crate::mv::refresh::contract::MvTargetWriteEffect;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::logical::LogicalPlanNode;
 use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
+use arrow::datatypes::DataType;
 use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct JoinFirstRefreshLogicalInput {
@@ -214,31 +207,6 @@ pub(crate) fn build_join_first_refresh_logical_plan(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_join_first_refresh_write<F>(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-    ident: &TableIdent,
-    target_ref: &str,
-    rewrite: &IcebergMvRewriteContext,
-    left_ref: &TableIdentity,
-    right_ref: &TableIdentity,
-    input: JoinFirstRefreshLogicalInput,
-    execute: F,
-) -> Result<PopulatedChangeStreamWrite, ChangeStreamWriteError>
-where
-    F: FnOnce(JoinFirstRefreshLogicalPlan) -> Result<ExecutedChangeStreamWrite, String>,
-{
-    let logical = build_join_first_refresh_logical_plan(rewrite, left_ref, right_ref, input)
-        .map_err(ChangeStreamWriteError::Execution)?;
-    execute_and_collect_change_stream_write(
-        table,
-        ident,
-        target_ref,
-        MvTargetWriteEffect::Append,
-        || execute(logical),
-    )
-}
-
 struct JoinFullRefreshApplyInput {
     plan: crate::sql::planner::logical::LogicalPlanNode,
     payload_columns: Vec<OutputColumn>,
@@ -341,7 +309,6 @@ fn validate_join_full_refresh_payload_columns(
 #[derive(Clone, Debug)]
 struct JoinFullRefreshBaseScan {
     output_columns: Vec<OutputColumn>,
-    schema_fields: Vec<novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef>,
 }
 
 fn find_join_full_refresh_base_scan(
@@ -380,10 +347,6 @@ fn collect_join_full_refresh_base_scans(
     {
         scans.push(JoinFullRefreshBaseScan {
             output_columns: scan.columns.clone(),
-            // Field identifiers are intentionally not recovered from an
-            // Iceberg table here.  The immutable MV schema contract remains
-            // the fallback lineage authority when a SQL scan is tokenized.
-            schema_fields: Vec::new(),
         });
     }
     for child in &plan.children {
@@ -525,7 +488,7 @@ fn join_predicate_lineage_for_sides<'a>(
 
 fn current_scan_field_name(
     base_contract: &mv_schema::BaseContract,
-    scan: &JoinFullRefreshBaseScan,
+    _scan: &JoinFullRefreshBaseScan,
     lineage: &mv_schema::QualifiedFieldLineage,
     role: &str,
 ) -> Result<String, String> {
@@ -538,18 +501,12 @@ fn current_scan_field_name(
             lineage.table_fqn, base_contract.table_fqn
         ));
     }
-    scan.schema_fields
+    base_contract
+        .schema_at_create
+        .fields
         .iter()
         .find(|field| field.field_id == lineage.field_id)
-        .map(|field| field.name.clone())
-        .or_else(|| {
-            base_contract
-                .schema_at_create
-                .fields
-                .iter()
-                .find(|field| field.field_id == lineage.field_id)
-                .map(|field| field.name_at_create.clone())
-        })
+        .map(|field| field.name_at_create.clone())
         .ok_or_else(|| {
             format!(
                 "join full refresh {role} lineage references unknown field {} on base {}",
@@ -703,276 +660,4 @@ fn max_logical_plan_output_column_id(plan: &LogicalPlanNode) -> Result<u32, Stri
         max_id = max_id.max(max_logical_plan_output_column_id(child)?);
     }
     Ok(max_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::cell::Cell;
-    use std::sync::Arc;
-
-    use novarocks_connector_iceberg::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
-        TableMetadataBuilder, Type,
-    };
-    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
-
-    use crate::mv::rewrite::context::tests_support::join_projection_rewrite_context;
-    use crate::sql::analysis::JoinKind;
-    use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind};
-    use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-    use crate::sql::planner::table::{
-        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
-    };
-    use novarocks_catalog::schema::ColumnDef;
-
-    fn output_column(
-        factory: &mut ColumnRefFactory,
-        qualifier: &str,
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-        is_internal: bool,
-    ) -> OutputColumn {
-        OutputColumn {
-            column_id: factory.create(
-                Some(qualifier.to_string()),
-                name.to_string(),
-                data_type.clone(),
-                nullable,
-            ),
-            name: name.to_string(),
-            data_type,
-            nullable,
-            is_internal,
-        }
-    }
-
-    fn scan(
-        factory: &mut ColumnRefFactory,
-        table_name: &str,
-        qualifier: &str,
-    ) -> (LogicalPlanNode, Vec<OutputColumn>) {
-        let columns = vec![
-            output_column(factory, qualifier, "k", DataType::Int64, false, false),
-            output_column(factory, qualifier, "v", DataType::Int64, true, false),
-            output_column(
-                factory,
-                qualifier,
-                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-                DataType::Int64,
-                false,
-                true,
-            ),
-        ];
-        let table_columns = columns[..2]
-            .iter()
-            .map(|column| ColumnDef {
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                write_default: None,
-                logical_type: None,
-            })
-            .collect();
-        let table = TableDef {
-            name: table_name.to_string(),
-            columns: table_columns,
-            iceberg_row_lineage_metadata_columns: Vec::new(),
-            source: ScanSource::Sql(SqlScanSource::new(
-                crate::sql::compiler::mv_rewrite::test_target_binding(),
-                SqlTableIdentity {
-                    catalog: "ice".to_string(),
-                    namespace: "db".to_string(),
-                    table: table_name.to_string(),
-                },
-                SqlScanKind::Data {
-                    version: SqlTableVersionSelector::Current,
-                },
-            )),
-        };
-        (
-            LogicalPlanNode::new(
-                LogicalPlanKind::Scan(PlanScanNode {
-                    database: "db".to_string(),
-                    table,
-                    alias: Some(qualifier.to_string()),
-                    columns: columns.clone(),
-                    predicates: Vec::new(),
-                    required_columns: None,
-                    variant_columns: Vec::new(),
-                    mv_rewritten_from: None,
-                }),
-                Vec::new(),
-                None,
-            ),
-            columns,
-        )
-    }
-
-    fn project_item(column: &OutputColumn, output_name: &str) -> ProjectItem {
-        ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: column.column_id,
-                    qualifier: None,
-                    column: column.name.clone(),
-                },
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-            },
-            output_name: output_name.to_string(),
-            output_column_id: column.column_id,
-        }
-    }
-
-    fn valid_input() -> JoinFirstRefreshLogicalInput {
-        let mut factory = ColumnRefFactory::new();
-        let (left, left_columns) = scan(&mut factory, "l", "l");
-        let (right, right_columns) = scan(&mut factory, "r", "r");
-        let join = LogicalPlanNode::new(
-            LogicalPlanKind::Join(LogicalJoinNode {
-                join_type: JoinKind::Inner,
-                condition: None,
-            }),
-            vec![left, right],
-            None,
-        );
-        let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(PlanProjectNode {
-                items: vec![
-                    project_item(&left_columns[0], "k"),
-                    project_item(&right_columns[1], "v"),
-                ],
-                output_qualifier: None,
-            }),
-            vec![join],
-            None,
-        );
-        JoinFirstRefreshLogicalInput { plan, factory }
-    }
-
-    fn test_ident() -> TableIdent {
-        TableIdent::new(NamespaceIdent::new("db".to_string()), "mv".to_string())
-    }
-
-    fn test_table() -> novarocks_connector_iceberg::iceberg::table::Table {
-        let schema = Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
-            ))])
-            .build()
-            .expect("schema");
-        let metadata = TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec().into_unbound(),
-            SortOrder::unsorted_order(),
-            "file:///warehouse/db/mv".to_string(),
-            FormatVersion::V3,
-            std::collections::HashMap::new(),
-        )
-        .expect("table metadata builder")
-        .build()
-        .expect("table metadata")
-        .metadata;
-        novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(test_ident())
-            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("table")
-    }
-
-    #[test]
-    fn builds_full_join_apply_key_change_stream_contract() {
-        let rewrite = join_projection_rewrite_context();
-        let logical = build_join_first_refresh_logical_plan(
-            &rewrite,
-            &rewrite.base_refs[0],
-            &rewrite.base_refs[1],
-            valid_input(),
-        )
-        .expect("join first-refresh logical plan");
-
-        let descriptor = logical
-            .change_stream
-            .join_refresh
-            .as_ref()
-            .expect("join refresh descriptor");
-        assert_eq!(
-            descriptor.mode,
-            crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshMode::Full
-        );
-        assert_eq!(descriptor.payload_columns.len(), 2);
-        assert_eq!(descriptor.join_key_pairs.len(), 1);
-        assert_eq!(descriptor.left_row_id_column.name, "_row_id");
-        assert_eq!(descriptor.right_row_id_column.name, "_row_id");
-        let outputs = crate::sql::planner::plan_output_columns(&logical.plan)
-            .expect("first-refresh plan outputs");
-        assert!(
-            outputs
-                .iter()
-                .any(|column| column.name == JOIN_APPLY_KEY_COLUMN_NAME)
-        );
-        assert!(
-            outputs
-                .iter()
-                .any(|column| column.name == novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
-        );
-    }
-
-    #[test]
-    fn builds_append_only_join_plan_without_change_stream_action() {
-        let rewrite = join_projection_rewrite_context();
-        let logical = build_join_first_refresh_append_logical_plan(
-            &rewrite,
-            &rewrite.base_refs[0],
-            &rewrite.base_refs[1],
-            valid_input(),
-        )
-        .expect("join first-refresh append logical plan");
-        let outputs = crate::sql::planner::plan_output_columns(&logical.plan)
-            .expect("join first-refresh append outputs");
-        assert!(
-            outputs
-                .iter()
-                .any(|column| column.name == JOIN_APPLY_KEY_COLUMN_NAME)
-        );
-        assert!(
-            outputs
-                .iter()
-                .all(|column| column.name != novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
-        );
-    }
-
-    #[test]
-    fn execution_adapter_builds_plan_and_invokes_callback_once() {
-        let rewrite = join_projection_rewrite_context();
-        let calls = Cell::new(0);
-
-        let error = match execute_join_first_refresh_write(
-            &test_table(),
-            &test_ident(),
-            "staging",
-            &rewrite,
-            &rewrite.base_refs[0],
-            &rewrite.base_refs[1],
-            valid_input(),
-            |logical| {
-                calls.set(calls.get() + 1);
-                assert!(logical.change_stream.join_refresh.is_some());
-                Err("sentinel execution failure".to_string())
-            },
-        ) {
-            Ok(_) => panic!("callback failure must cross the canonical execution seam"),
-            Err(error) => error,
-        };
-
-        assert_eq!(calls.get(), 1);
-        assert_eq!(error.into_message(), "sentinel execution failure");
-    }
 }

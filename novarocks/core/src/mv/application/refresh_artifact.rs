@@ -13,8 +13,9 @@
 use std::collections::BTreeMap;
 
 use novarocks_spi::connector::{
-    ConnectorCommittedVersion, ConnectorExecutionBindingKey, ConnectorTableHandle,
-    ConnectorWriteCohortId, ConnectorWriteOperationId, ConnectorWriteReceipt,
+    ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorExecutionBindingKey,
+    ConnectorManagedPartitionSpecReplacement, ConnectorTableHandle, ConnectorWriteCohortId,
+    ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
 use crate::sql::mv_refresh::first_refresh::{
@@ -101,6 +102,7 @@ pub struct MvRefreshPublicationIntent {
     target_namespace: String,
     target_name: String,
     staging_branch: String,
+    partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
 }
 
 impl MvRefreshPublicationIntent {
@@ -148,6 +150,7 @@ impl MvRefreshPublicationIntent {
             target_namespace,
             target_name,
             staging_branch,
+            partition_spec_replacement: None,
         })
     }
 
@@ -181,6 +184,18 @@ impl MvRefreshPublicationIntent {
     pub(crate) fn staging_branch(&self) -> &str {
         &self.staging_branch
     }
+
+    pub(crate) fn with_partition_spec_replacement(
+        mut self,
+        replacement: ConnectorManagedPartitionSpecReplacement,
+    ) -> Self {
+        self.partition_spec_replacement = Some(replacement);
+        self
+    }
+
+    pub fn partition_spec_replacement(&self) -> Option<&ConnectorManagedPartitionSpecReplacement> {
+        self.partition_spec_replacement.as_ref()
+    }
 }
 
 /// Facts admitted only after the provider has committed the exact write.
@@ -189,6 +204,7 @@ pub struct MvRefreshCommittedFacts {
     intent: MvRefreshPublicationIntent,
     committed_version: ConnectorCommittedVersion,
     resulting_row_count: i64,
+    committed_partitioning: Option<ConnectorCommittedPartitioning>,
 }
 
 impl MvRefreshCommittedFacts {
@@ -205,10 +221,18 @@ impl MvRefreshCommittedFacts {
                 "MV refresh write committed without resulting row-count fact".to_string()
             })?)
             .map_err(|_| "MV refresh committed row count exceeds i64 range".to_string())?;
+        let committed_partitioning = receipt.committed_partitioning().cloned();
+        if intent.partition_spec_replacement().is_some() != committed_partitioning.is_some() {
+            return Err(
+                "MV refresh committed partitioning does not match the requested transition"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             intent,
             committed_version,
             resulting_row_count,
+            committed_partitioning,
         })
     }
 
@@ -220,6 +244,9 @@ impl MvRefreshCommittedFacts {
     }
     pub const fn resulting_row_count(&self) -> i64 {
         self.resulting_row_count
+    }
+    pub fn committed_partitioning(&self) -> Option<&ConnectorCommittedPartitioning> {
+        self.committed_partitioning.as_ref()
     }
 }
 

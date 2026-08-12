@@ -24,10 +24,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "time"
 [features]
 foundationdb-provider = ["novarocks-state-store/foundationdb-provider"]
 mysql-state-store-provider = ["novarocks-state-store/mysql-state-store-provider"]
-mv-first-refresh-staging-test-support = [
-    "novarocks/mv-first-refresh-staging-test-support",
-    "novarocks-frontend/mv-first-refresh-staging-test-support",
-]
+mv-first-refresh-staging-test-support = []
 
 [dev-dependencies]
 # E2E tests that spawn the `novarocks` binary and drive it over MySQL / HTTP.

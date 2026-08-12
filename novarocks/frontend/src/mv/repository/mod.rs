@@ -1645,6 +1645,21 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         self.require_refresh_async(request.refresh_id).await?;
         let operation_id = Uuid::now_v7();
+        let existing_partitions = if request.partition_spec.is_some() {
+            let refresh = self
+                .load_refresh_async(request.refresh_id)
+                .await?
+                .ok_or_else(|| {
+                    MvRepositoryError::new(
+                        MvRepositoryErrorKind::NotFound,
+                        format!("mv refresh {} not found", request.refresh_id),
+                    )
+                })?;
+            self.list_partition_state_records_async(refresh.mv_id)
+                .await?
+        } else {
+            Vec::new()
+        };
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -1653,8 +1668,15 @@ impl StateStoreMvRepository {
             "finalize MV refresh",
             move |transaction| {
                 let request = request.clone();
+                let existing_partitions = existing_partitions.clone();
                 Box::pin(async move {
-                    finalize_refresh_transaction(transaction, operation_id, request).await
+                    let replace_partition_contract = request.partition_spec.is_some();
+                    finalize_refresh_transaction(transaction, operation_id, request).await?;
+                    if replace_partition_contract {
+                        delete_partition_states_transaction(transaction, &existing_partitions)
+                            .await?;
+                    }
+                    Ok(())
                 })
             },
         )
@@ -2090,6 +2112,21 @@ impl StateStoreMvRepository {
     ) -> Result<(), MvRepositoryError> {
         request.recovery.validate().map_err(invalid)?;
         let operation_id = Uuid::now_v7();
+        let existing_partitions = if request.finalize.partition_spec.is_some() {
+            let refresh = self
+                .load_refresh_async(request.finalize.refresh_id)
+                .await?
+                .ok_or_else(|| {
+                    MvRepositoryError::new(
+                        MvRepositoryErrorKind::NotFound,
+                        format!("mv refresh {} not found", request.finalize.refresh_id),
+                    )
+                })?;
+            self.list_partition_state_records_async(refresh.mv_id)
+                .await?
+        } else {
+            Vec::new()
+        };
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -2098,6 +2135,7 @@ impl StateStoreMvRepository {
             "finalize recovered published MV refresh",
             move |transaction| {
                 let request = request.clone();
+                let existing_partitions = existing_partitions.clone();
                 Box::pin(async move {
                     let (refresh_record, mut refresh) =
                         load_refresh_transaction(transaction, request.finalize.refresh_id).await?;
@@ -2127,6 +2165,19 @@ impl StateStoreMvRepository {
                         definition.last_refresh_snapshots = request.finalize.base_snapshots;
                         definition.last_refresh_table_uuids = request.finalize.base_table_uuids;
                         definition.last_refreshed_iceberg_snapshot_id = request.finalize.target_snapshot_id;
+                        if let Some(partition_spec) = request.finalize.partition_spec {
+                            let schema = definition.schema_contract.as_mut().ok_or_else(|| {
+                                invalid_state_store("MV definition has no schema contract during recovered repartition finalize")
+                            })?;
+                            schema.target.partition = Some(partition_spec.clone());
+                            definition.partition_spec = Some(partition_spec);
+                            definition.partition_state_complete = false;
+                            delete_partition_states_transaction(
+                                transaction,
+                                &existing_partitions,
+                            )
+                            .await?;
+                        }
                         definition.refresh_in_progress = false;
                         definition.active_refresh_id = None;
                         definition.refresh_target_snapshots.clear();
@@ -3297,6 +3348,14 @@ async fn finalize_refresh_transaction(
     definition.last_refresh_snapshots = request.base_snapshots;
     definition.last_refresh_table_uuids = request.base_table_uuids;
     definition.last_refreshed_iceberg_snapshot_id = request.target_snapshot_id;
+    if let Some(partition_spec) = request.partition_spec {
+        let schema = definition.schema_contract.as_mut().ok_or_else(|| {
+            invalid_state_store("MV definition has no schema contract during repartition finalize")
+        })?;
+        schema.target.partition = Some(partition_spec.clone());
+        definition.partition_spec = Some(partition_spec);
+        definition.partition_state_complete = false;
+    }
     definition.refresh_in_progress = false;
     definition.active_refresh_id = None;
     definition.refresh_target_snapshots.clear();

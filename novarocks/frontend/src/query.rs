@@ -561,8 +561,6 @@ impl FrontendQuerySession {
         ));
         let compiler = self.service.engine.query_compiler();
         let command_executor = self.service.engine.command_executor();
-        #[cfg(feature = "mv-first-refresh-staging-test-support")]
-        let staging_engine = self.service.engine.clone();
         let query_execution = self.service.query_execution.clone();
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
@@ -576,57 +574,6 @@ impl FrontendQuerySession {
             .set_allow_throw_exception(novarocks::sql::extract_allow_throw_exception_hint(&sql));
         let is_query = is_query_statement(&sql);
         let mut worker = task::spawn_blocking(move || {
-            #[cfg(feature = "mv-first-refresh-staging-test-support")]
-            let result = if let Some(mv_name) = parse_mvx2w_native_staging_command(&sql) {
-                staging_engine
-                    .stage_iceberg_mv_first_refresh_with_execution_for_test(
-                        context.session().current_catalog(),
-                        context.session().current_database(),
-                        mv_name,
-                        context.execution(),
-                    )
-                    .map(|_| StatementResult::Ok)
-            } else if is_query {
-                compiler
-                    .prepare(&sql, &context, Some(query_options))
-                    .and_then(|operation| execute_prepared_query(operation, &query_execution))
-            } else {
-                execute_frontend_command(
-                    dml.as_ref(),
-                    insert_engine.as_ref(),
-                    delete_engine.as_ref(),
-                    Some(mutation_engine.as_ref()),
-                    |sql, context, query_options| {
-                        dml.try_execute_ctas(
-                            ctas_engine.as_ref(),
-                            sql,
-                            context,
-                            Some(query_options),
-                        )
-                    },
-                    |sql, context, query_options| {
-                        dml.try_execute_truncate(
-                            truncate_engine.as_ref(),
-                            sql,
-                            context,
-                            Some(query_options),
-                        )
-                    },
-                    |sql, context, query_options| {
-                        dml.try_execute_add_files(
-                            add_files_engine.as_ref(),
-                            sql,
-                            context,
-                            Some(query_options),
-                        )
-                    },
-                    &command_executor,
-                    &sql,
-                    &context,
-                    query_options,
-                )
-            };
-            #[cfg(not(feature = "mv-first-refresh-staging-test-support"))]
             let result = if is_query {
                 compiler
                     .prepare(&sql, &context, Some(query_options))
@@ -996,20 +943,6 @@ fn parse_use_database(sql: &str) -> Option<&str> {
         .or_else(|| sql.strip_prefix("use "))
         .map(str::trim)
         .filter(|schema| !schema.is_empty())
-}
-
-/// Feature-only SQL entry for the native MVX-2W fixture.  It runs through the
-/// normal frontend MySQL session and therefore shares its exact cancellation
-/// source with `KILL QUERY`; it is not linked into the production binary.
-#[cfg(feature = "mv-first-refresh-staging-test-support")]
-fn parse_mvx2w_native_staging_command(sql: &str) -> Option<&str> {
-    const PREFIX: &str = "ADMIN TEST MVX2W STAGE FIRST REFRESH ";
-    let suffix = sql
-        .get(..PREFIX.len())?
-        .eq_ignore_ascii_case(PREFIX)
-        .then_some(&sql[PREFIX.len()..])?;
-    let mv_name = suffix.trim();
-    (!mv_name.is_empty() && !mv_name.contains(char::is_whitespace)).then_some(mv_name)
 }
 
 fn parse_kill_query(sql: &str) -> Result<Option<u32>, QueryServiceError> {

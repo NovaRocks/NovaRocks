@@ -259,6 +259,7 @@ mod tests {
             base_snapshot_id: Some(10),
             base_sequence_number: 3,
             staging_dir: "s3://bucket/db/tbl/data/_staging/abc".to_string(),
+            manifest_cleanup_token: None,
         };
         let err = CommitServiceError::unknown("connection reset by peer".to_string(), evidence);
         assert_eq!(

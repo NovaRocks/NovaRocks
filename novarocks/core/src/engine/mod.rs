@@ -87,9 +87,6 @@ pub mod view;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
-#[cfg(feature = "mv-first-refresh-staging-test-support")]
-pub use mv_first_refresh_staging::MvFirstRefreshStagingTestOutcome;
-
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
@@ -1605,65 +1602,6 @@ impl StandaloneNovaRocks {
         StandaloneSession {
             inner: Arc::clone(&self.inner),
         }
-    }
-
-    /// Feature-gated test seam for the native MVX-2W data-plane fixture.
-    ///
-    /// It admits one real frontend execution context from the live topology
-    /// and invokes only the result-free first-refresh staging consumer. The
-    /// default REFRESH route remains untouched.
-    #[cfg(feature = "mv-first-refresh-staging-test-support")]
-    pub fn stage_iceberg_mv_first_refresh_for_test(
-        &self,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        mv_name: &str,
-    ) -> Result<MvFirstRefreshStagingTestOutcome, String> {
-        use crate::query_execution::backend::BackendTopologyPort;
-        use crate::query_execution::cancellation::QueryCancellationSource;
-        use crate::query_execution::request_context::{RequestAdmission, RequestContext};
-
-        let topology = self
-            .inner
-            .backend_topology
-            .snapshot()
-            .map_err(|error| format!("capture MV first-refresh test topology: {error}"))?;
-        let cancellation = QueryCancellationSource::new();
-        let request = RequestContext::admit(RequestAdmission::new(
-            current_catalog.map(str::to_string),
-            current_database.to_string(),
-            self.inner.execution_role,
-            topology,
-            None,
-            cancellation.view(),
-            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
-        ));
-        self.stage_iceberg_mv_first_refresh_with_execution_for_test(
-            current_catalog,
-            current_database,
-            mv_name,
-            request.execution(),
-        )
-    }
-
-    /// Feature-gated test seam that reuses an already admitted frontend
-    /// execution context.  The native fixture uses this through an ordinary
-    /// MySQL query session so `KILL QUERY` cancels the same attempt.
-    #[cfg(feature = "mv-first-refresh-staging-test-support")]
-    pub fn stage_iceberg_mv_first_refresh_with_execution_for_test(
-        &self,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        mv_name: &str,
-        execution: &crate::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<MvFirstRefreshStagingTestOutcome, String> {
-        crate::engine::mv::iceberg_refresh::execute_iceberg_mv_first_refresh_staging_test(
-            &self.inner,
-            current_catalog,
-            current_database,
-            mv_name,
-            execution,
-        )
     }
 
     pub fn query_compiler(&self) -> StandaloneQueryCompiler {
@@ -3376,6 +3314,21 @@ pub(crate) fn dispatch_statement(
             &stmt,
             connector_context,
         ),
+        Statement::AlterMaterializedView(stmt)
+            if matches!(
+                stmt.action,
+                crate::sql::parser::ast::AlterMaterializedViewAction::Repartition(_)
+            ) =>
+        {
+            dispatch_frontend_mv_repartition(
+                state,
+                current_catalog,
+                current_database,
+                &stmt,
+                request_context,
+                connector_context,
+            )
+        }
         Statement::AlterMaterializedView(stmt) => {
             crate::engine::mv_flow::alter_mv_with_connector_context(
                 state,
@@ -3467,6 +3420,62 @@ pub(crate) fn dispatch_statement(
             },
         ),
     }
+}
+
+fn dispatch_frontend_mv_repartition(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    statement: &crate::sql::parser::ast::AlterMaterializedViewStmt,
+    request_context: &crate::query_execution::request_context::RequestContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let crate::sql::parser::ast::AlterMaterializedViewAction::Repartition(fields) =
+        &statement.action
+    else {
+        return Err("frontend MV repartition route received a non-repartition action".to_string());
+    };
+    let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+        current_catalog,
+        current_database,
+        &statement.name,
+    )?;
+    let target = crate::mv::repository::MvTarget {
+        catalog: Some(target.catalog),
+        database: target.namespace,
+        name: target.table,
+    };
+    let refresh_statement = crate::sql::parser::ast::RefreshMaterializedViewStmt {
+        name: statement.name.clone(),
+        full: false,
+    };
+    let preparation =
+        crate::engine::mv::iceberg_refresh::StandaloneMvRefreshPreparationService::new_repartition(
+            state,
+            current_catalog,
+            current_database,
+            &refresh_statement,
+            fields,
+            connector_context,
+        );
+    state
+        .mv_application_service
+        .prepare_and_execute_refresh(
+            &preparation,
+            crate::mv::application::MvApplicationStatement::Refresh(
+                crate::sql::mv_refresh::MvRefreshStatement::from(&refresh_statement),
+            ),
+            target,
+            connector_context.clone(),
+            request_context.execution(),
+        )
+        .map(|result| match result {
+            crate::mv::application::MvStatementResult::Ok => StatementResult::Ok,
+            crate::mv::application::MvStatementResult::Query(result) => {
+                StatementResult::Query(result)
+            }
+        })
+        .map_err(|error| error.to_string())
 }
 
 /// Execute every dependency-ordered `REFRESH MATERIALIZED VIEW` step through
@@ -4397,48 +4406,6 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overl
     )
 }
 
-/// Execute an admitted connector write as a result-free staging operation.
-///
-/// This is the native consumer used by MV first-refresh staging: callers get
-/// only the bounded SPI completion/summary, never a `QueryResult`, `Chunk` or
-/// `RecordBatch`. The existing generic writer remains responsible for BE-side
-/// scan, exchange, shuffle and connector writer execution.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_query_as_iceberg_staging_in_operation_with_connector_context(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &sqlparser::ast::Query,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
-    query_opts: Option<QueryOptions>,
-    root_distribution: crate::sql::compiler::RootDistributionRequirement,
-    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
-) -> Result<
-    (
-        crate::query_execution::ConnectorWriteCompletion,
-        crate::query_execution::ConnectorWriteStagingSummary,
-    ),
-    String,
-> {
-    let result = execute_query_as_iceberg_write_in_operation_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        query,
-        sink,
-        table_bindings,
-        query_opts,
-        root_distribution,
-        execution,
-        connector_context,
-        connector_write,
-    )?;
-    connector_staging_completion_from_result(result)
-}
-
 /// Prepare a typed MV logical append as the same inert distributed write
 /// request used by SQL-shaped connector writes.  It performs no submission or
 /// external mutation; the supplied template is activated from the frontend's
@@ -4983,7 +4950,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     query_table_bindings: Option<&crate::engine::query_planning::bindings::QueryTableBindingStore>,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
     // Change-stream planning can run from an MV worker without a client request.
@@ -4999,7 +4965,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         optimized_tree,
         query_table_bindings,
         dag,
-        mv_refresh_ctx,
         pre_expand_keyed_assert,
         &connector_context,
     )
@@ -5013,7 +4978,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     query_table_bindings: Option<&crate::engine::query_planning::bindings::QueryTableBindingStore>,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    _mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
@@ -5218,7 +5182,6 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     query_opts: Option<QueryOptions>,
-    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let planned = build_physical_plan_as_iceberg_change_stream_write(
         state,
@@ -5227,7 +5190,6 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
         optimized_tree,
         None,
         dag,
-        mv_refresh_ctx,
         None,
     )?;
     #[cfg(test)]
@@ -9395,7 +9357,6 @@ path = "meta/operations.sqlite"
             "default",
             &optimized_tree,
             &mut dag,
-            None,
             None,
         )
         .expect("planned physical change-stream write build");

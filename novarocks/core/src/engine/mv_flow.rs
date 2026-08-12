@@ -521,10 +521,7 @@ pub(crate) fn alter_mv_with_connector_context(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    if matches!(
-        stmt.action,
-        AlterMaterializedViewAction::Repartition(_) | AlterMaterializedViewAction::SetProperties(_)
-    ) {
+    if matches!(stmt.action, AlterMaterializedViewAction::SetProperties(_)) {
         let current_catalog = current_catalog.ok_or_else(|| {
             "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
         })?;
@@ -572,13 +569,7 @@ pub(crate) fn alter_mv_with_connector_context(
             )?;
             return Ok(StatementResult::Ok);
         }
-        return crate::engine::mv::iceberg_refresh::repartition_iceberg_mv_with_connector_context(
-            state,
-            Some(current_catalog),
-            db,
-            stmt,
-            connector_context,
-        );
+        unreachable!("properties branch must return after its provider mutation");
     }
     let definition = load_definition_for_alter(state, current_catalog, db, &stmt.name)?;
     let req = match &stmt.action {
@@ -604,7 +595,10 @@ pub(crate) fn alter_mv_with_connector_context(
             next_refresh_after_ms: definition.next_refresh_after_ms,
         },
         AlterMaterializedViewAction::Repartition(_) => {
-            unreachable!("repartition is handled before refresh metadata update")
+            return Err(
+                "ALTER MATERIALIZED VIEW ... REPARTITION requires the frontend MV lifecycle"
+                    .to_string(),
+            );
         }
         AlterMaterializedViewAction::SetProperties(_) => {
             unreachable!("properties are handled before refresh metadata update")

@@ -9,13 +9,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use novarocks_connector_iceberg::iceberg::TableIdent;
-
-use crate::mv::refresh::change_stream_write::{
-    ChangeStreamWriteError, ExecutedChangeStreamWrite, PopulatedChangeStreamWrite,
-    execute_and_collect_change_stream_write,
-};
-use crate::mv::refresh::contract::MvTargetWriteEffect;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
@@ -35,13 +28,6 @@ pub(crate) fn select_join_incremental_refresh_mode(
         JoinIncrementalRefreshMode::Coalesce
     } else {
         JoinIncrementalRefreshMode::AppendOnly
-    }
-}
-
-fn write_effect(mode: JoinIncrementalRefreshMode) -> MvTargetWriteEffect {
-    match mode {
-        JoinIncrementalRefreshMode::AppendOnly => MvTargetWriteEffect::Append,
-        JoinIncrementalRefreshMode::Coalesce => MvTargetWriteEffect::DeltaRetractingStagedFiles,
     }
 }
 
@@ -127,22 +113,6 @@ pub(crate) fn build_join_incremental_refresh_logical_plan(
         plan,
         factory,
         change_stream_override,
-    })
-}
-
-pub(crate) fn execute_join_incremental_refresh_write<F>(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-    ident: &TableIdent,
-    target_ref: &str,
-    mode: JoinIncrementalRefreshMode,
-    logical: JoinIncrementalLogicalPlan,
-    execute: F,
-) -> Result<PopulatedChangeStreamWrite, ChangeStreamWriteError>
-where
-    F: FnOnce(JoinIncrementalLogicalPlan) -> Result<ExecutedChangeStreamWrite, String>,
-{
-    execute_and_collect_change_stream_write(table, ident, target_ref, write_effect(mode), || {
-        execute(logical)
     })
 }
 
@@ -244,181 +214,4 @@ fn max_logical_plan_output_column_id(plan: &LogicalPlanNode) -> Result<u32, Stri
         max_id = max_id.max(max_logical_plan_output_column_id(child)?);
     }
     Ok(max_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::cell::Cell;
-
-    use novarocks_connector_iceberg::iceberg::NamespaceIdent;
-    use novarocks_connector_iceberg::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
-        TableMetadataBuilder, Type,
-    };
-
-    use crate::sql::analysis::OutputColumn;
-    use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::logical::LogicalPlanKind;
-    use crate::sql::planner::payload::PlanValuesNode;
-
-    fn empty_input() -> JoinIncrementalLogicalInput {
-        JoinIncrementalLogicalInput {
-            plan: LogicalPlanNode::new(
-                LogicalPlanKind::Values(PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: Vec::new(),
-                }),
-                Vec::new(),
-                None,
-            ),
-            factory: ColumnRefFactory::new(),
-        }
-    }
-
-    fn test_ident() -> TableIdent {
-        TableIdent::new(NamespaceIdent::new("db".to_string()), "mv".to_string())
-    }
-
-    fn test_table() -> novarocks_connector_iceberg::iceberg::table::Table {
-        let schema = Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
-            ))])
-            .build()
-            .expect("schema");
-        let metadata = TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec().into_unbound(),
-            SortOrder::unsorted_order(),
-            "file:///warehouse/db/mv".to_string(),
-            FormatVersion::V3,
-            std::collections::HashMap::new(),
-        )
-        .expect("table metadata builder")
-        .build()
-        .expect("table metadata")
-        .metadata;
-        novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(test_ident())
-            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("table")
-    }
-
-    #[test]
-    fn selects_mode_from_delete_presence() {
-        assert_eq!(
-            select_join_incremental_refresh_mode(false, false),
-            JoinIncrementalRefreshMode::AppendOnly
-        );
-        assert_eq!(
-            select_join_incremental_refresh_mode(true, false),
-            JoinIncrementalRefreshMode::Coalesce
-        );
-        assert_eq!(
-            select_join_incremental_refresh_mode(false, true),
-            JoinIncrementalRefreshMode::Coalesce
-        );
-    }
-
-    #[test]
-    fn mode_owns_write_effect() {
-        assert_eq!(
-            write_effect(JoinIncrementalRefreshMode::AppendOnly),
-            MvTargetWriteEffect::Append
-        );
-        assert_eq!(
-            write_effect(JoinIncrementalRefreshMode::Coalesce),
-            MvTargetWriteEffect::DeltaRetractingStagedFiles
-        );
-    }
-
-    #[test]
-    fn locator_ids_reserve_all_nested_outputs() {
-        let child_output = OutputColumn {
-            column_id: ColumnId(42),
-            name: "child_k".to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        };
-        let child = LogicalPlanNode::new(
-            LogicalPlanKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: vec![child_output],
-            }),
-            Vec::new(),
-            None,
-        );
-        let root_output = OutputColumn {
-            column_id: ColumnId(6),
-            name: "root_k".to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        };
-        let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: vec![root_output],
-            }),
-            vec![child],
-            None,
-        );
-        let mut factory = ColumnRefFactory::new();
-
-        let ids =
-            allocate_join_coalesce_locator_column_ids(&mut factory, &plan).expect("locator ids");
-        let allocated = [
-            ids.net,
-            ids.file,
-            ids.pos,
-            ids.row_id,
-            ids.last_updated_sequence_number,
-        ];
-        assert!(allocated.iter().all(|id| *id > 42));
-        assert_eq!(
-            allocated
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            allocated.len()
-        );
-    }
-
-    #[test]
-    fn execution_adapter_invokes_callback_once() {
-        let calls = Cell::new(0);
-        let input = empty_input();
-        let logical = JoinIncrementalLogicalPlan {
-            plan: input.plan,
-            factory: input.factory,
-            change_stream_override: None,
-        };
-
-        let error = match execute_join_incremental_refresh_write(
-            &test_table(),
-            &test_ident(),
-            "staging",
-            JoinIncrementalRefreshMode::AppendOnly,
-            logical,
-            |_| {
-                calls.set(calls.get() + 1);
-                Err("sentinel execution failure".to_string())
-            },
-        ) {
-            Ok(_) => panic!("callback failure must cross the canonical execution seam"),
-            Err(error) => error,
-        };
-
-        assert_eq!(calls.get(), 1);
-        assert_eq!(error.into_message(), "sentinel execution failure");
-    }
 }

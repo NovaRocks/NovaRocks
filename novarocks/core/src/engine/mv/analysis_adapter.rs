@@ -126,51 +126,6 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
     )
 }
 
-/// Map an Arrow `DataType` to the SQL head token that
-/// `is_hashable_pk_type` recognizes. Returns the token only — no
-/// precision/scale or element-type tail. Anything not on the accepted
-/// list falls through to the Arrow Debug form (e.g. `Float32`,
-/// `List(...)`), which `is_hashable_pk_type` will then reject.
-fn arrow_data_type_pk_head(dt: &arrow::datatypes::DataType) -> String {
-    use arrow::datatypes::DataType;
-    match dt {
-        DataType::Int8 => "TINYINT".to_string(),
-        DataType::Int16 => "SMALLINT".to_string(),
-        DataType::Int32 => "INT".to_string(),
-        DataType::Int64 => "BIGINT".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 => "STRING".to_string(),
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL".to_string(),
-        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
-        DataType::Timestamp(_, _) => "DATETIME".to_string(),
-        // Explicitly unsupported as PK: floats (NaN equality), booleans
-        // (degenerate cardinality), composites (no stable hash). Fall
-        // through to Debug form so is_hashable_pk_type rejects them.
-        other => format!("{other:?}"),
-    }
-}
-
-/// Build the `BaseTableDescriptor` projection from an already-loaded
-/// iceberg table. Used by `create_mv` and `create_iceberg_mv` before
-/// invoking `validate_ivm_primary_key`.
-pub(crate) fn descriptor_from_loaded(
-    loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-) -> BaseTableDescriptor {
-    let format_version = loaded.table.metadata().format_version() as i32;
-    let columns = loaded
-        .columns
-        .iter()
-        .map(|col| BaseColumnDescriptor {
-            name: col.name.clone(),
-            data_type: col.data_type.clone(),
-            sql_type: arrow_data_type_pk_head(&col.data_type),
-            nullable: col.nullable,
-        })
-        .collect();
-    BaseTableDescriptor {
-        format_version,
-        columns,
-    }
-}
 pub(crate) fn list_mv_rows(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,

@@ -100,6 +100,7 @@ fn provider_neutral_repository_preserves_create_refresh_partition_and_dependency
                     base_snapshots: BTreeMap::new(),
                     base_table_uuids: BTreeMap::new(),
                     target_snapshot_id: Some(7),
+                    partition_spec: None,
                 },
                 partitions: Some(ReplaceMvPartitionStatesRequest {
                     mv_id: definition.mv_id,

@@ -505,6 +505,9 @@ pub struct MvRefreshFinalizeRequest {
     pub base_snapshots: BTreeMap<String, i64>,
     pub base_table_uuids: BTreeMap<String, String>,
     pub target_snapshot_id: Option<i64>,
+    /// Exact provider-committed partition contract for an atomic repartition
+    /// write. Ordinary refreshes leave this absent.
+    pub partition_spec: Option<crate::mv::persistence::schema::MvPartitionContract>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

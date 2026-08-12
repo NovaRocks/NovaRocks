@@ -19,8 +19,7 @@ use std::path::PathBuf;
 use std::process;
 
 use novarocks::novarocks_logging;
-
-mod composition;
+use novarocks_server::composition;
 
 #[derive(Debug, PartialEq, Eq)]
 struct StandaloneServerCliArgs {

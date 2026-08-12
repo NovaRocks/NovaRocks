@@ -27,6 +27,7 @@ use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, arm_path, trigger_path};
 use novarocks_frontend::{FrontendServerConfig, run_frontend_server_until_shutdown};
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
+use novarocks_server::composition::IcebergMvStorageObservationAdapter;
 use tempfile::{NamedTempFile, TempDir};
 
 struct ReservedPort {
@@ -316,9 +317,8 @@ fn connect_mysql(port: u16) -> MysqlConn {
 }
 
 /// This uses three independent BE processes and the ordinary frontend host.
-/// The only test-only seam is the feature-gated consumer invoked after MV SQL
-/// preparation; all fragment submission, report collection and connector
-/// staging use the production native wire/QES path.
+/// Fragment submission, staging, publication, recovery evidence and
+/// cancellation all use the production frontend-owned MV refresh lifecycle.
 #[cfg(unix)]
 #[test]
 #[ignore = "requires native 1FE+3BE processes"]
@@ -411,9 +411,7 @@ deployment_owner = "fe-1"
             port_override: None,
             connector_control_factories: Vec::new(),
             connector_file_planning_resources,
-            mv_storage_observation: Arc::new(
-                novarocks::mv::storage_observation::UnavailableMvStorageObservationPort,
-            ),
+            mv_storage_observation: Arc::new(IcebergMvStorageObservationAdapter::default()),
             state_store_host_config: None,
         },
         async move {
@@ -443,29 +441,23 @@ deployment_owner = "fe-1"
     )
     .expect("create MV target");
 
-    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_mv")
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv")
         .expect("stage projection first refresh through native FE session");
     let main_rows: Vec<(i32, i64)> = conn
         .query("SELECT k1, v2 FROM orders_mv ORDER BY k1")
-        .expect("read un-published MV main ref");
-    assert!(
-        main_rows.is_empty(),
-        "fixture may commit only its staging branch"
-    );
+        .expect("read published MV main ref");
+    assert_eq!(main_rows, vec![(1, 10), (2, 20)]);
 
     conn.query_drop(
         "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
     )
     .expect("create aggregate MV target");
-    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_agg_mv")
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_agg_mv")
         .expect("stage aggregate first refresh through native FE session");
     let aggregate_main_rows: Vec<(i32, i64)> = conn
         .query("SELECT k1, total_v2 FROM orders_agg_mv ORDER BY k1")
-        .expect("read un-published aggregate MV main ref");
-    assert!(
-        aggregate_main_rows.is_empty(),
-        "aggregate fixture may commit only its staging branch"
-    );
+        .expect("read published aggregate MV main ref");
+    assert_eq!(aggregate_main_rows, vec![(1, 10), (2, 20)]);
 
     conn.query_drop(
         "CREATE TABLE customers (k1 INT, region VARCHAR(16)) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
@@ -477,21 +469,21 @@ deployment_owner = "fe-1"
         "CREATE MATERIALIZED VIEW orders_join_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT o.k1, o.v2, c.region FROM orders o JOIN customers c ON o.k1 = c.k1",
     )
     .expect("create join MV target");
-    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_join_mv")
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_join_mv")
         .expect("stage join first refresh through native FE session");
     let join_main_rows: Vec<(i32, i64, String)> = conn
         .query("SELECT k1, v2, region FROM orders_join_mv ORDER BY k1")
-        .expect("read un-published join MV main ref");
-    assert!(
-        join_main_rows.is_empty(),
-        "join fixture may commit only its staging branch"
+        .expect("read published join MV main ref");
+    assert_eq!(
+        join_main_rows,
+        vec![(1, 10, "east".to_string()), (2, 20, "west".to_string())]
     );
 
     conn.query_drop(
         "CREATE MATERIALIZED VIEW orders_empty_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders WHERE k1 < 0",
     )
     .expect("create empty MV target");
-    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_empty_mv")
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_empty_mv")
         .expect("stage empty first refresh through native FE session");
 
     conn.query_drop(
@@ -504,15 +496,12 @@ deployment_owner = "fe-1"
         "CREATE MATERIALIZED VIEW orders_union_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders UNION ALL SELECT k1, v2 FROM orders_extra",
     )
     .expect("create union MV target");
-    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_union_mv")
+    conn.query_drop("REFRESH MATERIALIZED VIEW orders_union_mv")
         .expect("stage union first refresh through native FE session");
     let union_main_rows: Vec<(i32, i64)> = conn
         .query("SELECT k1, v2 FROM orders_union_mv ORDER BY k1")
-        .expect("read un-published union MV main ref");
-    assert!(
-        union_main_rows.is_empty(),
-        "union fixture may commit only its staging branch"
-    );
+        .expect("read published union MV main ref");
+    assert_eq!(union_main_rows, vec![(1, 10), (2, 20), (3, 30)]);
 
     conn.query_drop(
         "CREATE MATERIALIZED VIEW orders_start_fault_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
@@ -524,7 +513,7 @@ deployment_owner = "fe-1"
         "mvx2w-start-abort",
     );
     let start_fault = conn
-        .query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_start_fault_mv")
+        .query_drop("REFRESH MATERIALIZED VIEW orders_start_fault_mv")
         .expect_err("a partial native start must not produce a staging completion");
     assert!(
         !start_fault.to_string().is_empty(),
@@ -552,7 +541,7 @@ deployment_owner = "fe-1"
         "mvx2w-terminal-conflict",
     );
     let terminal_conflict = conn
-        .query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_terminal_conflict_mv")
+        .query_drop("REFRESH MATERIALIZED VIEW orders_terminal_conflict_mv")
         .expect_err("a conflicting terminal report must not produce a staging completion");
     assert!(
         !terminal_conflict.to_string().is_empty(),
@@ -576,7 +565,7 @@ deployment_owner = "fe-1"
     .expect("create fragment-failure MV target");
     arm_fragment_failure(&fragment_failure_trigger, "mvx2w-fragment-failure");
     let fragment_failure = conn
-        .query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_fragment_failure_mv")
+        .query_drop("REFRESH MATERIALIZED VIEW orders_fragment_failure_mv")
         .expect_err("a failed native writer fragment must not produce a staging completion");
     assert!(
         !fragment_failure.to_string().is_empty(),
@@ -617,8 +606,7 @@ deployment_owner = "fe-1"
         staging
             .query_drop("USE ns")
             .expect("select backend-loss staging database");
-        let result =
-            staging.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_backend_loss_mv");
+        let result = staging.query_drop("REFRESH MATERIALIZED VIEW orders_backend_loss_mv");
         let _ = backend_loss_tx.send(result);
     });
     let admitted_backend = backends.wait_for_init_ack_marker(BACKEND_LOSS_TOKEN);
@@ -667,7 +655,7 @@ deployment_owner = "fe-1"
         kill_target_ready_tx
             .send(target.connection_id())
             .expect("publish KILL QUERY target connection id");
-        let result = target.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_kill_mv");
+        let result = target.query_drop("REFRESH MATERIALIZED VIEW orders_kill_mv");
         kill_target_done_tx
             .send(result)
             .expect("publish KILL QUERY target result");

@@ -122,7 +122,15 @@ pub(crate) fn activate_first_refresh_connector_write(
     let preparation = crate::engine::iceberg_writer::prepare_iceberg_connector_write(
         exact_lease,
         &target,
-        prepared.staging_branch(),
+        if prepared
+            .publication_intent()
+            .partition_spec_replacement()
+            .is_some()
+        {
+            "main"
+        } else {
+            prepared.staging_branch()
+        },
         intent,
         ConnectorWriteInputRequest::Data {
             fields: prepared
@@ -156,7 +164,7 @@ pub(crate) fn managed_publication_activation_intent(
     publication: &MvRefreshPublicationIntent,
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
 ) -> Result<ConnectorManagedPublicationIntent, String> {
-    ConnectorManagedPublicationIntent::try_new(
+    let arguments = (
         publication.refresh_id(),
         publication.mv_id(),
         publication.marker_token(),
@@ -178,6 +186,29 @@ pub(crate) fn managed_publication_activation_intent(
             .collect(),
         publication.definition_fingerprint(),
         empty_input,
-    )
+    );
+    match publication.partition_spec_replacement() {
+        Some(replacement) => {
+            ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5,
+                arguments.6,
+                replacement.clone(),
+            )
+        }
+        None => ConnectorManagedPublicationIntent::try_new(
+            arguments.0,
+            arguments.1,
+            arguments.2,
+            arguments.3,
+            arguments.4,
+            arguments.5,
+            arguments.6,
+        ),
+    }
     .map_err(|error| format!("build managed MV publication activation intent: {error}"))
 }

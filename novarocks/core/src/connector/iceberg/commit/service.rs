@@ -45,6 +45,10 @@ impl CommitRecoverySource for IcebergCommitCollector {
     fn recovery_staging_dir(&self) -> String {
         self.staging_dir.clone()
     }
+
+    fn recovery_manifest_cleanup_token(&self) -> Option<String> {
+        None
+    }
 }
 
 impl From<CommitServiceError> for crate::common::engine_error::EngineError {

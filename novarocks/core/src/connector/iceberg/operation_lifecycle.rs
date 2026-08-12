@@ -296,6 +296,7 @@ mod tests {
                 base_snapshot_id: Some(77),
                 base_sequence_number: 9,
                 staging_dir: "s3://warehouse/orders/_staging/finalize".to_string(),
+                manifest_cleanup_token: None,
             },
         );
 
@@ -331,6 +332,7 @@ mod tests {
                 base_snapshot_id: Some(77),
                 base_sequence_number: 9,
                 staging_dir: "s3://warehouse/orders/_staging/finalize".to_string(),
+                manifest_cleanup_token: None,
             },
         );
 
@@ -370,6 +372,7 @@ mod tests {
                 base_snapshot_id: Some(42),
                 base_sequence_number: 7,
                 staging_dir: "s3://warehouse/orders/_staging/attempt-1".to_string(),
+                manifest_cleanup_token: None,
             },
         );
         let fact = operation_fact_from_commit_result(Err(&error));

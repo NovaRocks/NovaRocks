@@ -394,7 +394,6 @@ fn plan_dml_change_stream_write(
         &plan.producer,
         Some(plan.table_bindings.as_ref()),
         &mut plan.dag,
-        None,
         keyed_assert,
     )
 }
