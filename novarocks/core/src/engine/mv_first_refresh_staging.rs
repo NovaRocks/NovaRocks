@@ -381,19 +381,29 @@ fn legacy_fixture_publication_intent(
 pub(crate) fn frozen_logical_context(
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
 ) -> Result<MvFirstRefreshLogicalContext, String> {
+    frozen_logical_context_from_rewrite(&ctx.rewrite, ctx.affected_partitions.clone(), None)
+}
+
+pub(crate) fn frozen_logical_context_from_rewrite(
+    rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
+    affected_partitions: crate::mv::model::AffectedTargetPartitions,
+    frozen_base_overlays: Option<
+        Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+    >,
+) -> Result<MvFirstRefreshLogicalContext, String> {
     Ok(MvFirstRefreshLogicalContext {
-        mv_definition: (*ctx.rewrite.mv_definition).clone(),
-        canonical_select_query: (*ctx.rewrite.canonical_select_query).clone(),
-        base_refs: ctx.rewrite.base_refs.to_vec(),
+        mv_definition: (*rewrite.mv_definition).clone(),
+        canonical_select_query: (*rewrite.canonical_select_query).clone(),
+        base_refs: rewrite.base_refs.to_vec(),
         pin: crate::sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
-            ctx.rewrite.pin.to_snapshot_map(),
-            ctx.rewrite.pin.to_table_uuid_map(),
+            rewrite.pin.to_snapshot_map(),
+            rewrite.pin.to_table_uuid_map(),
         )?,
-        previous_snapshot_ids: ctx.rewrite.previous_snapshot_ids.clone(),
-        previous_table_uuids: ctx.rewrite.previous_table_uuids.clone(),
-        target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
-        affected_partitions: ctx.affected_partitions.clone(),
-        frozen_base_overlays: None,
+        previous_snapshot_ids: rewrite.previous_snapshot_ids.clone(),
+        previous_table_uuids: rewrite.previous_table_uuids.clone(),
+        target_table_uuid: rewrite.target_table_uuid.clone(),
+        affected_partitions,
+        frozen_base_overlays,
     })
 }
 
@@ -606,7 +616,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 "MV first-refresh logical artifact is missing its admitted base bindings"
                     .to_string()
             })?;
-            let mut refresh_context = rebuild_frozen_mv_refresh_context(
+            let refresh_rewrite = rebuild_frozen_mv_rewrite_context(
                 state,
                 current_catalog.as_deref(),
                 &current_database,
@@ -615,14 +625,16 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 &target_namespace,
                 &target_name,
                 &facts,
+                planning_lease,
+                &connector_context,
             )?;
-            refresh_context.connector_context = Some(connector_context.clone());
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
             let _target_binding =
-                crate::engine::mv::iceberg_refresh::bind_imv_target_query_table_in_store(
-                    &refresh_context,
+                crate::engine::mv::iceberg_refresh::bind_imv_target_query_table_in_store_from_rewrite(
+                    &refresh_rewrite,
                     &bindings,
                     planning_lease,
+                    &connector_context,
                 )?;
             let write_target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
@@ -642,22 +654,23 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 None,
             )?;
             let (plan, factory) =
-                crate::engine::mv::iceberg_refresh::compile_canonical_select_for_imv_with_frozen_base_overlays(
+                crate::engine::mv::iceberg_refresh::compile_canonical_select_for_imv_with_frozen_rewrite(
                     state,
-                    &refresh_context,
+                    &refresh_rewrite,
+                    &connector_context,
                     Arc::clone(&bindings),
                     execution,
                     frozen_base_overlays,
                 )
                 .map_err(|error| error.message)?;
-            let schema_contract = refresh_context.rewrite.schema_contract.as_ref();
+            let schema_contract = refresh_rewrite.schema_contract.as_ref();
             let (left_ref, right_ref) =
                 crate::engine::mv::iceberg_refresh::join_base_refs_for_schema_contract(
                     schema_contract,
-                    &refresh_context.rewrite.base_refs,
+                    &refresh_rewrite.base_refs,
                 )?;
             let append = crate::mv::refresh::join_first_refresh::build_join_first_refresh_append_logical_plan(
-                &refresh_context.rewrite,
+                &refresh_rewrite,
                 left_ref,
                 right_ref,
                 crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput {
@@ -713,6 +726,105 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     Ok(distributed)
 }
 
+pub(crate) fn rebuild_frozen_mv_rewrite_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    expected_target_snapshot_id: Option<i64>,
+    target_catalog: &str,
+    target_namespace: &str,
+    target_name: &str,
+    facts: &MvFirstRefreshLogicalContext,
+    planning_lease: &ConnectorControlPlanningLease,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Arc<crate::mv::rewrite::context::IcebergMvRewriteContext>, String> {
+    let target_identity =
+        novarocks_catalog::identifier::TableIdentity {
+            catalog: facts.mv_definition.target_catalog.clone().ok_or_else(|| {
+                "MV first-refresh logical artifact target has no connector catalog".to_string()
+            })?,
+            namespace: facts
+                .mv_definition
+                .target_namespace
+                .clone()
+                .ok_or_else(|| {
+                    "MV first-refresh logical artifact target has no namespace".to_string()
+                })?,
+            table: facts.mv_definition.target_table.clone().ok_or_else(|| {
+                "MV first-refresh logical artifact target has no table".to_string()
+            })?,
+        };
+    if target_identity.catalog != target_catalog
+        || target_identity.namespace != target_namespace
+        || target_identity.table != target_name
+    {
+        return Err(
+            "MV refresh logical artifact target does not match its frozen write request"
+                .to_string(),
+        );
+    }
+    validate_frozen_join_base_facts(state, facts)?;
+    let target_binding = crate::mv::refresh::target_binding::load_mv_target_binding_with_lease(
+        state,
+        &target_identity,
+        planning_lease.clone(),
+        connector_context,
+    )?;
+    if target_binding.table_uuid() != facts.target_table_uuid {
+        return Err(
+            "MV refresh logical artifact target UUID drifted after preparation".to_string(),
+        );
+    }
+    if target_binding.current_snapshot_id() != expected_target_snapshot_id {
+        return Err(
+            "MV refresh logical artifact target snapshot drifted after preparation".to_string(),
+        );
+    }
+    let application_pin = crate::mv::refresh::pin::RefreshSnapshotPin::from_captured_entries(
+        facts
+            .base_refs
+            .iter()
+            .map(|base| {
+                let snapshot_id = facts.pin.get(base).ok_or_else(|| {
+                    format!(
+                        "MV first-refresh logical artifact has no snapshot pin for {}",
+                        base.fqn()
+                    )
+                })?;
+                let table_uuid = facts.pin.uuid(base).ok_or_else(|| {
+                    format!(
+                        "MV first-refresh logical artifact has no UUID pin for {}",
+                        base.fqn()
+                    )
+                })?;
+                Ok((base.clone(), snapshot_id, table_uuid.to_string()))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
+    let schema_contract = facts.mv_definition.schema_contract.clone().map(Arc::new);
+    crate::mv::rewrite::context::IcebergMvRewriteContext::from_parts(
+        target_identity,
+        facts.mv_definition.mv_id,
+        current_catalog.map(str::to_string),
+        current_database.to_string(),
+        Arc::new(facts.mv_definition.clone()),
+        Arc::new(facts.canonical_select_query.clone()),
+        Arc::from(facts.base_refs.clone()),
+        Arc::new(application_pin),
+        facts.previous_snapshot_ids.clone(),
+        facts.previous_table_uuids.clone(),
+        expected_target_snapshot_id,
+        facts.target_table_uuid.clone(),
+        target_binding.arrow_schema().clone(),
+        Arc::from(target_binding.observation().field_ids().to_vec()),
+        schema_contract,
+    )
+    .map(Arc::new)
+}
+
+/// Legacy physical refresh context retained only until the incremental
+/// activation migration completes. New first-refresh activation uses
+/// `rebuild_frozen_mv_rewrite_context` and never reconstructs a provider table.
 pub(crate) fn rebuild_frozen_mv_refresh_context(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,

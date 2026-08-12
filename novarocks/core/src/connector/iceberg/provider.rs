@@ -7860,14 +7860,13 @@ impl IcebergQueryTableMaterialization {
     }
 }
 
-/// Freeze the full and affected IMV target reads while the provider owns the
-/// Iceberg file representation.  Core receives only the two opaque read
-/// authorities; it does not inspect, filter, or encode Iceberg data files.
+/// Freeze the exact IMV target read while the provider owns the table handle.
+///
+/// Both lanes intentionally reuse the same full-table authority. Affected
+/// partition filtering is a performance optimization and must not force Core
+/// to recover provider file tuples or concrete target-table state.
 pub(crate) fn freeze_mv_target_reads(
     materialization: &IcebergQueryTableMaterialization,
-    target_runtime: &crate::mv::refresh::target_apply::IcebergMvTargetRuntimeBinding,
-    filter: &crate::mv::model::TargetPartitionFilter,
-    contract: Option<&crate::mv::persistence::schema::MvPartitionContract>,
     selector: ConnectorReadSelector,
 ) -> Result<
     (
@@ -7876,13 +7875,12 @@ pub(crate) fn freeze_mv_target_reads(
     ),
     String,
 > {
-    let files = target_runtime.data_files_at_frozen_snapshot()?;
-    let full = materialization.with_frozen_files(files.clone(), selector)?;
-    let affected = materialization.with_frozen_files(
-        filter_frozen_mv_target_state_files(files, filter, contract, 0)?,
-        selector,
-    )?;
-    Ok((full, affected))
+    let mut exact = materialization.clone();
+    exact.read_selector = selector;
+    if let ConnectorReadSelector::SnapshotId(snapshot_id) = selector {
+        exact.table.current_snapshot_id = Some(snapshot_id);
+    }
+    Ok((exact.clone(), exact))
 }
 
 pub(crate) fn filter_frozen_mv_target_state_files(
@@ -9273,6 +9271,21 @@ mod tests {
         assert!(payload.explicit_files.is_some());
         assert_eq!(payload.explicit_files.as_ref().map(Vec::len), Some(0));
         assert!(payload.prepared_files.is_empty());
+
+        let (full, affected) =
+            freeze_mv_target_reads(&materialization, ConnectorReadSelector::SnapshotId(7))
+                .expect("freeze exact MV target read lanes");
+        assert_eq!(full.read_selector, ConnectorReadSelector::SnapshotId(7));
+        assert_eq!(affected.read_selector, full.read_selector);
+        assert_eq!(affected.read_table, full.read_table);
+        assert_eq!(
+            affected.planning_lease.binding().incarnation(),
+            full.planning_lease.binding().incarnation()
+        );
+        let affected_payload: TablePayload =
+            decode_payload(affected.read_table.payload(), "affected full-table lane")
+                .expect("decode affected target read");
+        assert!(affected_payload.explicit_files.is_none());
     }
 
     #[test]

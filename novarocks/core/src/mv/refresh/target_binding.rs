@@ -140,6 +140,23 @@ pub(crate) fn load_mv_target_binding(
         state.connector_control.as_ref(),
         &table.catalog,
     )?;
+    load_mv_target_binding_with_lease(state, table, exact_lease, connector_context)
+}
+
+pub(crate) fn load_mv_target_binding_with_lease(
+    state: &Arc<crate::engine::StandaloneState>,
+    table: &TableIdentity,
+    exact_lease: ConnectorControlPlanningLease,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, String> {
+    let expected_instance = novarocks_spi::connector::ConnectorInstanceId::parse(&table.catalog)
+        .map_err(|error| error.to_string())?;
+    if exact_lease.binding().descriptor().instance_id != expected_instance {
+        return Err(format!(
+            "MV target lease instance does not match table catalog {}",
+            table.catalog
+        ));
+    }
     let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),

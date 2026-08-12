@@ -52,8 +52,9 @@ use crate::engine::mv::lifecycle::{
 };
 use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
 use crate::engine::mv::refresh_io::{
-    acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
-    run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
+    acquire_mv_refresh_lock, load_current_iceberg_base_table, observe_current_refresh_base,
+    parse_iceberg_table_refs, run_mv_full_select_chunks_with_catalog, single_snapshot_map,
+    single_table_uuid_map,
 };
 use crate::engine::mv::refresh_pin_adapter::capture_refresh_snapshot_pin;
 #[cfg(test)]
@@ -359,7 +360,6 @@ fn prepare_frontend_first_refresh_write(
         );
     }
     let definition = load_iceberg_mv_definition_by_target(state, &target)?;
-    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     let definition = rebind_mv_definition_before_refresh_derivation(
         state,
         &definition,
@@ -414,11 +414,8 @@ fn prepare_frontend_first_refresh_write(
                     .ok_or_else(|| {
                         format!("MV first-refresh has no pinned snapshot for {}", base.fqn())
                     })?;
-                let uuid = load_current_iceberg_base_table(state, base)?
-                    .table
-                    .metadata()
-                    .uuid()
-                    .to_string();
+                let observed = observe_current_refresh_base(state, base, &connector_context)?;
+                let uuid = observed.table_uuid().to_string();
                 let expected_uuid = base_table_uuids.get(&base.fqn()).ok_or_else(|| {
                     format!("MV first-refresh has no UUID fact for {}", base.fqn())
                 })?;
@@ -453,41 +450,29 @@ fn prepare_frontend_first_refresh_write(
         else {
             return Err("MV first-refresh join requires a snapshot-backed baseline".to_string());
         };
-        let target_identity = TableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        };
-        let mut context = {
-            let catalogs = state.iceberg_catalogs.read().map_err(|error| {
-                format!("read Iceberg catalog registry for join preparation: {error}")
-            })?;
-            crate::mv::refresh::execution_context::IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
-                target_identity,
-                definition.mv_id,
-                current_catalog,
-                current_database,
-                Arc::new(definition.clone()),
-                Arc::new(query.clone()),
-                Arc::from(contract.base_refs.clone()),
-                Arc::new(pin.clone()),
-                previous_snapshot_ids.clone(),
-                previous_table_uuids.clone(),
-                expected_target_snapshot_id,
-                target_table_uuid.clone(),
-                &catalogs,
-                Arc::new(target_entry),
-                iceberg_catalog,
-                target_loaded.table.clone(),
-                contract.affected_partitions.clone(),
-                state.mv_refresh_pruning_limits,
-            )?
-        };
-        // SQL compilation is deferred until activation, when the frontend
-        // has frozen topology and the write lifecycle has retained its target
-        // lease. Freeze the pinned base materializations into the application
-        // artifact now so activation cannot resolve a later base generation.
-        context.connector_context = Some(connector_context.clone());
+        let rewrite = build_neutral_refresh_rewrite_context(
+            state,
+            &target,
+            definition.mv_id,
+            current_catalog,
+            current_database,
+            Arc::new(definition.clone()),
+            Arc::new(query.clone()),
+            Arc::from(contract.base_refs.clone()),
+            Arc::new(pin.clone()),
+            previous_snapshot_ids.clone(),
+            previous_table_uuids.clone(),
+            expected_target_snapshot_id,
+            target_table_uuid.clone(),
+            &connector_context,
+        )?;
+        let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
+            state,
+            &connector_context,
+            &rewrite.base_refs,
+            &rewrite.pin,
+            &rewrite.previous_snapshot_ids,
+        )?;
         let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
             &write_lease,
             &crate::engine::backend_resolver::TargetBackend {
@@ -515,8 +500,10 @@ fn prepare_frontend_first_refresh_write(
         )?;
         return crate::mv::application::MvFirstRefreshWritePreparer::prepare_join_logical(
             request,
-            crate::engine::mv_first_refresh_staging::frozen_logical_context_with_base_overlays(
-                state, &context,
+            crate::engine::mv_first_refresh_staging::frozen_logical_context_from_rewrite(
+                &rewrite,
+                contract.affected_partitions.clone(),
+                Some(frozen_base_overlays),
             )?,
             publication_intent,
         );
@@ -809,18 +796,6 @@ fn prepare_frontend_incremental_write(
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
-    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
-    if target_binding_for(state, &target, &connector_context)?.table_uuid() != *target_table_uuid {
-        return Err("MV incremental refresh target UUID drifted after planning".to_string());
-    }
-    let actual_target_snapshot_id = target_loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id());
-    if actual_target_snapshot_id != *target_snapshot_id {
-        return Err("MV incremental refresh target snapshot drifted after planning".to_string());
-    }
     let definition = rebind_mv_definition_before_refresh_derivation(
         state,
         &definition,
@@ -834,16 +809,9 @@ fn prepare_frontend_incremental_write(
         current_catalog,
         current_database,
     );
-    let target_identity = TableIdentity {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-    };
-    let catalogs = state.iceberg_catalogs.read().map_err(|error| {
-        format!("read Iceberg catalog registry for incremental preparation: {error}")
-    })?;
-    let context = IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
-        target_identity,
+    let rewrite = build_neutral_refresh_rewrite_context(
+        state,
+        &target,
         definition.mv_id,
         current_catalog,
         current_database,
@@ -855,18 +823,11 @@ fn prepare_frontend_incremental_write(
         previous_table_uuids.clone(),
         *target_snapshot_id,
         target_table_uuid.clone(),
-        &catalogs,
-        Arc::new(target_entry),
-        iceberg_catalog,
-        target_loaded.into_table(),
-        contract.affected_partitions.clone(),
-        state.mv_refresh_pruning_limits,
+        &connector_context,
     )?;
-    drop(catalogs);
 
     if let Some((left_ref, right_ref)) = join_bases {
-        let left_from = context
-            .rewrite
+        let left_from = rewrite
             .previous_snapshot_ids
             .get(&left_ref.fqn())
             .copied()
@@ -876,8 +837,7 @@ fn prepare_frontend_incremental_write(
                     left_ref.fqn()
                 )
             })?;
-        let right_from = context
-            .rewrite
+        let right_from = rewrite
             .previous_snapshot_ids
             .get(&right_ref.fqn())
             .copied()
@@ -887,13 +847,13 @@ fn prepare_frontend_incremental_write(
                     right_ref.fqn()
                 )
             })?;
-        let left_to = context.rewrite.pin.get(&left_ref).ok_or_else(|| {
+        let left_to = rewrite.pin.get(&left_ref).ok_or_else(|| {
             format!(
                 "MV join incremental refresh is missing pinned snapshot for {}",
                 left_ref.fqn()
             )
         })?;
-        let right_to = context.rewrite.pin.get(&right_ref).ok_or_else(|| {
+        let right_to = rewrite.pin.get(&right_ref).ok_or_else(|| {
             format!(
                 "MV join incremental refresh is missing pinned snapshot for {}",
                 right_ref.fqn()
@@ -924,7 +884,7 @@ fn prepare_frontend_incremental_write(
         }
         if !full_rebuild_reasons.is_empty() {
             tracing::info!(
-                target = %context.rewrite.target.fqn(),
+                target = %rewrite.target.fqn(),
                 reasons = %full_rebuild_reasons.join("; "),
                 "MV join refresh admission selected a distributed full-rebuild staging overwrite"
             );
@@ -934,7 +894,7 @@ fn prepare_frontend_incremental_write(
                 current_database,
                 contract,
                 attempt,
-                &context.rewrite.pin.to_table_uuid_map(),
+                &rewrite.pin.to_table_uuid_map(),
                 observed_binding,
                 connector_context,
             )?
@@ -978,12 +938,12 @@ fn prepare_frontend_incremental_write(
         )?;
         let publication_intent = mv_refresh_publication_intent(
             attempt.refresh_id,
-            context.rewrite.mv_definition.mv_id,
+            rewrite.mv_definition.mv_id,
             attempt.marker_token.clone(),
             MvRefreshPublicationTechnique::Incremental,
-            &context.rewrite.pin.to_snapshot_map(),
-            &context.rewrite.pin.to_table_uuid_map(),
-            &context.rewrite.previous_snapshot_ids,
+            &rewrite.pin.to_snapshot_map(),
+            &rewrite.pin.to_table_uuid_map(),
+            &rewrite.previous_snapshot_ids,
             definition_fingerprint.clone(),
             target.catalog.clone(),
             target.namespace.clone(),
@@ -992,7 +952,11 @@ fn prepare_frontend_incremental_write(
         )?;
         return crate::mv::application::MvIncrementalWritePreparer::prepare(
             request,
-            crate::engine::mv_first_refresh_staging::frozen_logical_context(&context)?,
+            crate::engine::mv_first_refresh_staging::frozen_logical_context_from_rewrite(
+                &rewrite,
+                contract.affected_partitions.clone(),
+                None,
+            )?,
             match join_mode {
                 JoinIncrementalRefreshMode::AppendOnly => {
                     crate::mv::application::MvIncrementalWriteMode::FastAppend
@@ -1021,13 +985,11 @@ fn prepare_frontend_incremental_write(
         .map(PreparedIncrementalRefreshWork::ChangeStream);
     }
 
-    let loaded_bases = context
-        .rewrite
+    let loaded_bases = rewrite
         .base_refs
         .iter()
         .map(|base| {
-            let previous_snapshot_id = context
-                .rewrite
+            let previous_snapshot_id = rewrite
                 .previous_snapshot_ids
                 .get(&base.fqn())
                 .copied()
@@ -1037,13 +999,13 @@ fn prepare_frontend_incremental_write(
                         base.fqn()
                     )
                 })?;
-            let current_snapshot_id = context.rewrite.pin.get(base).ok_or_else(|| {
+            let current_snapshot_id = rewrite.pin.get(base).ok_or_else(|| {
                 format!(
                     "MV incremental refresh is missing pinned snapshot for {}",
                     base.fqn()
                 )
             })?;
-            let current_table_uuid = context.rewrite.pin.uuid(base).ok_or_else(|| {
+            let current_table_uuid = rewrite.pin.uuid(base).ok_or_else(|| {
                 format!(
                     "MV incremental refresh is missing pinned UUID for {}",
                     base.fqn()
@@ -1098,7 +1060,7 @@ fn prepare_frontend_incremental_write(
         }
         NonJoinIncrementalChangePlan::FullRebuild { reason, .. } => {
             tracing::info!(
-                target = %context.rewrite.target.fqn(),
+                target = %rewrite.target.fqn(),
                 "MV refresh SQL preparation selected a distributed full-rebuild staging overwrite: {reason}"
             );
             let rebuild = prepare_frontend_first_refresh_write(
@@ -1107,7 +1069,7 @@ fn prepare_frontend_incremental_write(
                 current_database,
                 contract,
                 attempt,
-                &context.rewrite.pin.to_table_uuid_map(),
+                &rewrite.pin.to_table_uuid_map(),
                 observed_binding,
                 connector_context,
             )?
@@ -1143,12 +1105,12 @@ fn prepare_frontend_incremental_write(
     )?;
     let publication_intent = mv_refresh_publication_intent(
         attempt.refresh_id,
-        context.rewrite.mv_definition.mv_id,
+        rewrite.mv_definition.mv_id,
         attempt.marker_token.clone(),
         MvRefreshPublicationTechnique::Incremental,
-        &context.rewrite.pin.to_snapshot_map(),
-        &context.rewrite.pin.to_table_uuid_map(),
-        &context.rewrite.previous_snapshot_ids,
+        &rewrite.pin.to_snapshot_map(),
+        &rewrite.pin.to_table_uuid_map(),
+        &rewrite.previous_snapshot_ids,
         definition_fingerprint.clone(),
         target.catalog.clone(),
         target.namespace.clone(),
@@ -1157,7 +1119,11 @@ fn prepare_frontend_incremental_write(
     )?;
     crate::mv::application::MvIncrementalWritePreparer::prepare(
         request,
-        crate::engine::mv_first_refresh_staging::frozen_logical_context(&context)?,
+        crate::engine::mv_first_refresh_staging::frozen_logical_context_from_rewrite(
+            &rewrite,
+            contract.affected_partitions.clone(),
+            None,
+        )?,
         mode,
         evidence,
         crate::mv::application::MvIncrementalExecutionArtifact::CanonicalQuery,
@@ -4714,6 +4680,61 @@ fn target_binding_for(
         },
         connector_context,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_neutral_refresh_rewrite_context(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    mv_id: i64,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    definition: Arc<StoredMvDefinition>,
+    canonical_query: Arc<sqlparser::ast::Query>,
+    base_refs: Arc<[TableIdentity]>,
+    pin: Arc<RefreshSnapshotPin>,
+    previous_snapshot_ids: BTreeMap<String, i64>,
+    previous_table_uuids: BTreeMap<String, String>,
+    target_snapshot_id: Option<i64>,
+    target_table_uuid: String,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Arc<crate::mv::rewrite::context::IcebergMvRewriteContext>, String> {
+    let binding = target_binding_for(state, target, connector_context)?;
+    if binding.table_uuid() != target_table_uuid {
+        return Err(format!(
+            "MV refresh target UUID drifted after planning for {}.{}.{}",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    if binding.current_snapshot_id() != target_snapshot_id {
+        return Err(format!(
+            "MV refresh target snapshot drifted after planning for {}.{}.{}",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    let schema_contract = definition.schema_contract.clone().map(Arc::new);
+    crate::mv::rewrite::context::IcebergMvRewriteContext::from_parts(
+        TableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        mv_id,
+        current_catalog.map(str::to_string),
+        current_database.to_string(),
+        definition,
+        canonical_query,
+        base_refs,
+        pin,
+        previous_snapshot_ids,
+        previous_table_uuids,
+        target_snapshot_id,
+        target_table_uuid,
+        binding.arrow_schema().clone(),
+        Arc::from(binding.observation().field_ids().to_vec()),
+        schema_contract,
+    )
+    .map(Arc::new)
 }
 
 fn validate_target_snapshot(
@@ -8993,7 +9014,6 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
                 validated.base_refs(),
                 &pin,
                 previous_snapshot_ids,
-                &base_catalog_entries,
             )
             .map_err(RefreshError::pre_commit)?,
         );
@@ -14169,6 +14189,30 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_base_overlays(
     ),
     RefreshError,
 > {
+    compile_canonical_select_for_imv_with_frozen_rewrite(
+        state,
+        &ctx.rewrite,
+        refresh_connector_context(ctx).map_err(RefreshError::user)?,
+        bindings,
+        execution,
+        overlays,
+    )
+}
+
+pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
+    state: &Arc<StandaloneState>,
+    rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    bindings: Arc<QueryTableBindingStore>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    overlays: Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+) -> Result<
+    (
+        crate::sql::planner::logical::LogicalPlanNode,
+        crate::sql::column_id::ColumnRefFactory,
+    ),
+    RefreshError,
+> {
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
     let materializer = crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
         None,
@@ -14176,11 +14220,11 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_base_overlays(
         bindings,
         crate::engine::query_stats::iceberg_table_binding_loader(
             state.connector_control.as_ref(),
-            refresh_connector_context(ctx).map_err(RefreshError::user)?.clone(),
+            connector_context.clone(),
         ),
         overlays,
     );
-    let mut query = (*ctx.rewrite.canonical_select_query).clone();
+    let mut query = (*rewrite.canonical_select_query).clone();
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
     let statistics =
         crate::engine::query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
@@ -14197,7 +14241,7 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_base_overlays(
         crate::sql::compiler::SqlCompileIntent::LogicalOnly,
         crate::sql::compiler::SqlSessionContext {
             current_catalog: None,
-            current_database: ctx.rewrite.current_database.clone(),
+            current_database: rewrite.current_database.clone(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
         crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
@@ -14216,7 +14260,7 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_base_overlays(
         crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| {
             RefreshError::user(format!(
                 "imv plan failed for {}.{}.{}: canonical SQL compiler: {error}",
-                ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
+                rewrite.target.catalog, rewrite.target.namespace, rewrite.target.table
             ))
         })?
     else {
@@ -14574,15 +14618,28 @@ pub(crate) fn bind_imv_target_query_table_in_store(
     store: &Arc<QueryTableBindingStore>,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<crate::sql::binding::SqlTableBindingId, String> {
-    let target = &refresh.rewrite.target;
-    let target_table_uuid = refresh.rewrite.target_table_uuid.clone();
-    let frozen_snapshot_id = refresh.rewrite.target_snapshot_id;
+    bind_imv_target_query_table_in_store_from_rewrite(
+        &refresh.rewrite,
+        store,
+        planning_lease,
+        refresh_connector_context(refresh)?,
+    )
+}
+
+pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
+    rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
+    store: &Arc<QueryTableBindingStore>,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::sql::binding::SqlTableBindingId, String> {
+    let target = &rewrite.target;
+    let target_table_uuid = rewrite.target_table_uuid.clone();
+    let frozen_snapshot_id = rewrite.target_snapshot_id;
     let planning_lease = planning_lease.clone();
-    let context = refresh_connector_context(refresh)?.clone();
     let materialization =
         crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
             planning_lease.clone(),
-            context,
+            connector_context.clone(),
             &target.namespace,
             &target.table,
         )?;
@@ -14599,13 +14656,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
         .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
         .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
     let (full_materialization, affected_materialization) =
-        crate::connector::iceberg::provider::freeze_mv_target_reads(
-            &materialization,
-            refresh.target_bindings.runtime(),
-            &refresh.affected_partitions_to_target_partition_filter(),
-            refresh.rewrite.schema_contract.target.partition.as_ref(),
-            selector,
-        )?;
+        crate::connector::iceberg::provider::freeze_mv_target_reads(&materialization, selector)?;
     let to_read = |materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization| {
         QueryScanMaterialization {
             table: materialization.read_table.clone(),
@@ -14641,15 +14692,13 @@ pub(crate) fn bind_imv_target_query_table_in_store(
                 facts: SqlMvTargetLocatorScan {
                     target_table_uuid: target_table_uuid.clone(),
                     target_snapshot_id: frozen_snapshot_id,
-                    apply_key_column: refresh
-                        .rewrite
+                    apply_key_column: rewrite
                         .schema_contract
                         .target
                         .hidden_apply_key
                         .column_name
                         .clone(),
-                    branch_id_column: refresh
-                        .rewrite
+                    branch_id_column: rewrite
                         .schema_contract
                         .branch
                         .as_ref()
@@ -14721,7 +14770,6 @@ pub(crate) fn freeze_imv_base_query_local_overlays(
         &refresh.rewrite.base_refs,
         &refresh.rewrite.pin,
         &refresh.rewrite.previous_snapshot_ids,
-        &refresh.base_catalog_entries,
     )
 }
 
@@ -14729,16 +14777,12 @@ pub(crate) fn freeze_imv_base_query_local_overlays(
 /// overlays retain the exact connector lease, table handle, selected files and
 /// delta facts; callers must carry them through later compilation instead of
 /// asking a provider for its current generation again.
-fn freeze_imv_base_query_local_overlays_from_captured_inputs(
+pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
     state: &Arc<StandaloneState>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     base_refs: &[TableIdentity],
     pin: &RefreshSnapshotPin,
     previous_snapshot_ids: &BTreeMap<String, i64>,
-    _base_catalog_entries: &BTreeMap<
-        String,
-        crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    >,
 ) -> Result<Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>, String>
 {
     let mut seen = BTreeSet::new();
@@ -22091,7 +22135,6 @@ mod tests {
             &base_refs,
             &pin,
             &BTreeMap::new(),
-            &base_catalog_entries,
         )
         .expect("freeze base overlay before connector replacement");
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice")
