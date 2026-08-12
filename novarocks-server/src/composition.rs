@@ -29,9 +29,9 @@ use novarocks::mv::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvMaintenanceMetadataObservation,
     MvObservedMaintenancePolicy, MvObservedRefreshMarker, MvObservedSnapshot,
     MvObservedTargetField, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
-    MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
-    MvStorageObservationPort, MvTargetCreationObservation,
+    MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
+    MvSchemaValidationPartitionContract, MvSchemaValidationPartitionField,
+    MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
 };
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
@@ -257,6 +257,23 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
         };
         MvLakePackageObservation::try_new(metadata.identity.clone(), descriptor, publication)
             .map(Some)
+    }
+
+    fn observe_refresh_base(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvRefreshBaseObservation, ConnectorError> {
+        let observed =
+            self.inspector
+                .observe_refresh_base(exact_lease, metadata, context.clone())?;
+        MvRefreshBaseObservation::try_new(
+            metadata.identity.clone(),
+            observed.table_uuid,
+            observed.current_snapshot_id,
+            &context,
+        )
     }
 
     fn observe_refresh_target(

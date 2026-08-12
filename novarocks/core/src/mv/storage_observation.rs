@@ -508,6 +508,54 @@ pub enum MvPublishedRefreshTechnique {
     MetadataOnly,
 }
 
+/// Exact base-table identity pinned for one MV refresh attempt.
+///
+/// The UUID and current snapshot come from the same sealed metadata value
+/// loaded through `table`'s retained exact connector generation. Keeping this
+/// observation narrow prevents base pinning from becoming a general-purpose
+/// provider metadata surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshBaseObservation {
+    table: ConnectorTableIdentity,
+    table_uuid: String,
+    current_snapshot_id: Option<i64>,
+}
+
+impl MvRefreshBaseObservation {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        table_uuid: String,
+        current_snapshot_id: Option<i64>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        validate_request_context(context)?;
+        validate_table_identity(&table, "MV refresh base")?;
+        require_non_empty(&table_uuid, "MV refresh base table UUID")?;
+        if let Some(snapshot_id) = current_snapshot_id
+            && snapshot_id < 0
+        {
+            return corrupt("MV refresh base observation has a negative current snapshot ID");
+        }
+        Ok(Self {
+            table,
+            table_uuid,
+            current_snapshot_id,
+        })
+    }
+
+    pub const fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+
+    pub fn table_uuid(&self) -> &str {
+        &self.table_uuid
+    }
+
+    pub const fn current_snapshot_id(&self) -> Option<i64> {
+        self.current_snapshot_id
+    }
+}
+
 /// Maximum number of named refs carried by one refresh-target observation.
 ///
 /// MV apply only ever consults `main` plus the refresh staging branches, so a
@@ -851,6 +899,16 @@ pub trait MvStorageObservationPort: Send + Sync {
         context: ConnectorRequestContext,
     ) -> Result<Option<MvLakePackageObservation>, ConnectorError>;
 
+    /// Observe a base table's UUID and current snapshot from one exact sealed
+    /// metadata value.
+    // Design: ADR-0060 (docs/adr/ADR-0060-exact-metadata-mv-refresh-base-pin.md)
+    fn observe_refresh_base(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvRefreshBaseObservation, ConnectorError>;
+
     /// Observe the refresh-time facts of an MV target.
     ///
     /// Called on the same exact generation that loaded `metadata`, so the
@@ -916,6 +974,18 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "MV storage observation port is not installed",
+        ))
+    }
+
+    fn observe_refresh_base(
+        &self,
+        _exact_lease: &ConnectorControlPlanningLease,
+        _metadata: &ConnectorTableMetadata,
+        _context: ConnectorRequestContext,
+    ) -> Result<MvRefreshBaseObservation, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "MV refresh base observation port is not installed",
         ))
     }
 
@@ -1306,7 +1376,8 @@ mod tests {
         BTreeMap, MvLakePackageObservation, MvLakePublication, MvMaintenanceMetadataObservation,
         MvObservedMaintenancePolicy, MvObservedSnapshot, MvObservedTargetField,
         MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
-        MvRefreshTargetObservation, MvSchemaValidationObservation, MvTargetCreationObservation,
+        MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
+        MvTargetCreationObservation,
     };
     use crate::mv::persistence::{
         descriptor::MvDescriptorV1,
@@ -1611,6 +1682,40 @@ mod tests {
             BTreeMap::new(),
             &context(4096),
         )
+    }
+
+    #[test]
+    fn refresh_base_observation_requires_neutral_identity_uuid_and_snapshot() {
+        let observed = MvRefreshBaseObservation::try_new(
+            table(),
+            "uuid-1".to_string(),
+            Some(7),
+            &context(4096),
+        )
+        .unwrap();
+        assert_eq!(observed.table(), &table());
+        assert_eq!(observed.table_uuid(), "uuid-1");
+        assert_eq!(observed.current_snapshot_id(), Some(7));
+
+        let empty_uuid =
+            MvRefreshBaseObservation::try_new(table(), String::new(), None, &context(4096))
+                .unwrap_err();
+        assert_eq!(
+            empty_uuid.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+
+        let negative_snapshot = MvRefreshBaseObservation::try_new(
+            table(),
+            "uuid-1".to_string(),
+            Some(-1),
+            &context(4096),
+        )
+        .unwrap_err();
+        assert_eq!(
+            negative_snapshot.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
     }
 
     #[test]

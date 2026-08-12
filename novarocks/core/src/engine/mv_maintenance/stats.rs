@@ -333,8 +333,8 @@ mod tests {
 
     use crate::mv::storage_observation::{
         MvLakePackageObservation, MvMaintenanceMetadataObservation, MvObservedMaintenancePolicy,
-        MvObservedSnapshot, MvRefreshTargetObservation, MvSchemaValidationObservation,
-        MvStorageObservationPort, MvTargetCreationObservation,
+        MvObservedSnapshot, MvRefreshBaseObservation, MvRefreshTargetObservation,
+        MvSchemaValidationObservation, MvStorageObservationPort, MvTargetCreationObservation,
     };
 
     const TEST_CATALOG: &str = "ice";
@@ -555,6 +555,15 @@ mod tests {
             _metadata: &ConnectorTableMetadata,
             _context: ConnectorRequestContext,
         ) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
+            unreachable!("a maintenance fact pass observes maintenance metadata only")
+        }
+
+        fn observe_refresh_base(
+            &self,
+            _exact_lease: &ConnectorControlPlanningLease,
+            _metadata: &ConnectorTableMetadata,
+            _context: ConnectorRequestContext,
+        ) -> Result<MvRefreshBaseObservation, ConnectorError> {
             unreachable!("a maintenance fact pass observes maintenance metadata only")
         }
 

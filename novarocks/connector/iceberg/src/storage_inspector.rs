@@ -112,6 +112,13 @@ pub enum IcebergStoragePartitionTransform {
     Void,
 }
 
+/// Narrow base-table facts projected from one frozen metadata document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageRefreshBaseObservation {
+    pub table_uuid: String,
+    pub current_snapshot_id: Option<i64>,
+}
+
 /// Refresh-time facts of an MV target.
 ///
 /// Distinct from [`IcebergStorageTargetObservation`]: apply needs snapshot and
@@ -266,6 +273,16 @@ impl IcebergStorageInspector {
         lake_package_observation(&table, &context)
     }
 
+    pub fn observe_refresh_base(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<IcebergStorageRefreshBaseObservation, ConnectorError> {
+        let table = decoded_table(exact_lease, metadata, &context)?;
+        refresh_base_observation(&table, &context)
+    }
+
     pub fn observe_refresh_target(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
@@ -286,6 +303,20 @@ impl IcebergStorageInspector {
         let table = decoded_table(exact_lease, metadata, &context)?;
         maintenance_metadata_observation(&table, &context)
     }
+}
+
+fn refresh_base_observation(
+    table: &TableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<IcebergStorageRefreshBaseObservation, ConnectorError> {
+    let table_uuid = table.uuid().to_string();
+    let mut budget = 0_usize;
+    reserve(context, &mut budget, &table_uuid)?;
+    validate_context(context)?;
+    Ok(IcebergStorageRefreshBaseObservation {
+        table_uuid,
+        current_snapshot_id: table.current_snapshot_id(),
+    })
 }
 
 fn maintenance_metadata_observation(
@@ -938,6 +969,18 @@ mod tests {
     fn unknown_partition_transform_fails_closed() {
         let error = partition_transform(&Transform::Unknown).expect_err("unknown transform");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn refresh_base_projection_keeps_uuid_and_snapshot_from_one_metadata_value() {
+        let table = maintenance_metadata(
+            vec![SnapshotFixture::new(11, 1_700_000_001_000).on_main()],
+            HashMap::new(),
+        );
+        let observed =
+            refresh_base_observation(&table, &context(4096)).expect("refresh base observation");
+        assert_eq!(observed.table_uuid, table.uuid().to_string());
+        assert_eq!(observed.current_snapshot_id, Some(11));
     }
 
     /// One snapshot to install, plus the ref (if any) that should point at it.
