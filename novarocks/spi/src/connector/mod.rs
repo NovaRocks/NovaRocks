@@ -224,6 +224,10 @@ pub use view_metadata::{
 };
 pub use write::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorActivatedWriteCohort, ConnectorBatchWriter,
+    ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
+    ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
+    ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionSpecReplacementId,
+    ConnectorManagedPartitionSpecReplacementTarget, ConnectorManagedPartitionTransform,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationIntent,
     ConnectorManagedPublicationTechnique, ConnectorOpenWriterRequest,
     ConnectorSealedWriteCohortSet, ConnectorStagedReport, ConnectorStagedReportFrame,
@@ -240,6 +244,7 @@ pub use write::{
     ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteReceipt,
     ConnectorWriteReconcileRequest, ConnectorWriteTargetRef, ConnectorWriterHandle,
     ConnectorWriterIdentity, ConnectorWriterTerminalState,
+    MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,
     MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
     MAX_CONNECTOR_STAGED_REPORT_PARTS, MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES,
     MAX_CONNECTOR_WRITE_ACTIVATIONS, MAX_CONNECTOR_WRITE_COHORTS,

@@ -30,9 +30,10 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorInstanceDescriptor, ConnectorMutationOperationId, ConnectorRequestContext,
-    ConnectorTableIdentity, ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorTableIdentity, ExternalMutationEvidence,
+    ExternalMutationOutcome,
 };
 
 pub const MAX_CONNECTOR_STAGED_PUBLICATION_PROOF_BYTES: usize = 64 * 1024;
@@ -271,6 +272,7 @@ pub struct ConnectorStagedPublicationObservation {
     pub definition_fingerprint: Option<Arc<str>>,
     pub staging_snapshot_id: Option<i64>,
     pub target_snapshot_id: Option<i64>,
+    pub committed_partitioning: Option<ConnectorCommittedPartitioning>,
     pub cleanup_required: bool,
     pub proof: ConnectorStagedPublicationProof,
     digest: [u8; 32],
@@ -286,6 +288,60 @@ impl ConnectorStagedPublicationObservation {
         definition_fingerprint: Option<Arc<str>>,
         staging_snapshot_id: Option<i64>,
         target_snapshot_id: Option<i64>,
+        cleanup_required: bool,
+        proof: ConnectorStagedPublicationProof,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_inner(
+            disposition,
+            committed_version,
+            resulting_row_count,
+            bases,
+            definition_fingerprint,
+            staging_snapshot_id,
+            target_snapshot_id,
+            None,
+            cleanup_required,
+            proof,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_committed_partitioning(
+        disposition: ConnectorStagedPublicationDisposition,
+        committed_version: Option<ConnectorCommittedVersion>,
+        resulting_row_count: Option<u64>,
+        bases: Vec<ConnectorStagedPublicationBaseFact>,
+        definition_fingerprint: Option<Arc<str>>,
+        staging_snapshot_id: Option<i64>,
+        target_snapshot_id: Option<i64>,
+        committed_partitioning: ConnectorCommittedPartitioning,
+        cleanup_required: bool,
+        proof: ConnectorStagedPublicationProof,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_inner(
+            disposition,
+            committed_version,
+            resulting_row_count,
+            bases,
+            definition_fingerprint,
+            staging_snapshot_id,
+            target_snapshot_id,
+            Some(committed_partitioning),
+            cleanup_required,
+            proof,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_inner(
+        disposition: ConnectorStagedPublicationDisposition,
+        committed_version: Option<ConnectorCommittedVersion>,
+        resulting_row_count: Option<u64>,
+        bases: Vec<ConnectorStagedPublicationBaseFact>,
+        definition_fingerprint: Option<Arc<str>>,
+        staging_snapshot_id: Option<i64>,
+        target_snapshot_id: Option<i64>,
+        committed_partitioning: Option<ConnectorCommittedPartitioning>,
         cleanup_required: bool,
         proof: ConnectorStagedPublicationProof,
     ) -> Result<Self, ConnectorError> {
@@ -315,6 +371,14 @@ impl ConnectorStagedPublicationObservation {
         if let Some(version) = &committed_version {
             version.validate()?;
         }
+        if let Some(partitioning) = &committed_partitioning {
+            if committed_version.is_none() {
+                return Err(invalid(
+                    "committed partitioning requires a staged publication committed version",
+                ));
+            }
+            partitioning.validate()?;
+        }
         proof.validate()?;
         let digest = observation_digest(
             disposition,
@@ -324,6 +388,7 @@ impl ConnectorStagedPublicationObservation {
             definition_fingerprint.as_deref(),
             staging_snapshot_id,
             target_snapshot_id,
+            committed_partitioning.as_ref(),
             cleanup_required,
             proof.digest(),
         );
@@ -335,13 +400,14 @@ impl ConnectorStagedPublicationObservation {
             definition_fingerprint,
             staging_snapshot_id,
             target_snapshot_id,
+            committed_partitioning,
             cleanup_required,
             proof,
             digest,
         })
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        let expected = Self::try_new(
+        let expected = Self::try_new_inner(
             self.disposition,
             self.committed_version.clone(),
             self.resulting_row_count,
@@ -349,6 +415,7 @@ impl ConnectorStagedPublicationObservation {
             self.definition_fingerprint.clone(),
             self.staging_snapshot_id,
             self.target_snapshot_id,
+            self.committed_partitioning.clone(),
             self.cleanup_required,
             self.proof.clone(),
         )?;
@@ -483,6 +550,7 @@ fn observation_digest(
     fingerprint: Option<&str>,
     staging: Option<i64>,
     target: Option<i64>,
+    committed_partitioning: Option<&ConnectorCommittedPartitioning>,
     cleanup_required: bool,
     proof_digest: [u8; 32],
 ) -> [u8; 32] {
@@ -506,13 +574,22 @@ fn observation_digest(
     h.update(target.unwrap_or_default().to_be_bytes());
     h.update([cleanup_required as u8]);
     h.update(proof_digest);
+    // Preserve ordinary historical observation digests exactly. Atomic
+    // repartition appends a typed, validated finalize fact only when present.
+    if let Some(partitioning) = committed_partitioning {
+        h.update(b"committed-partitioning\0");
+        h.update(partitioning.digest());
+    }
     h.finalize().into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::{ConnectorInstanceId, ConnectorInstanceIncarnation};
+    use crate::connector::{
+        ConnectorCommittedPartitionField, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorManagedPartitionTransform,
+    };
 
     #[test]
     fn proof_rejects_empty_or_oversized_payloads_and_redacts_debug() {
@@ -548,6 +625,47 @@ mod tests {
                 proof,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn published_observation_carries_exact_committed_partitioning() {
+        let partitioning = ConnectorCommittedPartitioning::try_new(
+            4,
+            vec![
+                ConnectorCommittedPartitionField::try_new(
+                    1000,
+                    "event_day",
+                    7,
+                    "event_time",
+                    0,
+                    ConnectorManagedPartitionTransform::Day,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let observation =
+            ConnectorStagedPublicationObservation::try_new_with_committed_partitioning(
+                ConnectorStagedPublicationDisposition::Published,
+                Some(
+                    ConnectorCommittedVersion::try_new(Bytes::from_static(b"version"), Some(9))
+                        .unwrap(),
+                ),
+                Some(3),
+                vec![],
+                Some(Arc::from("fingerprint")),
+                Some(9),
+                Some(9),
+                partitioning.clone(),
+                true,
+                ConnectorStagedPublicationProof::try_new(Bytes::from_static(b"proof")).unwrap(),
+            )
+            .unwrap();
+        observation.validate().unwrap();
+        assert_eq!(
+            observation.committed_partitioning.as_ref(),
+            Some(&partitioning)
         );
     }
 

@@ -49,11 +49,19 @@ pub const MAX_CONNECTOR_WRITE_OPERATION_WRITERS: usize = 16_384;
 pub const MAX_CONNECTOR_WRITE_OPERATION_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_CONNECTOR_WRITE_ACTIVATIONS: usize = 16_384;
 pub const MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS: usize = 4096;
+pub const MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES: usize = 4096;
 
 const CONNECTOR_WRITE_COHORT_ID_DOMAIN: &[u8] = b"novarocks.connector-write-cohort.v1\0";
 const CONNECTOR_WRITE_COHORT_SET_DOMAIN: &[u8] = b"novarocks.connector-write-cohort-set.v1\0";
 const CONNECTOR_WRITE_ATTEMPT_DOMAIN: &[u8] = b"novarocks.connector-write-attempt.v1\0";
 const CONNECTOR_WRITE_OPERATION_DOMAIN: &[u8] = b"novarocks.connector-write-operation.v1\0";
+const CONNECTOR_MANAGED_PARTITION_SPEC_OBSERVATION_DOMAIN: &[u8] =
+    b"novarocks.connector-managed-partition-spec-observation.v1\0";
+const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
+    b"novarocks.connector-managed-partition-spec-replacement-id.v1\0";
+const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_DOMAIN: &[u8] =
+    b"novarocks.connector-managed-partition-spec-replacement.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectorWriteOperationId(Uuid);
@@ -652,6 +660,505 @@ pub enum ConnectorManagedPublicationEmptyInputDisposition {
     CommitEmptyWrite,
 }
 
+/// The closed, provider-neutral transform vocabulary for an atomic managed
+/// partition-spec replacement. Providers remain responsible for validating
+/// each transform against the retained exact table schema.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ConnectorManagedPartitionTransform {
+    Identity,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Bucket { buckets: u32 },
+    Truncate { width: u32 },
+    Void,
+}
+
+impl ConnectorManagedPartitionTransform {
+    fn validate(self) -> Result<(), ConnectorError> {
+        let parameter = match self {
+            Self::Bucket { buckets } => Some(buckets),
+            Self::Truncate { width } => Some(width),
+            Self::Identity | Self::Year | Self::Month | Self::Day | Self::Hour | Self::Void => None,
+        };
+        if parameter.is_some_and(|value| value == 0 || value > i32::MAX as u32) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector managed partition transform parameter must be within 1..=i32::MAX",
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest_into(self, hasher: &mut Sha256) {
+        match self {
+            Self::Identity => hasher.update([1]),
+            Self::Year => hasher.update([2]),
+            Self::Month => hasher.update([3]),
+            Self::Day => hasher.update([4]),
+            Self::Hour => hasher.update([5]),
+            Self::Bucket { buckets } => {
+                hasher.update([6]);
+                hasher.update(buckets.to_be_bytes());
+            }
+            Self::Truncate { width } => {
+                hasher.update([7]);
+                hasher.update(width.to_be_bytes());
+            }
+            Self::Void => hasher.update([8]),
+        }
+    }
+}
+
+/// One ordered field in a complete managed partition-spec replacement.
+/// `source_field_id` is the stable application-visible source identity; the
+/// provider assigns any physical partition field identity and new spec ID.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectorManagedPartitionField {
+    source_field_id: i32,
+    position: u32,
+    transform: ConnectorManagedPartitionTransform,
+}
+
+impl ConnectorManagedPartitionField {
+    pub fn try_new(
+        source_field_id: i32,
+        position: u32,
+        transform: ConnectorManagedPartitionTransform,
+    ) -> Result<Self, ConnectorError> {
+        if source_field_id <= 0 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector managed partition source field ID must be positive",
+            ));
+        }
+        transform.validate()?;
+        Ok(Self {
+            source_field_id,
+            position,
+            transform,
+        })
+    }
+
+    pub const fn source_field_id(&self) -> i32 {
+        self.source_field_id
+    }
+
+    pub const fn position(&self) -> u32 {
+        self.position
+    }
+
+    pub const fn transform(&self) -> ConnectorManagedPartitionTransform {
+        self.transform
+    }
+
+    fn digest_into(&self, hasher: &mut Sha256) {
+        hasher.update(self.source_field_id.to_be_bytes());
+        hasher.update(self.position.to_be_bytes());
+        self.transform.digest_into(hasher);
+    }
+}
+
+fn validate_managed_partition_fields(
+    fields: &[ConnectorManagedPartitionField],
+    allow_empty: bool,
+) -> Result<(), ConnectorError> {
+    if (!allow_empty && fields.is_empty())
+        || fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector managed partition spec field count is invalid or exceeds its bound",
+        ));
+    }
+    let mut field_transforms = BTreeSet::new();
+    for (position, field) in fields.iter().enumerate() {
+        if field.source_field_id <= 0
+            || field.position as usize != position
+            || field.transform.validate().is_err()
+            || !field_transforms.insert((field.source_field_id, field.transform))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector managed partition spec has an invalid order, duplicate field transform, or transform",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Canonical observation of the exact prior default partition spec. This is
+/// logical, bounded evidence rather than a provider metadata location or a
+/// caller-selected physical spec ID.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectorManagedPartitionSpecObservation {
+    provider_spec_id: i32,
+    layout_digest: [u8; 32],
+}
+
+impl ConnectorManagedPartitionSpecObservation {
+    pub fn try_from_fields(
+        provider_spec_id: i32,
+        fields: &[ConnectorManagedPartitionField],
+    ) -> Result<Self, ConnectorError> {
+        if provider_spec_id < 0 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector managed prior partition spec ID must be non-negative",
+            ));
+        }
+        validate_managed_partition_fields(fields, true)?;
+        let mut hasher = Sha256::new();
+        hasher.update(CONNECTOR_MANAGED_PARTITION_SPEC_OBSERVATION_DOMAIN);
+        hasher.update(provider_spec_id.to_be_bytes());
+        hasher.update((fields.len() as u32).to_be_bytes());
+        for field in fields {
+            field.digest_into(&mut hasher);
+        }
+        Ok(Self {
+            provider_spec_id,
+            layout_digest: hasher.finalize().into(),
+        })
+    }
+
+    pub const fn provider_spec_id(self) -> i32 {
+        self.provider_spec_id
+    }
+
+    pub const fn layout_digest(self) -> [u8; 32] {
+        self.layout_digest
+    }
+}
+
+/// A deterministic identity proving that a replacement belongs to one write
+/// operation. There is at most one replacement in a managed publication
+/// intent, so no caller-provided identity or new physical spec ID is needed.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectorManagedPartitionSpecReplacementId([u8; 32]);
+
+impl ConnectorManagedPartitionSpecReplacementId {
+    pub fn derive(operation_id: ConnectorWriteOperationId) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN);
+        hasher.update(operation_id.to_bytes());
+        Self(hasher.finalize().into())
+    }
+
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// The metadata transition is coupled to publication of the managed target,
+/// never to creation or population of an internal staging reference.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ConnectorManagedPartitionSpecReplacementTarget {
+    MainPublication,
+}
+
+/// Complete, signed logical facts for replacing the default partition spec in
+/// the same external commit that publishes the managed snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorManagedPartitionSpecReplacement {
+    operation_id: ConnectorWriteOperationId,
+    replacement_id: ConnectorManagedPartitionSpecReplacementId,
+    target: ConnectorManagedPartitionSpecReplacementTarget,
+    expected_prior_default: ConnectorManagedPartitionSpecObservation,
+    fields: Vec<ConnectorManagedPartitionField>,
+}
+
+impl ConnectorManagedPartitionSpecReplacement {
+    pub fn try_new(
+        operation_id: ConnectorWriteOperationId,
+        expected_prior_default: ConnectorManagedPartitionSpecObservation,
+        fields: Vec<ConnectorManagedPartitionField>,
+    ) -> Result<Self, ConnectorError> {
+        validate_managed_partition_fields(&fields, false)?;
+        Ok(Self {
+            operation_id,
+            replacement_id: ConnectorManagedPartitionSpecReplacementId::derive(operation_id),
+            target: ConnectorManagedPartitionSpecReplacementTarget::MainPublication,
+            expected_prior_default,
+            fields,
+        })
+    }
+
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+
+    pub const fn replacement_id(&self) -> ConnectorManagedPartitionSpecReplacementId {
+        self.replacement_id
+    }
+
+    pub const fn target(&self) -> ConnectorManagedPartitionSpecReplacementTarget {
+        self.target
+    }
+
+    pub const fn expected_prior_default(&self) -> ConnectorManagedPartitionSpecObservation {
+        self.expected_prior_default
+    }
+
+    pub fn fields(&self) -> &[ConnectorManagedPartitionField] {
+        &self.fields
+    }
+
+    fn validate_for_operation(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+    ) -> Result<(), ConnectorError> {
+        validate_managed_partition_fields(&self.fields, false)?;
+        if self.operation_id != operation_id
+            || self.replacement_id
+                != ConnectorManagedPartitionSpecReplacementId::derive(operation_id)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector managed partition replacement does not match the write operation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_DOMAIN);
+        hasher.update(self.operation_id.to_bytes());
+        hasher.update(self.replacement_id.to_bytes());
+        hasher.update([match self.target {
+            ConnectorManagedPartitionSpecReplacementTarget::MainPublication => 1,
+        }]);
+        hasher.update(self.expected_prior_default.provider_spec_id().to_be_bytes());
+        hasher.update(self.expected_prior_default.layout_digest());
+        hasher.update((self.fields.len() as u32).to_be_bytes());
+        for field in &self.fields {
+            field.digest_into(&mut hasher);
+        }
+        hasher.finalize().into()
+    }
+}
+
+/// One exact provider-assigned field in committed partitioning. Both physical
+/// and source identities are application facts required to finalize or recover
+/// the durable MV partition contract without interpreting provider metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorCommittedPartitionField {
+    partition_field_id: i32,
+    partition_field_name: Arc<str>,
+    source_field_id: i32,
+    source_column_name: Arc<str>,
+    position: u32,
+    transform: ConnectorManagedPartitionTransform,
+}
+
+impl ConnectorCommittedPartitionField {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        partition_field_id: i32,
+        partition_field_name: impl Into<Arc<str>>,
+        source_field_id: i32,
+        source_column_name: impl Into<Arc<str>>,
+        position: u32,
+        transform: ConnectorManagedPartitionTransform,
+    ) -> Result<Self, ConnectorError> {
+        let partition_field_name = partition_field_name.into();
+        let source_column_name = source_column_name.into();
+        if partition_field_id <= 0
+            || source_field_id <= 0
+            || partition_field_name.is_empty()
+            || source_column_name.is_empty()
+            || partition_field_name.len() + source_column_name.len()
+                > MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES
+            || partition_field_name.chars().any(char::is_control)
+            || source_column_name.chars().any(char::is_control)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector committed partition field identity is invalid or exceeds its bound",
+            ));
+        }
+        transform.validate()?;
+        Ok(Self {
+            partition_field_id,
+            partition_field_name,
+            source_field_id,
+            source_column_name,
+            position,
+            transform,
+        })
+    }
+
+    pub const fn partition_field_id(&self) -> i32 {
+        self.partition_field_id
+    }
+    pub fn partition_field_name(&self) -> &str {
+        self.partition_field_name.as_ref()
+    }
+    pub const fn source_field_id(&self) -> i32 {
+        self.source_field_id
+    }
+    pub fn source_column_name(&self) -> &str {
+        self.source_column_name.as_ref()
+    }
+    pub const fn position(&self) -> u32 {
+        self.position
+    }
+    pub const fn transform(&self) -> ConnectorManagedPartitionTransform {
+        self.transform
+    }
+
+    fn digest_into(&self, hasher: &mut Sha256) {
+        hasher.update(self.partition_field_id.to_be_bytes());
+        digest_bytes(hasher, self.partition_field_name.as_bytes());
+        hasher.update(self.source_field_id.to_be_bytes());
+        digest_bytes(hasher, self.source_column_name.as_bytes());
+        hasher.update(self.position.to_be_bytes());
+        self.transform.digest_into(hasher);
+    }
+}
+
+fn validate_committed_partition_fields(
+    fields: &[ConnectorCommittedPartitionField],
+) -> Result<(), ConnectorError> {
+    if fields.is_empty() || fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector committed partition field count is invalid or exceeds its bound",
+        ));
+    }
+    let mut partition_field_ids = BTreeSet::new();
+    let mut partition_field_names = BTreeSet::new();
+    let mut field_transforms = BTreeSet::new();
+    for (position, field) in fields.iter().enumerate() {
+        ConnectorCommittedPartitionField::try_new(
+            field.partition_field_id,
+            field.partition_field_name.clone(),
+            field.source_field_id,
+            field.source_column_name.clone(),
+            field.position,
+            field.transform,
+        )?;
+        if field.position as usize != position
+            || !partition_field_ids.insert(field.partition_field_id)
+            || !partition_field_names.insert(field.partition_field_name.as_ref())
+            || !field_transforms.insert((field.source_field_id, field.transform))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector committed partitioning has an invalid order or duplicate field identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Exact partitioning facts returned after an atomic managed publication.
+/// The physical spec and partition field IDs are provider-assigned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorCommittedPartitioning {
+    spec_id: i32,
+    fields: Vec<ConnectorCommittedPartitionField>,
+    digest: [u8; 32],
+}
+
+impl ConnectorCommittedPartitioning {
+    pub fn try_new(
+        spec_id: i32,
+        fields: Vec<ConnectorCommittedPartitionField>,
+    ) -> Result<Self, ConnectorError> {
+        if spec_id < 0 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector committed partition spec ID must be non-negative",
+            ));
+        }
+        validate_committed_partition_fields(&fields)?;
+        let digest = committed_partitioning_digest(spec_id, &fields);
+        Ok(Self {
+            spec_id,
+            fields,
+            digest,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        validate_committed_partition_fields(&self.fields)?;
+        if self.spec_id < 0
+            || self.digest != committed_partitioning_digest(self.spec_id, &self.fields)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector committed partitioning digest does not match its contents",
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn spec_id(&self) -> i32 {
+        self.spec_id
+    }
+
+    pub fn fields(&self) -> &[ConnectorCommittedPartitionField] {
+        &self.fields
+    }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+fn committed_partitioning_digest(
+    spec_id: i32,
+    fields: &[ConnectorCommittedPartitionField],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.connector-committed-partitioning.v1\0");
+    hasher.update(spec_id.to_be_bytes());
+    hasher.update((fields.len() as u32).to_be_bytes());
+    for field in fields {
+        field.digest_into(&mut hasher);
+    }
+    hasher.finalize().into()
+}
+
+fn managed_partition_transform_wire(transform: ConnectorManagedPartitionTransform) -> (u8, u32) {
+    match transform {
+        ConnectorManagedPartitionTransform::Identity => (1, 0),
+        ConnectorManagedPartitionTransform::Year => (2, 0),
+        ConnectorManagedPartitionTransform::Month => (3, 0),
+        ConnectorManagedPartitionTransform::Day => (4, 0),
+        ConnectorManagedPartitionTransform::Hour => (5, 0),
+        ConnectorManagedPartitionTransform::Bucket { buckets } => (6, buckets),
+        ConnectorManagedPartitionTransform::Truncate { width } => (7, width),
+        ConnectorManagedPartitionTransform::Void => (8, 0),
+    }
+}
+
+fn managed_partition_transform_from_wire(
+    tag: u8,
+    parameter: u32,
+) -> Result<ConnectorManagedPartitionTransform, ConnectorError> {
+    let transform = match (tag, parameter) {
+        (1, 0) => ConnectorManagedPartitionTransform::Identity,
+        (2, 0) => ConnectorManagedPartitionTransform::Year,
+        (3, 0) => ConnectorManagedPartitionTransform::Month,
+        (4, 0) => ConnectorManagedPartitionTransform::Day,
+        (5, 0) => ConnectorManagedPartitionTransform::Hour,
+        (6, buckets) if buckets > 0 => ConnectorManagedPartitionTransform::Bucket { buckets },
+        (7, width) if width > 0 => ConnectorManagedPartitionTransform::Truncate { width },
+        (8, 0) => ConnectorManagedPartitionTransform::Void,
+        _ => {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "unknown or invalid connector managed partition transform wire value",
+            ));
+        }
+    };
+    transform.validate()?;
+    Ok(transform)
+}
+
 /// Bounded application facts that a provider may encode as its own managed
 /// publication provenance. Target identity and target ref deliberately stay
 /// in the signed preparation and cannot be duplicated here.
@@ -664,6 +1171,7 @@ pub struct ConnectorManagedPublicationIntent {
     bases: Vec<super::ConnectorStagedPublicationBaseFact>,
     definition_fingerprint: Arc<str>,
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+    partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
 }
 
 impl ConnectorManagedPublicationIntent {
@@ -677,8 +1185,52 @@ impl ConnectorManagedPublicationIntent {
         definition_fingerprint: impl Into<Arc<str>>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
     ) -> Result<Self, ConnectorError> {
-        let marker = marker.into();
-        let definition_fingerprint = definition_fingerprint.into();
+        Self::try_new_inner(
+            refresh_id,
+            materialization_id,
+            marker.into(),
+            technique,
+            bases,
+            definition_fingerprint.into(),
+            empty_input,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_partition_spec_replacement(
+        refresh_id: i64,
+        materialization_id: i64,
+        marker: impl Into<Arc<str>>,
+        technique: ConnectorManagedPublicationTechnique,
+        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        definition_fingerprint: impl Into<Arc<str>>,
+        empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+        partition_spec_replacement: ConnectorManagedPartitionSpecReplacement,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_inner(
+            refresh_id,
+            materialization_id,
+            marker.into(),
+            technique,
+            bases,
+            definition_fingerprint.into(),
+            empty_input,
+            Some(partition_spec_replacement),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_inner(
+        refresh_id: i64,
+        materialization_id: i64,
+        marker: Arc<str>,
+        technique: ConnectorManagedPublicationTechnique,
+        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        definition_fingerprint: Arc<str>,
+        empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+        partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
+    ) -> Result<Self, ConnectorError> {
         if refresh_id <= 0
             || materialization_id <= 0
             || marker.is_empty()
@@ -710,6 +1262,16 @@ impl ConnectorManagedPublicationIntent {
                 "connector managed publication intent has duplicate base identities",
             ));
         }
+        if partition_spec_replacement.is_some()
+            && (technique != ConnectorManagedPublicationTechnique::Full
+                || empty_input
+                    != ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector managed partition replacement requires a full publication that commits empty input",
+            ));
+        }
         Ok(Self {
             refresh_id,
             materialization_id,
@@ -718,6 +1280,7 @@ impl ConnectorManagedPublicationIntent {
             bases,
             definition_fingerprint,
             empty_input,
+            partition_spec_replacement,
         })
     }
 
@@ -742,6 +1305,19 @@ impl ConnectorManagedPublicationIntent {
     pub const fn empty_input(&self) -> ConnectorManagedPublicationEmptyInputDisposition {
         self.empty_input
     }
+    pub fn partition_spec_replacement(&self) -> Option<&ConnectorManagedPartitionSpecReplacement> {
+        self.partition_spec_replacement.as_ref()
+    }
+
+    fn validate_for_operation(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+    ) -> Result<(), ConnectorError> {
+        if let Some(replacement) = &self.partition_spec_replacement {
+            replacement.validate_for_operation(operation_id)?;
+        }
+        Ok(())
+    }
 
     fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -764,6 +1340,12 @@ impl ConnectorManagedPublicationIntent {
             ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit => 1,
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite => 2,
         }]);
+        // Preserve the frozen ordinary-publication digest exactly. The typed
+        // suffix exists only when atomic repartition is explicitly requested.
+        if let Some(replacement) = &self.partition_spec_replacement {
+            hasher.update(b"partition-spec-replacement\0");
+            hasher.update(replacement.digest());
+        }
         hasher.finalize().into()
     }
 }
@@ -775,6 +1357,16 @@ pub enum ConnectorWriteActivationIntent {
 }
 
 impl ConnectorWriteActivationIntent {
+    fn validate_for_operation(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+    ) -> Result<(), ConnectorError> {
+        match self {
+            Self::Ordinary => Ok(()),
+            Self::ManagedPublication(intent) => intent.validate_for_operation(operation_id),
+        }
+    }
+
     fn digest(&self) -> [u8; 32] {
         match self {
             Self::Ordinary => {
@@ -798,6 +1390,7 @@ impl ConnectorWriteActivationRequest {
         &self,
         owner: &ConnectorExecutionBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
+        self.intent.validate_for_operation(self.operation_id)?;
         self.source.validate(owner, self.operation_id)
     }
 }
@@ -1481,6 +2074,7 @@ pub struct ConnectorWriteReceipt {
     digest: [u8; 32],
     committed_version: Option<ConnectorCommittedVersion>,
     resulting_row_count: Option<u64>,
+    committed_partitioning: Option<ConnectorCommittedPartitioning>,
 }
 
 impl ConnectorWriteReceipt {
@@ -1491,6 +2085,7 @@ impl ConnectorWriteReceipt {
             payload,
             committed_version: None,
             resulting_row_count: None,
+            committed_partitioning: None,
         })
     }
 
@@ -1514,6 +2109,19 @@ impl ConnectorWriteReceipt {
         Ok(receipt)
     }
 
+    pub fn try_new_with_committed_facts_and_partitioning(
+        payload: Bytes,
+        committed_version: ConnectorCommittedVersion,
+        resulting_row_count: Option<u64>,
+        committed_partitioning: ConnectorCommittedPartitioning,
+    ) -> Result<Self, ConnectorError> {
+        let mut receipt =
+            Self::try_new_with_committed_facts(payload, committed_version, resulting_row_count)?;
+        committed_partitioning.validate()?;
+        receipt.committed_partitioning = Some(committed_partitioning);
+        Ok(receipt)
+    }
+
     pub fn validate(&self) -> Result<(), ConnectorError> {
         validate_receipt_payload(&self.payload)?;
         if self.digest != sha256(&self.payload) {
@@ -1524,6 +2132,15 @@ impl ConnectorWriteReceipt {
         }
         if let Some(version) = &self.committed_version {
             version.validate()?;
+        }
+        if let Some(partitioning) = &self.committed_partitioning {
+            if self.committed_version.is_none() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "connector committed partitioning requires a committed version",
+                ));
+            }
+            partitioning.validate()?;
         }
         Ok(())
     }
@@ -1539,6 +2156,9 @@ impl ConnectorWriteReceipt {
     }
     pub const fn resulting_row_count(&self) -> Option<u64> {
         self.resulting_row_count
+    }
+    pub fn committed_partitioning(&self) -> Option<&ConnectorCommittedPartitioning> {
+        self.committed_partitioning.as_ref()
     }
 
     /// Stable durable form for application journals. The provider payload is
@@ -1584,6 +2204,25 @@ impl ConnectorWriteReceipt {
                 encoded.extend_from_slice(&count.to_be_bytes());
             }
             None => encoded.push(0),
+        }
+        if let Some(partitioning) = &self.committed_partitioning {
+            encoded.push(1);
+            encoded.extend_from_slice(&partitioning.spec_id().to_be_bytes());
+            encoded.extend_from_slice(&partitioning.digest());
+            encoded.extend_from_slice(&(partitioning.fields().len() as u32).to_be_bytes());
+            for field in partitioning.fields() {
+                encoded.extend_from_slice(&field.partition_field_id().to_be_bytes());
+                encoded
+                    .extend_from_slice(&(field.partition_field_name().len() as u32).to_be_bytes());
+                encoded.extend_from_slice(field.partition_field_name().as_bytes());
+                encoded.extend_from_slice(&field.source_field_id().to_be_bytes());
+                encoded.extend_from_slice(&(field.source_column_name().len() as u32).to_be_bytes());
+                encoded.extend_from_slice(field.source_column_name().as_bytes());
+                encoded.extend_from_slice(&field.position().to_be_bytes());
+                let (tag, parameter) = managed_partition_transform_wire(field.transform());
+                encoded.push(tag);
+                encoded.extend_from_slice(&parameter.to_be_bytes());
+            }
         }
         Ok(Bytes::from(encoded))
     }
@@ -1666,19 +2305,123 @@ impl ConnectorWriteReceipt {
                 ));
             }
         };
+        // The optional appendix preserves the byte-for-byte durable form of
+        // all pre-repartition and ordinary receipts.
+        let partitioning = if offset == bytes.len() {
+            None
+        } else {
+            match read(&mut offset, 1)?[0] {
+                1 => {
+                    let spec_id = i32::from_be_bytes(
+                        read(&mut offset, 4)?
+                            .try_into()
+                            .expect("fixed-width committed partition spec ID"),
+                    );
+                    let expected_digest: [u8; 32] = read(&mut offset, 32)?
+                        .try_into()
+                        .expect("fixed-width committed partition digest");
+                    let field_count = read_u32(&mut offset)?;
+                    if field_count == 0 || field_count > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS
+                    {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "connector committed partition field count is invalid",
+                        ));
+                    }
+                    let mut fields = Vec::with_capacity(field_count);
+                    for _ in 0..field_count {
+                        let partition_field_id = i32::from_be_bytes(
+                            read(&mut offset, 4)?
+                                .try_into()
+                                .expect("fixed-width partition field ID"),
+                        );
+                        let partition_field_name_len = read_u32(&mut offset)?;
+                        let partition_field_name =
+                            std::str::from_utf8(read(&mut offset, partition_field_name_len)?)
+                                .map_err(|_| {
+                                    ConnectorError::new(
+                                        ConnectorErrorKind::CorruptData,
+                                        "connector committed partition field name is not UTF-8",
+                                    )
+                                })?;
+                        let source_field_id = i32::from_be_bytes(
+                            read(&mut offset, 4)?
+                                .try_into()
+                                .expect("fixed-width partition source field ID"),
+                        );
+                        let source_column_name_len = read_u32(&mut offset)?;
+                        let source_column_name =
+                            std::str::from_utf8(read(&mut offset, source_column_name_len)?)
+                                .map_err(|_| {
+                                    ConnectorError::new(
+                                        ConnectorErrorKind::CorruptData,
+                                        "connector committed partition source name is not UTF-8",
+                                    )
+                                })?;
+                        let position = u32::from_be_bytes(
+                            read(&mut offset, 4)?
+                                .try_into()
+                                .expect("fixed-width partition field position"),
+                        );
+                        let tag = read(&mut offset, 1)?[0];
+                        let parameter = u32::from_be_bytes(
+                            read(&mut offset, 4)?
+                                .try_into()
+                                .expect("fixed-width partition transform parameter"),
+                        );
+                        fields.push(ConnectorCommittedPartitionField::try_new(
+                            partition_field_id,
+                            partition_field_name,
+                            source_field_id,
+                            source_column_name,
+                            position,
+                            managed_partition_transform_from_wire(tag, parameter)?,
+                        )?);
+                    }
+                    let partitioning = ConnectorCommittedPartitioning::try_new(spec_id, fields)?;
+                    if partitioning.digest() != expected_digest {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "connector committed partitioning wire digest does not match its facts",
+                        ));
+                    }
+                    Some(partitioning)
+                }
+                _ => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "invalid connector committed partitioning tag",
+                    ));
+                }
+            }
+        };
         if offset != bytes.len() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "connector write receipt wire has trailing bytes",
             ));
         }
-        match version {
-            Some(version) => Self::try_new_with_committed_facts(payload, version, row_count),
-            None if row_count.is_some() => Err(ConnectorError::new(
+        match (version, partitioning) {
+            (Some(version), Some(partitioning)) => {
+                Self::try_new_with_committed_facts_and_partitioning(
+                    payload,
+                    version,
+                    row_count,
+                    partitioning,
+                )
+            }
+            (Some(version), None) => {
+                Self::try_new_with_committed_facts(payload, version, row_count)
+            }
+            (None, _) if row_count.is_some() => Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "connector write receipt row count requires a committed version",
             )),
-            None => Self::try_new(payload),
+            (None, Some(_)) => Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector write receipt partitioning requires a committed version",
+            )),
+            (None, None) => Self::try_new(payload),
         }
     }
 }
@@ -2776,6 +3519,51 @@ mod tests {
         )
     }
 
+    fn base_facts() -> Vec<super::super::ConnectorStagedPublicationBaseFact> {
+        vec![super::super::ConnectorStagedPublicationBaseFact {
+            table: Arc::from("db.base"),
+            uuid: Arc::from("base-uuid"),
+            from_version: Some(10),
+            to_version: 11,
+        }]
+    }
+
+    fn partition_fields() -> Vec<ConnectorManagedPartitionField> {
+        vec![
+            ConnectorManagedPartitionField::try_new(7, 0, ConnectorManagedPartitionTransform::Day)
+                .expect("day field"),
+            ConnectorManagedPartitionField::try_new(
+                9,
+                1,
+                ConnectorManagedPartitionTransform::Bucket { buckets: 16 },
+            )
+            .expect("bucket field"),
+        ]
+    }
+
+    fn committed_partition_fields() -> Vec<ConnectorCommittedPartitionField> {
+        vec![
+            ConnectorCommittedPartitionField::try_new(
+                1000,
+                "event_day",
+                7,
+                "event_time",
+                0,
+                ConnectorManagedPartitionTransform::Day,
+            )
+            .expect("committed day field"),
+            ConnectorCommittedPartitionField::try_new(
+                1001,
+                "account_bucket",
+                9,
+                "account_id",
+                1,
+                ConnectorManagedPartitionTransform::Bucket { buckets: 16 },
+            )
+            .expect("committed bucket field"),
+        ]
+    }
+
     #[test]
     fn operation_id_round_trips_through_durable_attempt_text() {
         let operation_id = ConnectorWriteOperationId::new();
@@ -2784,6 +3572,190 @@ mod tests {
             .parse()
             .expect("UUID v7 attempt text must round-trip");
         assert_eq!(parsed, operation_id);
+    }
+
+    #[test]
+    fn managed_partition_replacement_is_bounded_ordered_and_operation_scoped() {
+        assert!(
+            ConnectorManagedPartitionField::try_new(
+                1,
+                0,
+                ConnectorManagedPartitionTransform::Bucket { buckets: 0 },
+            )
+            .is_err()
+        );
+        let duplicate = vec![
+            ConnectorManagedPartitionField::try_new(7, 0, ConnectorManagedPartitionTransform::Day)
+                .unwrap(),
+            ConnectorManagedPartitionField::try_new(7, 1, ConnectorManagedPartitionTransform::Day)
+                .unwrap(),
+        ];
+        let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(0, &[])
+            .expect("unpartitioned prior spec is observable");
+        assert!(
+            ConnectorManagedPartitionSpecReplacement::try_new(
+                ConnectorWriteOperationId::new(),
+                prior,
+                duplicate,
+            )
+            .is_err()
+        );
+        let same_source_different_transforms = vec![
+            ConnectorManagedPartitionField::try_new(7, 0, ConnectorManagedPartitionTransform::Day)
+                .unwrap(),
+            ConnectorManagedPartitionField::try_new(7, 1, ConnectorManagedPartitionTransform::Hour)
+                .unwrap(),
+        ];
+        assert!(
+            ConnectorManagedPartitionSpecReplacement::try_new(
+                ConnectorWriteOperationId::new(),
+                prior,
+                same_source_different_transforms,
+            )
+            .is_ok()
+        );
+        assert!(
+            ConnectorManagedPartitionSpecReplacement::try_new(
+                ConnectorWriteOperationId::new(),
+                prior,
+                Vec::new(),
+            )
+            .is_err()
+        );
+
+        let operation_id = ConnectorWriteOperationId::new();
+        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
+            operation_id,
+            prior,
+            partition_fields(),
+        )
+        .expect("replacement");
+        assert_eq!(
+            replacement.replacement_id(),
+            ConnectorManagedPartitionSpecReplacementId::derive(operation_id)
+        );
+        assert_eq!(
+            replacement.target(),
+            ConnectorManagedPartitionSpecReplacementTarget::MainPublication
+        );
+        replacement
+            .validate_for_operation(operation_id)
+            .expect("exact operation");
+        assert!(
+            replacement
+                .validate_for_operation(ConnectorWriteOperationId::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_partition_replacement_is_signed_without_changing_ordinary_digest() {
+        let ordinary = ConnectorManagedPublicationIntent::try_new(
+            1,
+            2,
+            "marker",
+            ConnectorManagedPublicationTechnique::Full,
+            base_facts(),
+            "definition",
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        )
+        .expect("ordinary managed publication");
+        let mut legacy = Sha256::new();
+        legacy.update(b"novarocks.connector-managed-publication-intent.v1\0");
+        legacy.update(1_i64.to_be_bytes());
+        legacy.update(2_i64.to_be_bytes());
+        digest_bytes(&mut legacy, b"marker");
+        legacy.update([1]);
+        digest_bytes(&mut legacy, b"db.base");
+        digest_bytes(&mut legacy, b"base-uuid");
+        legacy.update(10_i64.to_be_bytes());
+        legacy.update(11_i64.to_be_bytes());
+        digest_bytes(&mut legacy, b"definition");
+        legacy.update([2]);
+        let legacy_digest: [u8; 32] = legacy.finalize().into();
+        assert_eq!(ordinary.digest(), legacy_digest);
+        assert!(ordinary.partition_spec_replacement().is_none());
+
+        let operation_id = ConnectorWriteOperationId::new();
+        let prior =
+            ConnectorManagedPartitionSpecObservation::try_from_fields(3, &partition_fields())
+                .expect("prior observation");
+        assert_ne!(
+            prior,
+            ConnectorManagedPartitionSpecObservation::try_from_fields(4, &partition_fields())
+                .expect("same layout under another prior spec")
+        );
+        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
+            operation_id,
+            prior,
+            vec![
+                ConnectorManagedPartitionField::try_new(
+                    7,
+                    0,
+                    ConnectorManagedPartitionTransform::Month,
+                )
+                .unwrap(),
+            ],
+        )
+        .expect("replacement");
+        let repartition =
+            ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
+                1,
+                2,
+                "marker",
+                ConnectorManagedPublicationTechnique::Full,
+                base_facts(),
+                "definition",
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+                replacement,
+            )
+            .expect("repartition intent");
+        assert_ne!(repartition.digest(), ordinary.digest());
+        repartition
+            .validate_for_operation(operation_id)
+            .expect("replacement operation is signed");
+        assert!(
+            repartition
+                .validate_for_operation(ConnectorWriteOperationId::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_partition_replacement_rejects_non_atomic_publication_modes() {
+        let operation_id = ConnectorWriteOperationId::new();
+        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
+            operation_id,
+            ConnectorManagedPartitionSpecObservation::try_from_fields(0, &[]).unwrap(),
+            partition_fields(),
+        )
+        .unwrap();
+        assert!(
+            ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
+                1,
+                2,
+                "marker",
+                ConnectorManagedPublicationTechnique::Incremental,
+                base_facts(),
+                "definition",
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+                replacement.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
+                1,
+                2,
+                "marker",
+                ConnectorManagedPublicationTechnique::Full,
+                base_facts(),
+                "definition",
+                ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
+                replacement,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2959,6 +3931,22 @@ mod tests {
             ConnectorWriteReceipt::try_from_wire_v1(&receipt.try_to_wire_v1().expect("wire"))
                 .expect("decode receipt");
         assert_eq!(decoded, receipt);
+
+        let partitioning = ConnectorCommittedPartitioning::try_new(4, committed_partition_fields())
+            .expect("committed partitioning");
+        let receipt = ConnectorWriteReceipt::try_new_with_committed_facts_and_partitioning(
+            Bytes::from_static(b"provider repartition receipt"),
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"version-2"), Some(8))
+                .expect("version"),
+            Some(14),
+            partitioning.clone(),
+        )
+        .expect("repartition receipt");
+        let decoded =
+            ConnectorWriteReceipt::try_from_wire_v1(&receipt.try_to_wire_v1().expect("wire"))
+                .expect("decode repartition receipt");
+        assert_eq!(decoded, receipt);
+        assert_eq!(decoded.committed_partitioning(), Some(&partitioning));
     }
 
     #[test]
