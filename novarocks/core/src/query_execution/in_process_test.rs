@@ -29,8 +29,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use novarocks_spi::connector::{
-    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionInstaller, ConnectorExecutionResolver,
+    ConnectorBatchReader, ConnectorError, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorExecutionDeclaration, ConnectorExecutionResolver, ConnectorOpenReaderRequest,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorReadExecution, ConnectorScanUnitDomainFacts,
+    ConnectorScanUnitFactsMissingReason, ConnectorSplit,
 };
 
 use crate::query_execution::artifact::{
@@ -90,9 +93,6 @@ pub(crate) fn bind_empty_runtime_filter_tables_for_test(
 #[derive(Default)]
 struct TestExecutionResolver {
     bindings: BTreeMap<ConnectorExecutionBindingKey, Arc<ConnectorExecutionBinding>>,
-    /// Keeps the explicitly composed test runtime alive for every installed
-    /// filesystem binding. Production uses server-owned role-local resources.
-    _file_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl ConnectorExecutionResolver for TestExecutionResolver {
@@ -112,46 +112,73 @@ impl ConnectorExecutionResolver for TestExecutionResolver {
     }
 }
 
+struct EmptyTestConnectorReader;
+
+impl ConnectorBatchReader for EmptyTestConnectorReader {
+    fn next_batch(&mut self) -> Result<Option<arrow::record_batch::RecordBatch>, ConnectorError> {
+        Ok(None)
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+struct TestReadExecution {
+    key: ConnectorExecutionBindingKey,
+}
+
+impl ConnectorReadExecution for TestReadExecution {
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    fn prepare_split(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorPrepareSplitRequest,
+    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+        ConnectorPreparedScanUnitSet::try_new(
+            self.key.clone(),
+            split,
+            bytes::Bytes::new(),
+            vec![ConnectorPreparedScanUnitDescriptor::try_new(
+                bytes::Bytes::from_static(b"core-in-process-test-unit"),
+                split.estimated_bytes(),
+                ConnectorScanUnitDomainFacts::missing(
+                    ConnectorScanUnitFactsMissingReason::ProviderUnsupported,
+                ),
+            )?],
+            &request,
+        )
+    }
+
+    fn open_unit_reader(
+        &self,
+        _unit: &ConnectorPreparedScanUnit,
+        _request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        Ok(Box::new(EmptyTestConnectorReader))
+    }
+}
+
 fn install_connector_bindings(
     declarations: &[ConnectorExecutionDeclaration],
 ) -> Result<Arc<dyn ConnectorExecutionResolver>, DistributedQueryError> {
-    let runtime = Arc::new(
-        tokio::runtime::Runtime::new()
-            .map_err(|error| failed(format!("build explicit test file runtime: {error}")))?,
-    );
-    let handle = runtime.handle().clone();
-    let binding = novarocks_connector_iceberg::access_binding::IcebergReadBinding::new(
-        None,
-        novarocks_fs::FsAccessResolver::new(),
-        Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
-    );
-    let installers: Vec<Arc<dyn ConnectorExecutionInstaller>> = vec![Arc::new(
-        novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller::new(
-            novarocks_connector_iceberg::resources::IcebergExecutionResources::new(
-                binding,
-                runtime.handle().clone(),
-            ),
-        ),
-    )];
-    let context = crate::connector::test_request_context();
     let mut resolver = TestExecutionResolver {
         bindings: BTreeMap::new(),
-        _file_runtime: Some(runtime),
     };
     for declaration in declarations {
-        let installer = installers
-            .iter()
-            .find(|installer| installer.provider_id() == &declaration.descriptor().provider_id)
-            .ok_or_else(|| {
-                failed(format!(
-                    "in-process test runtime has no installer for connector provider `{}`",
-                    declaration.descriptor().provider_id.as_str()
-                ))
-            })?;
-        let binding = installer
-            .install(declaration, &context)
-            .map_err(|error| failed(error.to_string()))?;
+        let key = ConnectorExecutionBindingKey {
+            instance_id: declaration.descriptor().instance_id.clone(),
+            incarnation: declaration.incarnation(),
+        };
+        let binding = ConnectorExecutionBinding::try_new(
+            declaration.descriptor().provider_id.clone(),
+            key.clone(),
+            Arc::new(TestReadExecution { key }),
+        )
+        .map_err(|error| failed(error.to_string()))?;
         resolver
             .bindings
             .insert(binding.key().clone(), Arc::new(binding));

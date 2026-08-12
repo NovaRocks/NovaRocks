@@ -71,11 +71,7 @@ pub(crate) fn fixture_sealed_change_scan(
     from_snapshot_id: i64,
     to_snapshot_id: i64,
 ) -> ConnectorScan {
-    crate::connector::iceberg::provider::fixture_change_window_scan(
-        instance_id,
-        from_snapshot_id,
-        to_snapshot_id,
-    )
+    fixture_sealed_change_scan_for_table(instance_id, "orders", from_snapshot_id, to_snapshot_id)
 }
 
 #[cfg(test)]
@@ -85,12 +81,102 @@ pub(crate) fn fixture_sealed_change_scan_for_table(
     from_snapshot_id: i64,
     to_snapshot_id: i64,
 ) -> ConnectorScan {
-    crate::connector::iceberg::provider::fixture_change_window_scan_for_table(
-        instance_id,
-        table,
-        from_snapshot_id,
-        to_snapshot_id,
+    use std::sync::Arc;
+
+    use novarocks_spi::connector::{
+        ConnectorBeginScanRequest, ConnectorChangeWindow, ConnectorInstanceId,
+        ConnectorReadPurpose, ConnectorScanSelection, ConnectorTableIdentity,
+        ConnectorTableRequest, ConnectorTableResolution,
+    };
+
+    let lease = fixture_planning_lease(instance_id);
+    let context = crate::connector::test_request_context();
+    let metadata = lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse(instance_id)
+                    .expect("fixture connector instance ID"),
+                namespace: Arc::from("db"),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context.clone(),
+        })
+        .expect("fixture connector table metadata");
+    let projection = (0..metadata.schema.fields().len()).collect();
+    lease
+        .binding()
+        .planning()
+        .begin_scan(
+            &metadata.table,
+            ConnectorBeginScanRequest {
+                projection,
+                static_predicates: Vec::new(),
+                selection: ConnectorScanSelection::ChangeWindow(ConnectorChangeWindow::new(
+                    from_snapshot_id,
+                    to_snapshot_id,
+                )),
+                purpose: ConnectorReadPurpose::Query,
+                limit: None,
+                batch: ConnectorBatchBudget {
+                    max_rows: std::num::NonZeroUsize::new(4096).expect("nonzero rows"),
+                    max_bytes: std::num::NonZeroUsize::new(context.max_handle_payload_bytes())
+                        .expect("nonzero bytes"),
+                },
+                context,
+            },
+        )
+        .expect("fixture change-window scan")
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_planning_lease(instance_id: &str) -> ConnectorControlPlanningLease {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    ConnectorControlPlanningLease::new(
+        Arc::new(crate::connector::scan_model::planned_files_fixture_binding(
+            instance_id,
+            HashMap::new(),
+            None,
+        )),
+        || {},
     )
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScanMaterialization {
+    use std::sync::Arc;
+
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorReadSelector, ConnectorTableIdentity, ConnectorTableRequest,
+        ConnectorTableResolution,
+    };
+
+    let planning_lease = fixture_planning_lease(instance_id);
+    let metadata = planning_lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse(instance_id)
+                    .expect("fixture connector instance ID"),
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: crate::connector::test_request_context(),
+        })
+        .expect("fixture connector read admission");
+    QueryScanMaterialization {
+        table: metadata.table,
+        schema: metadata.schema,
+        selector: ConnectorReadSelector::Current,
+        statistics_pin: None,
+        planning_lease,
+    }
 }
 
 /// Provider-neutral result of planning an executable connector read.  Its

@@ -262,6 +262,59 @@ mod tests {
     }
 
     #[test]
+    fn factory_request_rejects_duplicate_properties_before_provider_construction() {
+        let error = ConnectorControlFactoryRequest::try_new(
+            ConnectorProviderId::parse(PROVIDER_ID).expect("provider ID"),
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            vec![
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    "/tmp/first".to_string(),
+                ),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    "/tmp/second".to_string(),
+                ),
+            ],
+        )
+        .expect_err("duplicate properties must fail before provider construction");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate connector catalog property")
+        );
+    }
+
+    #[test]
+    fn factory_rejects_invalid_catalog_properties_before_runtime_construction() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+            binding,
+            runtime.handle().clone(),
+        ));
+        let request = ConnectorControlFactoryRequest::try_new(
+            factory.provider_id().clone(),
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            vec![("iceberg.catalog.type".to_string(), "unknown".to_string())],
+        )
+        .expect("factory request");
+
+        let error = factory
+            .prepare_unpublished(&request)
+            .expect_err("invalid catalog properties must not create a runtime");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("hadoop|rest|hive"));
+    }
+
+    #[test]
     fn unpublished_generation_redacts_credentials_before_attachment_persistence() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");

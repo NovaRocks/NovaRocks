@@ -36,8 +36,9 @@ use novarocks::mv::storage_observation::{
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
 use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
-use novarocks_connector_iceberg::resources::IcebergExecutionResources;
+use novarocks_connector_iceberg::resources::{IcebergControlResources, IcebergExecutionResources};
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
@@ -377,12 +378,16 @@ pub fn compose_backend_execution_installers(
     Ok(installers)
 }
 
-pub fn compose_frontend_control_factories() -> Vec<std::sync::Arc<dyn ConnectorControlFactory>> {
-    // SPI-5EF Phase 1 keeps the legacy Core Iceberg control binding as the
-    // sole production FE authority. The provider factory remains available
-    // for provider-local conformance tests and will be installed only by the
-    // follow-up atomic factory/owner cut.
-    Vec::new()
+pub fn compose_frontend_control_factories(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlFactory>>> {
+    let planning_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
+    let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        IcebergReadBinding::from_resources(planning_resources),
+        runtime,
+    ));
+    Ok(vec![std::sync::Arc::new(factory)])
 }
 
 pub fn compose_iceberg_execution_resources(
@@ -463,7 +468,7 @@ where
     F: Future<Output = Result<(), String>> + Send,
 {
     let optimizer_query_mem_limit_bytes = config.runtime.optimizer_query_mem_limit_bytes;
-    let connector_control_factories = compose_frontend_control_factories();
+    let connector_control_factories = compose_frontend_control_factories(&config, runtime.clone())?;
     let connector_file_planning_resources = Some(compose_connector_file_planning_resources(
         &config,
         runtime.clone(),
@@ -661,7 +666,8 @@ mod tests {
     fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = novarocks::common::app_config::NovaRocksConfig::default();
-        let factories = compose_frontend_control_factories();
+        let factories = compose_frontend_control_factories(&config, runtime.handle().clone())
+            .expect("frontend factories");
         let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
             .expect("backend installers");
         let iceberg = novarocks_spi::connector::ConnectorProviderId::parse(
@@ -669,16 +675,39 @@ mod tests {
         )
         .expect("provider ID");
 
-        assert!(
-            factories.is_empty(),
-            "Phase 1 must keep legacy Core control as the sole FE authority"
-        );
+        assert_eq!(factories.len(), 1);
+        assert_eq!(factories[0].provider_id(), &iceberg);
         assert_eq!(
             installers
                 .iter()
                 .filter(|installer| installer.provider_id() == &iceberg)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn frontend_factory_resource_failure_is_reported_before_role_startup() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let mut config = novarocks::common::app_config::NovaRocksConfig::default();
+        config.connector.object_store =
+            Some(novarocks::common::app_config::ConnectorObjectStoreConfig {
+                endpoint: Some("http://minio:9000".to_string()),
+                access_key_id: None,
+                access_key_secret: None,
+                region: None,
+                enable_path_style_access: Some(true),
+            });
+
+        let error = match compose_frontend_control_factories(&config, runtime.handle().clone()) {
+            Ok(_) => panic!("incomplete frontend resources must fail before role startup"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("object-store credentials missing aws.s3.access_key"),
+            "{error}"
         );
     }
 }

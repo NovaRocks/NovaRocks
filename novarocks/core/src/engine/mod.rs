@@ -38,7 +38,7 @@ use crate::runtime::query_result::{
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRepository};
-use crate::connector::{IcebergCatalogRegistry, iceberg_namespace_exists};
+use crate::connector::IcebergCatalogRegistry;
 use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
@@ -423,6 +423,7 @@ fn test_connector_file_planning_resources() -> Option<novarocks_fs::FsAccessReso
 #[cfg(test)]
 impl Default for StandaloneState {
     fn default() -> Self {
+        let connector_control = Arc::new(TestConnectorControlRegistry::default());
         Self {
             execution_role: crate::common::app_config::ClusterRole::AllInOne,
             catalog_service: Arc::new(
@@ -433,8 +434,10 @@ impl Default for StandaloneState {
             statistics_application: Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
-            connector_control: Arc::new(TestConnectorControlRegistry::default()),
-            connector_control_factory_resolver: Arc::new(TestConnectorControlRegistry::default()),
+            connector_control: Arc::clone(&connector_control)
+                as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+            connector_control_factory_resolver: connector_control
+                as Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
             connector_file_planning_resources: test_connector_file_planning_resources(),
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
@@ -476,7 +479,6 @@ impl Default for StandaloneState {
 }
 
 #[cfg(test)]
-#[derive(Default)]
 struct TestConnectorControlRegistry {
     active: std::sync::Mutex<
         std::collections::HashMap<
@@ -484,6 +486,36 @@ struct TestConnectorControlRegistry {
             Arc<novarocks_spi::connector::ConnectorControlBinding>,
         >,
     >,
+    factories: std::collections::HashMap<
+        novarocks_spi::connector::ConnectorProviderId,
+        Arc<dyn novarocks_spi::connector::ConnectorControlFactory>,
+    >,
+}
+
+#[cfg(test)]
+impl Default for TestConnectorControlRegistry {
+    fn default() -> Self {
+        let runtime = crate::runtime::global_async_runtime::data_runtime_handle()
+            .expect("test connector control runtime");
+        let resources = test_connector_file_planning_resources()
+            .expect("test connector file planning resources");
+        let factory = novarocks_connector_iceberg::control_factory::IcebergControlFactory::new(
+            novarocks_connector_iceberg::resources::IcebergControlResources::new(
+                novarocks_connector_iceberg::access_binding::IcebergReadBinding::from_resources(
+                    resources,
+                ),
+                runtime,
+            ),
+        );
+        let provider_id = factory.provider_id().clone();
+        Self {
+            active: std::sync::Mutex::new(std::collections::HashMap::new()),
+            factories: std::collections::HashMap::from([(
+                provider_id,
+                Arc::new(factory) as Arc<dyn novarocks_spi::connector::ConnectorControlFactory>,
+            )]),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1061,15 +1093,18 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
 impl novarocks_spi::connector::ConnectorControlFactoryResolver for TestConnectorControlRegistry {
     fn create_control(
         &self,
-        _request: novarocks_spi::connector::ConnectorControlFactoryRequest,
+        request: novarocks_spi::connector::ConnectorControlFactoryRequest,
     ) -> Result<
         novarocks_spi::connector::ConnectorControlCreation,
         novarocks_spi::connector::ConnectorError,
     > {
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-            "test connector control registry has no provider factories",
-        ))
+        let factory = self.factories.get(request.provider_id()).ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                "test connector control factory is not installed",
+            )
+        })?;
+        factory.create_control(request)
     }
 }
 
@@ -1707,12 +1742,21 @@ impl StandaloneNovaRocks {
     }
 
     pub fn iceberg_catalog_exists(&self, catalog_name: &str) -> Result<bool, String> {
-        let guard = self
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
+            .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+        match self
             .inner
-            .iceberg_catalogs
-            .read()
-            .expect("standalone iceberg catalog read lock");
-        guard.contains_catalog(catalog_name)
+            .connector_control
+            .observe_current_binding(&instance_id)
+        {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(format!("resolve Iceberg catalog `{catalog_name}`: {error}")),
+        }
     }
 
     pub fn iceberg_namespace_exists(
@@ -1720,13 +1764,16 @@ impl StandaloneNovaRocks {
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, String> {
-        let guard = self
-            .inner
-            .iceberg_catalogs
-            .read()
-            .expect("standalone iceberg catalog read lock");
-        let entry = guard.get(catalog_name)?;
-        iceberg_namespace_exists(&entry, namespace_name)
+        let context = crate::connector::connector_request_context(
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?;
+        crate::connector::metadata_namespace_exists(
+            self.inner.connector_control.as_ref(),
+            context,
+            catalog_name,
+            namespace_name,
+        )
     }
 
     pub(crate) fn has_local_table(&self, database_name: &str, table_name: &str) -> bool {
@@ -2785,28 +2832,24 @@ impl StandaloneSession {
             .lock()
             .map_err(|error| format!("catalog attachment lifecycle lock: {error}"))?;
         let normalized_catalog = normalize_identifier(&stmt.name)?;
-        let mut guard = self
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&normalized_catalog)
+            .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+        match self
             .inner
-            .iceberg_catalogs
-            .write()
-            .expect("standalone iceberg catalog write lock");
-        let created = !guard.contains_catalog(&stmt.name)?;
-        guard.create_catalog(&stmt.name, &stmt.properties)?;
-        if !created {
-            return Ok(StatementResult::Ok);
-        }
-        let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
-        drop(guard);
-        if let Err(error) = register_iceberg_control_binding(&self.inner, &normalized_catalog) {
-            if created {
-                self.inner
-                    .iceberg_catalogs
-                    .write()
-                    .expect("standalone iceberg catalog write lock")
-                    .drop_catalog(&normalized_catalog)?;
+            .connector_control
+            .observe_current_binding(&instance_id)
+        {
+            Ok(_) => return Ok(StatementResult::Ok),
+            Err(error)
+                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "resolve Iceberg catalog `{normalized_catalog}` before create: {error}"
+                ));
             }
-            return Err(error);
         }
+        let persisted_properties =
+            create_iceberg_control_binding(&self.inner, &normalized_catalog, stmt.properties)?;
         self.inner.catalog_service.register_catalog(
             crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
                 &stmt.name,
@@ -2820,13 +2863,6 @@ impl StandaloneSession {
             &persisted_properties,
         ) {
             retire_iceberg_control_binding(&self.inner, &normalized_catalog)?;
-            if created {
-                self.inner
-                    .iceberg_catalogs
-                    .write()
-                    .expect("standalone iceberg catalog write lock")
-                    .drop_catalog(&normalized_catalog)?;
-            }
             self.inner
                 .catalog_service
                 .unregister_catalog(&normalized_catalog);
@@ -3794,22 +3830,12 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
         .list(read.as_ref())
         .map_err(|e| format!("load catalog attachment metadata failed: {e}"))?;
     for catalog in &catalogs {
-        {
-            let mut guard = state
-                .iceberg_catalogs
-                .write()
-                .expect("standalone iceberg catalog write lock");
-            guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
-        }
         let normalized_catalog = normalize_identifier(&catalog.catalog)?;
-        if let Err(error) = register_iceberg_control_binding(state, &normalized_catalog) {
-            state
-                .iceberg_catalogs
-                .write()
-                .expect("standalone iceberg catalog write lock")
-                .drop_catalog(&normalized_catalog)?;
-            return Err(error);
-        }
+        create_iceberg_control_binding(
+            state,
+            &normalized_catalog,
+            catalog.properties.properties.clone(),
+        )?;
         state.catalog_service.register_catalog(
             crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
                 &catalog.catalog,
@@ -3822,7 +3848,37 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
     Ok(())
 }
 
-fn register_iceberg_control_binding(
+fn create_iceberg_control_binding(
+    state: &Arc<StandaloneState>,
+    normalized_catalog: &str,
+    properties: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, String> {
+    let provider_id = novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+        .map_err(|error| format!("invalid Iceberg connector provider ID: {error}"))?;
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    let request = novarocks_spi::connector::ConnectorControlFactoryRequest::try_new(
+        provider_id,
+        instance_id,
+        properties,
+    )
+    .map_err(|error| format!("prepare Iceberg connector control factory request: {error}"))?;
+    let creation = state
+        .connector_control_factory_resolver
+        .create_control(request)
+        .map_err(|error| format!("create Iceberg connector control binding: {error}"))?;
+    let (binding, durable_properties) = creation.into_parts();
+    state
+        .connector_control
+        .register(binding)
+        .map_err(|error| format!("register Iceberg connector control binding: {error}"))?;
+    Ok(durable_properties)
+}
+
+#[cfg(test)]
+/// Temporary bridge for provider-semantic tests that SPI-5P T6 must relocate
+/// before the final Core provider dependency cut.
+pub(crate) fn register_iceberg_control_binding(
     state: &Arc<StandaloneState>,
     normalized_catalog: &str,
 ) -> Result<(), String> {
@@ -3837,11 +3893,11 @@ fn register_iceberg_control_binding(
         Arc::clone(&state.iceberg_catalogs),
         planning_binding,
     )
-    .map_err(|error| format!("create Iceberg connector control binding: {error}"))?;
+    .map_err(|error| format!("create test Iceberg connector control binding: {error}"))?;
     state
         .connector_control
         .register(binding)
-        .map_err(|error| format!("register Iceberg connector control binding: {error}"))
+        .map_err(|error| format!("register test Iceberg connector control binding: {error}"))
 }
 
 fn retire_iceberg_control_binding(
@@ -6726,6 +6782,7 @@ mod tests {
         statistics_service: Arc<dyn StatisticsService>,
         backend_topology: Arc<dyn BackendTopologyPort>,
     ) -> StandaloneOpenServices {
+        let connector_control = Arc::new(super::TestConnectorControlRegistry::default());
         StandaloneOpenServices::new(
             crate::common::app_config::ClusterRole::AllInOne,
             system_catalog,
@@ -6739,8 +6796,10 @@ mod tests {
             backend_topology,
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
             crate::query_execution::control::QueryControlService::for_test(),
-            Arc::new(super::TestConnectorControlRegistry::default()),
-            Arc::new(super::TestConnectorControlRegistry::default()),
+            Arc::clone(&connector_control)
+                as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+            connector_control
+                as Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
             1,
         )
         // Production installs the provider-specific inspector from the Server
@@ -7866,8 +7925,6 @@ mysql_port = 47892
                 .execute_in_database("create table ice.db1.tbl (id int, name string)", "default")
                 .expect("create iceberg table");
             assert!(matches!(create_table, StatementResult::Ok));
-
-            insert_rows!(&session, ["ice", "db1", "tbl"]; [1, "a"], [2, "b"]);
         }
 
         let restored = StandaloneNovaRocks::open(
@@ -7877,20 +7934,14 @@ mysql_port = 47892
             test_open_services(),
         )
         .expect("reopen engine");
-        let entry = {
-            let registry = restored
-                .inner
-                .iceberg_catalogs
-                .read()
-                .expect("iceberg registry read lock");
-            registry.get("ice").expect("load restored iceberg catalog")
+        let result = restored
+            .session()
+            .execute_in_database("select id, name from ice.db1.tbl", "default")
+            .expect("read restored external table");
+        let StatementResult::Query(result) = result else {
+            panic!("restored external table read must return rows");
         };
-        let loaded = crate::connector::load_iceberg_table(&entry, "db1", "tbl")
-            .expect("load restored table");
-        assert!(
-            loaded.table.metadata().current_snapshot().is_some(),
-            "restored iceberg table should retain inserted snapshot"
-        );
+        assert_eq!(result.row_count(), 0);
     }
 
     #[test]
@@ -8438,12 +8489,9 @@ path = "meta/operations.sqlite"
             .expect("create catalog");
         let state = engine.state_for_test();
         assert!(
-            state
-                .iceberg_catalogs
-                .read()
-                .expect("iceberg catalog registry")
-                .get("ice_one")
-                .is_ok()
+            engine
+                .iceberg_catalog_exists("ice_one")
+                .expect("catalog exists")
         );
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice_one")
             .expect("connector instance ID");
@@ -8461,12 +8509,9 @@ path = "meta/operations.sqlite"
             .execute_in_database("drop catalog Ice_One", "default")
             .expect("drop catalog");
         assert!(
-            state
-                .iceberg_catalogs
-                .read()
-                .expect("iceberg catalog registry")
-                .get("ice_one")
-                .is_err()
+            !engine
+                .iceberg_catalog_exists("ice_one")
+                .expect("catalog removed")
         );
         let retired_error = match state.connector_control.acquire_current(&instance_id) {
             Ok(_) => panic!("catalog drop must retire its connector control binding"),

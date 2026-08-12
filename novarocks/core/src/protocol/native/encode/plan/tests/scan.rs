@@ -178,7 +178,7 @@ fn planned_connector_read_for_test()
             max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
             max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
         },
-        planning_lease: crate::connector::iceberg::provider::fixture_planning_lease("ice"),
+        planning_lease: crate::query_execution::preparation::scan::fixture_planning_lease("ice"),
         read_session: None,
     }
 }
@@ -603,7 +603,7 @@ fn file_binding_for_test(
     ResolvedScanBinding {
         node_id,
         execution: ResolvedScanExecution::AdmittedConnectorRead(
-            crate::connector::iceberg::provider::fixture_query_scan_materialization("ice"),
+            crate::query_execution::preparation::scan::fixture_query_scan_materialization("ice"),
         ),
         physical_columns,
         required_reads,

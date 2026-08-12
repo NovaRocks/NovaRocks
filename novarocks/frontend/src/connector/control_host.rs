@@ -1159,6 +1159,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn factory_host_rejects_requests_for_uninstalled_providers() {
+        let host = ConnectorControlHost::new();
+        let request = ConnectorControlFactoryRequest::try_new(
+            ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
+            Vec::new(),
+        )
+        .expect("factory request");
+
+        let error = match ConnectorControlFactoryResolver::create_control(&host, request) {
+            Ok(_) => panic!("missing provider factory must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+        assert!(error.to_string().contains("is not installed"));
+        assert!(
+            host.observe_current_binding(
+                &ConnectorInstanceId::parse("catalog.analytics").expect("instance ID")
+            )
+            .is_err(),
+            "a missing factory must not publish a generation"
+        );
+    }
+
+    #[test]
     fn factory_host_propagates_provider_error_without_publishing_generation() {
         let provider_id = ConnectorProviderId::parse("test").expect("provider ID");
         let factory: Arc<dyn ConnectorControlFactory> = Arc::new(TestControlFactory {

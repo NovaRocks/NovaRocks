@@ -75,7 +75,7 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
         calls: AtomicUsize::new(0),
     };
     let connectors = ConnectorRegistry::new();
-    crate::connector::iceberg::provider::register_planned_files_fixture(
+    crate::connector::scan_model::register_planned_files_fixture(
         &connectors,
         "test_catalog",
         Vec::new(),
@@ -133,7 +133,7 @@ fn fragment_build_reports_missing_delta_resolver_before_encoding() {
     );
 
     let connectors = ConnectorRegistry::new();
-    crate::connector::iceberg::provider::register_planned_files_fixture(
+    crate::connector::scan_model::register_planned_files_fixture(
         &connectors,
         "test_catalog",
         Vec::new(),

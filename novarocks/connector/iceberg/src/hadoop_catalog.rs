@@ -67,6 +67,14 @@ impl HadoopFileSystemCatalog {
         format!("{}/{}/{}", self.warehouse_location, namespace, ident.name())
     }
 
+    fn namespace_marker_location(&self, namespace: &NamespaceIdent) -> String {
+        format!(
+            "{}/{}/.novarocks_namespace",
+            self.warehouse_location,
+            namespace.join("/")
+        )
+    }
+
     /// Returns the path to the `vN.metadata.json` file for a given table location
     /// and version number.
     pub fn metadata_path(table_location: &str, version: u32) -> String {
@@ -182,6 +190,11 @@ impl Catalog for HadoopFileSystemCatalog {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<Namespace> {
+        let marker = self.namespace_marker_location(namespace);
+        self.file_io
+            .new_output(&marker)?
+            .write(Vec::new().into())
+            .await?;
         Ok(Namespace::with_properties(namespace.clone(), properties))
     }
 
@@ -190,7 +203,9 @@ impl Catalog for HadoopFileSystemCatalog {
     }
 
     async fn namespace_exists(&self, _namespace: &NamespaceIdent) -> Result<bool> {
-        Ok(true)
+        self.file_io
+            .exists(self.namespace_marker_location(_namespace))
+            .await
     }
 
     async fn update_namespace(
@@ -201,8 +216,10 @@ impl Catalog for HadoopFileSystemCatalog {
         Ok(())
     }
 
-    async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> Result<()> {
-        Ok(())
+    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
+        self.file_io
+            .delete(self.namespace_marker_location(namespace))
+            .await
     }
 
     async fn list_tables(&self, _namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
@@ -444,5 +461,31 @@ mod tests {
             catalog.table_location(&ident),
             "oss://bucket/warehouse/ns1/my_table"
         );
+    }
+
+    #[tokio::test]
+    async fn namespace_marker_survives_catalog_reconstruction() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        assert!(!catalog.namespace_exists(&namespace).await.unwrap());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        assert!(catalog.namespace_exists(&namespace).await.unwrap());
+
+        let restored = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+        assert!(restored.namespace_exists(&namespace).await.unwrap());
+        restored.drop_namespace(&namespace).await.unwrap();
+        assert!(!restored.namespace_exists(&namespace).await.unwrap());
     }
 }
