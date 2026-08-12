@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceId,
+    ConnectorWriteCohortId,
 };
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
@@ -162,7 +163,7 @@ pub trait ConnectorBindingInstallBarrier: Send + Sync + 'static {
 pub(crate) fn compile_install_plan(
     prepared: &PreparedFragmentSet,
     schedule: &SchedulingPlan,
-    connector_write_plan: Option<&ConnectorWritePlanAttachment>,
+    connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 ) -> Result<ConnectorBindingInstallPlan, DistributedQueryError> {
     let mut by_backend: BTreeMap<
         usize,
@@ -211,7 +212,7 @@ pub(crate) fn compile_install_plan(
         }
     }
 
-    if let Some(attachment) = connector_write_plan {
+    for attachment in connector_write_plans.values() {
         let declaration = attachment.execution_declaration();
         let instance_id = declaration.descriptor().instance_id.clone();
         for writer in attachment.manifest().writers() {
