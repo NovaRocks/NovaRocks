@@ -549,6 +549,35 @@ pub(crate) fn prepare_iceberg_connector_write(
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ConnectorWritePreparation, String> {
     let table = iceberg_connector_table_handle(exact_lease, target, context.clone())?;
+    prepare_iceberg_connector_write_with_table(
+        exact_lease,
+        table,
+        target_ref,
+        intent,
+        input,
+        purpose,
+        context,
+    )
+}
+
+/// Request a sealed preparation for a table handle frozen by an earlier exact
+/// metadata observation. The caller must keep the matching write lease; this
+/// avoids reloading a newer table metadata value within the same connector
+/// generation after admission facts have already been derived.
+pub(crate) fn prepare_iceberg_connector_write_with_table(
+    exact_lease: &ConnectorWriteLease,
+    table: ConnectorTableHandle,
+    target_ref: &str,
+    intent: ConnectorWriteIntent,
+    input: ConnectorWriteInputRequest,
+    purpose: ConnectorWriteAdmissionPurpose,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorWritePreparation, String> {
+    if table.owner() != &exact_lease.binding_key().instance_id {
+        return Err(
+            "frozen Iceberg write target belongs to a different connector instance".to_string(),
+        );
+    }
     let outcome = exact_lease
         .control()
         .prepare_write(ConnectorWritePreparationRequest {

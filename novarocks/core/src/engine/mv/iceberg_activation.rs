@@ -152,35 +152,48 @@ pub(crate) fn activate_first_refresh_connector_write(
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
         }
     };
-    let preparation = crate::engine::iceberg_writer::prepare_iceberg_connector_write(
-        exact_lease,
-        &target,
-        if prepared
-            .publication_intent()
-            .partition_spec_replacement()
-            .is_some()
-        {
-            "main"
-        } else {
-            prepared.staging_branch()
-        },
-        intent,
-        ConnectorWriteInputRequest::Data {
-            fields: prepared
-                .target_contract()
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| {
-                    novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                        field.as_ref().clone(),
-                    )
-                })
-                .collect(),
-        },
-        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
-        connector_context.clone(),
-    )?;
+    let replacement = prepared
+        .publication_intent()
+        .partition_spec_replacement()
+        .is_some();
+    let target_ref = if replacement {
+        "main"
+    } else {
+        prepared.staging_branch()
+    };
+    let input = ConnectorWriteInputRequest::Data {
+        fields: prepared
+            .target_contract()
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                novarocks_spi::connector::ConnectorWriteFieldRequest::new(field.as_ref().clone())
+            })
+            .collect(),
+    };
+    let purpose = novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh;
+    let preparation = if replacement {
+        crate::engine::iceberg_writer::prepare_iceberg_connector_write_with_table(
+            exact_lease,
+            prepared.target_table().clone(),
+            target_ref,
+            intent,
+            input,
+            purpose,
+            connector_context.clone(),
+        )?
+    } else {
+        crate::engine::iceberg_writer::prepare_iceberg_connector_write(
+            exact_lease,
+            &target,
+            target_ref,
+            intent,
+            input,
+            purpose,
+            connector_context.clone(),
+        )?
+    };
     let managed_publication =
         managed_publication_activation_intent(prepared.publication_intent(), empty_input)?;
     crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared_with_intent(

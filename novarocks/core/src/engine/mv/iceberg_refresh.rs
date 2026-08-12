@@ -189,6 +189,7 @@ use novarocks_connector_iceberg::commit::{
 };
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorTableIdentity,
 };
 
 /// SQL-owned bridge for refresh planning.  It owns only analysis and immutable
@@ -261,6 +262,12 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             self.connector_context,
         )
         .map_err(|error| error.to_string())?;
+        let retained_repartition_target = self
+            .repartition_fields
+            .map(|_| {
+                retain_exact_repartition_target(self.state, &plan.contract, self.connector_context)
+            })
+            .transpose()?;
         let partition_spec_replacement = match self.repartition_fields {
             Some(fields) => {
                 plan.contract.decision = ExecutableRefreshDecision::FirstRefresh;
@@ -271,6 +278,9 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                     fields,
                     &plan.contract,
                     request.attempt.write_operation_id,
+                    retained_repartition_target.as_ref().ok_or_else(|| {
+                        "MV repartition preparation lost its retained target binding".to_string()
+                    })?,
                     self.connector_context,
                 )?)
             }
@@ -283,11 +293,14 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             .as_deref()
             .ok_or_else(|| "Iceberg MV refresh target has no connector catalog".to_string())?;
         let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-        let observed_binding = self
-            .state
-            .connector_control
-            .observe_current_binding(&instance_id)
-            .map_err(|error| error.to_string())?;
+        let observed_binding = match retained_repartition_target.as_ref() {
+            Some(retained) => execution_binding_key_for_target(retained.binding.lease()),
+            None => self
+                .state
+                .connector_control
+                .observe_current_binding(&instance_id)
+                .map_err(|error| error.to_string())?,
+        };
         let base_table_uuids = plan
             .contract
             .base_refs
@@ -316,6 +329,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                     &base_table_uuids,
                     observed_binding.clone(),
                     partition_spec_replacement.clone(),
+                    retained_repartition_target.as_ref(),
                     self.connector_context.clone(),
                 )?),
             },
@@ -359,6 +373,76 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
     }
 }
 
+/// One repartition target observation retained across transition and write
+/// preparation. Both payloads were produced from the same exact lease and
+/// metadata value; no downstream repartition step may resolve `latest` again.
+struct RetainedRepartitionTarget {
+    binding: crate::mv::refresh::target_binding::MvTargetBinding,
+    schema_validation: MvSchemaValidationObservation,
+}
+
+fn retain_exact_repartition_target(
+    state: &Arc<StandaloneState>,
+    contract: &RefreshPlanContract,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RetainedRepartitionTarget, String> {
+    let target = IcebergMvTarget {
+        catalog: contract
+            .target
+            .catalog
+            .clone()
+            .ok_or_else(|| "MV repartition target has no connector catalog".to_string())?,
+        namespace: contract.target.database.clone(),
+        table: contract.target.name.clone(),
+    };
+    let binding = target_binding_for(state, &target, connector_context)?;
+    validate_retained_target_identity(&target, binding.identity())?;
+    let schema_validation = state
+        .mv_storage_observation
+        .observe_schema_validation(
+            binding.lease(),
+            binding.metadata(),
+            connector_context.clone(),
+        )
+        .map_err(|error| {
+            format!(
+                "observe exact MV repartition target schema for {}.{}.{}: {error}",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+    Ok(RetainedRepartitionTarget {
+        binding,
+        schema_validation,
+    })
+}
+
+fn validate_retained_target_identity(
+    target: &IcebergMvTarget,
+    identity: &ConnectorTableIdentity,
+) -> Result<(), String> {
+    let expected_instance =
+        ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
+    if identity.instance_id != expected_instance
+        || identity.namespace.as_ref() != target.namespace
+        || identity.table.as_ref() != target.table
+    {
+        return Err(format!(
+            "retained MV repartition target identity does not match {}.{}.{}",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    Ok(())
+}
+
+fn execution_binding_key_for_target(
+    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> ConnectorExecutionBindingKey {
+    ConnectorExecutionBindingKey {
+        instance_id: lease.binding().descriptor().instance_id.clone(),
+        incarnation: lease.binding().incarnation(),
+    }
+}
+
 fn prepare_managed_repartition_transition(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -366,6 +450,7 @@ fn prepare_managed_repartition_transition(
     fields: &[IcebergPartitionFieldExpr],
     contract: &RefreshPlanContract,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    retained_target: &RetainedRepartitionTarget,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement, String> {
     let target = IcebergMvTarget {
@@ -377,6 +462,7 @@ fn prepare_managed_repartition_transition(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
+    validate_retained_target_identity(&target, retained_target.binding.identity())?;
     let definition = load_iceberg_mv_definition_by_target(state, &target)?;
     let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
@@ -393,9 +479,9 @@ fn prepare_managed_repartition_transition(
     select_repartition_shape(&RefreshCapabilities::from_schema_contract(schema_contract)?)?;
     validate_repartition_schema_contract(
         state,
-        &target,
         schema_contract,
         &contract.base_refs,
+        &retained_target.schema_validation,
         connector_context,
     )?;
     let query = canonicalize_iceberg_mv_select_query(
@@ -417,12 +503,7 @@ fn prepare_managed_repartition_transition(
         return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
     }
 
-    let target_ref = TableIdentity {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-    };
-    let observation = observe_schema_validation_for_table(state, &target_ref, connector_context)?;
+    let observation = &retained_target.schema_validation;
     let prior_fields = observation
         .partition()
         .fields()
@@ -527,8 +608,10 @@ fn managed_partition_transform(
 }
 
 /// Prepare the SQL-shaped first-refresh artifact from persisted MV facts.
-/// This deliberately re-reads metadata only while SQL preparation is active;
-/// it allocates no provider ref, write service, execution, or durable intent.
+/// Ordinary refreshes deliberately re-read metadata only while SQL preparation
+/// is active. Repartition reuses its retained exact target binding so schema,
+/// partition, execution-generation, and write-lease facts cannot split.
+/// This allocates no provider ref, write service, execution, or durable intent.
 /// Join first refresh remains behind its typed logical binder and therefore
 /// fails closed here rather than using the old frontend row-materialization
 /// implementation.
@@ -544,6 +627,7 @@ fn prepare_frontend_first_refresh_write(
     partition_spec_replacement: Option<
         novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement,
     >,
+    retained_repartition_target: Option<&RetainedRepartitionTarget>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::mv::application::PreparedMvFirstRefreshWrite, String> {
     let target = IcebergMvTarget {
@@ -553,10 +637,16 @@ fn prepare_frontend_first_refresh_write(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
-    let planning_lease = crate::connector::acquire_metadata_planning_lease(
-        state.connector_control.as_ref(),
-        &target.catalog,
-    )?;
+    if let Some(retained) = retained_repartition_target {
+        validate_retained_target_identity(&target, retained.binding.identity())?;
+    }
+    let planning_lease = match retained_repartition_target {
+        Some(retained) => retained.binding.lease().clone(),
+        None => crate::connector::acquire_metadata_planning_lease(
+            state.connector_control.as_ref(),
+            &target.catalog,
+        )?,
+    };
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| format!("derive MV first-refresh write lease: {error}"))?;
@@ -571,6 +661,7 @@ fn prepare_frontend_first_refresh_write(
         &definition,
         &contract.base_refs,
         &target,
+        retained_repartition_target.map(|retained| &retained.schema_validation),
         &connector_context,
     )
     .map_err(IcebergMvRefreshExecutionError::into_message)?;
@@ -588,7 +679,14 @@ fn prepare_frontend_first_refresh_write(
         "Iceberg MV first-refresh requires a persisted schema contract".to_string()
     })?;
     let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
-    let target_binding = target_binding_for(state, &target, &connector_context)?;
+    let loaded_target_binding;
+    let target_binding = match retained_repartition_target {
+        Some(retained) => &retained.binding,
+        None => {
+            loaded_target_binding = target_binding_for(state, &target, &connector_context)?;
+            &loaded_target_binding
+        }
+    };
     let target_arrow_schema = target_binding.physical_write_schema()?.as_ref().clone();
     let target_field_ids = target_binding.observation().field_ids().to_vec();
     let observed_spec_id = target_binding.partition().target_spec_id;
@@ -673,6 +771,7 @@ fn prepare_frontend_first_refresh_write(
             previous_table_uuids.clone(),
             expected_target_snapshot_id,
             target_table_uuid.clone(),
+            retained_repartition_target.map(|retained| &retained.binding),
             &connector_context,
         )?;
         let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
@@ -682,14 +781,10 @@ fn prepare_frontend_first_refresh_write(
             &rewrite.pin,
             &rewrite.previous_snapshot_ids,
         )?;
-        let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+        let table = first_refresh_target_handle(
+            retained_repartition_target.map(|retained| retained.binding.handle()),
             &write_lease,
-            &crate::engine::backend_resolver::TargetBackend {
-                backend_name: "iceberg",
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-            },
+            &target,
             connector_context.clone(),
         )?;
         let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
@@ -818,14 +913,10 @@ fn prepare_frontend_first_refresh_write(
             )?,
         )
     };
-    let table = crate::engine::iceberg_writer::iceberg_connector_table_handle(
+    let table = first_refresh_target_handle(
+        retained_repartition_target.map(|retained| retained.binding.handle()),
         &write_lease,
-        &crate::engine::backend_resolver::TargetBackend {
-            backend_name: "iceberg",
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
+        &target,
         connector_context.clone(),
     )?;
     let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
@@ -853,6 +944,36 @@ fn prepare_frontend_first_refresh_write(
     } else {
         prepared
     })
+}
+
+fn first_refresh_target_handle(
+    retained: Option<&novarocks_spi::connector::ConnectorTableHandle>,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    target: &IcebergMvTarget,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<novarocks_spi::connector::ConnectorTableHandle, String> {
+    select_retained_target_handle(retained, || {
+        crate::engine::iceberg_writer::iceberg_connector_table_handle(
+            write_lease,
+            &crate::engine::backend_resolver::TargetBackend {
+                backend_name: "iceberg",
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            connector_context,
+        )
+    })
+}
+
+fn select_retained_target_handle(
+    retained: Option<&novarocks_spi::connector::ConnectorTableHandle>,
+    load_current: impl FnOnce() -> Result<novarocks_spi::connector::ConnectorTableHandle, String>,
+) -> Result<novarocks_spi::connector::ConnectorTableHandle, String> {
+    match retained {
+        Some(handle) => Ok(handle.clone()),
+        None => load_current(),
+    }
 }
 
 fn frontend_refresh_publication_intent(
@@ -1020,6 +1141,7 @@ fn prepare_frontend_incremental_write(
         &definition,
         &contract.base_refs,
         &target,
+        None,
         &connector_context,
     )
     .map_err(IcebergMvRefreshExecutionError::into_message)?;
@@ -1042,6 +1164,7 @@ fn prepare_frontend_incremental_write(
         previous_table_uuids.clone(),
         *target_snapshot_id,
         target_table_uuid.clone(),
+        None,
         &connector_context,
     )?;
 
@@ -1115,6 +1238,7 @@ fn prepare_frontend_incremental_write(
                 attempt,
                 &rewrite.pin.to_table_uuid_map(),
                 observed_binding,
+                None,
                 None,
                 connector_context,
             )?
@@ -1298,6 +1422,7 @@ fn prepare_frontend_incremental_write(
                 attempt,
                 &rewrite.pin.to_table_uuid_map(),
                 observed_binding,
+                None,
                 None,
                 connector_context,
             )?
@@ -4643,9 +4768,17 @@ fn build_neutral_refresh_rewrite_context(
     previous_table_uuids: BTreeMap<String, String>,
     target_snapshot_id: Option<i64>,
     target_table_uuid: String,
+    retained_target_binding: Option<&crate::mv::refresh::target_binding::MvTargetBinding>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<crate::mv::rewrite::context::IcebergMvRewriteContext>, String> {
-    let binding = target_binding_for(state, target, connector_context)?;
+    let loaded_target_binding;
+    let binding = match retained_target_binding {
+        Some(binding) => binding,
+        None => {
+            loaded_target_binding = target_binding_for(state, target, connector_context)?;
+            &loaded_target_binding
+        }
+    };
     if binding.table_uuid() != target_table_uuid {
         return Err(format!(
             "MV refresh target UUID drifted after planning for {}.{}.{}",
@@ -4797,6 +4930,7 @@ fn rebind_mv_definition_before_refresh_derivation(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     target: &IcebergMvTarget,
+    retained_target_observation: Option<&MvSchemaValidationObservation>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StoredMvDefinition, IcebergMvRefreshExecutionError> {
     let Some(contract) = mv_definition.schema_contract.as_ref() else {
@@ -4817,9 +4951,16 @@ fn rebind_mv_definition_before_refresh_derivation(
             };
             let base_observation =
                 observe_schema_validation_for_table(state, base_ref, connector_context)?;
-            let target_observation =
-                observe_schema_validation_for_table(state, &target_ref, connector_context)?;
-            match validate_schema_contract(contract, &base_observation, &target_observation) {
+            let loaded_target_observation;
+            let target_observation = match retained_target_observation {
+                Some(observation) => observation,
+                None => {
+                    loaded_target_observation =
+                        observe_schema_validation_for_table(state, &target_ref, connector_context)?;
+                    &loaded_target_observation
+                }
+            };
+            match validate_schema_contract(contract, &base_observation, target_observation) {
                 ContractDecision::Incompatible(error) => Err(format!("{error}").into()),
                 ContractDecision::CompatibleSafe => Ok(mv_definition.clone()),
                 ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
@@ -4840,8 +4981,15 @@ fn rebind_mv_definition_before_refresh_derivation(
                 observe_schema_validation_for_table(state, left_ref, connector_context)?;
             let right_observation =
                 observe_schema_validation_for_table(state, right_ref, connector_context)?;
-            let target_observation =
-                observe_schema_validation_for_table(state, &target_ref, connector_context)?;
+            let loaded_target_observation;
+            let target_observation = match retained_target_observation {
+                Some(observation) => observation,
+                None => {
+                    loaded_target_observation =
+                        observe_schema_validation_for_table(state, &target_ref, connector_context)?;
+                    &loaded_target_observation
+                }
+            };
             let left_fqn = left_ref.fqn();
             let right_fqn = right_ref.fqn();
             let decision = validate_join_schema_contract(
@@ -4850,7 +4998,7 @@ fn rebind_mv_definition_before_refresh_derivation(
                     (left_fqn.as_str(), left_observation),
                     (right_fqn.as_str(), right_observation),
                 ],
-                &target_observation,
+                target_observation,
             )
             .map_err(|error| error.to_string())?;
             apply_join_schema_contract_decision(decision, mv_definition).map_err(Into::into)
@@ -5353,6 +5501,7 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
         &mv_definition,
         &base_refs,
         &iceberg_target,
+        None,
         connector_context,
     )
     .map_err(IcebergMvRefreshExecutionError::into_message)
@@ -6677,18 +6826,11 @@ pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, 
 
 fn validate_repartition_schema_contract(
     state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
     schema_contract: &mv_schema::MvSchemaContract,
     base_refs: &[TableIdentity],
+    target_observation: &MvSchemaValidationObservation,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    let target_ref = TableIdentity {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-    };
-    let target_observation =
-        observe_schema_validation_for_table(state, &target_ref, connector_context)?;
     if schema_contract.join.is_some() {
         let [left_ref, right_ref] = base_refs else {
             return Err(format!(
@@ -6708,7 +6850,7 @@ fn validate_repartition_schema_contract(
                 (left_fqn.as_str(), left_observation),
                 (right_fqn.as_str(), right_observation),
             ],
-            &target_observation,
+            target_observation,
         )
         .map_err(|error| error.to_string())?
         {
@@ -6733,14 +6875,14 @@ fn validate_repartition_schema_contract(
                     schema_contract,
                     base_ref,
                     &base_observation,
-                    &target_observation,
+                    target_observation,
                 )?;
             } else {
                 validate_repartition_base_schema_contract(
                     schema_contract,
                     base_ref,
                     &base_observation,
-                    &target_observation,
+                    target_observation,
                 )?;
             }
         }
@@ -8137,6 +8279,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         mv_definition.last_refresh_table_uuids.clone(),
         target_binding.current_snapshot_id(),
         target_binding.table_uuid().to_string(),
+        None,
         connector_context,
     )?;
     let bindings = Arc::new(QueryTableBindingStore::try_new()?);
@@ -9801,7 +9944,61 @@ mod tests {
     use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
+    use std::cell::Cell;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn retained_repartition_target_identity_matches_exact_target() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_sales".to_string(),
+        };
+        let identity = ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            namespace: Arc::from("analytics"),
+            table: Arc::from("mv_sales"),
+        };
+
+        validate_retained_target_identity(&target, &identity).expect("matching identity");
+    }
+
+    #[test]
+    fn retained_repartition_target_identity_rejects_drift() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_sales".to_string(),
+        };
+        let identity = ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            namespace: Arc::from("analytics"),
+            table: Arc::from("mv_sales_recreated"),
+        };
+
+        let error = validate_retained_target_identity(&target, &identity)
+            .expect_err("drifted identity must fail closed");
+        assert!(error.contains("does not match ice.analytics.mv_sales"));
+    }
+
+    #[test]
+    fn retained_repartition_target_handle_skips_latest_reload() {
+        let handle = novarocks_spi::connector::ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("ice").expect("instance"),
+            bytes::Bytes::from_static(b"retained-table-metadata"),
+        )
+        .expect("retained table handle");
+        let reload_called = Cell::new(false);
+
+        let selected = select_retained_target_handle(Some(&handle), || {
+            reload_called.set(true);
+            Err("latest metadata reload must not run".to_string())
+        })
+        .expect("select retained target handle");
+
+        assert_eq!(selected, handle);
+        assert!(!reload_called.get());
+    }
 
     #[test]
     fn aggregate_incremental_inserts_use_row_delta() {
