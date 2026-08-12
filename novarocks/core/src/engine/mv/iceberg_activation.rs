@@ -83,6 +83,7 @@ impl MvRefreshProviderActivation for StandaloneMvRefreshProviderActivation {
         &self,
         mv_id: i64,
         partition_spec: crate::mv::persistence::schema::MvPartitionContract,
+        committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
         connector_context: &ConnectorRequestContext,
     ) -> Result<(), String> {
         let state = self.state.upgrade().ok_or_else(|| {
@@ -106,6 +107,7 @@ impl MvRefreshProviderActivation for StandaloneMvRefreshProviderActivation {
             &definition.refresh_policy,
             definition.refresh_paused,
             definition.refresh_interval_ms,
+            Some(committed_partitioning),
             connector_context,
         )
     }

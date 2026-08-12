@@ -57,6 +57,32 @@ mod tests {
     }
 
     #[test]
+    fn guarded_property_commit_conflicts_use_typed_terminal_classification() {
+        for kind in [
+            novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
+            novarocks_connector_iceberg::iceberg::ErrorKind::CatalogCommitConflicts,
+        ] {
+            let classified = classify_guarded_property_commit_error(
+                novarocks_connector_iceberg::iceberg::Error::new(kind, "lost CAS"),
+            );
+            assert!(matches!(
+                classified,
+                AlterTablePropertiesOnEntryError::Conflict(_)
+            ));
+        }
+        let classified = classify_guarded_property_commit_error(
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+                "response lost",
+            ),
+        );
+        assert!(matches!(
+            classified,
+            AlterTablePropertiesOnEntryError::Other(_)
+        ));
+    }
+
+    #[test]
     fn add_column_assigns_fresh_field_id() {
         let updated = apply_change_to_schema_for_test(
             &schema(),
@@ -2267,6 +2293,10 @@ use novarocks_connector_iceberg::iceberg::transaction::{
     ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
 };
 use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
+use novarocks_spi::connector::{
+    ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
+    ConnectorManagedPartitionTransform,
+};
 
 use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key,
@@ -4227,7 +4257,8 @@ pub(crate) fn alter_table_properties_on_entry(
     table: &str,
     op: &PropertiesOp,
     authority: novarocks_spi::connector::ConnectorPropertyAuthority,
-) -> Result<(), String> {
+    expected_committed_partitioning: Option<&ConnectorCommittedPartitioning>,
+) -> Result<(), AlterTablePropertiesOnEntryError> {
     let denied = collect_property_denylist_hits(op, authority);
     if !denied.is_empty() {
         let mut messages = denied
@@ -4235,10 +4266,14 @@ pub(crate) fn alter_table_properties_on_entry(
             .map(|(key, reason)| format!("`{key}`: {reason}"))
             .collect::<Vec<_>>();
         messages.sort();
-        return Err(format!(
+        return Err(AlterTablePropertiesOnEntryError::Other(format!(
             "ALTER TABLE TBLPROPERTIES rejected reserved key(s): {}",
             messages.join("; ")
-        ));
+        )));
+    }
+
+    if let Some(expected) = expected_committed_partitioning {
+        return alter_guarded_table_properties_on_entry(entry, namespace, table, op, expected);
     }
 
     entry.invalidate_table_cache(namespace, table);
@@ -4326,9 +4361,202 @@ pub(crate) fn alter_table_properties_on_entry(
             })
             .await
         })
-        .map_err(|error| format!("alter table properties runtime failed: {error}"))?;
+        .map_err(|error| {
+            AlterTablePropertiesOnEntryError::Other(format!(
+                "alter table properties runtime failed: {error}"
+            ))
+        })?;
     entry.invalidate_table_cache(namespace, table);
-    commit_result
+    commit_result.map_err(AlterTablePropertiesOnEntryError::Other)
+}
+
+#[derive(Debug)]
+pub(crate) enum AlterTablePropertiesOnEntryError {
+    Conflict(String),
+    Other(String),
+}
+
+fn alter_guarded_table_properties_on_entry(
+    entry: &IcebergCatalogEntry,
+    namespace: &str,
+    table: &str,
+    op: &PropertiesOp,
+    expected: &ConnectorCommittedPartitioning,
+) -> Result<(), AlterTablePropertiesOnEntryError> {
+    entry.invalidate_table_cache(namespace, table);
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(entry)
+        .map_err(AlterTablePropertiesOnEntryError::Other)?;
+    let loaded = crate::connector::iceberg::catalog::registry::load_table(entry, namespace, table)
+        .map_err(AlterTablePropertiesOnEntryError::Other)?;
+    let current = canonical_committed_partitioning(loaded.table.metadata())
+        .map_err(AlterTablePropertiesOnEntryError::Other)?;
+    if &current != expected {
+        return Err(AlterTablePropertiesOnEntryError::Conflict(
+            "Iceberg default partitioning changed before guarded property mutation".to_string(),
+        ));
+    }
+    let tx = Transaction::new(&loaded.table);
+    let tx = GuardedPropertyUpdateTxnAction {
+        op: op.clone(),
+        expected: expected.clone(),
+    }
+    .apply(tx)
+    .map_err(|error| AlterTablePropertiesOnEntryError::Other(error.to_string()))?;
+    let result = crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+        tx.commit(catalog.as_ref()).await
+    })
+    .map_err(|error| {
+        AlterTablePropertiesOnEntryError::Other(format!(
+            "alter guarded table properties runtime failed: {error}"
+        ))
+    })?;
+    entry.invalidate_table_cache(namespace, table);
+    result
+        .map(|_| ())
+        .map_err(classify_guarded_property_commit_error)
+}
+
+fn classify_guarded_property_commit_error(
+    error: novarocks_connector_iceberg::iceberg::Error,
+) -> AlterTablePropertiesOnEntryError {
+    if matches!(
+        error.kind(),
+        novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed
+            | novarocks_connector_iceberg::iceberg::ErrorKind::CatalogCommitConflicts
+    ) {
+        AlterTablePropertiesOnEntryError::Conflict(error.to_string())
+    } else {
+        AlterTablePropertiesOnEntryError::Other(error.to_string())
+    }
+}
+
+struct GuardedPropertyUpdateTxnAction {
+    op: PropertiesOp,
+    expected: ConnectorCommittedPartitioning,
+}
+
+#[async_trait]
+impl TransactionAction for GuardedPropertyUpdateTxnAction {
+    async fn commit(
+        self: Arc<Self>,
+        table: &novarocks_connector_iceberg::iceberg::table::Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
+        let metadata = table.metadata();
+        let current = canonical_committed_partitioning(metadata).map_err(|error| {
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                error,
+            )
+        })?;
+        if current != self.expected {
+            return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
+                "Iceberg default partitioning changed before guarded property mutation",
+            ));
+        }
+        let existing = metadata.properties().clone();
+        validate_variant_shredding_property_set(&self.op, metadata.current_schema()).map_err(
+            |error| {
+                novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                    error,
+                )
+            },
+        )?;
+        validate_unset_keys_present(&self.op, &existing).map_err(|error| {
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                error,
+            )
+        })?;
+        let updates = match &self.op {
+            PropertiesOp::Set { entries } => vec![TableUpdate::SetProperties {
+                updates: entries.iter().cloned().collect(),
+            }],
+            PropertiesOp::Unset { .. } => {
+                let removals = compute_remove_keys(&self.op, &existing);
+                if removals.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![TableUpdate::RemoveProperties { removals }]
+                }
+            }
+        };
+        Ok(ActionCommit::new(
+            updates,
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: metadata.uuid(),
+                },
+                TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: self.expected.spec_id(),
+                },
+            ],
+        ))
+    }
+}
+
+pub(crate) fn canonical_committed_partitioning(
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+) -> Result<ConnectorCommittedPartitioning, String> {
+    let spec_id = metadata.default_partition_spec_id();
+    let fields = metadata
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(position, field)| {
+            let source = metadata
+                .current_schema()
+                .field_by_id(field.source_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg partition source field {} is absent",
+                        field.source_id
+                    )
+                })?;
+            let transform = match field.transform {
+                novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+                    ConnectorManagedPartitionTransform::Identity
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+                    ConnectorManagedPartitionTransform::Year
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+                    ConnectorManagedPartitionTransform::Month
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+                    ConnectorManagedPartitionTransform::Day
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+                    ConnectorManagedPartitionTransform::Hour
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(value) => {
+                    ConnectorManagedPartitionTransform::Bucket { buckets: value }
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(value) => {
+                    ConnectorManagedPartitionTransform::Truncate { width: value }
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+                    ConnectorManagedPartitionTransform::Void
+                }
+                novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => {
+                    return Err("Iceberg partition transform is unknown".to_string());
+                }
+            };
+            ConnectorCommittedPartitionField::try_new(
+                field.field_id,
+                field.name.clone(),
+                field.source_id,
+                source.name.clone(),
+                u32::try_from(position)
+                    .map_err(|_| "Iceberg partition position exceeds u32".to_string())?,
+                transform,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    ConnectorCommittedPartitioning::try_new(spec_id, fields).map_err(|error| error.to_string())
 }
 
 /// Execute SET TBLPROPERTIES or UNSET TBLPROPERTIES on an Iceberg table.

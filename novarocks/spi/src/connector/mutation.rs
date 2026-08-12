@@ -26,9 +26,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorNamespaceIdentity,
-    ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorCommittedPartitioning, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorNamespaceIdentity, ConnectorRequestContext,
+    ConnectorTableIdentity,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
@@ -586,6 +587,14 @@ pub enum ConnectorCatalogMutationOperation {
         /// table" has no neutral expression at all, and the only way to do it
         /// is to bypass the SPI entirely (SPI-5I F6).
         authority: ConnectorPropertyAuthority,
+        /// Optional exact committed default partitioning that must still be
+        /// current when the provider applies the property changes.
+        ///
+        /// This closes the gap between an atomic managed publication and its
+        /// later engine-owned descriptor projection without exposing a
+        /// provider-specific partition spec. Ordinary property mutations do
+        /// not require this precondition and pass `None`.
+        expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
     },
     AlterRef {
         table: ConnectorTableIdentity,
@@ -608,6 +617,17 @@ impl ConnectorCatalogMutationOperation {
             Self::AlterProperties { .. } => "alter-properties",
             Self::AlterRef { .. } => "alter-ref",
         }
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        if let Self::AlterProperties {
+            expected_committed_partitioning: Some(expected),
+            ..
+        } = self
+        {
+            expected.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -1048,6 +1068,7 @@ impl ConnectorCatalogMutationLease {
                 "connector mutation request does not match its lease generation",
             ));
         }
+        request.operation.validate()?;
         Ok(())
     }
 
@@ -1110,13 +1131,44 @@ impl Drop for MutationLeaseRelease {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
 
-    use super::{ConnectorMutationOperationId, ExternalMutationEvidence};
-    use crate::connector::{
-        ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorProviderId,
+    use super::{
+        ConnectorCatalogMutationOperation, ConnectorMutationOperationId,
+        ConnectorPropertyAuthority, ExternalMutationEvidence,
     };
+    use crate::connector::{
+        ConnectorCommittedPartitionField, ConnectorCommittedPartitioning, ConnectorErrorKind,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorManagedPartitionTransform, ConnectorProviderId, ConnectorTableIdentity,
+    };
+
+    fn table() -> ConnectorTableIdentity {
+        ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("analytics").expect("instance ID"),
+            namespace: Arc::from("db"),
+            table: Arc::from("mv_target"),
+        }
+    }
+
+    fn committed_partition_field() -> ConnectorCommittedPartitionField {
+        ConnectorCommittedPartitionField::try_new(
+            1000,
+            "event_day",
+            7,
+            "event_time",
+            0,
+            ConnectorManagedPartitionTransform::Day,
+        )
+        .expect("committed partition field")
+    }
+
+    fn committed_partitioning() -> ConnectorCommittedPartitioning {
+        ConnectorCommittedPartitioning::try_new(4, vec![committed_partition_field()])
+            .expect("committed partitioning")
+    }
 
     fn evidence() -> ExternalMutationEvidence {
         ExternalMutationEvidence::try_new(
@@ -1152,5 +1204,47 @@ mod tests {
         let error = ExternalMutationEvidence::try_from_wire_v1(&wire)
             .expect_err("trailing bytes must not be accepted");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn guarded_alter_properties_accepts_valid_committed_partitioning() {
+        let operation = ConnectorCatalogMutationOperation::AlterProperties {
+            table: table(),
+            changes: Vec::new(),
+            authority: ConnectorPropertyAuthority::EngineOwned,
+            expected_committed_partitioning: Some(committed_partitioning().clone()),
+        };
+
+        operation
+            .validate()
+            .expect("valid canonical committed partitioning guard");
+        assert_eq!(operation.kind(), "alter-properties");
+    }
+
+    #[test]
+    fn committed_partitioning_guard_construction_rejects_invalid_facts() {
+        let invalid_spec =
+            ConnectorCommittedPartitioning::try_new(-1, vec![committed_partition_field()])
+                .expect_err("negative spec ID must fail closed");
+        assert_eq!(invalid_spec.kind(), ConnectorErrorKind::InvalidRequest);
+
+        let empty = ConnectorCommittedPartitioning::try_new(4, Vec::new())
+            .expect_err("empty canonical partitioning must fail closed");
+        assert_eq!(empty.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn unguarded_alter_properties_remains_compatible() {
+        let operation = ConnectorCatalogMutationOperation::AlterProperties {
+            table: table(),
+            changes: Vec::new(),
+            authority: ConnectorPropertyAuthority::UserStatement,
+            expected_committed_partitioning: None,
+        };
+
+        operation
+            .validate()
+            .expect("ordinary unguarded property mutation");
+        assert_eq!(operation.kind(), "alter-properties");
     }
 }

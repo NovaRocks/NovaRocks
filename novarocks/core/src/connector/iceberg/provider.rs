@@ -1299,6 +1299,70 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 properties,
             );
         }
+        if let ConnectorCatalogMutationOperation::AlterProperties {
+            table,
+            changes,
+            authority,
+            expected_committed_partitioning: Some(expected),
+        } = &request.operation
+        {
+            let evidence = match self.mutation_evidence(request.operation_id, &request.operation) {
+                Ok(evidence) => evidence,
+                Err(error) => return Ok(known_uncommitted(error)),
+            };
+            if table.instance_id != self.instance_id {
+                return Ok(known_uncommitted(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "property mutation belongs to another connector instance",
+                )));
+            }
+            let entry = match self.entry(self.instance_id.as_str()) {
+                Ok(entry) => entry,
+                Err(error) => return Ok(known_uncommitted(error)),
+            };
+            let operation = match lower_property_changes(changes) {
+                Ok(operation) => operation,
+                Err(error) => return Ok(known_uncommitted(error)),
+            };
+            return match super::catalog::schema_update::alter_table_properties_on_entry(
+                &entry,
+                &table.namespace,
+                &table.table,
+                &operation,
+                *authority,
+                Some(expected),
+            ) {
+                Ok(()) => Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: self.receipt(request.operation_id, request.operation.kind(), None)?,
+                    finalization: ExternalMutationFinalization::Complete,
+                }),
+                Err(super::catalog::schema_update::AlterTablePropertiesOnEntryError::Conflict(
+                    message,
+                )) => Ok(ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Conflict,
+                        message,
+                    ),
+                }),
+                Err(super::catalog::schema_update::AlterTablePropertiesOnEntryError::Other(
+                    message,
+                )) => {
+                    let error = map_iceberg_error(message);
+                    if mutation_commit_may_be_unknown(error.kind()) {
+                        Ok(ExternalMutationOutcome::CommitUnknown {
+                            failure: ConnectorMutationFailure::new(
+                                mutation_failure_kind(error.kind()),
+                                error.to_string(),
+                            ),
+                            evidence,
+                        })
+                    } else {
+                        Ok(known_uncommitted(error))
+                    }
+                }
+            };
+        }
         let operation_kind = request.operation.kind();
         let evidence = match self.mutation_evidence(request.operation_id, &request.operation) {
             Ok(evidence) => evidence,
@@ -1641,6 +1705,7 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                     table,
                     changes,
                     authority,
+                    expected_committed_partitioning: _,
                 } => {
                     if table.instance_id != self.instance_id {
                         return Err(ConnectorError::new(
@@ -1659,9 +1724,19 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         &table.table,
                         &operation,
                         authority,
+                        None,
                     )
                     .map(|()| ExternalMutationEffect::Applied)
-                    .map_err(map_iceberg_error)
+                    .map_err(|error| {
+                        match error {
+                        super::catalog::schema_update::AlterTablePropertiesOnEntryError::Conflict(
+                            message,
+                        )
+                        | super::catalog::schema_update::AlterTablePropertiesOnEntryError::Other(
+                            message,
+                        ) => map_iceberg_error(message),
+                    }
+                    })
                 }
                 ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
                     if table.instance_id != self.instance_id {
@@ -10262,6 +10337,150 @@ mod tests {
         assert_eq!(evidence.operation_kind(), "create-namespace");
         assert!(format!("{evidence:?}").contains("provider_payload_len"));
         assert!(!format!("{evidence:?}").contains("\"namespace\""));
+    }
+
+    #[test]
+    fn legacy_guarded_properties_require_exact_committed_partitioning() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let (_runtime, provider) = local_planning_provider(warehouse.path());
+        let target = ConnectorExecutionBindingKey {
+            instance_id: provider.instance_id.clone(),
+            incarnation: provider.incarnation,
+        };
+        let namespace = novarocks_spi::connector::ConnectorNamespaceIdentity {
+            instance_id: provider.instance_id.clone(),
+            namespace: Arc::from("guarded"),
+        };
+        let create_namespace = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: target.clone(),
+                operation: ConnectorCatalogMutationOperation::CreateNamespace {
+                    namespace,
+                    policy: CreatePolicy::FailIfExists,
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("create namespace");
+        assert!(matches!(
+            create_namespace,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: provider.instance_id.clone(),
+            namespace: Arc::from("guarded"),
+            table: Arc::from("orders"),
+        };
+        let create_table = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: target.clone(),
+                operation: ConnectorCatalogMutationOperation::CreateTable {
+                    table: table.clone(),
+                    columns: vec![ConnectorColumnDefinition {
+                        name: Arc::from("id"),
+                        data_type: ConnectorDataType::BigInt,
+                        nullable: false,
+                        aggregation: None,
+                        default: None,
+                    }],
+                    key: None,
+                    partitioning: vec![ConnectorPartitionTransform::Identity {
+                        column: Arc::from("id"),
+                    }],
+                    properties: Vec::new(),
+                    policy: CreatePolicy::FailIfExists,
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("create table");
+        assert!(matches!(
+            create_table,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        let entry = provider
+            .entry(provider.instance_id.as_str())
+            .expect("entry");
+        let loaded = load_table(&entry, &table.namespace, &table.table).expect("load table");
+        let current = super::super::catalog::schema_update::canonical_committed_partitioning(
+            loaded.table.metadata(),
+        )
+        .expect("canonical partitioning");
+        let success = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: target.clone(),
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table: table.clone(),
+                    changes: vec![novarocks_spi::connector::ConnectorPropertyChange::Set {
+                        key: Arc::from("novarocks.mv.partition"),
+                        value: Arc::from("exact"),
+                    }],
+                    authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(current.clone()),
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("guarded property success");
+        assert!(matches!(
+            success,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        let empty = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: target.clone(),
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table: table.clone(),
+                    changes: Vec::new(),
+                    authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(current.clone()),
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("empty guarded property mutation");
+        assert!(matches!(
+            empty,
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::InvalidRequest
+        ));
+        let first = current.fields().first().expect("partition field");
+        let mut mismatched_fields = current.fields().to_vec();
+        mismatched_fields[0] = novarocks_spi::connector::ConnectorCommittedPartitionField::try_new(
+            first.partition_field_id(),
+            format!("{}_changed", first.partition_field_name()),
+            first.source_field_id(),
+            first.source_column_name(),
+            first.position(),
+            first.transform(),
+        )
+        .expect("mismatched partition field");
+        let mismatched = novarocks_spi::connector::ConnectorCommittedPartitioning::try_new(
+            current.spec_id(),
+            mismatched_fields,
+        )
+        .expect("mismatched canonical guard");
+        let mismatch = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target,
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table,
+                    changes: vec![novarocks_spi::connector::ConnectorPropertyChange::Set {
+                        key: Arc::from("novarocks.mv.partition"),
+                        value: Arc::from("stale"),
+                    }],
+                    authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(mismatched),
+                },
+                context: context_with_payload_budgets(1024, 4096),
+            })
+            .expect("guarded property mismatch");
+        assert!(matches!(
+            mismatch,
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+        ));
     }
 
     #[test]

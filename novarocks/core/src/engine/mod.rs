@@ -2546,6 +2546,7 @@ impl StandaloneSession {
                 },
                 changes,
                 authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
+                expected_committed_partitioning: None,
             },
             connector_context.clone(),
         )?;

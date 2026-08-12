@@ -564,6 +564,7 @@ pub(crate) fn alter_mv_with_connector_context(
                         })
                         .collect(),
                     authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
+                    expected_committed_partitioning: None,
                 },
                 connector_context.clone(),
             )?;
@@ -614,6 +615,7 @@ pub(crate) fn alter_mv_with_connector_context(
         &req.refresh_policy,
         req.refresh_paused,
         req.refresh_interval_ms,
+        None,
         connector_context,
     )
     .map_err(|e| format!("sync Iceberg MV descriptor refresh metadata failed: {e}"))?;

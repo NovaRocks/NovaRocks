@@ -14,14 +14,14 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutation, ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorColumnPath,
-    ConnectorColumnPosition, ConnectorDataType, ConnectorDropTableDataDisposition, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorPartitionTransform, ConnectorPropertyAuthority, ConnectorPropertyChange,
-    ConnectorRefAction, ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey,
-    ConnectorTableKeyKind, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorColumnPosition, ConnectorCommittedPartitioning, ConnectorDataType,
+    ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorPartitionTransform,
+    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction, ConnectorSchemaChange,
+    ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind, CreateOrReplacePolicy,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 
 use crate::catalog_config::IcebergCatalogKind;
@@ -99,6 +99,17 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 committed_version,
                 *expected_target_snapshot_id,
                 guard,
+            );
+        }
+        if let ConnectorCatalogMutationOperation::AlterProperties {
+            table,
+            changes,
+            authority,
+            expected_committed_partitioning: Some(expected),
+        } = &request.operation
+        {
+            return execute_guarded_properties(
+                self, &request, table, changes, *authority, expected,
             );
         }
 
@@ -333,6 +344,7 @@ fn execute_operation(
             table,
             changes,
             authority,
+            expected_committed_partitioning: _,
         } => {
             ensure_owner(provider, &table.instance_id)?;
             alter_properties(provider.runtime(), table, changes, *authority)?;
@@ -791,6 +803,29 @@ fn alter_properties(
         .load_table(&table.namespace, &table.table)
         .map_err(unavailable)?;
     let metadata = loaded.table.metadata();
+    let updates = property_updates(metadata, changes, authority)?;
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let commit = TableCommit::builder()
+        .ident(table_ident(table).map_err(invalid)?)
+        .requirements(vec![TableRequirement::UuidMatch {
+            uuid: metadata.uuid(),
+        }])
+        .updates(updates)
+        .build();
+    update_table(runtime, commit, "alter Iceberg table properties")?;
+    runtime
+        .control_state()
+        .invalidate_table_cache(&table.namespace, &table.table);
+    Ok(())
+}
+
+fn property_updates(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    changes: &[ConnectorPropertyChange],
+    authority: ConnectorPropertyAuthority,
+) -> Result<Vec<TableUpdate>, ConnectorError> {
     let mut sets = HashMap::new();
     let mut removals = Vec::new();
     for change in changes {
@@ -841,20 +876,9 @@ fn alter_properties(
         updates.push(TableUpdate::RemoveProperties { removals });
     }
     if updates.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let commit = TableCommit::builder()
-        .ident(table_ident(table).map_err(invalid)?)
-        .requirements(vec![TableRequirement::UuidMatch {
-            uuid: metadata.uuid(),
-        }])
-        .updates(updates)
-        .build();
-    update_table(runtime, commit, "alter Iceberg table properties")?;
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(())
+    Ok(updates)
 }
 
 fn reserved_property(key: &str) -> Option<&'static str> {
@@ -1357,6 +1381,121 @@ fn execute_bootstrap(
         )?,
         finalization: ExternalMutationFinalization::Complete,
     })
+}
+
+fn execute_guarded_properties(
+    provider: &IcebergControlProvider,
+    request: &ConnectorCatalogMutationRequest,
+    table: &ConnectorTableIdentity,
+    changes: &[ConnectorPropertyChange],
+    authority: ConnectorPropertyAuthority,
+    expected: &ConnectorCommittedPartitioning,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    ensure_owner(provider, &table.instance_id)?;
+    if changes.is_empty() {
+        return Ok(known_uncommitted(invalid(
+            "Iceberg property mutation is empty",
+        )));
+    }
+    let loaded = match provider
+        .runtime()
+        .load_table(&table.namespace, &table.table)
+    {
+        Ok(loaded) => loaded,
+        Err(error) => return Ok(known_uncommitted(unavailable(error))),
+    };
+    let metadata = loaded.table.metadata();
+    let current = crate::commit::write_control::committed_partitioning_from_metadata(
+        metadata,
+        metadata.default_partition_spec_id(),
+    )?;
+    if &current != expected {
+        return Ok(known_conflict(
+            "Iceberg default partitioning changed before guarded property mutation",
+        ));
+    }
+    let updates = match property_updates(metadata, changes, authority) {
+        Ok(updates) => updates,
+        Err(error) => return Ok(known_uncommitted(error)),
+    };
+    if updates.is_empty() {
+        return Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            receipt: receipt_with_version(
+                provider,
+                request.operation_id,
+                request.operation.kind(),
+                loaded.table.metadata_location(),
+            )?,
+            finalization: ExternalMutationFinalization::Complete,
+        });
+    }
+    let evidence = mutation_evidence(provider, request.operation_id, &request.operation)?;
+    validate_context(&request.context)?;
+    let commit = TableCommit::builder()
+        .ident(table_ident(table).map_err(invalid)?)
+        .requirements(vec![
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+            TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: expected.spec_id(),
+            },
+        ])
+        .updates(updates)
+        .build();
+    let catalog = provider.runtime().catalog().clone();
+    let committed = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { catalog.update_table(commit).await });
+    let committed = match committed {
+        Ok(Ok(table)) => table,
+        Ok(Err(error)) if guarded_property_commit_conflict(error.kind()) => {
+            return Ok(known_conflict(format!(
+                "Iceberg guarded property mutation lost its partitioning CAS: {error}"
+            )));
+        }
+        Ok(Err(error)) => {
+            let error = map_iceberg_message("alter Iceberg table properties", error);
+            if commit_may_be_unknown(error.kind()) {
+                return Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: failure(&error),
+                    evidence,
+                });
+            }
+            return Ok(known_uncommitted(error));
+        }
+        Err(error) => {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(&unavailable(error)),
+                evidence,
+            });
+        }
+    };
+    provider
+        .runtime()
+        .control_state()
+        .invalidate_table_cache(&table.namespace, &table.table);
+    Ok(ExternalMutationOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::Applied,
+        receipt: receipt_with_version(
+            provider,
+            request.operation_id,
+            request.operation.kind(),
+            committed.metadata_location(),
+        )?,
+        finalization: ExternalMutationFinalization::Complete,
+    })
+}
+
+fn guarded_property_commit_conflict(kind: crate::iceberg::ErrorKind) -> bool {
+    matches!(
+        kind,
+        crate::iceberg::ErrorKind::PreconditionFailed
+            | crate::iceberg::ErrorKind::CatalogCommitConflicts
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1981,6 +2120,17 @@ fn known_uncommitted(
     }
 }
 
+fn known_conflict(
+    message: impl Into<String>,
+) -> ExternalMutationOutcome<ConnectorCatalogMutationReceipt> {
+    ExternalMutationOutcome::KnownUncommitted {
+        failure: ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Conflict,
+            message.into(),
+        ),
+    }
+}
+
 fn failure(error: &ConnectorError) -> ConnectorMutationFailure {
     ConnectorMutationFailure::new(failure_kind(error.kind()), error.to_string())
 }
@@ -2066,7 +2216,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
+        ConnectorProviderId, ConnectorRequestContext,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -2150,6 +2301,157 @@ mod tests {
             ])
             .build()
             .expect("schema")
+    }
+
+    fn guarded_table(provider: &IcebergControlProvider) -> ConnectorTableIdentity {
+        let namespace = NamespaceIdent::new("guarded".to_string());
+        let catalog = provider.runtime().catalog().clone();
+        provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
+            .expect("namespace runtime")
+            .expect("create namespace");
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "guarded".into(),
+            table: "orders".into(),
+        };
+        create_table(
+            provider,
+            &table,
+            &[ConnectorColumnDefinition {
+                name: "id".into(),
+                data_type: ConnectorDataType::BigInt,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[ConnectorPartitionTransform::Identity {
+                column: "id".into(),
+            }],
+            &[],
+            CreatePolicy::FailIfExists,
+        )
+        .expect("create guarded table");
+        table
+    }
+
+    #[test]
+    fn guarded_properties_succeed_with_exact_partitioning_and_reject_mismatch() {
+        let (_executor, _warehouse, provider) = provider();
+        let table = guarded_table(&provider);
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .expect("load guarded table");
+        let current = crate::commit::write_control::committed_partitioning_from_metadata(
+            loaded.table.metadata(),
+            loaded.table.metadata().default_partition_spec_id(),
+        )
+        .expect("canonical partitioning");
+        let success = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorExecutionBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table: table.clone(),
+                    changes: vec![ConnectorPropertyChange::Set {
+                        key: "novarocks.mv.partition".into(),
+                        value: "exact".into(),
+                    }],
+                    authority: ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(current.clone()),
+                },
+                context: context(),
+            })
+            .expect("execute guarded property mutation");
+        assert!(matches!(
+            success,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+
+        let empty = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorExecutionBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table: table.clone(),
+                    changes: Vec::new(),
+                    authority: ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(current.clone()),
+                },
+                context: context(),
+            })
+            .expect("execute empty guarded property mutation");
+        assert!(matches!(
+            empty,
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::InvalidRequest
+        ));
+
+        let first = current.fields().first().expect("partition field");
+        let mut mismatched_fields = current.fields().to_vec();
+        mismatched_fields[0] = novarocks_spi::connector::ConnectorCommittedPartitionField::try_new(
+            first.partition_field_id(),
+            format!("{}_changed", first.partition_field_name()),
+            first.source_field_id(),
+            first.source_column_name(),
+            first.position(),
+            first.transform(),
+        )
+        .expect("different canonical partition field");
+        let mismatched =
+            ConnectorCommittedPartitioning::try_new(current.spec_id(), mismatched_fields)
+                .expect("different canonical partitioning");
+        let mismatch = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorExecutionBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table,
+                    changes: vec![ConnectorPropertyChange::Set {
+                        key: "novarocks.mv.partition".into(),
+                        value: "stale".into(),
+                    }],
+                    authority: ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(mismatched),
+                },
+                context: context(),
+            })
+            .expect("execute mismatched property mutation");
+        assert!(matches!(
+            mismatch,
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+        ));
+    }
+
+    #[test]
+    fn guarded_property_cas_conflicts_are_terminal_uncommitted_conflicts() {
+        assert!(guarded_property_commit_conflict(
+            crate::iceberg::ErrorKind::PreconditionFailed
+        ));
+        assert!(guarded_property_commit_conflict(
+            crate::iceberg::ErrorKind::CatalogCommitConflicts
+        ));
+        let outcome = known_conflict("default partition spec changed during commit");
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+        ));
     }
 
     #[test]

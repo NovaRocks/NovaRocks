@@ -124,6 +124,7 @@ impl FrontendMvRefreshProviderActivationPort {
         &self,
         mv_id: i64,
         partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+        committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
         connector_context: &ConnectorRequestContext,
     ) -> Result<(), MvApplicationError> {
         let activation = self
@@ -133,7 +134,12 @@ impl FrontendMvRefreshProviderActivationPort {
             .clone()
             .ok_or_else(|| unavailable("MV refresh provider activation is unavailable"))?;
         activation
-            .sync_repartition_descriptor(mv_id, partition_spec, connector_context)
+            .sync_repartition_descriptor(
+                mv_id,
+                partition_spec,
+                committed_partitioning,
+                connector_context,
+            )
             .map_err(|error| {
                 MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
             })
@@ -485,17 +491,20 @@ fn execute_data_refresh(
         )?;
     }
 
-    let partition_spec = published
-        .committed()
-        .committed_partitioning()
+    let committed_partitioning = published.committed().committed_partitioning();
+    let partition_spec = committed_partitioning
         .map(mv_partition_contract)
         .transpose()?;
-    if let Some(partition_spec) = &partition_spec {
+    if let Some(committed_partitioning) = committed_partitioning {
+        let partition_spec = partition_spec.as_ref().ok_or_else(|| {
+            invalid("MV repartition commit is missing its application partition contract")
+        })?;
         dependencies
             .provider_activation
             .sync_repartition_descriptor(
                 finalize.mv_id,
                 partition_spec.clone(),
+                committed_partitioning.clone(),
                 &connector_context,
             )?;
     }
@@ -1009,7 +1018,8 @@ fn repository_error(error: MvRepositoryError) -> MvApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use novarocks::mv::application::{
         MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshProviderActivationSink,
@@ -1022,12 +1032,25 @@ mod tests {
     use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
     use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_spi::connector::{
-        ConnectorControlPlanningLease, ConnectorWriteLease, ConnectorWriteReceipt,
+        ConnectorCancellation, ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
+        ConnectorControlPlanningLease, ConnectorManagedPartitionTransform, ConnectorRequestContext,
+        ConnectorWriteLease, ConnectorWriteReceipt, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
     use super::{FrontendMvRefreshProviderActivationPort, proof_only_action, receipt_evidence};
 
-    struct FakeActivator;
+    #[derive(Default)]
+    struct FakeActivator {
+        descriptor_projection: Mutex<
+            Option<(
+                i64,
+                novarocks::mv::persistence::schema::MvPartitionContract,
+                ConnectorCommittedPartitioning,
+            )>,
+        >,
+        failure: Option<&'static str>,
+    }
 
     impl MvRefreshProviderActivation for FakeActivator {
         fn activate_write(
@@ -1050,24 +1073,126 @@ mod tests {
 
         fn sync_repartition_descriptor(
             &self,
-            _mv_id: i64,
-            _partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+            mv_id: i64,
+            partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+            committed_partitioning: ConnectorCommittedPartitioning,
             _connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<(), String> {
+            *self
+                .descriptor_projection
+                .lock()
+                .expect("descriptor projection observation lock") =
+                Some((mv_id, partition_spec, committed_partitioning));
+            if let Some(failure) = self.failure {
+                return Err(failure.to_string());
+            }
             Ok(())
         }
+    }
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn connector_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("connector request context")
+    }
+
+    fn committed_partitioning() -> ConnectorCommittedPartitioning {
+        ConnectorCommittedPartitioning::try_new(
+            12,
+            vec![
+                ConnectorCommittedPartitionField::try_new(
+                    1_050,
+                    "id_bucket_16",
+                    10,
+                    "id",
+                    0,
+                    ConnectorManagedPartitionTransform::Bucket { buckets: 16 },
+                )
+                .expect("committed partition field"),
+            ],
+        )
+        .expect("committed partitioning")
     }
 
     #[test]
     fn provider_activation_is_bound_once_after_frontend_composition() {
         let port = FrontendMvRefreshProviderActivationPort::new();
-        port.bind_mv_refresh_provider_activation(Arc::new(FakeActivator))
+        port.bind_mv_refresh_provider_activation(Arc::new(FakeActivator::default()))
             .expect("first Core activation adapter binds");
 
         let error = port
-            .bind_mv_refresh_provider_activation(Arc::new(FakeActivator))
+            .bind_mv_refresh_provider_activation(Arc::new(FakeActivator::default()))
             .expect_err("a second Core activation adapter must fail closed");
         assert_eq!(error, "MV refresh provider activation is already bound");
+    }
+
+    #[test]
+    fn repartition_descriptor_projection_forwards_raw_committed_partitioning() {
+        let port = FrontendMvRefreshProviderActivationPort::new();
+        let activation = Arc::new(FakeActivator::default());
+        port.bind_mv_refresh_provider_activation(activation.clone())
+            .expect("bind Core activation adapter");
+        let committed_partitioning = committed_partitioning();
+        let partition_spec = super::mv_partition_contract(&committed_partitioning)
+            .expect("application partition contract");
+        let expected_partition_spec = partition_spec.clone();
+        let expected_committed_partitioning = committed_partitioning.clone();
+
+        port.sync_repartition_descriptor(
+            42,
+            partition_spec,
+            committed_partitioning,
+            &connector_context(),
+        )
+        .expect("descriptor projection");
+
+        assert_eq!(
+            *activation
+                .descriptor_projection
+                .lock()
+                .expect("descriptor projection observation lock"),
+            Some((42, expected_partition_spec, expected_committed_partitioning,))
+        );
+    }
+
+    #[test]
+    fn repartition_descriptor_projection_failure_remains_a_finalize_failure() {
+        let port = FrontendMvRefreshProviderActivationPort::new();
+        let activation = Arc::new(FakeActivator {
+            descriptor_projection: Mutex::new(None),
+            failure: Some("guarded descriptor projection conflict"),
+        });
+        port.bind_mv_refresh_provider_activation(activation)
+            .expect("bind Core activation adapter");
+        let committed_partitioning = committed_partitioning();
+        let partition_spec = super::mv_partition_contract(&committed_partitioning)
+            .expect("application partition contract");
+
+        let error = port
+            .sync_repartition_descriptor(
+                42,
+                partition_spec,
+                committed_partitioning,
+                &connector_context(),
+            )
+            .expect_err("descriptor projection conflict must retain the refresh fence");
+
+        assert_eq!(
+            error.kind(),
+            novarocks::mv::application::MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        );
     }
 
     #[test]

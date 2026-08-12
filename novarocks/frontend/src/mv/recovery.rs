@@ -503,10 +503,16 @@ fn finalize_published(
         .map(super::refresh::mv_partition_contract)
         .transpose()
         .map_err(|_| ())?;
-    if let Some(partition_spec) = &partition_spec {
+    if let Some(committed_partitioning) = committed_partitioning {
+        let partition_spec = partition_spec.as_ref().ok_or(())?;
         dependencies
             .provider_activation
-            .sync_repartition_descriptor(refresh.mv_id, partition_spec.clone(), connector_context)
+            .sync_repartition_descriptor(
+                refresh.mv_id,
+                partition_spec.clone(),
+                committed_partitioning.clone(),
+                connector_context,
+            )
             .map_err(|_| ())?;
     }
     repository
@@ -870,6 +876,7 @@ impl ConnectorCancellation for NeverCancelled {
 mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use novarocks::mv::dependency::model::{
@@ -1010,7 +1017,11 @@ mod tests {
         reconcile_calls: AtomicUsize,
     }
 
-    struct TestDescriptorProjection;
+    #[derive(Default)]
+    struct TestDescriptorProjection {
+        committed_partitioning: Mutex<Vec<ConnectorCommittedPartitioning>>,
+        failure: Option<&'static str>,
+    }
 
     impl novarocks::mv::application::MvRefreshProviderActivation for TestDescriptorProjection {
         fn activate_write(
@@ -1038,8 +1049,16 @@ mod tests {
             &self,
             _mv_id: i64,
             _partition_spec: MvPartitionContract,
+            committed_partitioning: ConnectorCommittedPartitioning,
             _connector_context: &ConnectorRequestContext,
         ) -> Result<(), String> {
+            self.committed_partitioning
+                .lock()
+                .expect("descriptor projection observation lock")
+                .push(committed_partitioning);
+            if let Some(failure) = self.failure {
+                return Err(failure.to_string());
+            }
             Ok(())
         }
     }
@@ -1149,6 +1168,19 @@ mod tests {
 
     fn dependencies(
         recovery: Arc<TestRecovery>,
+    ) -> (
+        FrontendMvRecoveryDependencies,
+        Arc<ConnectorControlHost>,
+        Arc<TestDescriptorProjection>,
+    ) {
+        let projection = Arc::new(TestDescriptorProjection::default());
+        let (dependencies, host) = dependencies_with_projection(recovery, projection.clone());
+        (dependencies, host, projection)
+    }
+
+    fn dependencies_with_projection(
+        recovery: Arc<TestRecovery>,
+        projection: Arc<TestDescriptorProjection>,
     ) -> (FrontendMvRecoveryDependencies, Arc<ConnectorControlHost>) {
         let binding = test_control_binding(7)
             .try_with_staged_publication_recovery(Some(recovery))
@@ -1159,7 +1191,7 @@ mod tests {
             Arc::new(super::super::refresh::FrontendMvRefreshProviderActivationPort::new());
         novarocks::mv::application::MvRefreshProviderActivationSink::bind_mv_refresh_provider_activation(
             provider_activation.as_ref(),
-            Arc::new(TestDescriptorProjection),
+            projection,
         )
         .expect("bind descriptor projection");
         (
@@ -1393,7 +1425,7 @@ mod tests {
             ),
             CleanupMode::KnownCommitted,
         ));
-        let (dependencies, _host) = dependencies(recovery.clone());
+        let (dependencies, _host, _projection) = dependencies(recovery.clone());
 
         let summary = recover_once(environment.repository.as_ref(), &dependencies);
 
@@ -1453,7 +1485,7 @@ mod tests {
             ),
             CleanupMode::KnownCommitted,
         ));
-        let (dependencies, _host) = dependencies(recovery.clone());
+        let (dependencies, _host, _projection) = dependencies(recovery.clone());
 
         let summary = recover_once(environment.repository.as_ref(), &dependencies);
 
@@ -1482,7 +1514,7 @@ mod tests {
             observation(ConnectorStagedPublicationDisposition::Published, true),
             CleanupMode::KnownCommitted,
         ));
-        let (dependencies, _host) = dependencies(recovery.clone());
+        let (dependencies, _host, _projection) = dependencies(recovery.clone());
 
         let summary = recover_once(environment.repository.as_ref(), &dependencies);
 
@@ -1551,7 +1583,7 @@ mod tests {
             repartition_observation(),
             CleanupMode::KnownCommitted,
         ));
-        let (dependencies, _host) = dependencies(recovery.clone());
+        let (dependencies, _host, projection) = dependencies(recovery.clone());
 
         let first = recover_once(environment.repository.as_ref(), &dependencies);
         let second = recover_once(environment.repository.as_ref(), &dependencies);
@@ -1560,6 +1592,14 @@ mod tests {
         assert_eq!(first.cleanup_backlog, 0);
         assert_eq!(second.candidates, 0);
         assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 0);
+        let forwarded_partitioning = projection
+            .committed_partitioning
+            .lock()
+            .expect("descriptor projection observation lock");
+        assert_eq!(
+            forwarded_partitioning.as_slice(),
+            &[committed_partitioning()]
+        );
         let expected = MvPartitionContract {
             target_spec_id: 12,
             fields: vec![MvPartitionFieldContract {
@@ -1638,6 +1678,91 @@ mod tests {
     }
 
     #[test]
+    fn repartition_descriptor_projection_failure_keeps_recovery_fenced() {
+        let environment = TestEnvironment::open();
+        let key = current_binding_key();
+        let refresh = environment.begin_refresh("atomic_projection_failure", &key);
+        let prepared = refresh
+            .frontend_ledger
+            .as_ref()
+            .expect("frontend action ledger")
+            .clone();
+        environment
+            .repository
+            .record_frontend_refresh_action(
+                refresh.refresh_id,
+                FrontendMvRefreshAction {
+                    phase: FrontendMvRefreshActionPhase::StagingCreate,
+                    state: FrontendMvRefreshActionState::KnownCommitted,
+                    operation_id: prepared.staging_create_operation_id,
+                    receipt: None,
+                    committed_version: None,
+                    external_evidence: Some(evidence_value(b"staging-create-proof")),
+                    provider_finalized: true,
+                },
+            )
+            .expect("record proof-only staging create");
+        environment
+            .repository
+            .record_frontend_refresh_action(
+                refresh.refresh_id,
+                FrontendMvRefreshAction {
+                    phase: FrontendMvRefreshActionPhase::Write,
+                    state: FrontendMvRefreshActionState::CommitUnknown,
+                    operation_id: prepared.write_operation_id,
+                    receipt: None,
+                    committed_version: None,
+                    external_evidence: Some(evidence_value(b"write-response-lost")),
+                    provider_finalized: false,
+                },
+            )
+            .expect("record response loss after atomic repartition write");
+        let recovery = Arc::new(TestRecovery::new(
+            key,
+            repartition_observation(),
+            CleanupMode::KnownCommitted,
+        ));
+        let projection = Arc::new(TestDescriptorProjection {
+            committed_partitioning: Mutex::new(Vec::new()),
+            failure: Some("guarded descriptor projection conflict"),
+        });
+        let (dependencies, _host) = dependencies_with_projection(recovery, projection.clone());
+
+        let summary = recover_once(environment.repository.as_ref(), &dependencies);
+
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.resolved, 0);
+        assert_eq!(summary.unresolved, 1);
+        assert_eq!(
+            projection
+                .committed_partitioning
+                .lock()
+                .expect("descriptor projection observation lock")
+                .as_slice(),
+            &[committed_partitioning()]
+        );
+        let fenced = environment
+            .repository
+            .load_refresh(refresh.refresh_id)
+            .expect("load fenced refresh")
+            .expect("fenced refresh exists");
+        assert_ne!(fenced.state, MvRefreshState::Finalized);
+        let definition = environment
+            .repository
+            .load_by_id(refresh.mv_id)
+            .expect("load definition")
+            .expect("definition exists");
+        assert_eq!(definition.last_refreshed_iceberg_snapshot_id, None);
+        assert_eq!(
+            definition
+                .partition_spec
+                .as_ref()
+                .map(|partition| partition.target_spec_id),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn ambiguous_observation_remains_unresolved_without_cleanup() {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
@@ -1647,7 +1772,7 @@ mod tests {
             observation(ConnectorStagedPublicationDisposition::Ambiguous, true),
             CleanupMode::KnownCommitted,
         ));
-        let (dependencies, _host) = dependencies(recovery.clone());
+        let (dependencies, _host, _projection) = dependencies(recovery.clone());
 
         let summary = recover_once(environment.repository.as_ref(), &dependencies);
 
@@ -1686,7 +1811,7 @@ mod tests {
             ],
             CleanupMode::CommitUnknown,
         ));
-        let (dependencies, _host) = dependencies(recovery.clone());
+        let (dependencies, _host, _projection) = dependencies(recovery.clone());
 
         let summary = recover_once(environment.repository.as_ref(), &dependencies);
 

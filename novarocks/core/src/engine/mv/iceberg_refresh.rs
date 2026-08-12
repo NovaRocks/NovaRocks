@@ -1831,6 +1831,7 @@ impl MvEngine for StandaloneMvEngine {
             &definition.refresh_policy,
             definition.refresh_paused,
             definition.refresh_interval_ms,
+            None,
             &connector_context,
         )
         .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
@@ -3041,13 +3042,18 @@ fn stored_refresh_policy_descriptor_json(
 /// observe the descriptor from one exact connector generation, overwrite `refresh_contract` from the given
 /// refresh-policy inputs, carry `definition.schema_contract` (if present)
 /// into the descriptor's `schema_contract` field, and write the descriptor
-/// back through a mutation lease derived from the same generation.
+/// back through a mutation lease derived from the same generation. Repartition
+/// projection supplies the raw provider-committed partitioning as an atomic
+/// property-mutation guard; ordinary CREATE/ALTER policy sync passes `None`.
 pub(crate) fn sync_iceberg_mv_descriptor(
     state: &Arc<StandaloneState>,
     definition: &StoredMvDefinition,
     refresh_policy: &StoredMvRefreshPolicy,
     refresh_paused: bool,
     refresh_interval_ms: Option<i64>,
+    expected_committed_partitioning: Option<
+        novarocks_spi::connector::ConnectorCommittedPartitioning,
+    >,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     if definition.storage_engine != MvStorageEngine::Iceberg.as_sql_str() {
@@ -3119,6 +3125,7 @@ pub(crate) fn sync_iceberg_mv_descriptor(
                     )
                     .collect(),
                 authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+                expected_committed_partitioning,
             },
             connector_context.clone(),
         ),
