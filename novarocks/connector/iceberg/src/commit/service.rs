@@ -69,6 +69,7 @@ pub trait CommitRecoverySource {
     fn recovery_base_snapshot_id(&self) -> Option<i64>;
     fn recovery_base_sequence_number(&self) -> i64;
     fn recovery_staging_dir(&self) -> String;
+    fn recovery_manifest_cleanup_token(&self) -> Option<String>;
 }
 
 impl<T> CommitRecoverySource for Arc<T>
@@ -94,6 +95,10 @@ where
     fn recovery_staging_dir(&self) -> String {
         self.as_ref().recovery_staging_dir()
     }
+
+    fn recovery_manifest_cleanup_token(&self) -> Option<String> {
+        self.as_ref().recovery_manifest_cleanup_token()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +108,7 @@ pub struct RecoveryEvidence {
     pub base_snapshot_id: Option<i64>,
     pub base_sequence_number: i64,
     pub staging_dir: String,
+    pub manifest_cleanup_token: Option<String>,
 }
 
 impl RecoveryEvidence {
@@ -113,6 +119,7 @@ impl RecoveryEvidence {
             base_snapshot_id: source.recovery_base_snapshot_id(),
             base_sequence_number: source.recovery_base_sequence_number(),
             staging_dir: source.recovery_staging_dir(),
+            manifest_cleanup_token: source.recovery_manifest_cleanup_token(),
         }
     }
 }

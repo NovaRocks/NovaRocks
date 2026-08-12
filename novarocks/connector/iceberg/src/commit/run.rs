@@ -30,6 +30,7 @@ use std::sync::Arc;
 use crate::iceberg::Catalog;
 use crate::iceberg::io::FileIO;
 use crate::iceberg::table::Table;
+use crate::iceberg::{TableCommit, TableUpdate};
 use crate::opendal::Operator;
 use uuid::Uuid;
 
@@ -65,6 +66,28 @@ pub struct RunInput {
     /// DML (`INSERT INTO t.branch_dev`) supplies the branch name here.
     pub target_ref: String,
     pub snapshot_properties: BTreeMap<String, String>,
+    /// Provider-assigned partition-spec updates that must share the exact
+    /// external commit with one managed overwrite snapshot on `main`.
+    pub atomic_partition_replacement: Option<AtomicPartitionReplacement>,
+}
+
+pub(crate) struct AtomicPartitionReplacement {
+    updates: Vec<TableUpdate>,
+}
+
+impl AtomicPartitionReplacement {
+    pub(super) fn try_new(updates: Vec<TableUpdate>) -> Result<Self, String> {
+        if updates.len() != 2
+            || !matches!(updates[0], TableUpdate::AddSpec { .. })
+            || !matches!(updates[1], TableUpdate::SetDefaultSpec { .. })
+        {
+            return Err(
+                "atomic Iceberg partition replacement requires AddSpec then SetDefaultSpec"
+                    .to_string(),
+            );
+        }
+        Ok(Self { updates })
+    }
 }
 
 /// Dispatch a commit-action and return typed commit outcome/error.
@@ -84,7 +107,39 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
         selected_rewrite,
         target_ref,
         snapshot_properties,
+        atomic_partition_replacement,
     } = input;
+
+    if let Some(replacement) = atomic_partition_replacement {
+        if collector.op_kind != CommitOpKind::Overwrite || target_ref != "main" {
+            return Err(CommitServiceError::invalid_input(
+                "atomic Iceberg partition replacement requires one managed overwrite on main"
+                    .to_string(),
+            ));
+        }
+        let commit_uuid = Uuid::new_v4();
+        collector.set_manifest_cleanup_token(commit_uuid.to_string());
+        let ctx = CommitCtx {
+            collector: &collector,
+            table: &table,
+            catalog: catalog.as_ref(),
+            file_io: &file_io,
+            commit_uuid,
+            abort_handle: collector.abort_log.clone(),
+            target_ref: &target_ref,
+            snapshot_properties: &snapshot_properties,
+        };
+        let result = run_atomic_partition_replacement(ctx, replacement).await;
+        return match result {
+            Ok(outcome) => {
+                collector.mark_committed();
+                Ok(outcome)
+            }
+            Err(error) => {
+                Err(handle_commit_error(error, &collector, &fs, cleanup_path_mapper.as_ref()).await)
+            }
+        };
+    }
 
     let action: Box<dyn IcebergCommitAction> = match collector.op_kind {
         CommitOpKind::FastAppend => Box::new(FastAppendCommit),
@@ -118,12 +173,14 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
         }
     };
 
+    let commit_uuid = Uuid::new_v4();
+    collector.set_manifest_cleanup_token(commit_uuid.to_string());
     let ctx = CommitCtx {
         collector: &collector,
         table: &table,
         catalog: catalog.as_ref(),
         file_io: &file_io,
-        commit_uuid: Uuid::new_v4(),
+        commit_uuid,
         abort_handle: collector.abort_log.clone(),
         target_ref: &target_ref,
         snapshot_properties: &snapshot_properties,
@@ -141,6 +198,36 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
             )
         }
     }
+}
+
+async fn run_atomic_partition_replacement(
+    ctx: CommitCtx<'_>,
+    replacement: AtomicPartitionReplacement,
+) -> Result<CommitOutcome, String> {
+    let mut staged = super::overwrite::build_staged_overwrite_action(ctx).await?;
+    let snapshot_updates = staged.action.take_updates();
+    if snapshot_updates.len() != 2
+        || !matches!(snapshot_updates[0], TableUpdate::AddSnapshot { .. })
+        || !matches!(snapshot_updates[1], TableUpdate::SetSnapshotRef { .. })
+    {
+        return Err(
+            "atomic Iceberg repartition overwrite did not produce AddSnapshot then SetSnapshotRef"
+                .to_string(),
+        );
+    }
+    let mut updates = replacement.updates;
+    updates.extend(snapshot_updates);
+    let commit = TableCommit::builder()
+        .ident(staged.table_ident.clone())
+        .requirements(staged.action.take_requirements())
+        .updates(updates)
+        .build();
+    staged
+        .catalog
+        .update_table(commit)
+        .await
+        .map_err(|error| format!("atomic Iceberg repartition commit failed: {error}"))?;
+    Ok(staged.outcome)
 }
 
 async fn handle_commit_error(

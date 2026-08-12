@@ -442,6 +442,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     selected_rewrite: None,
                     target_ref,
                     snapshot_properties,
+                    atomic_partition_replacement: None,
                 })
                 .await
             })
@@ -1191,6 +1192,7 @@ fn recovery_evidence(
         base_snapshot_id: payload.base_snapshot_id,
         base_sequence_number: 0,
         staging_dir: String::new(),
+        manifest_cleanup_token: None,
     }
 }
 

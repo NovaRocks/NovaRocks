@@ -97,6 +97,7 @@ pub struct IcebergCommitCollector {
     /// without rebasing it onto a contiguous range.
     preserve_row_lineage: AtomicBool,
     committed: AtomicBool,
+    manifest_cleanup_token: Mutex<Option<String>>,
 }
 
 impl crate::commit::service::CommitRecoverySource for IcebergCommitCollector {
@@ -118,6 +119,13 @@ impl crate::commit::service::CommitRecoverySource for IcebergCommitCollector {
 
     fn recovery_staging_dir(&self) -> String {
         self.staging_dir.clone()
+    }
+
+    fn recovery_manifest_cleanup_token(&self) -> Option<String> {
+        self.manifest_cleanup_token
+            .lock()
+            .expect("manifest cleanup token poisoned")
+            .clone()
     }
 }
 
@@ -150,7 +158,15 @@ impl IcebergCommitCollector {
             sketch_sets: Mutex::new(Vec::new()),
             preserve_row_lineage: AtomicBool::new(false),
             committed: AtomicBool::new(false),
+            manifest_cleanup_token: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn set_manifest_cleanup_token(&self, token: String) {
+        *self
+            .manifest_cleanup_token
+            .lock()
+            .expect("manifest cleanup token poisoned") = Some(token);
     }
 
     pub(crate) fn with_table_metadata(mut self, metadata: TableMetadata) -> Self {

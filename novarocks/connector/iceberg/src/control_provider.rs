@@ -40,6 +40,7 @@ use novarocks_spi::connector::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::commit::write_control::operation_marker_partitioning;
 use crate::control_runtime::IcebergControlRuntime;
 use crate::file_reader::execution_payload::{
     ICEBERG_SPLIT_V5, IcebergFrozenScanUnitPayload, IcebergMetadataSplitPayloadV1,
@@ -837,39 +838,40 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
                 })
         };
         let target_ancestors = staged_publication_target_ancestors(metadata, target_snapshot_id);
-        let disposition = match (staging_snapshot_id, target_snapshot_id) {
-            (Some(staging), Some(target)) if staging == target => {
-                if marker_for(staging) {
-                    ConnectorStagedPublicationDisposition::CleanupPending
-                } else {
-                    ConnectorStagedPublicationDisposition::Ambiguous
-                }
-            }
-            (Some(staging), _) if target_ancestors.contains(&staging) => {
-                if marker_for(staging) {
-                    ConnectorStagedPublicationDisposition::Superseded
-                } else {
-                    ConnectorStagedPublicationDisposition::Ambiguous
-                }
-            }
-            (Some(staging), _) if marker_for(staging) => {
-                ConnectorStagedPublicationDisposition::Staged
-            }
-            (Some(_), _) => ConnectorStagedPublicationDisposition::Ambiguous,
-            (None, Some(target)) if marker_for(target) => {
-                ConnectorStagedPublicationDisposition::Published
-            }
-            (None, _) => ConnectorStagedPublicationDisposition::KnownUncommitted,
-        };
+        let target_marker_snapshot_id = target_ancestors
+            .iter()
+            .copied()
+            .filter(|snapshot_id| marker_for(*snapshot_id))
+            .try_fold(None, |matched, snapshot_id| match matched {
+                None => Ok(Some(snapshot_id)),
+                Some(_) => Err(corrupt(
+                    "Iceberg target lineage contains multiple matching MV refresh markers",
+                )),
+            })?;
+        let disposition = staged_publication_disposition(
+            staging_snapshot_id,
+            target_snapshot_id,
+            target_marker_snapshot_id,
+            staging_snapshot_id.is_some_and(marker_for),
+            staging_snapshot_id.is_some_and(|staging| target_ancestors.contains(&staging)),
+        );
         let observed_snapshot = match disposition {
             ConnectorStagedPublicationDisposition::Published
-            | ConnectorStagedPublicationDisposition::CleanupPending => target_snapshot_id,
-            ConnectorStagedPublicationDisposition::Superseded
-            | ConnectorStagedPublicationDisposition::Staged => staging_snapshot_id,
+            | ConnectorStagedPublicationDisposition::CleanupPending => target_marker_snapshot_id,
+            ConnectorStagedPublicationDisposition::Superseded => {
+                target_marker_snapshot_id.or(staging_snapshot_id)
+            }
+            ConnectorStagedPublicationDisposition::Staged => staging_snapshot_id,
             ConnectorStagedPublicationDisposition::KnownUncommitted
             | ConnectorStagedPublicationDisposition::Ambiguous => None,
         };
-        let (committed_version, resulting_row_count, bases, definition_fingerprint) = if matches!(
+        let (
+            committed_version,
+            resulting_row_count,
+            bases,
+            definition_fingerprint,
+            committed_partitioning,
+        ) = if matches!(
             disposition,
             ConnectorStagedPublicationDisposition::Published
                 | ConnectorStagedPublicationDisposition::Superseded
@@ -922,14 +924,16 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
                 Bytes::from(format!("iceberg/recovery/v1/{snapshot_id}")),
                 Some(snapshot_id),
             )?;
+            let committed_partitioning = operation_marker_partitioning(snapshot, metadata)?;
             (
                 Some(version),
                 Some(total_records),
                 bases,
                 Some(Arc::from(provenance.definition_fingerprint)),
+                committed_partitioning,
             )
         } else {
-            (None, None, Vec::new(), None)
+            (None, None, Vec::new(), None, None)
         };
         let proof = IcebergStagedPublicationProofV1 {
             version: ICEBERG_STAGED_PUBLICATION_PROOF_VERSION,
@@ -948,17 +952,34 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
         let proof = encode_staged_publication_proof(&proof)
             .map(Bytes::from)
             .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
-        ConnectorStagedPublicationObservation::try_new(
-            disposition,
-            committed_version,
-            resulting_row_count,
-            bases,
-            definition_fingerprint,
-            staging_snapshot_id,
-            target_snapshot_id,
-            staging_snapshot_id.is_some(),
-            ConnectorStagedPublicationProof::try_new(proof)?,
-        )
+        let proof = ConnectorStagedPublicationProof::try_new(proof)?;
+        match committed_partitioning {
+            Some(partitioning) => {
+                ConnectorStagedPublicationObservation::try_new_with_committed_partitioning(
+                    disposition,
+                    committed_version,
+                    resulting_row_count,
+                    bases,
+                    definition_fingerprint,
+                    staging_snapshot_id,
+                    target_snapshot_id,
+                    partitioning,
+                    staging_snapshot_id.is_some(),
+                    proof,
+                )
+            }
+            None => ConnectorStagedPublicationObservation::try_new(
+                disposition,
+                committed_version,
+                resulting_row_count,
+                bases,
+                definition_fingerprint,
+                staging_snapshot_id,
+                target_snapshot_id,
+                staging_snapshot_id.is_some(),
+                proof,
+            ),
+        }
     }
 
     fn cleanup(
@@ -1216,6 +1237,47 @@ fn staged_publication_target_ancestors(
             .and_then(|snapshot| snapshot.parent_snapshot_id());
     }
     ancestors
+}
+
+fn staged_publication_disposition(
+    staging_snapshot_id: Option<i64>,
+    target_snapshot_id: Option<i64>,
+    target_marker_snapshot_id: Option<i64>,
+    staging_has_marker: bool,
+    staging_is_target_ancestor: bool,
+) -> ConnectorStagedPublicationDisposition {
+    // Atomic managed repartition publishes directly to the target ref in the
+    // same commit as the partition-spec transition. A staging ref may still
+    // witness the old parent and must not hide this stronger target marker.
+    if let Some(marker_snapshot_id) = target_marker_snapshot_id {
+        if target_snapshot_id == Some(marker_snapshot_id) {
+            return if staging_snapshot_id == Some(marker_snapshot_id) {
+                ConnectorStagedPublicationDisposition::CleanupPending
+            } else {
+                ConnectorStagedPublicationDisposition::Published
+            };
+        }
+        return ConnectorStagedPublicationDisposition::Superseded;
+    }
+    match (staging_snapshot_id, target_snapshot_id) {
+        (Some(staging), Some(target)) if staging == target => {
+            if staging_has_marker {
+                ConnectorStagedPublicationDisposition::CleanupPending
+            } else {
+                ConnectorStagedPublicationDisposition::Ambiguous
+            }
+        }
+        (Some(_), _) if staging_is_target_ancestor => {
+            if staging_has_marker {
+                ConnectorStagedPublicationDisposition::Superseded
+            } else {
+                ConnectorStagedPublicationDisposition::Ambiguous
+            }
+        }
+        (Some(_), _) if staging_has_marker => ConnectorStagedPublicationDisposition::Staged,
+        (Some(_), _) => ConnectorStagedPublicationDisposition::Ambiguous,
+        (None, _) => ConnectorStagedPublicationDisposition::KnownUncommitted,
+    }
 }
 
 fn recovery_cleanup_lock_error<T>(error: std::sync::PoisonError<T>) -> ConnectorError {
@@ -2126,6 +2188,7 @@ mod staged_publication_recovery_tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use base64::Engine;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorHistoricalPublicationAction, ConnectorInstanceId,
@@ -2136,8 +2199,13 @@ mod staged_publication_recovery_tests {
     use super::*;
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-    use crate::iceberg::{NamespaceIdent, TableCreation};
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
+        SnapshotRetention, Summary, Transform, Type, UnboundPartitionSpecBuilder,
+    };
+    use crate::iceberg::{
+        NamespaceIdent, TableCommit, TableCreation, TableRequirement, TableUpdate,
+    };
     use crate::resources::IcebergControlResources;
 
     struct NeverCancelled;
@@ -2355,6 +2423,184 @@ mod staged_publication_recovery_tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn atomic_main_marker_wins_over_old_staging_ancestor() {
+        let disposition = staged_publication_disposition(Some(10), Some(11), Some(11), false, true);
+        assert_eq!(
+            disposition,
+            ConnectorStagedPublicationDisposition::Published
+        );
+        assert!(Some(10_i64).is_some());
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestAtomicOperationMarker {
+        version: u8,
+        instance_id: String,
+        incarnation_base64: String,
+        operation_id_base64: String,
+        target_ref: String,
+        cohort_set_digest_base64: String,
+        aggregate_digest_base64: String,
+        partition_replacement_id_base64: Option<String>,
+        expected_prior_partition_spec_id: Option<i32>,
+        expected_prior_partition_observation_base64: Option<String>,
+        committed_partition_spec_id: Option<i32>,
+        committed_partitioning_digest_base64: Option<String>,
+    }
+
+    #[test]
+    fn historical_inspection_finds_atomic_publication_below_later_main_head() {
+        let (executor, _warehouse, provider, table) = provider_with_empty_table();
+        let metadata = table.metadata().clone();
+        let unbound = UnboundPartitionSpecBuilder::new()
+            .add_partition_field(1, "value", Transform::Identity)
+            .expect("partition field")
+            .build();
+        let prospective =
+            crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
+                .add_default_partition_spec(unbound)
+                .expect("add default spec")
+                .build()
+                .expect("prospective metadata");
+        let spec_id = prospective.metadata.default_partition_spec_id();
+        let committed = crate::commit::write_control::committed_partitioning_from_metadata(
+            &prospective.metadata,
+            spec_id,
+        )
+        .expect("committed partitioning");
+        let write_operation_id =
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([12; 16]);
+        let prior_observation =
+            novarocks_spi::connector::ConnectorManagedPartitionSpecObservation::try_from_fields(
+                metadata.default_partition_spec_id(),
+                &[],
+            )
+            .expect("prior observation");
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let marker = TestAtomicOperationMarker {
+            version: 1,
+            instance_id: provider.descriptor.instance_id.as_str().to_string(),
+            incarnation_base64: b64(&provider.incarnation.to_bytes()),
+            operation_id_base64: b64(&write_operation_id.to_bytes()),
+            target_ref: "main".to_string(),
+            cohort_set_digest_base64: b64(&[13; 32]),
+            aggregate_digest_base64: b64(&[14; 32]),
+            partition_replacement_id_base64: Some(b64(
+                &novarocks_spi::connector::ConnectorManagedPartitionSpecReplacementId::derive(
+                    write_operation_id,
+                )
+                .to_bytes(),
+            )),
+            expected_prior_partition_spec_id: Some(metadata.default_partition_spec_id()),
+            expected_prior_partition_observation_base64: Some(b64(
+                &prior_observation.layout_digest()
+            )),
+            committed_partition_spec_id: Some(spec_id),
+            committed_partitioning_digest_base64: Some(b64(&committed.digest())),
+        };
+        let mut properties = crate::commit::MvProvenanceV1 {
+            provenance_version: crate::commit::MV_PROVENANCE_VERSION,
+            refresh_id: 41,
+            mv_id: 7,
+            token: "refresh-41".to_string(),
+            technique: crate::commit::RefreshTechnique::Full,
+            bases: Vec::new(),
+            definition_fingerprint: "definition-fingerprint".to_string(),
+            rows: 3,
+        }
+        .to_summary_properties()
+        .expect("provenance properties");
+        properties.insert("total-records".to_string(), "3".to_string());
+        properties.insert(
+            "novarocks.write.operation.v1".to_string(),
+            serde_json::to_string(&marker).expect("operation marker"),
+        );
+        let published_snapshot_id = 101;
+        let later_snapshot_id = 102;
+        let published = Snapshot::builder()
+            .with_snapshot_id(published_snapshot_id)
+            .with_sequence_number(1)
+            .with_timestamp_ms(metadata.last_updated_ms() + 1)
+            .with_manifest_list("file:///tmp/published.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Overwrite,
+                additional_properties: properties.into_iter().collect(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .build();
+        let later = Snapshot::builder()
+            .with_snapshot_id(later_snapshot_id)
+            .with_parent_snapshot_id(Some(published_snapshot_id))
+            .with_sequence_number(2)
+            .with_timestamp_ms(metadata.last_updated_ms() + 2)
+            .with_manifest_list("file:///tmp/later.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .build();
+        let mut updates = prospective.changes;
+        updates.extend([
+            TableUpdate::AddSnapshot {
+                snapshot: published,
+            },
+            TableUpdate::AddSnapshot { snapshot: later },
+            TableUpdate::SetSnapshotRef {
+                ref_name: "main".to_string(),
+                reference: SnapshotReference {
+                    snapshot_id: later_snapshot_id,
+                    retention: SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                },
+            },
+        ]);
+        let catalog = Arc::clone(provider.runtime.catalog());
+        executor.block_on(async move {
+            catalog
+                .update_table(
+                    TableCommit::builder()
+                        .ident(table.identifier().clone())
+                        .requirements(vec![
+                            TableRequirement::UuidMatch {
+                                uuid: metadata.uuid(),
+                            },
+                            TableRequirement::DefaultSpecIdMatch {
+                                default_spec_id: metadata.default_partition_spec_id(),
+                            },
+                            TableRequirement::RefSnapshotIdMatch {
+                                r#ref: "main".to_string(),
+                                snapshot_id: None,
+                            },
+                        ])
+                        .updates(updates)
+                        .build(),
+                )
+                .await
+                .expect("atomic publication plus later main snapshot");
+        });
+        let descriptor = recovery_descriptor(&provider, provider.descriptor.instance_id.clone());
+        let observation = provider
+            .inspect(descriptor, context())
+            .expect("historical inspection");
+        assert_eq!(
+            observation.disposition,
+            ConnectorStagedPublicationDisposition::Superseded
+        );
+        assert_eq!(
+            observation
+                .committed_version
+                .as_ref()
+                .and_then(ConnectorCommittedVersion::snapshot_id),
+            Some(published_snapshot_id)
+        );
+        assert_eq!(observation.committed_partitioning, Some(committed));
     }
 
     #[test]

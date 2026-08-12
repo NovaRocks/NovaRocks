@@ -33,10 +33,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceIncarnation, ConnectorManagedPublicationEmptyInputDisposition,
-    ConnectorManagedPublicationTechnique, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorRowMutationActivationRequest,
+    ConnectorCommittedPartitionField, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
+    ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
+    ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionTransform,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorRowMutationActivationRequest,
     ConnectorRowMutationExecutionPlan, ConnectorRowMutationPreparationOutcome,
     ConnectorRowMutationPreparationRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
     ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
@@ -159,6 +162,16 @@ struct ActiveOperation {
     target: ActiveTarget,
     cohorts: HashMap<ConnectorWriteCohortId, CohortService>,
     distributed_rewrite: Option<DistributedRewriteOperation>,
+    partition_replacement: Option<ActivePartitionReplacement>,
+}
+
+#[derive(Clone)]
+struct ActivePartitionReplacement {
+    replacement_id: [u8; 32],
+    expected_prior_default: ConnectorManagedPartitionSpecObservation,
+    prospective_metadata: crate::iceberg::spec::TableMetadata,
+    metadata_updates: Vec<crate::iceberg::TableUpdate>,
+    committed: novarocks_spi::connector::ConnectorCommittedPartitioning,
 }
 
 #[derive(Clone)]
@@ -259,6 +272,16 @@ struct IcebergWriteOperationMarkerV1 {
     target_ref: String,
     cohort_set_digest_base64: String,
     aggregate_digest_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partition_replacement_id_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_prior_partition_spec_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_prior_partition_observation_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    committed_partition_spec_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    committed_partitioning_digest_base64: Option<String>,
 }
 
 /// Canonical provider payload inside an SPI reconciliation evidence envelope.
@@ -269,6 +292,11 @@ pub struct IcebergWriteReconcileEvidenceV1 {
     operation_id_base64: String,
     cohort_set_digest_base64: String,
     aggregate_digest_base64: String,
+    partition_replacement_id_base64: Option<String>,
+    expected_prior_partition_spec_id: Option<i32>,
+    expected_prior_partition_observation_base64: Option<String>,
+    committed_partition_spec_id: Option<i32>,
+    committed_partitioning_digest_base64: Option<String>,
     recovery: IcebergRecoveryEvidenceV1,
 }
 
@@ -280,6 +308,7 @@ struct IcebergRecoveryEvidenceV1 {
     base_snapshot_id: Option<i64>,
     base_sequence_number: i64,
     staging_dir: String,
+    manifest_cleanup_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -352,6 +381,7 @@ impl IcebergWriteControl {
         };
         let mut cohorts = HashMap::with_capacity(activation.cohorts().len());
         let mut operation_target = None;
+        let mut operation_partition_replacement = None;
         for activated in activation.cohorts() {
             let preparation = activated.preparation();
             let table = self.provider.table_payload(preparation.table())?;
@@ -370,6 +400,34 @@ impl IcebergWriteControl {
                         "decode admitted Iceberg write table metadata: {error}"
                     ))
                 })?;
+            let partition_replacement = match &request.intent {
+                ConnectorWriteActivationIntent::ManagedPublication(intent) => intent
+                    .partition_spec_replacement()
+                    .map(|replacement| {
+                        prepare_partition_replacement(&metadata, replacement, request.operation_id)
+                    })
+                    .transpose()?,
+                ConnectorWriteActivationIntent::Ordinary => None,
+            };
+            if let Some(replacement) = &partition_replacement {
+                if preparation.target_ref().as_str() != "main" {
+                    return Err(invalid(
+                        "Iceberg managed partition replacement must be prepared against main",
+                    ));
+                }
+                if operation_partition_replacement.as_ref().is_some_and(
+                    |existing: &ActivePartitionReplacement| {
+                        existing.replacement_id != replacement.replacement_id
+                            || existing.expected_prior_default != replacement.expected_prior_default
+                            || existing.committed != replacement.committed
+                    },
+                ) {
+                    return Err(invalid(
+                        "Iceberg write cohorts disagree on their atomic partition replacement",
+                    ));
+                }
+                operation_partition_replacement = Some(replacement.clone());
+            }
             let target_snapshot_id = crate::ref_snapshot::resolve_branch_head_snapshot_id(
                 &metadata,
                 preparation.target_ref().as_str(),
@@ -394,9 +452,13 @@ impl IcebergWriteControl {
                 ));
             }
             operation_target = Some(target);
+            let writer_metadata = partition_replacement
+                .as_ref()
+                .map(|replacement| &replacement.prospective_metadata)
+                .unwrap_or(&metadata);
             let writer_payload = self.writer_payload(
                 preparation.input(),
-                &metadata,
+                writer_metadata,
                 &table_info.namespace,
                 &table_info.table,
                 preparation.target_ref().as_str(),
@@ -477,6 +539,7 @@ impl IcebergWriteControl {
                 .ok_or_else(|| corrupt("Iceberg activation has no operation target"))?,
             cohorts,
             distributed_rewrite: None,
+            partition_replacement: operation_partition_replacement,
         })
     }
 
@@ -1083,8 +1146,13 @@ impl IcebergWriteControl {
             .load_exact_commit_table(&active.target)
             .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
         let metadata = table.metadata().clone();
+        let commit_metadata = active
+            .partition_replacement
+            .as_ref()
+            .map(|replacement| &replacement.prospective_metadata)
+            .unwrap_or(&metadata);
         let decoded = self
-            .decode_commit_cohorts(request, active, &metadata)
+            .decode_commit_cohorts(request, active, commit_metadata)
             .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
         let staged_data_rows = decoded
             .iter()
@@ -1149,15 +1217,15 @@ impl IcebergWriteControl {
                 table_ident,
                 active.target.base_snapshot_id,
                 metadata.last_sequence_number(),
-                metadata.current_schema().clone(),
-                metadata.default_partition_spec().clone(),
+                commit_metadata.current_schema().clone(),
+                commit_metadata.default_partition_spec().clone(),
                 format!(
                     "{}/_staging/{}",
                     data_location(&metadata).trim_end_matches('/'),
                     request.operation_id()
                 ),
             )
-            .with_table_metadata(metadata.clone()),
+            .with_table_metadata(commit_metadata.clone()),
         );
         for cohort in &decoded {
             if op_kind == CommitOpKind::RowDeltaDvFromFiles
@@ -1191,8 +1259,22 @@ impl IcebergWriteControl {
             cleanup_path_mapper,
             cow_update_rewrite,
             selected_rewrite,
-            target_ref: active.target.target_ref.clone(),
+            target_ref: if active.partition_replacement.is_some() {
+                "main".to_string()
+            } else {
+                active.target.target_ref.clone()
+            },
             snapshot_properties,
+            atomic_partition_replacement: active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| {
+                    super::run::AtomicPartitionReplacement::try_new(
+                        replacement.metadata_updates.clone(),
+                    )
+                })
+                .transpose()
+                .map_err(CommitServiceError::invalid_input)?,
         };
         let result = self
             .runtime
@@ -1210,9 +1292,13 @@ impl IcebergWriteControl {
         } else {
             None
         };
-        let receipt = crate::write_codec::connector_write_receipt(
+        let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
             result.new_snapshot_id,
             resulting_row_count,
+            active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| replacement.committed.clone()),
         )
         .map_err(CommitServiceError::invalid_input)?;
         Ok(ExternalMutationOutcome::KnownCommitted {
@@ -1264,9 +1350,32 @@ impl IcebergWriteControl {
             instance_id: self.key.instance_id.as_str().to_string(),
             incarnation_base64: base64_encode(self.key.incarnation.to_bytes()),
             operation_id_base64: base64_encode(operation_id.to_bytes()),
-            target_ref: active.target.target_ref.clone(),
+            target_ref: if active.partition_replacement.is_some() {
+                "main".to_string()
+            } else {
+                active.target.target_ref.clone()
+            },
             cohort_set_digest_base64: base64_encode(cohort_set_digest),
             aggregate_digest_base64: base64_encode(aggregate_digest),
+            partition_replacement_id_base64: active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| base64_encode(replacement.replacement_id)),
+            expected_prior_partition_observation_base64: active.partition_replacement.as_ref().map(
+                |replacement| base64_encode(replacement.expected_prior_default.layout_digest()),
+            ),
+            expected_prior_partition_spec_id: active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| replacement.expected_prior_default.provider_spec_id()),
+            committed_partition_spec_id: active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| replacement.committed.spec_id()),
+            committed_partitioning_digest_base64: active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| base64_encode(replacement.committed.digest())),
         }
     }
 
@@ -1277,12 +1386,20 @@ impl IcebergWriteControl {
     }
 
     fn cleanup_files(&self, files: &[WrittenFile]) -> Result<super::CleanupAttempt, String> {
-        if files.is_empty() {
+        self.cleanup_paths(files.iter().map(|file| file.path.as_str()))
+    }
+
+    fn cleanup_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<super::CleanupAttempt, String> {
+        let paths = paths.into_iter().collect::<BTreeSet<_>>();
+        if paths.is_empty() {
             return Ok(super::CleanupAttempt::completed(Vec::new()));
         }
         let binding = self.runtime.resources().planning_binding();
         let access = binding
-            .resolve_access_for_locations(files.iter().map(|file| file.path.as_str()))
+            .resolve_access_for_locations(paths.iter().copied())
             .map_err(|error| error.to_string())?;
         let paths = access
             .operator_relative_paths()
@@ -1304,12 +1421,67 @@ impl IcebergWriteControl {
         Ok(super::CleanupAttempt::from_cleanup_errors(&cleanup))
     }
 
+    fn cleanup_operation_manifests(
+        &self,
+        target: &ActiveTarget,
+        token: &str,
+    ) -> Result<super::CleanupAttempt, String> {
+        let metadata_dir = format!("{}/metadata", target.location.trim_end_matches('/'));
+        let binding = self.runtime.resources().planning_binding();
+        let access = binding
+            .resolve_access_for_locations([metadata_dir.as_str()])
+            .map_err(|error| error.to_string())?;
+        let relative_paths = access.operator_relative_paths();
+        let [relative_dir] = relative_paths.as_slice() else {
+            return Err(
+                "resolve Iceberg manifest cleanup directory: expected exactly one path".to_string(),
+            );
+        };
+        let prefix = format!("{}/", relative_dir.trim_end_matches('/'));
+        let operator = access.operator();
+        let token = token.to_string();
+        let error_paths = self
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                let entries = match operator.list(&prefix).await {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
+                        return Ok::<_, String>(Vec::new());
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "list Iceberg operation manifest prefix `{prefix}`: {error}"
+                        ));
+                    }
+                };
+                let mut errors = Vec::new();
+                for entry in entries {
+                    if entry.metadata().is_dir() {
+                        continue;
+                    }
+                    let Some(name) = entry.path().rsplit('/').next() else {
+                        continue;
+                    };
+                    if operation_manifest_name_owned(name, &token) {
+                        if let Err(error) = operator.delete(entry.path()).await {
+                            errors.push(format!("{}: {error}", entry.path()));
+                        }
+                    }
+                }
+                Ok(errors)
+            })??;
+        Ok(super::CleanupAttempt::completed(error_paths))
+    }
+
     /// Seal provider recovery facts into the exact-generation SPI envelope.
     /// The provider commit action calls this only after it has classified an
     /// external commit result as uncertain.
-    pub fn encode_commit_unknown_evidence(
+    fn encode_commit_unknown_evidence(
         &self,
         request: &ConnectorWriteCommitRequest,
+        active: &ActiveOperation,
         recovery: RecoveryEvidence,
     ) -> Result<ExternalMutationEvidence, ConnectorError> {
         let payload = canonical_json(
@@ -1318,12 +1490,35 @@ impl IcebergWriteControl {
                 operation_id_base64: base64_encode(request.operation_id().to_bytes()),
                 cohort_set_digest_base64: base64_encode(request.sealed().digest()),
                 aggregate_digest_base64: base64_encode(request.aggregate_digest()),
+                partition_replacement_id_base64: active
+                    .partition_replacement
+                    .as_ref()
+                    .map(|replacement| base64_encode(replacement.replacement_id)),
+                expected_prior_partition_observation_base64: active
+                    .partition_replacement
+                    .as_ref()
+                    .map(|replacement| {
+                        base64_encode(replacement.expected_prior_default.layout_digest())
+                    }),
+                expected_prior_partition_spec_id: active
+                    .partition_replacement
+                    .as_ref()
+                    .map(|replacement| replacement.expected_prior_default.provider_spec_id()),
+                committed_partition_spec_id: active
+                    .partition_replacement
+                    .as_ref()
+                    .map(|replacement| replacement.committed.spec_id()),
+                committed_partitioning_digest_base64: active
+                    .partition_replacement
+                    .as_ref()
+                    .map(|replacement| base64_encode(replacement.committed.digest())),
                 recovery: IcebergRecoveryEvidenceV1 {
                     table_ident: recovery.table_ident,
                     op_kind: format!("{:?}", recovery.op_kind),
                     base_snapshot_id: recovery.base_snapshot_id,
                     base_sequence_number: recovery.base_sequence_number,
                     staging_dir: recovery.staging_dir,
+                    manifest_cleanup_token: recovery.manifest_cleanup_token,
                 },
             },
             "Iceberg write reconciliation evidence",
@@ -1373,6 +1568,28 @@ impl IcebergWriteControl {
         }
         decode_fixed::<32>(&decoded.cohort_set_digest_base64, "cohort set digest")?;
         decode_fixed::<32>(&decoded.aggregate_digest_base64, "aggregate digest")?;
+        if let Some(token) = decoded.recovery.manifest_cleanup_token.as_deref() {
+            let parsed = uuid::Uuid::parse_str(token).map_err(|error| {
+                invalid(format!(
+                    "Iceberg write reconciliation manifest cleanup token is invalid: {error}"
+                ))
+            })?;
+            if parsed.to_string() != token {
+                return Err(invalid(
+                    "Iceberg write reconciliation manifest cleanup token is not canonical",
+                ));
+            }
+        }
+        validate_partition_reconcile_facts(
+            &decoded.operation_id_base64,
+            decoded.partition_replacement_id_base64.as_deref(),
+            decoded.expected_prior_partition_spec_id,
+            decoded
+                .expected_prior_partition_observation_base64
+                .as_deref(),
+            decoded.committed_partition_spec_id,
+            decoded.committed_partitioning_digest_base64.as_deref(),
+        )?;
         Ok(decoded)
     }
 }
@@ -1638,7 +1855,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
                         ConnectorMutationFailureKind::Unavailable,
                         message,
                     ),
-                    evidence: self.encode_commit_unknown_evidence(&request, evidence)?,
+                    evidence: self.encode_commit_unknown_evidence(&request, &active, evidence)?,
                 },
                 None,
             ),
@@ -1649,9 +1866,13 @@ impl ConnectorWriteControl for IcebergWriteControl {
             }) => (
                 ExternalMutationOutcome::KnownCommitted {
                     effect: ExternalMutationEffect::Applied,
-                    receipt: crate::write_codec::connector_write_receipt(
+                    receipt: crate::write_codec::connector_write_receipt_with_partitioning(
                         committed.new_snapshot_id,
                         None,
+                        active
+                            .partition_replacement
+                            .as_ref()
+                            .map(|replacement| replacement.committed.clone()),
                     )
                     .map_err(internal)?,
                     finalization: ExternalMutationFinalization::Failed(
@@ -1673,7 +1894,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
                         ConnectorMutationFailureKind::Internal,
                         finalize_error,
                     ),
-                    evidence: self.encode_commit_unknown_evidence(&request, evidence)?,
+                    evidence: self.encode_commit_unknown_evidence(&request, &active, evidence)?,
                 },
                 None,
             ),
@@ -1828,6 +2049,11 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 .load_table(&active.target.namespace, &active.target.table)
                 .map_err(unavailable)?;
             let metadata = physical.table.metadata();
+            let decode_metadata = active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| &replacement.prospective_metadata)
+                .unwrap_or(metadata);
             let converter = IcebergCommitCollector::new(
                 CommitOpKind::FastAppend,
                 crate::iceberg::TableIdent::from_strs([
@@ -1837,9 +2063,9 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 .map_err(|error| invalid(format!("build Iceberg table identity: {error}")))?,
                 active.target.base_snapshot_id,
                 metadata.last_sequence_number(),
-                metadata.current_schema().clone(),
-                metadata.default_partition_spec().clone(),
-                data_location(metadata),
+                decode_metadata.current_schema().clone(),
+                decode_metadata.default_partition_spec().clone(),
+                data_location(decode_metadata),
             );
             let mut files = Vec::new();
             for completion in &request.cohorts {
@@ -1859,9 +2085,11 @@ impl ConnectorWriteControl for IcebergWriteControl {
                     }
                     for staged in attempt.reports() {
                         staged.validate()?;
-                        for report in
-                            crate::write_codec::decode_writer_reports(staged.payload(), metadata)
-                                .map_err(invalid)?
+                        for report in crate::write_codec::decode_writer_reports(
+                            staged.payload(),
+                            decode_metadata,
+                        )
+                        .map_err(invalid)?
                         {
                             files.push(converter.convert_writer_report(report).map_err(invalid)?);
                         }
@@ -1967,6 +2195,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 }
             }
         };
+        ensure_reconcile_partition_facts(&evidence, operation_id, &unknown.active)?;
         self.invalidate_target_caches(&unknown.active.target);
         let ident = crate::iceberg::TableIdent::from_strs([
             unknown.active.target.namespace.as_str(),
@@ -2015,12 +2244,35 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 }
                 ConnectorWriteActivationIntent::Ordinary => None,
             };
+            let committed_partitioning = unknown
+                .active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| {
+                    let actual = committed_partitioning_from_metadata(
+                        table.metadata(),
+                        replacement.committed.spec_id(),
+                    )?;
+                    if actual != replacement.committed
+                        || !snapshot_is_main_ancestor(
+                            table.metadata(),
+                            snapshot.snapshot_id(),
+                        )
+                    {
+                        return Err(corrupt(
+                            "Iceberg atomic repartition marker conflicts with committed table partitioning or main snapshot",
+                        ));
+                    }
+                    Ok(actual)
+                })
+                .transpose()?;
             (
                 ExternalMutationOutcome::KnownCommitted {
                     effect: ExternalMutationEffect::Applied,
-                    receipt: crate::write_codec::connector_write_receipt(
+                    receipt: crate::write_codec::connector_write_receipt_with_partitioning(
                         snapshot.snapshot_id(),
                         row_count,
+                        committed_partitioning,
                     )
                     .map_err(internal)?,
                     finalization: ExternalMutationFinalization::Complete,
@@ -2028,13 +2280,28 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 None,
             )
         } else {
+            let decode_metadata = unknown
+                .active
+                .partition_replacement
+                .as_ref()
+                .map(|replacement| &replacement.prospective_metadata)
+                .unwrap_or_else(|| table.metadata());
             let decoded =
-                self.decode_commit_cohorts(&unknown.request, &unknown.active, table.metadata())?;
+                self.decode_commit_cohorts(&unknown.request, &unknown.active, decode_metadata)?;
             let files = decoded
                 .into_iter()
                 .flat_map(|cohort| cohort.files)
                 .collect::<Vec<_>>();
-            let cleanup = self.cleanup_files(&files).map_err(internal)?;
+            let data_cleanup = self.cleanup_files(&files).map_err(internal)?;
+            let manifest_cleanup = evidence
+                .recovery
+                .manifest_cleanup_token
+                .as_deref()
+                .map(|token| self.cleanup_operation_manifests(&unknown.active.target, token))
+                .transpose()
+                .map_err(internal)?
+                .unwrap_or_else(super::CleanupAttempt::not_attempted);
+            let cleanup = merge_cleanup_attempts(data_cleanup, manifest_cleanup);
             (
                 ExternalMutationOutcome::KnownUncommitted {
                     failure: ConnectorMutationFailure::new(
@@ -2082,6 +2349,97 @@ impl ConnectorWriteControl for IcebergWriteControl {
         self.activations.release(operation_id)?;
         Ok(outcome)
     }
+}
+
+fn operation_manifest_name_owned(name: &str, token: &str) -> bool {
+    let manifest_prefix = format!("{token}-");
+    if let Some(rest) = name.strip_prefix(&manifest_prefix) {
+        return rest.ends_with(".avro")
+            && [
+                "append-data-",
+                "overwrite-",
+                "row-delta-",
+                "rewrite-",
+                "cow-update-",
+                "truncate-",
+                "selected-rewrite-",
+            ]
+            .iter()
+            .any(|prefix| rest.starts_with(prefix));
+    }
+    let snapshot_suffix = format!("-{token}.avro");
+    name.strip_prefix("snap-")
+        .and_then(|rest| rest.strip_suffix(&snapshot_suffix))
+        .is_some_and(|snapshot_id| snapshot_id.parse::<i64>().is_ok())
+}
+
+fn ensure_reconcile_partition_facts(
+    evidence: &IcebergWriteReconcileEvidenceV1,
+    operation_id: ConnectorWriteOperationId,
+    active: &ActiveOperation,
+) -> Result<(), ConnectorError> {
+    let expected = active.partition_replacement.as_ref();
+    let actual_replacement_id = evidence
+        .partition_replacement_id_base64
+        .as_deref()
+        .map(|raw| decode_fixed::<32>(raw, "partition replacement id"))
+        .transpose()?;
+    let actual_prior_digest = evidence
+        .expected_prior_partition_observation_base64
+        .as_deref()
+        .map(|raw| decode_fixed::<32>(raw, "prior partition observation"))
+        .transpose()?;
+    let actual_committed_digest = evidence
+        .committed_partitioning_digest_base64
+        .as_deref()
+        .map(|raw| decode_fixed::<32>(raw, "committed partitioning digest"))
+        .transpose()?;
+    match expected {
+        Some(expected)
+            if actual_replacement_id == Some(expected.replacement_id)
+                && actual_replacement_id
+                    == Some(
+                        novarocks_spi::connector::ConnectorManagedPartitionSpecReplacementId::derive(
+                            operation_id,
+                        )
+                        .to_bytes(),
+                    )
+                && evidence.expected_prior_partition_spec_id
+                    == Some(expected.expected_prior_default.provider_spec_id())
+                && actual_prior_digest
+                    == Some(expected.expected_prior_default.layout_digest())
+                && evidence.committed_partition_spec_id == Some(expected.committed.spec_id())
+                && actual_committed_digest == Some(expected.committed.digest()) => Ok(()),
+        None
+            if actual_replacement_id.is_none()
+                && evidence.expected_prior_partition_spec_id.is_none()
+                && actual_prior_digest.is_none()
+                && evidence.committed_partition_spec_id.is_none()
+                && actual_committed_digest.is_none() => Ok(()),
+        _ => Err(invalid(
+            "Iceberg write reconciliation partition replacement evidence does not match its active operation",
+        )),
+    }
+}
+
+fn snapshot_is_main_ancestor(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    expected: i64,
+) -> bool {
+    let mut cursor = metadata.current_snapshot_id();
+    let mut visited = BTreeSet::new();
+    while let Some(snapshot_id) = cursor {
+        if snapshot_id == expected {
+            return true;
+        }
+        if !visited.insert(snapshot_id) {
+            return false;
+        }
+        cursor = metadata
+            .snapshot_by_id(snapshot_id)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    }
+    false
 }
 
 fn commit_shape(
@@ -2179,6 +2537,242 @@ fn commit_shape(
     Ok((kind, None))
 }
 
+fn prepare_partition_replacement(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    replacement: &ConnectorManagedPartitionSpecReplacement,
+    operation_id: ConnectorWriteOperationId,
+) -> Result<ActivePartitionReplacement, ConnectorError> {
+    if replacement.operation_id() != operation_id {
+        return Err(invalid(
+            "Iceberg managed partition replacement belongs to another write operation",
+        ));
+    }
+    let current_fields = managed_partition_fields(metadata.default_partition_spec())?;
+    let current_observation = ConnectorManagedPartitionSpecObservation::try_from_fields(
+        metadata.default_partition_spec_id(),
+        &current_fields,
+    )?;
+    if current_observation != replacement.expected_prior_default() {
+        return Err(invalid(
+            "Iceberg default partition spec does not match the exact managed observation",
+        ));
+    }
+
+    let schema = metadata.current_schema();
+    let mut builder = crate::iceberg::spec::UnboundPartitionSpecBuilder::new();
+    for field in replacement.fields() {
+        let source = schema.field_by_id(field.source_field_id()).ok_or_else(|| {
+            invalid(format!(
+                "Iceberg managed partition source field {} is absent from the exact schema",
+                field.source_field_id()
+            ))
+        })?;
+        let transform = iceberg_partition_transform(field.transform());
+        transform
+            .result_type(source.field_type.as_ref())
+            .map_err(|error| {
+                invalid(format!(
+                    "Iceberg managed partition transform is invalid for source field {}: {error}",
+                    field.source_field_id()
+                ))
+            })?;
+        builder = builder
+            .add_partition_fields([crate::iceberg::spec::UnboundPartitionField {
+                source_id: field.source_field_id(),
+                field_id: None,
+                name: managed_partition_field_name(source.name.as_str(), field.transform()),
+                transform,
+            }])
+            .map_err(|error| {
+                invalid(format!("build Iceberg replacement partition spec: {error}"))
+            })?;
+    }
+    let build =
+        crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
+            .add_default_partition_spec(builder.build())
+            .map_err(|error| invalid(format!("bind Iceberg replacement partition spec: {error}")))?
+            .build()
+            .map_err(|error| {
+                invalid(format!(
+                    "finalize Iceberg replacement partition spec: {error}"
+                ))
+            })?;
+    if build.changes.len() != 2
+        || !matches!(
+            build.changes[0],
+            crate::iceberg::TableUpdate::AddSpec { .. }
+        )
+        || !matches!(
+            build.changes[1],
+            crate::iceberg::TableUpdate::SetDefaultSpec { .. }
+        )
+    {
+        return Err(invalid(
+            "Iceberg managed partition replacement did not produce AddSpec then SetDefaultSpec",
+        ));
+    }
+    let spec_id = build.metadata.default_partition_spec_id();
+    if spec_id == metadata.default_partition_spec_id() {
+        return Err(invalid(
+            "Iceberg managed partition replacement is identical to the current default spec",
+        ));
+    }
+    let committed_spec = build
+        .metadata
+        .partition_spec_by_id(spec_id)
+        .ok_or_else(|| corrupt("Iceberg prospective default partition spec is missing"))?;
+    let committed_fields = committed_spec
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(position, field)| {
+            let source = build
+                .metadata
+                .current_schema()
+                .field_by_id(field.source_id)
+                .ok_or_else(|| {
+                    corrupt(format!(
+                        "Iceberg prospective partition source field {} is missing",
+                        field.source_id
+                    ))
+                })?;
+            ConnectorCommittedPartitionField::try_new(
+                field.field_id,
+                field.name.clone(),
+                field.source_id,
+                source.name.clone(),
+                u32::try_from(position)
+                    .map_err(|_| corrupt("Iceberg committed partition position exceeds u32"))?,
+                connector_partition_transform(&field.transform)?,
+            )
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    let committed = novarocks_spi::connector::ConnectorCommittedPartitioning::try_new(
+        spec_id,
+        committed_fields,
+    )?;
+    Ok(ActivePartitionReplacement {
+        replacement_id: replacement.replacement_id().to_bytes(),
+        expected_prior_default: replacement.expected_prior_default(),
+        prospective_metadata: build.metadata,
+        metadata_updates: build.changes,
+        committed,
+    })
+}
+
+fn managed_partition_fields(
+    spec: &crate::iceberg::spec::PartitionSpec,
+) -> Result<Vec<ConnectorManagedPartitionField>, ConnectorError> {
+    spec.fields()
+        .iter()
+        .enumerate()
+        .map(|(position, field)| {
+            ConnectorManagedPartitionField::try_new(
+                field.source_id,
+                u32::try_from(position)
+                    .map_err(|_| corrupt("Iceberg partition field position exceeds u32"))?,
+                connector_partition_transform(&field.transform)?,
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn committed_partitioning_from_metadata(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    spec_id: i32,
+) -> Result<novarocks_spi::connector::ConnectorCommittedPartitioning, ConnectorError> {
+    let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+        corrupt(format!(
+            "Iceberg committed partition spec {spec_id} is absent from table metadata"
+        ))
+    })?;
+    let fields = spec
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(position, field)| {
+            let source = metadata
+                .current_schema()
+                .field_by_id(field.source_id)
+                .ok_or_else(|| {
+                    corrupt(format!(
+                        "Iceberg committed partition source field {} is missing",
+                        field.source_id
+                    ))
+                })?;
+            ConnectorCommittedPartitionField::try_new(
+                field.field_id,
+                field.name.clone(),
+                field.source_id,
+                source.name.clone(),
+                u32::try_from(position)
+                    .map_err(|_| corrupt("Iceberg committed partition position exceeds u32"))?,
+                connector_partition_transform(&field.transform)?,
+            )
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    novarocks_spi::connector::ConnectorCommittedPartitioning::try_new(spec_id, fields)
+}
+
+fn connector_partition_transform(
+    transform: &crate::iceberg::spec::Transform,
+) -> Result<ConnectorManagedPartitionTransform, ConnectorError> {
+    use crate::iceberg::spec::Transform;
+    match transform {
+        Transform::Identity => Ok(ConnectorManagedPartitionTransform::Identity),
+        Transform::Year => Ok(ConnectorManagedPartitionTransform::Year),
+        Transform::Month => Ok(ConnectorManagedPartitionTransform::Month),
+        Transform::Day => Ok(ConnectorManagedPartitionTransform::Day),
+        Transform::Hour => Ok(ConnectorManagedPartitionTransform::Hour),
+        Transform::Bucket(buckets) => {
+            Ok(ConnectorManagedPartitionTransform::Bucket { buckets: *buckets })
+        }
+        Transform::Truncate(width) => {
+            Ok(ConnectorManagedPartitionTransform::Truncate { width: *width })
+        }
+        Transform::Void => Ok(ConnectorManagedPartitionTransform::Void),
+        Transform::Unknown => Err(unsupported(
+            "Iceberg managed partition replacement cannot observe an unknown transform",
+        )),
+    }
+}
+
+fn iceberg_partition_transform(
+    transform: ConnectorManagedPartitionTransform,
+) -> crate::iceberg::spec::Transform {
+    use crate::iceberg::spec::Transform;
+    match transform {
+        ConnectorManagedPartitionTransform::Identity => Transform::Identity,
+        ConnectorManagedPartitionTransform::Year => Transform::Year,
+        ConnectorManagedPartitionTransform::Month => Transform::Month,
+        ConnectorManagedPartitionTransform::Day => Transform::Day,
+        ConnectorManagedPartitionTransform::Hour => Transform::Hour,
+        ConnectorManagedPartitionTransform::Bucket { buckets } => Transform::Bucket(buckets),
+        ConnectorManagedPartitionTransform::Truncate { width } => Transform::Truncate(width),
+        ConnectorManagedPartitionTransform::Void => Transform::Void,
+    }
+}
+
+fn managed_partition_field_name(
+    source: &str,
+    transform: ConnectorManagedPartitionTransform,
+) -> String {
+    match transform {
+        ConnectorManagedPartitionTransform::Identity => source.to_string(),
+        ConnectorManagedPartitionTransform::Year => format!("{source}_year"),
+        ConnectorManagedPartitionTransform::Month => format!("{source}_month"),
+        ConnectorManagedPartitionTransform::Day => format!("{source}_day"),
+        ConnectorManagedPartitionTransform::Hour => format!("{source}_hour"),
+        ConnectorManagedPartitionTransform::Bucket { buckets } => {
+            format!("{source}_bucket_{buckets}")
+        }
+        ConnectorManagedPartitionTransform::Truncate { width } => {
+            format!("{source}_truncate_{width}")
+        }
+        ConnectorManagedPartitionTransform::Void => format!("{source}_void"),
+    }
+}
+
 fn managed_snapshot_properties(
     intent: &ConnectorWriteActivationIntent,
     rows: u64,
@@ -2246,6 +2840,77 @@ fn managed_provenance_matches(
         && actual.definition_fingerprint == expected.definition_fingerprint()
 }
 
+pub(crate) fn operation_marker_partitioning(
+    snapshot: &crate::iceberg::spec::Snapshot,
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<Option<novarocks_spi::connector::ConnectorCommittedPartitioning>, ConnectorError> {
+    let Some(marker) = operation_marker_from_snapshot(snapshot)? else {
+        return Ok(None);
+    };
+    let Some(spec_id) = marker.committed_partition_spec_id else {
+        return Ok(None);
+    };
+    let operation_id = ConnectorWriteOperationId::from_bytes(decode_marker_fixed::<16>(
+        &marker.operation_id_base64,
+        "operation id",
+    )?);
+    let replacement_id = marker
+        .partition_replacement_id_base64
+        .as_deref()
+        .map(|raw| decode_marker_fixed::<32>(raw, "partition replacement id"))
+        .transpose()?
+        .ok_or_else(|| corrupt("Iceberg atomic repartition marker lacks replacement ID"))?;
+    if replacement_id
+        != novarocks_spi::connector::ConnectorManagedPartitionSpecReplacementId::derive(
+            operation_id,
+        )
+        .to_bytes()
+    {
+        return Err(corrupt(
+            "Iceberg atomic repartition marker replacement ID does not match its operation",
+        ));
+    }
+    let prior_spec_id = marker.expected_prior_partition_spec_id.ok_or_else(|| {
+        corrupt("Iceberg atomic repartition marker lacks prior partition spec ID")
+    })?;
+    let prior_spec = metadata
+        .partition_spec_by_id(prior_spec_id)
+        .ok_or_else(|| {
+            corrupt(format!(
+                "Iceberg atomic repartition prior spec {prior_spec_id} is absent"
+            ))
+        })?;
+    let prior_observation = ConnectorManagedPartitionSpecObservation::try_from_fields(
+        prior_spec_id,
+        &managed_partition_fields(prior_spec)?,
+    )?;
+    let marker_prior_digest = marker
+        .expected_prior_partition_observation_base64
+        .as_deref()
+        .map(|raw| decode_marker_fixed::<32>(raw, "prior partition observation"))
+        .transpose()?
+        .ok_or_else(|| corrupt("Iceberg atomic repartition marker lacks prior observation"))?;
+    if marker_prior_digest != prior_observation.layout_digest() {
+        return Err(corrupt(
+            "Iceberg atomic repartition marker prior observation conflicts with retained metadata",
+        ));
+    }
+    let committed = committed_partitioning_from_metadata(metadata, spec_id)?;
+    if marker
+        .committed_partitioning_digest_base64
+        .as_deref()
+        .map(|raw| decode_marker_fixed::<32>(raw, "committed partitioning digest"))
+        .transpose()?
+        != Some(committed.digest())
+        || marker.target_ref != "main"
+    {
+        return Err(corrupt(
+            "Iceberg atomic repartition marker conflicts with committed table partitioning",
+        ));
+    }
+    Ok(Some(committed))
+}
+
 fn operation_marker_from_snapshot(
     snapshot: &crate::iceberg::spec::Snapshot,
 ) -> Result<Option<IcebergWriteOperationMarkerV1>, ConnectorError> {
@@ -2275,6 +2940,16 @@ fn operation_marker_from_snapshot(
     decode_marker_fixed::<16>(&marker.operation_id_base64, "operation id")?;
     decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort set digest")?;
     decode_marker_fixed::<32>(&marker.aggregate_digest_base64, "aggregate digest")?;
+    validate_partition_reconcile_facts(
+        &marker.operation_id_base64,
+        marker.partition_replacement_id_base64.as_deref(),
+        marker.expected_prior_partition_spec_id,
+        marker
+            .expected_prior_partition_observation_base64
+            .as_deref(),
+        marker.committed_partition_spec_id,
+        marker.committed_partitioning_digest_base64.as_deref(),
+    )?;
     let canonical = serde_json::to_string(&marker)
         .map_err(|error| corrupt(format!("encode Iceberg write operation marker: {error}")))?;
     if canonical != *raw {
@@ -2283,6 +2958,62 @@ fn operation_marker_from_snapshot(
         ));
     }
     Ok(Some(marker))
+}
+
+fn validate_partition_reconcile_facts(
+    operation_id: &str,
+    replacement_id: Option<&str>,
+    prior_spec_id: Option<i32>,
+    prior_observation: Option<&str>,
+    committed_spec_id: Option<i32>,
+    committed_digest: Option<&str>,
+) -> Result<(), ConnectorError> {
+    let count = [
+        replacement_id.is_some(),
+        prior_spec_id.is_some(),
+        prior_observation.is_some(),
+        committed_spec_id.is_some(),
+        committed_digest.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if count == 0 {
+        return Ok(());
+    }
+    if count != 5
+        || prior_spec_id.is_some_and(|id| id < 0)
+        || committed_spec_id.is_some_and(|id| id < 0)
+    {
+        return Err(corrupt(
+            "Iceberg atomic partition replacement evidence is incomplete or invalid",
+        ));
+    }
+    let operation_id = ConnectorWriteOperationId::from_bytes(decode_marker_fixed::<16>(
+        operation_id,
+        "operation id",
+    )?);
+    let replacement_id =
+        decode_marker_fixed::<32>(replacement_id.expect("checked"), "partition replacement id")?;
+    if replacement_id
+        != novarocks_spi::connector::ConnectorManagedPartitionSpecReplacementId::derive(
+            operation_id,
+        )
+        .to_bytes()
+    {
+        return Err(corrupt(
+            "Iceberg atomic partition replacement ID is not derived from its operation ID",
+        ));
+    }
+    decode_marker_fixed::<32>(
+        prior_observation.expect("checked"),
+        "prior partition observation",
+    )?;
+    decode_marker_fixed::<32>(
+        committed_digest.expect("checked"),
+        "committed partitioning digest",
+    )?;
+    Ok(())
 }
 
 fn find_operation_marker_snapshot<'a>(
@@ -2329,6 +3060,7 @@ fn table_snapshot_row_count(
                     base_snapshot_id: target.base_snapshot_id,
                     base_sequence_number: 0,
                     staging_dir: target.location.clone(),
+                    manifest_cleanup_token: None,
                 },
             )
         })?
@@ -2345,6 +3077,7 @@ fn table_snapshot_row_count(
                     base_snapshot_id: target.base_snapshot_id,
                     base_sequence_number: 0,
                     staging_dir: target.location.clone(),
+                    manifest_cleanup_token: None,
                 },
             )
         })?;
@@ -2365,6 +3098,7 @@ fn table_snapshot_row_count(
                     base_snapshot_id: target.base_snapshot_id,
                     base_sequence_number: 0,
                     staging_dir: target.location.clone(),
+                    manifest_cleanup_token: None,
                 },
             )
         })?;
@@ -2584,6 +3318,21 @@ fn cleanup_finalization(cleanup: &super::CleanupAttempt) -> ExternalMutationFina
                 cleanup.error_paths.join(", ")
             ),
         ))
+    }
+}
+
+fn merge_cleanup_attempts(
+    left: super::CleanupAttempt,
+    right: super::CleanupAttempt,
+) -> super::CleanupAttempt {
+    let mut error_paths = left.error_paths;
+    error_paths.extend(right.error_paths);
+    error_paths.sort();
+    error_paths.dedup();
+    super::CleanupAttempt {
+        attempted: left.attempted || right.attempted,
+        error_count: error_paths.len(),
+        error_paths,
     }
 }
 
@@ -2996,6 +3745,94 @@ mod tests {
     }
 
     #[test]
+    fn atomic_partition_replacement_applies_spec_and_main_snapshot_once() {
+        let (_executor, _warehouse, _control, table) = control_with_empty_table();
+        let metadata = table.metadata().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([21; 16]);
+        let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(
+            metadata.default_partition_spec_id(),
+            &[],
+        )
+        .expect("prior observation");
+        let requested = ConnectorManagedPartitionField::try_new(
+            1,
+            0,
+            ConnectorManagedPartitionTransform::Identity,
+        )
+        .expect("requested partition field");
+        let replacement =
+            ConnectorManagedPartitionSpecReplacement::try_new(operation_id, prior, vec![requested])
+                .expect("replacement");
+        let prepared = prepare_partition_replacement(&metadata, &replacement, operation_id)
+            .expect("provider replacement");
+        let new_spec_id = prepared.committed.spec_id();
+        assert_ne!(new_spec_id, metadata.default_partition_spec_id());
+        assert_eq!(prepared.metadata_updates.len(), 2);
+
+        let snapshot_id = 77;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_sequence_number(metadata.last_sequence_number() + 1)
+            .with_timestamp_ms(metadata.last_updated_ms() + 1)
+            .with_manifest_list("file:///warehouse/db/t/metadata/repartition.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Overwrite,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .build();
+        let mut updates = prepared.metadata_updates;
+        updates.extend([
+            crate::iceberg::TableUpdate::AddSnapshot { snapshot },
+            crate::iceberg::TableUpdate::SetSnapshotRef {
+                ref_name: "main".to_string(),
+                reference: crate::iceberg::spec::SnapshotReference {
+                    snapshot_id,
+                    retention: crate::iceberg::spec::SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                },
+            },
+        ]);
+        let commit = crate::iceberg::TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![
+                crate::iceberg::TableRequirement::UuidMatch {
+                    uuid: metadata.uuid(),
+                },
+                crate::iceberg::TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: metadata.default_partition_spec_id(),
+                },
+                crate::iceberg::TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".to_string(),
+                    snapshot_id: metadata.current_snapshot_id(),
+                },
+            ])
+            .updates(updates)
+            .build();
+        let table = crate::iceberg::table::Table::builder()
+            .file_io(table.file_io().clone())
+            .metadata(metadata.clone())
+            .metadata_location(format!(
+                "{}/metadata/00000-00000000-0000-4000-8000-000000000001.metadata.json",
+                metadata.location().trim_end_matches('/')
+            ))
+            .identifier(table.identifier().clone())
+            .build()
+            .expect("table with canonical metadata location");
+        let applied = commit.apply(table).expect("one atomic metadata apply");
+        assert_eq!(applied.metadata().default_partition_spec_id(), new_spec_id);
+        assert_eq!(applied.metadata().current_snapshot_id(), Some(snapshot_id));
+        assert_eq!(
+            committed_partitioning_from_metadata(applied.metadata(), new_spec_id)
+                .expect("committed partitioning"),
+            prepared.committed
+        );
+    }
+
+    #[test]
     fn activation_and_planning_are_generation_local_and_idempotent() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
@@ -3247,6 +4084,72 @@ mod tests {
     }
 
     #[test]
+    fn historical_partition_marker_rejects_corrupt_transition_facts() {
+        let (_executor, _warehouse, _control, table) = control_with_empty_table();
+        let metadata = table.metadata().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([26; 16]);
+        let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(
+            metadata.default_partition_spec_id(),
+            &[],
+        )
+        .expect("prior observation");
+        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
+            operation_id,
+            prior.clone(),
+            vec![
+                ConnectorManagedPartitionField::try_new(
+                    1,
+                    0,
+                    ConnectorManagedPartitionTransform::Identity,
+                )
+                .expect("partition field"),
+            ],
+        )
+        .expect("replacement");
+        let prospective = prepare_partition_replacement(&metadata, &replacement, operation_id)
+            .expect("provider replacement");
+        let marker =
+            |replacement_id: [u8; 32], prior_digest: [u8; 32]| IcebergWriteOperationMarkerV1 {
+                version: ICEBERG_WRITE_OPERATION_MARKER_VERSION,
+                instance_id: "ice".to_string(),
+                incarnation_base64: base64_encode([7; 16]),
+                operation_id_base64: base64_encode(operation_id.to_bytes()),
+                target_ref: "main".to_string(),
+                cohort_set_digest_base64: base64_encode([8; 32]),
+                aggregate_digest_base64: base64_encode([9; 32]),
+                partition_replacement_id_base64: Some(base64_encode(replacement_id)),
+                expected_prior_partition_spec_id: Some(prior.provider_spec_id()),
+                expected_prior_partition_observation_base64: Some(base64_encode(prior_digest)),
+                committed_partition_spec_id: Some(prospective.committed.spec_id()),
+                committed_partitioning_digest_base64: Some(base64_encode(
+                    prospective.committed.digest(),
+                )),
+            };
+        let derived = novarocks_spi::connector::ConnectorManagedPartitionSpecReplacementId::derive(
+            operation_id,
+        )
+        .to_bytes();
+
+        let bad_prior = snapshot_with_operation_marker(
+            8,
+            serde_json::to_string(&marker(derived, [10; 32])).expect("bad-prior marker"),
+        );
+        let error = operation_marker_partitioning(&bad_prior, &prospective.prospective_metadata)
+            .expect_err("corrupt prior observation");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+
+        let bad_replacement = snapshot_with_operation_marker(
+            9,
+            serde_json::to_string(&marker([11; 32], prior.layout_digest()))
+                .expect("bad-replacement marker"),
+        );
+        let error =
+            operation_marker_partitioning(&bad_replacement, &prospective.prospective_metadata)
+                .expect_err("corrupt replacement id");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
     fn duplicate_operation_marker_matches_are_corrupt_data() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
@@ -3325,11 +4228,299 @@ mod tests {
     }
 
     #[test]
-    fn managed_empty_overwrite_commits_real_snapshot_with_operation_marker() {
+    fn commit_unknown_marker_absent_cleans_exact_data_and_manifest_paths() {
+        let (executor, _warehouse, control, table) = control_with_empty_table();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([22; 16]);
+        let activation = control
+            .activate_write(ConnectorWriteActivationRequest {
+                operation_id,
+                source: ConnectorWriteActivationSource::Prepared(preparation_for_metadata(
+                    &owner,
+                    table.metadata(),
+                    ConnectorWriteIntent::Overwrite,
+                    22,
+                )),
+                intent: ConnectorWriteActivationIntent::Ordinary,
+                context: context(),
+            })
+            .expect("activate overwrite");
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let execution_id = ConnectorWriteExecutionId::new([23; 16], 1);
+        let writer = ConnectorWriterIdentity::new(
+            operation_id,
+            cohort_id,
+            execution_id,
+            [24; 16],
+            1,
+            1,
+            0,
+            owner.clone(),
+        );
+        let planning = ConnectorWritePlanningRequest {
+            operation_id,
+            cohort_id,
+            execution_id,
+            activation: activation.cohort(cohort_id).expect("cohort"),
+            expected_writers: vec![writer.clone()],
+            context: context(),
+        };
+        let planning_digest = planning.stable_digest(&owner).expect("planning digest");
+        let plan = control.plan_write(planning).expect("plan overwrite");
+        let root = table.metadata().location().trim_end_matches('/');
+        let data_paths = (0..1_200)
+            .map(|index| {
+                format!(
+                    "{root}/data/response-loss-{index:05}-{}.parquet",
+                    "x".repeat(96)
+                )
+            })
+            .collect::<Vec<_>>();
+        let writer_reports = data_paths
+            .iter()
+            .map(|path| {
+                crate::commit::report::writer_report_from_written_file(
+                    &WrittenFile {
+                        path: path.clone(),
+                        format: crate::iceberg::spec::DataFileFormat::Parquet,
+                        content: crate::iceberg::spec::DataContentType::Data,
+                        partition_values: crate::iceberg::spec::Struct::empty(),
+                        partition_spec_id: table.metadata().default_partition_spec_id(),
+                        record_count: 1,
+                        file_size_in_bytes: 6,
+                        split_offsets: Vec::new(),
+                        column_sizes: HashMap::new(),
+                        value_counts: HashMap::new(),
+                        null_value_counts: HashMap::new(),
+                        nan_value_counts: HashMap::new(),
+                        lower_bounds: HashMap::new(),
+                        upper_bounds: HashMap::new(),
+                        key_metadata: None,
+                        referenced_data_file: None,
+                        equality_ids: None,
+                        first_row_id: None,
+                        content_offset: None,
+                        content_size_in_bytes: None,
+                        cardinality: None,
+                    },
+                    table.metadata(),
+                )
+                .expect("writer report")
+            })
+            .collect::<Vec<_>>();
+        let writer_payload =
+            crate::write_codec::encode_writer_reports(&writer_reports, table.metadata())
+                .expect("large report payload");
+        assert!(writer_payload.len() > 64 * 1024);
+        let report = ConnectorStagedReport::try_new(
+            writer,
+            CONNECTOR_WRITE_CONTRACT_VERSION,
+            ConnectorWriterTerminalState::Staged,
+            ConnectorStagedReportSummary::default(),
+            writer_payload,
+        )
+        .expect("staged report");
+        let attempt = ConnectorWriteAttemptCompletion::try_new(
+            owner.clone(),
+            operation_id,
+            cohort_id,
+            execution_id,
+            [25; 32],
+            vec![report],
+            plan.control_payload().clone(),
+        )
+        .expect("attempt completion");
+        let sealed = ConnectorSealedWriteCohortSet::try_new(
+            operation_id,
+            vec![ConnectorWriteCohortDescriptor::new(
+                cohort_id,
+                ConnectorWriteIntent::Overwrite,
+                planning_digest,
+            )],
+        )
+        .expect("sealed cohorts");
+        let completion = ConnectorWriteOperationCompletion::try_new(
+            owner.clone(),
+            sealed,
+            vec![
+                ConnectorWriteCohortCompletion::try_new(cohort_id, Some(attempt), Vec::new())
+                    .expect("cohort completion"),
+            ],
+        )
+        .expect("operation completion");
+        let request = ConnectorWriteCommitRequest {
+            completion,
+            context: context(),
+        };
+        let active = {
+            let operations = control.operations.lock().expect("operation table");
+            let OperationState::Active(active) = operations
+                .get(&operation_id)
+                .expect("active overwrite operation")
+            else {
+                panic!("expected active operation");
+            };
+            active.clone()
+        };
+        let cleanup_token = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+        let staged_paths = vec![
+            data_paths[0].clone(),
+            format!("{root}/metadata/{cleanup_token}-overwrite-data-0.avro"),
+            format!("{root}/metadata/snap-123-{cleanup_token}.avro"),
+        ];
+        let foreign_manifest =
+            format!("{root}/metadata/00000000-0000-4000-8000-000000000000-overwrite-data-0.avro");
+        let same_token_foreign = format!("{root}/metadata/{cleanup_token}-user-owned-file.avro");
+        for path in &staged_paths {
+            executor
+                .block_on(
+                    table
+                        .file_io()
+                        .new_output(path)
+                        .expect("staged output")
+                        .write(Bytes::from_static(b"orphan")),
+                )
+                .expect("write staged object");
+            assert!(
+                executor
+                    .block_on(
+                        table
+                            .file_io()
+                            .new_input(path)
+                            .expect("staged input")
+                            .exists()
+                    )
+                    .expect("staged existence")
+            );
+        }
+        executor
+            .block_on(
+                table
+                    .file_io()
+                    .new_output(&foreign_manifest)
+                    .expect("foreign manifest output")
+                    .write(Bytes::from_static(b"foreign")),
+            )
+            .expect("write foreign manifest");
+        executor
+            .block_on(
+                table
+                    .file_io()
+                    .new_output(&same_token_foreign)
+                    .expect("same-token foreign output")
+                    .write(Bytes::from_static(b"foreign")),
+            )
+            .expect("write same-token foreign file");
+        let recovery = RecoveryEvidence {
+            table_ident: table.identifier().to_string(),
+            op_kind: CommitOpKind::Overwrite,
+            base_snapshot_id: table.metadata().current_snapshot_id(),
+            base_sequence_number: table.metadata().last_sequence_number(),
+            staging_dir: format!("{root}/metadata"),
+            manifest_cleanup_token: Some(cleanup_token.to_string()),
+        };
+        let evidence = control
+            .encode_commit_unknown_evidence(&request, &active, recovery)
+            .expect("commit-unknown evidence");
+        assert!(evidence.provider_payload().len() < 64 * 1024);
+        let cohort_set_digest = request.sealed().digest();
+        let aggregate_digest = request.aggregate_digest();
+        let outcome = ExternalMutationOutcome::CommitUnknown {
+            failure: ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Unavailable,
+                "injected response loss",
+            ),
+            evidence: evidence.clone(),
+        };
+        control.operations.lock().expect("operation table").insert(
+            operation_id,
+            OperationState::CommitUnknown(CommitUnknownOperation {
+                cohort_set_digest,
+                aggregate_digest,
+                outcome,
+                active,
+                request,
+            }),
+        );
+
+        let reconciled = control
+            .reconcile(ConnectorWriteReconcileRequest {
+                owner,
+                operation_id,
+                cohort_set_digest,
+                aggregate_digest,
+                evidence,
+                context: context(),
+            })
+            .expect("reconcile marker-absent operation");
+        assert!(matches!(
+            reconciled,
+            ExternalMutationOutcome::KnownUncommitted { .. }
+        ));
+        for path in &staged_paths {
+            assert!(
+                !executor
+                    .block_on(
+                        table
+                            .file_io()
+                            .new_input(path)
+                            .expect("cleaned input")
+                            .exists()
+                    )
+                    .expect("cleaned existence"),
+                "reconcile left staged object {path}"
+            );
+        }
+        assert!(
+            executor
+                .block_on(
+                    table
+                        .file_io()
+                        .new_input(&foreign_manifest)
+                        .expect("foreign manifest input")
+                        .exists()
+                )
+                .expect("foreign manifest existence"),
+            "cleanup token deleted another operation's manifest"
+        );
+        assert!(
+            executor
+                .block_on(
+                    table
+                        .file_io()
+                        .new_input(&same_token_foreign)
+                        .expect("same-token foreign input")
+                        .exists()
+                )
+                .expect("same-token foreign existence"),
+            "cleanup token deleted a non-provider manifest namespace"
+        );
+    }
+
+    #[test]
+    fn managed_atomic_repartition_commits_writer_spec_snapshot_and_receipt_once() {
         let (_executor, _warehouse, control, table) = control_with_empty_table();
         let owner = control.binding_key().clone();
         let operation_id = ConnectorWriteOperationId::from_bytes([12; 16]);
-        let managed = ConnectorManagedPublicationIntent::try_new(
+        let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(
+            table.metadata().default_partition_spec_id(),
+            &[],
+        )
+        .expect("prior partition observation");
+        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
+            operation_id,
+            prior,
+            vec![
+                ConnectorManagedPartitionField::try_new(
+                    1,
+                    0,
+                    ConnectorManagedPartitionTransform::Identity,
+                )
+                .expect("replacement field"),
+            ],
+        )
+        .expect("replacement");
+        let managed = ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
             41,
             7,
             "refresh-41",
@@ -3342,6 +4533,7 @@ mod tests {
             }],
             "definition-fingerprint",
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            replacement,
         )
         .expect("managed intent");
         let activation = control
@@ -3379,12 +4571,33 @@ mod tests {
         };
         let planning_digest = planning.stable_digest(&owner).expect("planning digest");
         let plan = control.plan_write(planning).expect("plan write");
+        let writer_handle = crate::write_codec::decode_write_handle(plan.handles()[0].payload())
+            .expect("decode prospective writer handle");
+        assert_ne!(
+            writer_handle.target_partition_spec_id,
+            table.metadata().default_partition_spec_id()
+        );
+        let prospective_metadata = {
+            let operations = control.operations.lock().expect("operation table");
+            let OperationState::Active(active) = operations
+                .get(&operation_id)
+                .expect("active atomic repartition")
+            else {
+                panic!("expected active operation");
+            };
+            active
+                .partition_replacement
+                .as_ref()
+                .expect("active partition replacement")
+                .prospective_metadata
+                .clone()
+        };
         let report = ConnectorStagedReport::try_new(
             writer,
             CONNECTOR_WRITE_CONTRACT_VERSION,
             ConnectorWriterTerminalState::Staged,
             ConnectorStagedReportSummary::default(),
-            crate::write_codec::encode_writer_reports(&[], table.metadata())
+            crate::write_codec::encode_writer_reports(&[], &prospective_metadata)
                 .expect("empty report payload"),
         )
         .expect("staged report");
@@ -3432,6 +4645,14 @@ mod tests {
             .expect("committed version")
             .snapshot_id()
             .expect("snapshot id");
+        let committed_partitioning = receipt
+            .committed_partitioning()
+            .expect("committed partitioning")
+            .clone();
+        assert_eq!(
+            committed_partitioning.spec_id(),
+            writer_handle.target_partition_spec_id
+        );
         let loaded = control
             .runtime
             .load_table("db", "t")
@@ -3441,6 +4662,11 @@ mod tests {
             .metadata()
             .snapshot_by_id(snapshot_id)
             .expect("committed snapshot");
+        assert_eq!(
+            loaded.table.metadata().default_partition_spec_id(),
+            committed_partitioning.spec_id()
+        );
+        assert_eq!(loaded.table.metadata().snapshots().count(), 1);
         let marker = operation_marker_from_snapshot(snapshot)
             .expect("decode operation marker")
             .expect("operation marker");
@@ -3458,6 +4684,19 @@ mod tests {
             decode_marker_fixed::<32>(&marker.aggregate_digest_base64, "aggregate digest")
                 .expect("aggregate digest"),
             aggregate_digest
+        );
+        assert_eq!(
+            marker.committed_partition_spec_id,
+            Some(committed_partitioning.spec_id())
+        );
+        assert_eq!(
+            marker
+                .committed_partitioning_digest_base64
+                .as_deref()
+                .map(|raw| decode_marker_fixed::<32>(raw, "partition digest"))
+                .transpose()
+                .expect("partition marker digest"),
+            Some(committed_partitioning.digest())
         );
         assert!(
             crate::commit::MvProvenanceV1::from_snapshot_summary(snapshot)

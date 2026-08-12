@@ -1153,13 +1153,29 @@ pub fn connector_write_receipt(
     snapshot_id: i64,
     resulting_row_count: Option<u64>,
 ) -> Result<ConnectorWriteReceipt, String> {
+    connector_write_receipt_with_partitioning(snapshot_id, resulting_row_count, None)
+}
+
+pub fn connector_write_receipt_with_partitioning(
+    snapshot_id: i64,
+    resulting_row_count: Option<u64>,
+    committed_partitioning: Option<novarocks_spi::connector::ConnectorCommittedPartitioning>,
+) -> Result<ConnectorWriteReceipt, String> {
     let payload = encode_write_receipt(snapshot_id)?;
     let committed_version = ConnectorCommittedVersion::try_new(payload.clone(), Some(snapshot_id))
         .map_err(|error| format!("build Iceberg connector committed version failed: {error}"))?;
-    ConnectorWriteReceipt::try_new_with_committed_facts(
-        payload,
-        committed_version,
-        resulting_row_count,
-    )
+    match committed_partitioning {
+        Some(partitioning) => ConnectorWriteReceipt::try_new_with_committed_facts_and_partitioning(
+            payload,
+            committed_version,
+            resulting_row_count,
+            partitioning,
+        ),
+        None => ConnectorWriteReceipt::try_new_with_committed_facts(
+            payload,
+            committed_version,
+            resulting_row_count,
+        ),
+    }
     .map_err(|error| format!("build Iceberg connector write receipt failed: {error}"))
 }

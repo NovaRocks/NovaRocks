@@ -85,7 +85,6 @@ impl IcebergCommitAction for OverwriteCommit {
             sum.checked_add(f.record_count)
                 .ok_or_else(|| "row-lineage added row count overflow".to_string())
         })?;
-
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let action = OverwriteTxnAction {
             written,
@@ -100,10 +99,8 @@ impl IcebergCommitAction for OverwriteCommit {
             target_ref: ctx.target_ref.to_string(),
             snapshot_properties: ctx.snapshot_properties.clone(),
         };
-
         let sketch_sets = ctx.collector.take_sketch_sets();
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-
         let tx = Transaction::new(ctx.table);
         let tx = action
             .apply(tx)
@@ -142,6 +139,80 @@ impl IcebergCommitAction for OverwriteCommit {
             written_manifest_paths,
         })
     }
+}
+
+/// Provider-owned overwrite changes prepared without submitting a catalog
+/// update. Atomic managed repartition prepends its partition-spec updates and
+/// submits this snapshot action in the same `TableCommit`.
+pub(crate) struct StagedOverwriteAction<'a> {
+    pub action: ActionCommit,
+    pub outcome: CommitOutcome,
+    pub table_ident: crate::iceberg::TableIdent,
+    pub catalog: &'a dyn crate::iceberg::Catalog,
+}
+
+pub(crate) async fn build_staged_overwrite_action(
+    ctx: CommitCtx<'_>,
+) -> Result<StagedOverwriteAction<'_>, String> {
+    let written = ctx.collector.take_written_files()?;
+    for f in &written {
+        if f.content != DataContentType::Data {
+            return Err(format!(
+                "OverwriteCommit received {:?} content; expected Data only",
+                f.content
+            ));
+        }
+    }
+    let row_lineage_first_row_id = match crate::commit::classify_iceberg_write_mode(ctx.table) {
+        IcebergWriteMode::RowLineageV3 => Some(effective_next_row_id(ctx.table.metadata())?),
+        IcebergWriteMode::LegacyPositionDeletes => None,
+    };
+    let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {
+        sum.checked_add(f.record_count)
+            .ok_or_else(|| "row-lineage added row count overflow".to_string())
+    })?;
+
+    let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let action = OverwriteTxnAction {
+        written,
+        commit_uuid: ctx.commit_uuid,
+        file_io: ctx.file_io.clone(),
+        partition_spec: ctx.collector.partition_spec.clone(),
+        schema_id: ctx.table.metadata().current_schema_id(),
+        abort_handle: ctx.abort_handle.clone(),
+        manifest_paths_out: manifest_paths_out.clone(),
+        row_lineage_first_row_id,
+        row_lineage_added_rows,
+        target_ref: ctx.target_ref.to_string(),
+        snapshot_properties: ctx.snapshot_properties.clone(),
+    };
+
+    let mut staged = Arc::new(action)
+        .commit(ctx.table)
+        .await
+        .map_err(|e| format!("Overwrite apply failed: {e}"))?;
+    let updates = staged.take_updates();
+    let requirements = staged.take_requirements();
+    let new_snapshot_id = updates
+        .iter()
+        .find_map(|update| match update {
+            TableUpdate::AddSnapshot { snapshot } => Some(snapshot.snapshot_id()),
+            _ => None,
+        })
+        .ok_or_else(|| "staged overwrite did not build an add-snapshot update".to_string())?;
+    let written_manifest_paths = manifest_paths_out
+        .lock()
+        .expect("manifest_paths_out poisoned")
+        .clone();
+    Ok(StagedOverwriteAction {
+        action: ActionCommit::new(updates, requirements),
+        outcome: CommitOutcome {
+            new_snapshot_id,
+            written_manifest_paths,
+        },
+        table_ident: ctx.collector.table_ident.clone(),
+        catalog: ctx.catalog,
+    })
 }
 
 struct OverwriteTxnAction {
@@ -341,6 +412,7 @@ impl TransactionAction for OverwriteTxnAction {
             },
         ];
         let requirements = vec![
+            TableRequirement::UuidMatch { uuid: m.uuid() },
             TableRequirement::CurrentSchemaIdMatch {
                 current_schema_id: m.current_schema_id(),
             },
