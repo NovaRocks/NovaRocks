@@ -1244,10 +1244,17 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first_context =
+            ConnectorRequestContext::try_new(deadline, Arc::new(NeverCancelled), 1024, 4096)
+                .expect("first request context");
+        let second_context =
+            ConnectorRequestContext::try_new(deadline, Arc::new(NeverCancelled), 1024, 4096)
+                .expect("second request context");
 
         let error = match ConnectorWriteOperationRegistration::try_new(vec![
-            template(operation_id, first, exact_lease.clone()),
-            template(operation_id, second, exact_lease),
+            template_with_context(operation_id, first, exact_lease.clone(), first_context),
+            template_with_context(operation_id, second, exact_lease, second_context),
         ]) {
             Ok(_) => panic!("different cancellation identities must fail closed"),
             Err(error) => error,
