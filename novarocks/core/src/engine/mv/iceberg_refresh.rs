@@ -4808,7 +4808,7 @@ fn build_neutral_refresh_rewrite_context(
         previous_table_uuids,
         target_snapshot_id,
         target_table_uuid,
-        binding.arrow_schema().clone(),
+        binding.physical_write_schema()?,
         Arc::from(binding.observation().field_ids().to_vec()),
         schema_contract,
     )

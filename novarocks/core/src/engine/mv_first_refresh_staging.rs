@@ -344,7 +344,7 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
         facts.previous_table_uuids.clone(),
         expected_target_snapshot_id,
         facts.target_table_uuid.clone(),
-        target_binding.arrow_schema().clone(),
+        target_binding.physical_write_schema()?,
         Arc::from(target_binding.observation().field_ids().to_vec()),
         schema_contract,
     )
