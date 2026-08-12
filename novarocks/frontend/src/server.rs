@@ -44,9 +44,6 @@ pub struct FrontendServerConfig {
     pub port_override: Option<u16>,
     /// Provider-owned FE control factories composed by the server root.
     pub connector_control_factories: Vec<Arc<dyn ConnectorControlFactory>>,
-    /// Process-local, connector-neutral filesystem resources used by the
-    /// Phase 1 legacy Core control binding for FE scan planning.
-    pub connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
     /// Application-owned storage observation composed by the server role.
     /// Frontend and Core never decode provider table handles directly.
     pub mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -59,7 +56,6 @@ fn standalone_open_services(
     system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog>,
     host: &FrontendApplicationHost,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
 ) -> novarocks::engine::StandaloneOpenServices {
     novarocks::engine::StandaloneOpenServices::new(
         host.execution_role(),
@@ -85,7 +81,6 @@ fn standalone_open_services(
     .with_mv_refresh_provider_activation_sink(host.mv_refresh_provider_activation_sink())
     .with_mv_background_engine_sink(host.mv_background_engine_sink())
     .with_mv_storage_observation(mv_storage_observation)
-    .with_connector_file_planning_resources(connector_file_planning_resources)
 }
 
 /// Opens the frontend services once for an externally composed server. The
@@ -109,13 +104,11 @@ pub async fn open_frontend_application_for_server(
 pub fn standalone_open_services_for_server(
     host: &FrontendApplicationHost,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
 ) -> novarocks::engine::StandaloneOpenServices {
     standalone_open_services(
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
         host,
         mv_storage_observation,
-        connector_file_planning_resources,
     )
 }
 
@@ -150,7 +143,6 @@ where
     let backend = cluster_backend_open_config(&config.config)?;
     let connector_factories = config.connector_control_factories.clone();
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let connector_file_planning_resources = config.connector_file_planning_resources.clone();
     run_frontend_server_until_shutdown_with_ports(
         config,
         shutdown,
@@ -172,7 +164,6 @@ where
                     system_catalog,
                     host,
                     Arc::clone(&mv_storage_observation),
-                    connector_file_planning_resources.clone(),
                 ),
                 host.dml_service(),
                 host.terminal_ingress(),
@@ -247,7 +238,6 @@ where
     let backend = cluster_backend_open_config(&config.config)?;
     let connector_factories = config.connector_control_factories.clone();
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let connector_file_planning_resources = config.connector_file_planning_resources.clone();
     run_frontend_server_with_signal_and_ports(
         config,
         signal,
@@ -269,7 +259,6 @@ where
                     system_catalog,
                     host,
                     Arc::clone(&mv_storage_observation),
-                    connector_file_planning_resources.clone(),
                 ),
                 host.dml_service(),
                 host.terminal_ingress(),
@@ -638,7 +627,6 @@ mod tests {
             config_path: None,
             port_override: None,
             connector_control_factories: Vec::new(),
-            connector_file_planning_resources: None,
             mv_storage_observation: Arc::new(
                 novarocks::mv::storage_observation::UnavailableMvStorageObservationPort,
             ),
@@ -706,7 +694,6 @@ mod tests {
                 Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
                 &host,
                 Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
-                None,
             ),
         )
         .expect("open engine with frontend-owned application services");

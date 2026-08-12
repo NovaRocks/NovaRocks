@@ -26,8 +26,9 @@ use mysql::{Conn as MysqlConn, OptsBuilder};
 use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, arm_path, trigger_path};
 use novarocks_frontend::{FrontendServerConfig, run_frontend_server_until_shutdown};
-use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
-use novarocks_server::composition::IcebergMvStorageObservationAdapter;
+use novarocks_server::composition::{
+    IcebergMvStorageObservationAdapter, compose_frontend_control_factories,
+};
 use tempfile::{NamedTempFile, TempDir};
 
 struct ReservedPort {
@@ -394,12 +395,9 @@ deployment_owner = "fe-1"
         .enable_all()
         .build()
         .expect("build frontend runtime");
-    let connector_file_planning_resources = Some(FsAccessResources::new(
-        None,
-        FsAccessResolver::new(),
-        Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-        Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
-    ));
+    let connector_control_factories =
+        compose_frontend_control_factories(&config, runtime.handle().clone())
+            .expect("compose frontend control factories");
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let _ = fe_mysql.release();
     let _ = fe_http.release();
@@ -409,8 +407,7 @@ deployment_owner = "fe-1"
             config,
             config_path: Some(config_file.path().to_path_buf()),
             port_override: None,
-            connector_control_factories: Vec::new(),
-            connector_file_planning_resources,
+            connector_control_factories,
             mv_storage_observation: Arc::new(IcebergMvStorageObservationAdapter::default()),
             state_store_host_config: None,
         },

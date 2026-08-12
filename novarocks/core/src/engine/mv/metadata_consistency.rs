@@ -85,9 +85,6 @@ mod tests {
     use crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
-        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
-        );
         MvSchemaContract {
             contract_version: 1,
             base: BaseContract {
@@ -99,7 +96,7 @@ mod tests {
                     fields: vec![BaseFieldRecord {
                         field_id: 1,
                         name_at_create: "id".to_string(),
-                        type_signature: target_type.to_string(),
+                        type_signature: "int".to_string(),
                         required: true,
                     }],
                 },
@@ -125,7 +122,7 @@ mod tests {
                 visible_columns: vec![TargetVisibleColumn {
                     output_name: "id".to_string(),
                     target_field_id: 1,
-                    type_signature: target_type.to_string(),
+                    type_signature: "int".to_string(),
                     nullable: false,
                 }],
                 hidden_apply_key: HiddenApplyKeyContract {

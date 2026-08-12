@@ -17,7 +17,7 @@
 //! Integration tests for parquet probing via the local filesystem operator.
 
 use anyhow::{Context, Result};
-use novarocks_connector_iceberg::opendal::Operator;
+use opendal::Operator;
 use parquet::basic::Compression;
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
@@ -76,8 +76,7 @@ async fn fs_operator_can_read_and_parse_parquet() -> Result<()> {
 
     writer.close().context("close parquet writer")?;
 
-    let fs = novarocks_connector_iceberg::opendal::services::Fs::default()
-        .root(dir.path().to_string_lossy().as_ref());
+    let fs = opendal::services::Fs::default().root(dir.path().to_string_lossy().as_ref());
     let op = Operator::new(fs)?.finish();
 
     let data = op

@@ -38,7 +38,6 @@ use crate::runtime::query_result::{
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRepository};
-use crate::connector::IcebergCatalogRegistry;
 use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
@@ -339,7 +338,6 @@ pub(crate) struct StandaloneState {
     /// during a request.
     pub(crate) execution_role: crate::common::app_config::ClusterRole,
     pub(crate) catalog_service: Arc<QueryCatalogService>,
-    pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
     /// Frontend-owned durable application boundary for typed statistics commands.
     pub(crate) statistics_application: Arc<dyn statistics_application::StatisticsApplicationPort>,
@@ -350,10 +348,6 @@ pub(crate) struct StandaloneState {
     /// attachment facts here and never constructs a concrete generation.
     pub(crate) connector_control_factory_resolver:
         Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
-    /// Process-local filesystem resources supplied by the composition root.
-    /// During the Phase 1 checkpoint the legacy Core Iceberg control owner
-    /// consumes them without discovering a runtime or credentials globally.
-    pub(crate) connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
     /// Process-local cache of immutable evidence returned by connector
     /// statistics readers. Query compilation still consumes only the pin
     /// captured during table resolution.
@@ -410,17 +404,6 @@ pub(crate) struct StandaloneState {
 }
 
 #[cfg(test)]
-fn test_connector_file_planning_resources() -> Option<novarocks_fs::FsAccessResources> {
-    let runtime = crate::runtime::global_async_runtime::data_runtime_handle().ok()?;
-    Some(novarocks_fs::FsAccessResources::new(
-        None,
-        novarocks_fs::FsAccessResolver::new(),
-        Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
-        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime)),
-    ))
-}
-
-#[cfg(test)]
 impl Default for StandaloneState {
     fn default() -> Self {
         let connector_control = Arc::new(TestConnectorControlRegistry::default());
@@ -429,7 +412,6 @@ impl Default for StandaloneState {
             catalog_service: Arc::new(
                 crate::engine::query_planning::catalog_runtime::new_query_catalog_service(),
             ),
-            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
             statistics_application: Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
@@ -438,7 +420,6 @@ impl Default for StandaloneState {
                 as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
             connector_control_factory_resolver: connector_control
                 as Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
-            connector_file_planning_resources: test_connector_file_planning_resources(),
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
@@ -495,26 +476,48 @@ struct TestConnectorControlRegistry {
 #[cfg(test)]
 impl Default for TestConnectorControlRegistry {
     fn default() -> Self {
-        let runtime = crate::runtime::global_async_runtime::data_runtime_handle()
-            .expect("test connector control runtime");
-        let resources = test_connector_file_planning_resources()
-            .expect("test connector file planning resources");
-        let factory = novarocks_connector_iceberg::control_factory::IcebergControlFactory::new(
-            novarocks_connector_iceberg::resources::IcebergControlResources::new(
-                novarocks_connector_iceberg::access_binding::IcebergReadBinding::from_resources(
-                    resources,
-                ),
-                runtime,
-            ),
-        );
-        let provider_id = factory.provider_id().clone();
+        let factory: Arc<dyn novarocks_spi::connector::ConnectorControlFactory> =
+            Arc::new(TestConnectorControlFactory);
         Self {
             active: std::sync::Mutex::new(std::collections::HashMap::new()),
-            factories: std::collections::HashMap::from([(
-                provider_id,
-                Arc::new(factory) as Arc<dyn novarocks_spi::connector::ConnectorControlFactory>,
-            )]),
+            factories: std::collections::HashMap::from([(factory.provider_id().clone(), factory)]),
         }
+    }
+}
+
+#[cfg(test)]
+struct TestConnectorControlFactory;
+
+#[cfg(test)]
+impl novarocks_spi::connector::ConnectorControlFactory for TestConnectorControlFactory {
+    fn provider_id(&self) -> &novarocks_spi::connector::ConnectorProviderId {
+        static PROVIDER_ID: std::sync::OnceLock<novarocks_spi::connector::ConnectorProviderId> =
+            std::sync::OnceLock::new();
+        PROVIDER_ID.get_or_init(|| {
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("test provider ID")
+        })
+    }
+
+    fn create_control(
+        &self,
+        request: novarocks_spi::connector::ConnectorControlFactoryRequest,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlCreation,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let durable_properties = request.properties().to_vec();
+        let binding = crate::connector::scan_model::planned_files_fixture_binding_for_provider(
+            request.provider_id().clone(),
+            request.instance_id().as_str(),
+            std::collections::HashMap::new(),
+            None,
+        );
+        novarocks_spi::connector::ConnectorControlCreation::try_new(
+            &request,
+            binding,
+            durable_properties,
+        )
     }
 }
 
@@ -1309,9 +1312,6 @@ pub struct StandaloneOpenServices {
     /// durable attachment restore.
     pub connector_control_factory_resolver:
         std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
-    /// Connector-neutral FE filesystem resources. The legacy Core Iceberg
-    /// control owner consumes this only until the follow-up factory cut.
-    pub connector_file_planning_resources: Option<novarocks_fs::FsAccessResources>,
     /// Bound by the server composition root before engine open. Zero means no
     /// local fragment endpoint is available to this engine instance.
     pub exchange_port: u16,
@@ -1358,16 +1358,6 @@ impl StandaloneOpenServices {
             mv_background_engine_sink: None,
             connector_control,
             connector_control_factory_resolver,
-            connector_file_planning_resources: {
-                #[cfg(test)]
-                {
-                    test_connector_file_planning_resources()
-                }
-                #[cfg(not(test))]
-                {
-                    None
-                }
-            },
             table_maintenance_service,
             mv_repository,
             mv_application_service,
@@ -1388,14 +1378,6 @@ impl StandaloneOpenServices {
         observation: std::sync::Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
     ) -> Self {
         self.mv_storage_observation = observation;
-        self
-    }
-
-    pub fn with_connector_file_planning_resources(
-        mut self,
-        resources: Option<novarocks_fs::FsAccessResources>,
-    ) -> Self {
-        self.connector_file_planning_resources = resources;
         self
     }
 
@@ -1534,7 +1516,6 @@ impl StandaloneNovaRocks {
             mv_background_engine_sink,
             connector_control,
             connector_control_factory_resolver,
-            connector_file_planning_resources,
             table_maintenance_service,
             mv_repository,
             mv_application_service,
@@ -1567,7 +1548,6 @@ impl StandaloneNovaRocks {
             statistics_application,
             connector_control,
             connector_control_factory_resolver,
-            connector_file_planning_resources,
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
@@ -1579,7 +1559,6 @@ impl StandaloneNovaRocks {
             coordinator_report_endpoint,
             #[cfg(test)]
             _test_guard,
-            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             iceberg_operation_repo: IcebergOperationRepository,
         });
@@ -2623,11 +2602,13 @@ impl StandaloneSession {
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
         )?;
-        crate::connector::iceberg::catalog::schema_update::validate_schema_change_application_guard(
-            &self.inner,
-            &target,
-            &stmt.change,
-        )?;
+        if let crate::engine::statement::IcebergSchemaChange::DropColumn { path } = &stmt.change {
+            crate::engine::mv::iceberg_guard::reject_drop_column_mv_dependencies(
+                &self.inner,
+                &target,
+                path,
+            )?;
+        }
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| error.to_string())?;
         let change = match stmt.change {
@@ -3802,7 +3783,7 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 }
 
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
-    restore_iceberg_catalogs(state)?;
+    restore_connector_catalogs(state)?;
     // W4 statelessness: rediscover lake-native Iceberg MV packages that are
     // present on the lake but missing from a fresh `[metadata]` (SQLite) cache,
     // and persist their rebuilt definitions.
@@ -3818,7 +3799,7 @@ fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String
     Ok(())
 }
 
-fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> {
+fn restore_connector_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> {
     let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(());
     };
@@ -3873,31 +3854,6 @@ fn create_iceberg_control_binding(
         .register(binding)
         .map_err(|error| format!("register Iceberg connector control binding: {error}"))?;
     Ok(durable_properties)
-}
-
-#[cfg(test)]
-/// Temporary bridge for provider-semantic tests that SPI-5P T6 must relocate
-/// before the final Core provider dependency cut.
-pub(crate) fn register_iceberg_control_binding(
-    state: &Arc<StandaloneState>,
-    normalized_catalog: &str,
-) -> Result<(), String> {
-    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(normalized_catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let planning_binding = state
-        .connector_file_planning_resources
-        .clone()
-        .map(novarocks_connector_iceberg::access_binding::IcebergReadBinding::from_resources);
-    let binding = crate::connector::iceberg::provider::IcebergControlProvider::new_control_with_planning_binding(
-        instance_id,
-        Arc::clone(&state.iceberg_catalogs),
-        planning_binding,
-    )
-    .map_err(|error| format!("create test Iceberg connector control binding: {error}"))?;
-    state
-        .connector_control
-        .register(binding)
-        .map_err(|error| format!("register test Iceberg connector control binding: {error}"))
 }
 
 fn retire_iceberg_control_binding(
@@ -3977,18 +3933,11 @@ where
 
 fn ensure_mainline_distributed_execution(
     has_terminal_sink: bool,
-    has_iceberg_catalogs: bool,
     exchange_port: u16,
 ) -> Result<(), String> {
     if has_terminal_sink {
         return Err(
             "terminal sink execution requires mainline DistributedPlan sink support; direct execution fallback was removed"
-                .to_string(),
-        );
-    }
-    if has_iceberg_catalogs {
-        return Err(
-            "local Iceberg registry execution requires mainline DistributedPlan write support; direct execution fallback was removed"
                 .to_string(),
         );
     }
@@ -5471,14 +5420,7 @@ fn prepare_query_with_sql_compiler_kernel(
     else {
         return Err("query intent did not produce a distributed SQL plan".to_string());
     };
-    ensure_mainline_distributed_execution(
-        false,
-        // SQLX-1 has already lowered a connector-neutral distributed read.
-        // A populated Iceberg registry is catalog metadata, not a request for
-        // the removed local direct-write execution path.
-        false,
-        state.exchange_port,
-    )?;
+    ensure_mainline_distributed_execution(false, state.exchange_port)?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &compiled.distributed_plan,
         planning_inputs.post_compile.connector_controls,
@@ -6255,91 +6197,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
-    trait IntoTestLiteral {
-        fn into_test_literal(self) -> crate::sql::parser::ast::Literal;
-    }
-
-    impl IntoTestLiteral for i32 {
-        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
-            crate::sql::parser::ast::Literal::Int(i64::from(self))
-        }
-    }
-
-    impl IntoTestLiteral for i64 {
-        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
-            crate::sql::parser::ast::Literal::Int(self)
-        }
-    }
-
-    impl IntoTestLiteral for &str {
-        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
-            crate::sql::parser::ast::Literal::String(self.to_string())
-        }
-    }
-
-    impl IntoTestLiteral for String {
-        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
-            crate::sql::parser::ast::Literal::String(self)
-        }
-    }
-
-    impl<T> IntoTestLiteral for Option<T>
-    where
-        T: IntoTestLiteral,
-    {
-        fn into_test_literal(self) -> crate::sql::parser::ast::Literal {
-            self.map_or(
-                crate::sql::parser::ast::Literal::Null,
-                IntoTestLiteral::into_test_literal,
-            )
-        }
-    }
-
-    macro_rules! insert_rows {
-        ($session:expr, $target:expr; $([$($value:expr),* $(,)?]),+ $(,)?) => {
-            insert_iceberg_fixture_rows(
-                $session,
-                &$target,
-                &[
-                    $(vec![$($value.into_test_literal()),*]),+
-                ],
-            )
-        };
-    }
-
-    macro_rules! nullable_i64 {
-        (NULL) => {
-            None
-        };
-        ($value:expr) => {
-            Some($value as i64)
-        };
-    }
-
-    macro_rules! kv_rows {
-        ($(($key:tt, $value:tt)),* $(,)?) => {
-            &[$((nullable_i64!($key), nullable_i64!($value))),*]
-        };
-    }
-
-    fn insert_iceberg_fixture_rows(
-        session: &StandaloneSession,
-        target_parts: &[&str],
-        rows: &[Vec<crate::sql::parser::ast::Literal>],
-    ) {
-        let [catalog, namespace, table] = target_parts else {
-            panic!("Iceberg row fixture requires catalog.namespace.table");
-        };
-        let registry = session
-            .inner
-            .iceberg_catalogs
-            .read()
-            .expect("Iceberg catalog registry");
-        let entry = registry.get(catalog).expect("fixture Iceberg catalog");
-        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, rows)
-            .expect("insert Iceberg fixture rows");
-    }
-
     #[derive(Default)]
     struct RecordingStatisticsApplicationPort {
         commands: Mutex<Vec<StatisticsApplicationCommand>>,
@@ -6803,19 +6660,9 @@ mod tests {
             crate::query_execution::control::QueryControlService::for_test(),
             Arc::clone(&connector_control)
                 as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-            connector_control
-                as Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
+            connector_control as Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>,
             1,
         )
-        // Production installs the provider-specific inspector from the Server
-        // composition root; `new` leaves a fail-closed port so a composition
-        // that forgets it cannot silently observe nothing. Tests need the same
-        // observation the Server would provide, otherwise any statement that
-        // consults the MV guard fails on the port rather than on its own
-        // behaviour.
-        .with_mv_storage_observation(Arc::new(
-            crate::engine::mv::schema_validation_adapter::TestIcebergMvStorageObservationAdapter::default(),
-        ))
     }
 
     struct RecordingQueryExecutionCoordinator {
@@ -6973,29 +6820,6 @@ mod tests {
         session
             .query("EXPLAIN SELECT 1")
             .expect("EXPLAIN must execute");
-        let warehouse = TempDir::new().expect("view delegation warehouse");
-        session
-            .execute(&format!(
-                r#"CREATE EXTERNAL CATALOG delegated_catalog PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-                warehouse.path().display()
-            ))
-            .expect("catalog create");
-        session
-            .execute_in_context(
-                "CREATE DATABASE delegated_db",
-                Some("delegated_catalog"),
-                "",
-                None,
-            )
-            .expect("database create");
-        session
-            .execute_in_context(
-                "DROP DATABASE delegated_db",
-                Some("delegated_catalog"),
-                "",
-                None,
-            )
-            .expect("database drop");
         let missing_catalog_error = session
             .execute_in_context("DROP DATABASE unqualified_without_catalog", None, "", None)
             .expect_err("unqualified database drop without a catalog must keep failing");
@@ -7020,13 +6844,10 @@ mod tests {
                 .lock()
                 .expect("dropped databases")
                 .as_slice(),
-            [
-                ("delegated_catalog".to_string(), "delegated_db".to_string()),
-                (
-                    "default_catalog".to_string(),
-                    "delegated_view_db".to_string()
-                ),
-            ]
+            [(
+                "default_catalog".to_string(),
+                "delegated_view_db".to_string()
+            )]
         );
     }
 
@@ -7673,471 +7494,6 @@ mysql_port = 47892
     }
 
     #[test]
-    fn embedded_session_supports_minimal_iceberg_flow() {
-        let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = open_test_engine_with_metadata(&warehouse);
-        let session = engine.session();
-
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        let create_catalog = session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create iceberg catalog");
-        assert!(matches!(create_catalog, StatementResult::Ok));
-
-        let create_database = session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create iceberg database");
-        assert!(matches!(create_database, StatementResult::Ok));
-
-        let create_table = session
-            .execute_in_database("create table ice.db1.tbl (id int, name string)", "default")
-            .expect("create iceberg table");
-        assert!(matches!(create_table, StatementResult::Ok));
-
-        let empty_result = session
-            .query("select id, name from ice.db1.tbl limit 0")
-            .expect("query empty iceberg table");
-        assert_eq!(empty_result.row_count(), 0);
-        assert_eq!(empty_result.columns[0].name, "id");
-        assert_eq!(empty_result.columns[1].name, "name");
-
-        insert_rows!(&session, ["ice", "db1", "tbl"]; [1, "a"], [2, "b"]);
-
-        let result = session
-            .query("select name from ice.db1.tbl where id = 2")
-            .expect("query iceberg table");
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        let names = chunk.batch.column(0);
-        let names = names
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("string array");
-        assert_eq!(names.value(0), "b");
-    }
-
-    #[test]
-    fn embedded_session_preserves_iceberg_projection_order() {
-        let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = open_test_engine_with_metadata(&warehouse);
-        let session = engine.session();
-
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        let create_catalog = session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create iceberg catalog");
-        assert!(matches!(create_catalog, StatementResult::Ok));
-
-        let create_database = session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create iceberg database");
-        assert!(matches!(create_database, StatementResult::Ok));
-
-        let create_table = session
-            .execute_in_database("create table ice.db1.tbl (id int, name string)", "default")
-            .expect("create iceberg table");
-        assert!(matches!(create_table, StatementResult::Ok));
-
-        insert_rows!(&session, ["ice", "db1", "tbl"]; [1, "a"], [2, "b"]);
-
-        let result = session
-            .query("select name, id from ice.db1.tbl where id = 2")
-            .expect("query iceberg table");
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().field(0).name(), "name");
-        assert_eq!(chunk.schema().field(1).name(), "id");
-        let names = chunk.batch.column(0);
-        let names = names
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("string array");
-        assert_eq!(names.value(0), "b");
-        let ids = chunk.batch.column(1);
-        let ids = ids
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
-            .expect("int32 array");
-        assert_eq!(ids.value(0), 2);
-    }
-
-    #[test]
-    fn iceberg_refresh_load_failure_does_not_use_stale_external_metadata() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
-        session
-            .query("select id from ice.db1.t")
-            .expect("query iceberg table");
-        assert!(
-            !engine.has_local_table("db1", "t"),
-            "ordinary iceberg SELECT should not register a local catalog table"
-        );
-
-        let entry = {
-            let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-            registry.get("ice").expect("catalog entry")
-        };
-        crate::connector::iceberg::catalog::registry::drop_table(&entry, "db1", "t")
-            .expect("drop backing iceberg table");
-
-        let err = session
-            .query("select id from ice.db1.t")
-            .expect_err("dropped backing table should not use stale local table");
-        assert!(
-            err.contains("unknown iceberg table") || err.contains("unknown table"),
-            "err={err}"
-        );
-        assert!(
-            !engine.has_local_table("db1", "t"),
-            "failed refresh should not leave a local catalog table"
-        );
-    }
-
-    #[test]
-    fn drop_iceberg_table_invalidates_external_metadata_without_local_registration() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
-        session
-            .query("select id from ice.db1.t")
-            .expect("query iceberg table");
-        assert!(
-            !engine.has_local_table("db1", "t"),
-            "ordinary iceberg SELECT should not register a local catalog table"
-        );
-
-        let drop = session
-            .execute_in_database("drop table ice.db1.t", "default")
-            .expect("drop iceberg table");
-        assert!(matches!(drop, StatementResult::Ok));
-        assert!(
-            !engine.has_local_table("db1", "t"),
-            "drop table should keep the local catalog clear"
-        );
-        let err = session
-            .query("select id from ice.db1.t")
-            .expect_err("dropped iceberg table should not be queryable");
-        assert!(
-            err.contains("unknown iceberg table") || err.contains("unknown table"),
-            "err={err}"
-        );
-    }
-
-    #[test]
-    fn embedded_session_preserves_projection_order_with_current_catalog_context() {
-        let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = open_test_engine_with_metadata(&warehouse);
-        let session = engine.session();
-
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        let create_catalog = session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create iceberg catalog");
-        assert!(matches!(create_catalog, StatementResult::Ok));
-
-        let create_database = session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create iceberg database");
-        assert!(matches!(create_database, StatementResult::Ok));
-
-        let create_table = session
-            .execute_in_database(
-                "create table ice.db1.nums (c1 tinyint, c2 smallint)",
-                "default",
-            )
-            .expect("create iceberg table");
-        assert!(matches!(create_table, StatementResult::Ok));
-
-        insert_rows!(&session, ["ice", "db1", "nums"]; [1, 101], [2, 102]);
-
-        let result = session
-            .execute_in_context(
-                "select c2, c1 from nums order by 1, 2",
-                Some("ice"),
-                "db1",
-                None,
-            )
-            .expect("query iceberg table in current catalog context");
-        let StatementResult::Query(result) = result else {
-            panic!("expected query result");
-        };
-        assert_eq!(result.columns[0].name, "c2");
-        assert_eq!(result.columns[1].name, "c1");
-        assert_eq!(result.row_count(), 2);
-
-        let chunk = &result.chunks[0];
-        assert_eq!(chunk.schema().field(0).name(), "c2");
-        assert_eq!(chunk.schema().field(1).name(), "c1");
-        assert_eq!(chunk.batch.column(0).data_type(), &DataType::Int32);
-        assert_eq!(chunk.batch.column(1).data_type(), &DataType::Int32);
-        let c2 = chunk.batch.column(0);
-        let c2 = c2
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
-            .expect("int32 array");
-        assert_eq!(c2.value(0), 101);
-        assert_eq!(c2.value(1), 102);
-        let c1 = chunk.batch.column(1);
-        let c1 = c1
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
-            .expect("int32 array");
-        assert_eq!(c1.value(0), 1);
-        assert_eq!(c1.value(1), 2);
-    }
-
-    #[test]
-    fn embedded_session_restores_catalog_attachment_and_reads_external_table() {
-        let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let metadata_dir = TempDir::new().expect("create metadata dir");
-        let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
-
-        {
-            let engine = StandaloneNovaRocks::open(
-                StandaloneOptions {
-                    config_path: Some(config_path.clone()),
-                },
-                test_open_services(),
-            )
-            .expect("open engine");
-            let session = engine.session();
-
-            let create_catalog_sql = format!(
-                r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-                warehouse.path().display()
-            );
-            let create_catalog = session
-                .execute_in_database(&create_catalog_sql, "default")
-                .expect("create iceberg catalog");
-            assert!(matches!(create_catalog, StatementResult::Ok));
-
-            let create_database = session
-                .execute_in_database("create database ice.db1", "default")
-                .expect("create iceberg database");
-            assert!(matches!(create_database, StatementResult::Ok));
-
-            let create_table = session
-                .execute_in_database("create table ice.db1.tbl (id int, name string)", "default")
-                .expect("create iceberg table");
-            assert!(matches!(create_table, StatementResult::Ok));
-        }
-
-        let restored = StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services(),
-        )
-        .expect("reopen engine");
-        let result = restored
-            .session()
-            .execute_in_database("select id, name from ice.db1.tbl", "default")
-            .expect("read restored external table");
-        let StatementResult::Query(result) = result else {
-            panic!("restored external table read must return rows");
-        };
-        assert_eq!(result.row_count(), 0);
-    }
-
-    #[test]
-    fn restart_does_not_recreate_externally_deleted_iceberg_objects() {
-        let warehouse = TempDir::new().expect("iceberg warehouse");
-        let metadata_dir = TempDir::new().expect("metadata dir");
-        let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
-
-        let entry = {
-            let engine = StandaloneNovaRocks::open(
-                StandaloneOptions {
-                    config_path: Some(config_path.clone()),
-                },
-                test_open_services(),
-            )
-            .expect("open engine");
-            let session = engine.session();
-            let sql = format!(
-                r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-                warehouse.path().display()
-            );
-            session
-                .execute_in_database(&sql, "default")
-                .expect("catalog");
-            session
-                .execute_in_database("create database ice.db1", "default")
-                .expect("database");
-            session
-                .execute_in_database("create table ice.db1.tbl (id int)", "default")
-                .expect("table");
-            engine
-                .inner
-                .iceberg_catalogs
-                .read()
-                .expect("registry")
-                .get("ice")
-                .expect("catalog entry")
-        };
-
-        crate::connector::iceberg::catalog::registry::drop_table(&entry, "db1", "tbl")
-            .expect("external table drop");
-        crate::connector::iceberg::catalog::registry::drop_namespace(&entry, "db1")
-            .expect("external namespace drop");
-
-        let restored = StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services(),
-        )
-        .expect("reopen without replay");
-        let restored_entry = restored
-            .inner
-            .iceberg_catalogs
-            .read()
-            .expect("registry")
-            .get("ice")
-            .expect("restored attachment");
-        assert!(
-            !crate::connector::iceberg::catalog::namespace_exists(&restored_entry, "db1")
-                .expect("namespace existence")
-        );
-        assert!(crate::connector::load_iceberg_table(&restored_entry, "db1", "tbl").is_err());
-    }
-
-    #[test]
-    fn restore_metadata_registers_iceberg_mv_target_from_relationship() {
-        let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let metadata_dir = TempDir::new().expect("create metadata dir");
-        let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");
-
-        {
-            let engine = StandaloneNovaRocks::open(
-                StandaloneOptions {
-                    config_path: Some(config_path.clone()),
-                },
-                test_open_services(),
-            )
-            .expect("open engine");
-            let session = engine.session();
-
-            let create_catalog_sql = format!(
-                r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-                warehouse.path().display()
-            );
-            assert!(matches!(
-                session
-                    .execute_in_database(&create_catalog_sql, "default")
-                    .expect("create iceberg catalog"),
-                StatementResult::Ok
-            ));
-            assert!(matches!(
-                session
-                    .execute_in_database("create database ice.analytics", "default")
-                    .expect("create target namespace"),
-                StatementResult::Ok
-            ));
-            assert!(matches!(
-                session
-                    .execute_in_database("create database ice.sales", "default")
-                    .expect("create source namespace"),
-                StatementResult::Ok
-            ));
-            assert!(matches!(
-                session
-                    .execute_in_database(
-                        "create table ice.sales.orders (id int, name string) \
-                         tblproperties(\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
-                        "default",
-                    )
-                    .expect("create base table"),
-                StatementResult::Ok
-            ));
-            assert!(matches!(
-                session
-                    .execute_in_context(
-                        "CREATE MATERIALIZED VIEW mv_orders \
-                         DISTRIBUTED BY HASH(id) BUCKETS 1 \
-                         PROPERTIES('storage_engine'='iceberg') \
-                         AS SELECT id, name FROM ice.sales.orders",
-                        Some("ice"),
-                        "analytics",
-                        None,
-                    )
-                    .expect("create iceberg mv"),
-                StatementResult::Ok
-            ));
-            let drop_column_err = session
-                .execute_in_database("ALTER TABLE ice.sales.orders DROP COLUMN name", "default")
-                .expect_err("MV base column dependency must block DROP COLUMN");
-            assert!(
-                drop_column_err.contains("materialized view"),
-                "err={drop_column_err}"
-            );
-
-            assert!(
-                engine
-                    .inner
-                    .mv_repository
-                    .find_by_target(&MvTarget {
-                        catalog: Some("ice".to_string()),
-                        database: "analytics".to_string(),
-                        name: "mv_orders".to_string()
-                    })
-                    .expect("find iceberg mv definition")
-                    .is_some()
-            );
-        }
-
-        let restored = StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services(),
-        )
-        .expect("reopen engine");
-        let session = restored.session();
-        let show = session
-            .execute_in_context("SHOW MATERIALIZED VIEWS", Some("ice"), "analytics", None)
-            .expect("show restored mv");
-        let StatementResult::Query(show) = show else {
-            panic!("expected show query result");
-        };
-        assert!(query_result_contains_string(&show, "mv_orders"));
-        assert!(query_result_contains_string(&show, "iceberg"));
-
-        let info_schema = session
-            .execute_in_context(
-                "SELECT TABLE_NAME, IS_ACTIVE \
-                 FROM information_schema.materialized_views \
-                 WHERE TABLE_SCHEMA = 'analytics'",
-                Some("ice"),
-                "analytics",
-                None,
-            )
-            .expect("query information_schema materialized views");
-        let StatementResult::Query(info_schema) = info_schema else {
-            panic!("expected information_schema query result");
-        };
-        assert!(query_result_contains_string(&info_schema, "mv_orders"));
-
-        let select = session
-            .execute_in_context("SELECT * FROM mv_orders", Some("ice"), "analytics", None)
-            .expect("select restored mv target");
-        let StatementResult::Query(select) = select else {
-            panic!("expected select query result");
-        };
-        assert_eq!(select.row_count(), 0);
-    }
-
-    #[test]
     fn dispatch_statement_routes_materialized_view_ast_variants() {
         // This test's only goal is to confirm `Statement::RefreshMaterializedView`
         // is routed to the materialized-view dispatch path (not, say, an iceberg
@@ -8408,837 +7764,6 @@ mysql_port = 47892
     // (Plan Tasks 15-17 — IT-INS-1..4 / IT-OW-1..3 / IT-DEL-1..4 / NEG-*)
     // -----------------------------------------------------------------------
 
-    fn open_test_engine_with_metadata(warehouse: &TempDir) -> StandaloneNovaRocks {
-        open_test_engine_with_metadata_and_statistics(
-            warehouse,
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-        )
-    }
-
-    fn open_test_engine_with_metadata_and_statistics(
-        warehouse: &TempDir,
-        statistics_service: Arc<dyn StatisticsService>,
-    ) -> StandaloneNovaRocks {
-        let config_path = warehouse.path().join("novarocks.toml");
-        std::fs::create_dir_all(warehouse.path().join("meta")).expect("create metadata dir");
-        std::fs::write(
-            &config_path,
-            r#"[metadata]
-provider = "sqlite"
-path = "meta/operations.sqlite"
-"#,
-        )
-        .expect("write metadata config");
-        StandaloneNovaRocks::open(
-            StandaloneOptions {
-                config_path: Some(config_path),
-            },
-            test_open_services_with_statistics(
-                Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
-                Arc::new(crate::engine::view::EmptyViewService),
-                statistics_service,
-            ),
-        )
-        .expect("open engine")
-    }
-
-    fn open_iceberg_session_with_table(
-        warehouse: &TempDir,
-        format_version: &str,
-    ) -> (StandaloneNovaRocks, StandaloneSession) {
-        open_iceberg_session_with_table_and_statistics(
-            warehouse,
-            format_version,
-            Arc::new(crate::engine::statistics::EmptyStatisticsService),
-        )
-    }
-
-    fn open_iceberg_session_with_table_and_statistics(
-        warehouse: &TempDir,
-        format_version: &str,
-        statistics_service: Arc<dyn StatisticsService>,
-    ) -> (StandaloneNovaRocks, StandaloneSession) {
-        let engine = open_test_engine_with_metadata_and_statistics(warehouse, statistics_service);
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create catalog");
-        session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create database");
-        let create_table_sql = format!(
-            r#"create table ice.db1.t (id int, v string) tblproperties("format-version"="{format_version}")"#
-        );
-        session
-            .execute_in_database(&create_table_sql, "default")
-            .expect("create table");
-        (engine, session)
-    }
-
-    #[test]
-    fn iceberg_catalog_lifecycle_registers_and_retires_its_control_binding() {
-        let warehouse = tempfile::tempdir().expect("warehouse tempdir");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
-            .expect("open engine");
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog Ice_One properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create catalog");
-        let state = engine.state_for_test();
-        assert!(
-            engine
-                .iceberg_catalog_exists("ice_one")
-                .expect("catalog exists")
-        );
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice_one")
-            .expect("connector instance ID");
-        let planning_lease = state
-            .connector_control
-            .acquire_current(&instance_id)
-            .expect("catalog creation registers its connector control binding");
-        assert_eq!(
-            planning_lease.binding().descriptor().instance_id,
-            instance_id
-        );
-        drop(planning_lease);
-
-        session
-            .execute_in_database("drop catalog Ice_One", "default")
-            .expect("drop catalog");
-        assert!(
-            !engine
-                .iceberg_catalog_exists("ice_one")
-                .expect("catalog removed")
-        );
-        let retired_error = match state.connector_control.acquire_current(&instance_id) {
-            Ok(_) => panic!("catalog drop must retire its connector control binding"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            retired_error.kind(),
-            novarocks_spi::connector::ConnectorErrorKind::NotFound
-        );
-    }
-
-    fn open_row_lineage_iceberg_session_with_table(
-        warehouse: &TempDir,
-    ) -> (StandaloneNovaRocks, StandaloneSession) {
-        open_row_lineage_iceberg_session_with_table_extra_props(warehouse, &[])
-    }
-
-    fn open_row_lineage_iceberg_session_with_table_extra_props(
-        warehouse: &TempDir,
-        extra_props: &[(&str, &str)],
-    ) -> (StandaloneNovaRocks, StandaloneSession) {
-        use novarocks_connector_iceberg::iceberg::Catalog;
-
-        let engine = open_test_engine_with_metadata(warehouse);
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create catalog");
-        let catalog = {
-            let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-            let entry = registry.get("ice").expect("entry");
-            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
-                .expect("build hadoop catalog")
-        };
-        let namespace =
-            novarocks_connector_iceberg::iceberg::NamespaceIdent::new("db1".to_string());
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        1,
-                        "id",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
-                        ),
-                    ),
-                ),
-                Arc::new(
-                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                        2,
-                        "v",
-                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
-                        ),
-                    ),
-                ),
-            ])
-            .build()
-            .expect("build schema");
-        let mut props: Vec<(String, String)> =
-            vec![("write.row-lineage".to_string(), "true".to_string())];
-        for (k, v) in extra_props {
-            props.push(((*k).to_string(), (*v).to_string()));
-        }
-        let table_creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
-            .name("t".to_string())
-            .schema(schema)
-            .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3)
-            .properties(props)
-            .build();
-        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-            catalog
-                .create_namespace(&namespace, Default::default())
-                .await
-                .expect("create namespace");
-            catalog
-                .create_table(&namespace, table_creation)
-                .await
-                .expect("create row-lineage table");
-        })
-        .expect("create row-lineage table runtime");
-        (engine, session)
-    }
-
-    fn collect_id_v(session: &StandaloneSession, sql: &str) -> Vec<(i32, String)> {
-        let result = session.query(sql).expect("query");
-        collect_id_v_from_result(result)
-    }
-
-    fn collect_id_v_from_result(result: QueryResult) -> Vec<(i32, String)> {
-        let mut out = Vec::new();
-        for chunk in &result.chunks {
-            let ids = chunk
-                .batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int32Array>()
-                .expect("id i32");
-            let names = chunk
-                .batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("v utf8");
-            for i in 0..chunk.batch.num_rows() {
-                out.push((ids.value(i), names.value(i).to_string()));
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn time_travel_select_with_current_iceberg_catalog_resolves_synthetic_local_table() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
-
-        let result = session
-            .execute_in_context(
-                "select id, v from t for version as of 'main'",
-                Some("ice"),
-                "db1",
-                None,
-            )
-            .expect("time-travel select");
-        let StatementResult::Query(result) = result else {
-            panic!("expected query result");
-        };
-
-        assert_eq!(collect_id_v_from_result(result), vec![(1, "a".to_string())]);
-    }
-
-    #[test]
-    fn time_travel_explain_with_current_iceberg_catalog_resolves_synthetic_local_table() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
-
-        let result = session
-            .execute_in_context(
-                "explain select id from t for version as of 'main'",
-                Some("ice"),
-                "db1",
-                None,
-            )
-            .expect("time-travel explain");
-
-        assert!(matches!(result, StatementResult::Query(_)));
-    }
-
-    #[test]
-    fn select_resolves_join_on_subquery_iceberg_table_without_local_registration() {
-        // Engine gap #4 (join_apply_to_join q7): a table referenced ONLY inside
-        // a subquery nested in a JOIN ON predicate must resolve through the
-        // catalog-aware provider, exactly like FROM/WHERE subqueries. This
-        // SELECT must not materialize ordinary Iceberg tables into the local
-        // in-memory catalog.
-        let warehouse = TempDir::new().expect("warehouse");
-        let engine = open_test_engine_with_metadata(&warehouse);
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create catalog");
-        session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create database");
-        for (name, col) in [("t0", "v1"), ("t1", "v5"), ("t2", "v7")] {
-            session
-                .execute_in_database(
-                    &format!(
-                        r#"create table ice.db1.{name} ({col} bigint) tblproperties("format-version"="2")"#
-                    ),
-                    "default",
-                )
-                .expect("create table");
-            insert_rows!(&session, ["ice", "db1", name]; [1], [2], [3]);
-        }
-
-        // `t2` is referenced ONLY inside the ON-clause IN-subquery. Sanity:
-        // it is not in the in-memory catalog before the SELECT runs.
-        assert!(
-            !engine.has_local_table("db1", "t2"),
-            "iceberg table t2 must not be pre-registered before the SELECT",
-        );
-
-        let result = session
-            .execute_in_context(
-                "select count(*) from db1.t0 \
-                 left join db1.t1 on v1 in (select v7 from db1.t2) or v1 < v5",
-                Some("ice"),
-                "db1",
-                None,
-            )
-            .expect("SELECT with ON-clause subquery table must resolve, not error unknown table");
-
-        // The ON-clause-only table resolved through CatalogMgrProvider without
-        // being materialized in the in-memory catalog, and the query produced a
-        // count row.
-        assert!(
-            !engine.has_local_table("db1", "t2"),
-            "ON-clause-subquery table t2 must not be locally registered",
-        );
-        match result {
-            StatementResult::Query(query_result) => {
-                assert_eq!(
-                    query_result.row_count(),
-                    1,
-                    "count(*) over a LEFT JOIN must return exactly one row",
-                );
-            }
-            StatementResult::Ok => panic!("SELECT must return rows"),
-        }
-    }
-
-    fn current_iceberg_snapshot_id(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Option<i64> {
-        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-        let entry = registry.get(catalog).expect("entry");
-        // `load_table` in the registry caches per-entry; force-bypass by
-        // invalidating first so we read disk.
-        entry.invalidate_table_cache(namespace, table);
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
-        loaded
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-    }
-
-    fn iceberg_ref_snapshot_id(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        ref_name: &str,
-    ) -> Option<i64> {
-        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-        let entry = registry.get(catalog).expect("entry");
-        entry.invalidate_table_cache(namespace, table);
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
-        loaded
-            .table
-            .metadata()
-            .refs()
-            .get(ref_name)
-            .map(|r| r.snapshot_id)
-    }
-
-    fn load_iceberg_operation(
-        engine: &StandaloneNovaRocks,
-        operation_id: i64,
-    ) -> crate::meta::repository::iceberg_operation::StoredIcebergOperation {
-        let provider = engine
-            .inner
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("read operation metadata");
-        engine
-            .inner
-            .iceberg_operation_repo
-            .load_operation(read.as_ref(), operation_id)
-            .expect("load iceberg operation")
-            .expect("iceberg operation present")
-    }
-
-    fn assert_iceberg_operation_finalized(
-        engine: &StandaloneNovaRocks,
-        operation_id: i64,
-        expected_kind: crate::meta::repository::iceberg_operation::IcebergOperationKind,
-        expected_snapshot_id: Option<i64>,
-    ) {
-        let operation = load_iceberg_operation(engine, operation_id);
-        assert_eq!(operation.operation_kind, expected_kind);
-        assert_eq!(
-            operation.state,
-            crate::meta::repository::iceberg_operation::IcebergOperationState::Finalized
-        );
-        assert_eq!(
-            operation.commit_outcome.as_ref().map(|c| c.snapshot_id),
-            expected_snapshot_id
-        );
-    }
-
-    fn assert_iceberg_operation_finalized_any_snapshot(
-        engine: &StandaloneNovaRocks,
-        operation_id: i64,
-        expected_kind: crate::meta::repository::iceberg_operation::IcebergOperationKind,
-    ) -> Option<i64> {
-        let operation = load_iceberg_operation(engine, operation_id);
-        assert_eq!(operation.operation_kind, expected_kind);
-        assert_eq!(
-            operation.state,
-            crate::meta::repository::iceberg_operation::IcebergOperationState::Finalized
-        );
-        let snapshot_id = operation.commit_outcome.as_ref().map(|c| c.snapshot_id);
-        assert!(
-            snapshot_id.is_some(),
-            "finalized write operation must record committed snapshot id"
-        );
-        snapshot_id
-    }
-
-    fn assert_iceberg_operation_absent(engine: &StandaloneNovaRocks, operation_id: i64) {
-        let provider = engine
-            .inner
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("read operation metadata");
-        let operation = engine
-            .inner
-            .iceberg_operation_repo
-            .load_operation(read.as_ref(), operation_id)
-            .expect("load iceberg operation");
-        assert!(
-            operation.is_none(),
-            "expected no iceberg operation #{operation_id}, found {operation:?}"
-        );
-    }
-
-    fn current_iceberg_default_spec_fields(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Vec<(
-        String,
-        novarocks_connector_iceberg::iceberg::spec::Transform,
-    )> {
-        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-        let entry = registry.get(catalog).expect("entry");
-        entry.invalidate_table_cache(namespace, table);
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
-        loaded
-            .table
-            .metadata()
-            .default_partition_spec()
-            .fields()
-            .iter()
-            .map(|field| (field.name.clone(), field.transform.clone()))
-            .collect()
-    }
-
-    #[test]
-    fn iceberg_alter_partition_spec_accepts_add_and_drop() {
-        let warehouse = TempDir::new().expect("warehouse tempdir");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database(
-                r#"create table ice.db1.t_evolved
-                   (id bigint, ts datetime)
-                   partition by month(ts)
-                   tblproperties("format-version"="2")"#,
-                "default",
-            )
-            .expect("create partitioned table");
-        assert_eq!(
-            current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
-            vec![(
-                "ts_month".to_string(),
-                novarocks_connector_iceberg::iceberg::spec::Transform::Month
-            )]
-        );
-
-        session
-            .execute_in_database(
-                "alter table ice.db1.t_evolved drop partition column month(ts)",
-                "default",
-            )
-            .expect("drop partition column");
-        assert_eq!(
-            current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
-            Vec::<(
-                String,
-                novarocks_connector_iceberg::iceberg::spec::Transform
-            )>::new()
-        );
-
-        session
-            .execute_in_database(
-                "alter table ice.db1.t_evolved add partition column bucket(id, 8)",
-                "default",
-            )
-            .expect("add partition column");
-        assert_eq!(
-            current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
-            vec![(
-                "id_bucket_8".to_string(),
-                novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(8)
-            )]
-        );
-    }
-
-    fn current_iceberg_row_lineage(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> (u64, Option<(u64, u64)>) {
-        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-        let entry = registry.get(catalog).expect("entry");
-        entry.invalidate_table_cache(namespace, table);
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
-        let metadata = loaded.table.metadata();
-        (
-            metadata.next_row_id(),
-            metadata.current_snapshot().and_then(|s| s.row_range()),
-        )
-    }
-
-    fn current_live_data_file_first_row_ids(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Vec<Option<i64>> {
-        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-        let entry = registry.get(catalog).expect("entry");
-        entry.invalidate_table_cache(namespace, table);
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
-        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(&loaded.table)
-            .expect("extract data files")
-            .into_iter()
-            .map(|file| file.first_row_id)
-            .collect()
-    }
-
-    fn current_snapshot_has_position_delete_parquet(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> bool {
-        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-        let entry = registry.get(catalog).expect("entry");
-        entry.invalidate_table_cache(namespace, table);
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
-        let metadata = loaded.table.metadata();
-        let Some(snapshot) = metadata.current_snapshot() else {
-            return false;
-        };
-        let file_io = loaded.table.file_io().clone();
-        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-            let manifest_list = snapshot
-                .load_manifest_list(&file_io, metadata)
-                .await
-                .expect("load manifest list");
-            for manifest_file in manifest_list.entries() {
-                if manifest_file.content != novarocks_connector_iceberg::iceberg::spec::ManifestContentType::Deletes {
-                    continue;
-                }
-                let manifest = manifest_file
-                    .load_manifest(&file_io)
-                    .await
-                    .expect("load delete manifest");
-                for entry in manifest.entries() {
-                    let data_file = entry.data_file();
-                    if entry.is_alive()
-                        && data_file.content_type()
-                            == novarocks_connector_iceberg::iceberg::spec::DataContentType::PositionDeletes
-                        && data_file.file_format() == novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet
-                    {
-                        return true;
-                    }
-                }
-            }
-            false
-        })
-        .expect("inspect delete manifests")
-    }
-
-    // ---------------------------------------------------------------------------
-    // Helper: read (first_row_id, data_sequence_number) for the current snapshot
-    // directly from the iceberg catalog registry.  Used by the row-lineage SELECT
-    // integration tests below to build dynamic assertions without querying
-    // $snapshots (not yet supported in NovaRocks).
-    // ---------------------------------------------------------------------------
-    fn current_snapshot_lineage_info(
-        engine: &StandaloneNovaRocks,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> (u64, i64) {
-        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-        let entry = registry.get(catalog).expect("catalog entry");
-        entry.invalidate_table_cache(namespace, table);
-        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
-            .expect("load table");
-        let metadata = loaded.table.metadata();
-        let snapshot = metadata
-            .current_snapshot()
-            .expect("table must have a current snapshot");
-        let first_row_id = snapshot
-            .first_row_id()
-            .expect("V3 row-lineage snapshot must carry first_row_id");
-        let seq = snapshot.sequence_number();
-        (first_row_id, seq)
-    }
-
-    // Collect (id, _row_id, _last_updated_sequence_number) tuples from a SELECT
-    // that returns exactly those three BIGINT columns.
-    fn collect_id_rowid_seq(session: &StandaloneSession, sql: &str) -> Vec<(i64, i64, i64)> {
-        let result = session.query(sql).expect("query");
-        let mut out = Vec::new();
-        for chunk in &result.chunks {
-            let ids_col = arrow::compute::cast(chunk.batch.column(0), &DataType::Int64)
-                .expect("cast id column to Int64");
-            let ids = ids_col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("id column must be Int64");
-            let row_ids = chunk
-                .batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("_row_id column must be Int64");
-            let seqs = chunk
-                .batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("_last_updated_sequence_number column must be Int64");
-            for i in 0..chunk.batch.num_rows() {
-                out.push((ids.value(i), row_ids.value(i), seqs.value(i)));
-            }
-        }
-        out.sort_by_key(|row| row.0);
-        out
-    }
-
-    // -------------------------------------------------------------------------
-    // Task 5: end-to-end SELECT _row_id / _last_updated_sequence_number on a V3
-    // row-lineage Iceberg table.
-    // -------------------------------------------------------------------------
-
-    // Build a V3 row-lineage table with bigint id and string name columns via
-    // the iceberg catalog API (bypassing SQL DDL which defaults to V2).
-    fn open_v3_row_lineage_session_bigint(
-        warehouse: &TempDir,
-    ) -> (StandaloneNovaRocks, StandaloneSession) {
-        use novarocks_connector_iceberg::iceberg::Catalog;
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
-
-        let engine = open_test_engine_with_metadata(warehouse);
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create iceberg catalog");
-        let catalog = {
-            let registry = engine.inner.iceberg_catalogs.read().expect("registry");
-            let entry = registry.get("ice").expect("entry");
-            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
-                .expect("build hadoop catalog")
-        };
-        let namespace = novarocks_connector_iceberg::iceberg::NamespaceIdent::new("ns".to_string());
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Long),
-                )),
-                Arc::new(NestedField::optional(
-                    2,
-                    "name",
-                    Type::Primitive(PrimitiveType::String),
-                )),
-            ])
-            .build()
-            .expect("build schema");
-        let table_creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
-            .name("t".to_string())
-            .schema(schema)
-            .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3)
-            .properties([("write.row-lineage".to_string(), "true".to_string())])
-            .build();
-        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-            catalog
-                .create_namespace(&namespace, Default::default())
-                .await
-                .expect("create namespace");
-            catalog
-                .create_table(&namespace, table_creation)
-                .await
-                .expect("create V3 row-lineage table");
-        })
-        .expect("create table runtime");
-        (engine, session)
-    }
-
-    #[test]
-    fn select_row_id_fails_on_v2_iceberg_table() {
-        let warehouse = TempDir::new().expect("warehouse tempdir");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
-            .expect("open standalone engine");
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create catalog");
-        session
-            .execute_in_database("create database ice.ns", "default")
-            .expect("create namespace");
-        session
-            .execute_in_database(
-                r#"create table ice.ns.t2 (id bigint) tblproperties("format-version"="2")"#,
-                "default",
-            )
-            .expect("create V2 iceberg table");
-
-        let err = session
-            .execute_in_database("select _row_id from ice.ns.t2", "default")
-            .expect_err("selecting _row_id from a V2 table must fail");
-        assert!(
-            err.contains("only available on Iceberg V3 row-lineage tables"),
-            "expected row-lineage error, got: {err}"
-        );
-
-        drop(engine);
-    }
-
-    #[test]
-    fn select_row_id_fails_on_v3_table_without_row_lineage() {
-        let warehouse = TempDir::new().expect("warehouse tempdir");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
-            .expect("open standalone engine");
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create catalog");
-        session
-            .execute_in_database("create database ice.ns", "default")
-            .expect("create namespace");
-        session
-            .execute_in_database(
-                r#"create table ice.ns.t3 (id bigint) tblproperties("format-version"="3","write.row-lineage"="false")"#,
-                "default",
-            )
-            .expect("create V3 iceberg table with row-lineage disabled");
-
-        let err = session
-            .execute_in_database("select _row_id from ice.ns.t3", "default")
-            .expect_err("selecting _row_id from a V3 non-row-lineage table must fail");
-        assert!(
-            err.contains("only available on Iceberg V3 row-lineage tables"),
-            "expected row-lineage error, got: {err}"
-        );
-
-        drop(engine);
-    }
-
-    #[test]
-    fn select_last_updated_sequence_number_fails_on_non_row_lineage_iceberg_table() {
-        // Tests that _last_updated_sequence_number fails on a regular V3 iceberg
-        // table without write.row-lineage=true (same fail-fast path as unsupported
-        // source tables).
-        let warehouse = TempDir::new().expect("warehouse tempdir");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
-            .expect("open standalone engine");
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create catalog");
-        session
-            .execute_in_database("create database ice.ns", "default")
-            .expect("create namespace");
-        session
-            .execute_in_database(
-                r#"create table ice.ns.t4 (id bigint) tblproperties("format-version"="2")"#,
-                "default",
-            )
-            .expect("create V2 iceberg table (no row-lineage)");
-
-        let err = session
-            .execute_in_database(
-                "select _last_updated_sequence_number from ice.ns.t4",
-                "default",
-            )
-            .expect_err("must fail on table without row-lineage");
-        assert!(
-            err.contains("only available on Iceberg V3 row-lineage tables"),
-            "expected row-lineage error, got: {err}"
-        );
-
-        drop(engine);
-    }
-
     fn test_sql_write_plan_input(
         _bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
     ) -> crate::sql::planner::distributed::write::contract::SqlWritePlanInput {
@@ -9247,54 +7772,6 @@ path = "meta/operations.sqlite"
         )
     }
 
-    fn single_bucket_partition_metadata_json() -> String {
-        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
-            .with_fields(vec![Arc::new(
-                novarocks_connector_iceberg::iceberg::spec::NestedField::required(
-                    1,
-                    "id",
-                    novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
-                        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
-                    ),
-                ),
-            )])
-            .build()
-            .expect("schema");
-        let partition_spec =
-            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(schema.clone())
-                .add_partition_field(
-                    "id",
-                    "id_bucket",
-                    novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(16),
-                )
-                .expect("partition field")
-                .build()
-                .expect("partition spec");
-        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
-            schema,
-            partition_spec,
-            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
-            "file:///warehouse/target_orders".to_string(),
-            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
-            std::collections::HashMap::new(),
-        )
-        .expect("metadata builder")
-        .build()
-        .expect("metadata");
-        serde_json::to_string(&metadata.metadata).expect("serialize metadata")
-    }
-
-    #[test]
-    fn iceberg_write_root_shuffle_by_output_name_is_a_typed_sql_requirement() {
-        assert_eq!(
-            super::iceberg_write_shuffle_by_output_name("_file"),
-            crate::sql::compiler::RootDistributionRequirement::ShuffleOutputName(
-                "_file".to_string()
-            )
-        );
-    }
-
-    #[test]
     fn execute_query_as_iceberg_write_requires_admitted_topology() {
         let query = parse_query_for_engine_test("SELECT 1 AS payload, 'file-a' AS _file");
         let mut state = StandaloneState::default();
@@ -9503,668 +7980,6 @@ path = "meta/operations.sqlite"
 
     /// Open an Iceberg-backed test engine and return (engine, session, warehouse_dir).
     /// Tables are NOT yet created; the caller creates and populates them.
-    fn open_scalar_subquery_test_engine(
-        warehouse: &TempDir,
-    ) -> (StandaloneNovaRocks, StandaloneSession) {
-        let engine = open_test_engine_with_metadata(warehouse);
-        let session = engine.session();
-        let create_catalog_sql = format!(
-            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
-            warehouse.path().display()
-        );
-        session
-            .execute_in_database(&create_catalog_sql, "default")
-            .expect("create iceberg catalog");
-        session
-            .execute_in_database("create database ice.db1", "default")
-            .expect("create iceberg database");
-        (engine, session)
-    }
-
-    /// Run a SELECT query and return the first column's values
-    /// as a `Vec<Option<i64>>` (None = SQL NULL). Expects every row to have
-    /// exactly one column of type BIGINT/INT.
-    fn run_scalar_query_i64(
-        session: &StandaloneSession,
-        sql: &str,
-    ) -> Result<Vec<Option<i64>>, String> {
-        let result = session.execute_in_context(sql, Some("ice"), "db1", None)?;
-        let qr = match result {
-            StatementResult::Query(qr) => qr,
-            StatementResult::Ok => {
-                return Err("query returned no rows (StatementResult::Ok)".to_string());
-            }
-        };
-        let mut values = Vec::new();
-        for chunk in &qr.chunks {
-            let col = chunk.batch.column(0);
-            // Try Int64 first (BIGINT), then Int32 (INT).
-            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                for i in 0..arr.len() {
-                    values.push(if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    });
-                }
-            } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
-                for i in 0..arr.len() {
-                    values.push(if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as i64)
-                    });
-                }
-            } else {
-                return Err(format!(
-                    "expected Int64 or Int32 column, got {:?}",
-                    col.data_type()
-                ));
-            }
-        }
-        Ok(values)
-    }
-
-    /// Run a SELECT query and return all columns' values as a
-    /// `Vec<Vec<Option<i64>>>` (outer = rows, inner = columns). Expects every
-    /// column to be BIGINT/INT.
-    fn run_scalar_query_multi_col(
-        session: &StandaloneSession,
-        sql: &str,
-    ) -> Result<Vec<Vec<Option<i64>>>, String> {
-        let result = session.execute_in_context(sql, Some("ice"), "db1", None)?;
-        let qr = match result {
-            StatementResult::Query(qr) => qr,
-            StatementResult::Ok => {
-                return Err("query returned no rows (StatementResult::Ok)".to_string());
-            }
-        };
-        let num_cols = qr.columns.len();
-        // Build row-major result: collect per-column arrays, then transpose.
-        let mut col_values: Vec<Vec<Option<i64>>> = vec![Vec::new(); num_cols];
-        for chunk in &qr.chunks {
-            for col_idx in 0..num_cols {
-                let col = chunk.batch.column(col_idx);
-                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                    for i in 0..arr.len() {
-                        col_values[col_idx].push(if arr.is_null(i) {
-                            None
-                        } else {
-                            Some(arr.value(i))
-                        });
-                    }
-                } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
-                    for i in 0..arr.len() {
-                        col_values[col_idx].push(if arr.is_null(i) {
-                            None
-                        } else {
-                            Some(arr.value(i) as i64)
-                        });
-                    }
-                } else {
-                    return Err(format!(
-                        "col {col_idx}: expected Int64 or Int32, got {:?}",
-                        col.data_type()
-                    ));
-                }
-            }
-        }
-        // Transpose to row-major.
-        let num_rows = col_values.first().map(|v| v.len()).unwrap_or(0);
-        let rows = (0..num_rows)
-            .map(|r| (0..num_cols).map(|c| col_values[c][r]).collect())
-            .collect();
-        Ok(rows)
-    }
-
-    /// Run a SELECT query and expect an error containing `needle`.
-    fn expect_subquery_error(session: &StandaloneSession, sql: &str, needle: &str) {
-        let result = session.execute_in_context(sql, Some("ice"), "db1", None);
-        let err = result.expect_err(&format!(
-            "expected subquery error containing '{needle}', but query succeeded"
-        ));
-        assert!(
-            err.contains(needle),
-            "expected error containing '{needle}'; got: {err}"
-        );
-    }
-
-    fn create_kv_tables(
-        session: &StandaloneSession,
-        t1_rows: &[(Option<i64>, Option<i64>)],
-        t2_rows: &[(Option<i64>, Option<i64>)],
-    ) {
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        insert_kv_fixture_rows(session, "t1", t1_rows);
-        insert_kv_fixture_rows(session, "t2", t2_rows);
-    }
-
-    fn insert_kv_fixture_rows(
-        session: &StandaloneSession,
-        table: &str,
-        rows: &[(Option<i64>, Option<i64>)],
-    ) {
-        if rows.is_empty() {
-            return;
-        }
-        let rows = rows
-            .iter()
-            .map(|(key, value)| vec![(*key).into_test_literal(), (*value).into_test_literal()])
-            .collect::<Vec<_>>();
-        insert_iceberg_fixture_rows(session, &["ice", "db1", table], &rows);
-    }
-
-    fn assert_subquery_result_i64(
-        session: &StandaloneSession,
-        sql: &str,
-        expected: Vec<Option<i64>>,
-    ) {
-        let result = run_scalar_query_i64(session, sql).expect("subquery query");
-
-        assert_eq!(result, expected, "unexpected SQL result for query: {sql}");
-    }
-
-    // ---- Test 1: correlated aggregate (q17-shape) ----------------------------
-
-    /// Correlated aggregate scalar: `WHERE v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)`.
-    #[test]
-    fn scalar_subquery_correlated_agg_returns_expected_rows() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        // t1: (1,10),(2,20),(3,30)
-        // t2: (1,10),(1,5),(2,20),(2,15)  -> min for k=1 is 5, k=2 is 15, k=3 has no match
-        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 10_i64], [2_i64, 20_i64], [3_i64, 30_i64]);
-        insert_rows!(&session, ["ice", "db1", "t2"];
-            [1_i64, 10_i64], [1_i64, 5_i64], [2_i64, 20_i64], [2_i64, 15_i64]);
-
-        // The subquery: SELECT t1.k FROM t1 WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)
-        // k=1: min(t2.v) for k=1 = 5; t1.v=10 != 5 -> not selected
-        // k=2: min(t2.v) for k=2 = 15; t1.v=20 != 15 -> not selected
-        // k=3: no t2 rows -> NULL; t1.v=30 != NULL -> not selected
-        // Result: no rows (empty)
-        //
-        // Alternatively use a query where some rows DO match:
-        // WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)
-        // Let's insert a t1 row where v=5 (k=1) so it matches min(t2.v)=5.
-        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 5_i64]);
-
-        let sql = "SELECT t1.k FROM t1 WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) ORDER BY 1";
-
-        let result = run_scalar_query_i64(&session, sql).expect("corr-agg query");
-        // k=1, v=5 matches min(t2.v for k=1)=5 — exactly one row
-        assert_eq!(result, vec![Some(1)]);
-    }
-
-    // ---- Test 2: uncorrelated scalar ----------------------------------------
-
-    #[test]
-    fn scalar_subquery_uncorrelated_returns_expected_rows() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 10_i64], [2_i64, 20_i64], [3_i64, 30_i64]);
-        insert_rows!(&session, ["ice", "db1", "t2"];
-            [1_i64, 100_i64], [2_i64, 200_i64], [3_i64, 300_i64]);
-
-        // Uncorrelated scalar: v > (SELECT min(v) FROM t2). min(t2.v)=100 and all
-        // t1.v are < 100, so the result is empty.
-        let sql = "SELECT t1.k FROM t1 WHERE t1.v > (SELECT min(v) FROM t2) ORDER BY 1";
-
-        let result = run_scalar_query_i64(&session, sql).expect("uncorrelated query");
-        // t1.v > 100: v=20 no, v=30 no — wait, t1.v values are 10,20,30; min(t2.v)=100
-        // None qualify. Let's verify.
-        assert_eq!(result, vec![]);
-    }
-
-    // ---- Test 3: empty group -> NULL ----------------------------------------
-
-    /// When some outer rows have no matching inner group, the correlated
-    /// aggregate returns NULL (LEFT OUTER JOIN null-extension).
-    #[test]
-    fn scalar_subquery_empty_group_yields_null() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        // t1: k=1, k=2, k=3. t2 has only k=1 and k=2.
-        // k=3 has no match → scalar is NULL.
-        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 0_i64], [2_i64, 0_i64], [3_i64, 0_i64]);
-        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 10_i64], [2_i64, 20_i64]);
-
-        // Project the scalar result (may be NULL) for each t1 row.
-        let sql = "SELECT (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
-
-        let result = run_scalar_query_i64(&session, sql).expect("empty-group query");
-        // k=1 → Some(10), k=2 → Some(20), k=3 → None (NULL)
-        assert_eq!(result, vec![Some(10), Some(20), None]);
-    }
-
-    // ---- Test 4: count -> 0, not NULL ---------------------------------------
-
-    /// Correlated count(*) scalar: must return 0 (not NULL) for outer
-    /// rows with no matching inner group, thanks to the `ifnull(count,0)`
-    /// normalization in ScalarApplyToJoin.
-    #[test]
-    fn scalar_subquery_count_zero_normalizes_correctly() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 0_i64], [2_i64, 0_i64], [3_i64, 0_i64]);
-        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 10_i64], [1_i64, 20_i64]);
-
-        // count(*) for k=1 → 2, k=2 → 0, k=3 → 0 (not NULL)
-        let sql = "SELECT (SELECT count(*) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
-
-        let result = run_scalar_query_i64(&session, sql).expect("count-zero query");
-
-        assert_eq!(
-            result,
-            vec![Some(2), Some(0), Some(0)],
-            "count(*) must return 0 (not NULL) for unmatched outer rows (ifnull normalization)"
-        );
-    }
-
-    // ---- Test 5: NULL correlation key -> NULL scalar ------------------------
-
-    #[test]
-    fn scalar_subquery_null_correlation_key_yields_null() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        // t1 has a NULL k; the correlated scalar must also be NULL.
-        insert_rows!(&session, ["ice", "db1", "t1"];
-            [Some(1_i64), 0_i64], [None::<i64>, 0_i64]);
-        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 10_i64], [1_i64, 5_i64]);
-
-        let sql =
-            "SELECT (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k NULLS LAST";
-
-        let result = run_scalar_query_i64(&session, sql).expect("null-key query");
-        // k=1 → Some(5), k=NULL → None (NULL: no match because NULL != NULL in the join)
-        assert_eq!(result, vec![Some(5), None]);
-    }
-
-    // ---- Test 6: correlated non-agg single-row ------------------------------
-
-    /// Correlated NON-aggregate scalar where the inner key is unique (≤1 row
-    /// per outer key). The with-check path (count(1)/any_value/assert_true)
-    /// must return the correct value without raising the row-check error.
-    #[test]
-    fn scalar_subquery_correlated_nonagg_single_row_ok() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        // t2.k is effectively unique: each k appears exactly once.
-        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 0_i64], [2_i64, 0_i64], [3_i64, 0_i64]);
-        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 100_i64], [2_i64, 200_i64]);
-
-        // Correlated non-aggregate: (SELECT t2.v FROM t2 WHERE t2.k = t1.k)
-        // k=1 → 100, k=2 → 200, k=3 → NULL (no match)
-        let sql = "SELECT (SELECT t2.v FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
-
-        let result =
-            run_scalar_query_i64(&session, sql).expect("non-agg single-row query must succeed");
-
-        assert_eq!(
-            result,
-            vec![Some(100), Some(200), None],
-            "non-agg single-row must return correct values"
-        );
-    }
-
-    // ---- Test 7: correlated non-agg MULTI-ROW -> must ERROR -----------------
-    //
-    // This is the most important test: the assert_true(cnt IS NULL OR cnt <= 1,
-    // 'correlate scalar subquery result must 1 row') check must fire at runtime.
-    #[test]
-    fn scalar_subquery_correlated_nonagg_multirow_errors_with_apply_guard() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        // t2 has TWO rows with k=1, so the correlated scalar for t1.k=1 returns >1 row.
-        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 0_i64]);
-        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 100_i64], [1_i64, 200_i64]);
-
-        let sql = "SELECT (SELECT t2.v FROM t2 WHERE t2.k = t1.k) FROM t1";
-        expect_subquery_error(&session, sql, "correlate scalar subquery result must 1 row");
-    }
-
-    // ---- Test 8: two correlated scalar subqueries in one query ---------------
-
-    /// Two correlated scalar subqueries over different tables in the same SELECT
-    /// list. M1a stacks them as left-deep Apply nodes; M1b decorrelates each one
-    /// to a LEFT OUTER JOIN. This test verifies that both decorrelations succeed
-    /// and that results include NULL extension for
-    /// outer rows that only match one of the two subqueries.
-    ///
-    /// Schema:
-    ///   t1(k BIGINT, v BIGINT) — outer table
-    ///   t2(k BIGINT, v BIGINT) — has matches for k=1 and k=2, but NOT k=3
-    ///   t3(k BIGINT, v BIGINT) — has matches for k=1 and k=3, but NOT k=2
-    ///
-    /// Query:
-    ///   SELECT t1.k,
-    ///          (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k),
-    ///          (SELECT max(t3.v) FROM t3 WHERE t3.k = t1.k)
-    ///   FROM t1 ORDER BY t1.k
-    ///
-    /// Expected results (k, min_t2, max_t3):
-    ///   k=1 → (1, 5,  90)   — both subqueries match
-    ///   k=2 → (2, 20, NULL) — only t2 matches; t3 NULL-extends
-    ///   k=3 → (3, NULL, 30) — only t3 matches; t2 NULL-extends
-    #[test]
-    fn scalar_subquery_multiple_in_one_query_returns_expected_rows() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-
-        session
-            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
-            .expect("create t1");
-        session
-            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
-            .expect("create t2");
-        session
-            .execute_in_database("create table ice.db1.t3 (k bigint, v bigint)", "default")
-            .expect("create t3");
-
-        // t1: three outer rows with distinct keys
-        insert_rows!(&session, ["ice", "db1", "t1"];
-            [1_i64, 0_i64], [2_i64, 0_i64], [3_i64, 0_i64]);
-        // t2: k=1 has two rows (min=5), k=2 has one row (min=20), k=3 absent
-        insert_rows!(&session, ["ice", "db1", "t2"];
-            [1_i64, 5_i64], [1_i64, 10_i64], [2_i64, 20_i64]);
-        // t3: k=1 has one row (max=90), k=2 absent, k=3 has one row (max=30)
-        insert_rows!(&session, ["ice", "db1", "t3"]; [1_i64, 90_i64], [3_i64, 30_i64]);
-
-        let sql = "SELECT t1.k, \
-                   (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k), \
-                   (SELECT max(t3.v) FROM t3 WHERE t3.k = t1.k) \
-                   FROM t1 ORDER BY t1.k";
-
-        let result = run_scalar_query_multi_col(&session, sql).expect("multi-scalar query");
-
-        // Verify the concrete expected values:
-        //   k=1: min(t2.v for k=1)=5,  max(t3.v for k=1)=90
-        //   k=2: min(t2.v for k=2)=20, max(t3.v for k=2)=NULL (no t3 rows)
-        //   k=3: min(t2.v for k=3)=NULL (no t2 rows), max(t3.v for k=3)=30
-        assert_eq!(
-            result,
-            vec![
-                vec![Some(1), Some(5), Some(90)],
-                vec![Some(2), Some(20), None],
-                vec![Some(3), None, Some(30)],
-            ],
-            "unexpected result values for multiple scalar subqueries"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // EXISTS / IN Apply-to-Join — end-to-end parity tests (Task 7).
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn not_exists_correlated_returns_expected_rows() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(
-            &session,
-            kv_rows!((1, 10), (2, 20), (3, 30), (NULL, 40)),
-            kv_rows!((1, 100), (3, 300), (NULL, 999)),
-        );
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.k = t1.k) ORDER BY t1.k NULLS LAST",
-            vec![Some(2), None],
-        );
-    }
-
-    #[test]
-    fn exists_uncorrelated_returns_expected_rows() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(
-            &session,
-            kv_rows!((1, 10), (2, 20), (3, 30)),
-            kv_rows!((1, 101), (2, 200)),
-        );
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v > 100) ORDER BY 1",
-            vec![Some(1), Some(2), Some(3)],
-        );
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v > 1000) ORDER BY 1",
-            vec![],
-        );
-    }
-
-    #[test]
-    fn in_inside_or_with_build_null_preserves_unknown() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(
-            &session,
-            kv_rows!((1, 10), (2, 20), (3, NULL)),
-            kv_rows!((9, 10), (9, NULL)),
-        );
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 \
-             WHERE (t1.v IN (SELECT t2.v FROM t2)) OR false \
-             ORDER BY 1",
-            vec![Some(1)],
-        );
-    }
-
-    #[test]
-    fn in_projection_with_build_null_preserves_unknown() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(
-            &session,
-            kv_rows!((1, 10), (2, 20), (3, NULL)),
-            kv_rows!((9, 10), (9, NULL)),
-        );
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT CASE \
-                    WHEN t1.v IN (SELECT t2.v FROM t2) THEN 1 \
-                    WHEN (t1.v IN (SELECT t2.v FROM t2)) IS NULL THEN NULL \
-                    ELSE 0 \
-                END \
-             FROM t1 ORDER BY t1.k",
-            vec![Some(1), None, None],
-        );
-    }
-
-    #[test]
-    fn not_in_uncorrelated_no_null() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(
-            &session,
-            kv_rows!((1, 10), (2, 20), (3, 30)),
-            kv_rows!((9, 20), (9, 40)),
-        );
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2) ORDER BY 1",
-            vec![Some(1), Some(3)],
-        );
-    }
-
-    #[test]
-    fn not_in_uncorrelated_build_null() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(
-            &session,
-            kv_rows!((1, 10), (2, 20), (3, 30)),
-            kv_rows!((9, 20), (9, NULL)),
-        );
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2) ORDER BY 1",
-            vec![],
-        );
-    }
-
-    #[test]
-    fn not_in_inside_or_with_build_null_is_unknown() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, kv_rows!((1, 10), (2, 20)), kv_rows!((9, NULL)));
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 \
-             WHERE (t1.v NOT IN (SELECT t2.v FROM t2)) OR false \
-             ORDER BY 1",
-            vec![],
-        );
-    }
-
-    #[test]
-    fn not_in_inside_or_with_probe_null_and_empty_build_is_true() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, kv_rows!((1, NULL), (2, 20)), &[]);
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 \
-             WHERE (t1.v NOT IN (SELECT t2.v FROM t2)) OR false \
-             ORDER BY 1",
-            vec![Some(1), Some(2)],
-        );
-    }
-
-    #[test]
-    fn not_in_join_on_with_build_null_is_unknown() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, kv_rows!((1, 10), (2, 20)), kv_rows!((9, NULL)));
-        session
-            .execute_in_database("create table ice.db1.t3 (k bigint, v bigint)", "default")
-            .expect("create t3");
-        insert_rows!(&session, ["ice", "db1", "t3"]; [100_i64, 0_i64]);
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 JOIN t3 \
-             ON t1.v NOT IN (SELECT t2.v FROM t2) \
-             ORDER BY 1",
-            vec![],
-        );
-    }
-
-    #[test]
-    fn not_in_join_on_with_probe_null_is_unknown() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, kv_rows!((1, NULL), (2, 20)), kv_rows!((9, 10)));
-        session
-            .execute_in_database("create table ice.db1.t3 (k bigint, v bigint)", "default")
-            .expect("create t3");
-        insert_rows!(&session, ["ice", "db1", "t3"]; [100_i64, 0_i64]);
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 JOIN t3 \
-             ON t1.v NOT IN (SELECT t2.v FROM t2) \
-             ORDER BY 1",
-            vec![Some(2)],
-        );
-    }
-
-    #[test]
-    fn not_in_uncorrelated_probe_null() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(
-            &session,
-            kv_rows!((1, 10), (2, NULL), (3, 30)),
-            kv_rows!((9, 20), (9, 40)),
-        );
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2) ORDER BY 1",
-            vec![Some(1), Some(3)],
-        );
-    }
-
-    #[test]
-    fn not_in_correlated_conjunct() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(
-            &session,
-            kv_rows!((1, 10), (2, 20), (3, 30), (4, 40)),
-            kv_rows!((1, 20), (1, 30), (2, 20), (2, NULL), (3, NULL), (3, 40)),
-        );
-
-        assert_subquery_result_i64(
-            &session,
-            "SELECT t1.k FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2 WHERE t2.k = t1.k) ORDER BY 1",
-            vec![Some(1), Some(4)],
-        );
-    }
-
     #[test]
     fn typed_statistics_statements_use_the_injected_application_port() {
         let port = Arc::new(RecordingStatisticsApplicationPort::default());

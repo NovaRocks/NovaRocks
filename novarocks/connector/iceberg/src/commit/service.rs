@@ -59,11 +59,8 @@ impl CleanupAttempt {
     }
 }
 
-/// Provider-neutral projection required to retain recovery evidence.
-///
-/// The commit collector can remain application-owned during migration while
-/// the provider owns the terminal value and never imports Core.
-pub trait CommitRecoverySource {
+/// Provider-local projection required to retain recovery evidence.
+pub(crate) trait CommitRecoverySource {
     fn recovery_table_ident(&self) -> String;
     fn recovery_op_kind(&self) -> CommitOpKind;
     fn recovery_base_snapshot_id(&self) -> Option<i64>;
@@ -112,7 +109,7 @@ pub struct RecoveryEvidence {
 }
 
 impl RecoveryEvidence {
-    pub fn from_collector(source: &impl CommitRecoverySource) -> Self {
+    pub(crate) fn from_collector(source: &impl CommitRecoverySource) -> Self {
         Self {
             table_ident: source.recovery_table_ident(),
             op_kind: source.recovery_op_kind(),

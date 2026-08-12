@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorSealedWriteCohortSet, ConnectorWriteAbortOutcome,
     ConnectorWriteAbortRequest, ConnectorWriteAttemptCompletion, ConnectorWriteCohortCompletion,
-    ConnectorWriteCohortDescriptor, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
-    ConnectorWriteExecutionId, ConnectorWriteLease, ConnectorWriteOperationCompletion,
-    ConnectorWriteOperationId, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
-    ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorWriteCohortId, ConnectorWriteCommitRequest, ConnectorWriteExecutionId,
+    ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
+    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ExternalMutationEvidence,
+    ExternalMutationOutcome,
 };
 
 use crate::query_execution::contract::{
@@ -81,7 +81,7 @@ impl ConnectorWriteOperationSession {
         }
         let owner = lease.binding_key().clone();
         let mut cohorts = BTreeMap::new();
-        let mut descriptors = Vec::new();
+        let sealed = registration.sealed_cohorts()?;
         let mut context = None;
         for template in registration.into_cohorts() {
             if template.operation_id() != operation_id {
@@ -93,19 +93,12 @@ impl ConnectorWriteOperationSession {
             if context.is_none() {
                 context = Some(template.request_context().clone());
             }
-            let descriptor = ConnectorWriteCohortDescriptor::new(
-                cohort_id,
-                template.intent(),
-                template.stable_digest(&owner)?,
-            );
             if cohorts.insert(cohort_id, template).is_some() {
                 return Err(invalid(
                     "connector write operation registration contains a duplicate cohort",
                 ));
             }
-            descriptors.push(descriptor);
         }
-        let sealed = ConnectorSealedWriteCohortSet::try_new(operation_id, descriptors)?;
         let context = context.ok_or_else(|| invalid("connector write operation has no cohorts"))?;
         let state = OperationState {
             cohorts: cohorts
@@ -1205,17 +1198,19 @@ mod tests {
     fn sealed_session_rejects_another_lease_for_the_same_binding() {
         let operation_id = ConnectorWriteOperationId::from_bytes([91; 16]);
         let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let planned_abort_calls = Arc::new(AtomicUsize::new(0));
         let planned_lease = lease(
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&planned_abort_calls),
         );
+        let replacement_abort_calls = Arc::new(AtomicUsize::new(0));
         let replacement_lease = lease(
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&replacement_abort_calls),
         );
         let error = match ConnectorWriteOperationSession::try_begin(
             ConnectorWriteOperationRegistration::single(template(
@@ -1229,6 +1224,8 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("exact lease generation"));
+        assert_eq!(planned_abort_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(replacement_abort_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

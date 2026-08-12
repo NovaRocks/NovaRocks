@@ -1441,6 +1441,7 @@ pub struct ConnectorWriteActivation {
     source_digest: [u8; 32],
     activation_digest: [u8; 32],
     cohorts: Vec<ConnectorActivatedWriteCohort>,
+    sealed_cohorts: ConnectorSealedWriteCohortSet,
 }
 
 impl ConnectorWriteActivation {
@@ -1489,13 +1490,32 @@ impl ConnectorWriteActivation {
                 preparation,
                 activation_digest,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let sealed_cohorts = ConnectorSealedWriteCohortSet::try_new(
+            request.operation_id,
+            cohorts
+                .iter()
+                .map(|cohort| {
+                    ConnectorWriteCohortDescriptor::new(
+                        cohort.cohort_id(),
+                        cohort.preparation().intent(),
+                        write_planning_digest(
+                            &owner,
+                            cohort.operation_id(),
+                            cohort.cohort_id(),
+                            cohort.activation_digest(),
+                        ),
+                    )
+                })
+                .collect(),
+        )?;
         Ok(Self {
             owner,
             operation_id: request.operation_id,
             source_digest,
             activation_digest,
             cohorts,
+            sealed_cohorts,
         })
     }
     pub fn owner(&self) -> &ConnectorExecutionBindingKey {
@@ -1512,6 +1532,14 @@ impl ConnectorWriteActivation {
     }
     pub fn cohorts(&self) -> &[ConnectorActivatedWriteCohort] {
         &self.cohorts
+    }
+    /// Exact operation authority reserved by this activation.
+    ///
+    /// Consumers retain this set before building any local planning carriers,
+    /// so a local validation failure after provider activation can still be
+    /// terminalized through the exact lease.
+    pub fn sealed_cohorts(&self) -> &ConnectorSealedWriteCohortSet {
+        &self.sealed_cohorts
     }
     pub fn cohort(
         &self,
@@ -1540,6 +1568,30 @@ impl ConnectorWriteActivation {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "connector activation contains invalid cohorts",
+            ));
+        }
+        let expected_sealed = ConnectorSealedWriteCohortSet::try_new(
+            self.operation_id,
+            self.cohorts
+                .iter()
+                .map(|cohort| {
+                    ConnectorWriteCohortDescriptor::new(
+                        cohort.cohort_id(),
+                        cohort.preparation().intent(),
+                        write_planning_digest(
+                            &self.owner,
+                            cohort.operation_id(),
+                            cohort.cohort_id(),
+                            cohort.activation_digest(),
+                        ),
+                    )
+                })
+                .collect(),
+        )?;
+        if expected_sealed != self.sealed_cohorts {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector activation sealed cohort set does not match its cohorts",
             ));
         }
         Ok(())
@@ -1614,14 +1666,28 @@ impl ConnectorWritePlanningRequest {
                 "connector write planning preparation does not match the exact control owner",
             ));
         }
-        let mut hasher = Sha256::new();
-        hasher.update(b"novarocks.connector-write-planning.v1\0");
-        digest_owner(&mut hasher, owner);
-        hasher.update(self.operation_id.to_bytes());
-        hasher.update(self.cohort_id.to_bytes());
-        hasher.update(self.activation.activation_digest());
-        Ok(hasher.finalize().into())
+        Ok(write_planning_digest(
+            owner,
+            self.operation_id,
+            self.cohort_id,
+            self.activation.activation_digest(),
+        ))
     }
+}
+
+fn write_planning_digest(
+    owner: &ConnectorExecutionBindingKey,
+    operation_id: ConnectorWriteOperationId,
+    cohort_id: ConnectorWriteCohortId,
+    activation_digest: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.connector-write-planning.v1\0");
+    digest_owner(&mut hasher, owner);
+    hasher.update(operation_id.to_bytes());
+    hasher.update(cohort_id.to_bytes());
+    hasher.update(activation_digest);
+    hasher.finalize().into()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

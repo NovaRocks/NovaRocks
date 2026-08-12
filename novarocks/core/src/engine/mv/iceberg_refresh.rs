@@ -25,13 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
-#[cfg(test)]
-use novarocks_connector_iceberg::iceberg::spec::DataFile;
-#[cfg(test)]
-use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-#[cfg(test)]
-use novarocks_connector_iceberg::iceberg::transaction::ApplyTransactionAction;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::common::engine_error::EngineError;
@@ -39,33 +33,18 @@ use crate::engine::mv::analysis_adapter::{
     BaseColumnDescriptor, BaseTableDescriptor, analyze_mv_select_with_connector_context, now_ms,
     validate_ivm_primary_key,
 };
-#[cfg(test)]
-use crate::engine::mv::lifecycle::IcebergRefreshOutcome;
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
 use crate::engine::mv::refresh_io::{
     acquire_mv_refresh_lock, observe_current_refresh_base, parse_iceberg_table_refs,
 };
-#[cfg(test)]
-use crate::engine::mv::refresh_io::{
-    load_current_iceberg_base_table, run_mv_full_select_chunks_with_catalog, single_snapshot_map,
-    single_table_uuid_map,
-};
 use crate::engine::mv::refresh_pin_adapter::capture_refresh_snapshot_pin;
-#[cfg(test)]
-use crate::engine::mv::schema_validation_adapter::current_iceberg_table_observation;
 use crate::engine::query_planning::bindings::{
     MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
     QueryTableBindingStore,
 };
 use crate::engine::{StandaloneState, StatementResult};
-use crate::meta::repository::iceberg_operation::{
-    CreateIcebergOperationRequest, IcebergCommitOutcomeRecord, IcebergOperationFactUpdate,
-    IcebergOperationFailureKind, IcebergOperationFailureRecord, IcebergOperationKind,
-    IcebergOperationNextAction, IcebergOperationState, IcebergOperationTarget,
-    StoredIcebergOperation,
-};
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
 use crate::mv::analysis::rebind::rewrite_select_sql_for_rebind;
@@ -91,38 +70,14 @@ use crate::mv::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::persistence::descriptor::{
     DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
 };
-#[cfg(test)]
-use crate::mv::persistence::partition::MvPartitionRefreshStatus;
-use crate::mv::persistence::partition::{
-    ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
-};
-#[cfg(test)]
-use crate::mv::persistence::refresh::UpdateStarRocksMvRefreshSummaryRequest;
-use crate::mv::persistence::refresh::{
-    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshState,
-    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
-    StoredMvRefresh,
-};
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::persistence::schema::{
     APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
     HIDDEN_COLUMNS_PROPERTY,
 };
-#[cfg(test)]
-use crate::mv::refresh::aggregate_first_refresh::{
-    AggregateStateRead, prepare_aggregate_first_refresh_chunks,
-    prepare_branch_union_aggregate_first_refresh_chunks,
-};
 use crate::mv::refresh::apply_key::ApplyKeyContract;
-#[cfg(test)]
-use crate::mv::refresh::apply_key::RewriteEvidence;
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::{ImvRefreshContract, MvTargetWriteEffect};
-#[cfg(test)]
-use crate::mv::refresh::execution::{
-    RefreshExecutionObservation, ValidatedRefreshExecution, dispatch_refresh_decision,
-    validate_refresh_execution,
-};
 use crate::mv::refresh::join_incremental_refresh::{
     JoinIncrementalLogicalInput, JoinIncrementalRefreshMode,
     build_join_incremental_refresh_logical_plan, select_join_incremental_refresh_mode,
@@ -134,11 +89,6 @@ use crate::mv::refresh::non_join_incremental::{
 use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::refresh::planning::{
     RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline, decide_refresh_plan,
-};
-#[cfg(test)]
-use crate::mv::refresh::projection_first_refresh::{
-    prepare_projection_first_refresh_chunks, prepare_projection_full_read_sql,
-    prepare_union_projection_first_refresh_chunks,
 };
 #[cfg(test)]
 use crate::mv::refresh::repartition::RepartitionShape;
@@ -158,15 +108,11 @@ use crate::mv::schema_validation::{validate_join_schema_contract, validate_schem
 use crate::mv::storage_observation::MvSchemaValidationObservation;
 use crate::mv::storage_observation::{MvStorageObservationPort, MvTargetCreationObservation};
 #[cfg(test)]
-use crate::runtime::global_async_runtime::data_block_on;
-#[cfg(test)]
 use crate::sql::analysis::ProjectItem;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::column_id::ColumnId;
 use crate::sql::mv_refresh::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts};
-#[cfg(test)]
-use crate::sql::parser::ast::{AlterMaterializedViewAction, AlterMaterializedViewStmt};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr, ObjectName,
     RefreshMaterializedViewStmt,
@@ -180,12 +126,6 @@ use crate::sql::planner::vocabulary::{
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
-#[cfg(test)]
-use novarocks_connector_iceberg::commit::CommitOutcome;
-#[cfg(test)]
-use novarocks_connector_iceberg::commit::{
-    MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
-};
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorExecutionBindingKey, ConnectorInstanceId,
     ConnectorTableIdentity,
@@ -4456,42 +4396,6 @@ fn persist_sql_mv_join_contract(
     }
 }
 
-#[cfg(test)]
-fn target_observation_from_loaded_for_test(
-    target: &IcebergMvTarget,
-    loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-) -> Result<MvTargetCreationObservation, String> {
-    let metadata = loaded.table.metadata();
-    let table = novarocks_spi::connector::ConnectorTableIdentity {
-        instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?,
-        namespace: Arc::from(target.namespace.as_str()),
-        table: Arc::from(target.table.as_str()),
-    };
-    let fields = metadata
-        .current_schema()
-        .as_struct()
-        .fields()
-        .iter()
-        .map(
-            |field| crate::mv::storage_observation::MvObservedTargetField {
-                field_id: field.id,
-                name: field.name.clone(),
-                type_signature: field.field_type.to_string(),
-                nullable: !field.required,
-            },
-        )
-        .collect();
-    MvTargetCreationObservation::try_new(
-        table,
-        metadata.uuid().to_string(),
-        metadata.current_schema_id(),
-        fields,
-        test_partition_contract_from_table(&loaded.table)?,
-    )
-    .map_err(|error| error.to_string())
-}
-
 fn target_field_id_by_column(
     target_observation: &MvTargetCreationObservation,
     column_name: &str,
@@ -4545,78 +4449,6 @@ fn target_contract(
         },
         partition: Some(target_observation.partition.clone()),
     })
-}
-
-/// Test-only projection of a live Iceberg partition spec onto the MV contract.
-///
-/// Production reads this from the neutral observation; the Provider owns the
-/// projection and rejects unknown transforms (spec D4). Fixtures that build a
-/// table by hand still need the same mapping, and it retires with the rest of
-/// the MV test scaffolding in T20/T21.
-#[cfg(test)]
-fn test_partition_contract_from_table(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-) -> Result<mv_schema::MvPartitionContract, String> {
-    let metadata = table.metadata();
-    let schema = metadata.current_schema();
-    let spec = metadata.default_partition_spec();
-    let mut fields = Vec::with_capacity(spec.fields().len());
-    for field in spec.fields() {
-        let source = schema.field_by_id(field.source_id).ok_or_else(|| {
-            format!(
-                "iceberg MV target partition field {} references missing target field id {}",
-                field.name, field.source_id
-            )
-        })?;
-        fields.push(mv_schema::MvPartitionFieldContract {
-            partition_field_id: field.field_id,
-            partition_field_name: field.name.clone(),
-            source_target_field_id: field.source_id,
-            source_column_name: source.name.clone(),
-            transform: mv_partition_transform_contract(&field.transform)?,
-        });
-    }
-    Ok(mv_schema::MvPartitionContract {
-        target_spec_id: spec.spec_id(),
-        fields,
-    })
-}
-
-#[cfg(test)]
-fn mv_partition_transform_contract(
-    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
-) -> Result<mv_schema::MvPartitionTransformContract, String> {
-    match transform {
-        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
-            Ok(mv_schema::MvPartitionTransformContract::Identity)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
-            Ok(mv_schema::MvPartitionTransformContract::Year)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
-            Ok(mv_schema::MvPartitionTransformContract::Month)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
-            Ok(mv_schema::MvPartitionTransformContract::Day)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
-            Ok(mv_schema::MvPartitionTransformContract::Hour)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(num_buckets) => {
-            Ok(mv_schema::MvPartitionTransformContract::Bucket {
-                num_buckets: *num_buckets,
-            })
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
-            Ok(mv_schema::MvPartitionTransformContract::Truncate { width: *width })
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
-            Ok(mv_schema::MvPartitionTransformContract::Void)
-        }
-        novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => {
-            Err("iceberg MV target partition contract cannot persist unknown transform".to_string())
-        }
-    }
 }
 
 fn aggregate_contract(
@@ -4730,6 +4562,1012 @@ pub(crate) fn resolve_refresh_target(
         namespace,
         table,
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mv::refresh::apply_key::ApplyKeyValueType;
+    use crate::mv::refresh::capabilities::PartitionPruningPolicy;
+    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
+    use crate::sql::planner::payload::*;
+    use arrow::datatypes::DataType;
+    use std::cell::Cell;
+
+    #[test]
+    fn retained_repartition_target_identity_matches_exact_target() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_sales".to_string(),
+        };
+        let identity = ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            namespace: Arc::from("analytics"),
+            table: Arc::from("mv_sales"),
+        };
+
+        validate_retained_target_identity(&target, &identity).expect("matching identity");
+    }
+
+    #[test]
+    fn retained_repartition_target_identity_rejects_drift() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_sales".to_string(),
+        };
+        let identity = ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            namespace: Arc::from("analytics"),
+            table: Arc::from("mv_sales_recreated"),
+        };
+
+        let error = validate_retained_target_identity(&target, &identity)
+            .expect_err("drifted identity must fail closed");
+        assert!(error.contains("does not match ice.analytics.mv_sales"));
+    }
+
+    #[test]
+    fn retained_repartition_target_handle_skips_latest_reload() {
+        let handle = novarocks_spi::connector::ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("ice").expect("instance"),
+            bytes::Bytes::from_static(b"retained-table-metadata"),
+        )
+        .expect("retained table handle");
+        let reload_called = Cell::new(false);
+
+        let selected = select_retained_target_handle(Some(&handle), || {
+            reload_called.set(true);
+            Err("latest metadata reload must not run".to_string())
+        })
+        .expect("select retained target handle");
+
+        assert_eq!(selected, handle);
+        assert!(!reload_called.get());
+    }
+
+    #[test]
+    fn aggregate_incremental_inserts_use_row_delta() {
+        assert!(matches!(
+            non_join_incremental_write_mode(true, false),
+            crate::mv::application::MvIncrementalWriteMode::RowDelta
+        ));
+        assert!(matches!(
+            non_join_incremental_write_mode(false, false),
+            crate::mv::application::MvIncrementalWriteMode::FastAppend
+        ));
+        assert!(matches!(
+            non_join_incremental_write_mode(false, true),
+            crate::mv::application::MvIncrementalWriteMode::RowDelta
+        ));
+    }
+    #[test]
+    fn explain_refresh_full_guard_rejects_full_with_disabled_message() {
+        let err = super::explain_refresh_full_guard(true).unwrap_err();
+        assert!(
+            err.contains(concat!("currently disabled", " pending redesign")),
+            "EXPLAIN REFRESH FULL must align with the exec-side disabled message, got: {err}"
+        );
+        assert!(
+            !err.contains("not supported"),
+            "stale 'not supported' wording must be gone: {err}"
+        );
+        assert!(super::explain_refresh_full_guard(false).is_ok());
+    }
+
+    #[test]
+    fn imv_change_stream_effect_set_can_include_zero_row_route() {
+        let effects = build_imv_change_stream_branches_for_test(ImvBranchShape::DeleteAndReuse);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| *effect
+                    == novarocks_spi::connector::ConnectorRowMutationEffect::Delete)
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| *effect
+                    == novarocks_spi::connector::ConnectorRowMutationEffect::Replace)
+        );
+    }
+
+    #[test]
+    fn normalize_imv_rewrite_root_project_preserves_aggregate_output_identity() {
+        let group_output = OutputColumn {
+            column_id: ColumnId::new_for_test(1),
+            name: "region".to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            is_internal: false,
+        };
+        let aggregate_output = OutputColumn {
+            column_id: ColumnId::new_for_test(11),
+            name: "sum(amount)".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        };
+        let child = LogicalPlanNode::new(
+            LogicalPlanKind::Values(PlanValuesNode {
+                rows: Vec::new(),
+                columns: vec![group_output.clone()],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![column_ref_expr(&group_output)],
+                aggregates: vec![AggregateCall {
+                    name: "sum".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: Vec::new(),
+                    output_column_id: aggregate_output.column_id,
+                }],
+                output_columns: vec![group_output.clone(), aggregate_output.clone()],
+                already_pushed: false,
+            }),
+            vec![child],
+            None,
+        );
+        let root = LogicalPlanNode::new(
+            LogicalPlanKind::Project(PlanProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: column_ref_expr(&group_output),
+                        output_name: "region".to_string(),
+                        output_column_id: ColumnId::new_for_test(21),
+                    },
+                    ProjectItem {
+                        expr: column_ref_expr(&aggregate_output),
+                        output_name: "s".to_string(),
+                        output_column_id: ColumnId::new_for_test(22),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![aggregate],
+            None,
+        );
+
+        let normalized = normalize_imv_rewrite_root_project(root);
+        let LogicalPlanKind::Aggregate(aggregate) = &normalized.kind else {
+            panic!(
+                "expected normalized root Aggregate, got {:?}",
+                normalized.kind
+            );
+        };
+
+        assert_eq!(
+            aggregate
+                .output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (group_output.column_id, "region"),
+                (aggregate_output.column_id, "s")
+            ]
+        );
+        assert_eq!(
+            aggregate.aggregates[0].output_column_id,
+            aggregate_output.column_id
+        );
+
+        let mut arena = ScalarArena::new();
+        try_to_optimizer_expr(&normalized, &mut arena)
+            .expect("normalized aggregate must satisfy optimizer bridge contract");
+    }
+
+    #[test]
+    fn normalize_imv_rewrite_root_project_keeps_reordered_passthrough_project() {
+        let (g1, g2, sum_output) = normalization_aggregate_outputs();
+        let root = normalization_project_over_aggregate(vec![
+            normalization_project_item(&g2, 21, "g2"),
+            normalization_project_item(&g1, 22, "g1"),
+            normalization_project_item(&sum_output, 23, "s"),
+        ]);
+
+        let normalized = normalize_imv_rewrite_root_project(root);
+
+        assert!(matches!(&normalized.kind, LogicalPlanKind::Project(_)));
+        let LogicalPlanKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
+            panic!("expected preserved Project over Aggregate");
+        };
+        assert_eq!(
+            aggregate
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![g1.column_id, g2.column_id, sum_output.column_id]
+        );
+    }
+
+    #[test]
+    fn normalize_imv_rewrite_root_project_keeps_duplicate_passthrough_project() {
+        let (g1, g2, sum_output) = normalization_aggregate_outputs();
+        let root = normalization_project_over_aggregate(vec![
+            normalization_project_item(&g1, 21, "g1"),
+            normalization_project_item(&g1, 22, "g1_again"),
+            normalization_project_item(&sum_output, 23, "s"),
+        ]);
+
+        let normalized = normalize_imv_rewrite_root_project(root);
+
+        assert!(matches!(&normalized.kind, LogicalPlanKind::Project(_)));
+        let LogicalPlanKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
+            panic!("expected preserved Project over Aggregate");
+        };
+        assert_eq!(
+            aggregate
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![g1.column_id, g2.column_id, sum_output.column_id]
+        );
+    }
+
+    fn normalization_aggregate_outputs() -> (OutputColumn, OutputColumn, OutputColumn) {
+        (
+            normalization_output_column(1, "g1", DataType::Utf8, false),
+            normalization_output_column(2, "g2", DataType::Utf8, false),
+            normalization_output_column(11, "sum(amount)", DataType::Int64, true),
+        )
+    }
+
+    fn normalization_project_over_aggregate(project_items: Vec<ProjectItem>) -> LogicalPlanNode {
+        let (g1, g2, sum_output) = normalization_aggregate_outputs();
+        let child = LogicalPlanNode::new(
+            LogicalPlanKind::Values(PlanValuesNode {
+                rows: Vec::new(),
+                columns: vec![g1.clone(), g2.clone()],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![column_ref_expr(&g1), column_ref_expr(&g2)],
+                aggregates: vec![AggregateCall {
+                    name: "sum".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: Vec::new(),
+                    output_column_id: sum_output.column_id,
+                }],
+                output_columns: vec![g1, g2, sum_output],
+                already_pushed: false,
+            }),
+            vec![child],
+            None,
+        );
+        LogicalPlanNode::new(
+            LogicalPlanKind::Project(PlanProjectNode {
+                items: project_items,
+                output_qualifier: None,
+            }),
+            vec![aggregate],
+            None,
+        )
+    }
+
+    fn normalization_project_item(
+        source: &OutputColumn,
+        output_id: u32,
+        name: &str,
+    ) -> ProjectItem {
+        ProjectItem {
+            expr: column_ref_expr(source),
+            output_name: name.to_string(),
+            output_column_id: ColumnId::new_for_test(output_id),
+        }
+    }
+
+    fn normalization_output_column(
+        id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    #[test]
+    fn join_coalesce_locator_ids_reserve_rewritten_plan_outputs() {
+        let child_output = crate::sql::analysis::OutputColumn {
+            column_id: crate::sql::column_id::ColumnId(42),
+            name: "child_k".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let root_output = crate::sql::analysis::OutputColumn {
+            column_id: crate::sql::column_id::ColumnId(6),
+            name: "root_k".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let child = crate::sql::planner::logical::LogicalPlanNode::new(
+            crate::sql::planner::logical::LogicalPlanKind::Values(
+                crate::sql::planner::payload::PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: vec![child_output.clone()],
+                },
+            ),
+            Vec::new(),
+            None,
+        );
+        let plan = crate::sql::planner::logical::LogicalPlanNode::new(
+            crate::sql::planner::logical::LogicalPlanKind::Project(
+                crate::sql::planner::payload::PlanProjectNode {
+                    items: vec![crate::sql::analysis::ProjectItem {
+                        expr: crate::sql::analysis::TypedExpr {
+                            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                                column_id: child_output.column_id,
+                                qualifier: None,
+                                column: child_output.name.clone(),
+                            },
+                            data_type: child_output.data_type.clone(),
+                            nullable: child_output.nullable,
+                        },
+                        output_name: root_output.name.clone(),
+                        output_column_id: root_output.column_id,
+                    }],
+                    output_qualifier: None,
+                },
+            ),
+            vec![child],
+            None,
+        );
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+
+        let ids = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
+            &mut factory,
+            &plan,
+        )
+        .expect("allocate locator column ids");
+
+        let allocated = [
+            ids.net,
+            ids.file,
+            ids.pos,
+            ids.row_id,
+            ids.last_updated_sequence_number,
+        ];
+        assert!(allocated.iter().all(|id| *id > child_output.column_id.0));
+        let unique = allocated
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), allocated.len());
+    }
+
+    #[test]
+    fn imv_change_stream_write_recognizes_physical_change_op_by_reserved_shape() {
+        let output = OutputColumn {
+            column_id: ColumnId(17),
+            name: novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: false,
+        };
+
+        assert!(is_imv_change_op_output_column(&output));
+    }
+
+    #[test]
+    fn join_base_refs_for_schema_contract_uses_join_lineage_order() {
+        let left = TableIdentity {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "fact".to_string(),
+        };
+        let right = TableIdentity {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "dim".to_string(),
+        };
+        let base_refs = vec![right.clone(), left.clone()];
+        let contract = test_join_projection_schema_contract(&left.fqn(), &right.fqn());
+
+        let (actual_left, actual_right) = join_base_refs_for_schema_contract(&contract, &base_refs)
+            .expect("schema-contract join base refs");
+
+        assert_eq!(actual_left.fqn(), left.fqn());
+        assert_eq!(actual_right.fqn(), right.fqn());
+    }
+
+    fn test_join_projection_schema_contract(
+        left_fqn: &str,
+        right_fqn: &str,
+    ) -> mv_schema::MvSchemaContract {
+        use mv_schema::{
+            HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
+            MvSchemaContract, OutputContract, QualifiedFieldLineage, TargetContract,
+        };
+
+        MvSchemaContract {
+            contract_version: 2,
+            base: test_base_contract(left_fqn),
+            bases: vec![test_base_contract(left_fqn), test_base_contract(right_fqn)],
+            output: OutputContract {
+                columns: Vec::new(),
+                filter: None,
+            },
+            join: Some(JoinContract {
+                kind: JoinContractKind::InnerEquiJoin,
+                predicates: vec![JoinPredicateLineage {
+                    left: QualifiedFieldLineage {
+                        table_fqn: left_fqn.to_string(),
+                        qualifier_at_create: "l".to_string(),
+                        field_id: 1,
+                    },
+                    right: QualifiedFieldLineage {
+                        table_fqn: right_fqn.to_string(),
+                        qualifier_at_create: "r".to_string(),
+                        field_id: 1,
+                    },
+                }],
+            }),
+            aggregate: None,
+            branch: None,
+            target: TargetContract {
+                table_fqn: "ice.sales.mv".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 1,
+                visible_columns: Vec::new(),
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+                    target_field_id: 1,
+                    source: ApplyKeySource::JoinRowKey,
+                },
+                partition: None,
+            },
+        }
+    }
+
+    fn test_base_contract(table_fqn: &str) -> mv_schema::BaseContract {
+        mv_schema::BaseContract {
+            table_fqn: table_fqn.to_string(),
+            table_uuid: format!("{table_fqn}-uuid"),
+            alias_at_create: None,
+            schema_id_at_create: 1,
+            schema_at_create: mv_schema::BaseSchemaSnapshot { fields: Vec::new() },
+        }
+    }
+
+    fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
+        let normalized =
+            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let sqlparser::ast::Statement::Query(q) = stmt else {
+            panic!("expected SELECT");
+        };
+        *q
+    }
+
+    #[test]
+    fn iceberg_join_mv_uses_join_apply_key_column() {
+        let column = crate::mv::refresh::target_apply::join_apply_key_table_column();
+        assert_eq!(
+            column.name,
+            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
+        );
+    }
+
+    #[test]
+    fn create_apply_key_metadata_comes_from_refresh_contract() {
+        use crate::mv::refresh::apply_key::ApplyKeyContract;
+
+        assert_eq!(
+            create_apply_key_source_property(&ApplyKeyContract::projection_filter()),
+            ApplyKeySource::BaseRowId.table_property_value()
+        );
+        assert_eq!(
+            create_apply_key_source_property(&ApplyKeyContract::join_projection_filter()),
+            ApplyKeySource::JoinRowKey.table_property_value()
+        );
+        assert_eq!(
+            create_apply_key_source_property(&ApplyKeyContract::aggregate_group_row()),
+            ApplyKeySource::GroupRowId.table_property_value()
+        );
+        assert_eq!(
+            create_apply_key_source_property(&ApplyKeyContract::join_aggregate_group_row()),
+            ApplyKeySource::GroupRowId.table_property_value()
+        );
+    }
+
+    #[test]
+    fn repartition_support_accepts_projection_filter_and_aggregate() {
+        let projection = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::SingleBase,
+            has_agg_state: false,
+            identity: RefreshIdentity::BaseRowId,
+            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Int64,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            select_repartition_shape(&projection).expect("projection/filter support"),
+            RepartitionShape::ProjectionFilterSingleBase
+        );
+
+        let aggregate = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::SingleBase,
+            has_agg_state: true,
+            identity: RefreshIdentity::GroupRowId,
+            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            select_repartition_shape(&aggregate).expect("aggregate support"),
+            RepartitionShape::AggregateSingleBase
+        );
+    }
+
+    #[test]
+    fn repartition_support_accepts_join_projection_filter() {
+        let join = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+            has_agg_state: false,
+            identity: RefreshIdentity::JoinRowKey,
+            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            select_repartition_shape(&join).expect("join projection/filter support"),
+            RepartitionShape::JoinProjectionFilter
+        );
+    }
+
+    #[test]
+    fn repartition_support_accepts_multi_base_shapes() {
+        let join_aggregate = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+            has_agg_state: true,
+            identity: RefreshIdentity::GroupRowId,
+            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            select_repartition_shape(&join_aggregate).expect("join aggregate support"),
+            RepartitionShape::JoinAggregate
+        );
+
+        let fan_in_aggregate = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            has_agg_state: true,
+            identity: RefreshIdentity::GroupRowId,
+            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            select_repartition_shape(&fan_in_aggregate).expect("fan-in aggregate support"),
+            RepartitionShape::FanInAggregate
+        );
+
+        let union_projection = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            has_agg_state: false,
+            identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::BaseRowId)),
+            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+            apply_key_value_type: ApplyKeyValueType::BranchInt64,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        assert_eq!(
+            select_repartition_shape(&union_projection).expect("union projection support"),
+            RepartitionShape::UnionProjectionFilter
+        );
+    }
+
+    #[test]
+    fn repartition_support_rejects_specific_unsupported_shape() {
+        let invalid = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            has_agg_state: false,
+            identity: RefreshIdentity::JoinRowKey,
+            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+            apply_key_value_type: ApplyKeyValueType::Utf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+
+        let err = select_repartition_shape(&invalid).expect_err("shape must be rejected");
+        assert!(err.contains("UnsupportedRepartitionShape"));
+        assert!(err.contains("JoinRowKey"));
+        assert!(err.contains("AllBasesRequired"));
+        assert!(err.contains("aggregate_state=false"));
+
+        let branch_union_aggregate = RefreshCapabilities {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            has_agg_state: true,
+            identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId)),
+            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+            apply_key_value_type: ApplyKeyValueType::BranchUtf8,
+            partition_pruning: PartitionPruningPolicy::BestEffort,
+        };
+        let err = select_repartition_shape(&branch_union_aggregate)
+            .expect_err("branch UNION ALL aggregate repartition is unsupported");
+        assert!(err.contains("UnsupportedRepartitionShape"));
+        assert!(err.contains("BranchScoped"));
+        assert!(err.contains("aggregate_state=true"));
+    }
+
+    #[test]
+    fn identity_gating_matches_legacy_strategy_gating() {
+        use crate::mv::analysis::refresh_property::TargetIdentity;
+
+        let base_row = TargetIdentity::BaseRowId;
+        let join_row = TargetIdentity::JoinRowKey(
+            Box::new(TargetIdentity::BaseRowId),
+            Box::new(TargetIdentity::BaseRowId),
+        );
+        let group_row = TargetIdentity::GroupRowId(vec!["region".to_string()]);
+        let union_proj = TargetIdentity::BranchScoped(Box::new(TargetIdentity::BaseRowId));
+        let union_agg = TargetIdentity::BranchScoped(Box::new(group_row.clone()));
+
+        // Physical apply-key column: required for base/join row identities
+        // (ProjectionFilter / JoinProjectionFilter / UnionProjectionFilter),
+        // not for group-row identities (the aggregate strategies).
+        assert!(identity_needs_physical_apply_key_column(&base_row));
+        assert!(identity_needs_physical_apply_key_column(&join_row));
+        assert!(identity_needs_physical_apply_key_column(&union_proj));
+        assert!(!identity_needs_physical_apply_key_column(&group_row));
+        assert!(!identity_needs_physical_apply_key_column(&union_agg));
+
+        // Branch id column: required iff the identity top is BranchScoped.
+        assert!(!identity_needs_branch_id_column(&base_row));
+        assert!(!identity_needs_branch_id_column(&join_row));
+        assert!(!identity_needs_branch_id_column(&group_row));
+        assert!(identity_needs_branch_id_column(&union_proj));
+        assert!(identity_needs_branch_id_column(&union_agg));
+    }
+
+    #[test]
+    fn refresh_status_uses_base_ref_fqn() {
+        let base_ref = TableIdentity {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "orders".to_string(),
+        };
+
+        let status = base_snapshot_status_for_refresh(&base_ref, Some(10), Some(11));
+
+        assert_eq!(status.fqn, "ice.sales.orders");
+        assert_eq!(status.previous_snapshot_id, Some(10));
+        assert_eq!(status.current_snapshot_id_before_pin, Some(11));
+    }
+
+    #[test]
+    fn join_coalesce_builder_factory_metadata_survives_rewritten_plan_reserve() {
+        let desc = join_coalesce_factory_test_descriptor();
+        let branch_union = join_coalesce_factory_test_branch_union(&desc);
+        let locator =
+            crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                target_binding: crate::sql::compiler::mv_rewrite::test_target_binding(),
+                target_table_uuid: "target-uuid".to_string(),
+                target_snapshot_id: Some(77),
+            };
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        factory.reserve_until(109);
+        let locator_columns = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
+            &mut factory,
+            &branch_union,
+        )
+        .expect("allocate locator column ids");
+
+        let plan =
+            crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+                branch_union,
+                &desc,
+                &locator,
+                &mut factory,
+                locator_columns.net,
+                locator_columns.file,
+                locator_columns.pos,
+                locator_columns.row_id,
+                locator_columns.last_updated_sequence_number,
+            )
+            .expect("join coalesce plan");
+        crate::mv::refresh::join_incremental_refresh::reserve_factory_for_logical_plan(
+            &mut factory,
+            &plan,
+        )
+        .expect("reserve rewritten plan outputs");
+
+        let watched_columns =
+            collect_join_coalesce_factory_watch_columns(&plan, ColumnId(locator_columns.net));
+        let watched_names = watched_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "net",
+            JOIN_APPLY_KEY_COLUMN_NAME,
+            "__pending_insert_count",
+            "__pending_delete_count",
+            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
+            novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
+            novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+            novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        ] {
+            assert!(
+                watched_names.contains(expected),
+                "missing watched column {expected}; watched={watched_columns:?}"
+            );
+        }
+        for column in watched_columns {
+            let metadata = factory.get(column.column_id);
+            assert!(
+                !metadata.name.starts_with("__reserved_col_"),
+                "column {} leaked reserved metadata {:?}",
+                column.name,
+                metadata
+            );
+            assert_eq!(metadata.name, column.name);
+            assert_eq!(metadata.data_type, column.data_type);
+            assert_eq!(metadata.nullable, column.nullable);
+        }
+    }
+
+    fn output_col(name: &str, ty: DataType, nullable: bool) -> OutputColumn {
+        OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::UNSET,
+            name: name.to_string(),
+            data_type: ty,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn join_coalesce_factory_test_descriptor()
+    -> crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
+        use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
+            JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor,
+            JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity,
+            JoinRefreshOutputMapping, JoinRefreshOutputSource,
+        };
+
+        let payload = join_coalesce_factory_test_column(1, "id", DataType::Int32, false, false);
+        let payload_output =
+            join_coalesce_factory_test_column(80, "id", DataType::Int32, false, false);
+        let action = join_coalesce_factory_test_column(
+            4,
+            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
+            DataType::Int8,
+            false,
+            true,
+        );
+        let action_output = join_coalesce_factory_test_column(
+            91,
+            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
+            DataType::Int8,
+            false,
+            true,
+        );
+        let join_apply_key = join_coalesce_factory_test_column(
+            5,
+            JOIN_APPLY_KEY_COLUMN_NAME,
+            DataType::Utf8,
+            false,
+            true,
+        );
+        let join_apply_key_output = join_coalesce_factory_test_column(
+            90,
+            JOIN_APPLY_KEY_COLUMN_NAME,
+            DataType::Utf8,
+            false,
+            true,
+        );
+
+        JoinRefreshDescriptor {
+            mode: JoinRefreshMode::Coalesce,
+            mv_identity: JoinRefreshMvIdentity {
+                catalog: "ice".to_string(),
+                database: "sales".to_string(),
+                name: "mv_join".to_string(),
+            },
+            left_base_fqn: "ice.sales.left_orders".to_string(),
+            right_base_fqn: "ice.sales.right_orders".to_string(),
+            left_row_id_column: join_coalesce_factory_test_column(
+                2,
+                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            right_row_id_column: join_coalesce_factory_test_column(
+                3,
+                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            action_column: action.clone(),
+            join_apply_key_column: join_apply_key.clone(),
+            payload_columns: vec![payload.clone()],
+            join_key_pairs: vec![JoinRefreshJoinKeyPair {
+                left_column: join_coalesce_factory_test_column(
+                    6,
+                    "left_id",
+                    DataType::Int32,
+                    false,
+                    false,
+                ),
+                right_column: join_coalesce_factory_test_column(
+                    7,
+                    "right_id",
+                    DataType::Int32,
+                    false,
+                    false,
+                ),
+            }],
+            output_mappings: vec![
+                JoinRefreshOutputMapping {
+                    mv_output_column: payload_output,
+                    source: JoinRefreshOutputSource::Payload(payload.column_id),
+                },
+                JoinRefreshOutputMapping {
+                    mv_output_column: join_apply_key_output,
+                    source: JoinRefreshOutputSource::JoinApplyKey(join_apply_key.column_id),
+                },
+                JoinRefreshOutputMapping {
+                    mv_output_column: action_output,
+                    source: JoinRefreshOutputSource::Action(action.column_id),
+                },
+            ],
+            branches: vec![
+                JoinRefreshBranchDescriptor {
+                    side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
+                    action_column_id: action.column_id,
+                },
+                JoinRefreshBranchDescriptor {
+                    side: JoinRefreshBranchSide::LeftSnapshotRightDelta,
+                    action_column_id: action.column_id,
+                },
+            ],
+            needs_target_locator: true,
+        }
+    }
+
+    fn join_coalesce_factory_test_branch_union(
+        desc: &crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
+    ) -> crate::sql::planner::logical::LogicalPlanNode {
+        let mut output_columns = desc.payload_columns.clone();
+        output_columns.push(desc.action_column.clone());
+        output_columns.push(desc.join_apply_key_column.clone());
+        let branch = crate::sql::planner::logical::LogicalPlanNode::new(
+            crate::sql::planner::logical::LogicalPlanKind::Values(
+                crate::sql::planner::payload::PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: output_columns.clone(),
+                },
+            ),
+            Vec::new(),
+            None,
+        );
+        crate::sql::planner::logical::LogicalPlanNode::new(
+            crate::sql::planner::logical::LogicalPlanKind::Union(
+                crate::sql::planner::logical::LogicalUnionNode {
+                    all: true,
+                    output_columns,
+                },
+            ),
+            vec![branch.clone(), branch],
+            None,
+        )
+    }
+
+    fn collect_join_coalesce_factory_watch_columns(
+        plan: &crate::sql::planner::logical::LogicalPlanNode,
+        min_id: ColumnId,
+    ) -> Vec<OutputColumn> {
+        let mut columns = Vec::new();
+        collect_join_coalesce_factory_watch_columns_inner(plan, min_id, &mut columns);
+        columns
+    }
+
+    fn collect_join_coalesce_factory_watch_columns_inner(
+        plan: &crate::sql::planner::logical::LogicalPlanNode,
+        min_id: ColumnId,
+        columns: &mut Vec<OutputColumn>,
+    ) {
+        match &plan.kind {
+            crate::sql::planner::logical::LogicalPlanKind::Project(project) => {
+                columns.extend(project.items.iter().filter_map(|item| {
+                    is_join_coalesce_factory_locator_output(&item.output_name).then(|| {
+                        OutputColumn {
+                            column_id: item.output_column_id,
+                            name: item.output_name.clone(),
+                            data_type: item.expr.data_type.clone(),
+                            nullable: item.expr.nullable,
+                            is_internal: true,
+                        }
+                    })
+                }));
+            }
+            crate::sql::planner::logical::LogicalPlanKind::Aggregate(aggregate) => {
+                columns.extend(
+                    aggregate
+                        .output_columns
+                        .iter()
+                        .filter(|column| {
+                            column.column_id >= min_id
+                                && is_join_coalesce_factory_internal_output(&column.name)
+                        })
+                        .cloned(),
+                );
+            }
+            crate::sql::planner::logical::LogicalPlanKind::Scan(scan) => {
+                columns.extend(
+                    scan.columns
+                        .iter()
+                        .filter(|column| {
+                            column.column_id >= min_id && column.name == JOIN_APPLY_KEY_COLUMN_NAME
+                        })
+                        .cloned(),
+                );
+            }
+            _ => {}
+        }
+        for child in &plan.children {
+            collect_join_coalesce_factory_watch_columns_inner(child, min_id, columns);
+        }
+    }
+
+    fn is_join_coalesce_factory_internal_output(name: &str) -> bool {
+        matches!(
+            name,
+            "net"
+                | JOIN_APPLY_KEY_COLUMN_NAME
+                | "__pending_insert_count"
+                | "__pending_delete_count"
+        )
+    }
+
+    fn is_join_coalesce_factory_locator_output(name: &str) -> bool {
+        matches!(
+            name,
+            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL
+                | novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL
+                | novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
+                | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+        )
+    }
+
+    fn join_coalesce_factory_test_column(
+        id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        is_internal: bool,
+    ) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal,
+        }
+    }
 }
 
 /// Resolve the MV target's neutral binding for a validation-only read.
@@ -8382,138 +9220,6 @@ fn should_use_join_delta_append_only_fast_path(
         && crate::engine::mv::iceberg_join_branch::is_append_only_join_delta_eligible(query)
 }
 
-#[cfg(test)]
-fn build_join_delta_coalesce_catalog(
-    state: &Arc<StandaloneState>,
-    branches: &[crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan],
-    target: &IcebergMvTarget,
-    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    target_snapshot_id: Option<i64>,
-) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
-    let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
-    let mut registered_delta_tables = BTreeSet::new();
-    let mut registered_snapshot_tables = BTreeSet::new();
-    for branch in branches {
-        register_join_delta_coalesce_side(
-            &mut catalog,
-            state,
-            &branch.left_base,
-            branch.left,
-            &mut registered_delta_tables,
-            &mut registered_snapshot_tables,
-        )?;
-        register_join_delta_coalesce_side(
-            &mut catalog,
-            state,
-            &branch.right_base,
-            branch.right,
-            &mut registered_delta_tables,
-            &mut registered_snapshot_tables,
-        )?;
-    }
-    register_join_delta_target_locator(
-        &mut catalog,
-        state,
-        target,
-        target_table,
-        target_snapshot_id,
-    )?;
-    Ok(catalog)
-}
-
-#[cfg(test)]
-fn register_join_delta_target_locator(
-    catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
-    state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    target_snapshot_id: Option<i64>,
-) -> Result<(), String> {
-    catalog.create_database(&target.namespace)?;
-    let table_def =
-        build_join_delta_target_locator_table_def(state, target, target_table, target_snapshot_id)?;
-    catalog
-        .register(&target.namespace, table_def)
-        .map_err(|e| format!("register join coalesce target locator table: {e}"))
-}
-
-#[cfg(test)]
-fn build_join_delta_target_locator_table_def(
-    state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
-    target_snapshot_id: Option<i64>,
-) -> Result<crate::sql::planner::table::TableDef, String> {
-    let _ = (state, target, target_table, target_snapshot_id);
-    Err(
-        "legacy planner-memory join target-locator fixture was removed; use tokenized MV planning input"
-            .to_string(),
-    )
-}
-
-#[cfg(test)]
-fn build_empty_join_delta_target_locator_table_def(
-    state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-) -> Result<crate::sql::planner::table::TableDef, String> {
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&target.catalog)?
-    };
-    let loaded =
-        crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)?;
-    let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-        loaded,
-    )?;
-    table_def
-        .iceberg_row_lineage_metadata_columns
-        .retain(|column| column.name != novarocks_execution::exec::change_op::CHANGE_OP_COLUMN);
-    Ok(table_def)
-}
-
-#[cfg(test)]
-fn register_join_delta_coalesce_side(
-    catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
-    state: &Arc<StandaloneState>,
-    base: &TableIdentity,
-    side: crate::engine::mv::iceberg_join_branch::BranchSide,
-    registered_delta_tables: &mut BTreeSet<String>,
-    registered_snapshot_tables: &mut BTreeSet<String>,
-) -> Result<(), String> {
-    let _ = (
-        catalog,
-        state,
-        base,
-        side,
-        registered_delta_tables,
-        registered_snapshot_tables,
-    );
-    Err(
-        "legacy planner-memory join branch fixture was removed; use tokenized MV planning input"
-            .to_string(),
-    )
-}
-
-#[cfg(test)]
-fn join_catalog_registration_key(
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<String, String> {
-    Ok(format!(
-        "{}.{}.{}",
-        novarocks_catalog::identifier::normalize_identifier(catalog)?,
-        novarocks_catalog::identifier::normalize_identifier(namespace)?,
-        novarocks_catalog::identifier::normalize_identifier(table)?
-    ))
-}
-
 fn normalize_join_branch_snapshot_tables(
     query: &mut sqlparser::ast::Query,
     branch: &crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan,
@@ -9824,5928 +10530,4 @@ fn resolve_drop_target(
         namespace,
         table,
     })
-}
-
-/// Build an Iceberg `Schema` from the MV's analyzed output columns.
-/// Each column is mapped to a primitive Iceberg type; nullable columns become
-/// optional fields, non-nullable columns become required fields.
-#[cfg(test)]
-fn build_iceberg_schema_from_outputs(output_columns: &[OutputColumn]) -> Result<Schema, String> {
-    let mut fields = Vec::with_capacity(output_columns.len());
-    for (idx, col) in output_columns.iter().enumerate() {
-        let id = (idx + 1) as i32;
-        let primitive = arrow_data_type_to_iceberg_primitive(&col.data_type)?;
-        let field: Arc<NestedField> = if col.nullable {
-            NestedField::optional(id, &col.name, Type::Primitive(primitive)).into()
-        } else {
-            NestedField::required(id, &col.name, Type::Primitive(primitive)).into()
-        };
-        fields.push(field);
-    }
-    Schema::builder()
-        .with_fields(fields)
-        .build()
-        .map_err(|e| format!("build iceberg mv schema failed: {e}"))
-}
-
-/// Map an Arrow `DataType` to an Iceberg `PrimitiveType`. Returns an error
-/// for types that cannot be represented as Iceberg primitive columns.
-#[cfg(test)]
-fn arrow_data_type_to_iceberg_primitive(
-    arrow_type: &arrow::datatypes::DataType,
-) -> Result<PrimitiveType, String> {
-    use arrow::datatypes::{DataType, TimeUnit};
-    Ok(match arrow_type {
-        DataType::Boolean => PrimitiveType::Boolean,
-        // Promote narrow integer types — Iceberg has no Int8/Int16 primitive.
-        DataType::Int8 | DataType::Int16 => PrimitiveType::Int,
-        DataType::Int32 => PrimitiveType::Int,
-        DataType::Int64 => PrimitiveType::Long,
-        DataType::Float32 => PrimitiveType::Float,
-        DataType::Float64 => PrimitiveType::Double,
-        DataType::Date32 => PrimitiveType::Date,
-        DataType::Timestamp(TimeUnit::Microsecond, _) => PrimitiveType::Timestamp,
-        DataType::Utf8 | DataType::LargeUtf8 => PrimitiveType::String,
-        DataType::Binary | DataType::LargeBinary => PrimitiveType::Binary,
-        DataType::Decimal128(precision, scale) => {
-            let scale_u32 = u32::try_from(*scale).map_err(|_| {
-                format!("iceberg-backed mv: Decimal128 negative scale {scale} is not supported")
-            })?;
-            PrimitiveType::Decimal {
-                precision: *precision as u32,
-                scale: scale_u32,
-            }
-        }
-        DataType::Decimal256(_, _) => {
-            return Err(
-                "iceberg-backed mv: Decimal256 (precision > 38) is not supported by Iceberg; \
-                 use DECIMAL with precision <= 38"
-                    .to_string(),
-            );
-        }
-        DataType::FixedSizeBinary(16) => {
-            return Err(
-                "iceberg-backed mv: LARGEINT (FixedSizeBinary(16)) is not supported in \
-                 iceberg-backed MV; use BIGINT or DECIMAL"
-                    .to_string(),
-            );
-        }
-        other => {
-            return Err(format!(
-                "iceberg-backed mv: unsupported column type `{other:?}`"
-            ));
-        }
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::meta::{
-        ExpectedRevision, IdScope, MetaCommitOutcome, MetaError, MetaErrorKind, MetaKey,
-        MetaReadTxn, MetaRecord, MetaRecordPut, MetaStoreCapabilities, MetaStoreProvider,
-        MetaWriteTxn,
-    };
-    use crate::mv::refresh::apply_key::ApplyKeyValueType;
-    use crate::mv::refresh::capabilities::PartitionPruningPolicy;
-    use crate::mv::test_repository::{
-        TestMvRepositoryFailurePoint, after_next_mv_repository_create,
-        fail_next_mv_repository_command,
-    };
-    use crate::query_execution::backend::{
-        BackendTopologyError, BackendTopologyPort, BackendTopologySnapshot,
-        BackendTopologyValidationError, LiveBackendTarget,
-    };
-    use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::planner::logical::*;
-    use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
-    use crate::sql::planner::payload::*;
-    use arrow::array::{Int32Array, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use arrow::record_batch::RecordBatch;
-    use std::cell::Cell;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    #[test]
-    fn retained_repartition_target_identity_matches_exact_target() {
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_sales".to_string(),
-        };
-        let identity = ConnectorTableIdentity {
-            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-            namespace: Arc::from("analytics"),
-            table: Arc::from("mv_sales"),
-        };
-
-        validate_retained_target_identity(&target, &identity).expect("matching identity");
-    }
-
-    #[test]
-    fn retained_repartition_target_identity_rejects_drift() {
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_sales".to_string(),
-        };
-        let identity = ConnectorTableIdentity {
-            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-            namespace: Arc::from("analytics"),
-            table: Arc::from("mv_sales_recreated"),
-        };
-
-        let error = validate_retained_target_identity(&target, &identity)
-            .expect_err("drifted identity must fail closed");
-        assert!(error.contains("does not match ice.analytics.mv_sales"));
-    }
-
-    #[test]
-    fn retained_repartition_target_handle_skips_latest_reload() {
-        let handle = novarocks_spi::connector::ConnectorTableHandle::try_new(
-            ConnectorInstanceId::parse("ice").expect("instance"),
-            bytes::Bytes::from_static(b"retained-table-metadata"),
-        )
-        .expect("retained table handle");
-        let reload_called = Cell::new(false);
-
-        let selected = select_retained_target_handle(Some(&handle), || {
-            reload_called.set(true);
-            Err("latest metadata reload must not run".to_string())
-        })
-        .expect("select retained target handle");
-
-        assert_eq!(selected, handle);
-        assert!(!reload_called.get());
-    }
-
-    #[test]
-    fn aggregate_incremental_inserts_use_row_delta() {
-        assert!(matches!(
-            non_join_incremental_write_mode(true, false),
-            crate::mv::application::MvIncrementalWriteMode::RowDelta
-        ));
-        assert!(matches!(
-            non_join_incremental_write_mode(false, false),
-            crate::mv::application::MvIncrementalWriteMode::FastAppend
-        ));
-        assert!(matches!(
-            non_join_incremental_write_mode(false, true),
-            crate::mv::application::MvIncrementalWriteMode::RowDelta
-        ));
-    }
-    use std::sync::Arc as StdArc;
-    use tempfile::TempDir;
-
-    /// Test-only topology paired with the all-in-one loopback exchange server.
-    ///
-    /// Production admission must never invent a backend count. These refresh
-    /// fixtures do install one concrete loopback backend, so model that exact
-    /// endpoint explicitly instead of inheriting the default empty topology.
-    #[derive(Clone)]
-    struct LoopbackTestBackendTopology {
-        snapshot: BackendTopologySnapshot,
-    }
-
-    impl LoopbackTestBackendTopology {
-        fn new(exchange_port: u16) -> Self {
-            let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), exchange_port);
-            let snapshot =
-                BackendTopologySnapshot::try_new(0, vec![LiveBackendTarget::new(0, endpoint, 1)])
-                    .expect("single loopback backend forms a valid topology");
-            Self { snapshot }
-        }
-    }
-
-    impl BackendTopologyPort for LoopbackTestBackendTopology {
-        fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
-            Ok(self.snapshot.clone())
-        }
-
-        fn validate_snapshot(
-            &self,
-            expected: &BackendTopologySnapshot,
-        ) -> Result<(), BackendTopologyValidationError> {
-            if expected == &self.snapshot {
-                Ok(())
-            } else {
-                Err(
-                    BackendTopologyValidationError::ContentChangedWithoutRevision {
-                        revision: expected.revision(),
-                    },
-                )
-            }
-        }
-
-        fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
-
-        fn add_backend(&self, _endpoint: SocketAddr) -> Result<(), String> {
-            Err("loopback test topology is immutable".to_string())
-        }
-
-        fn drop_backend(&self, _endpoint: SocketAddr, _force: bool) -> Result<(), String> {
-            Err("loopback test topology is immutable".to_string())
-        }
-
-        fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String> {
-            Err("loopback test topology does not expose backend management".to_string())
-        }
-    }
-
-    #[test]
-    fn explain_refresh_full_guard_rejects_full_with_disabled_message() {
-        let err = super::explain_refresh_full_guard(true).unwrap_err();
-        assert!(
-            err.contains(concat!("currently disabled", " pending redesign")),
-            "EXPLAIN REFRESH FULL must align with the exec-side disabled message, got: {err}"
-        );
-        assert!(
-            !err.contains("not supported"),
-            "stale 'not supported' wording must be gone: {err}"
-        );
-        assert!(super::explain_refresh_full_guard(false).is_ok());
-    }
-
-    #[test]
-    fn imv_change_stream_effect_set_can_include_zero_row_route() {
-        let effects = build_imv_change_stream_branches_for_test(ImvBranchShape::DeleteAndReuse);
-        assert!(
-            effects
-                .iter()
-                .any(|effect| *effect
-                    == novarocks_spi::connector::ConnectorRowMutationEffect::Delete)
-        );
-        assert!(
-            effects
-                .iter()
-                .any(|effect| *effect
-                    == novarocks_spi::connector::ConnectorRowMutationEffect::Replace)
-        );
-    }
-
-    #[test]
-    fn normalize_imv_rewrite_root_project_preserves_aggregate_output_identity() {
-        let group_output = OutputColumn {
-            column_id: ColumnId::new_for_test(1),
-            name: "region".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            is_internal: false,
-        };
-        let aggregate_output = OutputColumn {
-            column_id: ColumnId::new_for_test(11),
-            name: "sum(amount)".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
-            is_internal: false,
-        };
-        let child = LogicalPlanNode::new(
-            LogicalPlanKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: vec![group_output.clone()],
-            }),
-            vec![],
-            None,
-        );
-        let aggregate = LogicalPlanNode::new(
-            LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: vec![column_ref_expr(&group_output)],
-                aggregates: vec![AggregateCall {
-                    name: "sum".to_string(),
-                    args: Vec::new(),
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: Vec::new(),
-                    output_column_id: aggregate_output.column_id,
-                }],
-                output_columns: vec![group_output.clone(), aggregate_output.clone()],
-                already_pushed: false,
-            }),
-            vec![child],
-            None,
-        );
-        let root = LogicalPlanNode::new(
-            LogicalPlanKind::Project(PlanProjectNode {
-                items: vec![
-                    ProjectItem {
-                        expr: column_ref_expr(&group_output),
-                        output_name: "region".to_string(),
-                        output_column_id: ColumnId::new_for_test(21),
-                    },
-                    ProjectItem {
-                        expr: column_ref_expr(&aggregate_output),
-                        output_name: "s".to_string(),
-                        output_column_id: ColumnId::new_for_test(22),
-                    },
-                ],
-                output_qualifier: None,
-            }),
-            vec![aggregate],
-            None,
-        );
-
-        let normalized = normalize_imv_rewrite_root_project(root);
-        let LogicalPlanKind::Aggregate(aggregate) = &normalized.kind else {
-            panic!(
-                "expected normalized root Aggregate, got {:?}",
-                normalized.kind
-            );
-        };
-
-        assert_eq!(
-            aggregate
-                .output_columns
-                .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (group_output.column_id, "region"),
-                (aggregate_output.column_id, "s")
-            ]
-        );
-        assert_eq!(
-            aggregate.aggregates[0].output_column_id,
-            aggregate_output.column_id
-        );
-
-        let mut arena = ScalarArena::new();
-        try_to_optimizer_expr(&normalized, &mut arena)
-            .expect("normalized aggregate must satisfy optimizer bridge contract");
-    }
-
-    #[test]
-    fn normalize_imv_rewrite_root_project_keeps_reordered_passthrough_project() {
-        let (g1, g2, sum_output) = normalization_aggregate_outputs();
-        let root = normalization_project_over_aggregate(vec![
-            normalization_project_item(&g2, 21, "g2"),
-            normalization_project_item(&g1, 22, "g1"),
-            normalization_project_item(&sum_output, 23, "s"),
-        ]);
-
-        let normalized = normalize_imv_rewrite_root_project(root);
-
-        assert!(matches!(&normalized.kind, LogicalPlanKind::Project(_)));
-        let LogicalPlanKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
-            panic!("expected preserved Project over Aggregate");
-        };
-        assert_eq!(
-            aggregate
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![g1.column_id, g2.column_id, sum_output.column_id]
-        );
-    }
-
-    #[test]
-    fn normalize_imv_rewrite_root_project_keeps_duplicate_passthrough_project() {
-        let (g1, g2, sum_output) = normalization_aggregate_outputs();
-        let root = normalization_project_over_aggregate(vec![
-            normalization_project_item(&g1, 21, "g1"),
-            normalization_project_item(&g1, 22, "g1_again"),
-            normalization_project_item(&sum_output, 23, "s"),
-        ]);
-
-        let normalized = normalize_imv_rewrite_root_project(root);
-
-        assert!(matches!(&normalized.kind, LogicalPlanKind::Project(_)));
-        let LogicalPlanKind::Aggregate(aggregate) = &normalized.unary_input().kind else {
-            panic!("expected preserved Project over Aggregate");
-        };
-        assert_eq!(
-            aggregate
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![g1.column_id, g2.column_id, sum_output.column_id]
-        );
-    }
-
-    fn normalization_aggregate_outputs() -> (OutputColumn, OutputColumn, OutputColumn) {
-        (
-            normalization_output_column(1, "g1", DataType::Utf8, false),
-            normalization_output_column(2, "g2", DataType::Utf8, false),
-            normalization_output_column(11, "sum(amount)", DataType::Int64, true),
-        )
-    }
-
-    fn normalization_project_over_aggregate(project_items: Vec<ProjectItem>) -> LogicalPlanNode {
-        let (g1, g2, sum_output) = normalization_aggregate_outputs();
-        let child = LogicalPlanNode::new(
-            LogicalPlanKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: vec![g1.clone(), g2.clone()],
-            }),
-            vec![],
-            None,
-        );
-        let aggregate = LogicalPlanNode::new(
-            LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: vec![column_ref_expr(&g1), column_ref_expr(&g2)],
-                aggregates: vec![AggregateCall {
-                    name: "sum".to_string(),
-                    args: Vec::new(),
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: Vec::new(),
-                    output_column_id: sum_output.column_id,
-                }],
-                output_columns: vec![g1, g2, sum_output],
-                already_pushed: false,
-            }),
-            vec![child],
-            None,
-        );
-        LogicalPlanNode::new(
-            LogicalPlanKind::Project(PlanProjectNode {
-                items: project_items,
-                output_qualifier: None,
-            }),
-            vec![aggregate],
-            None,
-        )
-    }
-
-    fn normalization_project_item(
-        source: &OutputColumn,
-        output_id: u32,
-        name: &str,
-    ) -> ProjectItem {
-        ProjectItem {
-            expr: column_ref_expr(source),
-            output_name: name.to_string(),
-            output_column_id: ColumnId::new_for_test(output_id),
-        }
-    }
-
-    fn normalization_output_column(
-        id: u32,
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-    ) -> OutputColumn {
-        OutputColumn {
-            column_id: ColumnId::new_for_test(id),
-            name: name.to_string(),
-            data_type,
-            nullable,
-            is_internal: false,
-        }
-    }
-
-    #[test]
-    fn join_coalesce_locator_ids_reserve_rewritten_plan_outputs() {
-        let child_output = crate::sql::analysis::OutputColumn {
-            column_id: crate::sql::column_id::ColumnId(42),
-            name: "child_k".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        };
-        let root_output = crate::sql::analysis::OutputColumn {
-            column_id: crate::sql::column_id::ColumnId(6),
-            name: "root_k".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        };
-        let child = crate::sql::planner::logical::LogicalPlanNode::new(
-            crate::sql::planner::logical::LogicalPlanKind::Values(
-                crate::sql::planner::payload::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: vec![child_output.clone()],
-                },
-            ),
-            Vec::new(),
-            None,
-        );
-        let plan = crate::sql::planner::logical::LogicalPlanNode::new(
-            crate::sql::planner::logical::LogicalPlanKind::Project(
-                crate::sql::planner::payload::PlanProjectNode {
-                    items: vec![crate::sql::analysis::ProjectItem {
-                        expr: crate::sql::analysis::TypedExpr {
-                            kind: crate::sql::analysis::ExprKind::ColumnRef {
-                                column_id: child_output.column_id,
-                                qualifier: None,
-                                column: child_output.name.clone(),
-                            },
-                            data_type: child_output.data_type.clone(),
-                            nullable: child_output.nullable,
-                        },
-                        output_name: root_output.name.clone(),
-                        output_column_id: root_output.column_id,
-                    }],
-                    output_qualifier: None,
-                },
-            ),
-            vec![child],
-            None,
-        );
-        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
-
-        let ids = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
-            &mut factory,
-            &plan,
-        )
-        .expect("allocate locator column ids");
-
-        let allocated = [
-            ids.net,
-            ids.file,
-            ids.pos,
-            ids.row_id,
-            ids.last_updated_sequence_number,
-        ];
-        assert!(allocated.iter().all(|id| *id > child_output.column_id.0));
-        let unique = allocated
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), allocated.len());
-    }
-
-    #[test]
-    fn imv_change_stream_write_recognizes_physical_change_op_by_reserved_shape() {
-        let output = OutputColumn {
-            column_id: ColumnId(17),
-            name: novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
-            is_internal: false,
-        };
-
-        assert!(is_imv_change_op_output_column(&output));
-    }
-
-    fn branch_field_test_contract(source: ApplyKeySource) -> mv_schema::MvSchemaContract {
-        let aggregate = (source == crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId)
-            .then(|| mv_schema::AggregateStateContract {
-                state_layout_version: 1,
-                row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-                state_columns: vec![mv_schema::AggregateStateColumnContract {
-                    column_name: "__agg_state_count".to_string(),
-                    target_field_id: 3,
-                    type_signature: "long".to_string(),
-                    nullable: false,
-                    role: mv_schema::AggregateStateRoleContract::Single,
-                }],
-            });
-        let hidden_name = match source {
-            crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId => {
-                HIDDEN_APPLY_KEY_COLUMN_NAME
-            }
-            crate::sql::planner::vocabulary::ApplyKeySource::JoinRowKey => {
-                JOIN_APPLY_KEY_COLUMN_NAME
-            }
-            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId => {
-                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
-            }
-        };
-        mv_schema::MvSchemaContract {
-            contract_version: if aggregate.is_some() { 3 } else { 1 },
-            base: test_base_contract("ice.db.base"),
-            bases: vec![test_base_contract("ice.db.base")],
-            output: mv_schema::OutputContract {
-                columns: Vec::new(),
-                filter: None,
-            },
-            join: None,
-            aggregate,
-            branch: Some(mv_schema::BranchUnionContract {
-                branch_id_column: mv_schema::BranchIdColumnContract {
-                    column_name: BRANCH_ID_COLUMN_NAME.to_string(),
-                    target_field_id: 2,
-                },
-                branch_count: 2,
-                inner_apply_key_source: source,
-            }),
-            target: mv_schema::TargetContract {
-                table_fqn: "ice.db.mv".to_string(),
-                table_uuid: "target-uuid".to_string(),
-                schema_id_at_create: 1,
-                visible_columns: Vec::new(),
-                hidden_apply_key: mv_schema::HiddenApplyKeyContract {
-                    column_name: hidden_name.to_string(),
-                    target_field_id: 10,
-                    source,
-                },
-                partition: None,
-            },
-        }
-    }
-
-    fn branch_field_test_table(
-        branch_field: Option<novarocks_connector_iceberg::iceberg::spec::NestedField>,
-    ) -> novarocks_connector_iceberg::iceberg::table::Table {
-        use novarocks_connector_iceberg::iceberg::spec::{
-            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
-            TableMetadataBuilder, Type,
-        };
-
-        let mut fields = vec![StdArc::new(NestedField::required(
-            1,
-            "id",
-            Type::Primitive(PrimitiveType::Int),
-        ))];
-        fields.extend(branch_field.map(StdArc::new));
-        let schema = Schema::builder()
-            .with_schema_id(2)
-            .with_fields(fields)
-            .build()
-            .expect("branch field test schema");
-        let metadata = TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec().into_unbound(),
-            SortOrder::unsorted_order(),
-            "file:///tmp/ebd16b-branch-field".to_string(),
-            FormatVersion::V3,
-            std::collections::HashMap::from([(
-                "write.row-lineage".to_string(),
-                "true".to_string(),
-            )]),
-        )
-        .expect("branch field table metadata builder")
-        .build()
-        .expect("branch field table metadata")
-        .metadata;
-        novarocks_connector_iceberg::iceberg::table::Table::builder()
-            .identifier(
-                novarocks_connector_iceberg::iceberg::TableIdent::from_strs([
-                    "db",
-                    "branch_target",
-                ])
-                .expect("branch field table ident"),
-            )
-            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("branch field test table")
-    }
-
-    fn branch_field_cases() -> Vec<(
-        novarocks_connector_iceberg::iceberg::table::Table,
-        &'static str,
-    )> {
-        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
-
-        vec![
-            (branch_field_test_table(None), "missing"),
-            (
-                branch_field_test_table(Some(NestedField::required(
-                    2,
-                    "renamed_branch",
-                    Type::Primitive(PrimitiveType::Int),
-                ))),
-                "renamed",
-            ),
-            (
-                branch_field_test_table(Some(NestedField::optional(
-                    2,
-                    BRANCH_ID_COLUMN_NAME,
-                    Type::Primitive(PrimitiveType::Int),
-                ))),
-                "not-required",
-            ),
-            (
-                branch_field_test_table(Some(NestedField::required(
-                    2,
-                    BRANCH_ID_COLUMN_NAME,
-                    Type::Primitive(PrimitiveType::Long),
-                ))),
-                "wrong-type",
-            ),
-        ]
-    }
-
-    #[test]
-    fn branch_union_aggregate_branch_field_errors_preserve_exact_messages() {
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "mv".to_string(),
-        };
-        let contract =
-            branch_field_test_contract(crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId);
-        let expected = [
-            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id field id 2 is missing from target schema",
-            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column renamed externally to renamed_branch; recreate the MV",
-            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column must be required",
-            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column must be Int, got long",
-        ];
-
-        for ((table, label), expected) in branch_field_cases().into_iter().zip(expected) {
-            let target_observation =
-                current_iceberg_table_observation(&table).expect("target observation");
-            let error = validate_branch_union_contract(&target, &contract, 2, &target_observation)
-                .expect_err(label);
-            assert_eq!(error, expected, "case={label}");
-        }
-    }
-
-    #[test]
-    fn union_projection_branch_field_errors_preserve_exact_messages() {
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "mv".to_string(),
-        };
-        let contract =
-            branch_field_test_contract(crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId);
-        let base_ref = TableIdentity {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "base".to_string(),
-        };
-        let expected = [
-            "iceberg UNION ALL projection/filter MV ice.db.mv branch id field id 2 is missing from target schema",
-            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column renamed externally to renamed_branch; recreate the MV",
-            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column must be required",
-            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column must be Int, got long",
-        ];
-
-        for ((table, label), expected) in branch_field_cases().into_iter().zip(expected) {
-            let observation =
-                current_iceberg_table_observation(&table).expect("schema observation");
-            let error = validate_union_projection_schema_contract_for_base(
-                &target,
-                &contract,
-                2,
-                &base_ref,
-                &observation,
-                &observation,
-            )
-            .expect_err(label);
-            assert_eq!(error, expected, "case={label}");
-        }
-    }
-
-    #[test]
-    fn join_base_refs_for_schema_contract_uses_join_lineage_order() {
-        let left = TableIdentity {
-            catalog: "ice".to_string(),
-            namespace: "sales".to_string(),
-            table: "fact".to_string(),
-        };
-        let right = TableIdentity {
-            catalog: "ice".to_string(),
-            namespace: "sales".to_string(),
-            table: "dim".to_string(),
-        };
-        let base_refs = vec![right.clone(), left.clone()];
-        let contract = test_join_projection_schema_contract(&left.fqn(), &right.fqn());
-
-        let (actual_left, actual_right) = join_base_refs_for_schema_contract(&contract, &base_refs)
-            .expect("schema-contract join base refs");
-
-        assert_eq!(actual_left.fqn(), left.fqn());
-        assert_eq!(actual_right.fqn(), right.fqn());
-    }
-
-    fn test_join_projection_schema_contract(
-        left_fqn: &str,
-        right_fqn: &str,
-    ) -> mv_schema::MvSchemaContract {
-        use mv_schema::{
-            HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
-            MvSchemaContract, OutputContract, QualifiedFieldLineage, TargetContract,
-        };
-
-        MvSchemaContract {
-            contract_version: 2,
-            base: test_base_contract(left_fqn),
-            bases: vec![test_base_contract(left_fqn), test_base_contract(right_fqn)],
-            output: OutputContract {
-                columns: Vec::new(),
-                filter: None,
-            },
-            join: Some(JoinContract {
-                kind: JoinContractKind::InnerEquiJoin,
-                predicates: vec![JoinPredicateLineage {
-                    left: QualifiedFieldLineage {
-                        table_fqn: left_fqn.to_string(),
-                        qualifier_at_create: "l".to_string(),
-                        field_id: 1,
-                    },
-                    right: QualifiedFieldLineage {
-                        table_fqn: right_fqn.to_string(),
-                        qualifier_at_create: "r".to_string(),
-                        field_id: 1,
-                    },
-                }],
-            }),
-            aggregate: None,
-            branch: None,
-            target: TargetContract {
-                table_fqn: "ice.sales.mv".to_string(),
-                table_uuid: "target-uuid".to_string(),
-                schema_id_at_create: 1,
-                visible_columns: Vec::new(),
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-                    target_field_id: 1,
-                    source: ApplyKeySource::JoinRowKey,
-                },
-                partition: None,
-            },
-        }
-    }
-
-    fn test_base_contract(table_fqn: &str) -> mv_schema::BaseContract {
-        mv_schema::BaseContract {
-            table_fqn: table_fqn.to_string(),
-            table_uuid: format!("{table_fqn}-uuid"),
-            alias_at_create: None,
-            schema_id_at_create: 1,
-            schema_at_create: mv_schema::BaseSchemaSnapshot { fields: Vec::new() },
-        }
-    }
-
-    fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
-        let sqlparser::ast::Statement::Query(q) = stmt else {
-            panic!("expected SELECT");
-        };
-        *q
-    }
-
-    #[test]
-    fn iceberg_join_mv_uses_join_apply_key_column() {
-        let column = crate::mv::refresh::target_apply::join_apply_key_table_column();
-        assert_eq!(
-            column.name,
-            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
-        );
-    }
-
-    #[test]
-    fn create_apply_key_metadata_comes_from_refresh_contract() {
-        use crate::mv::refresh::apply_key::ApplyKeyContract;
-
-        assert_eq!(
-            create_apply_key_source_property(&ApplyKeyContract::projection_filter()),
-            ApplyKeySource::BaseRowId.table_property_value()
-        );
-        assert_eq!(
-            create_apply_key_source_property(&ApplyKeyContract::join_projection_filter()),
-            ApplyKeySource::JoinRowKey.table_property_value()
-        );
-        assert_eq!(
-            create_apply_key_source_property(&ApplyKeyContract::aggregate_group_row()),
-            ApplyKeySource::GroupRowId.table_property_value()
-        );
-        assert_eq!(
-            create_apply_key_source_property(&ApplyKeyContract::join_aggregate_group_row()),
-            ApplyKeySource::GroupRowId.table_property_value()
-        );
-    }
-
-    #[test]
-    fn repartition_support_accepts_projection_filter_and_aggregate() {
-        let projection = RefreshCapabilities {
-            snapshot_policy: BaseSnapshotPolicy::SingleBase,
-            has_agg_state: false,
-            identity: RefreshIdentity::BaseRowId,
-            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Int64,
-            partition_pruning: PartitionPruningPolicy::BestEffort,
-        };
-        assert_eq!(
-            select_repartition_shape(&projection).expect("projection/filter support"),
-            RepartitionShape::ProjectionFilterSingleBase
-        );
-
-        let aggregate = RefreshCapabilities {
-            snapshot_policy: BaseSnapshotPolicy::SingleBase,
-            has_agg_state: true,
-            identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
-            partition_pruning: PartitionPruningPolicy::BestEffort,
-        };
-        assert_eq!(
-            select_repartition_shape(&aggregate).expect("aggregate support"),
-            RepartitionShape::AggregateSingleBase
-        );
-    }
-
-    #[test]
-    fn repartition_support_accepts_join_projection_filter() {
-        let join = RefreshCapabilities {
-            snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-            has_agg_state: false,
-            identity: RefreshIdentity::JoinRowKey,
-            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
-            partition_pruning: PartitionPruningPolicy::BestEffort,
-        };
-        assert_eq!(
-            select_repartition_shape(&join).expect("join projection/filter support"),
-            RepartitionShape::JoinProjectionFilter
-        );
-    }
-
-    #[test]
-    fn repartition_support_accepts_multi_base_shapes() {
-        let join_aggregate = RefreshCapabilities {
-            snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-            has_agg_state: true,
-            identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
-            partition_pruning: PartitionPruningPolicy::BestEffort,
-        };
-        assert_eq!(
-            select_repartition_shape(&join_aggregate).expect("join aggregate support"),
-            RepartitionShape::JoinAggregate
-        );
-
-        let fan_in_aggregate = RefreshCapabilities {
-            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
-            has_agg_state: true,
-            identity: RefreshIdentity::GroupRowId,
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
-            partition_pruning: PartitionPruningPolicy::BestEffort,
-        };
-        assert_eq!(
-            select_repartition_shape(&fan_in_aggregate).expect("fan-in aggregate support"),
-            RepartitionShape::FanInAggregate
-        );
-
-        let union_projection = RefreshCapabilities {
-            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
-            has_agg_state: false,
-            identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::BaseRowId)),
-            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::BranchInt64,
-            partition_pruning: PartitionPruningPolicy::BestEffort,
-        };
-        assert_eq!(
-            select_repartition_shape(&union_projection).expect("union projection support"),
-            RepartitionShape::UnionProjectionFilter
-        );
-    }
-
-    #[test]
-    fn repartition_support_rejects_specific_unsupported_shape() {
-        let invalid = RefreshCapabilities {
-            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
-            has_agg_state: false,
-            identity: RefreshIdentity::JoinRowKey,
-            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::Utf8,
-            partition_pruning: PartitionPruningPolicy::BestEffort,
-        };
-
-        let err = select_repartition_shape(&invalid).expect_err("shape must be rejected");
-        assert!(err.contains("UnsupportedRepartitionShape"));
-        assert!(err.contains("JoinRowKey"));
-        assert!(err.contains("AllBasesRequired"));
-        assert!(err.contains("aggregate_state=false"));
-
-        let branch_union_aggregate = RefreshCapabilities {
-            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
-            has_agg_state: true,
-            identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId)),
-            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            apply_key_value_type: ApplyKeyValueType::BranchUtf8,
-            partition_pruning: PartitionPruningPolicy::BestEffort,
-        };
-        let err = select_repartition_shape(&branch_union_aggregate)
-            .expect_err("branch UNION ALL aggregate repartition is unsupported");
-        assert!(err.contains("UnsupportedRepartitionShape"));
-        assert!(err.contains("BranchScoped"));
-        assert!(err.contains("aggregate_state=true"));
-    }
-
-    #[test]
-    fn identity_gating_matches_legacy_strategy_gating() {
-        use crate::mv::analysis::refresh_property::TargetIdentity;
-
-        let base_row = TargetIdentity::BaseRowId;
-        let join_row = TargetIdentity::JoinRowKey(
-            Box::new(TargetIdentity::BaseRowId),
-            Box::new(TargetIdentity::BaseRowId),
-        );
-        let group_row = TargetIdentity::GroupRowId(vec!["region".to_string()]);
-        let union_proj = TargetIdentity::BranchScoped(Box::new(TargetIdentity::BaseRowId));
-        let union_agg = TargetIdentity::BranchScoped(Box::new(group_row.clone()));
-
-        // Physical apply-key column: required for base/join row identities
-        // (ProjectionFilter / JoinProjectionFilter / UnionProjectionFilter),
-        // not for group-row identities (the aggregate strategies).
-        assert!(identity_needs_physical_apply_key_column(&base_row));
-        assert!(identity_needs_physical_apply_key_column(&join_row));
-        assert!(identity_needs_physical_apply_key_column(&union_proj));
-        assert!(!identity_needs_physical_apply_key_column(&group_row));
-        assert!(!identity_needs_physical_apply_key_column(&union_agg));
-
-        // Branch id column: required iff the identity top is BranchScoped.
-        assert!(!identity_needs_branch_id_column(&base_row));
-        assert!(!identity_needs_branch_id_column(&join_row));
-        assert!(!identity_needs_branch_id_column(&group_row));
-        assert!(identity_needs_branch_id_column(&union_proj));
-        assert!(identity_needs_branch_id_column(&union_agg));
-    }
-
-    #[test]
-    fn refresh_status_uses_base_ref_fqn() {
-        let base_ref = TableIdentity {
-            catalog: "ice".to_string(),
-            namespace: "sales".to_string(),
-            table: "orders".to_string(),
-        };
-
-        let status = base_snapshot_status_for_refresh(&base_ref, Some(10), Some(11));
-
-        assert_eq!(status.fqn, "ice.sales.orders");
-        assert_eq!(status.previous_snapshot_id, Some(10));
-        assert_eq!(status.current_snapshot_id_before_pin, Some(11));
-    }
-
-    #[test]
-    #[ignore = "legacy planner-memory fixture replaced by tokenized MV planning coverage"]
-    fn join_delta_coalesce_catalog_registers_target_locator_at_supplied_snapshot() {
-        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "sales");
-        create_base_table(&env.state, "ice", "sales", "left_orders");
-        create_base_table(&env.state, "ice", "sales", "right_orders");
-        insert_into_iceberg_table(&env.state, "ice", "sales", "left_orders", &[(1, "left")]);
-        insert_into_iceberg_table(&env.state, "ice", "sales", "right_orders", &[(1, "right")]);
-        let right_snapshot_id = load_iceberg_table(&env.state, "ice", "sales", "right_orders")
-            .metadata()
-            .current_snapshot()
-            .expect("right snapshot")
-            .snapshot_id();
-        create_join_mv_target_locator_table(&env.state, "ice", "sales", "mv_join");
-        insert_into_join_mv_target_locator_table(
-            &env.state,
-            "ice",
-            "sales",
-            "mv_join",
-            &[(1, "sku-1", "join-key-1")],
-        );
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "sales".to_string(),
-            table: "mv_join".to_string(),
-        };
-        let target_table = load_iceberg_table(&env.state, "ice", "sales", "mv_join");
-        let target_snapshot_id = target_table
-            .metadata()
-            .current_snapshot()
-            .expect("target snapshot")
-            .snapshot_id();
-        let branches = vec![
-            crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan {
-                left_base: iceberg_ref("ice", "sales", "left_orders"),
-                right_base: iceberg_ref("ice", "sales", "right_orders"),
-                left: crate::engine::mv::iceberg_join_branch::BranchSide::Delta(
-                    crate::engine::mv::iceberg_join_branch::SnapshotWindow { from: 10, to: 11 },
-                ),
-                right: crate::engine::mv::iceberg_join_branch::BranchSide::Snapshot(
-                    right_snapshot_id,
-                ),
-            },
-        ];
-
-        let catalog = build_join_delta_coalesce_catalog(
-            &env.state,
-            &branches,
-            &target,
-            &target_table,
-            Some(target_snapshot_id),
-        )
-        .expect("join coalesce catalog");
-        let locator = catalog
-            .get("sales", "__nr_join_delta_target_locator")
-            .expect("target locator table");
-
-        assert!(
-            locator
-                .columns
-                .iter()
-                .any(|column| column.name == JOIN_APPLY_KEY_COLUMN_NAME),
-            "locator columns={:?}",
-            locator.columns
-        );
-        assert!(
-            locator
-                .iceberg_row_lineage_metadata_columns
-                .iter()
-                .any(|column| column.name == "_file"),
-            "locator metadata columns={:?}",
-            locator.iceberg_row_lineage_metadata_columns
-        );
-        assert!(
-            locator
-                .iceberg_row_lineage_metadata_columns
-                .iter()
-                .any(|column| column.name == "_pos"),
-            "locator metadata columns={:?}",
-            locator.iceberg_row_lineage_metadata_columns
-        );
-        let crate::sql::planner::table::ScanSource::Sql(source) = &locator.source else {
-            panic!("expected tokenized SQL locator source");
-        };
-        assert_eq!(source.table.catalog, "ice");
-        assert_eq!(source.table.namespace, "sales");
-        assert_eq!(source.table.table, "mv_join");
-        assert!(matches!(
-            source.kind,
-            crate::sql::planner::table::SqlScanKind::Data {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(id),
-            } if id == target_snapshot_id
-        ));
-    }
-
-    #[test]
-    fn join_coalesce_builder_factory_metadata_survives_rewritten_plan_reserve() {
-        let desc = join_coalesce_factory_test_descriptor();
-        let branch_union = join_coalesce_factory_test_branch_union(&desc);
-        let locator =
-            crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                target_binding: crate::sql::compiler::mv_rewrite::test_target_binding(),
-                target_table_uuid: "target-uuid".to_string(),
-                target_snapshot_id: Some(77),
-            };
-        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
-        factory.reserve_until(109);
-        let locator_columns = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
-            &mut factory,
-            &branch_union,
-        )
-        .expect("allocate locator column ids");
-
-        let plan =
-            crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                branch_union,
-                &desc,
-                &locator,
-                &mut factory,
-                locator_columns.net,
-                locator_columns.file,
-                locator_columns.pos,
-                locator_columns.row_id,
-                locator_columns.last_updated_sequence_number,
-            )
-            .expect("join coalesce plan");
-        crate::mv::refresh::join_incremental_refresh::reserve_factory_for_logical_plan(
-            &mut factory,
-            &plan,
-        )
-        .expect("reserve rewritten plan outputs");
-
-        let watched_columns =
-            collect_join_coalesce_factory_watch_columns(&plan, ColumnId(locator_columns.net));
-        let watched_names = watched_columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<BTreeSet<_>>();
-        for expected in [
-            "net",
-            JOIN_APPLY_KEY_COLUMN_NAME,
-            "__pending_insert_count",
-            "__pending_delete_count",
-            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
-            novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
-            novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-            novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
-        ] {
-            assert!(
-                watched_names.contains(expected),
-                "missing watched column {expected}; watched={watched_columns:?}"
-            );
-        }
-        for column in watched_columns {
-            let metadata = factory.get(column.column_id);
-            assert!(
-                !metadata.name.starts_with("__reserved_col_"),
-                "column {} leaked reserved metadata {:?}",
-                column.name,
-                metadata
-            );
-            assert_eq!(metadata.name, column.name);
-            assert_eq!(metadata.data_type, column.data_type);
-            assert_eq!(metadata.nullable, column.nullable);
-        }
-    }
-
-    #[test]
-    fn refresh_contract_selects_fan_in_aggregate_for_a_family() {
-        let env = open_test_state_with_hadoop_iceberg_catalog("ice_fan_in", "sales");
-        create_aggregate_fact_table(&env.state, "ice_fan_in", "sales", "t1");
-        create_aggregate_fact_table(&env.state, "ice_fan_in", "sales", "t2");
-        let query = parse_mv_select_query(
-            "select region, count(*) as c from (
-               select region from ice_fan_in.sales.t1
-               union all
-               select region from ice_fan_in.sales.t2
-             ) u group by region",
-        )
-        .expect("parse");
-        let analysis = analyze_mv_select_with_connector_context(
-            &env.state,
-            Some("ice_fan_in"),
-            "sales",
-            &query,
-            &crate::connector::test_request_context(),
-        )
-        .expect("analyze");
-        let contract = derive_imv_refresh_contract(&analysis).expect("derive");
-        // FanInAggregate: aggregate over a UNION ALL of simple scans.
-        // Contract fields: aggregate present, branch present (the fan-in union),
-        // no join, apply key is aggregate_group_row (Utf8, group-row-id column).
-        assert!(
-            contract.aggregate.is_some(),
-            "fan-in aggregate must have aggregate contract"
-        );
-        assert!(
-            contract.branch.is_some(),
-            "fan-in aggregate must have branch contract"
-        );
-        assert!(
-            contract.join.is_none(),
-            "fan-in aggregate must not have join contract"
-        );
-        assert_eq!(
-            contract.apply_key,
-            crate::mv::refresh::apply_key::ApplyKeyContract::aggregate_group_row(),
-        );
-        assert_eq!(contract.base_refs.len(), 2);
-    }
-
-    #[test]
-    fn iceberg_aggregate_target_columns_use_state_layout() {
-        let (shape, analysis) = analyze_aggregate_fact_query(
-            "select region, count(*) as c, sum(amount) as s \
-             from ice.ns.fact group by region",
-        );
-
-        let columns = iceberg_aggregate_target_columns(&shape, &analysis).expect("columns");
-        let names = columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
-
-        assert_eq!(
-            names,
-            vec![
-                "__row_id__",
-                "region",
-                "c",
-                "s",
-                "__agg_state_c",
-                "__agg_state_s"
-            ]
-        );
-    }
-
-    #[test]
-    fn definition_fingerprint_is_exact_canonical_json_and_order_independent() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "one")]);
-        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_fingerprint");
-        let mut definition =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fingerprint")
-                .expect("definition");
-        definition.base_table_refs = vec![
-            "ice.sales.orders".to_string(),
-            "ice.sales.other".to_string(),
-        ];
-        let first =
-            refresh_execution_definition_fingerprint(&definition, Some("ice"), &env.current_db)
-                .expect("fingerprint");
-        definition.base_table_refs.reverse();
-        let reordered =
-            refresh_execution_definition_fingerprint(&definition, Some("ice"), &env.current_db)
-                .expect("reordered fingerprint");
-
-        assert_eq!(first, reordered);
-        let encoded: serde_json::Value =
-            serde_json::from_str(&first).expect("fingerprint must be exact JSON");
-        assert_eq!(encoded["mv_id"], definition.mv_id);
-        assert_eq!(
-            encoded["canonical_base_refs"],
-            serde_json::json!(["ice.sales.orders", "ice.sales.other"])
-        );
-    }
-
-    // Stale contract validation is covered by mv::refresh::execution unit tests;
-    // completing the first attempt is a native FE/BE writer lifecycle concern.
-
-    // Pure SQLX-2 exact-generation coverage is
-    // `sqlx2_mv_frozen_base_overlays_survive_connector_generation_replacement`.
-    // The writer/RF execution portion belongs to the native FE/BE IVM suite.
-
-    // Native FE/BE owner coverage: iceberg_ivm_join_aggregate.sql.
-
-    // Native FE/BE owner coverage: iceberg_ivm_fan_in_aggregate_union.sql.
-
-    fn assert_aggregate_region_rows(
-        state: &Arc<StandaloneState>,
-        current_catalog: &str,
-        current_database: &str,
-        mv_name: &str,
-        expected: &[(&str, i64, i64)],
-    ) {
-        let sql = format!("SELECT region, c, s FROM {mv_name} ORDER BY region");
-        let session = crate::engine::StandaloneSession {
-            inner: Arc::clone(state),
-        };
-        let result = match session
-            .execute_in_context(&sql, Some(current_catalog), current_database, None)
-            .expect("query fan-in aggregate mv")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("expected query result for {sql}"),
-        };
-        let actual = string_i64_i64_rows(&result);
-        let expected = expected
-            .iter()
-            .map(|(region, count, sum)| ((*region).to_string(), *count, *sum))
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn create_b_family_union_aggregate_persists_branch_contract() {
-        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "t1");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "t2");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_agg
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, count(*) AS c FROM ice.sales.t1 GROUP BY region
-                UNION ALL
-                SELECT region, count(*) AS c FROM ice.sales.t2 GROUP BY region",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create B-family UNION ALL aggregate MV");
-        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_agg")
-            .expect("stored MV definition");
-        let contract = mv.schema_contract.expect("schema contract");
-        assert!(contract.aggregate.is_some());
-        let branch = contract.branch.expect("branch contract");
-        assert_eq!(branch.branch_count, 2);
-        assert_eq!(
-            branch.inner_apply_key_source,
-            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
-        );
-    }
-
-    // Native FE/BE owner coverage: iceberg_ivm_branch_union_aggregate.sql.
-
-    fn assert_aggregate_region_sum_rows(
-        state: &Arc<StandaloneState>,
-        current_catalog: &str,
-        current_database: &str,
-        mv_name: &str,
-        expected: &[(&str, i64, i64)],
-    ) {
-        let sql = format!("SELECT region, c, s FROM {mv_name} ORDER BY region, s");
-        let session = crate::engine::StandaloneSession {
-            inner: Arc::clone(state),
-        };
-        let result = match session
-            .execute_in_context(&sql, Some(current_catalog), current_database, None)
-            .expect("query union-of-aggregates mv")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("expected query result for {sql}"),
-        };
-        let actual = string_i64_i64_rows(&result);
-        let expected = expected
-            .iter()
-            .map(|(region, count, sum)| ((*region).to_string(), *count, *sum))
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
-    }
-
-    fn execute_iceberg_sql(
-        state: &Arc<StandaloneState>,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        sql: &str,
-    ) {
-        let session = crate::engine::StandaloneSession {
-            inner: Arc::clone(state),
-        };
-        match session
-            .execute_in_context(sql, current_catalog, current_database, None)
-            .expect("execute iceberg sql")
-        {
-            StatementResult::Ok => {}
-            StatementResult::Query(_) => panic!("expected non-query statement for {sql}"),
-        }
-    }
-
-    fn assert_join_aggregate_rows(
-        state: &Arc<StandaloneState>,
-        current_catalog: &str,
-        current_database: &str,
-        mv_name: &str,
-        expected: &[(&str, i64, i64)],
-    ) {
-        let sql = format!("SELECT category, c, s FROM {mv_name} ORDER BY category");
-        let session = crate::engine::StandaloneSession {
-            inner: Arc::clone(state),
-        };
-        let result = match session
-            .execute_in_context(&sql, Some(current_catalog), current_database, None)
-            .expect("query join aggregate mv")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("expected query result for {sql}"),
-        };
-        let actual = string_i64_i64_rows(&result);
-        let expected = expected
-            .iter()
-            .map(|(category, count, sum)| ((*category).to_string(), *count, *sum))
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
-    }
-
-    fn string_i64_i64_rows(
-        result: &crate::runtime::query_result::QueryResult,
-    ) -> Vec<(String, i64, i64)> {
-        let mut rows = Vec::new();
-        for chunk in &result.chunks {
-            let category = chunk
-                .batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("category column");
-            let count = chunk
-                .batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("count column");
-            let sum = chunk
-                .batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("sum column");
-            for row in 0..chunk.batch.num_rows() {
-                rows.push((
-                    category.value(row).to_string(),
-                    count.value(row),
-                    sum.value(row),
-                ));
-            }
-        }
-        rows
-    }
-
-    fn id_name_rows(result: &crate::runtime::query_result::QueryResult) -> Vec<(i32, String)> {
-        let mut rows = Vec::new();
-        for chunk in &result.chunks {
-            let id = chunk
-                .batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("id column");
-            let name = chunk
-                .batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("name column");
-            for row in 0..chunk.batch.num_rows() {
-                rows.push((id.value(row), name.value(row).to_string()));
-            }
-        }
-        rows
-    }
-
-    fn join_repartition_rows(
-        state: &Arc<StandaloneState>,
-        current_catalog: &str,
-        current_database: &str,
-        mv_name: &str,
-    ) -> Vec<(i32, String)> {
-        let sql = format!("SELECT id, region FROM {mv_name} ORDER BY id");
-        let session = crate::engine::StandaloneSession {
-            inner: Arc::clone(state),
-        };
-        let result = match session
-            .execute_in_context(&sql, Some(current_catalog), current_database, None)
-            .expect("query join repartition mv")
-        {
-            StatementResult::Query(result) => result,
-            StatementResult::Ok => panic!("expected query result for {sql}"),
-        };
-        id_name_rows(&result)
-    }
-
-    fn union_projection_rows_with_hidden(
-        state: &Arc<StandaloneState>,
-        current_catalog: &str,
-        current_database: &str,
-        mv_name: &str,
-    ) -> Vec<(i32, String, i64, i32)> {
-        use futures::StreamExt;
-        use novarocks_connector_iceberg::iceberg::arrow::ArrowReaderBuilder;
-
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(current_catalog).expect("catalog")
-        };
-        let loaded = load_iceberg_mv_table(&entry, current_database, mv_name);
-        let mut rows = data_block_on(async {
-            let scan = loaded
-                .table
-                .scan()
-                .select(vec![
-                    "id".to_string(),
-                    "name".to_string(),
-                    HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-                    BRANCH_ID_COLUMN_NAME.to_string(),
-                ])
-                .build()
-                .expect("build UNION ALL target scan");
-            let tasks = scan
-                .plan_files()
-                .await
-                .expect("plan UNION ALL target files");
-            let arrow_reader = ArrowReaderBuilder::new(loaded.table.file_io().clone()).build();
-            let mut stream = arrow_reader.read(tasks).expect("read UNION ALL target");
-            let mut rows = Vec::new();
-            while let Some(batch_result) = stream.next().await {
-                let batch = batch_result.expect("UNION ALL target batch");
-                let id = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("id column");
-                let name = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("name column");
-                let base_row_id = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("base row id column");
-                let branch_id = batch
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("branch id column");
-                for row in 0..batch.num_rows() {
-                    rows.push((
-                        id.value(row),
-                        name.value(row).to_string(),
-                        base_row_id.value(row),
-                        branch_id.value(row),
-                    ));
-                }
-            }
-            rows
-        })
-        .expect("read UNION ALL projection/filter target rows");
-        rows.sort_by_key(|(id, _, base_row_id, branch_id)| (*branch_id, *id, *base_row_id));
-        rows
-    }
-
-    fn output_col(name: &str, ty: DataType, nullable: bool) -> OutputColumn {
-        OutputColumn {
-            column_id: crate::sql::column_id::ColumnId::UNSET,
-            name: name.to_string(),
-            data_type: ty,
-            nullable,
-            is_internal: false,
-        }
-    }
-
-    fn join_coalesce_factory_test_descriptor()
-    -> crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
-        use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
-            JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor,
-            JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity,
-            JoinRefreshOutputMapping, JoinRefreshOutputSource,
-        };
-
-        let payload = join_coalesce_factory_test_column(1, "id", DataType::Int32, false, false);
-        let payload_output =
-            join_coalesce_factory_test_column(80, "id", DataType::Int32, false, false);
-        let action = join_coalesce_factory_test_column(
-            4,
-            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
-            DataType::Int8,
-            false,
-            true,
-        );
-        let action_output = join_coalesce_factory_test_column(
-            91,
-            novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
-            DataType::Int8,
-            false,
-            true,
-        );
-        let join_apply_key = join_coalesce_factory_test_column(
-            5,
-            JOIN_APPLY_KEY_COLUMN_NAME,
-            DataType::Utf8,
-            false,
-            true,
-        );
-        let join_apply_key_output = join_coalesce_factory_test_column(
-            90,
-            JOIN_APPLY_KEY_COLUMN_NAME,
-            DataType::Utf8,
-            false,
-            true,
-        );
-
-        JoinRefreshDescriptor {
-            mode: JoinRefreshMode::Coalesce,
-            mv_identity: JoinRefreshMvIdentity {
-                catalog: "ice".to_string(),
-                database: "sales".to_string(),
-                name: "mv_join".to_string(),
-            },
-            left_base_fqn: "ice.sales.left_orders".to_string(),
-            right_base_fqn: "ice.sales.right_orders".to_string(),
-            left_row_id_column: join_coalesce_factory_test_column(
-                2,
-                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-                DataType::Int64,
-                false,
-                true,
-            ),
-            right_row_id_column: join_coalesce_factory_test_column(
-                3,
-                novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
-                DataType::Int64,
-                false,
-                true,
-            ),
-            action_column: action.clone(),
-            join_apply_key_column: join_apply_key.clone(),
-            payload_columns: vec![payload.clone()],
-            join_key_pairs: vec![JoinRefreshJoinKeyPair {
-                left_column: join_coalesce_factory_test_column(
-                    6,
-                    "left_id",
-                    DataType::Int32,
-                    false,
-                    false,
-                ),
-                right_column: join_coalesce_factory_test_column(
-                    7,
-                    "right_id",
-                    DataType::Int32,
-                    false,
-                    false,
-                ),
-            }],
-            output_mappings: vec![
-                JoinRefreshOutputMapping {
-                    mv_output_column: payload_output,
-                    source: JoinRefreshOutputSource::Payload(payload.column_id),
-                },
-                JoinRefreshOutputMapping {
-                    mv_output_column: join_apply_key_output,
-                    source: JoinRefreshOutputSource::JoinApplyKey(join_apply_key.column_id),
-                },
-                JoinRefreshOutputMapping {
-                    mv_output_column: action_output,
-                    source: JoinRefreshOutputSource::Action(action.column_id),
-                },
-            ],
-            branches: vec![
-                JoinRefreshBranchDescriptor {
-                    side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
-                    action_column_id: action.column_id,
-                },
-                JoinRefreshBranchDescriptor {
-                    side: JoinRefreshBranchSide::LeftSnapshotRightDelta,
-                    action_column_id: action.column_id,
-                },
-            ],
-            needs_target_locator: true,
-        }
-    }
-
-    fn join_coalesce_factory_test_branch_union(
-        desc: &crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
-    ) -> crate::sql::planner::logical::LogicalPlanNode {
-        let mut output_columns = desc.payload_columns.clone();
-        output_columns.push(desc.action_column.clone());
-        output_columns.push(desc.join_apply_key_column.clone());
-        let branch = crate::sql::planner::logical::LogicalPlanNode::new(
-            crate::sql::planner::logical::LogicalPlanKind::Values(
-                crate::sql::planner::payload::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: output_columns.clone(),
-                },
-            ),
-            Vec::new(),
-            None,
-        );
-        crate::sql::planner::logical::LogicalPlanNode::new(
-            crate::sql::planner::logical::LogicalPlanKind::Union(
-                crate::sql::planner::logical::LogicalUnionNode {
-                    all: true,
-                    output_columns,
-                },
-            ),
-            vec![branch.clone(), branch],
-            None,
-        )
-    }
-
-    fn collect_join_coalesce_factory_watch_columns(
-        plan: &crate::sql::planner::logical::LogicalPlanNode,
-        min_id: ColumnId,
-    ) -> Vec<OutputColumn> {
-        let mut columns = Vec::new();
-        collect_join_coalesce_factory_watch_columns_inner(plan, min_id, &mut columns);
-        columns
-    }
-
-    fn collect_join_coalesce_factory_watch_columns_inner(
-        plan: &crate::sql::planner::logical::LogicalPlanNode,
-        min_id: ColumnId,
-        columns: &mut Vec<OutputColumn>,
-    ) {
-        match &plan.kind {
-            crate::sql::planner::logical::LogicalPlanKind::Project(project) => {
-                columns.extend(project.items.iter().filter_map(|item| {
-                    is_join_coalesce_factory_locator_output(&item.output_name).then(|| {
-                        OutputColumn {
-                            column_id: item.output_column_id,
-                            name: item.output_name.clone(),
-                            data_type: item.expr.data_type.clone(),
-                            nullable: item.expr.nullable,
-                            is_internal: true,
-                        }
-                    })
-                }));
-            }
-            crate::sql::planner::logical::LogicalPlanKind::Aggregate(aggregate) => {
-                columns.extend(
-                    aggregate
-                        .output_columns
-                        .iter()
-                        .filter(|column| {
-                            column.column_id >= min_id
-                                && is_join_coalesce_factory_internal_output(&column.name)
-                        })
-                        .cloned(),
-                );
-            }
-            crate::sql::planner::logical::LogicalPlanKind::Scan(scan) => {
-                columns.extend(
-                    scan.columns
-                        .iter()
-                        .filter(|column| {
-                            column.column_id >= min_id && column.name == JOIN_APPLY_KEY_COLUMN_NAME
-                        })
-                        .cloned(),
-                );
-            }
-            _ => {}
-        }
-        for child in &plan.children {
-            collect_join_coalesce_factory_watch_columns_inner(child, min_id, columns);
-        }
-    }
-
-    fn is_join_coalesce_factory_internal_output(name: &str) -> bool {
-        matches!(
-            name,
-            "net"
-                | JOIN_APPLY_KEY_COLUMN_NAME
-                | "__pending_insert_count"
-                | "__pending_delete_count"
-        )
-    }
-
-    fn is_join_coalesce_factory_locator_output(name: &str) -> bool {
-        matches!(
-            name,
-            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL
-                | novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL
-                | novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
-                | novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
-        )
-    }
-
-    fn join_coalesce_factory_test_column(
-        id: u32,
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-        is_internal: bool,
-    ) -> OutputColumn {
-        OutputColumn {
-            column_id: ColumnId(id),
-            name: name.to_string(),
-            data_type,
-            nullable,
-            is_internal,
-        }
-    }
-
-    fn analyze_aggregate_fact_query(
-        sql: &str,
-    ) -> (
-        crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-        MvAnalysis,
-    ) {
-        let env = open_test_state_with_iceberg_catalog("ice", "ns");
-        create_aggregate_fact_table(&env.state, "ice", "ns", "fact");
-        let query = parse_select_query(sql);
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-                .expect("extract aggregate calls");
-        let analysis = analyze_mv_select_with_connector_context(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            &query,
-            &crate::connector::test_request_context(),
-        )
-        .expect("analyze aggregate query");
-        (calls, analysis)
-    }
-
-    struct IcebergMvTestState {
-        state: Arc<StandaloneState>,
-        current_db: String,
-        _metadata_dir: TempDir,
-        _warehouse_dir: TempDir,
-        _loopback_backend: crate::engine::StandaloneLoopbackTestBackend,
-    }
-
-    fn parse_create_mv(sql: &str) -> CreateMaterializedViewStmt {
-        let mut statements = crate::sql::parser::parse_sql(sql).expect("parse");
-        let crate::sql::parser::ast::Statement::CreateMaterializedView(stmt) = statements.remove(0)
-        else {
-            panic!("expected CREATE MATERIALIZED VIEW");
-        };
-        stmt
-    }
-
-    fn parse_refresh_mv(sql: &str) -> RefreshMaterializedViewStmt {
-        let mut statements = crate::sql::parser::parse_sql(sql).expect("parse");
-        let crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) =
-            statements.remove(0)
-        else {
-            panic!("expected REFRESH MATERIALIZED VIEW");
-        };
-        stmt
-    }
-
-    fn parse_alter_mv(sql: &str) -> AlterMaterializedViewStmt {
-        let mut statements = crate::sql::parser::parse_sql(sql).expect("parse");
-        let crate::sql::parser::ast::Statement::AlterMaterializedView(stmt) = statements.remove(0)
-        else {
-            panic!("expected ALTER MATERIALIZED VIEW");
-        };
-        stmt
-    }
-
-    fn iceberg_ref(catalog: &str, namespace: &str, table: &str) -> TableIdentity {
-        TableIdentity {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            table: table.to_string(),
-        }
-    }
-
-    fn parse_drop_mv(sql: &str) -> DropMaterializedViewStmt {
-        let mut statements = crate::sql::parser::parse_sql(sql).expect("parse");
-        let crate::sql::parser::ast::Statement::DropMaterializedView(stmt) = statements.remove(0)
-        else {
-            panic!("expected DROP MATERIALIZED VIEW");
-        };
-        stmt
-    }
-
-    fn create_test_iceberg_namespace(state: &Arc<StandaloneState>, catalog: &str, namespace: &str) {
-        let entry = state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg catalogs")
-            .get(catalog)
-            .expect("catalog");
-        crate::connector::iceberg::catalog::registry::create_namespace(&entry, namespace)
-            .expect("create test namespace");
-    }
-
-    fn initialize_iceberg_mv_test_namespaces(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        current_db: &str,
-    ) {
-        create_test_iceberg_namespace(state, catalog, current_db);
-        if !current_db.eq_ignore_ascii_case("sales") {
-            create_test_iceberg_namespace(state, catalog, "sales");
-        }
-    }
-
-    fn iceberg_mv_test_state_defaults() -> StandaloneState {
-        let defaults = StandaloneState::default();
-        let query_execution = crate::engine::test_query_execution_service_with_connector_control(
-            Some(Arc::clone(&defaults.connector_control)),
-        );
-        StandaloneState {
-            query_execution,
-            mv_storage_observation: Arc::new(
-                crate::engine::mv::schema_validation_adapter::TestIcebergMvStorageObservationAdapter::default(),
-            ),
-            ..defaults
-        }
-    }
-
-    fn open_test_state_with_iceberg_catalog(catalog: &str, current_db: &str) -> IcebergMvTestState {
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
-        let metadata_dir = TempDir::new().expect("metadata tempdir");
-        let warehouse_dir = TempDir::new().expect("warehouse tempdir");
-        let metadata_path = metadata_dir.path().join("standalone.sqlite");
-        let metadata_provider: Arc<dyn MetaStoreProvider> = Arc::new(
-            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider"),
-        );
-        let state = Arc::new(StandaloneState {
-            mv_repository: crate::engine::test_mv_repository(),
-            metadata_provider: Some(metadata_provider),
-            exchange_port: loopback_backend.exchange_port,
-            backend_topology: Arc::new(LoopbackTestBackendTopology::new(
-                loopback_backend.exchange_port,
-            )),
-            ..iceberg_mv_test_state_defaults()
-        });
-        crate::connector::register_standalone_backends(&state);
-        // CREATE EXTERNAL CATALOG persists a durable attachment and only then
-        // materializes the runtime registry. Populating just the registry
-        // leaves anything that reads attachments -- lake MV rebuild is the one
-        // that matters -- looking at an empty catalog list.
-        let catalog_properties = vec![
-            ("type".to_string(), "iceberg".to_string()),
-            ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-            (
-                "iceberg.catalog.warehouse".to_string(),
-                warehouse_dir.path().display().to_string(),
-            ),
-        ];
-        crate::engine::persist_catalog_attachment_if_needed(&state, catalog, &catalog_properties)
-            .expect("persist iceberg catalog attachment");
-        {
-            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
-            catalogs
-                .create_catalog(catalog, &catalog_properties)
-                .expect("create iceberg catalog");
-        }
-        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
-        crate::engine::register_iceberg_control_binding(&state, catalog)
-            .expect("register Iceberg connector control binding");
-        state.catalog_service.register_catalog(
-            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
-                catalog,
-                Arc::clone(&state.connector_control)
-                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ),
-        );
-        IcebergMvTestState {
-            state,
-            current_db: current_db.to_string(),
-            _metadata_dir: metadata_dir,
-            _warehouse_dir: warehouse_dir,
-            _loopback_backend: loopback_backend,
-        }
-    }
-
-    fn open_test_state_with_iceberg_catalog_without_metadata(
-        catalog: &str,
-        current_db: &str,
-    ) -> IcebergMvTestState {
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
-        let metadata_dir = TempDir::new().expect("metadata tempdir");
-        let warehouse_dir = TempDir::new().expect("warehouse tempdir");
-        let state = Arc::new(StandaloneState {
-            metadata_provider: None,
-            exchange_port: loopback_backend.exchange_port,
-            backend_topology: Arc::new(LoopbackTestBackendTopology::new(
-                loopback_backend.exchange_port,
-            )),
-            ..iceberg_mv_test_state_defaults()
-        });
-        crate::connector::register_standalone_backends(&state);
-        {
-            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
-            catalogs
-                .create_catalog(
-                    catalog,
-                    &[
-                        ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                        (
-                            "iceberg.catalog.warehouse".to_string(),
-                            warehouse_dir.path().display().to_string(),
-                        ),
-                    ],
-                )
-                .expect("create iceberg catalog");
-        }
-        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
-        crate::engine::register_iceberg_control_binding(&state, catalog)
-            .expect("register Iceberg connector control binding");
-        state.catalog_service.register_catalog(
-            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
-                catalog,
-                Arc::clone(&state.connector_control)
-                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ),
-        );
-        IcebergMvTestState {
-            state,
-            current_db: current_db.to_string(),
-            _metadata_dir: metadata_dir,
-            _warehouse_dir: warehouse_dir,
-            _loopback_backend: loopback_backend,
-        }
-    }
-
-    fn open_test_state_with_hadoop_iceberg_catalog(
-        catalog: &str,
-        current_db: &str,
-    ) -> IcebergMvTestState {
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
-        let metadata_dir = TempDir::new().expect("metadata tempdir");
-        let warehouse_dir = TempDir::new().expect("warehouse tempdir");
-        let metadata_path = metadata_dir.path().join("standalone.sqlite");
-        let metadata_provider: Arc<dyn MetaStoreProvider> = Arc::new(
-            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider"),
-        );
-        let state = Arc::new(StandaloneState {
-            mv_repository: crate::engine::test_mv_repository(),
-            metadata_provider: Some(metadata_provider),
-            exchange_port: loopback_backend.exchange_port,
-            backend_topology: Arc::new(LoopbackTestBackendTopology::new(
-                loopback_backend.exchange_port,
-            )),
-            ..iceberg_mv_test_state_defaults()
-        });
-        crate::connector::register_standalone_backends(&state);
-        {
-            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
-            catalogs
-                .create_catalog(
-                    catalog,
-                    &[
-                        ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                        (
-                            "iceberg.catalog.warehouse".to_string(),
-                            format!("file://{}", warehouse_dir.path().display()),
-                        ),
-                    ],
-                )
-                .expect("create iceberg catalog");
-        }
-        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
-        crate::engine::register_iceberg_control_binding(&state, catalog)
-            .expect("register Iceberg connector control binding");
-        state.catalog_service.register_catalog(
-            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
-                catalog,
-                Arc::clone(&state.connector_control)
-                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ),
-        );
-        IcebergMvTestState {
-            state,
-            current_db: current_db.to_string(),
-            _metadata_dir: metadata_dir,
-            _warehouse_dir: warehouse_dir,
-            _loopback_backend: loopback_backend,
-        }
-    }
-
-    fn find_iceberg_mv_definition(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Option<StoredMvDefinition> {
-        state
-            .mv_repository
-            .find_by_target(&MvTarget {
-                catalog: Some(catalog.to_string()),
-                database: namespace.to_string(),
-                name: table.to_string(),
-            })
-            .expect("lookup mv definition")
-    }
-
-    fn load_iceberg_mv_table(
-        entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-        namespace: &str,
-        table: &str,
-    ) -> crate::connector::iceberg::catalog::IcebergLoadedTable {
-        crate::connector::iceberg::catalog::load_table(entry, namespace, table)
-            .expect("load iceberg MV table")
-    }
-
-    fn rewrite_mv_descriptor_package_id_for_test(
-        state: &Arc<StandaloneState>,
-        catalog_name: &str,
-        namespace: &str,
-        table: &str,
-        package_id: &str,
-    ) -> Result<(), String> {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog_name).expect("catalog")
-        };
-        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)?;
-        let mut descriptor =
-            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())?;
-        descriptor.package_id = package_id.to_string();
-        let descriptor_properties = descriptor.to_storage_properties()?;
-        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-        let tx = novarocks_connector_iceberg::iceberg::transaction::Transaction::new(&loaded.table);
-        let mut action = tx.update_table_properties();
-        for (key, value) in descriptor_properties {
-            action = action.set(key, value);
-        }
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("apply descriptor package-id test update failed: {e}"))?;
-        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-            tx.commit(catalog.as_ref()).await
-        })
-        .map_err(|e| format!("descriptor package-id test update runtime failed: {e}"))?
-        .map_err(|e| format!("descriptor package-id test update failed: {e}"))?;
-        entry.invalidate_table_cache(namespace, table);
-        Ok(())
-    }
-
-    fn corrupt_mv_descriptor_for_test(
-        state: &Arc<StandaloneState>,
-        catalog_name: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<(), String> {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog_name).expect("catalog")
-        };
-        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)?;
-        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-        let tx = novarocks_connector_iceberg::iceberg::transaction::Transaction::new(&loaded.table);
-        let tx = tx
-            .update_table_properties()
-            .set(
-                crate::mv::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP.to_string(),
-                "injected-invalid-descriptor-json".to_string(),
-            )
-            .apply(tx)
-            .map_err(|e| format!("apply descriptor corruption test update failed: {e}"))?;
-        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-            tx.commit(catalog.as_ref()).await
-        })
-        .map_err(|e| format!("descriptor corruption test update runtime failed: {e}"))?
-        .map_err(|e| format!("descriptor corruption test update failed: {e}"))?;
-        entry.invalidate_table_cache(namespace, table);
-        Ok(())
-    }
-
-    fn load_test_operation_for_refresh(
-        state: &Arc<StandaloneState>,
-        refresh_id: i64,
-    ) -> crate::meta::repository::iceberg_operation::StoredIcebergOperation {
-        let provider = state.metadata_provider.as_ref().expect("metadata provider");
-        let read = provider.begin_read().expect("open read txn");
-        let refresh = state
-            .mv_repository
-            .load_refresh(refresh_id)
-            .expect("load refresh")
-            .expect("refresh");
-        let operation_id = refresh.operation_id.expect("operation id");
-        state
-            .iceberg_operation_repo
-            .load_operation(read.as_ref(), operation_id)
-            .expect("load operation")
-            .expect("operation")
-    }
-
-    fn seed_union_projection_uuid_only_refresh_metadata(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        base_fqn: &str,
-    ) {
-        let mv = find_iceberg_mv_definition(state, catalog, namespace, table)
-            .expect("mv definition for uuid-only metadata seed");
-        let mut table_uuids = BTreeMap::new();
-        table_uuids.insert(base_fqn.to_string(), "uuid-without-snapshot".to_string());
-        let updated = state
-            .mv_repository
-            .update_starrocks_refresh_summary_if_present(UpdateStarRocksMvRefreshSummaryRequest {
-                mv_id: mv.mv_id,
-                last_refresh_ms: now_ms(),
-                last_refresh_rows: 0,
-                base_snapshots: BTreeMap::new(),
-                base_table_uuids: table_uuids,
-            })
-            .expect("seed uuid-only refresh metadata");
-        assert!(updated);
-    }
-
-    fn seed_mismatched_refresh_uuid_metadata(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        mismatched_base_fqn: &str,
-    ) {
-        let mv = find_iceberg_mv_definition(state, catalog, namespace, table)
-            .expect("mv definition for mismatched uuid metadata seed");
-        let mut table_uuids = mv.last_refresh_table_uuids.clone();
-        table_uuids.insert(
-            mismatched_base_fqn.to_string(),
-            "mismatched-table-uuid".to_string(),
-        );
-        let updated = state
-            .mv_repository
-            .update_starrocks_refresh_summary_if_present(UpdateStarRocksMvRefreshSummaryRequest {
-                mv_id: mv.mv_id,
-                last_refresh_ms: now_ms(),
-                last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
-                base_snapshots: mv.last_refresh_snapshots.clone(),
-                base_table_uuids: table_uuids,
-            })
-            .expect("seed mismatched uuid refresh metadata");
-        assert!(updated);
-    }
-
-    fn seed_union_projection_mismatched_uuid_refresh_metadata(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        mismatched_base_fqn: &str,
-    ) {
-        let mv = find_iceberg_mv_definition(state, catalog, namespace, table)
-            .expect("mv definition for mismatched uuid metadata seed");
-        assert_eq!(
-            mv.last_refresh_snapshots.len(),
-            2,
-            "mismatched uuid seed expects complete previous snapshots"
-        );
-        assert_eq!(
-            mv.last_refresh_table_uuids.len(),
-            2,
-            "mismatched uuid seed expects complete previous table uuids"
-        );
-        let mut table_uuids = mv.last_refresh_table_uuids.clone();
-        table_uuids.insert(
-            mismatched_base_fqn.to_string(),
-            "mismatched-table-uuid".to_string(),
-        );
-        let updated = state
-            .mv_repository
-            .update_starrocks_refresh_summary_if_present(UpdateStarRocksMvRefreshSummaryRequest {
-                mv_id: mv.mv_id,
-                last_refresh_ms: now_ms(),
-                last_refresh_rows: mv.last_refresh_rows.unwrap_or(0),
-                base_snapshots: mv.last_refresh_snapshots.clone(),
-                base_table_uuids: table_uuids,
-            })
-            .expect("seed mismatched uuid refresh metadata");
-        assert!(updated);
-    }
-
-    fn create_base_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "name".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            namespace,
-            table,
-            &columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-            ],
-        )
-        .expect("create iceberg table");
-    }
-
-    fn create_aggregate_fact_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "region".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "amount".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::BigInt,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            namespace,
-            table,
-            &columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-            ],
-        )
-        .expect("create aggregate fact iceberg table");
-    }
-
-    fn create_aggregate_fact_table_with_float(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "region".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "price".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Double,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            namespace,
-            table,
-            &columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-            ],
-        )
-        .expect("create aggregate fact (float) iceberg table");
-    }
-
-    fn create_aggregate_dim_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "category".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            namespace,
-            table,
-            &columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-            ],
-        )
-        .expect("create aggregate dim iceberg table");
-    }
-
-    fn create_join_orders_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "customer_id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            namespace,
-            table,
-            &columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-            ],
-        )
-        .expect("create join orders iceberg table");
-    }
-
-    fn create_join_customers_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "region".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            namespace,
-            table,
-            &columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-            ],
-        )
-        .expect("create join customers iceberg table");
-    }
-
-    fn create_join_mv_target_locator_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "label".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            namespace,
-            table,
-            &columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-                (
-                    APPLY_KEY_COLUMN_PROPERTY.to_string(),
-                    JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-                ),
-            ],
-        )
-        .expect("create join MV target locator table");
-    }
-
-    fn insert_into_join_mv_target_locator_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        rows: &[(i32, &str, &str)],
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let rows = rows
-            .iter()
-            .map(|(id, label, join_key)| {
-                vec![
-                    crate::sql::Literal::Int(i64::from(*id)),
-                    crate::sql::Literal::String((*label).to_string()),
-                    crate::sql::Literal::String((*join_key).to_string()),
-                ]
-            })
-            .collect::<Vec<_>>();
-        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
-            .expect("insert join MV target locator rows");
-    }
-
-    fn load_iceberg_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> novarocks_connector_iceberg::iceberg::table::Table {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
-            .expect("load iceberg table")
-            .into_table()
-    }
-
-    fn create_identity_partitioned_base_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let columns = vec![
-            crate::sql::TableColumnDef {
-                name: "id".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            },
-            crate::sql::TableColumnDef {
-                name: "name".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::String,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            },
-        ];
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            namespace,
-            table,
-            &columns,
-            None,
-            &[
-                crate::sql::parser::ast::IcebergPartitionFieldExpr::Identity {
-                    column: "id".to_string(),
-                },
-            ],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-            ],
-        )
-        .expect("create identity-partitioned iceberg table");
-    }
-
-    fn insert_into_iceberg_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        rows: &[(i32, &str)],
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let has_apply_key_column =
-            crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
-                .expect("load iceberg table")
-                .table
-                .metadata()
-                .current_schema()
-                .as_struct()
-                .fields()
-                .iter()
-                .any(|field| {
-                    field
-                        .name
-                        .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
-                });
-        let rows = rows
-            .iter()
-            .enumerate()
-            .map(|(idx, (id, name))| {
-                let mut values = vec![
-                    crate::sql::Literal::Int(i64::from(*id)),
-                    crate::sql::Literal::String((*name).to_string()),
-                ];
-                if has_apply_key_column {
-                    values.push(crate::sql::Literal::Int(1_000_i64 + idx as i64));
-                }
-                values
-            })
-            .collect::<Vec<_>>();
-        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
-            .expect("insert iceberg rows");
-    }
-
-    fn insert_into_aggregate_fact_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        rows: &[(i32, &str, i64)],
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let rows = rows
-            .iter()
-            .map(|(id, region, amount)| {
-                vec![
-                    crate::sql::Literal::Int(i64::from(*id)),
-                    crate::sql::Literal::String((*region).to_string()),
-                    crate::sql::Literal::Int(*amount),
-                ]
-            })
-            .collect::<Vec<_>>();
-        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
-            .expect("insert aggregate fact iceberg rows");
-    }
-
-    fn insert_into_aggregate_dim_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        rows: &[(i32, &str)],
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let rows = rows
-            .iter()
-            .map(|(id, category)| {
-                vec![
-                    crate::sql::Literal::Int(i64::from(*id)),
-                    crate::sql::Literal::String((*category).to_string()),
-                ]
-            })
-            .collect::<Vec<_>>();
-        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
-            .expect("insert aggregate dim iceberg rows");
-    }
-
-    fn insert_into_join_orders_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        rows: &[(i32, i32)],
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let rows = rows
-            .iter()
-            .map(|(id, customer_id)| {
-                vec![
-                    crate::sql::Literal::Int(i64::from(*id)),
-                    crate::sql::Literal::Int(i64::from(*customer_id)),
-                ]
-            })
-            .collect::<Vec<_>>();
-        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
-            .expect("insert join orders iceberg rows");
-    }
-
-    fn insert_into_join_customers_table(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        rows: &[(i32, &str)],
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        let rows = rows
-            .iter()
-            .map(|(id, region)| {
-                vec![
-                    crate::sql::Literal::Int(i64::from(*id)),
-                    crate::sql::Literal::String((*region).to_string()),
-                ]
-            })
-            .collect::<Vec<_>>();
-        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
-            .expect("insert join customers iceberg rows");
-    }
-
-    fn create_base_table_with_rows(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        rows: &[(i32, &str)],
-    ) {
-        create_base_table(state, catalog, namespace, table);
-        insert_into_iceberg_table(state, catalog, namespace, table, rows);
-    }
-
-    #[test]
-    fn sqlx2_mv_frozen_base_overlays_survive_connector_generation_replacement() {
-        use crate::sql::catalog::PlannerTableProvider;
-        use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlTableVersionSelector};
-
-        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
-        create_base_table_with_rows(
-            &env.state,
-            "ice",
-            "sales",
-            "orders",
-            &[(1, "before-generation-replacement")],
-        );
-        let base_ref = iceberg_ref("ice", "sales", "orders");
-        let base_refs = vec![base_ref.clone()];
-        let pin = capture_refresh_snapshot_pin(
-            &env.state,
-            &base_refs,
-            &crate::connector::test_request_context(),
-        )
-        .expect("capture base pin");
-        let frozen_snapshot_id = pin.get(&base_ref).expect("pinned base snapshot");
-        let connector_context = crate::connector::test_request_context();
-        let overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-            &env.state,
-            &connector_context,
-            &base_refs,
-            &pin,
-            &BTreeMap::new(),
-        )
-        .expect("freeze base overlay before connector replacement");
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice")
-            .expect("connector instance id");
-        let original_incarnation =
-            novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-                env.state.connector_control.as_ref(),
-                &instance_id,
-            )
-            .expect("acquire original connector generation")
-            .binding()
-            .incarnation();
-
-        crate::engine::retire_iceberg_control_binding(&env.state, "ice")
-            .expect("retire original connector generation");
-        crate::engine::register_iceberg_control_binding(&env.state, "ice")
-            .expect("register replacement connector generation");
-        let replacement_incarnation =
-            novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-                env.state.connector_control.as_ref(),
-                &instance_id,
-            )
-            .expect("acquire replacement connector generation")
-            .binding()
-            .incarnation();
-        assert_ne!(replacement_incarnation, original_incarnation);
-
-        let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
-        let catalog_service = crate::engine::catalog_service_snapshot(&env.state);
-        let materializer = crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-            None,
-            &catalog_service,
-            Arc::clone(&bindings),
-            crate::engine::query_stats::iceberg_table_binding_loader(
-                env.state.connector_control.as_ref(),
-                connector_context,
-            ),
-            overlays,
-        );
-        let resolved = materializer
-            .resolve_table_for_analysis(None, "sales", "orders")
-            .expect("materialize original frozen overlay");
-        let ScanSource::Sql(source) = resolved.planner.source else {
-            panic!("frozen overlay must resolve to an SQL scan source");
-        };
-        assert!(matches!(
-            source.kind,
-            SqlScanKind::FrozenInputSet {
-                version: SqlTableVersionSelector::Snapshot(snapshot_id),
-            } if snapshot_id == frozen_snapshot_id
-        ));
-        let lease = bindings
-            .exact_planning_lease(source.binding)
-            .expect("frozen overlay must retain planning lease");
-        assert_eq!(lease.binding().incarnation(), original_incarnation);
-        assert_ne!(lease.binding().incarnation(), replacement_incarnation);
-        let Some(materialization) = bindings
-            .scan_materialization(source.binding)
-            .expect("read frozen overlay materialization")
-        else {
-            panic!("frozen overlay must retain a connector read handle");
-        };
-        assert_eq!(
-            materialization.selector,
-            novarocks_spi::connector::ConnectorReadSelector::SnapshotId(frozen_snapshot_id)
-        );
-    }
-
-    fn create_mv_only(
-        state: &Arc<StandaloneState>,
-        current_catalog: Option<&str>,
-        current_db: &str,
-        mv_name: &str,
-    ) {
-        let stmt = parse_create_mv(&format!(
-            "CREATE MATERIALIZED VIEW {mv_name}
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders"
-        ));
-        create_iceberg_mv(state, current_catalog, current_db, &stmt).expect("create iceberg mv");
-    }
-
-    fn add_target_identity_partition_column(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        column: &str,
-    ) {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        crate::connector::iceberg::catalog::registry::alter_partition_spec(
-            &entry,
-            namespace,
-            table,
-            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-                table: crate::sql::parser::ast::ObjectName {
-                    parts: vec![
-                        catalog.to_string(),
-                        namespace.to_string(),
-                        table.to_string(),
-                    ],
-                },
-                field: crate::sql::parser::ast::IcebergPartitionFieldExpr::Identity {
-                    column: column.to_string(),
-                },
-            },
-        )
-        .expect("alter target partition spec");
-    }
-
-    fn sorted_base_field_ids(contract: &mv_schema::BaseContract) -> Vec<i32> {
-        contract
-            .schema_at_create
-            .fields
-            .iter()
-            .map(|field| field.field_id)
-            .collect::<Vec<_>>()
-    }
-
-    fn create_mv_with_select_only(
-        state: &Arc<StandaloneState>,
-        current_catalog: Option<&str>,
-        current_db: &str,
-        mv_name: &str,
-        select_sql: &str,
-    ) {
-        let stmt = parse_create_mv(&format!(
-            "CREATE MATERIALIZED VIEW {mv_name}
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS {select_sql}"
-        ));
-        create_iceberg_mv(state, current_catalog, current_db, &stmt).expect("create iceberg mv");
-    }
-
-    fn load_all_mv_refreshes(state: &Arc<StandaloneState>) -> Vec<StoredMvRefresh> {
-        let mut refreshes = state
-            .mv_repository
-            .list_refreshes()
-            .expect("list MV refreshes through repository port");
-        refreshes.sort_by_key(|refresh| refresh.refresh_id);
-        refreshes
-    }
-
-    fn single_int_chunk(values: &[i32]) -> Vec<novarocks_execution::exec::chunk::Chunk> {
-        let arrow_schema = StdArc::new(ArrowSchema::new(vec![Field::new(
-            "k",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![StdArc::new(Int32Array::from(values.to_vec()))],
-        )
-        .expect("record batch");
-        let chunk_schema_ref =
-            novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                &arrow_schema,
-                &[novarocks_types::SlotId(0)],
-            )
-            .expect("chunk schema");
-        vec![
-            novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema_ref),
-        ]
-    }
-
-    fn id_name_chunk(rows: &[(i32, &str)]) -> Vec<novarocks_execution::exec::chunk::Chunk> {
-        let arrow_schema = StdArc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new(HIDDEN_APPLY_KEY_COLUMN_NAME, DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                StdArc::new(Int32Array::from_iter_values(rows.iter().map(|(id, _)| *id))),
-                StdArc::new(StringArray::from_iter_values(
-                    rows.iter().map(|(_, name)| *name),
-                )),
-                StdArc::new(Int64Array::from_iter_values(
-                    rows.iter()
-                        .enumerate()
-                        .map(|(idx, _)| 1_000_i64 + idx as i64),
-                )),
-            ],
-        )
-        .expect("record batch");
-        let chunk_schema_ref =
-            novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                &arrow_schema,
-                &[
-                    novarocks_types::SlotId(0),
-                    novarocks_types::SlotId(1),
-                    novarocks_types::SlotId(2),
-                ],
-            )
-            .expect("chunk schema");
-        vec![
-            novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema_ref),
-        ]
-    }
-
-    #[test]
-    fn create_iceberg_mv_creates_branch_capable_v3_target() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load target table");
-        assert_eq!(
-            loaded.table.metadata().format_version(),
-            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
-        );
-        assert_eq!(
-            loaded
-                .table
-                .metadata()
-                .properties()
-                .get("write.row-lineage")
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            loaded
-                .table
-                .metadata()
-                .properties()
-                .get(APPLY_KEY_COLUMN_PROPERTY)
-                .map(String::as_str),
-            Some(HIDDEN_APPLY_KEY_COLUMN_NAME)
-        );
-        let fields = loaded
-            .table
-            .metadata()
-            .current_schema()
-            .as_struct()
-            .fields();
-        let apply_key_field = fields
-            .iter()
-            .find(|field| field.name == HIDDEN_APPLY_KEY_COLUMN_NAME)
-            .expect("target apply-key field");
-        assert_eq!(apply_key_field.id, 3);
-        assert!(apply_key_field.required);
-        assert_eq!(
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-                .expect("mv definition")
-                .schema_contract
-                .expect("schema contract")
-                .target
-                .hidden_apply_key
-                .target_field_id,
-            3
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_writes_descriptor_property_on_mv_table() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load MV table");
-        let descriptor =
-            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
-                .expect("descriptor properties");
-
-        assert_eq!(descriptor.descriptor_version, MV_DESCRIPTOR_VERSION);
-        assert_eq!(descriptor.package_id, "analytics.mv_orders");
-        assert_eq!(
-            descriptor.logical_sql,
-            "SELECT id, name FROM ice.sales.orders"
-        );
-        assert_eq!(descriptor.dialect, "starrocks");
-        assert_eq!(
-            descriptor.visible_columns,
-            vec!["id".to_string(), "name".to_string()]
-        );
-        assert_eq!(
-            descriptor.hidden_columns,
-            vec![HIDDEN_APPLY_KEY_COLUMN_NAME.to_string()]
-        );
-        assert_eq!(
-            descriptor.base_dependencies,
-            vec![DescriptorDependency {
-                catalog: "ice".to_string(),
-                namespace: "sales".to_string(),
-                name: "orders".to_string(),
-                object_type: "table".to_string(),
-                storage_engine: "iceberg".to_string(),
-            }]
-        );
-        // W2: CREATE now pushes the freshly-persisted schema contract into the
-        // MV table descriptor after the metadata transaction commits. Previously this field stayed
-        // `None` on the descriptor written at create_table time, because the
-        // contract needs the created target table's field-ids.
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_orders".to_string(),
-        };
-        let stored_definition = load_iceberg_mv_definition_by_target(&env.state, &target)
-            .expect("load stored mv definition");
-        assert_eq!(
-            descriptor.schema_contract_typed().expect("typed contract"),
-            stored_definition.schema_contract
-        );
-        assert!(descriptor.schema_contract_typed().unwrap().is_some());
-        assert_eq!(
-            descriptor.refresh_contract,
-            Some(serde_json::json!({
-                "policy": "DEFERRED_MANUAL",
-                "interval_ms": null,
-                "paused": false,
-            }))
-        );
-        assert!(descriptor.created_at_ms > 0);
-
-        let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
-        let missing_direct_target_err =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", &legacy_alias_name)
-                .expect_err("legacy alias target table must not exist");
-        assert!(
-            missing_direct_target_err.contains(&legacy_alias_name),
-            "{missing_direct_target_err}"
-        );
-    }
-
-    #[test]
-    fn iceberg_mv_reader_loads_target_table_without_alias() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let resolved = crate::connector::metadata_load_table(
-            env.state.connector_control.as_ref(),
-            crate::connector::test_request_context(),
-            "ice",
-            "analytics",
-            "mv_orders",
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )
-        .expect("read MV table by public name")
-        .0;
-        assert_eq!(resolved.table, "mv_orders");
-
-        let (schema_table, schema_id) = crate::connector::metadata_load_table(
-            env.state.connector_control.as_ref(),
-            crate::connector::test_request_context(),
-            "ice",
-            "analytics",
-            "mv_orders",
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )
-        .expect("read MV schema id by public name");
-        assert_eq!(schema_table.table, "mv_orders");
-        assert!(schema_id.is_some());
-
-        let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
-        let missing_schema_err = crate::connector::metadata_load_table(
-            env.state.connector_control.as_ref(),
-            crate::connector::test_request_context(),
-            "ice",
-            "analytics",
-            &legacy_alias_name,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )
-        .expect_err("legacy alias schema id must not resolve");
-        assert!(
-            missing_schema_err.contains(&legacy_alias_name) || missing_schema_err.contains("not"),
-            "{missing_schema_err}"
-        );
-
-        let missing_target_err = crate::connector::metadata_load_table(
-            env.state.connector_control.as_ref(),
-            crate::connector::test_request_context(),
-            "ice",
-            "analytics",
-            &legacy_alias_name,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )
-        .expect_err("legacy alias target must not resolve");
-        assert!(
-            missing_target_err.contains(&legacy_alias_name) || missing_target_err.contains("not"),
-            "{missing_target_err}"
-        );
-    }
-
-    fn discover_lake_packages_for_test(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-    ) -> Result<Vec<crate::mv::storage_observation::MvLakePackageObservation>, String> {
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
-            .map_err(|error| error.to_string())?;
-        crate::mv::storage_observation::discover_mv_lake_packages(
-            state.connector_control.as_ref(),
-            [instance_id],
-            state.mv_storage_observation.as_ref(),
-            crate::connector::test_request_context(),
-        )
-        .map(|packages| {
-            packages
-                .into_iter()
-                .filter(|package| {
-                    package.table.instance_id.as_str() == catalog
-                        && package.table.namespace.as_ref() == namespace
-                })
-                .collect()
-        })
-        .map_err(|error| error.to_string())
-    }
-
-    #[test]
-    fn discover_iceberg_mvs_recovers_single_table_descriptor_from_lake() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "analytics", "plain_orders");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let discovered = discover_lake_packages_for_test(&env.state, "ice", "analytics")
-            .expect("discover iceberg mvs");
-        assert_eq!(discovered.len(), 1);
-        assert_eq!(
-            discovered
-                .iter()
-                .map(|mv| mv.table.table.as_ref())
-                .collect::<Vec<_>>(),
-            vec!["mv_orders"]
-        );
-        let mv = &discovered[0];
-        assert_eq!(mv.table.instance_id.as_str(), "ice");
-        assert_eq!(mv.table.namespace.as_ref(), "analytics");
-        assert_eq!(mv.table.table.as_ref(), "mv_orders");
-        assert_eq!(mv.descriptor.package_id, "analytics.mv_orders");
-        assert_eq!(mv.descriptor.base_dependencies[0].name.as_str(), "orders");
-    }
-
-    #[test]
-    fn discover_iceberg_mvs_skips_legacy_namespace_names() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-        std::fs::create_dir_all(env._warehouse_dir.path().join("statistics-sqlt-deadbeef"))
-            .expect("create legacy Iceberg namespace directory");
-
-        let discovered = discover_lake_packages_for_test(&env.state, "ice", "analytics")
-            .expect("legacy namespace name must not abort MV lake discovery");
-        assert_eq!(discovered.len(), 1);
-        assert_eq!(discovered[0].table.table.as_ref(), "mv_orders");
-    }
-
-    /// Read the [`MvProvenanceV1`] carried by an MV table's current snapshot
-    /// summary, reloading the table fresh from the catalog. Returns `None` when
-    /// there is no current snapshot or the snapshot carries no provenance.
-    fn read_target_current_snapshot_provenance(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Option<MvProvenanceV1> {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        entry.invalidate_table_cache(namespace, table);
-        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
-            .expect("load target table for provenance read");
-        let current = loaded.table.metadata().current_snapshot()?;
-        MvProvenanceV1::from_snapshot_summary(current).expect("parse provenance from summary")
-    }
-
-    /// Current-snapshot id of an MV table (reloaded fresh from the catalog).
-    fn read_target_current_snapshot_id(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Option<i64> {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        entry.invalidate_table_cache(namespace, table);
-        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
-            .expect("load target table for snapshot id read");
-        loaded
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-    }
-
-    /// Count live data-file entries reachable from an MV table's current
-    /// snapshot. A data-free watermark append adds an empty manifest, so this
-    /// count is invariant across a net-zero refresh — a direct proxy for "the
-    /// MV's materialized data is unchanged" that avoids a full `SELECT *` round
-    /// trip through the pipeline.
-    fn live_target_data_file_count(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> usize {
-        let entry = {
-            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get(catalog).expect("catalog")
-        };
-        entry.invalidate_table_cache(namespace, table);
-        let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)
-            .expect("load target table for data-file count");
-        let table = loaded.into_table();
-        data_block_on(async {
-            let Some(current) = table.metadata().current_snapshot() else {
-                return 0usize;
-            };
-            let manifest_list = current
-                .load_manifest_list(table.file_io(), table.metadata())
-                .await
-                .expect("load manifest list");
-            let mut count = 0usize;
-            for entry in manifest_list.entries() {
-                let manifest = entry
-                    .load_manifest(table.file_io())
-                    .await
-                    .expect("load manifest");
-                for manifest_entry in manifest.entries() {
-                    if manifest_entry.is_alive()
-                        && manifest_entry.data_file().content_type()
-                            == novarocks_connector_iceberg::iceberg::spec::DataContentType::Data
-                    {
-                        count += 1;
-                    }
-                }
-            }
-            count
-        })
-        .expect("count live target data files")
-    }
-
-    /// Delete an MV definition through its port without dropping its lake table.
-    fn drop_mv_definition_from_sqlite_only(
-        state: &Arc<StandaloneState>,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) {
-        let dropped = state
-            .mv_repository
-            .drop_by_target(&MvTarget {
-                catalog: Some(catalog.to_string()),
-                database: namespace.to_string(),
-                name: table.to_string(),
-            })
-            .expect("drop mv definition");
-        assert!(dropped, "expected an existing mv definition to drop");
-    }
-
-    fn list_mv_dependency_names(
-        state: &Arc<StandaloneState>,
-        mv_id: i64,
-    ) -> Vec<(Option<String>, String, String)> {
-        state
-            .mv_repository
-            .list_dependencies_by_downstream(mv_id)
-            .expect("list dependencies")
-            .into_iter()
-            .map(|dep| {
-                (
-                    dep.upstream.catalog,
-                    dep.upstream.database_or_namespace,
-                    dep.upstream.name,
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn rebuild_imv_cache_from_lake_reappears_after_sqlite_definition_dropped() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        // Capture the created definition + its dependencies as the golden.
-        let before = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv definition present after create");
-        let before_deps = list_mv_dependency_names(&env.state, before.mv_id);
-
-        // Forget the MV in SQLite but keep its lake MV table + descriptor.
-        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "mv_orders");
-        assert!(
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders").is_none(),
-            "definition should be gone from SQLite after drop"
-        );
-
-        // Rebuild purely from the lake.
-        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
-            .expect("rebuild imv cache from lake");
-
-        // The definition reappears with matching select_sql / target / schema
-        // contract / watermark, and its base dependencies are restored.
-        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv definition reappears after rebuild");
-        assert_eq!(after.select_sql, before.select_sql);
-        assert_eq!(after.storage_engine, before.storage_engine);
-        assert_eq!(after.target_catalog, before.target_catalog);
-        assert_eq!(after.target_namespace, before.target_namespace);
-        assert_eq!(after.target_table, before.target_table);
-        assert_eq!(after.schema_contract, before.schema_contract);
-        assert_eq!(after.partition_spec, before.partition_spec);
-        assert_eq!(after.last_refresh_snapshots, before.last_refresh_snapshots);
-        assert_eq!(
-            after.last_refresh_table_uuids,
-            before.last_refresh_table_uuids
-        );
-        let after_deps = list_mv_dependency_names(&env.state, after.mv_id);
-        assert_eq!(after_deps, before_deps);
-        assert_eq!(
-            after_deps,
-            vec![(
-                Some("ice".to_string()),
-                "sales".to_string(),
-                "orders".to_string()
-            )]
-        );
-
-        // Idempotent: a second rebuild is a no-op (the MV is now a cache hit).
-        crate::engine::mv::lake_rebuild::rebuild_imv_cache_from_lake(&env.state)
-            .expect("second rebuild is a no-op");
-        let after_again = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv definition still present after idempotent rebuild");
-        assert_eq!(after_again.select_sql, after.select_sql);
-        assert_eq!(
-            list_mv_dependency_names(&env.state, after_again.mv_id),
-            after_deps
-        );
-    }
-
-    /// Read one string cell out of the W0 stateless-rebuild report chunk.
-    /// Returns `None` for a NULL cell (the hash columns are nullable).
-    fn stateless_report_cell(
-        result: &crate::runtime::query_result::QueryResult,
-        column: usize,
-    ) -> Option<String> {
-        let chunk = &result.chunks[0];
-        let array = chunk
-            .batch
-            .column(column)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("stateless report column is Utf8");
-        arrow::array::Array::is_valid(array, 0).then(|| array.value(0).to_string())
-    }
-
-    /// W0 `full` level: invoking the stateless-rebuild procedure at `full`
-    /// clears the MV's SQLite records and rebuilds them purely from the lake,
-    /// proving SQLite is a rebuildable cache (not just readable lake metadata as
-    /// `provenance` does). The report is `AvailableLevel=full`,
-    /// `RebuildSource=lake`, with non-null descriptor/provenance/waterline
-    /// hashes, and the MV's SQLite definition round-trips back to an equivalent
-    /// record.
-
-    /// W0 `full` level statelessness precondition: if the MV has no SQLite
-    /// definition to clear, there is nothing to prove a round-trip against, so
-    /// the probe fails loud rather than silently reporting `full`.
-    #[test]
-    fn stateless_rebuild_full_errors_when_no_sqlite_definition_to_clear() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-        // Forget the MV in SQLite (lake MV table stays), so `full` has no
-        // cached record to clear.
-        drop_mv_definition_from_sqlite_only(&env.state, "ice", "analytics", "mv_orders");
-
-        let req = crate::engine::mv::stateless_rebuild::ImvStatelessRebuildRequest {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            mv: "mv_orders".to_string(),
-            required_level: crate::engine::mv::stateless_rebuild::StatelessLevel::Full,
-        };
-        let err = crate::engine::mv::stateless_rebuild::execute_request(&env.state, &req)
-            .expect_err("full rebuild must fail with no SQLite definition to clear");
-        assert!(
-            err.contains("no repository definition to clear"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn create_writes_schema_contract_into_descriptor() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-        // Discover the MV descriptor straight off the MV table, the same way
-        // `discover_iceberg_mvs_recovers_single_table_descriptor_from_lake`
-        // does above.
-        let discovered = discover_lake_packages_for_test(&env.state, "ice", "analytics")
-            .expect("discover iceberg mvs");
-        assert_eq!(discovered.len(), 1);
-        let descriptor = &discovered[0].descriptor;
-
-        // Load the MV definition from the metadata store directly, to compare
-        // against what the descriptor carries.
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_orders".to_string(),
-        };
-        let stored_definition = load_iceberg_mv_definition_by_target(&env.state, &target)
-            .expect("load stored mv definition");
-
-        let descriptor_contract = descriptor
-            .schema_contract_typed()
-            .expect("parse typed schema contract from descriptor");
-
-        // The descriptor now carries the schema contract (not just `None`,
-        // and not merely "some arbitrary JSON") and it is byte-for-byte the
-        // same contract the CREATE path persisted into the metadata store.
-        assert!(descriptor_contract.is_some());
-        assert_eq!(descriptor_contract, stored_definition.schema_contract);
-    }
-
-    #[test]
-    fn discover_iceberg_mvs_rejects_descriptor_package_id_mismatch() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-        rewrite_mv_descriptor_package_id_for_test(
-            &env.state,
-            "ice",
-            "analytics",
-            "mv_orders",
-            "analytics.wrong_public_name",
-        )
-        .expect("rewrite descriptor package id");
-
-        let err = discover_lake_packages_for_test(&env.state, "ice", "analytics")
-            .expect_err("package id mismatch should fail discovery");
-        assert!(
-            err.contains("descriptor package id mismatch"),
-            "unexpected discovery error: {err}"
-        );
-        assert!(err.contains("analytics.mv_orders"), "err={err}");
-        assert!(err.contains("analytics.wrong_public_name"), "err={err}");
-    }
-
-    #[test]
-    fn alter_iceberg_mv_refresh_metadata_updates_descriptor_refresh_contract() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let set_refresh = parse_alter_mv(
-            "ALTER MATERIALIZED VIEW mv_orders SET REFRESH ASYNC EVERY INTERVAL 2 HOURS",
-        );
-        crate::engine::mv_flow::alter_mv(&env.state, Some("ice"), &env.current_db, &set_refresh)
-            .expect("alter refresh policy");
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load MV table after alter");
-        let descriptor =
-            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
-                .expect("descriptor after alter");
-        assert_eq!(
-            descriptor.refresh_contract,
-            Some(serde_json::json!({
-                "policy": "ASYNC_INTERVAL",
-                "interval_ms": 7_200_000,
-                "paused": false,
-            }))
-        );
-
-        let pause = parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders PAUSE REFRESH");
-        crate::engine::mv_flow::alter_mv(&env.state, Some("ice"), &env.current_db, &pause)
-            .expect("pause refresh");
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load MV table after pause");
-        let descriptor =
-            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
-                .expect("descriptor after pause");
-        assert_eq!(
-            descriptor.refresh_contract,
-            Some(serde_json::json!({
-                "policy": "ASYNC_INTERVAL",
-                "interval_ms": 7_200_000,
-                "paused": true,
-            }))
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_creates_partitioned_target_from_partition_by() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             PARTITION BY (bucket(id, 16), truncate(name, 8))
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load target table");
-        let spec = loaded.table.metadata().default_partition_spec();
-        assert_eq!(spec.spec_id(), 0);
-        let fields = spec.fields();
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].name, "id_bucket_16");
-        assert_eq!(fields[0].source_id, 1);
-        assert_eq!(
-            fields[0].transform,
-            novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(16)
-        );
-        assert_eq!(fields[1].name, "name_truncate_8");
-        assert_eq!(fields[1].source_id, 2);
-        assert_eq!(
-            fields[1].transform,
-            novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(8)
-        );
-        let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv definition");
-        let stored_partition = definition.partition_spec.expect("stored partition spec");
-        assert_eq!(stored_partition.target_spec_id, 0);
-        assert_eq!(stored_partition.fields.len(), 2);
-        let contract_partition = definition
-            .schema_contract
-            .expect("schema contract")
-            .target
-            .partition
-            .expect("target partition contract");
-        assert_eq!(contract_partition, stored_partition);
-    }
-
-    // Native FE/BE owner coverage: iceberg_ivm_projection_repartition.sql.
-
-    #[test]
-    fn replace_default_partition_spec_expected_default_rejects_external_spec_change() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "alfa")]);
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             PARTITION BY (bucket(id, 16))
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let before =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load target before external spec change");
-        let old_default_spec_id = before.table.metadata().default_partition_spec_id();
-        assert_eq!(
-            before.table.metadata().default_partition_spec().fields()[0].name,
-            "id_bucket_16"
-        );
-
-        let external_alter =
-            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (bucket(id, 8))");
-        let AlterMaterializedViewAction::Repartition(external_fields) = &external_alter.action
-        else {
-            panic!("expected external repartition action");
-        };
-        let externally_updated =
-            crate::connector::iceberg::catalog::registry::replace_default_partition_spec(
-                &entry,
-                "analytics",
-                "mv_orders",
-                external_fields,
-            )
-            .expect("replace default partition spec externally");
-        let external_default_spec_id = externally_updated.metadata().default_partition_spec_id();
-        assert_ne!(external_default_spec_id, old_default_spec_id);
-        assert_eq!(
-            externally_updated
-                .metadata()
-                .default_partition_spec()
-                .fields()[0]
-                .name,
-            "id_bucket_8"
-        );
-
-        let alter =
-            parse_alter_mv("ALTER MATERIALIZED VIEW mv_orders REPARTITION BY (truncate(name, 2))");
-        let AlterMaterializedViewAction::Repartition(fields) = &alter.action else {
-            panic!("expected repartition action");
-        };
-        let err = crate::connector::iceberg::catalog::registry::replace_default_partition_spec_with_expected_default(
-            &entry,
-            "analytics",
-            "mv_orders",
-            fields,
-            old_default_spec_id,
-        )
-        .expect_err("stale expected default spec id should reject replacement");
-        assert!(err.contains("expected default spec id"), "{err}");
-
-        let after =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load target after rejected replacement");
-        let after_spec = after.table.metadata().default_partition_spec();
-        assert_eq!(after_spec.spec_id(), external_default_spec_id);
-        assert_eq!(after_spec.fields().len(), 1);
-        assert_eq!(after_spec.fields()[0].name, "id_bucket_8");
-    }
-
-    #[test]
-    fn create_iceberg_aggregate_mv_persists_v3_group_row_id_contract() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_fact_region
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, count(*) AS c, sum(amount) AS s
-                FROM ice.sales.fact
-                GROUP BY region",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create aggregate iceberg mv");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_fact_region");
-        assert_eq!(
-            loaded
-                .table
-                .metadata()
-                .properties()
-                .get(HIDDEN_COLUMNS_PROPERTY)
-                .map(String::as_str),
-            Some("__agg_state_c,__agg_state_s")
-        );
-
-        let contract = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_region")
-            .expect("mv definition")
-            .schema_contract
-            .expect("schema contract");
-        assert_eq!(contract.contract_version, 3);
-        assert_eq!(
-            contract.target.hidden_apply_key.column_name,
-            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
-        );
-        assert_eq!(
-            contract.target.hidden_apply_key.source,
-            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
-        );
-        assert_eq!(contract.target.hidden_apply_key.target_field_id, 1);
-        assert_eq!(sorted_base_field_ids(&contract.base), vec![2, 3]);
-        assert_eq!(
-            contract.output.columns[2]
-                .expression
-                .referenced_base_field_ids,
-            vec![3]
-        );
-        let aggregate = contract.aggregate.expect("aggregate contract");
-        assert_eq!(aggregate.state_layout_version, 1);
-        assert_eq!(
-            aggregate.row_id_column_name,
-            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
-        );
-        assert_eq!(aggregate.state_columns.len(), 2);
-        assert_eq!(aggregate.state_columns[0].column_name, "__agg_state_c");
-        assert_eq!(aggregate.state_columns[0].target_field_id, 5);
-        assert_eq!(aggregate.state_columns[0].type_signature, "binary");
-        assert!(!aggregate.state_columns[0].nullable);
-        assert_eq!(
-            aggregate.state_columns[0].role,
-            mv_schema::AggregateStateRoleContract::Single
-        );
-        assert_eq!(aggregate.state_columns[1].column_name, "__agg_state_s");
-        assert_eq!(aggregate.state_columns[1].target_field_id, 6);
-        assert_eq!(aggregate.state_columns[1].type_signature, "binary");
-        assert!(!aggregate.state_columns[1].nullable);
-        assert_eq!(
-            aggregate.state_columns[1].role,
-            mv_schema::AggregateStateRoleContract::Single
-        );
-    }
-
-    #[test]
-    fn create_iceberg_join_aggregate_mv_persists_join_and_group_row_id_contract() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
-        create_aggregate_dim_table(&env.state, "ice", "sales", "dim");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_fact_dim
-             DISTRIBUTED BY HASH(category) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT d.category, sum(f.amount) AS total
-                FROM ice.sales.fact f JOIN ice.sales.dim d ON f.id = d.id
-                GROUP BY d.category",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create join aggregate iceberg mv");
-
-        let contract = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_dim")
-            .expect("mv definition")
-            .schema_contract
-            .expect("schema contract");
-        assert_eq!(contract.contract_version, 3);
-        assert_eq!(contract.bases.len(), 2);
-        assert!(contract.join.is_some());
-        assert!(contract.aggregate.is_some());
-        assert_eq!(
-            contract.target.hidden_apply_key.source,
-            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
-        );
-        assert_eq!(
-            contract.target.hidden_apply_key.column_name,
-            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
-        );
-
-        let fact_contract = contract
-            .bases
-            .iter()
-            .find(|base| base.table_fqn == "ice.sales.fact")
-            .expect("fact base contract");
-        let dim_contract = contract
-            .bases
-            .iter()
-            .find(|base| base.table_fqn == "ice.sales.dim")
-            .expect("dim base contract");
-        assert_eq!(fact_contract.alias_at_create.as_deref(), Some("f"));
-        assert_eq!(dim_contract.alias_at_create.as_deref(), Some("d"));
-        assert_eq!(sorted_base_field_ids(fact_contract), vec![1, 3]);
-        assert_eq!(sorted_base_field_ids(dim_contract), vec![1, 2]);
-        assert_eq!(
-            contract.join.as_ref().unwrap().predicates[0].left.table_fqn,
-            "ice.sales.fact"
-        );
-        assert_eq!(
-            contract.join.as_ref().unwrap().predicates[0].left.field_id,
-            1
-        );
-        assert_eq!(
-            contract.join.as_ref().unwrap().predicates[0]
-                .right
-                .table_fqn,
-            "ice.sales.dim"
-        );
-        assert_eq!(
-            contract.join.as_ref().unwrap().predicates[0].right.field_id,
-            1
-        );
-        assert_eq!(
-            contract.output.columns[1].expression.referenced_base_fields,
-            vec![mv_schema::QualifiedFieldLineage {
-                table_fqn: "ice.sales.fact".to_string(),
-                qualifier_at_create: "f".to_string(),
-                field_id: 3,
-            }]
-        );
-    }
-
-    #[test]
-    fn create_iceberg_union_all_aggregate_over_join_persists_composed_branch_contract() {
-        // P4.4: a HOMOGENEOUS composed branch-union shape — UNION ALL of
-        // `Agg(a JOIN b)` x 2 over the SAME bases — is now SUPPORTED at CREATE.
-        // The delta execution composes the branches off the full UNION ALL
-        // logical plan, so CREATE persists a BranchUnionAggregate contract and a
-        // target table carrying the apply-key + branch-id columns. The first
-        // branch is a join aggregate, so the schema contract carries the two-base
-        // join lineage from that branch (representative under homogeneity).
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_a");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_b");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_agg_join
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT a.region, count(*) AS c, sum(a.amount) AS s
-                FROM ice.sales.fact_a a JOIN ice.sales.fact_b b ON a.id = b.id
-                WHERE a.amount > 0
-                GROUP BY a.region
-                UNION ALL
-                SELECT a.region, count(*) AS c, sum(a.amount) AS s
-                FROM ice.sales.fact_a a JOIN ice.sales.fact_b b ON a.id = b.id
-                WHERE a.amount > 10
-                GROUP BY a.region",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("homogeneous composed branch-union aggregate-over-join must be created");
-
-        // The target table was created with the branch-id + apply-key columns.
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_union_agg_join");
-        let field_names = loaded
-            .table
-            .metadata()
-            .current_schema()
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| field.name.clone())
-            .collect::<Vec<_>>();
-        assert!(
-            field_names.iter().any(|name| name == BRANCH_ID_COLUMN_NAME),
-            "composed branch-union target must carry the branch-id column, got {field_names:?}"
-        );
-        // The aggregate apply key is the synthetic row-id column (BranchUtf8
-        // group-row identity), and the per-aggregate state columns are present.
-        assert!(
-            field_names
-                .iter()
-                .any(|name| { name == crate::mv::aggregate_state::mv_agg_state::ROW_ID_COLUMN }),
-            "composed branch-union aggregate target must carry the row-id apply key, got {field_names:?}"
-        );
-
-        // The persisted schema contract is a version-3 branch contract carrying
-        // the two-base join lineage + aggregate + branch sections.
-        let mv_definition =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_agg_join")
-                .expect("load mv definition");
-        let schema_contract = mv_definition
-            .schema_contract
-            .as_ref()
-            .expect("composed branch-union MV must persist a schema contract");
-        assert_eq!(schema_contract.contract_version, 3);
-        assert!(
-            schema_contract.aggregate.is_some(),
-            "composed branch-union contract must carry an aggregate section"
-        );
-        assert!(
-            schema_contract.join.is_some(),
-            "composed branch-union (join first branch) contract must carry a join section"
-        );
-        let branch = schema_contract
-            .branch
-            .as_ref()
-            .expect("composed branch-union contract must carry a branch section");
-        assert_eq!(branch.branch_count, 2);
-        assert_eq!(schema_contract.bases.len(), 2, "two join bases");
-    }
-
-    #[test]
-    fn create_iceberg_union_all_aggregate_over_join_rejects_heterogeneous_bases() {
-        // A composed `BranchScoped(GroupRowId)` UNION ALL whose branches join
-        // *different* base sets (branch0: a JOIN b, branch1: c JOIN d) is
-        // structurally heterogeneous and stays REJECTED: the homogeneity gate
-        // inside `derive_fragment_property` rejects it because first-branch-only
-        // persisted lineage cannot describe branch1's different bases. (The
-        // HOMOGENEOUS composed case — same bases in every branch — is now
-        // supported and persists a contract; see
-        // `create_iceberg_union_all_aggregate_over_join_persists_composed_branch_contract`.)
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_a");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_b");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_c");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_d");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_agg_join_het
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT a.region, count(*) AS c, sum(a.amount) AS s
-                FROM ice.sales.fact_a a JOIN ice.sales.fact_b b ON a.id = b.id
-                GROUP BY a.region
-                UNION ALL
-                SELECT c0.region, count(*) AS c, sum(c0.amount) AS s
-                FROM ice.sales.fact_c c0 JOIN ice.sales.fact_d d ON c0.id = d.id
-                GROUP BY c0.region",
-        );
-
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("heterogeneous-base composed UNION ALL aggregate must be rejected");
-        assert!(
-            err.contains("homogeneous") || err.contains("same base"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn create_iceberg_union_all_projection_mv_persists_branch_contract() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "sales", "returns");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders
-                UNION ALL
-                SELECT id, name FROM ice.sales.returns",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create projection/filter UNION ALL iceberg mv");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded = load_iceberg_mv_table(&entry, "analytics", "mv_union_orders");
-        let fields = loaded
-            .table
-            .metadata()
-            .current_schema()
-            .as_struct()
-            .fields();
-        let field_names = fields
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            field_names,
-            vec![
-                "id",
-                "name",
-                HIDDEN_APPLY_KEY_COLUMN_NAME,
-                BRANCH_ID_COLUMN_NAME
-            ]
-        );
-        let branch_field = fields
-            .iter()
-            .find(|field| field.name == BRANCH_ID_COLUMN_NAME)
-            .expect("branch id field");
-
-        let contract =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_orders")
-                .expect("mv definition")
-                .schema_contract
-                .expect("schema contract");
-        assert_eq!(contract.bases.len(), 2);
-        assert_eq!(
-            contract.target.hidden_apply_key.source,
-            crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId
-        );
-        assert_eq!(contract.target.hidden_apply_key.target_field_id, 3);
-        let branch = contract.branch.expect("branch contract");
-        assert_eq!(branch.branch_count, 2);
-        assert_eq!(
-            branch.inner_apply_key_source,
-            crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId
-        );
-        assert_eq!(branch.branch_id_column.column_name, BRANCH_ID_COLUMN_NAME);
-        assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
-    }
-
-    #[test]
-    fn plan_iceberg_mv_refresh_plans_union_all_projection_mv() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "sales", "returns");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders
-                UNION ALL
-                SELECT id, name FROM ice.sales.returns",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create projection/filter UNION ALL iceberg mv");
-
-        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
-        let target = crate::mv::model::MvTarget {
-            catalog: Some("ice".to_string()),
-            database: "analytics".to_string(),
-            name: "mv_union_orders".to_string(),
-        };
-        let plan =
-            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
-                .expect("projection/filter UNION ALL refresh planning");
-
-        assert_eq!(plan.contract.mode(), RefreshMode::Noop);
-        assert_eq!(
-            plan.contract
-                .base_refs
-                .iter()
-                .map(|base| format!("{}.{}.{}", base.catalog, base.namespace, base.table))
-                .collect::<Vec<_>>(),
-            vec![
-                "ice.sales.orders".to_string(),
-                "ice.sales.returns".to_string()
-            ]
-        );
-        assert_eq!(plan.contract.snapshot_pins.len(), 2);
-        assert_eq!(
-            plan.contract.snapshot_pins.get("ice.sales.orders").copied(),
-            Some(None)
-        );
-        assert_eq!(
-            plan.contract
-                .snapshot_pins
-                .get("ice.sales.returns")
-                .copied(),
-            Some(None)
-        );
-    }
-
-    #[test]
-    fn plan_iceberg_union_all_projection_rejects_uuid_without_snapshot_metadata() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "sales", "returns");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders
-                UNION ALL
-                SELECT id, name FROM ice.sales.returns",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create projection/filter UNION ALL iceberg mv");
-        seed_union_projection_uuid_only_refresh_metadata(
-            &env.state,
-            "ice",
-            "analytics",
-            "mv_union_orders",
-            "ice.sales.orders",
-        );
-
-        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
-        let target = crate::mv::model::MvTarget {
-            catalog: Some("ice".to_string()),
-            database: "analytics".to_string(),
-            name: "mv_union_orders".to_string(),
-        };
-        let err =
-            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
-                .expect_err("uuid-only previous metadata should be rejected during planning");
-
-        assert!(
-            err.message.contains("partial previous refresh metadata"),
-            "err={err:?}"
-        );
-        assert!(err.message.contains("recreate the MV"), "err={err:?}");
-    }
-
-    // Native FE/BE owner coverage: iceberg_ivm_union_projection_filter.sql.
-
-    #[test]
-    fn validate_aggregate_fan_in_base_refs_accepts_distinct_resolved_refs() {
-        // The validator no longer compares a classifier-derived fan-in base set
-        // against the resolved refs (that invariant is trivially satisfied now
-        // that the resolved refs ARE the fan-in base set). A distinct resolved
-        // base-ref set is accepted; per-base schema-contract checks live in
-        // `validate_aggregate_schema_contract_for_base`.
-        let base_refs = vec![
-            iceberg_ref("ice", "sales", "fact_east"),
-            iceberg_ref("ice", "sales", "fact_west"),
-        ];
-
-        validate_aggregate_fan_in_base_refs(&base_refs)
-            .expect("distinct resolved fan-in base refs must be accepted");
-    }
-
-    #[test]
-    fn validate_aggregate_fan_in_base_refs_rejects_duplicate_resolved_base() {
-        let base_refs = vec![
-            iceberg_ref("ice", "sales", "fact"),
-            iceberg_ref("ice", "sales", "fact"),
-        ];
-
-        let err = validate_aggregate_fan_in_base_refs(&base_refs)
-            .expect_err("duplicate resolved base refs should be rejected");
-
-        assert!(err.contains("duplicate resolved base ref"), "err={err}");
-        assert!(err.contains("ice.sales.fact"), "err={err}");
-    }
-
-    #[test]
-    fn create_iceberg_union_all_projection_mv_rejects_branch_id_output_alias() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "sales", "returns");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_branch_id
-             DISTRIBUTED BY HASH(__branch_id__) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id AS __branch_id__, name FROM ice.sales.orders
-                UNION ALL
-                SELECT id AS __branch_id__, name FROM ice.sales.returns",
-        );
-
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("UNION ALL branch id output alias should be rejected");
-        assert!(err.contains(BRANCH_ID_COLUMN_NAME), "err={err}");
-        assert!(err.contains("reserved"), "err={err}");
-
-        let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-        let entry = catalogs.get("ice").expect("catalog");
-        assert!(
-            crate::connector::iceberg::catalog::load_table(
-                &entry,
-                "analytics",
-                "mv_union_branch_id",
-            )
-            .is_err(),
-            "reserved-name failure must happen before target schema creation"
-        );
-    }
-
-    #[test]
-    fn build_iceberg_union_all_aggregate_schema_contract_includes_branch_contract() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_west");
-        let query = parse_select_query(
-            "SELECT region, count(*) AS c, sum(amount) AS s
-             FROM ice.sales.fact_east
-             GROUP BY region
-             UNION ALL
-             SELECT region, count(*) AS c, sum(amount) AS s
-             FROM ice.sales.fact_west
-             GROUP BY region",
-        );
-        let analysis = analyze_mv_select_with_connector_context(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            &query,
-            &crate::connector::test_request_context(),
-        )
-        .expect("analyze UNION ALL aggregate query");
-        let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
-            &env.state,
-            &analysis.resolved_refs,
-            now_ms(),
-        )
-        .expect("resolve dependencies");
-        let loaded_bases = resolved_dependencies
-            .base_refs
-            .iter()
-            .map(|base_ref| {
-                let loaded = load_current_iceberg_base_table(&env.state, base_ref)
-                    .expect("load current base table");
-                (base_ref.clone(), loaded)
-            })
-            .collect::<Vec<_>>();
-        // Source the first-branch aggregate calls from the AST (no classifier).
-        let first_branch_ast =
-            first_union_branch_ast_query(&query).expect("first branch ast query");
-        let first_branch_calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                &first_branch_ast,
-            )
-            .expect("first branch aggregate calls");
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_union_fact_region_contract".to_string(),
-        };
-        let mut columns = iceberg_aggregate_target_columns_from_resolved_query(
-            &first_branch_calls,
-            &analysis.output_columns,
-            first_union_branch_resolved_query(&analysis.resolved_query)
-                .expect("first branch resolved query"),
-        )
-        .expect("target columns");
-        columns.push(branch_id_table_column());
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        crate::connector::iceberg::catalog::registry::create_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-            &columns,
-            None,
-            &[],
-            &[
-                ("format-version".to_string(), "3".to_string()),
-                ("write.row-lineage".to_string(), "true".to_string()),
-                (
-                    APPLY_KEY_COLUMN_PROPERTY.to_string(),
-                    GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-                ),
-                (
-                    APPLY_KEY_SOURCE_PROPERTY.to_string(),
-                    ApplyKeySource::GroupRowId
-                        .table_property_value()
-                        .to_string(),
-                ),
-                (
-                    HIDDEN_COLUMNS_PROPERTY.to_string(),
-                    "__agg_state_c,__agg_state_s".to_string(),
-                ),
-            ],
-        )
-        .expect("create contract target table");
-        let loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        )
-        .expect("load union aggregate target table");
-        let target_observation =
-            target_observation_from_loaded_for_test(&target, &loaded).expect("target observation");
-        let actual_apply_key_field_id =
-            target_field_id_by_column(&target_observation, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME)
-                .expect("apply-key field");
-
-        let refresh_contract = derive_imv_refresh_contract(&analysis).expect("refresh contract");
-        let property =
-            derive_fragment_property(&analysis.resolved_query).expect("fragment property");
-        let contract = build_iceberg_mv_schema_contract(
-            &refresh_contract,
-            &property,
-            &query,
-            &analysis,
-            &resolved_dependencies.base_refs,
-            &observe_base_fields_for_refs(
-                &env.state,
-                &resolved_dependencies.base_refs,
-                &crate::connector::test_request_context(),
-            )
-            .expect("base field observations"),
-            &target,
-            &target_observation,
-            actual_apply_key_field_id,
-        )
-        .expect("schema contract");
-        assert_eq!(
-            loaded
-                .table
-                .metadata()
-                .properties()
-                .get(HIDDEN_COLUMNS_PROPERTY)
-                .map(String::as_str),
-            Some("__agg_state_c,__agg_state_s")
-        );
-        let fields = loaded
-            .table
-            .metadata()
-            .current_schema()
-            .as_struct()
-            .fields();
-        let field_names = fields
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
-        let branch_field = fields
-            .iter()
-            .find(|field| field.name == BRANCH_ID_COLUMN_NAME)
-            .expect("branch id field");
-        assert_eq!(
-            field_names,
-            vec![
-                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                "region",
-                "c",
-                "s",
-                "__agg_state_c",
-                "__agg_state_s",
-                BRANCH_ID_COLUMN_NAME
-            ]
-        );
-
-        assert_eq!(
-            contract.target.hidden_apply_key.source,
-            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
-        );
-        assert!(contract.aggregate.is_some());
-        let branch = contract.branch.expect("branch contract");
-        assert_eq!(branch.branch_count, 2);
-        assert_eq!(
-            branch.inner_apply_key_source,
-            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
-        );
-        assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
-    }
-
-    // A fan-in aggregate over the SAME physical table more than once
-    // (`FROM (SELECT .. FROM t UNION ALL SELECT .. FROM t) GROUP BY ..`) dedups
-    // to a single resolved base. After de-classifying the CREATE schema-contract
-    // builders (R6), the degenerate fan-in must still be rejected at CREATE. It
-    // is rejected upstream of the schema-contract builder, by the capability
-    // property's `validate_distinct_base_ref_arity` (which requires the distinct
-    // base count to equal the fan-in branch count), so the de-classification
-    // did not regress this guard. This end-to-end `create_iceberg_mv` test pins
-    // that rejection (the `refresh_contract` unit suite covers the in-isolation
-    // `derive_imv_refresh_contract` path).
-    #[test]
-    fn create_iceberg_mv_rejects_fan_in_aggregate_over_same_table_twice() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_fan_in_same_table
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, sum(amount) AS s
-                FROM (
-                    SELECT region, amount FROM ice.sales.fact
-                    UNION ALL
-                    SELECT region, amount FROM ice.sales.fact
-                ) u
-                GROUP BY region",
-        );
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("fan-in over the same physical table twice must be rejected at CREATE");
-        assert!(
-            err.contains("distinct Iceberg base table refs"),
-            "expected same-physical-table fan-in rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn plan_iceberg_mv_refresh_plans_aggregate_over_union_all_mv() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_east");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_west");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_union_fact_region
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, sum(amount) AS s
-                FROM (
-                    SELECT region, amount FROM ice.sales.fact_east
-                    UNION ALL
-                    SELECT region, amount FROM ice.sales.fact_west
-                ) u
-                GROUP BY region",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create aggregate-over-UNION-ALL iceberg mv");
-
-        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_fact_region");
-        let target = crate::mv::model::MvTarget {
-            catalog: Some("ice".to_string()),
-            database: "analytics".to_string(),
-            name: "mv_union_fact_region".to_string(),
-        };
-        let plan =
-            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
-                .expect("aggregate-over-UNION-ALL refresh planning");
-
-        assert_eq!(plan.contract.mode(), RefreshMode::Noop);
-        assert_eq!(
-            plan.contract
-                .base_refs
-                .iter()
-                .map(|base| format!("{}.{}.{}", base.catalog, base.namespace, base.table))
-                .collect::<Vec<_>>(),
-            vec![
-                "ice.sales.fact_east".to_string(),
-                "ice.sales.fact_west".to_string()
-            ]
-        );
-        assert_eq!(plan.contract.snapshot_pins.len(), 2);
-        assert_eq!(
-            plan.contract
-                .snapshot_pins
-                .get("ice.sales.fact_east")
-                .copied(),
-            Some(None)
-        );
-        assert_eq!(
-            plan.contract
-                .snapshot_pins
-                .get("ice.sales.fact_west")
-                .copied(),
-            Some(None)
-        );
-    }
-
-    #[test]
-    fn iceberg_aggregate_target_columns_reject_duplicate_physical_names() {
-        let (shape, analysis) = analyze_aggregate_fact_query(
-            "select region, sum(amount) as s, count(*) as __agg_state_s \
-             from ice.ns.fact group by region",
-        );
-
-        let err = iceberg_aggregate_target_columns(&shape, &analysis)
-            .expect_err("duplicate aggregate physical column names should be rejected");
-        assert!(
-            err.contains("aggregate MV physical column name collision"),
-            "err={err}"
-        );
-        assert!(err.contains("__agg_state_s"), "err={err}");
-    }
-
-    #[test]
-    fn union_branch_inner_apply_key_maps_kind_to_source() {
-        use crate::sql::planner::vocabulary::ApplyKeySource;
-
-        assert_eq!(
-            union_branch_inner_apply_key(UnionBranchKind::Aggregate),
-            ApplyKeySource::GroupRowId
-        );
-        assert_eq!(
-            union_branch_inner_apply_key(UnionBranchKind::ProjectionFilter),
-            ApplyKeySource::BaseRowId
-        );
-    }
-
-    #[test]
-    fn create_iceberg_aggregate_mv_rejects_primary_key() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_fact_region
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PRIMARY KEY (region)
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, count(*) AS c
-                FROM ice.sales.fact
-                GROUP BY region",
-        );
-
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("aggregate primary key should be rejected");
-        assert!(
-            err.contains("iceberg-backed aggregate materialized views do not support PRIMARY KEY"),
-            "err={err}"
-        );
-    }
-
-    #[test]
-    fn iceberg_aggregate_mv_with_min_max_int64_passes_validation() {
-        // DDL-time MIN/MAX rejection has been removed. Detail-map state
-        // runtime support allows creating an aggregate MV containing
-        // MIN(int64_col) and MAX(int64_col) end-to-end.
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_fact_region
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, min(amount) AS min_amount, max(amount) AS max_amount
-                FROM ice.sales.fact
-                GROUP BY region",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("MIN/MAX on int64 column should be accepted");
-
-        // Verify the resulting layout has Map<Int64, Int64> state columns
-        // for both MIN and MAX (the visible scalar SQL type is BigInt, but
-        // the physical state column stores a value-count detail map).
-        let contract = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_region")
-            .expect("mv definition")
-            .schema_contract
-            .expect("schema contract");
-        let aggregate = contract.aggregate.expect("aggregate contract");
-        // Two MIN/MAX state columns plus one retraction-count state column
-        // (no explicit COUNT(*) in the shape — see
-        // `aggregate_shape_needs_retraction_count_state`).
-        assert_eq!(
-            aggregate.state_columns.len(),
-            3,
-            "unexpected state column layout: {:?}",
-            aggregate
-                .state_columns
-                .iter()
-                .map(|c| c.column_name.clone())
-                .collect::<Vec<_>>()
-        );
-        let by_name: std::collections::HashMap<&str, &str> = aggregate
-            .state_columns
-            .iter()
-            .map(|c| (c.column_name.as_str(), c.type_signature.as_str()))
-            .collect();
-        assert_eq!(
-            by_name.get("__agg_state_min_amount").copied(),
-            Some("binary")
-        );
-        assert_eq!(
-            by_name.get("__agg_state_max_amount").copied(),
-            Some("binary")
-        );
-    }
-
-    #[test]
-    fn iceberg_aggregate_mv_with_min_max_combined_with_others_passes_validation() {
-        // MIN/MAX coexists with SUM/COUNT/AVG aggregate VARBINARY states.
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_fact_mix
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region,
-                       min(amount) AS min_amount,
-                       max(region) AS max_region,
-                       sum(amount) AS sum_amount,
-                       count(*) AS row_count,
-                       avg(amount) AS avg_amount
-                FROM ice.sales.fact
-                GROUP BY region",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("mixed aggregate MV with MIN/MAX should be accepted post-Phase-5");
-
-        let contract = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fact_mix")
-            .expect("mv definition")
-            .schema_contract
-            .expect("schema contract");
-        let aggregate = contract.aggregate.expect("aggregate contract");
-        // One opaque VARBINARY state column per aggregate.
-        assert_eq!(
-            aggregate.state_columns.len(),
-            5,
-            "unexpected state column layout: {:?}",
-            aggregate
-                .state_columns
-                .iter()
-                .map(|c| c.column_name.clone())
-                .collect::<Vec<_>>()
-        );
-        let by_name: std::collections::HashMap<&str, &str> = aggregate
-            .state_columns
-            .iter()
-            .map(|c| (c.column_name.as_str(), c.type_signature.as_str()))
-            .collect();
-        assert_eq!(
-            by_name.get("__agg_state_min_amount").copied(),
-            Some("binary")
-        );
-        assert_eq!(
-            by_name.get("__agg_state_max_region").copied(),
-            Some("binary")
-        );
-        assert_eq!(
-            by_name.get("__agg_state_sum_amount").copied(),
-            Some("binary")
-        );
-        assert_eq!(
-            by_name.get("__agg_state_row_count").copied(),
-            Some("binary")
-        );
-        assert_eq!(
-            by_name.get("__agg_state_avg_amount").copied(),
-            Some("binary")
-        );
-    }
-
-    #[test]
-    fn iceberg_aggregate_mv_with_min_float_is_accepted() {
-        // IVM-P5 Float follow-up: Float MIN/MAX is now supported in
-        // detail-state aggregate IMVs. NaN handling lives in three sites:
-        // `scalar_keys_equal` (NaN == NaN), `sort_map_entries_by_key`
-        // (NaN sorts to end), and `derive_visible_from_detail_map` (skips
-        // NaN keys — matches SQL standard "ignore NaN in MIN/MAX").
-        // This replaces the previous MIN/MAX rejection test.
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table_with_float(&env.state, "ice", "sales", "fact_float");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_fact_float
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, min(price) AS min_price
-                FROM ice.sales.fact_float
-                GROUP BY region",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("Float MIN/MAX should now be accepted at the validator layer");
-    }
-
-    #[test]
-    fn create_iceberg_mv_uses_current_catalog_target_without_starrocks_table_row() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        crate::engine::mv_flow::create_mv(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            &stmt,
-            &crate::connector::test_request_context(),
-        )
-        .expect("create iceberg mv through ddl");
-
-        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv relationship");
-        assert_eq!(mv.select_sql, "SELECT id, name FROM ice.sales.orders");
-        assert_eq!(mv.target_catalog.as_deref(), Some("ice"));
-        assert_eq!(mv.target_namespace.as_deref(), Some("analytics"));
-        assert_eq!(mv.target_table.as_deref(), Some("mv_orders"));
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-            .expect("target table");
-        let catalog = env
-            .state
-            .catalog_service
-            .local()
-            .read()
-            .expect("standalone catalog");
-        assert!(
-            catalog.get("analytics", "mv_orders").is_err(),
-            "provider MV targets must not leak into the process-wide planner catalog"
-        );
-    }
-
-    // Native FE/BE owner coverage: iceberg_backed_mv_basic_lifecycle.sql,
-    // iceberg_ivm_union_projection_filter.sql,
-    // iceberg_ivm_fan_in_aggregate_union.sql,
-    // iceberg_ivm_aggregate_cross_join.sql,
-    // iceberg_ivm_branch_union_aggregate.sql, iceberg_ivm_join_aggregate.sql,
-    // and iceberg_ivm_projection_repartition.sql. Core retains only
-    // contract-level unit tests.
-
-    // Native FE/BE owner coverage: iceberg_ivm_aggregate_cross_join.sql.
-
-    // Native FE/BE owner coverage: iceberg_ivm_a11_base_rename_referenced.sql.
-    // The provider-visible rename plus refresh lifecycle cannot be represented
-    // by the Core in-process executor after SQLX-2.
-
-    /// W5 external-interop contract for the current single-table lake-native
-    /// MV model: external engines read the MV Iceberg table itself. The table
-    /// physically carries NovaRocks internal columns, while the descriptor
-    /// records which columns form the public read surface.
-    #[test]
-    fn mv_table_descriptor_separates_external_visible_columns_from_hidden_columns() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("load MV table by visible target name");
-        let field_names = loaded
-            .table
-            .metadata()
-            .current_schema()
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
-        assert!(field_names.contains(&"id"), "{field_names:?}");
-        assert!(field_names.contains(&"name"), "{field_names:?}");
-        assert!(
-            field_names.contains(&HIDDEN_APPLY_KEY_COLUMN_NAME),
-            "{field_names:?}"
-        );
-
-        let descriptor =
-            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
-                .expect("descriptor properties");
-        assert_eq!(descriptor.package_id, "analytics.mv_orders");
-        assert_eq!(
-            descriptor.visible_columns,
-            vec!["id".to_string(), "name".to_string()]
-        );
-        assert_eq!(
-            descriptor.hidden_columns,
-            vec![HIDDEN_APPLY_KEY_COLUMN_NAME.to_string()]
-        );
-        for hidden in &descriptor.hidden_columns {
-            assert!(
-                !descriptor.visible_columns.contains(hidden),
-                "hidden column `{hidden}` must not be part of the external visible-column contract"
-            );
-        }
-    }
-
-    #[test]
-    fn create_iceberg_mv_treats_legacy_prefixed_visible_name_as_target_name() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let visible_name = ["__nr", "_mv_", "visible_name"].concat();
-        let stmt = parse_create_mv(&format!(
-            "CREATE MATERIALIZED VIEW {visible_name}
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders"
-        ));
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("legacy-shaped prefix is no longer reserved");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", &visible_name)
-                .expect("load MV table by visible target name");
-        let descriptor =
-            MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
-                .expect("descriptor properties");
-        assert_eq!(descriptor.package_id, format!("analytics.{visible_name}"));
-
-        let doubled_legacy_name = ["__nr", "_mv_", &visible_name].concat();
-        let doubled_err = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            &doubled_legacy_name,
-        )
-        .expect_err("doubled legacy-style target table must not exist");
-        assert!(doubled_err.contains(&doubled_legacy_name), "{doubled_err}");
-    }
-
-    #[test]
-    fn create_iceberg_mv_resolves_unqualified_base_in_current_catalog() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "analytics", "orders");
-
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM orders",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg mv");
-
-        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv relationship");
-        assert_eq!(mv.base_table_refs.len(), 1);
-        assert_eq!(mv.base_table_refs[0], "ice.analytics.orders");
-    }
-
-    #[test]
-    fn drop_iceberg_mv_drops_target_table_and_relationship() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
-
-        let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv definition before drop");
-        let mv_id = definition.mv_id;
-        assert!(!list_mv_dependency_names(&env.state, mv_id).is_empty());
-
-        let stmt = parse_drop_mv("DROP MATERIALIZED VIEW mv_orders");
-        drop_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt).expect("drop mv");
-
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("read metadata");
-        assert!(
-            env.state
-                .mv_repository
-                .load_by_id(mv_id)
-                .expect("load definition")
-                .is_none()
-        );
-        assert!(
-            env.state
-                .mv_repository
-                .list_dependencies_by_downstream(mv_id)
-                .expect("list dependencies")
-                .is_empty()
-        );
-        assert!(
-            env.state
-                .mv_repository
-                .list_partition_states(mv_id)
-                .expect("list partition states")
-                .is_empty()
-        );
-        drop(read);
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        assert!(
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders",)
-                .is_err()
-        );
-        assert!(find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders").is_none());
-        let catalog = env
-            .state
-            .catalog_service
-            .local()
-            .read()
-            .expect("standalone catalog");
-        assert!(catalog.get("analytics", "mv_orders").is_err());
-    }
-
-    #[test]
-    fn drop_iceberg_mv_rejects_active_refresh_before_external_drop() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
-
-        let mv_id = {
-            let provider = env
-                .state
-                .metadata_provider
-                .as_ref()
-                .expect("metadata provider");
-            let read = provider.begin_read().expect("open read txn");
-            env.state
-                .mv_repository
-                .find_by_target(&MvTarget {
-                    catalog: Some("ice".to_string()),
-                    database: "analytics".to_string(),
-                    name: "mv_orders".to_string(),
-                })
-                .expect("find mv target")
-                .expect("mv definition")
-                .mv_id
-        };
-        {
-            let provider = env
-                .state
-                .metadata_provider
-                .as_ref()
-                .expect("metadata provider");
-            let mut txn = provider
-                .begin_write("begin active mv refresh")
-                .expect("write");
-            env.state
-                .mv_repository
-                .begin_refresh_intent(mv_id, std::collections::BTreeMap::new())
-                .expect("begin refresh");
-            txn.commit().expect("commit refresh intent");
-        }
-
-        let stmt = parse_drop_mv("DROP MATERIALIZED VIEW mv_orders");
-        let err = drop_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("active refresh should block drop before external table drop");
-        assert!(err.contains("refresh in progress"), "err={err}");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-            .expect("target table should remain after rejected drop");
-        assert!(find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders").is_some());
-    }
-
-    #[test]
-    fn create_iceberg_mv_rejects_existing_target_table() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "analytics", "mv_orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("existing target should fail");
-        assert_eq!(
-            err,
-            "Iceberg MV target table ice.analytics.mv_orders already exists"
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_post_create_failure_drops_target_table() {
-        let env = open_test_state_with_iceberg_catalog_without_metadata("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        // The typed repository availability check runs before target creation.
-        // With no StateStore repository attached to the test state, we fail
-        // fast and the Iceberg target table is never created — so there is
-        // nothing to clean up.
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("missing StateStore repository should fail before target create");
-        assert!(
-            err.contains("materialized view service requires [state_store]"),
-            "err={err}"
-        );
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        assert!(
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders",)
-                .is_err(),
-            "target table should never have been created"
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_target_preflight_failure_leaves_no_repository_metadata() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let blocked_target = env
-            ._warehouse_dir
-            .path()
-            .join("analytics")
-            .join("mv_orders");
-        std::fs::write(&blocked_target, b"not a directory")
-            .expect("block target table directory creation");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("target create must fail");
-        let canonical_warehouse = env
-            ._warehouse_dir
-            .path()
-            .canonicalize()
-            .expect("canonical warehouse path");
-        let metadata_location = format!(
-            "file://{}/analytics/mv_orders/metadata/v1.metadata.json",
-            canonical_warehouse.display()
-        );
-        assert!(
-            err.contains("read iceberg metadata dir")
-                && err.contains("/analytics/mv_orders/metadata failed")
-                && err.contains("Not a directory"),
-            "unexpected target preflight error for {metadata_location}: {err}"
-        );
-        assert!(blocked_target.is_file());
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("repository read");
-        assert!(
-            env.state
-                .mv_repository
-                .list_definitions()
-                .expect("definitions")
-                .is_empty(),
-            "target creation fails before repository persistence"
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_target_inspection_failure_cleans_target_and_metadata() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let hook_entry = entry.clone();
-        let _after_create_hook = AfterCreateTargetHookGuard::install(Arc::new(move || {
-            hook_entry.poison_table_cache_for_test();
-        }));
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("post-create target inspection must fail");
-        assert_eq!(
-            err,
-            "Internal: table cache lock: poisoned lock: another task failed inside; target cleanup=Ok(())"
-        );
-        assert!(
-            !env._warehouse_dir
-                .path()
-                .join("analytics")
-                .join("mv_orders")
-                .exists(),
-            "inspection failure must clean the created target"
-        );
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("repository read");
-        assert!(
-            env.state
-                .mv_repository
-                .list_definitions()
-                .expect("definitions")
-                .is_empty(),
-            "inspection fails before repository persistence"
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_characterizes_successful_boundary_artifacts() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let definition_loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let _definition_load_guard =
-            DefinitionLoadCounterGuard::install(Arc::clone(&definition_loads));
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create iceberg MV");
-
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        let target =
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-                .expect("created and inspected target");
-        let bootstrap = target
-            .table
-            .metadata()
-            .current_snapshot()
-            .expect("CREATE MV must establish a provider-owned empty snapshot");
-        assert!(
-            bootstrap.parent_snapshot_id().is_none(),
-            "the MV bootstrap snapshot must be the target table's first snapshot"
-        );
-        assert_eq!(
-            bootstrap
-                .summary()
-                .additional_properties
-                .get("novarocks.mv.bootstrap")
-                .map(String::as_str),
-            Some("true"),
-            "the bootstrap request properties must be committed by the provider"
-        );
-        assert!(
-            bootstrap
-                .summary()
-                .additional_properties
-                .contains_key("novarocks.bootstrap.empty.operation-id"),
-            "the provider must retain its idempotency marker on the bootstrap snapshot"
-        );
-        let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("repository definition");
-        assert!(definition.schema_contract.is_some());
-        assert_eq!(
-            definition_loads.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "descriptor sync must use the committed definition supplied by the application shell"
-        );
-        let descriptor =
-            MvDescriptorV1::from_storage_properties(target.table.metadata().properties())
-                .expect("synced descriptor");
-        assert_eq!(
-            descriptor.schema_contract_typed().expect("typed contract"),
-            definition.schema_contract
-        );
-        let provider = env
-            .state
-            .metadata_provider
-            .as_ref()
-            .expect("metadata provider");
-        let read = provider.begin_read().expect("repository read");
-        let dependencies = env
-            .state
-            .mv_repository
-            .list_dependencies_by_downstream(definition.mv_id)
-            .expect("repository dependencies");
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].upstream.display_name(), "ice.sales.orders");
-        assert!(
-            env.state
-                .catalog_service
-                .local()
-                .read()
-                .expect("local catalog")
-                .get("analytics", "mv_orders")
-                .is_err(),
-            "the provider target is resolved through a query-local binding, not a planner table"
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_repository_open_failure_cleans_created_target() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        let _failure = fail_next_mv_repository_command(TestMvRepositoryFailurePoint::Create);
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("repository write open must fail");
-        assert_eq!(
-            err,
-            "create iceberg MV repository metadata failed: test-only injected MV repository failure at Create; target cleanup=Ok(())"
-        );
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        assert!(
-            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders",)
-                .is_err(),
-            "known repository failure must clean the created target"
-        );
-        assert!(
-            env.state
-                .mv_repository
-                .list_definitions()
-                .expect("definitions")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_descriptor_sync_failure_retains_target_and_committed_metadata() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        let state_slot = Arc::new(std::sync::Mutex::new(None::<Arc<StandaloneState>>));
-        let hook_slot = Arc::clone(&state_slot);
-        let _after_create = after_next_mv_repository_create(Arc::new(move || {
-            let state = hook_slot
-                .lock()
-                .expect("state slot")
-                .as_ref()
-                .expect("test state installed")
-                .clone();
-            corrupt_mv_descriptor_for_test(&state, "ice", "analytics", "mv_orders")
-                .expect("corrupt descriptor after repository commit");
-        }));
-        *state_slot.lock().expect("state slot") = Some(Arc::clone(&env.state));
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("descriptor sync must fail after repository create");
-        assert!(
-            err.starts_with("[CommitKnownCommittedFinalizeFailed] Iceberg MV repository create committed but descriptor sync failed:"),
-            "unexpected error: {err}"
-        );
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-            .expect("descriptor sync failure must retain the committed target");
-        let definitions = env
-            .state
-            .mv_repository
-            .list_definitions()
-            .expect("definitions");
-        assert_eq!(
-            definitions.len(),
-            1,
-            "repository commit precedes descriptor sync"
-        );
-        assert_eq!(definitions[0].target_table.as_deref(), Some("mv_orders"));
-        assert_eq!(
-            env.state
-                .mv_repository
-                .list_dependencies_by_downstream(definitions[0].mv_id)
-                .expect("dependencies")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_catalog_register_failure_keeps_target_and_committed_metadata() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        let _failure = CatalogRegistrationFailureGuard::install(
-            "test-only injected catalog registration failure",
-        );
-        create_base_table(&env.state, "ice", "sales", "orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect_err("catalog register must fail");
-        assert_eq!(
-            err,
-            "[CommitKnownCommittedFinalizeFailed] Iceberg MV repository create committed but catalog registration failed: test-only injected catalog registration failure"
-        );
-        let entry = {
-            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
-            catalogs.get("ice").expect("catalog")
-        };
-        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
-            .expect("register failure occurs after target create and descriptor sync");
-        let definition = env
-            .state
-            .mv_repository
-            .find_by_target(&MvTarget {
-                catalog: Some("ice".to_string()),
-                database: "analytics".to_string(),
-                name: "mv_orders".to_string(),
-            })
-            .expect("definition lookup")
-            .expect("committed definition");
-        assert!(definition.schema_contract.is_some());
-        assert_eq!(
-            env.state
-                .mv_repository
-                .list_dependencies_by_downstream(definition.mv_id)
-                .expect("dependencies")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_if_not_exists_does_not_adopt_existing_target() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "analytics", "mv_orders");
-        register_iceberg_mv_target_in_catalog(
-            &env.state,
-            &IcebergMvTarget {
-                catalog: "ice".to_string(),
-                namespace: "analytics".to_string(),
-                table: "mv_orders".to_string(),
-            },
-        )
-        .expect("register existing target");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        let err = crate::engine::mv_flow::create_mv(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            &stmt,
-            &crate::connector::test_request_context(),
-        )
-        .expect_err("existing target should fail even with IF NOT EXISTS");
-        assert_eq!(
-            err,
-            "Iceberg MV target table ice.analytics.mv_orders already exists"
-        );
-    }
-
-    #[test]
-    fn create_iceberg_mv_requires_current_iceberg_catalog() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT id, name FROM ice.sales.orders",
-        );
-
-        for current_catalog in [None, Some("default_catalog")] {
-            let err = create_iceberg_mv(&env.state, current_catalog, &env.current_db, &stmt)
-                .expect_err("non-iceberg catalog should fail");
-            assert_eq!(
-                err,
-                "storage_engine='iceberg' requires current catalog to be an Iceberg catalog"
-            );
-        }
-    }
-
-    #[test]
-    fn plan_iceberg_mv_refresh_reports_unknown_for_join_mv() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "left_orders");
-        create_base_table(&env.state, "ice", "sales", "right_orders");
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_join_orders
-             DISTRIBUTED BY HASH(id) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT l.id, l.name
-                FROM ice.sales.left_orders l
-                JOIN ice.sales.right_orders r ON l.id = r.id",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create join iceberg mv");
-
-        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_join_orders");
-        let target = crate::mv::model::MvTarget {
-            catalog: Some("ice".to_string()),
-            database: "analytics".to_string(),
-            name: "mv_join_orders".to_string(),
-        };
-        let plan =
-            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
-                .expect("join refresh plan");
-
-        assert_eq!(
-            plan.contract.affected_partitions.not_derived_reason(),
-            Some("join MV affected partition planning is not implemented")
-        );
-    }
-
-    #[test]
-    fn plan_iceberg_mv_refresh_requires_a11_schema_contract() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table(&env.state, "ice", "sales", "orders");
-        create_base_table(&env.state, "ice", "analytics", "mv_orders");
-        env.state
-            .mv_repository
-            .create(
-                uuid::Uuid::new_v4(),
-                CreateMvRepositoryRequest {
-                    definition: CreateMvDefinitionRequest {
-                        select_sql: "SELECT id, name FROM ice.sales.orders".to_string(),
-                        base_table_refs: vec!["ice.sales.orders".to_string()],
-                        primary_key_columns: Vec::new(),
-                        storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
-                        target_catalog: Some("ice".to_string()),
-                        target_namespace: Some("analytics".to_string()),
-                        target_table: Some("mv_orders".to_string()),
-                        schema_contract: None,
-                        partition_spec: None,
-                        created_at_ms: now_ms(),
-                    },
-                    refresh: initial_refresh_configuration_for_create(
-                        &crate::mv::application::MvCreateRefreshPolicy::Manual,
-                    ),
-                    dependencies: Vec::new(),
-                },
-            )
-            .expect("create mv definition");
-
-        let stmt = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
-        let target = crate::mv::model::MvTarget {
-            catalog: Some("ice".to_string()),
-            database: "analytics".to_string(),
-            name: "mv_orders".to_string(),
-        };
-        let err = plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &stmt, target)
-            .expect_err("missing schema contract should fail");
-
-        assert!(
-            err.to_string().contains("missing A11 schema contract"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn change_stream_writer_result_override_is_test_thread_local() {
-        let _main_guard = install_imv_change_stream_execution_result_for_test(
-            imv_change_stream_writer_abort_result_for_test("main-thread abort"),
-        );
-
-        let worker_reason = std::thread::spawn(|| {
-            assert!(
-                take_imv_change_stream_execution_result_for_test().is_none(),
-                "worker must not observe another test thread's override"
-            );
-            let _worker_guard = install_imv_change_stream_execution_result_for_test(
-                imv_change_stream_writer_abort_result_for_test("worker-thread abort"),
-            );
-            take_imv_change_stream_execution_result_for_test()
-                .and_then(|result| result.write_abort)
-                .map(|abort| abort.reason)
-                .expect("worker override")
-        })
-        .join()
-        .expect("worker thread");
-
-        assert_eq!(worker_reason, "worker-thread abort");
-        let main_reason = take_imv_change_stream_execution_result_for_test()
-            .and_then(|result| result.write_abort)
-            .map(|abort| abort.reason)
-            .expect("main-thread override");
-        assert_eq!(main_reason, "main-thread abort");
-    }
-
-    /// Lake-native recovery: when `main` was moved to some OTHER snapshot (here
-    /// by an external writer with no MV marker) while a refresh's staging
-    /// branch is still off `main`'s lineage, the staged snapshot never
-    /// published, so recovery classifies it `Diverged` and rolls it back —
-    /// dropping the staging branch and aborting the ledger row — while leaving
-    /// the (externally advanced) `main` untouched. Fail-loud is reserved for
-    /// the narrower case where `main`'s current snapshot IS the staged snapshot
-    /// id but its marker does not match (see
-    /// `classify_staging_branch`); a divergent `main` is a rollback, not a
-    /// commit-unknown.
-
-    #[test]
-    fn build_iceberg_schema_maps_int_bigint_string() {
-        let cols = vec![
-            output_col("k", DataType::Int32, false),
-            output_col("v", DataType::Int64, true),
-            output_col("s", DataType::Utf8, true),
-        ];
-        let schema = build_iceberg_schema_from_outputs(&cols).expect("schema");
-        assert_eq!(schema.as_struct().fields().len(), 3);
-        assert_eq!(schema.as_struct().fields()[0].name, "k");
-        assert!(schema.as_struct().fields()[0].required);
-        assert_eq!(schema.as_struct().fields()[1].name, "v");
-        assert!(!schema.as_struct().fields()[1].required);
-        assert_eq!(schema.as_struct().fields()[2].name, "s");
-        assert!(!schema.as_struct().fields()[2].required);
-    }
-
-    #[test]
-    fn arrow_data_type_to_iceberg_rejects_unsupported_types() {
-        let err = arrow_data_type_to_iceberg_primitive(&DataType::Map(
-            std::sync::Arc::new(arrow::datatypes::Field::new(
-                "entries",
-                DataType::Struct(arrow::datatypes::Fields::empty()),
-                false,
-            )),
-            false,
-        ))
-        .unwrap_err();
-        assert!(err.to_lowercase().contains("unsupported"));
-    }
-
-    #[test]
-    fn arrow_decimal_negative_scale_is_rejected() {
-        let err = arrow_data_type_to_iceberg_primitive(&DataType::Decimal128(10, -2)).unwrap_err();
-        assert!(err.contains("negative scale"));
-    }
-
-    #[test]
-    fn arrow_int8_int16_promote_to_iceberg_int() {
-        use novarocks_connector_iceberg::iceberg::spec::PrimitiveType;
-        assert_eq!(
-            arrow_data_type_to_iceberg_primitive(&DataType::Int8).unwrap(),
-            PrimitiveType::Int
-        );
-        assert_eq!(
-            arrow_data_type_to_iceberg_primitive(&DataType::Int16).unwrap(),
-            PrimitiveType::Int
-        );
-    }
-
-    #[test]
-    fn arrow_decimal256_is_rejected() {
-        let err = arrow_data_type_to_iceberg_primitive(&DataType::Decimal256(40, 2)).unwrap_err();
-        assert!(err.contains("Decimal256"));
-    }
-
-    #[test]
-    fn arrow_fixed_size_binary_16_is_rejected() {
-        let err = arrow_data_type_to_iceberg_primitive(&DataType::FixedSizeBinary(16)).unwrap_err();
-        assert!(err.contains("LARGEINT"));
-    }
-    mod aggregate_apply_test_helpers {
-        use crate::mv::aggregate_state::mv_agg_state::{
-            AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
-        };
-        use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
-        use crate::mv::model::AggregateStateRole;
-        use crate::sql::mv_refresh::AggregateFunctionKind;
-        use arrow::datatypes::DataType;
-        use novarocks_catalog::schema::SqlType;
-
-        pub(super) fn count_layout(group_key: &str) -> AggregateMvLayout {
-            let row_id = starrocks_physical_column(
-                "__row_id__".to_string(),
-                SqlType::String,
-                false,
-                false,
-                true,
-            );
-            let group = starrocks_physical_column(
-                group_key.to_string(),
-                SqlType::String,
-                true,
-                true,
-                false,
-            );
-            let counter =
-                starrocks_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
-            let state = starrocks_physical_column(
-                "__agg_state_c".to_string(),
-                SqlType::BigInt,
-                false,
-                false,
-                false,
-            );
-            AggregateMvLayout {
-                row_id_column: row_id.clone(),
-                visible_columns: vec![
-                    AggregateVisibleColumn {
-                        name: group_key.to_string(),
-                        data_type: DataType::Utf8,
-                        sql_type: SqlType::String,
-                        nullable: true,
-                        source_index: 0,
-                    },
-                    AggregateVisibleColumn {
-                        name: "c".to_string(),
-                        data_type: DataType::Int64,
-                        sql_type: SqlType::BigInt,
-                        nullable: false,
-                        source_index: 1,
-                    },
-                ],
-                state_columns: vec![AggregateStateColumn {
-                    name: "__agg_state_c".to_string(),
-                    data_type: DataType::Int64,
-                    sql_type: SqlType::BigInt,
-                    nullable: false,
-                    visible_source_index: 1,
-                    aggregate_index: 0,
-                    function: AggregateFunctionKind::Count,
-                    state_role: AggregateStateRole::Single,
-                    count_star: true,
-                }],
-                aggregate_input_types: vec![None],
-                group_key_source_indexes: vec![0],
-                physical_columns: vec![row_id, group, counter, state],
-            }
-        }
-    }
-
-    // Native FE/BE owner coverage: iceberg_ivm_optimize_replace_refresh.sql.
-    #[allow(dead_code)]
-    fn incremental_refresh_absorbs_optimize_replace_snapshot() {
-        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
-        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
-        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
-
-        let stmt = parse_create_mv(
-            "CREATE MATERIALIZED VIEW mv_fact
-             DISTRIBUTED BY HASH(region) BUCKETS 1
-             PROPERTIES('storage_engine'='iceberg')
-             AS SELECT region, count(*) AS c, sum(amount) AS s
-                FROM ice.sales.fact GROUP BY region",
-        );
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create incremental MV");
-        execute_iceberg_sql(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            "REFRESH MATERIALIZED VIEW mv_fact",
-        );
-
-        // Second append snapshot on the base, then rewrite the base table.
-        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 5)]);
-        let base_snapshot_id = read_target_current_snapshot_id(&env.state, "ice", "sales", "fact")
-            .expect("base snapshot before rewrite");
-        let target = crate::connector::iceberg::compact::WholeTableRewriteTarget {
-            catalog: "ice".to_string(),
-            namespace: "sales".to_string(),
-            table: "fact".to_string(),
-            base_snapshot_id,
-            job_id: None,
-        };
-        crate::connector::iceberg::compact::execute_whole_table_rewrite_for_target(
-            &env.state, &target,
-        )
-        .expect("rewrite base table");
-
-        // Third append after the replace snapshot, then refresh incrementally.
-        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(3, "east", 7)]);
-        execute_iceberg_sql(
-            &env.state,
-            Some("ice"),
-            &env.current_db,
-            "REFRESH MATERIALIZED VIEW mv_fact",
-        );
-
-        // Lineage walk previous -> current crossed the REPLACE snapshot; rows
-        // must reflect all three appends.
-        assert_aggregate_region_rows(
-            &env.state,
-            "ice",
-            &env.current_db,
-            "mv_fact",
-            &[("east", 2, 17), ("west", 1, 5)],
-        );
-    }
-}
-
-#[cfg(test)]
-mod imv_planning_catalog_tests {
-    use super::*;
-
-    // The test below exercises the correct API surface for
-    // build_iceberg_mv_planning_catalog. Full execution requires a
-    // StandaloneState with two real Iceberg catalog entries, which depends on
-    // the iceberg-rest Docker harness. Deferred to the iceberg-ivm SQL suite
-    // (Task 15). The #[ignore] keeps the test compilable and discoverable
-    // without requiring the harness in unit-test runs.
-    #[test]
-    #[ignore = "fixture deferred — covered by iceberg-ivm suite (Task 15)"]
-    fn build_iceberg_mv_planning_catalog_registers_each_base() {
-        // Planning-catalog registration was a concrete provider fixture. The
-        // canonical compiler now receives tokenized, admission-frozen table
-        // facts; native Iceberg coverage belongs to the iceberg-ivm suite.
-        assert!(true);
-    }
-}
-
-#[cfg(test)]
-mod imv_pipeline_wiring_tests {
-    // Lib-level refresh smoke for the IMV pipeline wire-up.
-    //
-    // Reuses the same fixture obstacle as imv_planning_catalog_tests above:
-    // exercising refresh pipeline wiring end-to-end requires a StandaloneState
-    // with real Iceberg catalog entries (driven by the iceberg-rest Docker
-    // harness). Deferred to the iceberg-ivm SQL suite.
-    #[test]
-    #[ignore = "fixture deferred — covered by iceberg-ivm suite (Task 15)"]
-    fn projection_filter_refresh_through_imv_pipeline_matches_baseline() {
-        unimplemented!(
-            "inline an existing ProjectionFilter refresh fixture and assert row equality"
-        )
-    }
 }

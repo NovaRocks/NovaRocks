@@ -27,7 +27,6 @@ doctest = false
 novarocks-catalog = { path = "../catalog" }
 novarocks-execution = { path = "../execution" }
 novarocks-fs = { path = "../fs" }
-novarocks-connector-iceberg = { path = "../connector/iceberg" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 novarocks-types = { path = "../types" }
@@ -102,6 +101,7 @@ tdigest = { version = "0.2.3", features = ["use_serde"] }
 [dev-dependencies]
 tempfile = "3"
 mockito = "1"
+opendal = { version = "0.55", features = ["services-fs"] }
 
 [features]
 foundationdb-provider = ["novarocks-state-store/foundationdb-provider"]

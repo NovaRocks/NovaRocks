@@ -19,13 +19,13 @@
 //! `summary.additional_properties`.
 //!
 //! [`MvProvenanceV1`] is a superset of the narrow
-//! [`crate::connector::iceberg::commit::mv_refresh_ref::MvRefreshSnapshotMarker`]:
+//! [`crate::commit::mv_refresh_ref::MvRefreshSnapshotMarker`]:
 //! it carries the same `refresh_id` / `mv_id` / `token` identity fields, plus
 //! the refresh technique, the per-base watermark (`from_snapshot` /
 //! `to_snapshot`), a definition fingerprint, and the resulting row count.
 //! [`MvProvenanceV1::to_summary_properties`] always emits the three narrow
 //! marker keys alongside the full record so that
-//! [`crate::connector::iceberg::commit::mv_refresh_ref::snapshot_matches_refresh_marker`]
+//! [`crate::commit::mv_refresh_ref::snapshot_matches_refresh_marker`]
 //! and W3b crash recovery keep working unchanged against a provenance-carrying
 //! snapshot.
 //!

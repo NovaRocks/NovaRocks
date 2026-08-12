@@ -44,8 +44,6 @@ mod row_delta_dv;
 mod row_delta_dv_from_files;
 pub mod row_delta_dv_metadata;
 mod row_mutation_activation;
-#[cfg(test)]
-mod row_mutation_parity_tests;
 mod row_mutation_preparation;
 mod run;
 mod selected_rewrite;
@@ -91,9 +89,10 @@ pub use rewrite_data_files::{
     LiveDataFileCompactionStats, current_live_data_file_compaction_stats,
 };
 pub use service::{
-    CleanupAttempt, CommitFailureKind, CommitRecoverySource, CommitServiceError,
-    CommitServiceOutcome, RecoveryEvidence, classify_commit_error,
+    CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome,
+    classify_commit_error,
 };
+pub(crate) use service::RecoveryEvidence;
 pub use snapshot_lifecycle_helpers::{
     FileSet, build_dv_index, compute_live_snapshot_set, enumerate_files_for_snapshots,
     is_puffin_path, puffin_half_reference_protection,

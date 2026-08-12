@@ -23,9 +23,8 @@
 //! provider, so none of it names one.
 //!
 //! Provider semantics that used to be asserted through this encoder now live
-//! beside their implementation: static file and partition pruning in
-//! `crate::connector::iceberg::file_pruning`, and equality-key/delete-cost
-//! validation in `crate::connector::iceberg::planning`.
+//! beside the provider implementation; Core tests cover only the neutral scan
+//! contract encoded here.
 
 use std::collections::BTreeMap;
 

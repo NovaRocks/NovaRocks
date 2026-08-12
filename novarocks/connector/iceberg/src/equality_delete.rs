@@ -89,10 +89,8 @@ pub fn load_equality_delete_sets_with_context(
     Ok(sets)
 }
 
-/// Construct a provider equality-delete set from batches decoded by a
-/// legacy Core-only reader.  This is intentionally conversion-only: legacy
-/// IVM reverse projection retains its own physical I/O until it is moved.
-pub fn equality_delete_set_from_record_batches<I>(
+/// Construct a provider equality-delete set from provider-decoded batches.
+fn equality_delete_set_from_record_batches<I>(
     path: &str,
     batches: I,
 ) -> Result<EqualityDeleteSet, String>

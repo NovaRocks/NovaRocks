@@ -469,16 +469,11 @@ where
 {
     let optimizer_query_mem_limit_bytes = config.runtime.optimizer_query_mem_limit_bytes;
     let connector_control_factories = compose_frontend_control_factories(&config, runtime.clone())?;
-    let connector_file_planning_resources = Some(compose_connector_file_planning_resources(
-        &config,
-        runtime.clone(),
-    )?);
     let frontend_config = FrontendServerConfig {
         config: config.clone(),
         config_path: config_path.clone(),
         port_override,
         connector_control_factories,
-        connector_file_planning_resources,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_host_config: state_store_host_config(&config),
     };
@@ -507,7 +502,6 @@ where
     let mut services = novarocks_frontend::standalone_open_services_for_server(
         &frontend,
         std::sync::Arc::clone(&frontend_config.mv_storage_observation),
-        frontend_config.connector_file_planning_resources.clone(),
     );
     services
         .backend_topology

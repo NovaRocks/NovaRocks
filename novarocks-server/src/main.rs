@@ -309,11 +309,6 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
             let state_store_host_config = composition::state_store_host_config(&cfg);
             let connector_control_factories =
                 composition::compose_frontend_control_factories(&cfg, runtime.handle().clone())?;
-            let connector_file_planning_resources =
-                Some(composition::compose_connector_file_planning_resources(
-                    &cfg,
-                    runtime.handle().clone(),
-                )?);
             runtime
                 .block_on(novarocks_frontend::run_frontend_server_until_shutdown(
                     novarocks_frontend::FrontendServerConfig {
@@ -321,7 +316,6 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
                         config_path: frontend_config_path,
                         port_override: port,
                         connector_control_factories,
-                        connector_file_planning_resources,
                         mv_storage_observation: std::sync::Arc::new(
                             composition::IcebergMvStorageObservationAdapter::default(),
                         ),

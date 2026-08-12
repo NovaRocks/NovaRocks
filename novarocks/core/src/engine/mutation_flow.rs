@@ -26,7 +26,6 @@ use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::engine::StandaloneState;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
@@ -147,7 +146,18 @@ struct DmlChangeStreamPreparations {
 #[derive(Clone)]
 struct ActivatedDmlChangeStreamPreparations {
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-    routes: Vec<novarocks_spi::connector::ConnectorRowMutationRoute>,
+    plan: novarocks_spi::connector::ConnectorRowMutationExecutionPlan,
+}
+
+struct ActivatedDmlChangeStreamWrite {
+    registration: Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
+    sealed_cohorts: novarocks_spi::connector::ConnectorSealedWriteCohortSet,
+    registration_error: Option<String>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_MOR_REGISTRATION_AFTER_ACTIVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl DmlChangeStreamPreparations {
@@ -212,17 +222,83 @@ impl DmlChangeStreamPreparations {
             })?;
         Ok(ActivatedDmlChangeStreamPreparations {
             operation_id: self.operation_id,
-            routes: plan.routes().to_vec(),
+            plan,
         })
     }
 }
 
 impl ActivatedDmlChangeStreamPreparations {
-    fn primary(&self) -> &novarocks_spi::connector::ConnectorWritePreparation {
-        self.routes
-            .first()
-            .expect("row-mutation route plan is non-empty")
-            .preparation()
+    fn routes(&self) -> &[novarocks_spi::connector::ConnectorRowMutationRoute] {
+        self.plan.routes()
+    }
+
+    fn activate_write(
+        &self,
+        write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ActivatedDmlChangeStreamWrite, String> {
+        let activation = write_lease
+            .activate_write(novarocks_spi::connector::ConnectorWriteActivationRequest {
+                operation_id: self.operation_id,
+                source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
+                    self.plan.clone(),
+                ),
+                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+                context: context.clone(),
+            })
+            .map_err(|error| format!("activate exact MOR row-mutation plan: {error}"))?;
+        let sealed_cohorts = activation.sealed_cohorts().clone();
+        let registration = activation
+            .cohorts()
+            .iter()
+            .cloned()
+            .map(|cohort| {
+                crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+                    cohort,
+                    context.clone(),
+                    write_lease.clone(),
+                )
+                .map_err(|error| format!("build activated MOR cohort template: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(|templates| {
+                #[cfg(test)]
+                if FAIL_MOR_REGISTRATION_AFTER_ACTIVATION
+                    .with(|fail| fail.replace(false))
+                {
+                    return Err(
+                        "synthetic MOR registration failure after provider activation".to_string(),
+                    );
+                }
+                crate::query_execution::contract::ConnectorWriteOperationRegistration::try_new(
+                    templates,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .and_then(|registration| {
+                let registered_sealed = registration.sealed_cohorts().map_err(|error| {
+                    format!("seal activated MOR cohorts before execution: {error}")
+                })?;
+                if registered_sealed != sealed_cohorts {
+                    return Err(
+                        "activated MOR registration changed the provider-sealed cohort set"
+                            .to_string(),
+                    );
+                }
+                Ok(registration)
+            });
+        match registration {
+            Ok(registration) => Ok(ActivatedDmlChangeStreamWrite {
+                registration: Some(registration),
+                sealed_cohorts,
+                registration_error: None,
+            }),
+            Err(error) => Ok(ActivatedDmlChangeStreamWrite {
+                registration: None,
+                sealed_cohorts,
+                registration_error: Some(error),
+            }),
+        }
     }
 }
 
@@ -284,7 +360,7 @@ fn build_dml_change_stream_write_plan(
     use novarocks_spi::connector::{ConnectorMutationRouteInput, ConnectorWriteInputShape};
 
     let mut routes = Vec::new();
-    for route in &preparations.routes {
+    for route in preparations.routes() {
         let target_binding = table_bindings.admitted_iceberg_write_binding_id_for_preparation(
             &target.catalog,
             &target.namespace,
@@ -483,10 +559,6 @@ pub(crate) struct PreparedUpdateMutation {
 /// contrast, MOR builds one SQL change-stream producer after the frontend has
 /// persisted the mutation intent, so its writer target must be frozen here.
 pub(crate) struct PreparedMorUpdateWriteTarget {
-    /// The branch/current snapshot selected during admission. MOR production
-    /// planning must not observe a later branch head after the frontend has
-    /// recorded the mutation intent.
-    pub(crate) read_snapshot_id: Option<i64>,
     /// Provider-signed writer facts frozen with `planning_lease`. They are
     /// admitted into the same query-local store as the producer compile, never
     /// rebuilt during stage/preparation.
@@ -794,7 +866,6 @@ pub(crate) fn prepare_update_mutation(
             // must never reopen the connector generation or observe a later
             // snapshot.
             Some(PreparedMorUpdateWriteTarget {
-                read_snapshot_id: admitted_base_snapshot_id,
                 preparations: signed_preparations,
                 planning_lease: planning_lease.clone(),
             })
@@ -992,7 +1063,7 @@ pub(crate) fn stage_prepared_update_mutation(
         cow_preparations,
         mor_write_target,
         mode,
-        admitted_base_snapshot_id,
+        admitted_base_snapshot_id: _,
         execution,
         connector_context,
     } = prepared;
@@ -1079,7 +1150,6 @@ pub(crate) fn stage_prepared_update_mutation(
         )),
         novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead => {
             let PreparedMorUpdateWriteTarget {
-                read_snapshot_id,
                 preparations,
                 planning_lease: write_planning_lease,
             } = mor_write_target.ok_or_else(|| {
@@ -1098,14 +1168,6 @@ pub(crate) fn stage_prepared_update_mutation(
             let write_lease = write_planning_lease
                 .derive_write_lease()
                 .map_err(|error| format!("derive MOR UPDATE write lease: {error}"))?;
-            let (commit_executor, entry) =
-                crate::engine::iceberg_writer::build_iceberg_row_commit_executor(
-                    state,
-                    &target,
-                    &target_ref,
-                    novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead,
-                    read_snapshot_id,
-                )?;
             let write = build_update_mor_change_stream_write_plan(
                 state,
                 &target,
@@ -1119,44 +1181,23 @@ pub(crate) fn stage_prepared_update_mutation(
                 &preparations,
                 write_planning_lease,
             )?;
-            let operation_id = preparations.operation_id;
             let mut write = write;
             let planned = plan_dml_change_stream_write(state, &target, &mut write)?;
-            let provider_binding = Arc::new(
-                crate::connector::iceberg::change_stream_write::bind_iceberg_change_stream_provider(
-                    crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderRequest {
-                        target: &format!("{}.{}.{}", target.catalog, target.namespace, target.table),
-                        target_ref: &target_ref,
-                        table: &commit_executor.table,
-                        entry: &entry,
-                    base_snapshot_id: read_snapshot_id,
-                    operation_id,
-                    topology: &planned.topology,
-                    table_bindings: write.table_bindings.as_ref(),
-                    commit_executor: Arc::clone(&commit_executor),
-                    },
-                )?,
-            );
-            let connector_write =
-                crate::engine::iceberg_writer::iceberg_change_stream_provider_binding_template(
-                    state,
-                    &target,
-                    &provider_binding,
-                    operation_id,
-                    connector_context.clone(),
-                    &write_lease,
-                    preparations.primary(),
-                )?;
+            let ActivatedDmlChangeStreamWrite {
+                registration: write_registration,
+                sealed_cohorts: activated_sealed,
+                registration_error,
+            } = preparations.activate_write(&write_lease, &connector_context)?;
             let execution_handle = Arc::new(MorUpdateChangeStreamExecutor {
                 state: Arc::clone(state),
                 target: target.clone(),
                 planned: Mutex::new(Some(planned)),
-                connector_write,
-                provider_binding,
-                commit_executor,
+                write_registration,
+                registration_error,
                 execution,
                 connector_context,
                 write_lease,
+                activated_sealed,
                 operation_session: Mutex::new(None),
             });
             let result = match execution_handle.stage() {
@@ -1378,7 +1419,7 @@ fn build_update_mor_change_stream_write_plan(
     // intentionally precedes compilation, so `build_dml_change_stream_write_plan`
     // can recover the write token from the same store that resolves producer
     // scans. No preparation phase is allowed to reacquire current/latest.
-    for route in &preparations.routes {
+    for route in preparations.routes() {
         crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
             table_bindings.as_ref(),
             crate::sql::planner::table::SqlTableIdentity {
@@ -2028,16 +2069,16 @@ struct MorUpdateChangeStreamExecutor {
     state: Arc<StandaloneState>,
     target: crate::engine::backend_resolver::TargetBackend,
     planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-    provider_binding:
-        Arc<crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    write_registration:
+        Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
+    registration_error: Option<String>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     /// Exact write authority derived during admission.  Staging must seal the
     /// operation against this lease; it must not reacquire a current control
     /// generation after frontend durable intent.
     write_lease: novarocks_spi::connector::ConnectorWriteLease,
+    activated_sealed: novarocks_spi::connector::ConnectorSealedWriteCohortSet,
     operation_session:
         Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
 }
@@ -2046,15 +2087,15 @@ struct MorMergeChangeStreamExecutor {
     state: Arc<StandaloneState>,
     target: crate::engine::backend_resolver::TargetBackend,
     planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-    provider_binding:
-        Arc<crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding>,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    write_registration:
+        Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
+    registration_error: Option<String>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     /// Exact write authority derived during admission.  See the corresponding
     /// UPDATE executor for why this is retained through staging.
     write_lease: novarocks_spi::connector::ConnectorWriteLease,
+    activated_sealed: novarocks_spi::connector::ConnectorSealedWriteCohortSet,
     operation_session:
         Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
 }
@@ -2070,6 +2111,12 @@ impl MorUpdateChangeStreamExecutor {
     }
 
     fn run_stage(&self) -> Result<QueryExecutionResult, String> {
+        if let Some(error) = &self.registration_error {
+            return Err(error.clone());
+        }
+        let write_registration = self.write_registration.clone().ok_or_else(|| {
+            "MOR UPDATE has no registration after successful provider activation".to_string()
+        })?;
         let planned = self
             .planned
             .lock()
@@ -2086,38 +2133,34 @@ impl MorUpdateChangeStreamExecutor {
         if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
             return Ok(result);
         }
-        let prepared_request = crate::engine::prepare_planned_iceberg_change_stream_write(
-            prepared,
-            native_bundle,
-            None,
-            &self.execution,
-            Some(crate::engine::DistributedConnectorWrite::Begin(
-                self.connector_write.clone(),
-            )),
-        )?;
-        let exact_lease = prepared_request.lease();
+        let writer_fragment_cohorts = topology
+            .writer_routes
+            .iter()
+            .map(|route| (route.writer_fragment_id, route.cohort_id))
+            .collect::<Vec<_>>();
         let session = self
             .state
             .query_execution
-            .begin_write_operation(prepared_request.registration(), exact_lease)
+            .begin_write_operation(write_registration.clone(), self.write_lease.clone())
             .map_err(|error| error.to_string())?;
         *self
             .operation_session
             .lock()
             .expect("MOR UPDATE operation session lock poisoned") = Some(session.clone());
-        crate::engine::iceberg_writer::activate_iceberg_change_stream_provider_binding_after_session(
-            &self.state,
-            &self.target,
-            &self.provider_binding,
-            session.operation_id(),
-            &session,
-        )?;
-        let registration =
-            crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
-                session,
-                prepared_request.write_cohort_id(),
-            )
-            .map_err(|error| error.to_string())?;
+        let prepared_request = crate::query_execution::prepared_write::PreparedDistributedWriteRequest::new_with_writer_fragment_cohorts(
+            prepared,
+            native_bundle,
+            None,
+            write_registration,
+            writer_fragment_cohorts.clone(),
+            self.write_lease.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let registration = crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new_with_writer_fragment_cohorts(
+            session,
+            writer_fragment_cohorts,
+        )
+        .map_err(|error| error.to_string())?;
         let request = prepared_request
             .into_request(&self.execution, registration)
             .map_err(|error| error.to_string())?;
@@ -2131,10 +2174,7 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
-        self.operation_session
-            .lock()
-            .expect("MOR UPDATE operation session lock poisoned")
-            .is_some()
+        true
     }
 
     fn abort_terminal(
@@ -2144,11 +2184,20 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
             .operation_session
             .lock()
             .expect("MOR UPDATE operation session lock poisoned")
-            .clone()
-            .expect("MOR UPDATE abort requires a retained operation session");
-        session
-            .abort(self.connector_context.clone())
-            .map_err(|error| format!("abort MOR UPDATE connector operation: {error}"))
+            .clone();
+        match session {
+            Some(session) => session
+                .abort(self.connector_context.clone())
+                .map_err(|error| format!("abort MOR UPDATE connector operation: {error}")),
+            None => novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
+                self.write_lease.binding_key().clone(),
+                self.activated_sealed.clone(),
+                Vec::new(),
+                self.connector_context.clone(),
+            )
+            .and_then(|request| self.write_lease.control().abort(request))
+            .map_err(|error| format!("abort activated MOR UPDATE operation: {error}")),
+        }
     }
 
     fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
@@ -2171,6 +2220,12 @@ impl MorMergeChangeStreamExecutor {
     }
 
     fn run_stage(&self) -> Result<QueryExecutionResult, String> {
+        if let Some(error) = &self.registration_error {
+            return Err(error.clone());
+        }
+        let write_registration = self.write_registration.clone().ok_or_else(|| {
+            "MOR MERGE has no registration after successful provider activation".to_string()
+        })?;
         let planned = self
             .planned
             .lock()
@@ -2187,38 +2242,34 @@ impl MorMergeChangeStreamExecutor {
         if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
             return Ok(result);
         }
-        let prepared_request = crate::engine::prepare_planned_iceberg_change_stream_write(
-            prepared,
-            native_bundle,
-            None,
-            &self.execution,
-            Some(crate::engine::DistributedConnectorWrite::Begin(
-                self.connector_write.clone(),
-            )),
-        )?;
-        let exact_lease = prepared_request.lease();
+        let writer_fragment_cohorts = topology
+            .writer_routes
+            .iter()
+            .map(|route| (route.writer_fragment_id, route.cohort_id))
+            .collect::<Vec<_>>();
         let session = self
             .state
             .query_execution
-            .begin_write_operation(prepared_request.registration(), exact_lease)
+            .begin_write_operation(write_registration.clone(), self.write_lease.clone())
             .map_err(|error| error.to_string())?;
         *self
             .operation_session
             .lock()
             .expect("MOR MERGE operation session lock poisoned") = Some(session.clone());
-        crate::engine::iceberg_writer::activate_iceberg_change_stream_provider_binding_after_session(
-            &self.state,
-            &self.target,
-            &self.provider_binding,
-            session.operation_id(),
-            &session,
-        )?;
-        let registration =
-            crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
-                session,
-                prepared_request.write_cohort_id(),
-            )
-            .map_err(|error| error.to_string())?;
+        let prepared_request = crate::query_execution::prepared_write::PreparedDistributedWriteRequest::new_with_writer_fragment_cohorts(
+            prepared,
+            native_bundle,
+            None,
+            write_registration,
+            writer_fragment_cohorts.clone(),
+            self.write_lease.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let registration = crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new_with_writer_fragment_cohorts(
+            session,
+            writer_fragment_cohorts,
+        )
+        .map_err(|error| error.to_string())?;
         let request = prepared_request
             .into_request(&self.execution, registration)
             .map_err(|error| error.to_string())?;
@@ -2232,10 +2283,7 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
-        self.operation_session
-            .lock()
-            .expect("MOR MERGE operation session lock poisoned")
-            .is_some()
+        true
     }
 
     fn abort_terminal(
@@ -2245,11 +2293,20 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
             .operation_session
             .lock()
             .expect("MOR MERGE operation session lock poisoned")
-            .clone()
-            .expect("MOR MERGE abort requires a retained operation session");
-        session
-            .abort(self.connector_context.clone())
-            .map_err(|error| format!("abort MOR MERGE connector operation: {error}"))
+            .clone();
+        match session {
+            Some(session) => session
+                .abort(self.connector_context.clone())
+                .map_err(|error| format!("abort MOR MERGE connector operation: {error}")),
+            None => novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
+                self.write_lease.binding_key().clone(),
+                self.activated_sealed.clone(),
+                Vec::new(),
+                self.connector_context.clone(),
+            )
+            .and_then(|request| self.write_lease.control().abort(request))
+            .map_err(|error| format!("abort activated MOR MERGE operation: {error}")),
+        }
     }
 
     fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
@@ -3631,7 +3688,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         cow_preparations,
         mor_write_target,
         insert_columns_resolved,
-        admitted_base_snapshot_id,
+        admitted_base_snapshot_id: _,
         execution,
         connector_context,
     } = prepared;
@@ -3650,7 +3707,6 @@ pub(crate) fn stage_prepared_merge_mutation(
         if !has_matched_update && !has_matched_delete && !has_not_matched_insert {
             return Ok(MutationStagedWrite::NoOp);
         }
-        let base_snapshot_id = admitted_base_snapshot_id;
         let PreparedMorMergeWriteTarget {
             preparations,
             planning_lease: write_planning_lease,
@@ -3666,14 +3722,6 @@ pub(crate) fn stage_prepared_merge_mutation(
         let write_lease = write_planning_lease
             .derive_write_lease()
             .map_err(|error| format!("derive MOR MERGE write lease: {error}"))?;
-        let (commit_executor, entry) =
-            crate::engine::iceberg_writer::build_iceberg_row_commit_executor(
-                state,
-                &target,
-                &target_ref,
-                novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead,
-                base_snapshot_id,
-            )?;
         let write = build_merge_mor_change_stream_write_plan(
             state,
             &target,
@@ -3688,44 +3736,23 @@ pub(crate) fn stage_prepared_merge_mutation(
             &preparations,
             write_planning_lease,
         )?;
-        let operation_id = preparations.operation_id;
         let mut write = write;
         let planned = plan_dml_change_stream_write(state, &target, &mut write)?;
-        let provider_binding = Arc::new(
-            crate::connector::iceberg::change_stream_write::bind_iceberg_change_stream_provider(
-                crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderRequest {
-                    target: &format!("{}.{}.{}", target.catalog, target.namespace, target.table),
-                    target_ref: &target_ref,
-                    table: &commit_executor.table,
-                    entry: &entry,
-                    base_snapshot_id,
-                    operation_id,
-                    topology: &planned.topology,
-                    table_bindings: write.table_bindings.as_ref(),
-                    commit_executor: Arc::clone(&commit_executor),
-                },
-            )?,
-        );
-        let connector_write =
-            crate::engine::iceberg_writer::iceberg_change_stream_provider_binding_template(
-                state,
-                &target,
-                &provider_binding,
-                operation_id,
-                connector_context.clone(),
-                &write_lease,
-                preparations.primary(),
-            )?;
+        let ActivatedDmlChangeStreamWrite {
+            registration: write_registration,
+            sealed_cohorts: activated_sealed,
+            registration_error,
+        } = preparations.activate_write(&write_lease, &connector_context)?;
         let execution_handle = Arc::new(MorMergeChangeStreamExecutor {
             state: Arc::clone(state),
             target: target.clone(),
             planned: Mutex::new(Some(planned)),
-            connector_write,
-            provider_binding,
-            commit_executor,
+            write_registration,
+            registration_error,
             execution,
             connector_context,
             write_lease,
+            activated_sealed,
             operation_session: Mutex::new(None),
         });
         let result = match execution_handle.stage() {
@@ -4475,7 +4502,7 @@ fn build_merge_mor_change_stream_write_plan(
         matched_delete: has_matched_delete,
         not_matched_insert: has_not_matched_insert,
     };
-    for route in &preparations.routes {
+    for route in preparations.routes() {
         crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
             table_bindings.as_ref(),
             crate::sql::planner::table::SqlTableIdentity {
@@ -5342,6 +5369,328 @@ mod tests {
             scan_bindings,
             match_tokens,
             written_version_token: source_version_token,
+        }
+    }
+
+    struct RecordingDirectWriteControl {
+        owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
+        activate_calls: std::sync::atomic::AtomicUsize,
+        observed_source: std::sync::Mutex<Option<([u8; 32], usize, bool)>>,
+    }
+
+    impl novarocks_spi::connector::ConnectorWriteControl for RecordingDirectWriteControl {
+        fn binding_key(&self) -> &novarocks_spi::connector::ConnectorExecutionBindingKey {
+            &self.owner
+        }
+
+        fn activate_write(
+            &self,
+            request: novarocks_spi::connector::ConnectorWriteActivationRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorWriteActivation,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            use std::sync::atomic::Ordering;
+
+            self.activate_calls.fetch_add(1, Ordering::SeqCst);
+            let novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(plan) =
+                &request.source
+            else {
+                return Err(novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "test expected the complete row-mutation plan",
+                ));
+            };
+            *self
+                .observed_source
+                .lock()
+                .expect("recording write control lock") = Some((
+                plan.digest(),
+                plan.routes().len(),
+                plan.copy_on_write().is_some(),
+            ));
+            let cohorts = plan
+                .routes()
+                .iter()
+                .map(|route| (route.cohort_id(), route.preparation().clone()))
+                .collect();
+            novarocks_spi::connector::ConnectorWriteActivation::try_new(
+                self.owner.clone(),
+                &request,
+                cohorts,
+            )
+        }
+
+        fn plan_write(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWritePlanningRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorWritePlan,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "recording control does not plan writes",
+            ))
+        }
+
+        fn commit(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteCommitRequest,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "recording control does not commit writes",
+            ))
+        }
+
+        fn abort(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteAbortRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorWriteAbortOutcome,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Ok(
+                novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted {
+                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                },
+            )
+        }
+
+        fn reconcile(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteReconcileRequest,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "recording control does not reconcile writes",
+            ))
+        }
+    }
+
+    #[test]
+    fn direct_replace_fanout_activates_full_plan_once_and_seals_both_cohorts() {
+        use novarocks_spi::connector::{
+            ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent,
+            ConnectorRowMutationPreparation, ConnectorRowMutationRoute,
+            ConnectorRowMutationStrategy, ConnectorWriteCohortId, ConnectorWriteLease,
+            ConnectorWriteRouteId,
+        };
+        use std::sync::atomic::Ordering;
+
+        let fixture = cow_rewrite_query_fixture(
+            vec![7],
+            vec![2],
+            Arc::new(StringArray::from(vec!["bb"])) as ArrayRef,
+            DataType::Utf8,
+        );
+        let source = fixture.preparation;
+        let preparation = ConnectorRowMutationPreparation::try_new(
+            source.owner().clone(),
+            source.operation_id(),
+            source.table().clone(),
+            source.match_source().clone(),
+            source.match_source_schema().clone(),
+            source.target_ref().clone(),
+            ConnectorRowMutationIntent::Update,
+            source.base_version().clone(),
+            source.match_contract().clone(),
+            ConnectorRowMutationStrategy::MergeOnRead,
+            source.base_version_ordinal(),
+            source.written_version_ordinal(),
+            bytes::Bytes::from_static(b"direct-replace-fanout"),
+        )
+        .expect("direct preparation");
+        let writer = fixture.route.preparation().clone();
+        let first =
+            ConnectorWriteCohortId::derive(preparation.operation_id(), b"replace-fanout", [1; 32])
+                .expect("first cohort");
+        let second =
+            ConnectorWriteCohortId::derive(preparation.operation_id(), b"replace-fanout", [2; 32])
+                .expect("second cohort");
+        let routes = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(index, cohort_id)| {
+                ConnectorRowMutationRoute::try_new(
+                    ConnectorWriteRouteId::from_bytes([20 + index as u8; 32]),
+                    cohort_id,
+                    vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
+                    writer.input().clone(),
+                    fixture.route.input_ordinals().to_vec(),
+                    Vec::new(),
+                    writer.clone(),
+                )
+                .expect("replace route")
+            })
+            .collect::<Vec<_>>();
+        let plan = ConnectorRowMutationExecutionPlan::try_direct(preparation, routes)
+            .expect("direct fanout plan");
+        let expected_digest = plan.digest();
+        let control = Arc::new(RecordingDirectWriteControl {
+            owner: plan.owner().clone(),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            observed_source: std::sync::Mutex::new(None),
+        });
+        let lease = ConnectorWriteLease::new(plan.owner().clone(), control.clone(), || {})
+            .expect("write lease");
+        let activated = ActivatedDmlChangeStreamPreparations {
+            operation_id: plan.operation_id(),
+            plan,
+        };
+        let activated_write = activated
+            .activate_write(&lease, &connector_context_for_test())
+            .expect("activate full Direct plan");
+        let registration = activated_write
+            .registration
+            .expect("build full Direct registration");
+
+        assert_eq!(control.activate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *control.observed_source.lock().expect("recorded source"),
+            Some((expected_digest, 2, false))
+        );
+        let registered = registration
+            .clone()
+            .into_cohorts()
+            .into_iter()
+            .map(|template| template.cohort_id())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            registered,
+            std::collections::BTreeSet::from([first, second])
+        );
+        let session =
+            crate::query_execution::write_operation::ConnectorWriteOperationSession::try_begin(
+                registration,
+                lease.clone(),
+            )
+            .expect("seal exact two-cohort operation");
+        assert!(session.contains_cohort(first));
+        assert!(session.contains_cohort(second));
+
+        FAIL_MOR_REGISTRATION_AFTER_ACTIVATION.with(|fail| fail.set(true));
+        let failed = activated
+            .activate_write(&lease, &connector_context_for_test())
+            .expect("retain activated authority after local registration failure");
+        assert!(failed.registration.is_none());
+        assert_eq!(
+            failed.registration_error.as_deref(),
+            Some("synthetic MOR registration failure after provider activation")
+        );
+        assert_eq!(
+            failed.sealed_cohorts.cohorts().len(),
+            2,
+            "provider activation must preserve the complete abort authority"
+        );
+        let abort = novarocks_spi::connector::ConnectorWriteAbortRequest::try_new(
+            lease.binding_key().clone(),
+            failed.sealed_cohorts,
+            Vec::new(),
+            connector_context_for_test(),
+        )
+        .and_then(|request| lease.control().abort(request))
+        .expect("abort exact post-activation authority");
+        assert!(matches!(
+            abort,
+            novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted { .. }
+        ));
+    }
+
+    struct AbortOutcomeExecution {
+        outcome: novarocks_spi::connector::ConnectorWriteAbortOutcome,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    }
+
+    impl MutationExecution for AbortOutcomeExecution {
+        fn stage(&self) -> Result<QueryExecutionResult, String> {
+            Err("synthetic post-begin staging failure".to_string())
+        }
+
+        fn abort_terminal(
+            &self,
+        ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
+            Ok(self.outcome.clone())
+        }
+
+        fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+            self.context.clone()
+        }
+
+        fn finalize(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn abort_unknown_evidence() -> novarocks_spi::connector::ExternalMutationEvidence {
+        use novarocks_spi::connector::{
+            ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+            ConnectorMutationOperationId, ConnectorProviderId, ExternalMutationEvidence,
+        };
+
+        ExternalMutationEvidence::try_new(
+            1,
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test-provider").expect("provider ID"),
+                instance_id: ConnectorInstanceId::parse("test-instance").expect("instance ID"),
+            },
+            ConnectorInstanceIncarnation::from_bytes([33; 16]),
+            ConnectorMutationOperationId::from_bytes([44; 16]),
+            "row-mutation-abort",
+            bytes::Bytes::from_static(b"uncertain"),
+        )
+        .expect("abort evidence")
+    }
+
+    #[test]
+    fn abort_required_preserves_known_committed_and_commit_unknown_outcomes() {
+        use novarocks_spi::connector::{
+            ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAbortOutcome,
+            ConnectorWriteReceipt, ExternalMutationFinalization,
+        };
+
+        let outcomes = [
+            ConnectorWriteAbortOutcome::KnownCommitted {
+                receipt: ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"committed"))
+                    .expect("receipt"),
+                finalization: ExternalMutationFinalization::Complete,
+            },
+            ConnectorWriteAbortOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "commit state unavailable",
+                ),
+                evidence: abort_unknown_evidence(),
+            },
+        ];
+
+        for expected in outcomes {
+            let staged = MutationStagedWrite::AbortRequired {
+                reason: "synthetic post-begin staging failure".to_string(),
+                execution: Arc::new(AbortOutcomeExecution {
+                    outcome: expected.clone(),
+                    context: connector_context_for_test(),
+                }),
+            };
+            let MutationStagedWrite::AbortRequired { reason, execution } = staged else {
+                panic!("expected AbortRequired");
+            };
+            assert_eq!(reason, "synthetic post-begin staging failure");
+            assert_eq!(
+                execution.abort_terminal().expect("typed abort outcome"),
+                expected
+            );
         }
     }
 

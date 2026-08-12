@@ -109,8 +109,8 @@ fn files_columns() -> Vec<MetadataColumn> {
 
 /// Fixed analyzer-level column schema for each Iceberg metadata table.
 ///
-/// Wire types match the Iceberg metadata SPI reader's `build_*_array` helpers in
-/// `src/connector/iceberg/metadata.rs`. Logical formatting (e.g. converting
+/// Wire types match the Iceberg provider metadata reader's `build_*_array` helpers.
+/// Logical formatting (e.g. converting
 /// the `committed_at` Int64-of-micros into a TIMESTAMPTZ display) is FE's
 /// responsibility; the analyzer surfaces the underlying Arrow type.
 pub fn metadata_table_schema(ty: SqlMetadataTableKind) -> Vec<MetadataColumn> {

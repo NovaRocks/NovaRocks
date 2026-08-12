@@ -192,28 +192,6 @@ pub(crate) fn connector_table_materialization_from_metadata(
     })
 }
 
-/// Convert an admitted Iceberg provider envelope into the one SQL-facing
-/// table shape.  The caller supplies the token allocated by
-/// `QueryTableBindingStore`; every concrete descriptor remains paired with
-/// that token in `QueryScanMaterialization`.
-pub(crate) fn iceberg_query_binding_from_materialization(
-    materialization: crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
-    catalog: &str,
-    namespace: &str,
-    sql_table_name: &str,
-    binding: SqlTableBindingId,
-) -> Result<QueryTableBinding, String> {
-    iceberg_query_binding_from_materialization_with_change_scans(
-        materialization,
-        catalog,
-        namespace,
-        sql_table_name,
-        binding,
-        BTreeMap::new(),
-        std::collections::BTreeSet::new(),
-    )
-}
-
 /// Project a provider-neutral SPI metadata materialization into the
 /// request-local SQL binding. Provider aliases retain their separately frozen
 /// provider-owned facts until their dedicated adapters run.
@@ -293,96 +271,6 @@ pub(crate) fn connector_query_binding_from_materialization(
         write_target_admission: None,
         frozen_snapshot_materializations,
         admitted_change_scans: BTreeMap::new(),
-    })
-}
-
-/// Equivalent to [`iceberg_query_binding_from_materialization`] with sealed
-/// provider snapshot-window admissions. SQL receives only the binding token;
-/// preparation recovers each opaque scan from the same request-local store.
-pub(crate) fn iceberg_query_binding_from_materialization_with_change_scans(
-    materialization: crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
-    catalog: &str,
-    namespace: &str,
-    sql_table_name: &str,
-    binding: SqlTableBindingId,
-    admitted_change_scans: BTreeMap<(i64, i64), novarocks_spi::connector::ConnectorScan>,
-    mut frozen_snapshot_ids: std::collections::BTreeSet<i64>,
-) -> Result<QueryTableBinding, String> {
-    use crate::sql::planner::table::{
-        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
-    };
-
-    let (version, kind, frozen_snapshot_id) = match materialization.read_selector {
-        novarocks_spi::connector::ConnectorReadSelector::Current => (
-            SqlTableVersionSelector::Current,
-            SqlScanKind::Data {
-                version: SqlTableVersionSelector::Current,
-            },
-            None,
-        ),
-        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id) => {
-            let version = SqlTableVersionSelector::Snapshot(snapshot_id);
-            (
-                version.clone(),
-                SqlScanKind::FrozenInputSet { version },
-                Some(snapshot_id),
-            )
-        }
-        novarocks_spi::connector::ConnectorReadSelector::TimestampMicros(timestamp_micros) => {
-            return Err(format!(
-                "connector read selector timestamp {timestamp_micros} must resolve to a snapshot before SQL materialization"
-            ));
-        }
-    };
-    let table_identity = SqlTableIdentity {
-        catalog: catalog.to_string(),
-        namespace: namespace.to_string(),
-        table: sql_table_name.to_string(),
-    };
-    let planner = TableDef {
-        name: sql_table_name.to_string(),
-        columns: materialization.columns,
-        iceberg_row_lineage_metadata_columns: materialization.iceberg_row_lineage_metadata_columns,
-        source: ScanSource::Sql(
-            SqlScanSource::new(binding, table_identity, kind)
-                .with_ukfk_facts(materialization.sql_ukfk_facts.clone()),
-        ),
-    };
-    if let Some(snapshot_id) = frozen_snapshot_id {
-        frozen_snapshot_ids.insert(snapshot_id);
-    }
-    let frozen_snapshot_materializations = frozen_snapshot_ids
-        .into_iter()
-        .map(|snapshot_id| {
-            (
-                snapshot_id,
-                QueryScanMaterialization {
-                    table: materialization.read_table.clone(),
-                    schema: materialization.read_schema.clone(),
-                    selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
-                        snapshot_id,
-                    ),
-                    statistics_pin: materialization.statistics_pin.clone(),
-                    planning_lease: materialization.planning_lease.clone(),
-                },
-            )
-        })
-        .collect();
-    Ok(QueryTableBinding {
-        resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-        statistics_pin: materialization.statistics_pin.clone(),
-        admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
-        scan_materialization: Some(QueryScanMaterialization {
-            table: materialization.read_table,
-            schema: materialization.read_schema,
-            selector: materialization.read_selector,
-            statistics_pin: materialization.statistics_pin.clone(),
-            planning_lease: materialization.planning_lease.clone(),
-        }),
-        mv_target_read: None,
-        write_target_admission: materialization.write_target_admission,
-        frozen_snapshot_materializations,
-        admitted_change_scans,
     })
 }
 

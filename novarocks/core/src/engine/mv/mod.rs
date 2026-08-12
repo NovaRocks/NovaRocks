@@ -29,6 +29,4 @@ pub(crate) mod metadata_consistency;
 pub(crate) mod partition;
 pub(crate) mod refresh_io;
 pub(crate) mod refresh_pin_adapter;
-#[cfg(test)]
-pub(crate) mod schema_validation_adapter;
 pub(crate) mod stateless_rebuild;

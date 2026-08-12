@@ -898,8 +898,6 @@ fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, 
 pub(crate) mod tests_support {
     use std::sync::Arc;
 
-    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-
     use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
     use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
@@ -923,35 +921,6 @@ pub(crate) mod tests_support {
 
     pub(crate) fn make_pin(entries: &[(&str, i64, &str)]) -> RefreshSnapshotPin {
         RefreshSnapshotPin::from_entries_for_tests(entries)
-    }
-
-    /// Iceberg-typed fixture used only where a test must build a real
-    /// `TableMetadata` for a fixture table. It is provider scaffolding, not a
-    /// rewrite-context input, and retires with the rest of the MV test
-    /// scaffolding in T20/T21.
-    pub(crate) fn make_target_iceberg_schema()
-    -> Arc<novarocks_connector_iceberg::iceberg::spec::Schema> {
-        use novarocks_connector_iceberg::iceberg::spec::{
-            NestedField, PrimitiveType, Schema, Type,
-        };
-        Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        )
     }
 
     /// Neutral target-schema fixture: the Arrow types plus the positionally
@@ -1237,8 +1206,6 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-
-    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::refresh::pin::RefreshSnapshotPin;
     use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;

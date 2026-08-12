@@ -764,6 +764,22 @@ pub(crate) fn planned_files_fixture_binding(
     files_by_table: HashMap<String, Vec<FixtureScanFile>>,
     seen_projections: Option<Arc<Mutex<Vec<Vec<usize>>>>>,
 ) -> ConnectorControlBinding {
+    planned_files_fixture_binding_for_provider(
+        ConnectorProviderId::parse(FIXTURE_PROVIDER_ID).expect("fixture provider ID"),
+        catalog,
+        files_by_table,
+        seen_projections,
+    )
+}
+
+/// Build the same opaque read fixture under an explicitly selected provider ID.
+#[cfg(test)]
+pub(crate) fn planned_files_fixture_binding_for_provider(
+    provider_id: ConnectorProviderId,
+    catalog: &str,
+    files_by_table: HashMap<String, Vec<FixtureScanFile>>,
+    seen_projections: Option<Arc<Mutex<Vec<Vec<usize>>>>>,
+) -> ConnectorControlBinding {
     let instance_id = ConnectorInstanceId::parse(catalog).expect("fixture instance ID");
     let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
     let read = Arc::new(Fixture {
@@ -773,7 +789,7 @@ pub(crate) fn planned_files_fixture_binding(
         seen_projections,
     });
     let descriptor = ConnectorInstanceDescriptor {
-        provider_id: ConnectorProviderId::parse(FIXTURE_PROVIDER_ID).expect("fixture provider ID"),
+        provider_id,
         instance_id,
     };
     ConnectorControlBinding::try_new(

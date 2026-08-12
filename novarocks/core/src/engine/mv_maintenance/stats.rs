@@ -314,8 +314,8 @@ mod tests {
     //
     // Whether a real provider derives those facts correctly is proven where
     // that provider lives: the maintenance projection cases in
-    // `novarocks/connector/iceberg/src/storage_inspector.rs` and the compaction
-    // parity cases in `novarocks/core/src/connector/iceberg/metadata_maintenance.rs`.
+    // `novarocks/connector/iceberg/src/storage_inspector.rs` and
+    // `novarocks/connector/iceberg/src/catalog_control/metadata_maintenance.rs`.
     // Re-deriving them here would only retest the provider through a longer
     // path.
     // ---------------------------------------------------------------------

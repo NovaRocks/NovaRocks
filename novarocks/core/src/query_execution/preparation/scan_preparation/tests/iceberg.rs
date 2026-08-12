@@ -109,7 +109,7 @@ fn planned_data_files(
 /// Whether a statistics bound excludes a unit is provider semantics, so the
 /// fixture connector never prunes and this test supplies only the unit a
 /// pruning provider would have selected. The pruning decision itself is
-/// asserted by `connector::iceberg::file_pruning`'s unit tests.
+/// asserted by the provider's file-pruning unit tests.
 #[test]
 fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
     let mut root = scan_node(10);
@@ -309,7 +309,7 @@ fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
 ///
 /// Identity-partition exclusion is provider semantics, so the fixture does not
 /// prune and this test supplies only the surviving unit; the exclusion itself is
-/// asserted by `connector::iceberg::file_pruning`'s unit tests.
+/// asserted by the provider's file-pruning unit tests.
 #[test]
 fn identity_partition_predicate_stays_on_opaque_connector_path() {
     let mut root = scan_node(10);

@@ -18,8 +18,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-#[cfg(test)]
-use crate::connector::iceberg::catalog::load_table;
 use crate::engine::StandaloneState;
 use crate::engine::mv_flow::execute_query_for_mv_refresh_with_catalog;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
@@ -50,22 +48,6 @@ pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, 
         .into_iter()
         .map(|chunk| record_batch_to_chunk(chunk.batch))
         .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn load_current_iceberg_base_table(
-    state: &Arc<StandaloneState>,
-    table_ref: &TableIdentity,
-) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg registry read lock");
-        registry.get(&table_ref.catalog)?
-    };
-    entry.invalidate_table_cache(&table_ref.namespace, &table_ref.table);
-    load_table(&entry, &table_ref.namespace, &table_ref.table)
 }
 
 /// Freeze the narrow base-table facts used by one MV refresh attempt.

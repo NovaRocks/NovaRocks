@@ -385,6 +385,28 @@ impl ConnectorWriteOperationRegistration {
         &self.owner
     }
 
+    pub fn sealed_cohorts(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorSealedWriteCohortSet, ConnectorError> {
+        let descriptors = self
+            .cohorts
+            .iter()
+            .map(|template| {
+                Ok(
+                    novarocks_spi::connector::ConnectorWriteCohortDescriptor::new(
+                        template.cohort_id(),
+                        template.intent(),
+                        template.stable_digest(&self.owner)?,
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>, ConnectorError>>()?;
+        novarocks_spi::connector::ConnectorSealedWriteCohortSet::try_new(
+            self.operation_id,
+            descriptors,
+        )
+    }
+
     pub fn into_cohorts(self) -> Vec<ConnectorWritePlanningTemplate> {
         self.cohorts
     }

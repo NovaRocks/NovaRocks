@@ -19,7 +19,6 @@ pub mod cleanup_maintenance;
 pub(crate) mod data_mutation;
 pub mod distributed_rewrite_application;
 pub mod file_execution;
-pub mod iceberg;
 pub mod metadata_maintenance;
 pub mod mutation;
 pub mod runtime;
@@ -30,11 +29,6 @@ pub(crate) mod unified_statistics;
 pub(crate) mod write_target;
 
 pub(crate) use backend::MvBackend;
-#[cfg(test)]
-pub(crate) use iceberg::catalog::load_table as load_iceberg_table;
-pub(crate) use iceberg::catalog::{
-    IcebergCatalogRegistry, namespace_exists as iceberg_namespace_exists,
-};
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
