@@ -1711,27 +1711,29 @@ mod tests {
         }
 
         let warehouse = tempfile::TempDir::new().expect("warehouse");
-        let entry = {
-            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
-            catalogs
-                .create_catalog(
-                    "ice",
-                    &[
-                        ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                        (
-                            "iceberg.catalog.warehouse".to_string(),
-                            warehouse.path().display().to_string(),
-                        ),
-                    ],
-                )
-                .expect("create Hadoop catalog");
-            catalogs.get("ice").expect("Hadoop catalog entry")
-        };
-        crate::connector::iceberg::catalog::registry::create_namespace(&entry, "sales")
-            .expect("create namespace");
-        crate::engine::register_iceberg_control_binding(&state, "ice")
-            .expect("register Hadoop control binding");
+        crate::engine::create_iceberg_control_binding(
+            &state,
+            "ice",
+            vec![
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse.path().display().to_string(),
+                ),
+            ],
+        )
+        .expect("create Hadoop control binding through the provider factory");
+        crate::engine::statement::execute_create_database_statement(
+            &state,
+            &crate::sql::parser::ast::ObjectName {
+                parts: vec!["ice".to_string(), "sales".to_string()],
+            },
+            false,
+            None,
+            &connector_context(),
+        )
+        .expect("create namespace through the connector mutation port");
 
         assert_eq!(
             CtasEngine::precheck_ctas_target(&state, &command, None, "unused")

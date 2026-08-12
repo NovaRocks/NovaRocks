@@ -38,8 +38,11 @@
 
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorRequestContext,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableResolution,
-    ConnectorWriteLease,
+    ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
+    ConnectorTableColumnRole, ConnectorTableColumnVisibility, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableResolution, ConnectorWriteLease,
+    ConnectorWriteOperationId, ConnectorWriteTargetRef,
 };
 
 /// One write target, resolved once against a single provider generation.
@@ -94,11 +97,110 @@ impl ConnectorWriteTargetBinding {
         &self.metadata.schema
     }
 
+    /// SQL-visible columns in the shape row DML must write.
+    ///
+    /// Visibility, row-lineage ownership and provider-declared write type
+    /// overrides are all bounded neutral planning facts. Keeping this
+    /// projection here avoids loading or decoding a concrete provider table in
+    /// statement planning.
+    pub(crate) fn dml_target_columns(&self) -> Vec<novarocks_catalog::schema::ColumnDef> {
+        self.metadata
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, field)| {
+                let fact = self.metadata.planning_facts.column_facts().get(ordinal);
+                if matches!(
+                    fact.map(|fact| fact.visibility()),
+                    Some(ConnectorTableColumnVisibility::Hidden)
+                ) || matches!(
+                    fact.map(|fact| fact.role()),
+                    Some(ConnectorTableColumnRole::RowLineageSystem)
+                ) {
+                    return None;
+                }
+                Some(novarocks_catalog::schema::ColumnDef {
+                    name: field.name().to_string(),
+                    data_type: fact
+                        .and_then(|fact| fact.write_target_type())
+                        .cloned()
+                        .unwrap_or_else(|| field.data_type().clone()),
+                    nullable: field.is_nullable(),
+                    write_default: None,
+                    logical_type: None,
+                })
+            })
+            .collect()
+    }
+
     /// Derive the write lease for this statement from the same generation.
     pub(crate) fn derive_write_lease(&self) -> Result<ConnectorWriteLease, String> {
         self.lease
             .derive_write_lease()
             .map_err(|error| error.to_string())
+    }
+
+    /// Ask the exact generation that resolved this target to sign one row
+    /// mutation. The opaque table handle is passed through unchanged.
+    pub(crate) fn prepare_row_mutation(
+        &self,
+        target_ref: &str,
+        operation_id: ConnectorWriteOperationId,
+        intent: ConnectorRowMutationIntent,
+        context: ConnectorRequestContext,
+    ) -> Result<(ConnectorWriteLease, ConnectorRowMutationPreparation), String> {
+        let lease = self
+            .derive_write_lease()
+            .map_err(|error| format!("derive connector row-mutation write lease: {error}"))?;
+        let preparation = match lease
+            .prepare_row_mutation(ConnectorRowMutationPreparationRequest {
+                operation_id,
+                table: self.handle().clone(),
+                target_ref: ConnectorWriteTargetRef::parse(target_ref).map_err(|error| {
+                    format!("validate connector row-mutation target ref: {error}")
+                })?,
+                intent,
+                context,
+            })
+            .map_err(|error| format!("prepare connector row mutation: {error}"))?
+        {
+            ConnectorRowMutationPreparationOutcome::Prepared(preparation) => preparation,
+            ConnectorRowMutationPreparationOutcome::Denied(error) => {
+                return Err(format!("connector row-mutation admission denied: {error}"));
+            }
+        };
+        Ok((lease, preparation))
+    }
+
+    /// Resolve the current head used by the existing durable DML journal.
+    ///
+    /// This intentionally preserves the historical RefHead observation rather
+    /// than claiming it is the opaque base sealed into a write preparation.
+    /// Those two facts can differ if the external ref moves; harmonizing them
+    /// is a separate lifecycle change.
+    pub(crate) fn journal_ref_head_snapshot_id(
+        &self,
+        target_ref: &str,
+        context: ConnectorRequestContext,
+    ) -> Result<Option<i64>, String> {
+        let facts = super::metadata_read_reference_facts_with_planning_lease(
+            self.lease.clone(),
+            context,
+            self.identity().namespace.as_ref(),
+            self.identity().table.as_ref(),
+        )?;
+        if target_ref == "main" {
+            return Ok(facts.current_snapshot_id());
+        }
+        facts
+            .named_references()
+            .iter()
+            .find(|reference| reference.name.as_ref() == target_ref)
+            .map(|reference| Some(reference.snapshot_id))
+            .ok_or_else(|| {
+                format!("iceberg ref: branch '{target_ref}' not found in table metadata")
+            })
     }
 }
 

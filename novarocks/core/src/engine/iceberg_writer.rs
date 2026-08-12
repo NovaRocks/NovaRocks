@@ -264,12 +264,13 @@ fn prepare_iceberg_distributed_write(
     )?;
 
     let connector_operation_id = options.operation_id;
-    let (connector_write, base_snapshot_id) = register_insert_connector_write(
-        state,
-        target,
-        target_ref,
+    // Preserve the journal's historical RefHead observation. This is not the
+    // opaque base sealed into `preparation`; aligning those two values is the
+    // separately recorded F7 lifecycle change.
+    let base_snapshot_id =
+        write_target.journal_ref_head_snapshot_id(target_ref, connector_context.clone())?;
+    let connector_write = register_insert_connector_write(
         preparation,
-        options.snapshot_properties.clone(),
         connector_operation_id,
         connector_context.clone(),
         &write_lease,
@@ -309,65 +310,18 @@ fn prepare_iceberg_distributed_write(
 
 #[allow(clippy::too_many_arguments)]
 fn register_insert_connector_write(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    target_ref: &str,
     preparation: ConnectorWritePreparation,
-    snapshot_properties: BTreeMap<String, String>,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
-) -> Result<
-    (
-        crate::query_execution::contract::ConnectorWritePlanningTemplate,
-        Option<i64>,
-    ),
-    String,
-> {
-    // The catalog entry and the write-service registry are the two places this
-    // layer still touches the concrete registry. Both belong to the final
-    // factory cut; everything Iceberg-shaped beyond them is built by the
-    // provider below.
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
-        registry.get(&target.catalog)?
-    };
-    let (commit_executor, base_snapshot_id) =
-        crate::connector::iceberg::write_commit::build_admitted_data_write_commit_executor(
-            &entry,
-            &target.namespace,
-            &target.table,
-            target_ref,
-            preparation.intent(),
-            snapshot_properties,
-        )?;
-    let services = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
-        .write_services();
-    let committer: Arc<dyn IcebergWriteReportCommitter> = commit_executor;
-    crate::connector::iceberg::provider::register_iceberg_data_write_service_from_preparation(
-        services,
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
         operation_id,
-        &preparation,
-        target_ref,
-        &entry,
-        committer,
+        preparation,
+        context,
+        exact_lease.clone(),
     )
-    .map_err(|error| format!("activate Iceberg data writer from preparation: {error}"))?;
-    let template =
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-            operation_id,
-            preparation,
-            context,
-            exact_lease.clone(),
-        )
-        .map_err(|error| format!("activate exact Iceberg write generation: {error}"))?;
-    Ok((template, base_snapshot_id))
+    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
 }
 
 pub(crate) fn register_iceberg_change_stream_provider_binding(
@@ -598,55 +552,6 @@ pub(crate) fn prepare_iceberg_connector_write_with_table(
     }
 }
 
-/// Reserve the row-delete writer and committer for a Provider-signed route
-/// preparation.
-///
-/// The caller passes the neutral strategy the provider signed and nothing else
-/// about the table. Everything Iceberg-shaped -- the catalog handle, the table,
-/// the commit operation kind, the staging location and the abort cleanup -- is
-/// derived here, so a row-DML entry point never names any of it. This whole
-/// function disappears with the Core Iceberg implementation; until then it is
-/// where the legacy implementation that serves the neutral contract keeps its
-/// own vocabulary.
-pub(crate) fn register_iceberg_row_delete_write_service(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    target_ref: &str,
-    strategy: novarocks_spi::connector::ConnectorRowMutationStrategy,
-    preparation: novarocks_spi::connector::ConnectorWritePreparation,
-    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?;
-        registry.get(&target.catalog)?
-    };
-    let (commit_executor, table) =
-        crate::connector::iceberg::write_commit::build_admitted_row_mutation_commit_executor(
-            &entry,
-            &target.namespace,
-            &target.table,
-            target_ref,
-            strategy,
-            crate::connector::iceberg::write_commit::RowMutationCommitBase::RefHead,
-        )?;
-    register_iceberg_row_connector_write(
-        state,
-        target_ref,
-        preparation,
-        &entry,
-        &table,
-        commit_executor,
-        operation_id,
-        context,
-        write_lease,
-    )
-}
-
 /// Build the commit executor for a row mutation from its target, the signed
 /// strategy and the base version admission signed.
 ///
@@ -692,46 +597,6 @@ pub(crate) fn build_iceberg_row_commit_executor(
             ),
         )?;
     Ok((commit_executor, entry))
-}
-
-/// Activate a row-level writer from a Provider-signed preparation.  The
-/// application retains only the exact lease and opaque preparation; the
-/// Iceberg provider derives its private writer handle and service payload.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn register_iceberg_row_connector_write(
-    state: &Arc<StandaloneState>,
-    target_ref: &str,
-    preparation: ConnectorWritePreparation,
-    entry: &IcebergCatalogEntry,
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-    commit_executor: Arc<IcebergWriteCommitExecutor>,
-    operation_id: ConnectorWriteOperationId,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
-    let services = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
-        .write_services();
-    let committer: Arc<dyn IcebergWriteReportCommitter> = commit_executor;
-    crate::connector::iceberg::provider::register_iceberg_row_write_service_from_preparation(
-        services,
-        operation_id,
-        &preparation,
-        target_ref,
-        entry,
-        table,
-        committer,
-    )
-    .map_err(|error| format!("activate Iceberg row writer from preparation: {error}"))?;
-    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-        operation_id,
-        preparation,
-        context,
-        exact_lease.clone(),
-    )
-    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
 }
 
 /// Resolve an opaque Iceberg write target through the connector metadata

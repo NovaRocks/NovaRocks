@@ -169,7 +169,11 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
     }
 
     fn finalize(&self) -> Result<(), String> {
-        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)
+        self.state.catalog_service.invalidate_table(
+            &self.target.catalog,
+            &self.target.namespace,
+            &self.target.table,
+        )
     }
 }
 
@@ -221,20 +225,14 @@ fn prepare_equality_delete_distributed_write(
     )?;
 
     let connector_operation_id = ConnectorWriteOperationId::new();
-    // `ALTER TABLE ... ADD EQUALITY DELETE` names its own physical form, so
-    // there is no strategy for the provider to choose here. The neutral value is
-    // passed through purely so the legacy implementation can derive its own
-    // commit vocabulary instead of this entry point constructing it.
-    let connector_write = crate::engine::iceberg_writer::register_iceberg_row_delete_write_service(
-        state,
-        target,
-        "main",
-        novarocks_spi::connector::ConnectorRowMutationStrategy::EqualityDelete,
-        preparation,
-        connector_operation_id,
-        connector_context.clone(),
-        &write_lease,
-    )?;
+    let connector_write =
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+            connector_operation_id,
+            preparation,
+            connector_context.clone(),
+            write_lease,
+        )
+        .map_err(|error| format!("activate Provider equality-delete write: {error}"))?;
     let executor = DistributedEqualityDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),

@@ -92,23 +92,15 @@ pub(crate) fn prepare_delete_statement(
             target.backend_name
         ));
     }
-    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+    let target_binding = crate::connector::write_target::load_write_target_binding(
         state.connector_control.as_ref(),
         &target.catalog,
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        connector_context.clone(),
     )?;
-
-    // 2. Resolve the target's SQL-owned facts under that exact generation. The
-    //    concrete Iceberg table is never loaded here.
-    let materialization =
-        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
-            planning_lease.clone(),
-            connector_context.clone(),
-            &target.namespace,
-            &target.table,
-        )?;
-    // Retain the lease returned beside the provider facts rather than an
-    // independent clone, so there is one explicit generation authority.
-    let planning_lease = materialization.planning_lease.clone();
+    let planning_lease = target_binding.lease().clone();
 
     // Reject a managed materialized view from neutral metadata under an exact
     // generation, the same way INSERT, TRUNCATE and ADD FILES already do. This
@@ -126,7 +118,7 @@ pub(crate) fn prepare_delete_statement(
     //    The distributed SELECT planner owns scan pruning and existing delete
     //    visibility from this point onward. Column types come from the provider,
     //    so this check never decodes an Iceberg schema itself.
-    validate_where(&stmt.where_clause, &materialization.dml_target_columns)?;
+    validate_where(&stmt.where_clause, &target_binding.dml_target_columns())?;
 
     // 4. Ask the provider to plan the row mutation. The physical strategy, the
     //    branch/format admission gates and the base version the frontend
@@ -136,7 +128,7 @@ pub(crate) fn prepare_delete_statement(
     //    which defer activation until after. Aligning the two is a lifecycle
     //    change and not part of this cutover.
     let connector_operation_id = ConnectorWriteOperationId::new();
-    let (write_lease, row_mutation) = materialization.prepare_row_mutation(
+    let (write_lease, row_mutation) = target_binding.prepare_row_mutation(
         &target_ref,
         connector_operation_id,
         novarocks_spi::connector::ConnectorRowMutationIntent::Delete,
@@ -228,7 +220,11 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
     }
 
     fn finalize(&self) -> Result<(), String> {
-        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)
+        self.state.catalog_service.invalidate_table(
+            &self.target.catalog,
+            &self.target.namespace,
+            &self.target.table,
+        )
     }
 }
 
@@ -294,16 +290,14 @@ fn prepare_delete_write(
         &write_input_columns(&preparation),
         target_ref,
     )?;
-    let connector_write = crate::engine::iceberg_writer::register_iceberg_row_delete_write_service(
-        state,
-        target,
-        target_ref,
-        strategy,
-        preparation,
-        connector_operation_id,
-        connector_context.clone(),
-        write_lease,
-    )?;
+    let connector_write =
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+            connector_operation_id,
+            preparation,
+            connector_context.clone(),
+            write_lease.clone(),
+        )
+        .map_err(|error| format!("activate Provider DELETE write: {error}"))?;
     let executor = DistributedDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -837,14 +831,8 @@ mod tests {
             table: "orders".to_string(),
         };
         let sink_columns = vec![
-            column(
-                crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN,
-                DataType::Utf8,
-            ),
-            column(
-                crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_POS_COLUMN,
-                DataType::Int64,
-            ),
+            column("_file", DataType::Utf8),
+            column("_pos", DataType::Int64),
             column("region", DataType::Utf8),
         ];
         let where_clause = where_expr("SELECT 1 FROM orders WHERE region = 'east' AND amount = 10");
@@ -870,14 +858,8 @@ mod tests {
             table: "orders".to_string(),
         };
         let sink_columns = vec![
-            column(
-                crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN,
-                DataType::Utf8,
-            ),
-            column(
-                crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_POS_COLUMN,
-                DataType::Int64,
-            ),
+            column("_file", DataType::Utf8),
+            column("_pos", DataType::Int64),
         ];
         let where_clause = where_expr("SELECT 1 FROM orders WHERE id = 1");
 

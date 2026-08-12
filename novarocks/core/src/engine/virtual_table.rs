@@ -440,10 +440,11 @@ fn num_to_expr<N: std::fmt::Display>(n: N) -> Result<sqlast::Expr, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::connector::iceberg::catalog::registry::build_catalog_entry;
     use crate::engine::StandaloneState;
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::sql::parser::dialect::StarRocksDialect;
@@ -451,6 +452,12 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_catalog::schema::ColumnDef;
+    use novarocks_spi::connector::{
+        ConnectorControlBinding, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+        ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
+        ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorTableIdentity,
+        ConnectorTableMetadata, ConnectorTableRequest,
+    };
     use sqlparser::parser::Parser;
 
     #[derive(Default)]
@@ -509,27 +516,102 @@ mod tests {
         q
     }
 
-    /// Build a minimal `StandaloneState` with a local Iceberg (Hadoop) catalog
-    /// registered under `catalog_name`, whose warehouse is `warehouse_path`.
-    fn state_with_local_catalog(catalog_name: &str, warehouse_path: &str) -> Arc<StandaloneState> {
+    struct NamespaceMetadata {
+        instance_id: ConnectorInstanceId,
+        namespaces: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ConnectorMetadata for NamespaceMetadata {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance_id
+        }
+
+        fn list_namespaces(
+            &self,
+            request: ConnectorListNamespacesRequest,
+        ) -> Result<Vec<ConnectorNamespaceIdentity>, ConnectorError> {
+            if request.instance_id != self.instance_id {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "namespace fixture received another connector instance",
+                ));
+            }
+            Ok(self
+                .namespaces
+                .lock()
+                .expect("namespace fixture lock")
+                .iter()
+                .map(|namespace| ConnectorNamespaceIdentity {
+                    instance_id: self.instance_id.clone(),
+                    namespace: Arc::from(namespace.as_str()),
+                })
+                .collect())
+        }
+
+        fn namespace_exists(
+            &self,
+            _request: ConnectorNamespaceRequest,
+        ) -> Result<bool, ConnectorError> {
+            Err(unsupported_namespace_fixture_operation())
+        }
+
+        fn table_exists(&self, _request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            Err(unsupported_namespace_fixture_operation())
+        }
+
+        fn list_tables(
+            &self,
+            _request: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            Err(unsupported_namespace_fixture_operation())
+        }
+
+        fn load_table(
+            &self,
+            _request: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            Err(unsupported_namespace_fixture_operation())
+        }
+    }
+
+    fn unsupported_namespace_fixture_operation() -> ConnectorError {
+        ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "namespace fixture only supports namespace enumeration",
+        )
+    }
+
+    /// Build a minimal state whose opaque control binding exposes only the
+    /// namespace facts consumed by this Core AST rewrite.
+    fn state_with_namespace_catalog(
+        catalog_name: &str,
+        namespaces: Arc<Mutex<Vec<String>>>,
+    ) -> Arc<StandaloneState> {
         let state = Arc::new(StandaloneState {
             system_catalog: Arc::new(EchoSchemaNames::default()),
             ..StandaloneState::default()
         });
-        let properties = vec![(
-            "iceberg.catalog.warehouse".to_string(),
-            warehouse_path.to_string(),
-        )];
-        let entry = build_catalog_entry(catalog_name, &properties).expect("build catalog entry");
+        let fixture = crate::connector::scan_model::planned_files_fixture_binding(
+            catalog_name,
+            HashMap::new(),
+            None,
+        );
+        let binding = ConnectorControlBinding::try_new(
+            fixture.descriptor().clone(),
+            fixture.incarnation(),
+            Arc::new(NamespaceMetadata {
+                instance_id: fixture.descriptor().instance_id.clone(),
+                namespaces,
+            }),
+            Arc::clone(fixture.planning()),
+            Arc::clone(fixture.execution_distribution()),
+            None,
+        )
+        .expect("namespace fixture control binding");
         state
-            .iceberg_catalogs
-            .write()
-            .expect("registry lock")
-            .create_catalog(catalog_name, &properties)
-            .expect("register catalog");
-        crate::engine::register_iceberg_control_binding(&state, catalog_name)
-            .expect("register catalog control binding");
-        let _ = entry;
+            .connector_control
+            .register(binding)
+            .expect("register namespace fixture control binding");
         state
     }
 
@@ -609,23 +691,12 @@ mod tests {
 
     #[test]
     fn rewrite_registered_iceberg_catalog_information_schema_schemata() {
-        // Create a temporary warehouse directory with one namespace subdirectory.
-        let warehouse_dir = tempfile::tempdir().expect("tempdir");
-        let ns_dir = warehouse_dir.path().join("ns_alpha");
-        std::fs::create_dir_all(&ns_dir).expect("create namespace dir");
-
-        let warehouse_path = warehouse_dir.path().to_str().unwrap();
-        let base_state = state_with_local_catalog("myice", warehouse_path);
-        let state = Arc::new(StandaloneState {
-            catalog_service: Arc::clone(&base_state.catalog_service),
-            iceberg_catalogs: Arc::clone(&base_state.iceberg_catalogs),
-            connector_control: Arc::clone(&base_state.connector_control),
-            system_catalog: Arc::new(EchoSchemaNames::default()),
-            ..StandaloneState::default()
-        });
-
-        std::fs::create_dir_all(warehouse_dir.path().join("ns_live"))
-            .expect("create live namespace");
+        let namespaces = Arc::new(Mutex::new(vec!["ns_alpha".to_string()]));
+        let state = state_with_namespace_catalog("myice", Arc::clone(&namespaces));
+        namespaces
+            .lock()
+            .expect("namespace fixture lock")
+            .push("ns_live".to_string());
         let mut query = parse_query("SELECT schema_name FROM myice.information_schema.schemata");
         super::rewrite_query(&state, &mut query).expect("rewrite_query");
         assert!(format!("{query:?}").contains("ns_live"));
