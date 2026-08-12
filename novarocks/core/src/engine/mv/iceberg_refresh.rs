@@ -4895,7 +4895,7 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
         return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
     }
 
-    let pin = capture_refresh_snapshot_pin(state, &base_refs)?;
+    let pin = capture_refresh_snapshot_pin(state, &base_refs, connector_context)?;
     validate_repartition_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
     let pre_repartition = target_binding_for(state, &target, connector_context)?;
@@ -8947,7 +8947,8 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
         #[cfg(test)]
         invoke_after_observe_before_capture_hook();
         let pin = Arc::new(
-            capture_refresh_snapshot_pin(state, &base_refs).map_err(RefreshError::pre_commit)?,
+            capture_refresh_snapshot_pin(state, &base_refs, connector_context)
+                .map_err(RefreshError::pre_commit)?,
         );
         let captured_snapshot_ids = optional_snapshot_map(&pin);
         let captured_observation = RefreshExecutionObservation {
@@ -15386,7 +15387,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         validate_aggregate_schema_contract_metadata(&target, &mv_definition)?;
     }
 
-    let pin = capture_refresh_snapshot_pin(state, &base_refs)?;
+    let pin = capture_refresh_snapshot_pin(state, &base_refs, connector_context)?;
     validate_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
     let mut ctx = {
@@ -22069,7 +22070,12 @@ mod tests {
         );
         let base_ref = iceberg_ref("ice", "sales", "orders");
         let base_refs = vec![base_ref.clone()];
-        let pin = capture_refresh_snapshot_pin(&env.state, &base_refs).expect("capture base pin");
+        let pin = capture_refresh_snapshot_pin(
+            &env.state,
+            &base_refs,
+            &crate::connector::test_request_context(),
+        )
+        .expect("capture base pin");
         let frozen_snapshot_id = pin.get(&base_ref).expect("pinned base snapshot");
         let base_catalog_entries = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
@@ -23880,7 +23886,12 @@ mod tests {
         let [_base_ref] = base_refs.as_slice() else {
             panic!("expected single base ref");
         };
-        let pin = capture_refresh_snapshot_pin(&env.state, &base_refs).expect("capture pin");
+        let pin = capture_refresh_snapshot_pin(
+            &env.state,
+            &base_refs,
+            &crate::connector::test_request_context(),
+        )
+        .expect("capture pin");
         let physical_full_select_sql =
             prepare_projection_full_read_sql(&mv.select_sql, &pin, Some("ice"), &env.current_db)
                 .expect("prepare physical select with pin");
@@ -26876,7 +26887,12 @@ mod tests {
             .expect("mv definition");
         let base_refs =
             parse_iceberg_table_refs(&mv.base_table_refs).expect("parse base table refs");
-        let pin = capture_refresh_snapshot_pin(&env.state, &base_refs).expect("capture pin");
+        let pin = capture_refresh_snapshot_pin(
+            &env.state,
+            &base_refs,
+            &crate::connector::test_request_context(),
+        )
+        .expect("capture pin");
         let target = IcebergMvTarget {
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
@@ -26976,7 +26992,12 @@ mod tests {
         let [base_ref] = base_refs.as_slice() else {
             panic!("expected single base ref");
         };
-        let pin = capture_refresh_snapshot_pin(&env.state, &base_refs).expect("capture pin");
+        let pin = capture_refresh_snapshot_pin(
+            &env.state,
+            &base_refs,
+            &crate::connector::test_request_context(),
+        )
+        .expect("capture pin");
         let base_snapshot_id = pin.get(base_ref).expect("base snapshot");
         let current_table_uuid = pin.uuid(base_ref).expect("base table uuid").to_string();
         let physical_full_select_sql =

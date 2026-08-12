@@ -24,6 +24,7 @@ use crate::engine::mv_flow::execute_query_for_mv_refresh_with_catalog;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_execution::exec::chunk::Chunk;
+use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution};
 
 pub(crate) fn run_mv_full_select_chunks_with_catalog(
     state: &Arc<StandaloneState>,
@@ -63,6 +64,45 @@ pub(crate) fn load_current_iceberg_base_table(
     };
     entry.invalidate_table_cache(&table_ref.namespace, &table_ref.table);
     load_table(&entry, &table_ref.namespace, &table_ref.table)
+}
+
+/// Freeze the narrow base-table facts used by one MV refresh attempt.
+///
+/// Metadata and the observation are resolved through the same exact planning
+/// lease. Callers must retain the returned value instead of re-resolving the
+/// connector's latest generation within the same decision.
+pub(crate) fn observe_current_refresh_base(
+    state: &Arc<StandaloneState>,
+    table_ref: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &table_ref.catalog,
+    )?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &table_ref.namespace,
+        &table_ref.table,
+        ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let observation = state
+        .mv_storage_observation
+        .observe_refresh_base(&exact_lease, &metadata, connector_context.clone())
+        .map_err(|error| {
+            format!(
+                "observe MV refresh base facts for {}: {error}",
+                table_ref.fqn()
+            )
+        })?;
+    if observation.table() != &metadata.identity {
+        return Err(format!(
+            "MV refresh base observation identity does not match loaded metadata for {}",
+            table_ref.fqn()
+        ));
+    }
+    Ok(observation)
 }
 
 pub(crate) fn single_snapshot_map(

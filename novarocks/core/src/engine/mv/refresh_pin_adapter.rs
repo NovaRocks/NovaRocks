@@ -20,30 +20,30 @@ use std::sync::Arc;
 use crate::engine::StandaloneState;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::ConnectorRequestContext;
 
 pub(crate) fn capture_refresh_snapshot_pin(
     state: &Arc<StandaloneState>,
     base_refs: &[TableIdentity],
+    connector_context: &ConnectorRequestContext,
 ) -> Result<RefreshSnapshotPin, String> {
     let mut entries = Vec::with_capacity(base_refs.len());
     for base_ref in base_refs {
-        let loaded =
-            crate::engine::mv::refresh_io::load_current_iceberg_base_table(state, base_ref)?;
-        let snapshot_id = loaded
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|snapshot| snapshot.snapshot_id())
-            .ok_or_else(|| {
-                format!(
-                    "iceberg base table {} has no current snapshot; cannot freeze refresh pin",
-                    base_ref.fqn()
-                )
-            })?;
+        let observed = crate::engine::mv::refresh_io::observe_current_refresh_base(
+            state,
+            base_ref,
+            connector_context,
+        )?;
+        let snapshot_id = observed.current_snapshot_id().ok_or_else(|| {
+            format!(
+                "iceberg base table {} has no current snapshot; cannot freeze refresh pin",
+                base_ref.fqn()
+            )
+        })?;
         entries.push((
             base_ref.clone(),
             snapshot_id,
-            loaded.table.metadata().uuid().to_string(),
+            observed.table_uuid().to_string(),
         ));
     }
     Ok(RefreshSnapshotPin::from_captured_entries(entries))

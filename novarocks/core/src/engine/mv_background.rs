@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::StandaloneState;
-use crate::engine::mv::refresh_io::{load_current_iceberg_base_table, parse_iceberg_table_refs};
+use crate::engine::mv::refresh_io::{observe_current_refresh_base, parse_iceberg_table_refs};
 use crate::engine::table_maintenance::MaintenanceTarget;
 use crate::mv::application::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
@@ -154,19 +154,24 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
         let refs = parse_iceberg_table_refs(&definition.base_table_refs).map_err(|error| {
             MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::InvalidDefinition, error)
         })?;
+        let connector_context = crate::connector::connector_request_context(
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .map_err(|error| {
+            MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
+        })?;
         refs.into_iter()
             .map(|table_ref| {
-                let snapshot = load_current_iceberg_base_table(&self.state, &table_ref)
-                    .map_err(|error| {
-                        MvBackgroundEngineError::new(
-                            MvBackgroundEngineErrorKind::TransientUnavailable,
-                            error,
-                        )
-                    })?
-                    .table
-                    .metadata()
-                    .current_snapshot()
-                    .map(|snapshot| snapshot.snapshot_id());
+                let snapshot =
+                    observe_current_refresh_base(&self.state, &table_ref, &connector_context)
+                        .map_err(|error| {
+                            MvBackgroundEngineError::new(
+                                MvBackgroundEngineErrorKind::TransientUnavailable,
+                                error,
+                            )
+                        })?
+                        .current_snapshot_id();
                 Ok((table_ref.fqn(), snapshot))
             })
             .collect()
