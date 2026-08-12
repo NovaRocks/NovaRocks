@@ -106,6 +106,7 @@ fn activate_iceberg_direct_row_mutation(
                 primary,
                 b"direct-position-delete",
                 effects,
+                ConnectorWriteIntent::RowDelta,
                 input,
                 iceberg_position_partition_tokens(preparation)?,
             )?);
@@ -125,6 +126,7 @@ fn activate_iceberg_direct_row_mutation(
                 primary,
                 b"direct-equality-delete",
                 effects,
+                ConnectorWriteIntent::RowDelta,
                 input,
                 Vec::new(),
             )?);
@@ -147,6 +149,7 @@ fn activate_iceberg_direct_row_mutation(
                     iceberg_row_mutation_direct_cohort(preparation, b"mor-delete")?,
                     b"mor-delete",
                     delete_effects,
+                    ConnectorWriteIntent::RowDelta,
                     iceberg_mor_delete_input(preparation)?,
                     iceberg_position_partition_tokens(preparation)?,
                 )?);
@@ -159,6 +162,7 @@ fn activate_iceberg_direct_row_mutation(
                     iceberg_row_mutation_direct_cohort(preparation, b"mor-replacement")?,
                     b"mor-replacement",
                     replacement_effects,
+                    ConnectorWriteIntent::RowDelta,
                     iceberg_cow_rewrite_input(preparation)?,
                     Vec::new(),
                 )?);
@@ -171,6 +175,8 @@ fn activate_iceberg_direct_row_mutation(
                     iceberg_row_mutation_direct_cohort(preparation, b"mor-insert")?,
                     b"mor-insert",
                     insert_effects,
+                    // Inserted rows are published as data files.
+                    ConnectorWriteIntent::Append,
                     ConnectorWriteInputShape::Data {
                         fields: target_bindings(preparation.match_contract().after_fields()),
                     },
@@ -371,11 +377,16 @@ fn admitted_effects(
         .collect()
 }
 
+/// One route's write intent is the shape of what it physically publishes, not
+/// the logical mutation it serves: a route that only appends data files is an
+/// append even inside a merge-on-read mutation. The commit action is selected
+/// from these intents, and a row-delta commit accepts delete files only.
 fn iceberg_row_mutation_route(
     preparation: &ConnectorRowMutationPreparation,
     cohort_id: ConnectorWriteCohortId,
     route_kind: &[u8],
     effects: Vec<ConnectorRowMutationEffect>,
+    intent: ConnectorWriteIntent,
     input: ConnectorWriteInputShape,
     partition_fields: Vec<ConnectorWriteFieldToken>,
 ) -> Result<ConnectorRowMutationRoute, ConnectorError> {
@@ -383,7 +394,7 @@ fn iceberg_row_mutation_route(
         preparation.owner().clone(),
         preparation.table().clone(),
         preparation.target_ref().clone(),
-        ConnectorWriteIntent::RowDelta,
+        intent,
         preparation.base_version().clone(),
         input,
         iceberg_row_mutation_route_payload(preparation, route_kind),

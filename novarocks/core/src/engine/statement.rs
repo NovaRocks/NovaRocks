@@ -1249,6 +1249,9 @@ fn is_missing_table_guard_error(err: &str) -> bool {
     lower.contains("unknown table:")
         || lower.contains("table not found")
         || lower.contains("no metadata files")
+        // Catalog backends normalize absence differently; the REST client
+        // reports that the table does not exist.
+        || lower.contains("does not exist")
 }
 
 fn cleanup_iceberg_drop_table_registration_if_exists(

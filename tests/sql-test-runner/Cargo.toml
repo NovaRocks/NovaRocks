@@ -15,6 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Own workspace root. The repository root manifest excludes this directory so the
+# runner keeps its own [profile.*] tables, but relying on that exclusion alone
+# breaks whenever the checkout lives inside another checkout (for example a git
+# worktree under <repo>/.claude/worktrees/): cargo then walks past the local
+# root and lands on the outer workspace, which neither lists nor excludes this
+# path. Declaring an empty workspace here stops that upward search.
+[workspace]
+
 [package]
 name = "starust-sql-tests"
 version = "0.1.0"

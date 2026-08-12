@@ -175,6 +175,39 @@ pub fn annotate_schema_from_scan_model(
     )))
 }
 
+/// Re-annotate a read output schema with the provider-owned field facts carried
+/// by the frozen Iceberg schema: parquet field IDs and each column's
+/// spec-encoded initial default. iceberg-rust's Arrow conversion drops initial
+/// defaults, so without this a data file written before `ADD COLUMN ... DEFAULT`
+/// reads back as NULL instead of the column's default.
+///
+/// A field with no frozen counterpart is returned unchanged: metadata
+/// pseudo-columns own their own identity, and a frozen row-mutation source
+/// projects an older snapshot schema whose columns may since have been renamed.
+pub fn annotate_read_schema_from_scan_model(
+    output_schema: &SchemaRef,
+    iceberg_schema: &IcebergSchemaDef,
+) -> Result<SchemaRef, String> {
+    let fields = output_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let Some(frozen) = iceberg_schema
+                .fields
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(field.name()))
+            else {
+                return Ok(field.as_ref().clone());
+            };
+            apply_scan_field_id_recursive(field.as_ref(), frozen)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        output_schema.metadata().clone(),
+    )))
+}
+
 fn is_write_virtual_column(name: &str) -> bool {
     matches!(name, "_file" | "_pos" | "__change_op") || name.starts_with("__nr_var_")
 }

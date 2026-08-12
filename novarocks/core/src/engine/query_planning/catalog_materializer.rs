@@ -120,7 +120,15 @@ fn load_connector_table_materialization_with_resolution(
             resolution,
             context,
         })
-        .map_err(|error| error.to_string())?;
+        // An absent relation is a SQL name-resolution failure, not a provider
+        // incident: render the vocabulary the rest of the engine already
+        // recognizes instead of leaking the provider's own wording.
+        .map_err(|error| match error.kind() {
+            novarocks_spi::connector::ConnectorErrorKind::NotFound => {
+                format!("unknown table: {namespace}.{table}")
+            }
+            _ => error.to_string(),
+        })?;
     connector_table_materialization_from_metadata(metadata, planning_lease)
 }
 

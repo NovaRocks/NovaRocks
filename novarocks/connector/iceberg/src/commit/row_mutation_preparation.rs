@@ -973,9 +973,12 @@ mod tests {
             )
             .expect("prepare"),
         );
+        // An insert-only merge matches no live row, so it has no copy-on-write
+        // rewrite to express and no bounded selection to activate one with. It
+        // resolves to merge-on-read, whose insert route publishes data files.
         assert_eq!(
             preparation.strategy(),
-            ConnectorRowMutationStrategy::CopyOnWrite
+            ConnectorRowMutationStrategy::MergeOnRead
         );
         assert!(
             preparation.match_contract().identity_fields()[0]

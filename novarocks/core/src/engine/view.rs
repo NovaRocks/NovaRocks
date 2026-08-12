@@ -222,7 +222,16 @@ impl ViewEngine for StandaloneState {
             context: context.clone(),
         }) {
             Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(view))),
-            Err(error) if error.kind() == ConnectorErrorKind::NotFound => {
+            // A catalog that cannot host views has none, so resolution treats
+            // that exactly like an absent view and the name falls through to
+            // the ordinary unknown-relation error. Creating a view still fails
+            // loudly with the provider's capability error.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
+                ) =>
+            {
                 Ok(ExternalViewResolution::Missing)
             }
             Err(error) => Err(error.to_string()),
@@ -334,7 +343,16 @@ impl ViewEngine for StandaloneState {
             context: context.clone(),
         }) {
             Ok(view) => Ok(Some(resolved_external_view(view))),
-            Err(error) if error.kind() == ConnectorErrorKind::NotFound => Ok(None),
+            // See `resolve_external_view`: a catalog without view support has
+            // no view to find.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
+                ) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(error.to_string()),
         }
     }

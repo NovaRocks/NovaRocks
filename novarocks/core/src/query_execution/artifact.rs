@@ -698,7 +698,13 @@ fn attach_connector_write_plans(
             let fragment_id = u32::try_from(writer.fragment_id()).map_err(|_| {
                 contract_error("connector writer manifest contains a negative fragment ID")
             })?;
-            if cohort_by_fragment.insert(fragment_id, cohort_id).is_some() {
+            // A manifest carries one writer per scheduled placement, so the same
+            // terminal fragment legitimately repeats within a cohort. Only two
+            // different cohorts claiming one fragment breaks the partition.
+            if cohort_by_fragment
+                .insert(fragment_id, cohort_id)
+                .is_some_and(|previous| previous != cohort_id)
+            {
                 return Err(contract_error(format!(
                     "connector write plan manifests overlap at terminal fragment {fragment_id}"
                 )));
@@ -1938,9 +1944,14 @@ fn assemble_native_execution(
             let fragment_id = u32::try_from(writer.fragment_id()).map_err(|_| {
                 contract_error("connector writer manifest contains a negative fragment ID")
             })?;
+            // One writer per scheduled placement means a distributed writer
+            // fragment repeats inside its own cohort; only a second cohort
+            // claiming the fragment is a contract violation.
             if connector_attachment_by_fragment
                 .insert(fragment_id, attachment)
-                .is_some()
+                .is_some_and(|previous| {
+                    previous.manifest().cohort_id() != attachment.manifest().cohort_id()
+                })
             {
                 return Err(contract_error(format!(
                     "connector write plans assign terminal fragment {fragment_id} to multiple cohorts"
@@ -2634,6 +2645,43 @@ mod tests {
                 .contains("does not match a validated fragment placement")
         );
         assert!(mismatched_slot.is_empty());
+    }
+
+    #[test]
+    fn connector_write_attachment_accepts_one_fragment_placed_on_every_backend() {
+        // A distributed writer fragment is placed once per backend, so its
+        // cohort manifest carries three writers that all report fragment 3.
+        let execution = write_execution();
+        let schedule = SchedulingPlan {
+            root_fragment_id: 3,
+            by_fragment: BTreeMap::from([(
+                3,
+                vec![
+                    placement(3, 0, UniqueId::new(3, 30), 8),
+                    placement(3, 1, UniqueId::new(3, 31), 9),
+                    placement(3, 2, UniqueId::new(3, 32), 10),
+                ],
+            )]),
+            root_finst_id: UniqueId::new(3, 30),
+            root_backend_idx: 8,
+        };
+        let terminal_fragments = BTreeSet::from([3]);
+        let mut slot = BTreeMap::new();
+        attach_connector_write_plans(
+            &mut slot,
+            &schedule,
+            execution,
+            &terminal_fragments,
+            std::iter::once(planned_attachment(&schedule)),
+        )
+        .expect("one cohort covers every placement of its terminal writer fragment");
+        assert_eq!(slot.len(), 1);
+        assert_eq!(
+            slot.values()
+                .flat_map(|attachment| attachment.manifest().writers())
+                .count(),
+            3
+        );
     }
 
     #[test]

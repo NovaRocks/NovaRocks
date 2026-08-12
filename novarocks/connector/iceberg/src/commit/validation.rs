@@ -223,6 +223,16 @@ pub fn row_mutation_strategy_from_metadata(
             }
         }
         ConnectorRowMutationIntent::Update | ConnectorRowMutationIntent::Merge { .. } => {
+            // An insert-only MERGE rewrites nothing: no live row is matched, so
+            // there is no copy-on-write rewrite to express and the mutation is
+            // append-shaped. Resolving it before the update-mode property keeps
+            // a copy-on-write table from demanding a bounded selection that an
+            // insert-only merge can never produce.
+            if !intent.accepts(ConnectorRowMutationEffect::Delete)
+                && !intent.accepts(ConnectorRowMutationEffect::Replace)
+            {
+                return Ok(ConnectorRowMutationStrategy::MergeOnRead);
+            }
             let mode = select_update_mode_from_properties(
                 metadata.format_version(),
                 metadata.properties(),

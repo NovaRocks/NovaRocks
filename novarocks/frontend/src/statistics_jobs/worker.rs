@@ -228,12 +228,29 @@ async fn run_worker(
         if stop.load(Ordering::Acquire) || executor.upgrade().is_none() {
             return Ok(());
         }
-        match coordination
-            .acquire()
-            .await
-            .map_err(|error| format!("acquire statistics worker lease failed: {error}"))?
-        {
-            AcquireOutcome::Acquired(mut guard) => {
+        let acquired = match coordination.acquire().await {
+            Ok(outcome) => Some(outcome),
+            // A definite transaction conflict acquires no lease and is retried
+            // on the next poll, exactly as `release_worker_lease` retries it;
+            // a closed write path means teardown already started. Both are
+            // routine during FE shutdown, while other StateStore-backed workers
+            // finish their writes, and neither may turn worker teardown into a
+            // failed shutdown.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    CoordinationErrorKind::OperationNotCommitted
+                        | CoordinationErrorKind::WriteClosed
+                ) =>
+            {
+                None
+            }
+            Err(error) => {
+                return Err(format!("acquire statistics worker lease failed: {error}"));
+            }
+        };
+        match acquired {
+            Some(AcquireOutcome::Acquired(mut guard)) => {
                 let current_fence = CurrentLeaseFence::new(guard.fence());
                 let fence = current_fence.validator();
                 process_cancellation_requests(&repository, now_unix_millis(), &fence).await?;
@@ -273,7 +290,7 @@ async fn run_worker(
                 release
                     .map_err(|error| format!("release statistics worker lease failed: {error}"))?;
             }
-            AcquireOutcome::Contended(_) | AcquireOutcome::AwaitingTakeover(_) => {}
+            Some(AcquireOutcome::Contended(_) | AcquireOutcome::AwaitingTakeover(_)) | None => {}
         }
         tokio::select! {
             _ = wakeup.notified() => {}

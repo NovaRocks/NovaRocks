@@ -25,6 +25,7 @@
 use std::sync::Arc;
 
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_spi::connector::ConnectorErrorKind;
 
 use crate::catalog_control::IcebergCatalogControlState;
 use crate::iceberg::{NamespaceIdent, TableIdent};
@@ -90,28 +91,52 @@ impl IcebergControlRuntime {
         namespace: &str,
         table: &str,
     ) -> Result<IcebergPhysicalTable, String> {
-        let namespace = normalize_identifier(namespace)?;
-        let table = normalize_identifier(table)?;
+        self.load_table_classified(namespace, table)
+            .map_err(|(_, message)| message)
+    }
+
+    /// Load a table while keeping the catalog's own error classification.
+    ///
+    /// The string-returning `load_table` erases it, but the metadata SPI has to
+    /// keep absence distinguishable from a transport failure: callers drive
+    /// `CREATE ... IF NOT EXISTS` and MV target creation off
+    /// `ConnectorErrorKind::NotFound`, and an absent table reported as
+    /// `Unavailable` turns those into hard errors.
+    pub(crate) fn load_table_classified(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
+        let table = normalize_identifier(table).map_err(invalid_request)?;
         if let Some(table) = self
             .control_state
             .physical_table_cache()
-            .get(&namespace, &table)?
+            .get(&namespace, &table)
+            .map_err(unavailable)?
         {
             return Ok(table);
         }
         let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
-            .map_err(|error| format!("build Iceberg table identity: {error}"))?;
+            .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
         let catalog = Arc::clone(&self.catalog);
         let loaded = self
             .resources
             .catalog_runtime()
-            .block_on(async move { catalog.load_table(&ident).await })?
-            .map_err(|error| format!("load Iceberg table {namespace}.{table}: {error}"))?;
+            .block_on(async move { catalog.load_table(&ident).await })
+            .map_err(unavailable)?
+            .map_err(|error| {
+                (
+                    catalog_error_kind(&error),
+                    format!("load Iceberg table {namespace}.{table}: {error}"),
+                )
+            })?;
         let physical =
             IcebergPhysicalTable::new(loaded, self.control_state.object_store_config().cloned());
         self.control_state
             .physical_table_cache()
-            .insert(&namespace, &table, physical.clone())?;
+            .insert(&namespace, &table, physical.clone())
+            .map_err(unavailable)?;
         Ok(physical)
     }
 
@@ -183,6 +208,38 @@ impl IcebergControlRuntime {
     ) -> &Arc<crate::write_activation::IcebergWriteActivationReservations> {
         &self.write_activations
     }
+}
+
+fn invalid_request(message: String) -> (ConnectorErrorKind, String) {
+    (ConnectorErrorKind::InvalidRequest, message)
+}
+
+fn unavailable(message: String) -> (ConnectorErrorKind, String) {
+    (ConnectorErrorKind::Unavailable, message)
+}
+
+/// Project a catalog client error onto the neutral connector classification.
+/// Only absence is special: everything else stays a retryable control-plane
+/// failure, exactly as the string-returning path reports it.
+fn catalog_error_kind(error: &crate::iceberg::Error) -> ConnectorErrorKind {
+    if matches!(
+        error.kind(),
+        crate::iceberg::ErrorKind::TableNotFound | crate::iceberg::ErrorKind::NamespaceNotFound
+    ) {
+        return ConnectorErrorKind::NotFound;
+    }
+    // Catalog backends disagree about how to tag a missing table — the REST
+    // client reports `Unexpected` — so absence is also recognized from the
+    // wording each backend normalizes to.
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("not found")
+        || message.contains("does not exist")
+        || message.contains("unknown table")
+        || message.contains("no metadata files")
+    {
+        return ConnectorErrorKind::NotFound;
+    }
+    ConnectorErrorKind::Unavailable
 }
 
 impl std::fmt::Debug for IcebergControlRuntime {

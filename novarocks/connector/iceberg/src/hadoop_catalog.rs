@@ -286,7 +286,7 @@ impl Catalog for HadoopFileSystemCatalog {
                 // create_table and populate the cache via try_cache_existing_table.
                 self.try_cache_existing_table(table).await.ok_or_else(|| {
                     Error::new(
-                        ErrorKind::FeatureUnsupported,
+                        ErrorKind::TableNotFound,
                         format!("table not found: {}", key),
                     )
                 })?

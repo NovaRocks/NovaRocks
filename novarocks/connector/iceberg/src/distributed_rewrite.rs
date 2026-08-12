@@ -1255,8 +1255,25 @@ pub(crate) fn rewrite_input_schema(
     physical_schema: SchemaRef,
     row_lineage: bool,
 ) -> SchemaRef {
-    match operation {
-        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } if row_lineage => {
+    frozen_rewrite_scan_schema(operation.kind(), physical_schema, row_lineage)
+}
+
+/// The schema one frozen rewrite cohort reads.
+///
+/// Planning freezes this into the cohort plan and `begin_scan` has to reproduce
+/// it field-for-field — the frozen read refuses a scan whose output schema
+/// differs — so both sides resolve it here rather than deriving it twice.
+pub(crate) fn frozen_rewrite_scan_schema(
+    operation_kind: &str,
+    physical_schema: SchemaRef,
+    row_lineage: bool,
+) -> SchemaRef {
+    match operation_kind {
+        REWRITE_POSITION_DELETES_KIND => Arc::new(Schema::new(vec![
+            Field::new("_file", DataType::Utf8, false),
+            Field::new("_pos", DataType::Int64, false),
+        ])),
+        _ if row_lineage => {
             let mut fields = physical_schema.fields().to_vec();
             fields.extend([
                 Arc::new(Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false)),
@@ -1268,14 +1285,22 @@ pub(crate) fn rewrite_input_schema(
             ]);
             Arc::new(Schema::new(fields))
         }
-        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => physical_schema,
-        ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => {
-            Arc::new(Schema::new(vec![
-                Field::new("_file", DataType::Utf8, false),
-                Field::new("_pos", DataType::Int64, false),
-            ]))
-        }
+        _ => physical_schema,
     }
+}
+
+/// Decode the optional frozen-rewrite facts a rewrite source handle carries.
+/// An ordinary table handle has none and yields `None`.
+pub(crate) fn frozen_rewrite_source_facts(
+    payload: &[u8],
+) -> Result<Option<(String, IcebergRewriteGroupPayloadV1)>, ConnectorError> {
+    let value: Value = serde_json::from_slice(payload)
+        .map_err(|error| invalid(format!("decode Iceberg rewrite source: {error}")))?;
+    if value.get("frozen_rewrite").is_none_or(Value::is_null) {
+        return Ok(None);
+    }
+    let (_, _, operation_kind, group) = decode_frozen_rewrite_source(payload)?;
+    Ok(Some((operation_kind, group)))
 }
 
 fn group_payload(

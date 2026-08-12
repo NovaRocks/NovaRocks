@@ -747,6 +747,22 @@ fn partition_field_name(field: &ConnectorPartitionTransform) -> String {
     }
 }
 
+/// Iceberg time-based partition transforms are specified on microsecond
+/// timestamps. Deriving one from a nanosecond source would silently
+/// mis-partition every row, so the spec gap fails fast and says why.
+fn reject_nanosecond_partition_source(data_type: &Type) -> Result<(), String> {
+    if matches!(
+        data_type,
+        Type::Primitive(PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs)
+    ) {
+        return Err(
+            "time-based partition transforms cannot derive partitions from a nanosecond timestamp source"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_partition_transform(
     schema: &Schema,
     source_id: i32,
@@ -763,6 +779,7 @@ fn validate_partition_transform(
         ConnectorPartitionTransform::Year { .. }
         | ConnectorPartitionTransform::Month { .. }
         | ConnectorPartitionTransform::Day { .. } => {
+            reject_nanosecond_partition_source(data_type)?;
             if !matches!(
                 data_type,
                 Type::Primitive(
@@ -775,6 +792,7 @@ fn validate_partition_transform(
             }
         }
         ConnectorPartitionTransform::Hour { .. } => {
+            reject_nanosecond_partition_source(data_type)?;
             if !matches!(
                 data_type,
                 Type::Primitive(PrimitiveType::Timestamp | PrimitiveType::Timestamptz)

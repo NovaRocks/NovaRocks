@@ -1007,6 +1007,16 @@ impl IcebergWriteControl {
         cow_recipe: Option<&crate::row_mutation_payload::IcebergCowRecipePayloadV3>,
     ) -> Result<Bytes, ConnectorError> {
         if let Some(recipe) = cow_recipe {
+            // A copy-on-write cohort carries its private rewrite recipe instead
+            // of a plan payload, so it has nowhere to stamp MV provenance.
+            if matches!(
+                request.intent,
+                ConnectorWriteActivationIntent::ManagedPublication(_)
+            ) {
+                return Err(invalid(
+                    "Iceberg managed publication cannot publish a copy-on-write cohort",
+                ));
+            }
             let base_snapshot_id = target_snapshot_id
                 .ok_or_else(|| invalid("Iceberg COW cohort requires a frozen base snapshot"))?;
             match recipe.role.as_str() {
@@ -1044,11 +1054,10 @@ impl IcebergWriteControl {
         match &request.intent {
             ConnectorWriteActivationIntent::Ordinary => plan.encode(),
             ConnectorWriteActivationIntent::ManagedPublication(intent) => {
-                if !matches!(&request.source, ConnectorWriteActivationSource::Prepared(_)) {
-                    return Err(invalid(
-                        "Iceberg managed publication requires one prepared write source",
-                    ));
-                }
+                // A refresh publishes either a prepared staging write (full
+                // refresh) or the provider routes of a row-mutation apply
+                // (incremental refresh). Both stamp the same provenance; only a
+                // copy-on-write cohort is refused, above.
                 let provenance = super::MvProvenanceV1 {
                     provenance_version: super::MV_PROVENANCE_VERSION,
                     refresh_id: intent.refresh_id(),
@@ -1237,6 +1246,7 @@ impl IcebergWriteControl {
                 active.activation_intent,
                 ConnectorWriteActivationIntent::Ordinary
             )
+            && !replaces_every_live_row(&decoded)
         {
             return Err(CommitServiceError::invalid_input(
                 "known-empty Iceberg writes must terminate through provider abort".to_string(),
@@ -1280,8 +1290,12 @@ impl IcebergWriteControl {
             .with_table_metadata(commit_metadata.clone()),
         );
         for cohort in &decoded {
+            // The net-new INSERT channel accepts data only. A collapsed cohort
+            // that also carries deletion vectors goes through the reuse channel,
+            // which partitions the mixed delta by content.
             if op_kind == CommitOpKind::RowDeltaDvFromFiles
                 && cohort.intent == novarocks_spi::connector::ConnectorWriteIntent::Append
+                && cohorts_carry_data_only(std::slice::from_ref(cohort))
             {
                 collector.inject_appended_files(cohort.files.clone());
             } else {
@@ -2494,6 +2508,28 @@ fn snapshot_is_main_ancestor(
     false
 }
 
+/// Whether every staged file is table data. Delete-file content means the
+/// cohorts carry a row delta, whatever their declared intent.
+fn cohorts_carry_data_only(cohorts: &[DecodedCohort]) -> bool {
+    cohorts
+        .iter()
+        .flat_map(|cohort| &cohort.files)
+        .all(|file| file.content == crate::iceberg::spec::DataContentType::Data)
+}
+
+/// Whether an ordinary write that staged no files still has a snapshot to
+/// publish. A full overwrite replaces every live row, so staging nothing means
+/// "replace all rows with nothing" and must commit; `OverwriteCommit` degrades
+/// to a real no-op only when the base is empty too. Every other ordinary intent
+/// adds to what is already live, so an empty stage has nothing to publish and
+/// has to terminate through abort.
+fn replaces_every_live_row(cohorts: &[DecodedCohort]) -> bool {
+    !cohorts.is_empty()
+        && cohorts.iter().all(|cohort| {
+            cohort.intent == novarocks_spi::connector::ConnectorWriteIntent::Overwrite
+        })
+}
+
 fn commit_shape(
     active: &ActiveOperation,
     cohorts: &[DecodedCohort],
@@ -2560,7 +2596,17 @@ fn commit_shape(
         .into_iter()
         .collect::<Vec<_>>();
     let kind = match intents.as_slice() {
-        [novarocks_spi::connector::ConnectorWriteIntent::Append] => CommitOpKind::FastAppend,
+        [novarocks_spi::connector::ConnectorWriteIntent::Append] => {
+            // A caller that collapses a multi-route mutation onto one sealed
+            // cohort publishes the whole delta through that cohort, so an
+            // append-intent cohort can still carry deletion vectors. Only a
+            // data-only cohort set is a fast append.
+            if cohorts_carry_data_only(cohorts) {
+                CommitOpKind::FastAppend
+            } else {
+                CommitOpKind::RowDeltaDvFromFiles
+            }
+        }
         [novarocks_spi::connector::ConnectorWriteIntent::Overwrite] => CommitOpKind::Overwrite,
         [novarocks_spi::connector::ConnectorWriteIntent::PartitionOverwrite] => {
             CommitOpKind::OverwritePartitions

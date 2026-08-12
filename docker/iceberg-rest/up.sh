@@ -370,6 +370,11 @@ user = "root"
 endpoint = "$minio_endpoint"
 access_key_id = "$minio_user"
 access_key_secret = "$minio_password"
+# Every generated and suite-owned CREATE EXTERNAL CATALOG statement declares
+# aws.s3.region, and the Iceberg control factory rejects a catalog whose
+# object-store credentials differ from this server-composed binding, so the
+# region has to be stated on both sides.
+region = "us-east-1"
 enable_path_style_access = true
 EOF
 
@@ -404,6 +409,11 @@ mv_refresh_scheduler_max_failure_backoff_ms = 2000
 endpoint = "$minio_endpoint"
 access_key_id = "$minio_user"
 access_key_secret = "$minio_password"
+# Every generated and suite-owned CREATE EXTERNAL CATALOG statement declares
+# aws.s3.region, and the Iceberg control factory rejects a catalog whose
+# object-store credentials differ from this server-composed binding, so the
+# region has to be stated on both sides.
+region = "us-east-1"
 enable_path_style_access = true
 EOF
 

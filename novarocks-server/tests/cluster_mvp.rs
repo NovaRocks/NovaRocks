@@ -2862,6 +2862,7 @@ fn cross_process_three_be_frontend_ctas_truncate_lifecycle() {
 endpoint = "{s3_endpoint}"
 access_key_id = "{s3_access_key}"
 access_key_secret = "{s3_secret_key}"
+region = "us-east-1"
 enable_path_style_access = true
 "#
     );
@@ -3225,6 +3226,7 @@ AS source(old_note, old_id);
 endpoint = "{s3_endpoint}"
 access_key_id = "{s3_access_key}"
 access_key_secret = "{s3_secret_key}"
+region = "us-east-1"
 enable_path_style_access = true
 "#
     );
@@ -3360,6 +3362,7 @@ fn cross_process_three_be_frontend_update_merge_lifecycle() {
 endpoint = "{s3_endpoint}"
 access_key_id = "{s3_access_key}"
 access_key_secret = "{s3_secret_key}"
+region = "us-east-1"
 enable_path_style_access = true
 "#
     );

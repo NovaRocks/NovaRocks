@@ -88,11 +88,11 @@ pub use retry::{
 pub use rewrite_data_files::{
     LiveDataFileCompactionStats, current_live_data_file_compaction_stats,
 };
+pub(crate) use service::RecoveryEvidence;
 pub use service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome,
     classify_commit_error,
 };
-pub(crate) use service::RecoveryEvidence;
 pub use snapshot_lifecycle_helpers::{
     FileSet, build_dv_index, compute_live_snapshot_set, enumerate_files_for_snapshots,
     is_puffin_path, puffin_half_reference_protection,
