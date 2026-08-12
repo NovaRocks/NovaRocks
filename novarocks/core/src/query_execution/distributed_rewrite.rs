@@ -250,7 +250,7 @@ impl ConnectorDistributedRewriteSession {
             .write_session
             .as_ref()
             .expect("validated rewrite completion has a write session")
-            .supersede_attempt(completion.attachment(), completion.input())?;
+            .supersede_attempt(completion.attachment()?, completion.input()?)?;
         self.persist_checkpoint(
             ConnectorDistributedRewriteAttemptDisposition::Superseded,
             attempt,
@@ -821,7 +821,8 @@ mod tests {
                 session
                     .execution_registration(cohort_id)
                     .unwrap()
-                    .cohort_id(),
+                    .single_cohort_id()
+                    .unwrap(),
                 cohort_id
             );
         }

@@ -191,6 +191,7 @@ impl DeleteEngine for Arc<StandaloneState> {
         };
         let has_staged_output = completion
             .input()
+            .map_err(|error| error.to_string())?
             .reports()
             .iter()
             .any(|report| report.summary().artifact_count > 0);

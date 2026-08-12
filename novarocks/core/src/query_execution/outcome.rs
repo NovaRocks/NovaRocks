@@ -17,6 +17,8 @@
 
 //! Intent-bound completion capability.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
@@ -26,7 +28,7 @@ use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use crate::runtime::query_result::QueryResult;
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorWriteCohortId};
 
 /// Role-neutral execution data assembled by core engine flows before intent
 /// validation seals the public distributed-query outcome.
@@ -174,8 +176,8 @@ impl ConnectorWriteStagingSummary {
 /// report set.
 pub struct ConnectorWriteCompletion {
     session: ConnectorWriteOperationSession,
-    attachment: ConnectorWritePlanAttachment,
-    input: ConnectorWriteCommitInput,
+    attempts:
+        BTreeMap<ConnectorWriteCohortId, (ConnectorWritePlanAttachment, ConnectorWriteCommitInput)>,
 }
 
 impl ConnectorWriteCompletion {
@@ -184,60 +186,100 @@ impl ConnectorWriteCompletion {
         attachment: ConnectorWritePlanAttachment,
         commit: &WriteCommitInput,
     ) -> Result<Self, DistributedQueryError> {
-        let input = ConnectorWriteCommitInput::try_extract(commit)?.ok_or_else(|| {
-            DistributedQueryError::new(
+        Self::from_write_commits(session, std::iter::once(attachment), commit)
+    }
+
+    pub fn from_write_commits(
+        session: ConnectorWriteOperationSession,
+        attachments: impl IntoIterator<Item = ConnectorWritePlanAttachment>,
+        commit: &WriteCommitInput,
+    ) -> Result<Self, DistributedQueryError> {
+        let inputs = ConnectorWriteCommitInput::try_extract_grouped(commit)?;
+        if inputs.is_empty() {
+            return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "connector write attachment completed without generic staged reports",
-            )
-        })?;
-        let manifest = attachment.manifest();
-        if input.owner() != manifest.owner()
-            || input.operation_id() != manifest.operation_id()
-            || input.cohort_id() != manifest.cohort_id()
-            || input.execution_id() != manifest.execution_id()
+                "connector write attachments completed without generic staged reports",
+            ));
+        }
+        let mut attachments_by_cohort = BTreeMap::new();
+        for attachment in attachments {
+            if attachments_by_cohort
+                .insert(attachment.manifest().cohort_id(), attachment)
+                .is_some()
+            {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "connector write completion contains duplicate cohort attachments",
+                ));
+            }
+        }
+        let mut attachments = attachments_by_cohort;
+        if attachments.len() != inputs.len()
+            || attachments.keys().copied().collect::<BTreeSet<_>>()
+                != inputs.keys().copied().collect::<BTreeSet<_>>()
         {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "generic staged reports do not match the frozen connector write attachment",
+                "generic staged report cohorts do not exactly match connector write attachments",
             ));
         }
-        let expected = manifest
-            .writers()
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        let actual = input
-            .reports()
-            .iter()
-            .map(|report| report.writer().clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        if expected != actual || input.reports().len() != actual.len() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "generic staged reports do not exactly cover the frozen connector writer manifest",
-            ));
+        let mut attempts = BTreeMap::new();
+        for (cohort_id, input) in inputs {
+            let attachment = attachments.remove(&cohort_id).ok_or_else(|| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "generic staged report cohort has no connector write attachment",
+                )
+            })?;
+            validate_connector_write_attempt(&attachment, &input)?;
+            attempts.insert(cohort_id, (attachment, input));
         }
-        session
-            .accept_attempt(&attachment, &input)
+        let accepted = attempts
+            .values()
+            .map(|(attachment, input)| session.completed_attempt(attachment, input))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
-                    format!("register accepted connector write attempt: {error}"),
+                    format!("materialize accepted connector write attempts: {error}"),
                 )
             })?;
-        Ok(Self {
-            session,
-            attachment,
-            input,
-        })
+        session.accept_attempts(accepted).map_err(|error| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                format!("register accepted connector write attempts: {error}"),
+            )
+        })?;
+        Ok(Self { session, attempts })
     }
 
-    pub(crate) fn attachment(&self) -> &ConnectorWritePlanAttachment {
-        &self.attachment
+    fn single_attempt(
+        &self,
+    ) -> Result<(&ConnectorWritePlanAttachment, &ConnectorWriteCommitInput), ConnectorError> {
+        if self.attempts.len() != 1 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "single-cohort connector write attempt access requires exactly one cohort",
+            ));
+        }
+        let (attachment, input) = self
+            .attempts
+            .values()
+            .next()
+            .expect("one connector write attempt");
+        Ok((attachment, input))
     }
 
-    pub(crate) fn input(&self) -> &ConnectorWriteCommitInput {
-        &self.input
+    pub(crate) fn commit_context(&self) -> &novarocks_spi::connector::ConnectorRequestContext {
+        self.session.request_context()
+    }
+
+    pub(crate) fn attachment(&self) -> Result<&ConnectorWritePlanAttachment, ConnectorError> {
+        self.single_attempt().map(|(attachment, _)| attachment)
+    }
+
+    pub(crate) fn input(&self) -> Result<&ConnectorWriteCommitInput, ConnectorError> {
+        self.single_attempt().map(|(_, input)| input)
     }
 
     /// Return the exact accepted staged reports as an SPI attempt completion.
@@ -246,8 +288,8 @@ impl ConnectorWriteCompletion {
     pub(crate) fn attempt_completion(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAttemptCompletion, ConnectorError> {
-        self.session
-            .completed_attempt(&self.attachment, &self.input)
+        let (attachment, input) = self.single_attempt()?;
+        self.session.completed_attempt(attachment, input)
     }
 
     pub fn session(&self) -> &ConnectorWriteOperationSession {
@@ -269,51 +311,65 @@ impl ConnectorWriteCompletion {
     }
 
     pub fn staging_summary(&self) -> Result<ConnectorWriteStagingSummary, DistributedQueryError> {
-        let writer_count = u32::try_from(self.input.reports().len()).map_err(|_| {
+        let report_count = self
+            .attempts
+            .values()
+            .map(|(_, input)| input.reports().len())
+            .try_fold(0usize, |total, count| total.checked_add(count))
+            .ok_or_else(|| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "connector staging report count overflow",
+                )
+            })?;
+        let writer_count = u32::try_from(report_count).map_err(|_| {
             DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "connector staging report count exceeds bounded summary range",
             )
         })?;
-        self.input.reports().iter().try_fold(
-            ConnectorWriteStagingSummary {
-                writer_count,
-                ..ConnectorWriteStagingSummary::default()
-            },
-            |summary, report| {
-                let report_summary = report.summary();
-                Ok(ConnectorWriteStagingSummary {
-                    input_rows: summary
-                        .input_rows
-                        .checked_add(report_summary.input_rows)
-                        .ok_or_else(|| {
-                            DistributedQueryError::new(
-                                DistributedQueryErrorKind::ContractViolation,
-                                "connector staging input row summary overflow",
-                            )
-                        })?,
-                    staged_bytes: summary
-                        .staged_bytes
-                        .checked_add(report_summary.staged_bytes)
-                        .ok_or_else(|| {
-                            DistributedQueryError::new(
-                                DistributedQueryErrorKind::ContractViolation,
-                                "connector staging byte summary overflow",
-                            )
-                        })?,
-                    artifact_count: summary
-                        .artifact_count
-                        .checked_add(report_summary.artifact_count)
-                        .ok_or_else(|| {
-                            DistributedQueryError::new(
-                                DistributedQueryErrorKind::ContractViolation,
-                                "connector staging artifact summary overflow",
-                            )
-                        })?,
-                    writer_count: summary.writer_count,
-                })
-            },
-        )
+        self.attempts
+            .values()
+            .flat_map(|(_, input)| input.reports())
+            .try_fold(
+                ConnectorWriteStagingSummary {
+                    writer_count,
+                    ..ConnectorWriteStagingSummary::default()
+                },
+                |summary, report| {
+                    let report_summary = report.summary();
+                    Ok(ConnectorWriteStagingSummary {
+                        input_rows: summary
+                            .input_rows
+                            .checked_add(report_summary.input_rows)
+                            .ok_or_else(|| {
+                                DistributedQueryError::new(
+                                    DistributedQueryErrorKind::ContractViolation,
+                                    "connector staging input row summary overflow",
+                                )
+                            })?,
+                        staged_bytes: summary
+                            .staged_bytes
+                            .checked_add(report_summary.staged_bytes)
+                            .ok_or_else(|| {
+                                DistributedQueryError::new(
+                                    DistributedQueryErrorKind::ContractViolation,
+                                    "connector staging byte summary overflow",
+                                )
+                            })?,
+                        artifact_count: summary
+                            .artifact_count
+                            .checked_add(report_summary.artifact_count)
+                            .ok_or_else(|| {
+                                DistributedQueryError::new(
+                                    DistributedQueryErrorKind::ContractViolation,
+                                    "connector staging artifact summary overflow",
+                                )
+                            })?,
+                        writer_count: summary.writer_count,
+                    })
+                },
+            )
     }
 
     /// Return whether this accepted aggregate contains no input, staged bytes
@@ -333,8 +389,11 @@ impl ConnectorWriteCompletion {
                 "connector write completion has input, staged bytes, or artifacts and cannot finish as known-empty",
             ));
         }
-        self.session
-            .discard_known_empty_attempt(&self.attachment, &self.input)
+        self.attempts
+            .values()
+            .try_for_each(|(attachment, input)| {
+                self.session.discard_known_empty_attempt(attachment, input)
+            })
             .and_then(|_| self.session.finish_known_empty_noop())
             .map_err(|error| {
                 DistributedQueryError::new(
@@ -343,6 +402,36 @@ impl ConnectorWriteCompletion {
                 )
             })
     }
+}
+
+fn validate_connector_write_attempt(
+    attachment: &ConnectorWritePlanAttachment,
+    input: &ConnectorWriteCommitInput,
+) -> Result<(), DistributedQueryError> {
+    let manifest = attachment.manifest();
+    if input.owner() != manifest.owner()
+        || input.operation_id() != manifest.operation_id()
+        || input.cohort_id() != manifest.cohort_id()
+        || input.execution_id() != manifest.execution_id()
+    {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "generic staged reports do not match the frozen connector write attachment",
+        ));
+    }
+    let expected = manifest.writers().iter().cloned().collect::<BTreeSet<_>>();
+    let actual = input
+        .reports()
+        .iter()
+        .map(|report| report.writer().clone())
+        .collect::<BTreeSet<_>>();
+    if expected != actual || input.reports().len() != actual.len() {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "generic staged reports do not exactly cover the frozen connector writer manifest",
+        ));
+    }
+    Ok(())
 }
 
 pub struct FragmentProfileSet {

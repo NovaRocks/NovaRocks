@@ -24,5 +24,5 @@ pub(crate) fn commit(
 ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
     completion
         .session()
-        .commit(completion.attachment().context().clone())
+        .commit(completion.commit_context().clone())
 }

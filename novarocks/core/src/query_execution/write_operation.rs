@@ -5,7 +5,7 @@
 
 //! Sealed frontend-owned distributed write operation state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use novarocks_spi::connector::{
@@ -139,6 +139,10 @@ impl ConnectorWriteOperationSession {
 
     pub fn sealed(&self) -> &ConnectorSealedWriteCohortSet {
         &self.inner.sealed
+    }
+
+    pub(crate) fn request_context(&self) -> &novarocks_spi::connector::ConnectorRequestContext {
+        &self.inner.context
     }
 
     /// Return the Provider-signed preparation for one sealed cohort.  SQL may
@@ -294,42 +298,73 @@ impl ConnectorWriteOperationSession {
         Ok(attachment)
     }
 
-    pub(crate) fn accept_attempt(
+    /// Atomically accept one or more completed cohorts from one distributed
+    /// query. Every attempt is validated before any cohort state changes, so a
+    /// conflicting later cohort cannot leave a partially accepted operation.
+    pub(crate) fn accept_attempts(
         &self,
-        attachment: &ConnectorWritePlanAttachment,
-        input: &ConnectorWriteCommitInput,
-    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
-        let attempt = self.attempt_completion(attachment, input)?;
+        attempts: Vec<ConnectorWriteAttemptCompletion>,
+    ) -> Result<(), ConnectorError> {
+        if attempts.is_empty() {
+            return Err(invalid(
+                "connector write operation cannot accept an empty attempt set",
+            ));
+        }
         let mut state = self.lock_state()?;
         if state.terminal.is_some() {
             return Err(invalid(
-                "connector write attempt completed after a terminal operation decision",
+                "connector write attempts completed after a terminal operation decision",
             ));
         }
         if state.recovery_only {
             return Err(invalid(
-                "connector write recovery session cannot accept a new execution",
+                "connector write recovery session cannot accept new executions",
             ));
         }
-        let cohort = state
-            .cohorts
-            .get_mut(&attempt.cohort_id())
-            .ok_or_else(|| invalid("connector write attempt references an unknown cohort"))?;
-        if cohort.superseded.contains_key(&attempt.execution_id()) {
-            return Err(invalid(
-                "connector write attempt cannot be both accepted and superseded",
-            ));
-        }
-        match &cohort.accepted {
-            Some(accepted) if accepted == &attempt => {}
-            Some(_) => {
+        let mut cohorts = BTreeSet::new();
+        for attempt in &attempts {
+            if attempt.owner() != &self.inner.owner
+                || attempt.operation_id() != self.inner.operation_id
+            {
+                return Err(invalid(
+                    "connector write attempt does not belong to this operation session",
+                ));
+            }
+            if !cohorts.insert(attempt.cohort_id()) {
+                return Err(invalid(
+                    "connector write attempt set contains a duplicate cohort",
+                ));
+            }
+            let cohort = state
+                .cohorts
+                .get(&attempt.cohort_id())
+                .ok_or_else(|| invalid("connector write attempt references an unknown cohort"))?;
+            if cohort.planned.get(&attempt.execution_id()) != Some(&attempt.manifest_digest()) {
+                return Err(invalid(
+                    "connector write attempt was not planned by this operation session",
+                ));
+            }
+            if cohort.superseded.contains_key(&attempt.execution_id()) {
+                return Err(invalid(
+                    "connector write attempt cannot be both accepted and superseded",
+                ));
+            }
+            if matches!(&cohort.accepted, Some(accepted) if accepted != attempt) {
                 return Err(invalid(
                     "connector write cohort already has a different accepted attempt",
                 ));
             }
-            None => cohort.accepted = Some(attempt.clone()),
         }
-        Ok(attempt)
+        for attempt in attempts {
+            let cohort = state
+                .cohorts
+                .get_mut(&attempt.cohort_id())
+                .expect("validated connector write cohort exists");
+            if cohort.accepted.is_none() {
+                cohort.accepted = Some(attempt);
+            }
+        }
+        Ok(())
     }
 
     /// Withdraw an accepted metadata-only attempt before the operation makes
@@ -739,7 +774,11 @@ mod tests {
     use crate::common::types::UniqueId;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+    use crate::query_execution::outcome::ConnectorWriteCompletion;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+    use crate::query_execution::write::{
+        WriteCommitInput, WriterCommitInput, WriterKey, encode_connector_staged_report_frame,
+    };
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
     struct NeverCancelled;
@@ -866,7 +905,15 @@ mod tests {
         cohort_id: ConnectorWriteCohortId,
         exact_lease: ConnectorWriteLease,
     ) -> ConnectorWritePlanningTemplate {
-        let context = context();
+        template_with_context(operation_id, cohort_id, exact_lease, context())
+    }
+
+    fn template_with_context(
+        operation_id: ConnectorWriteOperationId,
+        cohort_id: ConnectorWriteCohortId,
+        exact_lease: ConnectorWriteLease,
+        context: ConnectorRequestContext,
+    ) -> ConnectorWritePlanningTemplate {
         let preparation = ConnectorWritePreparation::try_new(
             owner(),
             ConnectorTableHandle::try_new(owner().instance_id, Bytes::from_static(b"table"))
@@ -971,6 +1018,101 @@ mod tests {
             execution(attempt),
         )
         .expect("writer manifest")
+    }
+
+    fn multi_writer_schedule() -> SchedulingPlan {
+        let by_fragment = [
+            (3, UniqueId::new(3, 30)),
+            (4, UniqueId::new(4, 40)),
+            (5, UniqueId::new(5, 50)),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(backend_idx, (fragment_id, finst_id))| {
+            (
+                fragment_id,
+                vec![FragmentInstancePlacement {
+                    fragment_id,
+                    instance_index: 0,
+                    finst_id,
+                    backend_idx,
+                    endpoint: RuntimeEndpoint::new(
+                        "127.0.0.1",
+                        19048 + i32::try_from(backend_idx).expect("bounded backend"),
+                    )
+                    .expect("endpoint"),
+                    scan_ranges: BTreeMap::new(),
+                    connector_splits: BTreeMap::new(),
+                    destinations: Vec::new(),
+                    per_exch_num_senders: BTreeMap::new(),
+                }],
+            )
+        })
+        .collect();
+        SchedulingPlan {
+            root_fragment_id: 3,
+            by_fragment,
+            root_finst_id: UniqueId::new(3, 30),
+            root_backend_idx: 0,
+        }
+    }
+
+    fn manifest_from_schedule(
+        schedule: &SchedulingPlan,
+        fragments: &BTreeSet<u32>,
+        operation_id: ConnectorWriteOperationId,
+        cohort_id: ConnectorWriteCohortId,
+    ) -> ConnectorWriteManifest {
+        ConnectorWriteManifest::freeze(
+            schedule,
+            fragments,
+            operation_id,
+            cohort_id,
+            owner(),
+            execution(3),
+        )
+        .expect("writer manifest")
+    }
+
+    fn writer_commit_input(
+        writer_id: usize,
+        writer: &ConnectorWriterIdentity,
+    ) -> WriterCommitInput {
+        let report = ConnectorStagedReport::try_new(
+            writer.clone(),
+            CONNECTOR_WRITE_CONTRACT_VERSION,
+            ConnectorWriterTerminalState::Staged,
+            ConnectorStagedReportSummary {
+                input_rows: 1,
+                staged_bytes: 6,
+                artifact_count: 1,
+            },
+            Bytes::from_static(b"staged"),
+        )
+        .expect("staged report");
+        let fragment_instance_id = writer.fragment_instance_id();
+        let finst_id = UniqueId::new(
+            i64::from_be_bytes(fragment_instance_id[..8].try_into().expect("UUID prefix")),
+            i64::from_be_bytes(fragment_instance_id[8..].try_into().expect("UUID suffix")),
+        );
+        WriterCommitInput {
+            writer_id,
+            fragment_id: u32::try_from(writer.fragment_id()).expect("nonnegative fragment ID"),
+            writer_key: WriterKey {
+                query_id: UniqueId::new(41, 73),
+                fragment_instance_id: finst_id,
+                backend_num: writer.backend_num(),
+            },
+            connector_staged_report_frames: report
+                .frames()
+                .iter()
+                .map(encode_connector_staged_report_frame)
+                .collect(),
+            load_counters: BTreeMap::new(),
+            loaded_rows: 1,
+            loaded_bytes: 6,
+            filtered_rows: 0,
+        }
     }
 
     fn attempt_completion(
@@ -1090,6 +1232,279 @@ mod tests {
     }
 
     #[test]
+    fn operation_registration_rejects_mixed_request_contexts() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([94; 16]);
+        let first =
+            ConnectorWriteCohortId::derive(operation_id, b"cohort", [1; 32]).expect("first cohort");
+        let second = ConnectorWriteCohortId::derive(operation_id, b"cohort", [2; 32])
+            .expect("second cohort");
+        let exact_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let error = match ConnectorWriteOperationRegistration::try_new(vec![
+            template(operation_id, first, exact_lease.clone()),
+            template(operation_id, second, exact_lease),
+        ]) {
+            Ok(_) => panic!("different cancellation identities must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("inconsistent request contexts"));
+    }
+
+    #[test]
+    fn multi_cohort_acceptance_is_atomic_on_late_conflict() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([92; 16]);
+        let first =
+            ConnectorWriteCohortId::derive(operation_id, b"cohort", [1; 32]).expect("first cohort");
+        let second = ConnectorWriteCohortId::derive(operation_id, b"cohort", [2; 32])
+            .expect("second cohort");
+        let exact_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let request_context = context();
+        let registration = ConnectorWriteOperationRegistration::try_new(vec![
+            template_with_context(
+                operation_id,
+                first,
+                exact_lease.clone(),
+                request_context.clone(),
+            ),
+            template_with_context(operation_id, second, exact_lease.clone(), request_context),
+        ])
+        .expect("two cohorts");
+        let session = ConnectorWriteOperationSession::try_begin(registration, exact_lease)
+            .expect("sealed operation session");
+        let first_attempt = attempt_completion(operation_id, first, 1);
+        let second_attempt = attempt_completion(operation_id, second, 2);
+        {
+            let mut state = session.lock_state().expect("operation state");
+            state
+                .cohorts
+                .get_mut(&first)
+                .expect("first cohort")
+                .planned
+                .insert(
+                    first_attempt.execution_id(),
+                    first_attempt.manifest_digest(),
+                );
+            let second_state = state.cohorts.get_mut(&second).expect("second cohort");
+            second_state.planned.insert(
+                second_attempt.execution_id(),
+                second_attempt.manifest_digest(),
+            );
+            second_state.accepted = Some(attempt_completion(operation_id, second, 9));
+        }
+
+        let error = session
+            .accept_attempts(vec![first_attempt, second_attempt])
+            .expect_err("a later cohort conflict must reject the whole attempt set");
+        assert!(error.to_string().contains("different accepted attempt"));
+        let state = session.lock_state().expect("operation state");
+        assert!(
+            state
+                .cohorts
+                .get(&first)
+                .expect("first cohort")
+                .accepted
+                .is_none(),
+            "the earlier cohort must remain unaccepted"
+        );
+    }
+
+    #[test]
+    fn multi_cohort_acceptance_seals_one_aggregate_completion() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([93; 16]);
+        let first =
+            ConnectorWriteCohortId::derive(operation_id, b"cohort", [1; 32]).expect("first cohort");
+        let second = ConnectorWriteCohortId::derive(operation_id, b"cohort", [2; 32])
+            .expect("second cohort");
+        let exact_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let request_context = context();
+        let registration = ConnectorWriteOperationRegistration::try_new(vec![
+            template_with_context(
+                operation_id,
+                first,
+                exact_lease.clone(),
+                request_context.clone(),
+            ),
+            template_with_context(operation_id, second, exact_lease.clone(), request_context),
+        ])
+        .expect("two cohorts");
+        let session = ConnectorWriteOperationSession::try_begin(registration, exact_lease)
+            .expect("sealed operation session");
+        let first_attempt = attempt_completion(operation_id, first, 1);
+        let second_attempt = attempt_completion(operation_id, second, 2);
+        {
+            let mut state = session.lock_state().expect("operation state");
+            state
+                .cohorts
+                .get_mut(&first)
+                .expect("first cohort")
+                .planned
+                .insert(
+                    first_attempt.execution_id(),
+                    first_attempt.manifest_digest(),
+                );
+            state
+                .cohorts
+                .get_mut(&second)
+                .expect("second cohort")
+                .planned
+                .insert(
+                    second_attempt.execution_id(),
+                    second_attempt.manifest_digest(),
+                );
+        }
+
+        session
+            .accept_attempts(vec![first_attempt, second_attempt])
+            .expect("accept both cohorts atomically");
+        let completion = session
+            .sealed_operation_completion()
+            .expect("one aggregate completion");
+        assert_eq!(completion.cohorts().len(), 2);
+        assert!(
+            completion
+                .cohorts()
+                .iter()
+                .all(|cohort| cohort.accepted().is_some())
+        );
+        assert_eq!(
+            completion
+                .cohorts()
+                .iter()
+                .map(|cohort| cohort.cohort_id())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, second])
+        );
+    }
+
+    #[test]
+    fn distributed_reports_complete_three_writers_across_two_cohorts() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([95; 16]);
+        let first =
+            ConnectorWriteCohortId::derive(operation_id, b"cohort", [1; 32]).expect("first cohort");
+        let second = ConnectorWriteCohortId::derive(operation_id, b"cohort", [2; 32])
+            .expect("second cohort");
+        let exact_lease = lease(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let request_context = context();
+        let registration = ConnectorWriteOperationRegistration::try_new(vec![
+            template_with_context(
+                operation_id,
+                first,
+                exact_lease.clone(),
+                request_context.clone(),
+            ),
+            template_with_context(operation_id, second, exact_lease.clone(), request_context),
+        ])
+        .expect("two cohorts");
+        let session = ConnectorWriteOperationSession::try_begin(registration, exact_lease)
+            .expect("sealed operation session");
+        let schedule = multi_writer_schedule();
+        let first_manifest =
+            manifest_from_schedule(&schedule, &BTreeSet::from([3, 4]), operation_id, first);
+        let second_manifest =
+            manifest_from_schedule(&schedule, &BTreeSet::from([5]), operation_id, second);
+        let mut writers = first_manifest
+            .writers()
+            .iter()
+            .chain(second_manifest.writers())
+            .enumerate()
+            .map(|(writer_id, writer)| writer_commit_input(writer_id, writer))
+            .collect::<Vec<_>>();
+        writers.sort_by_key(|writer| writer.fragment_id);
+        let commit = WriteCommitInput {
+            write_id: UniqueId::new(41, 73),
+            writers,
+        };
+
+        let missing_attachment = session
+            .plan_manifest(&first_manifest)
+            .expect("first cohort attachment");
+        let error = match ConnectorWriteCompletion::from_write_commits(
+            session.clone(),
+            [missing_attachment],
+            &commit,
+        ) {
+            Ok(_) => panic!("missing cohort attachment must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("exactly match"));
+
+        let mut foreign_commit = commit.clone();
+        foreign_commit.writers[2].connector_staged_report_frames[0]
+            .writer
+            .as_mut()
+            .expect("writer identity")
+            .connector_instance_id = "foreign-session".to_string();
+        let error = match ConnectorWriteCompletion::from_write_commits(
+            session.clone(),
+            [
+                session
+                    .plan_manifest(&first_manifest)
+                    .expect("first cohort attachment"),
+                session
+                    .plan_manifest(&second_manifest)
+                    .expect("second cohort attachment"),
+            ],
+            &foreign_commit,
+        ) {
+            Ok(_) => panic!("foreign writer owner must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.message().contains("connector binding")
+                || error.message().contains("native owner"),
+            "unexpected foreign-owner error: {}",
+            error.message()
+        );
+
+        let attachments = [
+            session
+                .plan_manifest(&first_manifest)
+                .expect("first cohort attachment"),
+            session
+                .plan_manifest(&second_manifest)
+                .expect("second cohort attachment"),
+        ];
+        let completion =
+            ConnectorWriteCompletion::from_write_commits(session, attachments, &commit)
+                .expect("two cohort distributed completion");
+        let summary = completion.staging_summary().expect("staging summary");
+        assert_eq!(summary.writer_count(), 3);
+        assert_eq!(summary.input_rows(), 3);
+        let sealed = completion
+            .sealed_operation_completion()
+            .expect("aggregate operation completion");
+        assert_eq!(sealed.cohorts().len(), 2);
+        assert_eq!(
+            sealed
+                .cohorts()
+                .iter()
+                .map(|cohort| cohort.cohort_id())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, second])
+        );
+    }
+
+    #[test]
     fn incomplete_operation_can_only_abort_and_then_forbids_staging() {
         let operation_id = ConnectorWriteOperationId::from_bytes([10; 16]);
         let first =
@@ -1105,9 +1520,15 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             Arc::clone(&abort_calls),
         );
+        let request_context = context();
         let registration = ConnectorWriteOperationRegistration::try_new(vec![
-            template(operation_id, first, exact_lease.clone()),
-            template(operation_id, second, exact_lease.clone()),
+            template_with_context(
+                operation_id,
+                first,
+                exact_lease.clone(),
+                request_context.clone(),
+            ),
+            template_with_context(operation_id, second, exact_lease.clone(), request_context),
         ])
         .expect("two cohorts");
         let session = ConnectorWriteOperationSession::try_begin(registration, exact_lease)

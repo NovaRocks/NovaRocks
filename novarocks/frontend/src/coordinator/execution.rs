@@ -17,6 +17,7 @@
 
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -793,16 +794,33 @@ impl FrontendDistributedQueryCoordinator {
         let scheduled = match parts.connector_write {
             Some(registration) => {
                 let session = registration.session();
-                let manifest = scheduled.freeze_connector_write_manifest(
-                    &scheduled.terminal_write_fragment_ids(),
-                    session.operation_id(),
-                    registration.cohort_id(),
-                    session.owner().clone(),
+                let terminal_writer_fragment_ids = scheduled.terminal_write_fragment_ids();
+                let routing = registration.resolve_writer_fragment_cohorts(
+                    terminal_writer_fragment_ids.iter().copied(),
                 )?;
-                let attachment = session
-                    .plan_manifest(&manifest)
-                    .map_err(|error| failed(format!("plan connector writer manifest: {error}")))?;
-                scheduled.attach_connector_write_plan(attachment)?
+                let mut fragments_by_cohort = BTreeMap::<
+                    novarocks_spi::connector::ConnectorWriteCohortId,
+                    BTreeSet<u32>,
+                >::new();
+                for (fragment_id, cohort_id) in routing {
+                    fragments_by_cohort
+                        .entry(cohort_id)
+                        .or_default()
+                        .insert(fragment_id);
+                }
+                let mut attachments = Vec::with_capacity(fragments_by_cohort.len());
+                for (cohort_id, fragment_ids) in fragments_by_cohort {
+                    let manifest = scheduled.freeze_connector_write_manifest(
+                        &fragment_ids,
+                        session.operation_id(),
+                        cohort_id,
+                        session.owner().clone(),
+                    )?;
+                    attachments.push(session.plan_manifest(&manifest).map_err(|error| {
+                        failed(format!("plan connector writer manifest: {error}"))
+                    })?);
+                }
+                scheduled.attach_connector_write_plans(attachments)?
             }
             None => scheduled,
         };
@@ -877,7 +895,7 @@ impl FrontendDistributedQueryCoordinator {
             expected_output,
             query_lifecycle_lease,
             connector_binding_lease: _connector_binding_lease,
-            connector_write_plan,
+            connector_write_plans,
             connector_read_sessions,
         } = execution.into_parts();
         let mut query_lifecycle_lease = Some(query_lifecycle_lease);
@@ -989,19 +1007,23 @@ impl FrontendDistributedQueryCoordinator {
                 let (commit, abort) = report_outcome.into_payloads();
                 let connector_completion = match (
                     connector_write_session,
-                    connector_write_plan,
+                    connector_write_plans,
                     commit.as_ref(),
                 ) {
-                    (Some(session), Some(attachment), Some(commit)) => Some(
-                        ConnectorWriteCompletion::from_write_commit(session, attachment, commit)?,
-                    ),
-                    (Some(_), Some(_), None) => {
+                    (Some(session), attachments, Some(commit)) if !attachments.is_empty() => {
+                        Some(ConnectorWriteCompletion::from_write_commits(
+                            session,
+                            attachments.into_values(),
+                            commit,
+                        )?)
+                    }
+                    (Some(_), attachments, None) if !attachments.is_empty() => {
                         return Err(DistributedQueryError::new(
                             DistributedQueryErrorKind::ContractViolation,
                             "connector write execution ended without a complete staged-report commit",
                         ));
                     }
-                    (None, None, _) => None,
+                    (None, attachments, _) if attachments.is_empty() => None,
                     _ => {
                         return Err(DistributedQueryError::new(
                             DistributedQueryErrorKind::ContractViolation,

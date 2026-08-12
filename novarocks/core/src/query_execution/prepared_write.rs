@@ -17,6 +17,8 @@
 
 //! Side-effect-free SQL handoff for a distributed connector writer.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::contract::{
     ConnectorWriteExecutionRegistration, ConnectorWriteOperationRegistration,
@@ -25,6 +27,7 @@ use crate::query_execution::contract::{
 };
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::request_context::QueryExecutionContext;
+use crate::sql::planner::distributed::FragmentId;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId,
@@ -39,7 +42,8 @@ pub struct PreparedDistributedWriteRequest {
     native_bundle: NativeFragmentBundle,
     query_options: Option<QueryOptions>,
     registration: ConnectorWriteOperationRegistration,
-    cohort_id: ConnectorWriteCohortId,
+    terminal_writer_fragment_ids: BTreeSet<FragmentId>,
+    writer_fragment_cohorts: BTreeMap<FragmentId, ConnectorWriteCohortId>,
     lease: ConnectorWriteLease,
 }
 
@@ -52,15 +56,62 @@ impl PreparedDistributedWriteRequest {
         cohort_id: ConnectorWriteCohortId,
         lease: ConnectorWriteLease,
     ) -> Result<Self, DistributedQueryError> {
-        if registration
-            .clone()
-            .into_cohorts()
-            .iter()
-            .all(|template| template.cohort_id() != cohort_id)
-        {
+        let writer_fragment_cohorts = terminal_writer_fragment_ids(&prepared)
+            .into_iter()
+            .map(|fragment_id| (fragment_id, cohort_id));
+        Self::new_with_writer_fragment_cohorts(
+            prepared,
+            native_bundle,
+            query_options,
+            registration,
+            writer_fragment_cohorts,
+            lease,
+        )
+    }
+
+    pub(crate) fn new_with_writer_fragment_cohorts<I>(
+        prepared: PreparedFragmentSet,
+        native_bundle: NativeFragmentBundle,
+        query_options: Option<QueryOptions>,
+        registration: ConnectorWriteOperationRegistration,
+        writer_fragment_cohorts: I,
+        lease: ConnectorWriteLease,
+    ) -> Result<Self, DistributedQueryError>
+    where
+        I: IntoIterator<Item = (FragmentId, ConnectorWriteCohortId)>,
+    {
+        let terminal_fragments = terminal_writer_fragment_ids(&prepared);
+        if terminal_fragments.is_empty() {
             return Err(DistributedQueryError::new(
                 crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
-                "prepared connector write request references a cohort outside its sealed registration",
+                "prepared connector write request has no terminal writer fragments",
+            ));
+        }
+        let mut canonical = BTreeMap::new();
+        for (fragment_id, cohort_id) in writer_fragment_cohorts {
+            if canonical.insert(fragment_id, cohort_id).is_some() {
+                return Err(DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                    "prepared connector write request repeats a terminal writer fragment",
+                ));
+            }
+        }
+        if canonical.keys().copied().collect::<BTreeSet<_>>() != terminal_fragments {
+            return Err(DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                "prepared connector write mapping does not exactly cover terminal writer fragments",
+            ));
+        }
+        let templates = registration.clone().into_cohorts();
+        let registered = templates
+            .iter()
+            .map(|template| template.cohort_id())
+            .collect::<BTreeSet<_>>();
+        let mapped = canonical.values().copied().collect::<BTreeSet<_>>();
+        if mapped != registered {
+            return Err(DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                "prepared connector write mapping does not exactly cover registered cohorts",
             ));
         }
         if registration.owner() != lease.binding_key() {
@@ -69,9 +120,7 @@ impl PreparedDistributedWriteRequest {
                 "prepared connector write request registration does not match its retained lease",
             ));
         }
-        if registration
-            .clone()
-            .into_cohorts()
+        if templates
             .iter()
             .any(|template| !template.retains_lease_generation(&lease))
         {
@@ -85,7 +134,8 @@ impl PreparedDistributedWriteRequest {
             native_bundle,
             query_options,
             registration,
-            cohort_id,
+            terminal_writer_fragment_ids: terminal_fragments,
+            writer_fragment_cohorts: canonical,
             lease,
         })
     }
@@ -94,8 +144,20 @@ impl PreparedDistributedWriteRequest {
         self.registration.operation_id()
     }
 
-    pub const fn write_cohort_id(&self) -> ConnectorWriteCohortId {
-        self.cohort_id
+    pub fn writer_fragment_cohorts(&self) -> &BTreeMap<FragmentId, ConnectorWriteCohortId> {
+        &self.writer_fragment_cohorts
+    }
+
+    pub fn write_cohort_id(&self) -> ConnectorWriteCohortId {
+        let mut cohorts = self.writer_fragment_cohorts.values().copied();
+        let cohort_id = cohorts
+            .next()
+            .expect("prepared connector write has terminal writers");
+        assert!(
+            cohorts.all(|candidate| candidate == cohort_id),
+            "write_cohort_id requires a single-cohort prepared write"
+        );
+        cohort_id
     }
 
     /// Clone the complete sealed operation registration for the application
@@ -116,8 +178,25 @@ impl PreparedDistributedWriteRequest {
         execution: &QueryExecutionContext,
         registration: ConnectorWriteExecutionRegistration,
     ) -> Result<DistributedQueryRequest, DistributedQueryError> {
+        let resolved_routing = registration
+            .resolve_writer_fragment_cohorts(self.terminal_writer_fragment_ids.iter().copied())?;
+        let session_templates_match =
+            self.registration
+                .clone()
+                .into_cohorts()
+                .iter()
+                .all(|template| {
+                    registration
+                        .session()
+                        .preparation(template.cohort_id())
+                        .is_ok_and(|preparation| {
+                            preparation.digest() == template.preparation().digest()
+                        })
+                });
         if registration.session().operation_id() != self.registration.operation_id()
-            || registration.cohort_id() != self.cohort_id
+            || registration.session().owner() != self.registration.owner()
+            || resolved_routing != self.writer_fragment_cohorts
+            || !session_templates_match
         {
             return Err(DistributedQueryError::new(
                 crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
@@ -133,4 +212,13 @@ impl PreparedDistributedWriteRequest {
         )?;
         with_connector_write_operation(request, registration)
     }
+}
+
+fn terminal_writer_fragment_ids(prepared: &PreparedFragmentSet) -> BTreeSet<FragmentId> {
+    prepared
+        .scheduling_view()
+        .fragments()
+        .filter(|fragment| fragment.execution_role().is_terminal_write())
+        .map(|fragment| fragment.fragment_id())
+        .collect()
 }

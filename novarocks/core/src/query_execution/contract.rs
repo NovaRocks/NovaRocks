@@ -17,7 +17,9 @@
 
 //! Core-owned distributed-query request contract.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::protocol::native::encode::NativeFragmentBundle;
@@ -42,6 +44,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::sql::planner::distributed::FragmentId;
 pub(crate) use novarocks_types::QueryId;
 
 /// Query options resolved by core before ownership crosses into frontend.
@@ -337,8 +340,10 @@ impl ConnectorWriteOperationRegistration {
         let operation_id = first.operation_id();
         let owner = first.preparation().owner().clone();
         let lease = first.lease();
+        let context = first.request_context();
         let mut cohort_ids = std::collections::BTreeSet::new();
         for cohort in &cohorts {
+            let candidate_context = cohort.request_context();
             if cohort.operation_id() != operation_id
                 || cohort.preparation().owner() != &owner
                 || !cohort.retains_lease_generation(&lease)
@@ -347,6 +352,17 @@ impl ConnectorWriteOperationRegistration {
                 return Err(DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
                     "connector write operation registration contains a foreign or duplicate cohort",
+                ));
+            }
+            if candidate_context.deadline() != context.deadline()
+                || candidate_context.max_handle_payload_bytes()
+                    != context.max_handle_payload_bytes()
+                || candidate_context.max_total_payload_bytes() != context.max_total_payload_bytes()
+                || !Arc::ptr_eq(candidate_context.cancellation(), context.cancellation())
+            {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "connector write operation registration contains inconsistent request contexts",
                 ));
             }
         }
@@ -374,14 +390,25 @@ impl ConnectorWriteOperationRegistration {
     }
 }
 
-/// One sealed cohort selected for a concrete distributed execution attempt.
+/// Exact operation-scoped routing from terminal writer fragments to cohorts.
 #[derive(Clone)]
 pub struct ConnectorWriteExecutionRegistration {
     session: ConnectorWriteOperationSession,
-    cohort_id: ConnectorWriteCohortId,
+    routing: ConnectorWriteExecutionRouting,
+}
+
+#[derive(Clone)]
+enum ConnectorWriteExecutionRouting {
+    Single(ConnectorWriteCohortId),
+    ByWriter(BTreeMap<FragmentId, ConnectorWriteCohortId>),
 }
 
 impl ConnectorWriteExecutionRegistration {
+    /// Register a genuinely single-cohort distributed execution.
+    ///
+    /// The scheduling artifact will bind every terminal writer fragment to
+    /// this cohort. Multi-cohort executions must use
+    /// [`Self::try_new_with_writer_fragment_cohorts`] instead.
     pub fn try_new(
         session: ConnectorWriteOperationSession,
         cohort_id: ConnectorWriteCohortId,
@@ -392,15 +419,128 @@ impl ConnectorWriteExecutionRegistration {
                 "connector write execution references a cohort outside the sealed operation",
             ));
         }
-        Ok(Self { session, cohort_id })
+        Ok(Self {
+            session,
+            routing: ConnectorWriteExecutionRouting::Single(cohort_id),
+        })
+    }
+
+    pub fn try_new_with_writer_fragment_cohorts<I>(
+        session: ConnectorWriteOperationSession,
+        writer_fragment_cohorts: I,
+    ) -> Result<Self, DistributedQueryError>
+    where
+        I: IntoIterator<Item = (FragmentId, ConnectorWriteCohortId)>,
+    {
+        let mut canonical = BTreeMap::new();
+        for (fragment_id, cohort_id) in writer_fragment_cohorts {
+            if canonical.insert(fragment_id, cohort_id).is_some() {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "connector write execution contains a duplicate writer fragment",
+                ));
+            }
+        }
+        if canonical.is_empty() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write execution has no terminal writer fragments",
+            ));
+        }
+        if canonical
+            .values()
+            .any(|cohort_id| !session.contains_cohort(*cohort_id))
+        {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write execution mapping references a cohort outside the sealed operation",
+            ));
+        }
+        Ok(Self {
+            session,
+            routing: ConnectorWriteExecutionRouting::ByWriter(canonical),
+        })
+    }
+
+    pub fn single<I>(
+        session: ConnectorWriteOperationSession,
+        writer_fragment_ids: I,
+        cohort_id: ConnectorWriteCohortId,
+    ) -> Result<Self, DistributedQueryError>
+    where
+        I: IntoIterator<Item = FragmentId>,
+    {
+        Self::try_new_with_writer_fragment_cohorts(
+            session,
+            writer_fragment_ids
+                .into_iter()
+                .map(|fragment_id| (fragment_id, cohort_id)),
+        )
     }
 
     pub fn session(&self) -> &ConnectorWriteOperationSession {
         &self.session
     }
 
-    pub const fn cohort_id(&self) -> ConnectorWriteCohortId {
-        self.cohort_id
+    pub fn writer_fragment_cohorts(&self) -> Option<&BTreeMap<FragmentId, ConnectorWriteCohortId>> {
+        match &self.routing {
+            ConnectorWriteExecutionRouting::Single(_) => None,
+            ConnectorWriteExecutionRouting::ByWriter(routing) => Some(routing),
+        }
+    }
+
+    pub fn cohort_id_for_writer_fragment(
+        &self,
+        fragment_id: FragmentId,
+    ) -> Option<ConnectorWriteCohortId> {
+        match &self.routing {
+            ConnectorWriteExecutionRouting::Single(cohort_id) => Some(*cohort_id),
+            ConnectorWriteExecutionRouting::ByWriter(routing) => routing.get(&fragment_id).copied(),
+        }
+    }
+
+    pub fn single_cohort_id(&self) -> Option<ConnectorWriteCohortId> {
+        match &self.routing {
+            ConnectorWriteExecutionRouting::Single(cohort_id) => Some(*cohort_id),
+            ConnectorWriteExecutionRouting::ByWriter(routing) => {
+                let mut cohorts = routing.values().copied();
+                let cohort_id = cohorts.next()?;
+                cohorts
+                    .all(|candidate| candidate == cohort_id)
+                    .then_some(cohort_id)
+            }
+        }
+    }
+
+    pub fn resolve_writer_fragment_cohorts<I>(
+        &self,
+        writer_fragment_ids: I,
+    ) -> Result<BTreeMap<FragmentId, ConnectorWriteCohortId>, DistributedQueryError>
+    where
+        I: IntoIterator<Item = FragmentId>,
+    {
+        let writer_fragment_ids = writer_fragment_ids.into_iter().collect::<BTreeSet<_>>();
+        if writer_fragment_ids.is_empty() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write execution has no terminal writer fragments",
+            ));
+        }
+        match &self.routing {
+            ConnectorWriteExecutionRouting::Single(cohort_id) => Ok(writer_fragment_ids
+                .into_iter()
+                .map(|fragment_id| (fragment_id, *cohort_id))
+                .collect()),
+            ConnectorWriteExecutionRouting::ByWriter(routing) => {
+                if routing.keys().copied().collect::<BTreeSet<_>>() != writer_fragment_ids {
+                    return Err(DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "connector write execution mapping does not exactly cover terminal writer fragments",
+                    ));
+                }
+                Ok(routing.clone())
+            }
+        }
     }
 }
 

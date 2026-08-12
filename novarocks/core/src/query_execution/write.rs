@@ -23,8 +23,8 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorExecutionBindingKey, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorStagedReport, ConnectorStagedReportSummary,
-    ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterIdentity,
-    ConnectorWriterTerminalState, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
+    ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
+    ConnectorWriterIdentity, ConnectorWriterTerminalState, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
     MAX_CONNECTOR_STAGED_REPORT_PARTS, MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES,
 };
 use sha2::{Digest, Sha256};
@@ -97,12 +97,24 @@ impl ConnectorWriteCommitInput {
     pub(crate) fn try_extract(
         write_commit: &WriteCommitInput,
     ) -> Result<Option<Self>, DistributedQueryError> {
+        let grouped = Self::try_extract_grouped(write_commit)?;
+        if grouped.len() > 1 {
+            return Err(contract_violation(
+                "generic connector write commit contains multiple write cohorts",
+            ));
+        }
+        Ok(grouped.into_values().next())
+    }
+
+    pub(crate) fn try_extract_grouped(
+        write_commit: &WriteCommitInput,
+    ) -> Result<BTreeMap<ConnectorWriteCohortId, Self>, DistributedQueryError> {
         let has_generic = write_commit
             .writers
             .iter()
             .any(|writer| !writer.connector_staged_report_frames.is_empty());
         if !has_generic {
-            return Ok(None);
+            return Ok(BTreeMap::new());
         }
         if write_commit.writers.is_empty() {
             return Err(contract_violation(
@@ -111,9 +123,11 @@ impl ConnectorWriteCommitInput {
         }
 
         let mut expected_writer_keys = std::collections::BTreeSet::new();
-        let mut reports_by_identity = BTreeMap::new();
+        let mut reports_by_cohort = BTreeMap::<
+            ConnectorWriteCohortId,
+            BTreeMap<ConnectorWriterIdentity, ConnectorStagedReport>,
+        >::new();
         let mut operation_id = None;
-        let mut cohort_id = None;
         let mut execution_id = None;
         let mut owner = None;
         for writer in &write_commit.writers {
@@ -149,15 +163,6 @@ impl ConnectorWriteCommitInput {
                 None => operation_id = Some(identity.operation_id()),
                 _ => {}
             }
-            match cohort_id {
-                Some(expected) if expected != identity.cohort_id() => {
-                    return Err(contract_violation(
-                        "generic connector write commit contains multiple write cohorts",
-                    ));
-                }
-                None => cohort_id = Some(identity.cohort_id()),
-                _ => {}
-            }
             match execution_id {
                 Some(expected) if expected != identity.execution_id() => {
                     return Err(contract_violation(
@@ -176,19 +181,36 @@ impl ConnectorWriteCommitInput {
                 None => owner = Some(identity.binding_key().clone()),
                 _ => {}
             }
-            if reports_by_identity.insert(identity, report).is_some() {
+            let cohort_id = identity.cohort_id();
+            if reports_by_cohort
+                .entry(cohort_id)
+                .or_default()
+                .insert(identity, report)
+                .is_some()
+            {
                 return Err(contract_violation(
                     "generic connector write commit contains duplicate logical writer reports",
                 ));
             }
         }
-        Ok(Some(Self {
-            owner: owner.expect("generic connector reports have an owner"),
-            operation_id: operation_id.expect("generic connector reports have an operation"),
-            cohort_id: cohort_id.expect("generic connector reports have a cohort"),
-            execution_id: execution_id.expect("generic connector reports have an execution"),
-            reports: reports_by_identity.into_values().collect(),
-        }))
+        let owner = owner.expect("generic connector reports have an owner");
+        let operation_id = operation_id.expect("generic connector reports have an operation");
+        let execution_id = execution_id.expect("generic connector reports have an execution");
+        Ok(reports_by_cohort
+            .into_iter()
+            .map(|(cohort_id, reports)| {
+                (
+                    cohort_id,
+                    Self {
+                        owner: owner.clone(),
+                        operation_id,
+                        cohort_id,
+                        execution_id,
+                        reports: reports.into_values().collect(),
+                    },
+                )
+            })
+            .collect())
     }
 }
 
@@ -239,7 +261,7 @@ impl WriteReportOutcome {
 /// completion payload.
 pub struct WriteTerminalBuilder {
     write_id: UniqueId,
-    expected: BTreeMap<WriterKey, (usize, u32, QueryExecutionId)>,
+    expected: BTreeMap<WriterKey, (usize, u32, QueryExecutionId, Option<ConnectorWriteCohortId>)>,
     completed: BTreeMap<WriterKey, WriterCommitInput>,
     failure: Option<String>,
 }
@@ -270,6 +292,7 @@ impl WriteTerminalBuilder {
                         writer_id,
                         registration.fragment_id,
                         registration.execution_id,
+                        registration.expected_connector_cohort_id,
                     ),
                 )
                 .is_some()
@@ -296,7 +319,9 @@ impl WriteTerminalBuilder {
             fragment_instance_id: fragment.fragment_instance_id(),
             backend_num: fragment.backend_num(),
         };
-        let Some((writer_id, fragment_id, execution_id)) = self.expected.get(&key).copied() else {
+        let Some((writer_id, fragment_id, execution_id, expected_cohort_id)) =
+            self.expected.get(&key).copied()
+        else {
             return Ok(());
         };
         if !matches!(fragment.outcome(), FragmentTerminalOutcome::Succeeded) {
@@ -331,6 +356,28 @@ impl WriteTerminalBuilder {
         ) {
             self.failure.get_or_insert(error);
             return Ok(());
+        }
+        if let Some(expected_cohort_id) = expected_cohort_id {
+            let Some(writer) = frames.first().and_then(|frame| frame.writer.as_ref()) else {
+                self.failure.get_or_insert_with(|| {
+                    "connector terminal writer completed without staged report frames".to_string()
+                });
+                return Ok(());
+            };
+            let identity = match connector_writer_identity_from_native(writer) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.failure.get_or_insert(error.to_string());
+                    return Ok(());
+                }
+            };
+            if identity.cohort_id() != expected_cohort_id {
+                self.failure.get_or_insert_with(|| {
+                    "connector staged report cohort does not match its terminal writer registration"
+                        .to_string()
+                });
+                return Ok(());
+            }
         }
         let output = WriterCommitInput {
             writer_id,
@@ -1095,5 +1142,60 @@ mod tests {
         })
         .expect_err("one attempt cannot mix cohort reports");
         assert!(error.message().contains("multiple write cohorts"));
+    }
+
+    #[test]
+    fn connector_write_commit_input_groups_three_writers_by_two_cohorts() {
+        let first = writer_commit_input(vec![frame(b"first", 0, 1, b"first")]);
+
+        let mut second_frame = frame(b"second", 0, 1, b"second");
+        let second_identity = second_frame.writer.as_mut().expect("second identity");
+        second_identity.fragment_id = 30;
+        second_identity.fragment_instance_id = Some(common::UniqueId { hi: 41, lo: 43 });
+        second_identity.backend_num = 47;
+        let mut second = writer_commit_input(vec![second_frame]);
+        second.writer_id = 1;
+        second.fragment_id = 30;
+        second.writer_key.fragment_instance_id = UniqueId::new(41, 43);
+        second.writer_key.backend_num = 47;
+
+        let mut third_frame = frame(b"third", 0, 1, b"third");
+        let third_identity = third_frame.writer.as_mut().expect("third identity");
+        third_identity.cohort_id = vec![4; 32];
+        third_identity.fragment_id = 31;
+        third_identity.fragment_instance_id = Some(common::UniqueId { hi: 53, lo: 59 });
+        third_identity.backend_num = 61;
+        let mut third = writer_commit_input(vec![third_frame]);
+        third.writer_id = 2;
+        third.fragment_id = 31;
+        third.writer_key.fragment_instance_id = UniqueId::new(53, 59);
+        third.writer_key.backend_num = 61;
+
+        let grouped = ConnectorWriteCommitInput::try_extract_grouped(&WriteCommitInput {
+            write_id: query_id(),
+            writers: vec![first, second, third],
+        })
+        .expect("mixed operation reports group by signed cohort");
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(
+            grouped
+                .iter()
+                .find(|(cohort_id, _)| cohort_id.to_bytes() == [3; 32])
+                .map(|(_, input)| input)
+                .expect("first cohort")
+                .reports()
+                .len(),
+            2
+        );
+        assert_eq!(
+            grouped
+                .iter()
+                .find(|(cohort_id, _)| cohort_id.to_bytes() == [4; 32])
+                .map(|(_, input)| input)
+                .expect("second cohort")
+                .reports()
+                .len(),
+            1
+        );
     }
 }
