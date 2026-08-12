@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use arrow::array::{Array, ArrayRef, Int8Array};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use novarocks_spi::connector::{
@@ -49,6 +50,7 @@ pub struct BoundedRowMutationMatchCollector {
     max_bytes: u64,
     row_count: u64,
     byte_count: u64,
+    schema: Option<SchemaRef>,
     batches: Vec<RecordBatch>,
 }
 
@@ -67,6 +69,27 @@ impl BoundedRowMutationMatchCollector {
     pub fn try_new(
         context: ConnectorRequestContext,
         exec_mem_limit: Option<i64>,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_inner(context, exec_mem_limit, None)
+    }
+
+    /// Creates a collector with an explicit logical result schema.
+    ///
+    /// This is required when a valid query can return no batches: an empty
+    /// selection still carries the exact schema used by its canonical digest
+    /// and by provider activation validation.
+    pub fn try_new_with_schema(
+        context: ConnectorRequestContext,
+        exec_mem_limit: Option<i64>,
+        schema: SchemaRef,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_inner(context, exec_mem_limit, Some(schema))
+    }
+
+    fn try_new_inner(
+        context: ConnectorRequestContext,
+        exec_mem_limit: Option<i64>,
+        schema: Option<SchemaRef>,
     ) -> Result<Self, ConnectorError> {
         let connector_budget = u64::try_from(context.max_total_payload_bytes()).map_err(|_| {
             ConnectorError::new(
@@ -91,6 +114,7 @@ impl BoundedRowMutationMatchCollector {
             max_bytes,
             row_count: 0,
             byte_count: 0,
+            schema,
             batches: Vec::new(),
         })
     }
@@ -114,6 +138,16 @@ impl BoundedRowMutationMatchCollector {
     /// Retains one result batch without concatenating it with prior batches.
     pub fn push(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         self.check_control()?;
+        match &self.schema {
+            Some(schema) if batch.schema_ref() != schema => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "row-mutation match batch schema differs from the retained selection schema",
+                ));
+            }
+            None => self.schema = Some(batch.schema()),
+            Some(_) => {}
+        }
         let rows = u64::try_from(batch.num_rows()).map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
@@ -158,7 +192,13 @@ impl BoundedRowMutationMatchCollector {
 
     pub fn finish(self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
         self.check_control()?;
-        ConnectorRowMutationSelection::try_new(self.batches, self.max_rows, self.max_bytes)
+        let schema = self.schema.ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "empty row-mutation match collection has no explicit selection schema",
+            )
+        })?;
+        ConnectorRowMutationSelection::try_new(schema, self.batches, self.max_rows, self.max_bytes)
     }
 
     fn check_control(&self) -> Result<(), ConnectorError> {
@@ -490,12 +530,7 @@ mod tests {
     }
 
     fn batch(rows: Vec<(i32, i32, Option<i32>, i8)>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("identity", DataType::Int32, false),
-            Field::new("before", DataType::Int32, true),
-            Field::new("after", DataType::Int32, true),
-            Field::new("effect", DataType::Int8, false),
-        ]));
+        let schema = selection_schema();
         RecordBatch::try_new(
             schema,
             vec![
@@ -514,6 +549,15 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn selection_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("identity", DataType::Int32, false),
+            Field::new("before", DataType::Int32, true),
+            Field::new("after", DataType::Int32, true),
+            Field::new("effect", DataType::Int8, false),
+        ]))
     }
 
     #[test]
@@ -536,6 +580,49 @@ mod tests {
         assert_eq!(selection.batches().len(), 2);
         assert_eq!(selection.row_count(), 2);
         assert_eq!(selection.byte_count(), max_bytes);
+        assert_eq!(selection.schema(), &selection_schema());
+    }
+
+    #[test]
+    fn collector_preserves_an_explicit_schema_for_an_empty_selection() {
+        let schema = selection_schema();
+        let collector = BoundedRowMutationMatchCollector::try_new_with_schema(
+            context(Arc::new(Cancellation::default()), 1024),
+            None,
+            Arc::clone(&schema),
+        )
+        .unwrap();
+        let selection = collector.finish().unwrap();
+        assert_eq!(selection.schema(), &schema);
+        assert!(selection.batches().is_empty());
+        assert_eq!(selection.row_count(), 0);
+        assert_eq!(selection.byte_count(), 0);
+    }
+
+    #[test]
+    fn collector_rejects_schema_drift_and_untyped_empty_selection() {
+        let cancellation = Arc::new(Cancellation::default());
+        let mut collector = BoundedRowMutationMatchCollector::try_new(
+            context(Arc::clone(&cancellation), 4096),
+            None,
+        )
+        .unwrap();
+        collector
+            .push(batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]))
+            .unwrap();
+        let drifted = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "other",
+            DataType::Int32,
+            false,
+        )])));
+        let error = collector.push(drifted).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(collector.row_count(), 1);
+
+        let untyped =
+            BoundedRowMutationMatchCollector::try_new(context(cancellation, 4096), None).unwrap();
+        let error = untyped.finish().unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     #[test]

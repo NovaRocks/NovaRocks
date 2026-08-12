@@ -41,7 +41,7 @@ use crate::commit::write_shared::{
     write_target_snapshot_id,
 };
 use crate::control_provider::{IcebergTablePayload, metadata_arrow_fields};
-use crate::file_reader::execution_payload::decode_payload;
+use crate::file_reader::execution_payload::{decode_payload, encode_payload};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 
 /// Provider-side row-mutation admission. This is intentionally independent of
@@ -176,6 +176,35 @@ pub(crate) fn prepare_row_mutation(
             .map(|field| Arc::new(field.field().clone()))
             .collect::<Vec<_>>(),
     );
+    // The match query must scan the exact target ref/base chosen above. The
+    // ordinary admitted table handle names the provider's default/current ref,
+    // so reusing it would silently scan main for a branch mutation. Freeze a
+    // second provider-owned handle whose `Current` selector means this exact
+    // admitted snapshot, and sign the schema that handle will produce.
+    let mut match_source_payload = payload.clone();
+    match_source_payload.prepared_files.clear();
+    match_source_payload.explicit_files = None;
+    match_source_payload.row_mutation_frozen_source = false;
+    let match_table_info = match_source_payload.table_info.as_mut().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "admitted Iceberg row-mutation table lost its frozen descriptor",
+        )
+    })?;
+    match_table_info.current_snapshot_id = target_snapshot_id;
+    match_table_info.schema_id = target_iceberg_schema.schema_id();
+    match_table_info.schema = crate::schema_facts::iceberg_schema_def(&target_iceberg_schema);
+    let mut match_source_fields = target_schema.fields().to_vec();
+    match_source_fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
+    let match_source_schema = Arc::new(Schema::new(match_source_fields));
+    let match_source = ConnectorTableHandle::try_new(
+        owner.instance_id.clone(),
+        encode_payload(
+            &match_source_payload,
+            "row-mutation match source",
+            request.context.max_handle_payload_bytes(),
+        )?,
+    )?;
     let target_start = u32::try_from(identity_fields.len()).map_err(|_| {
         ConnectorError::new(
             ConnectorErrorKind::ResourceExhausted,
@@ -275,6 +304,8 @@ pub(crate) fn prepare_row_mutation(
             owner.clone(),
             request.operation_id,
             request.table,
+            match_source,
+            match_source_schema,
             request.target_ref,
             request.intent,
             base_version,
@@ -461,6 +492,19 @@ mod tests {
             ])
             .build()
             .expect("evolved schema");
+        let evolved_snapshot = Snapshot::builder()
+            .with_snapshot_id(42)
+            .with_parent_snapshot_id(Some(41))
+            .with_sequence_number(2)
+            .with_timestamp_ms(2)
+            .with_manifest_list("file:///tmp/row-mutation/snap-42.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: BTreeMap::new().into_iter().collect(),
+            })
+            .with_schema_id(2)
+            .with_row_range(0, 0)
+            .build();
         TableMetadataBuilder::new(
             base_schema.as_ref().clone(),
             PartitionSpec::unpartition_spec(),
@@ -490,6 +534,32 @@ mod tests {
         .expect("evolved schema")
         .set_current_schema(-1)
         .expect("current schema")
+        .add_snapshot(evolved_snapshot)
+        .expect("evolved snapshot")
+        .set_ref(
+            "main",
+            SnapshotReference::new(
+                42,
+                SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            ),
+        )
+        .expect("main ref")
+        .set_ref(
+            "dev",
+            SnapshotReference::new(
+                41,
+                SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            ),
+        )
+        .expect("dev ref")
         .build()
         .expect("metadata")
         .metadata
@@ -711,7 +781,7 @@ mod tests {
             prepare_row_mutation(
                 request(
                     PayloadSpec::new(&table_metadata).handle(),
-                    "main",
+                    "dev",
                     ConnectorRowMutationIntent::Delete,
                 ),
                 &owner,
@@ -719,6 +789,14 @@ mod tests {
             .expect("prepare"),
         );
         assert_eq!(preparation.base_version_ordinal(), Some(41));
+        let match_source: IcebergTablePayload = decode_payload(
+            preparation.match_source().payload(),
+            "row-mutation match source",
+        )
+        .expect("decode match source");
+        let match_info = match_source.table_info.expect("match table info");
+        assert_eq!(match_info.current_snapshot_id, Some(41));
+        assert_eq!(match_info.schema_id, 0);
         let prepared_names = preparation
             .match_contract()
             .after_fields()
@@ -738,6 +816,9 @@ mod tests {
             frozen_names.iter().map(String::as_str).collect::<Vec<_>>()
         );
         assert_eq!(prepared_names, vec!["id", "name"]);
+        assert_eq!(preparation.match_source_schema().field(0).name(), "id");
+        assert_eq!(preparation.match_source_schema().field(1).name(), "name");
+        assert_eq!(preparation.match_source_schema().field(2).name(), "_file");
     }
 
     #[test]

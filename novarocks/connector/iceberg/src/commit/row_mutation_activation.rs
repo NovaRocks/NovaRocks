@@ -1635,7 +1635,15 @@ mod tests {
         ConnectorRowMutationPreparation::try_new(
             owner.clone(),
             ConnectorWriteOperationId::from_bytes([3; 16]),
+            table.clone(),
             table,
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                Field::new("value", DataType::Int64, true),
+                Field::new("_file", DataType::Utf8, false),
+                Field::new("_pos", DataType::Int64, false),
+                Field::new("_row_id", DataType::Int64, false),
+                Field::new("_last_updated_sequence_number", DataType::Int64, false),
+            ])),
             ConnectorWriteTargetRef::main(),
             intent,
             base_version,

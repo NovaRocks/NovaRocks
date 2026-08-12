@@ -5699,6 +5699,13 @@ pub(crate) fn prepare_iceberg_row_mutation(
         .iter()
         .map(ConnectorMutationSourceField::token)
         .collect();
+    let mut match_source_fields = target_schema.fields().to_vec();
+    match_source_fields.extend(
+        identity_fields
+            .iter()
+            .map(|field| Arc::new(field.field().clone())),
+    );
+    let match_source_schema = Arc::new(Schema::new(match_source_fields));
     let contract = ConnectorMutationMatchContract::try_new(
         owner.clone(),
         request.table.clone(),
@@ -5718,7 +5725,9 @@ pub(crate) fn prepare_iceberg_row_mutation(
         ConnectorRowMutationPreparation::try_new(
             owner.clone(),
             request.operation_id,
+            request.table.clone(),
             request.table,
+            match_source_schema,
             request.target_ref,
             request.intent,
             base_version,

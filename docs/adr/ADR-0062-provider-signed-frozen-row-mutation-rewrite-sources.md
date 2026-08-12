@@ -2,9 +2,9 @@
 id: ADR-0062
 title: "Provider-signed frozen sources for copy-on-write row mutation"
 domain: [provider-spi, frontend-dml]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0063
 date: 2026-08-12
 provenance:
   - "discussion: 2026-08-12 provider-signed frozen sources for copy-on-write row mutation"

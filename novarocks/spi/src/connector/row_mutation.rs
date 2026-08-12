@@ -479,6 +479,9 @@ pub struct ConnectorRowMutationPreparation {
     owner: ConnectorExecutionBindingKey,
     operation_id: ConnectorWriteOperationId,
     table: ConnectorTableHandle,
+    match_source: ConnectorTableHandle,
+    match_source_schema: SchemaRef,
+    match_source_schema_digest: [u8; 32],
     target_ref: ConnectorWriteTargetRef,
     intent: ConnectorRowMutationIntent,
     base_version: ConnectorWriteBaseVersion,
@@ -496,6 +499,8 @@ impl ConnectorRowMutationPreparation {
         owner: ConnectorExecutionBindingKey,
         operation_id: ConnectorWriteOperationId,
         table: ConnectorTableHandle,
+        match_source: ConnectorTableHandle,
+        match_source_schema: SchemaRef,
         target_ref: ConnectorWriteTargetRef,
         intent: ConnectorRowMutationIntent,
         base_version: ConnectorWriteBaseVersion,
@@ -506,6 +511,7 @@ impl ConnectorRowMutationPreparation {
         payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         if table.owner() != &owner.instance_id
+            || match_source.owner() != &owner.instance_id
             || match_contract.owner() != &owner
             || match_contract.table() != &table
             || match_contract.base_version() != &base_version
@@ -518,11 +524,47 @@ impl ConnectorRowMutationPreparation {
         intent.validate()?;
         base_version.validate()?;
         match_contract.validate()?;
+        validate_selection_schema_shape(match_source_schema.as_ref())?;
+        for expected in match_contract
+            .identity_fields()
+            .iter()
+            .map(ConnectorMutationSourceField::field)
+            .chain(
+                match_contract
+                    .before_fields()
+                    .iter()
+                    .chain(match_contract.after_fields())
+                    .map(ConnectorMutationTargetField::field),
+            )
+        {
+            let mut matching = match_source_schema
+                .fields()
+                .iter()
+                .filter(|actual| actual.name() == expected.name());
+            let actual = matching.next().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "row-mutation match source omits a signed match field",
+                )
+            })?;
+            if matching.next().is_some()
+                || actual.data_type() != expected.data_type()
+                || (actual.is_nullable() && !expected.is_nullable())
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "row-mutation match source field differs from its signed match role",
+                ));
+            }
+        }
+        let match_source_schema_digest = canonical_schema_digest(match_source_schema.as_ref())?;
         validate_payload(&payload)?;
         let digest = preparation_digest(
             &owner,
             operation_id,
             &table,
+            &match_source,
+            match_source_schema_digest,
             &target_ref,
             &intent,
             &base_version,
@@ -536,6 +578,9 @@ impl ConnectorRowMutationPreparation {
             owner,
             operation_id,
             table,
+            match_source,
+            match_source_schema,
+            match_source_schema_digest,
             target_ref,
             intent,
             base_version,
@@ -552,6 +597,8 @@ impl ConnectorRowMutationPreparation {
             self.owner.clone(),
             self.operation_id,
             self.table.clone(),
+            self.match_source.clone(),
+            self.match_source_schema.clone(),
             self.target_ref.clone(),
             self.intent.clone(),
             self.base_version.clone(),
@@ -577,6 +624,20 @@ impl ConnectorRowMutationPreparation {
     }
     pub fn table(&self) -> &ConnectorTableHandle {
         &self.table
+    }
+    /// Exact provider-signed source handle for the SQL match phase. This may
+    /// differ from [`Self::table`] when a named ref is not the provider's
+    /// current/default ref.
+    pub fn match_source(&self) -> &ConnectorTableHandle {
+        &self.match_source
+    }
+    /// Exact provider-signed Arrow schema produced when scanning [`Self::table`]
+    /// for the match phase of this admitted row mutation.
+    pub fn match_source_schema(&self) -> &SchemaRef {
+        &self.match_source_schema
+    }
+    pub const fn match_source_schema_digest(&self) -> [u8; 32] {
+        self.match_source_schema_digest
     }
     pub fn target_ref(&self) -> &ConnectorWriteTargetRef {
         &self.target_ref
@@ -2100,6 +2161,8 @@ fn preparation_digest(
     owner: &ConnectorExecutionBindingKey,
     operation: ConnectorWriteOperationId,
     table: &ConnectorTableHandle,
+    match_source: &ConnectorTableHandle,
+    match_source_schema_digest: [u8; 32],
     target_ref: &ConnectorWriteTargetRef,
     intent: &ConnectorRowMutationIntent,
     base: &ConnectorWriteBaseVersion,
@@ -2110,10 +2173,12 @@ fn preparation_digest(
     payload: &Bytes,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"novarocks.connector-row-mutation-preparation.v1\0");
+    hasher.update(b"novarocks.connector-row-mutation-preparation.v2\0");
     digest_owner(&mut hasher, owner);
     hasher.update(operation.to_bytes());
     digest_bytes(&mut hasher, table.payload());
+    digest_bytes(&mut hasher, match_source.payload());
+    hasher.update(match_source_schema_digest);
     digest_bytes(&mut hasher, target_ref.as_str().as_bytes());
     match intent {
         ConnectorRowMutationIntent::Delete => hasher.update([1]),
@@ -2398,6 +2463,13 @@ mod tests {
         .expect("context")
     }
 
+    fn match_source_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]))
+    }
+
     #[test]
     fn selection_is_non_concat_and_bounded() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
@@ -2609,6 +2681,8 @@ mod tests {
             owner.clone(),
             operation,
             table.clone(),
+            table.clone(),
+            match_source_schema(),
             ConnectorWriteTargetRef::main(),
             ConnectorRowMutationIntent::Merge {
                 effects: vec![ConnectorRowMutationEffect::Insert],
@@ -2852,6 +2926,8 @@ mod tests {
             owner.clone(),
             operation,
             table.clone(),
+            table.clone(),
+            match_source_schema(),
             ConnectorWriteTargetRef::main(),
             ConnectorRowMutationIntent::Update,
             base.clone(),
@@ -3166,7 +3242,9 @@ mod tests {
         ConnectorRowMutationPreparation::try_new(
             owner,
             ConnectorWriteOperationId::new(),
+            table.clone(),
             table,
+            match_source_schema(),
             ConnectorWriteTargetRef::main(),
             ConnectorRowMutationIntent::Delete,
             base_version,
