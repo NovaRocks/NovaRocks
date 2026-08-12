@@ -119,6 +119,25 @@ impl FrontendMvRefreshProviderActivationPort {
             .interpret_write_commit(intent, receipt)
             .map_err(invalid)
     }
+
+    pub(super) fn sync_repartition_descriptor(
+        &self,
+        mv_id: i64,
+        partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+        connector_context: &ConnectorRequestContext,
+    ) -> Result<(), MvApplicationError> {
+        let activation = self
+            .activation
+            .read()
+            .map_err(|_| unavailable("MV refresh provider activation lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| unavailable("MV refresh provider activation is unavailable"))?;
+        activation
+            .sync_repartition_descriptor(mv_id, partition_spec, connector_context)
+            .map_err(|error| {
+                MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
+            })
+    }
 }
 
 impl MvRefreshProviderActivationSink for FrontendMvRefreshProviderActivationPort {
@@ -168,6 +187,7 @@ pub(super) fn execute(
     }
 
     let base_snapshots = required_base_snapshots(&refresh.finalize)?;
+    let base_table_uuids = refresh.finalize.base_table_uuids.clone();
     let has_external_actions = matches!(&refresh.work, PreparedMvRefreshWork::DataProducing { .. });
     let ledger = new_ledger(&refresh, &planning_lease, has_external_actions)?;
     repository
@@ -180,6 +200,7 @@ pub(super) fn execute(
             staging_branch: refresh.attempt.staging_branch.clone(),
             expected_main_snapshot_id: refresh.finalize.expected_target_snapshot_id,
             base_snapshots: base_snapshots.clone(),
+            base_table_uuids: base_table_uuids.clone(),
             marker_token: refresh.attempt.marker_token.clone(),
             prepare_external_actions: has_external_actions,
             ledger,
@@ -199,7 +220,7 @@ pub(super) fn execute(
                     refresh_id: attempt.refresh_id,
                     rows: 0,
                     base_snapshots,
-                    base_table_uuids: finalize.base_table_uuids,
+                    base_table_uuids,
                     target_snapshot_id: finalize.expected_target_snapshot_id,
                     partition_spec: None,
                 })
@@ -452,7 +473,7 @@ fn execute_data_refresh(
                     policy: DropPolicy::NoOpIfMissing,
                 },
             },
-            connector_context,
+            connector_context.clone(),
         );
         record_catalog_action(
             repository,
@@ -464,6 +485,20 @@ fn execute_data_refresh(
         )?;
     }
 
+    let partition_spec = published
+        .committed()
+        .committed_partitioning()
+        .map(mv_partition_contract)
+        .transpose()?;
+    if let Some(partition_spec) = &partition_spec {
+        dependencies
+            .provider_activation
+            .sync_repartition_descriptor(
+                finalize.mv_id,
+                partition_spec.clone(),
+                &connector_context,
+            )?;
+    }
     repository
         .finalize_refresh(MvRefreshFinalizeRequest {
             refresh_id: attempt.refresh_id,
@@ -471,11 +506,7 @@ fn execute_data_refresh(
             base_snapshots,
             base_table_uuids: finalize.base_table_uuids,
             target_snapshot_id: published_frontend_version.snapshot_id,
-            partition_spec: published
-                .committed()
-                .committed_partitioning()
-                .map(mv_partition_contract)
-                .transpose()?,
+            partition_spec,
         })
         .map_err(|error| {
             MvApplicationError::new(
@@ -1015,6 +1046,15 @@ mod tests {
             _receipt: &ConnectorWriteReceipt,
         ) -> Result<MvRefreshCommittedFacts, String> {
             unreachable!("the composition test never interprets a receipt")
+        }
+
+        fn sync_repartition_descriptor(
+            &self,
+            _mv_id: i64,
+            _partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+            _connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<(), String> {
+            Ok(())
         }
     }
 

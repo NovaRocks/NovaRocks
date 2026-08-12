@@ -78,6 +78,37 @@ impl MvRefreshProviderActivation for StandaloneMvRefreshProviderActivation {
     ) -> Result<MvRefreshCommittedFacts, String> {
         MvRefreshCommittedFacts::from_write_receipt(intent, receipt)
     }
+
+    fn sync_repartition_descriptor(
+        &self,
+        mv_id: i64,
+        partition_spec: crate::mv::persistence::schema::MvPartitionContract,
+        connector_context: &ConnectorRequestContext,
+    ) -> Result<(), String> {
+        let state = self.state.upgrade().ok_or_else(|| {
+            "MV repartition descriptor projection is unavailable during engine shutdown".to_string()
+        })?;
+        let mut definition = state
+            .mv_repository
+            .load_by_id(mv_id)
+            .map_err(|error| format!("load MV definition for descriptor projection: {error}"))?
+            .ok_or_else(|| {
+                format!("materialized view {mv_id} is absent during descriptor projection")
+            })?;
+        let schema = definition.schema_contract.as_mut().ok_or_else(|| {
+            format!("materialized view {mv_id} has no schema contract during descriptor projection")
+        })?;
+        schema.target.partition = Some(partition_spec.clone());
+        definition.partition_spec = Some(partition_spec);
+        crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor(
+            &state,
+            &definition,
+            &definition.refresh_policy,
+            definition.refresh_paused,
+            definition.refresh_interval_ms,
+            connector_context,
+        )
+    }
 }
 
 /// Activate a managed MV write from the exact provider-signed preparation.

@@ -1295,7 +1295,7 @@ impl StateStoreMvRepository {
                         staging_snapshot_id: None,
                         published_snapshot_id: None,
                         target_snapshots: request.base_snapshots,
-                        base_table_uuids: BTreeMap::new(),
+                        base_table_uuids: request.base_table_uuids,
                         rows: None,
                         marker: Some(RefreshCommitMarker {
                             refresh_id,
@@ -1954,6 +1954,11 @@ impl StateStoreMvRepository {
                     recovery.inspection_provider_id = Some(request.provider_id);
                     recovery.inspection_instance_id = Some(request.instance_id);
                     recovery.inspection_incarnation = Some(request.incarnation);
+                    // Each recovery cycle records a fresh observation of the
+                    // current lake truth. Cleanup identity and evidence remain
+                    // stable so a later cycle can safely converge an unknown
+                    // cleanup outcome without replaying the mutation.
+                    recovery.observation = None;
                     recovery.last_unresolved_reason = None;
                     recovery.validate().map_err(invalid_state_store)?;
                     refresh.frontend_recovery = Some(recovery);
@@ -2159,6 +2164,9 @@ impl StateStoreMvRepository {
                         && !matches!(refresh.state, MvRefreshState::Finalized)
                     {
                         return Err(conflict_state_store("recovered refresh is not the active MV fence"));
+                    }
+                    if request.finalize.partition_spec.is_some() {
+                        converge_recovered_repartition_actions(&mut refresh, observation)?;
                     }
                     if !matches!(refresh.state, MvRefreshState::Finalized) {
                         definition.last_refresh_rows = Some(request.finalize.rows);
@@ -3536,6 +3544,15 @@ fn validate_frontend_refresh_request(
             "frontend MV refresh intent cannot contain completed external actions",
         ));
     }
+    if request
+        .base_snapshots
+        .keys()
+        .ne(request.base_table_uuids.keys())
+    {
+        return Err(invalid(
+            "frontend MV refresh base snapshot and table UUID keys must match exactly",
+        ));
+    }
     request.ledger.validate().map_err(invalid)
 }
 
@@ -3592,6 +3609,36 @@ fn frontend_prepared_actions(ledger: &FrontendMvRefreshLedger) -> Vec<FrontendMv
         provider_finalized: false,
     })
     .collect()
+}
+
+fn converge_recovered_repartition_actions(
+    refresh: &mut StoredMvRefresh,
+    observation: &novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryObservation,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    let ledger = refresh.frontend_ledger.as_mut().ok_or_else(|| {
+        invalid_state_store("recovered repartition refresh has no frontend action ledger")
+    })?;
+    let committed_version = observation.committed_version.clone().ok_or_else(|| {
+        conflict_state_store("recovered repartition publication has no committed version")
+    })?;
+    if ledger.actions.len() != 4 {
+        return Err(conflict_state_store(
+            "recovered repartition refresh does not retain all four action intents",
+        ));
+    }
+    for action in &mut ledger.actions {
+        action.state = FrontendMvRefreshActionState::KnownCommitted;
+        action.receipt = None;
+        action.committed_version = matches!(
+            action.phase,
+            FrontendMvRefreshActionPhase::Write | FrontendMvRefreshActionPhase::Publication
+        )
+        .then(|| committed_version.clone());
+        action.external_evidence = Some(observation.proof.clone());
+        action.provider_finalized = true;
+    }
+    ledger.cleanup_pending = false;
+    ledger.validate().map_err(invalid_state_store)
 }
 
 fn ensure_frontend_action_prerequisites(

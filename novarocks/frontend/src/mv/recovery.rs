@@ -62,6 +62,7 @@ pub struct FrontendMvRecoverySummary {
 
 pub(super) struct FrontendMvRecoveryDependencies {
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
+    pub(super) provider_activation: Arc<super::refresh::FrontendMvRefreshProviderActivationPort>,
 }
 
 pub(super) fn recover_once(
@@ -190,9 +191,11 @@ fn recover_one(
             let committed_partitioning = observation.committed_partitioning.clone();
             finalize_published(
                 repository,
+                dependencies,
                 &recovered,
                 frontend_observation.clone(),
                 committed_partitioning.as_ref(),
+                &context,
             )?;
             if observation.cleanup_required {
                 match cleanup(
@@ -201,7 +204,7 @@ fn recover_one(
                     &descriptor,
                     observation,
                     &recovered,
-                    context,
+                    context.clone(),
                 )? {
                     RecoveryResult::Resolved => {
                         // Cleanup persists its terminal evidence after the first
@@ -214,9 +217,11 @@ fn recover_one(
                             .ok_or(())?;
                         finalize_published(
                             repository,
+                            dependencies,
                             &recovered,
                             frontend_observation,
                             committed_partitioning.as_ref(),
+                            &context,
                         )?;
                         Ok(RecoveryResult::Resolved)
                     }
@@ -476,9 +481,11 @@ fn record_cleanup_outcome(
 
 fn finalize_published(
     repository: &dyn MvRepository,
+    dependencies: &FrontendMvRecoveryDependencies,
     refresh: &StoredMvRefresh,
     observation: FrontendMvRefreshRecoveryObservation,
     committed_partitioning: Option<&novarocks_spi::connector::ConnectorCommittedPartitioning>,
+    connector_context: &ConnectorRequestContext,
 ) -> Result<(), ()> {
     let mut recovery = refresh.frontend_recovery.clone().ok_or(())?;
     recovery.observation = Some(observation.clone());
@@ -492,6 +499,16 @@ fn finalize_published(
         .as_ref()
         .and_then(|version| version.snapshot_id)
         .ok_or(())?;
+    let partition_spec = committed_partitioning
+        .map(super::refresh::mv_partition_contract)
+        .transpose()
+        .map_err(|_| ())?;
+    if let Some(partition_spec) = &partition_spec {
+        dependencies
+            .provider_activation
+            .sync_repartition_descriptor(refresh.mv_id, partition_spec.clone(), connector_context)
+            .map_err(|_| ())?;
+    }
     repository
         .finalize_recovered_published_refresh(FinalizeRecoveredMvRefreshRequest {
             finalize: MvRefreshFinalizeRequest {
@@ -500,10 +517,7 @@ fn finalize_published(
                 base_snapshots: refresh.target_snapshots.clone(),
                 base_table_uuids: refresh.base_table_uuids.clone(),
                 target_snapshot_id: Some(committed_snapshot_id),
-                partition_spec: committed_partitioning
-                    .map(super::refresh::mv_partition_contract)
-                    .transpose()
-                    .map_err(|_| ())?,
+                partition_spec,
             },
             recovery,
         })
@@ -969,6 +983,10 @@ mod tests {
                     staging_branch: format!("__nova_mv_{table}"),
                     expected_main_snapshot_id: Some(7),
                     base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
+                    base_table_uuids: BTreeMap::from([(
+                        "ice.sales.orders".to_string(),
+                        "orders-uuid".to_string(),
+                    )]),
                     marker_token: format!("marker-{table}"),
                     prepare_external_actions: true,
                     ledger: frontend_ledger(binding),
@@ -985,10 +1003,45 @@ mod tests {
 
     struct TestRecovery {
         key: ConnectorExecutionBindingKey,
-        observation: ConnectorStagedPublicationObservation,
+        observations: Vec<ConnectorStagedPublicationObservation>,
+        inspect_calls: AtomicUsize,
         cleanup_mode: CleanupMode,
         cleanup_calls: AtomicUsize,
         reconcile_calls: AtomicUsize,
+    }
+
+    struct TestDescriptorProjection;
+
+    impl novarocks::mv::application::MvRefreshProviderActivation for TestDescriptorProjection {
+        fn activate_write(
+            &self,
+            _prepared: novarocks::mv::application::PreparedMvRefreshWrite,
+            _planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+            _exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+            _execution: &novarocks::query_execution::request_context::QueryExecutionContext,
+        ) -> Result<
+            novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest,
+            String,
+        > {
+            unreachable!("recovery never activates a writer")
+        }
+
+        fn interpret_write_commit(
+            &self,
+            _intent: novarocks::mv::application::MvRefreshPublicationIntent,
+            _receipt: &novarocks_spi::connector::ConnectorWriteReceipt,
+        ) -> Result<novarocks::mv::application::MvRefreshCommittedFacts, String> {
+            unreachable!("recovery never interprets a live write receipt")
+        }
+
+        fn sync_repartition_descriptor(
+            &self,
+            _mv_id: i64,
+            _partition_spec: MvPartitionContract,
+            _connector_context: &ConnectorRequestContext,
+        ) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     impl TestRecovery {
@@ -997,9 +1050,22 @@ mod tests {
             observation: ConnectorStagedPublicationObservation,
             cleanup_mode: CleanupMode,
         ) -> Self {
+            Self::with_observations(key, vec![observation], cleanup_mode)
+        }
+
+        fn with_observations(
+            key: ConnectorExecutionBindingKey,
+            observations: Vec<ConnectorStagedPublicationObservation>,
+            cleanup_mode: CleanupMode,
+        ) -> Self {
+            assert!(
+                !observations.is_empty(),
+                "test recovery requires an observation"
+            );
             Self {
                 key,
-                observation,
+                observations,
+                inspect_calls: AtomicUsize::new(0),
                 cleanup_mode,
                 cleanup_calls: AtomicUsize::new(0),
                 reconcile_calls: AtomicUsize::new(0),
@@ -1042,7 +1108,8 @@ mod tests {
             _context: ConnectorRequestContext,
         ) -> Result<ConnectorStagedPublicationObservation, novarocks_spi::connector::ConnectorError>
         {
-            Ok(self.observation.clone())
+            let index = self.inspect_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.observations[index.min(self.observations.len() - 1)].clone())
         }
 
         fn cleanup(
@@ -1088,9 +1155,17 @@ mod tests {
             .expect("attach staged-publication recovery");
         let host = Arc::new(ConnectorControlHost::new());
         host.register(binding).expect("register control binding");
+        let provider_activation =
+            Arc::new(super::super::refresh::FrontendMvRefreshProviderActivationPort::new());
+        novarocks::mv::application::MvRefreshProviderActivationSink::bind_mv_refresh_provider_activation(
+            provider_activation.as_ref(),
+            Arc::new(TestDescriptorProjection),
+        )
+        .expect("bind descriptor projection");
         (
             FrontendMvRecoveryDependencies {
                 connector_control: host.clone(),
+                provider_activation,
             },
             host,
         )
@@ -1243,6 +1318,14 @@ mod tests {
         disposition: ConnectorStagedPublicationDisposition,
         cleanup_required: bool,
     ) -> ConnectorStagedPublicationObservation {
+        observation_with_proof(disposition, cleanup_required, b"lake-proof")
+    }
+
+    fn observation_with_proof(
+        disposition: ConnectorStagedPublicationDisposition,
+        cleanup_required: bool,
+        proof: &'static [u8],
+    ) -> ConnectorStagedPublicationObservation {
         let published = matches!(
             disposition,
             ConnectorStagedPublicationDisposition::Published
@@ -1266,7 +1349,7 @@ mod tests {
             Some(42),
             published.then_some(42),
             cleanup_required,
-            ConnectorStagedPublicationProof::try_new(Bytes::from_static(b"lake-proof"))
+            ConnectorStagedPublicationProof::try_new(Bytes::from_static(proof))
                 .expect("publication proof"),
         )
         .expect("staged-publication observation")
@@ -1323,7 +1406,7 @@ mod tests {
                 cleanup_backlog: 0,
             }
         );
-        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 1);
         let recovered = environment
             .repository
             .load_refresh(refresh.refresh_id)
@@ -1428,6 +1511,41 @@ mod tests {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
         let refresh = environment.begin_refresh("atomic_published", &key);
+        let prepared = refresh
+            .frontend_ledger
+            .as_ref()
+            .expect("frontend action ledger")
+            .clone();
+        environment
+            .repository
+            .record_frontend_refresh_action(
+                refresh.refresh_id,
+                FrontendMvRefreshAction {
+                    phase: FrontendMvRefreshActionPhase::StagingCreate,
+                    state: FrontendMvRefreshActionState::KnownCommitted,
+                    operation_id: prepared.staging_create_operation_id.clone(),
+                    receipt: None,
+                    committed_version: None,
+                    external_evidence: Some(evidence_value(b"staging-create-proof")),
+                    provider_finalized: true,
+                },
+            )
+            .expect("record proof-only staging create");
+        environment
+            .repository
+            .record_frontend_refresh_action(
+                refresh.refresh_id,
+                FrontendMvRefreshAction {
+                    phase: FrontendMvRefreshActionPhase::Write,
+                    state: FrontendMvRefreshActionState::CommitUnknown,
+                    operation_id: prepared.write_operation_id.clone(),
+                    receipt: None,
+                    committed_version: None,
+                    external_evidence: Some(evidence_value(b"write-response-lost")),
+                    provider_finalized: false,
+                },
+            )
+            .expect("record response loss after atomic repartition write");
         let recovery = Arc::new(TestRecovery::new(
             key,
             repartition_observation(),
@@ -1466,6 +1584,57 @@ mod tests {
                 .and_then(|contract| contract.target.partition.as_ref()),
             Some(&expected)
         );
+        let recovered = environment
+            .repository
+            .load_refresh(refresh.refresh_id)
+            .expect("load recovered repartition refresh")
+            .expect("recovered repartition refresh exists");
+        let ledger = recovered.frontend_ledger.expect("frontend action ledger");
+        assert!(!ledger.cleanup_pending);
+        for (phase, operation_id) in [
+            (
+                FrontendMvRefreshActionPhase::StagingCreate,
+                &prepared.staging_create_operation_id,
+            ),
+            (
+                FrontendMvRefreshActionPhase::Write,
+                &prepared.write_operation_id,
+            ),
+            (
+                FrontendMvRefreshActionPhase::Publication,
+                &prepared.publication_operation_id,
+            ),
+            (
+                FrontendMvRefreshActionPhase::StagingDrop,
+                &prepared.staging_drop_operation_id,
+            ),
+        ] {
+            let action = ledger
+                .actions
+                .iter()
+                .find(|action| action.phase == phase)
+                .expect("terminal action");
+            assert_eq!(action.operation_id, *operation_id);
+            assert_eq!(action.state, FrontendMvRefreshActionState::KnownCommitted);
+            assert_eq!(
+                action.external_evidence.as_ref(),
+                Some(&evidence_value(b"lake-proof"))
+            );
+            assert!(action.provider_finalized);
+            if matches!(
+                phase,
+                FrontendMvRefreshActionPhase::Write | FrontendMvRefreshActionPhase::Publication
+            ) {
+                let version = action
+                    .committed_version
+                    .as_ref()
+                    .expect("write and publication retain the committed version");
+                assert_eq!(version.payload, b"v42");
+                assert_eq!(version.snapshot_id, Some(42));
+            } else {
+                assert_eq!(action.committed_version, None);
+            }
+        }
     }
 
     #[test]
@@ -1497,13 +1666,24 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_commit_unknown_is_retained_as_backlog() {
+    fn cleanup_commit_unknown_reinspects_evolved_truth_and_converges() {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
         let refresh = environment.begin_refresh("cleanup_unknown", &key);
-        let recovery = Arc::new(TestRecovery::new(
+        let recovery = Arc::new(TestRecovery::with_observations(
             key,
-            observation(ConnectorStagedPublicationDisposition::Published, true),
+            vec![
+                observation_with_proof(
+                    ConnectorStagedPublicationDisposition::Published,
+                    true,
+                    b"lake-proof-before-cleanup",
+                ),
+                observation_with_proof(
+                    ConnectorStagedPublicationDisposition::Superseded,
+                    false,
+                    b"lake-proof-after-cleanup",
+                ),
+            ],
             CleanupMode::CommitUnknown,
         ));
         let (dependencies, _host) = dependencies(recovery.clone());
@@ -1531,13 +1711,15 @@ mod tests {
         );
         let first_operation_id = ledger.cleanup_operation_id.clone();
         let first_evidence = ledger.cleanup_evidence.clone().expect("cleanup evidence");
+        let first_observation = ledger.observation.clone().expect("first observation");
 
         let second = recover_once(environment.repository.as_ref(), &dependencies);
         assert_eq!(second.candidates, 1);
-        assert_eq!(second.cleanup_backlog, 1);
-        assert_eq!(second.resolved, 0);
-        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(recovery.reconcile_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(second.cleanup_backlog, 0);
+        assert_eq!(second.resolved, 1);
+        assert_eq!(recovery.inspect_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery.reconcile_calls.load(Ordering::SeqCst), 1);
         let recovered = environment
             .repository
             .load_refresh(refresh.refresh_id)
@@ -1546,9 +1728,16 @@ mod tests {
         let ledger = recovered.frontend_recovery.expect("recovery ledger");
         assert_eq!(
             ledger.status,
-            FrontendMvRefreshRecoveryStatus::CleanupPending
+            FrontendMvRefreshRecoveryStatus::ResolvedPublished
         );
         assert_eq!(ledger.cleanup_operation_id, first_operation_id);
         assert_eq!(ledger.cleanup_evidence.as_ref(), Some(&first_evidence));
+        let second_observation = ledger.observation.expect("second observation");
+        assert_eq!(
+            second_observation.disposition,
+            novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Superseded
+        );
+        assert!(!second_observation.cleanup_required);
+        assert_ne!(second_observation.digest, first_observation.digest);
     }
 }

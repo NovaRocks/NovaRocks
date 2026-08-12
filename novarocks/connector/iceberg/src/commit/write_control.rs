@@ -2850,6 +2850,15 @@ pub(crate) fn operation_marker_partitioning(
     let Some(spec_id) = marker.committed_partition_spec_id else {
         return Ok(None);
     };
+    if metadata.default_partition_spec_id() != spec_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!(
+                "Iceberg atomic repartition default partition spec drifted from committed spec {spec_id} to {}",
+                metadata.default_partition_spec_id()
+            ),
+        ));
+    }
     let operation_id = ConnectorWriteOperationId::from_bytes(decode_marker_fixed::<16>(
         &marker.operation_id_base64,
         "operation id",

@@ -181,6 +181,7 @@ pub struct BeginFrontendMvRefreshIntentRequest {
     pub staging_branch: String,
     pub expected_main_snapshot_id: Option<i64>,
     pub base_snapshots: BTreeMap<String, i64>,
+    pub base_table_uuids: BTreeMap<String, String>,
     pub marker_token: String,
     /// `false` is the explicit no-op/metadata form: it writes the durable v3
     /// intent but does not synthesize writer or staging actions.

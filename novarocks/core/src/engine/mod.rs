@@ -1549,6 +1549,13 @@ impl StandaloneNovaRocks {
             iceberg_operation_repo: IcebergOperationRepository,
         });
         register_connector_backends(&inner);
+        if let Some(sink) = &mv_refresh_provider_activation_sink {
+            sink.bind_mv_refresh_provider_activation(Arc::new(
+                crate::engine::mv::iceberg_activation::StandaloneMvRefreshProviderActivation::new(
+                    Arc::downgrade(&inner),
+                ),
+            ))?;
+        }
         restore_metadata_if_needed(&inner)?;
         let engine = Self { inner };
         if let Some(sink) = statistics_target_resolver_sink {
@@ -1559,9 +1566,6 @@ impl StandaloneNovaRocks {
         }
         if let Some(sink) = statistics_attempt_executor_sink {
             sink.bind_statistics_attempt_executor(engine.statistics_attempt_executor())?;
-        }
-        if let Some(sink) = mv_refresh_provider_activation_sink {
-            sink.bind_mv_refresh_provider_activation(engine.mv_refresh_provider_activation())?;
         }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;

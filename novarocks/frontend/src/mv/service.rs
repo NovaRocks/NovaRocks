@@ -111,9 +111,12 @@ impl FrontendMvService {
             refresh: Some(refresh::FrontendMvRefreshDependencies {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
-                provider_activation,
+                provider_activation: Arc::clone(&provider_activation),
             }),
-            recovery: Some(recovery::FrontendMvRecoveryDependencies { connector_control }),
+            recovery: Some(recovery::FrontendMvRecoveryDependencies {
+                connector_control,
+                provider_activation: Arc::clone(&provider_activation),
+            }),
             activity_gate: MvActivityGate::new(),
             background: Mutex::new(None),
             scheduler_config,

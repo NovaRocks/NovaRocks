@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
-use novarocks_connector_iceberg::iceberg::Catalog;
 #[cfg(test)]
 use novarocks_connector_iceberg::iceberg::spec::DataFile;
 #[cfg(test)]
@@ -36,16 +35,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::common::engine_error::EngineError;
-#[cfg(test)]
-use crate::connector::iceberg::commit::{
-    CleanupAttempt, IcebergCommitCollector, RunInput, run_iceberg_commit,
-};
-use crate::connector::iceberg::commit::{
-    CommitServiceError, MvRefreshSnapshotMarker, RecoveryEvidence,
-};
-use crate::connector::iceberg::operation_lifecycle::{
-    operation_fact_from_commit_result, operation_fact_from_finalize_failure,
-};
 use crate::engine::mv::analysis_adapter::{
     BaseColumnDescriptor, BaseTableDescriptor, analyze_mv_select_with_connector_context, now_ms,
     validate_ivm_primary_key,
@@ -194,6 +183,7 @@ use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 #[cfg(test)]
 use novarocks_connector_iceberg::commit::CommitOutcome;
 use novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files;
+#[cfg(test)]
 use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };

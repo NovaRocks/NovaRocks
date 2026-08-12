@@ -2452,7 +2452,7 @@ mod staged_publication_recovery_tests {
     }
 
     #[test]
-    fn historical_inspection_finds_atomic_publication_below_later_main_head() {
+    fn historical_inspection_accepts_later_main_head_but_rejects_default_spec_drift() {
         let (executor, _warehouse, provider, table) = provider_with_empty_table();
         let metadata = table.metadata().clone();
         let unbound = UnboundPartitionSpecBuilder::new()
@@ -2561,18 +2561,21 @@ mod staged_publication_recovery_tests {
                 },
             },
         ]);
+        let table_ident = table.identifier().clone();
+        let table_uuid = metadata.uuid();
+        let original_default_spec_id = metadata.default_partition_spec_id();
         let catalog = Arc::clone(provider.runtime.catalog());
+        let publication_catalog = Arc::clone(&catalog);
+        let publication_ident = table_ident.clone();
         executor.block_on(async move {
-            catalog
+            publication_catalog
                 .update_table(
                     TableCommit::builder()
-                        .ident(table.identifier().clone())
+                        .ident(publication_ident)
                         .requirements(vec![
-                            TableRequirement::UuidMatch {
-                                uuid: metadata.uuid(),
-                            },
+                            TableRequirement::UuidMatch { uuid: table_uuid },
                             TableRequirement::DefaultSpecIdMatch {
-                                default_spec_id: metadata.default_partition_spec_id(),
+                                default_spec_id: original_default_spec_id,
                             },
                             TableRequirement::RefSnapshotIdMatch {
                                 r#ref: "main".to_string(),
@@ -2601,6 +2604,61 @@ mod staged_publication_recovery_tests {
             Some(published_snapshot_id)
         );
         assert_eq!(observation.committed_partitioning, Some(committed));
+
+        provider
+            .runtime
+            .control_state()
+            .invalidate_table_cache("db", "t");
+        let current = provider
+            .runtime
+            .load_table("db", "t")
+            .expect("load atomic publication before external spec drift");
+        let current_metadata = current.table.metadata().clone();
+        let drifted = crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(
+            current_metadata.clone(),
+            None,
+        )
+        .add_default_partition_spec(
+            UnboundPartitionSpecBuilder::new()
+                .add_partition_field(1, "value_bucket_16", Transform::Bucket(16))
+                .expect("drifted partition field")
+                .build(),
+        )
+        .expect("add externally drifted default spec")
+        .build()
+        .expect("build externally drifted metadata");
+        assert_ne!(drifted.metadata.default_partition_spec_id(), spec_id);
+        executor.block_on(async move {
+            catalog
+                .update_table(
+                    TableCommit::builder()
+                        .ident(table_ident)
+                        .requirements(vec![
+                            TableRequirement::UuidMatch {
+                                uuid: current_metadata.uuid(),
+                            },
+                            TableRequirement::DefaultSpecIdMatch {
+                                default_spec_id: current_metadata.default_partition_spec_id(),
+                            },
+                        ])
+                        .updates(drifted.changes)
+                        .build(),
+                )
+                .await
+                .expect("externally drift default partition spec");
+        });
+        let error = provider
+            .inspect(
+                recovery_descriptor(&provider, provider.descriptor.instance_id.clone()),
+                context(),
+            )
+            .expect_err("historical inspection must reject default spec drift");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            error
+                .to_string()
+                .contains("atomic repartition default partition spec drifted from committed spec")
+        );
     }
 
     #[test]
