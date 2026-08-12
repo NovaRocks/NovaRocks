@@ -182,7 +182,6 @@ use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 #[cfg(test)]
 use novarocks_connector_iceberg::commit::CommitOutcome;
-use novarocks_connector_iceberg::commit::data_writer::write_record_batches_as_data_files;
 #[cfg(test)]
 use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
@@ -9686,26 +9685,6 @@ fn build_imv_change_stream_branches_for_test(
             novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
         ],
     }
-}
-
-#[derive(Clone, Copy)]
-enum FullRebuildSelectPreparation<'a> {
-    Projection {
-        select_sql: &'a str,
-        pin: &'a RefreshSnapshotPin,
-        current_catalog: Option<&'a str>,
-        current_database: &'a str,
-    },
-    LegacyVisible {
-        select_sql: &'a str,
-    },
-}
-
-pub(crate) async fn write_chunks_as_iceberg_data_files(
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-    chunks: &[novarocks_execution::exec::chunk::Chunk],
-) -> Result<Vec<novarocks_connector_iceberg::iceberg::spec::DataFile>, String> {
-    write_record_batches_as_data_files(table, chunks.iter().map(|chunk| chunk.batch.clone())).await
 }
 
 #[cfg(test)]

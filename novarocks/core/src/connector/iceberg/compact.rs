@@ -36,11 +36,11 @@ use crate::connector::iceberg::commit::{
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::{invalidate_iceberg_caches, run_select_to_chunks};
-use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use novarocks_connector_iceberg::commit::AbortLog;
 use novarocks_connector_iceberg::commit::CommitOpKind;
 use novarocks_connector_iceberg::commit::data_writer::{
-    RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
+    RowLineageColumns, RowLineageWriteBatch, write_record_batches_as_data_files,
+    write_row_lineage_batches_as_data_files,
 };
 use novarocks_connector_iceberg::row_lineage_synth::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
@@ -214,7 +214,10 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
             let batches = chunks_to_row_lineage_batches(&chunks)?;
             block_on_iceberg(write_row_lineage_batches_as_data_files(&table, &batches))??
         } else {
-            block_on_iceberg(write_chunks_as_iceberg_data_files(&table, &chunks))??
+            block_on_iceberg(write_record_batches_as_data_files(
+                &table,
+                chunks.iter().map(|chunk| chunk.batch.clone()),
+            ))??
         };
         (data_files, visible_rows)
     };

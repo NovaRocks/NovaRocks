@@ -37,6 +37,7 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata,
 };
 
+#[cfg(test)]
 const ICEBERG_ROW_LINEAGE_PROP: &str = "write.row-lineage";
 
 /// Test-only equivalent of the Server composition adapter.
@@ -351,12 +352,14 @@ fn validation_partition_transform(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn current_iceberg_table_observation(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<MvSchemaValidationObservation, String> {
     current_iceberg_table_observation_with_schema(table, table.metadata().current_schema())
 }
 
+#[cfg(test)]
 fn current_iceberg_table_observation_with_schema(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
@@ -385,6 +388,7 @@ fn current_iceberg_table_observation_with_schema(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn partition_contract(
     spec: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
     schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
@@ -448,6 +452,7 @@ fn partition_contract(
     ))
 }
 
+#[cfg(test)]
 fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> bool {
     props
         .get(ICEBERG_ROW_LINEAGE_PROP)
