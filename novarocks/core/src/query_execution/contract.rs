@@ -17,6 +17,7 @@
 
 //! Core-owned distributed-query request contract.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Instant;
 
@@ -42,6 +43,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::sql::planner::distributed::FragmentId;
 pub(crate) use novarocks_types::QueryId;
 
 /// Query options resolved by core before ownership crosses into frontend.
@@ -374,33 +376,108 @@ impl ConnectorWriteOperationRegistration {
     }
 }
 
-/// One sealed cohort selected for a concrete distributed execution attempt.
+/// One operation-scoped writer routing registration for a concrete
+/// distributed execution attempt.
+///
+/// Every terminal writer fragment is bound to exactly one cohort. The map is
+/// canonical by fragment ID and its cohort set must exactly match the cohorts
+/// sealed in the retained operation session; callers cannot silently omit a
+/// cohort or route all writers through an arbitrary primary cohort.
 #[derive(Clone)]
 pub struct ConnectorWriteExecutionRegistration {
     session: ConnectorWriteOperationSession,
-    cohort_id: ConnectorWriteCohortId,
+    writer_fragment_cohorts: BTreeMap<FragmentId, ConnectorWriteCohortId>,
 }
 
 impl ConnectorWriteExecutionRegistration {
-    pub fn try_new(
+    pub fn try_new<I>(
         session: ConnectorWriteOperationSession,
-        cohort_id: ConnectorWriteCohortId,
-    ) -> Result<Self, DistributedQueryError> {
-        if !session.contains_cohort(cohort_id) {
+        writer_fragment_cohorts: I,
+    ) -> Result<Self, DistributedQueryError>
+    where
+        I: IntoIterator<Item = (FragmentId, ConnectorWriteCohortId)>,
+    {
+        let mut canonical = BTreeMap::new();
+        for (fragment_id, cohort_id) in writer_fragment_cohorts {
+            if canonical.insert(fragment_id, cohort_id).is_some() {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "connector write execution contains a duplicate writer fragment",
+                ));
+            }
+        }
+        if canonical.is_empty() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "connector write execution references a cohort outside the sealed operation",
+                "connector write execution has no terminal writer fragments",
             ));
         }
-        Ok(Self { session, cohort_id })
+        let mapped_cohorts = canonical.values().copied().collect::<BTreeSet<_>>();
+        let sealed_cohorts = session
+            .sealed()
+            .cohorts()
+            .iter()
+            .map(|cohort| cohort.cohort_id())
+            .collect::<BTreeSet<_>>();
+        if mapped_cohorts != sealed_cohorts {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write execution writer mapping does not exactly cover the sealed operation cohorts",
+            ));
+        }
+        Ok(Self {
+            session,
+            writer_fragment_cohorts: canonical,
+        })
+    }
+
+    /// Convenience for a genuinely single-cohort operation. The caller must
+    /// still provide the complete terminal writer fragment set; this never
+    /// selects a cohort from a multi-cohort operation.
+    pub fn single<I>(
+        session: ConnectorWriteOperationSession,
+        writer_fragment_ids: I,
+        cohort_id: ConnectorWriteCohortId,
+    ) -> Result<Self, DistributedQueryError>
+    where
+        I: IntoIterator<Item = FragmentId>,
+    {
+        Self::try_new(
+            session,
+            writer_fragment_ids
+                .into_iter()
+                .map(|fragment_id| (fragment_id, cohort_id)),
+        )
     }
 
     pub fn session(&self) -> &ConnectorWriteOperationSession {
         &self.session
     }
 
-    pub const fn cohort_id(&self) -> ConnectorWriteCohortId {
-        self.cohort_id
+    pub fn writer_fragment_cohorts(
+        &self,
+    ) -> &BTreeMap<FragmentId, ConnectorWriteCohortId> {
+        &self.writer_fragment_cohorts
+    }
+
+    pub fn cohort_id_for_writer_fragment(
+        &self,
+        fragment_id: FragmentId,
+    ) -> Option<ConnectorWriteCohortId> {
+        self.writer_fragment_cohorts.get(&fragment_id).copied()
+    }
+
+    pub fn cohort_ids(&self) -> BTreeSet<ConnectorWriteCohortId> {
+        self.writer_fragment_cohorts.values().copied().collect()
+    }
+
+    pub fn single_cohort_id(&self) -> Option<ConnectorWriteCohortId> {
+        let cohorts = self.cohort_ids();
+        if cohorts.len() == 1 {
+            cohorts.into_iter().next()
+        } else {
+            None
+        }
     }
 }
 
