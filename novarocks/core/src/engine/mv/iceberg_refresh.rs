@@ -16900,10 +16900,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             change_stream: planned_query.change_stream,
             producer_branches,
             mv_refresh_ctx: Some(&refresh_context),
-            snapshot_properties:
-                crate::engine::mv::iceberg_activation::iceberg_publication_properties(
-                    &publication_intent,
-                )?,
+            snapshot_properties: legacy_incremental_publication_properties(&publication_intent)?,
             connector_operation_id: operation_id,
         },
         &staging_branch,
@@ -16917,6 +16914,42 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         return Err("MV incremental distributed artifact identity mismatch".to_string());
     }
     Ok(distributed)
+}
+
+/// Legacy incremental commit-driver input retained only until T5 moves this
+/// binder onto managed-publication activation. First/full activation must not
+/// call this provider codec.
+fn legacy_incremental_publication_properties(
+    intent: &MvRefreshPublicationIntent,
+) -> Result<BTreeMap<String, String>, String> {
+    let technique = match intent.technique() {
+        MvRefreshPublicationTechnique::Full => {
+            novarocks_connector_iceberg::commit::RefreshTechnique::Full
+        }
+        MvRefreshPublicationTechnique::Incremental => {
+            novarocks_connector_iceberg::commit::RefreshTechnique::Incremental
+        }
+    };
+    novarocks_connector_iceberg::commit::MvProvenanceV1 {
+        provenance_version: novarocks_connector_iceberg::commit::MV_PROVENANCE_VERSION,
+        refresh_id: intent.refresh_id(),
+        mv_id: intent.mv_id(),
+        token: intent.marker_token().to_string(),
+        technique,
+        bases: intent
+            .bases()
+            .iter()
+            .map(|base| novarocks_connector_iceberg::commit::ProvenanceBase {
+                table_fqn: base.table_fqn().to_string(),
+                uuid: base.table_uuid().to_string(),
+                from_snapshot: base.from_snapshot(),
+                to_snapshot: base.to_snapshot(),
+            })
+            .collect(),
+        definition_fingerprint: intent.definition_fingerprint().to_string(),
+        rows: 0,
+    }
+    .to_summary_properties()
 }
 
 fn executed_change_stream_write_from_result(

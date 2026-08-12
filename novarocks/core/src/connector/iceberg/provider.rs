@@ -40,23 +40,25 @@ use novarocks_spi::connector::{
     ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListNamespacesRequest,
-    ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
-    ConnectorMutationEffectField, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationMatchContract, ConnectorMutationOperationId, ConnectorMutationRouteInput,
-    ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorNamespaceRequest,
-    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorPrepareSplitRequest, ConnectorProviderId, ConnectorReadNamedReference,
-    ConnectorReadPurpose, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
-    ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
-    ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard,
-    ConnectorRequestContext, ConnectorRowMutationActivationRequest,
-    ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
-    ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
-    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationRoute, ConnectorRowMutationStrategy, ConnectorScalarType,
-    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorScanSelection, ConnectorSealedWriteCohortSet, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorListTablesRequest, ConnectorListViewsRequest,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
+    ConnectorMetadata, ConnectorMutationEffectField, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationMatchContract, ConnectorMutationOperationId,
+    ConnectorMutationRouteInput, ConnectorMutationSourceField, ConnectorMutationTargetField,
+    ConnectorNamespaceRequest, ConnectorPartitionTransform, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorProviderId,
+    ConnectorReadNamedReference, ConnectorReadPurpose, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind, ConnectorReadSelector,
+    ConnectorReadSnapshotLogEntry, ConnectorRefAction, ConnectorRefKind,
+    ConnectorRefreshPublicationGuard, ConnectorRequestContext,
+    ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
+    ConnectorRowMutationEffect, ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent,
+    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorRowMutationRoute,
+    ConnectorRowMutationStrategy, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanSelection,
+    ConnectorSealedWriteCohortSet, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
     ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
     ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
@@ -66,14 +68,15 @@ use novarocks_spi::connector::{
     ConnectorTableColumnVisibility, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
     ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata,
-    ConnectorViewMetadataValue, ConnectorViewRequest, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteRouteId,
-    ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy, DropPolicy,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ConnectorViewMetadataValue, ConnectorViewRequest, ConnectorWriteActivationIntent,
+    ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor,
+    ConnectorWriteCohortId, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorWriteRouteId, ConnectorWriteTargetRef, CreateOrReplacePolicy, CreatePolicy,
+    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     ExternalMutationOutcome, StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
     StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
     StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricState, StatisticsMetricValue,
@@ -306,7 +309,10 @@ impl IcebergControlProvider {
             Arc::new(
                 IcebergWriteControlAdapter::new_with_preparation(
                     write_key.clone(),
-                    Arc::new(RegisteredIcebergWriteControlBackend::new(services.clone())),
+                    Arc::new(
+                        RegisteredIcebergWriteControlBackend::new(services.clone())
+                            .with_control_registry(Arc::clone(&registry)),
+                    ),
                     Arc::new(prepare_iceberg_write) as Arc<IcebergWritePreparationFactory>,
                 )?
                 .with_row_mutation_preparation(Arc::new(prepare_iceberg_row_mutation)
@@ -6703,6 +6709,141 @@ pub(crate) fn register_iceberg_data_write_service_from_preparation(
         sink_spec,
         writer_handle_payload,
         commit_executor,
+    )
+}
+
+/// Activate one managed MV publication entirely inside the legacy provider
+/// generation. The application supplies only the provider-signed preparation
+/// and neutral publication intent; catalog reload, exact-target validation,
+/// writer service construction, provenance encoding and commit ownership stay
+/// behind `ConnectorWriteControl::activate_write`.
+pub(crate) fn activate_iceberg_managed_publication_write(
+    registry: &Arc<RwLock<IcebergCatalogRegistry>>,
+    services: IcebergWriteServiceRegistry,
+    request: &ConnectorWriteActivationRequest,
+) -> Result<(), ConnectorError> {
+    let ConnectorWriteActivationIntent::ManagedPublication(intent) = &request.intent else {
+        return Ok(());
+    };
+    let ConnectorWriteActivationSource::Prepared(preparation) = &request.source else {
+        return Err(invalid_iceberg_write_activation(
+            "Iceberg managed publication requires one prepared write source",
+        ));
+    };
+    preparation.validate()?;
+    let payload: TablePayload = decode_payload(
+        preparation.table().payload(),
+        "managed Iceberg publication target",
+    )?;
+    let target = payload.table_info.as_ref().ok_or_else(|| {
+        invalid_iceberg_write_activation(
+            "managed Iceberg publication target is missing its frozen descriptor",
+        )
+    })?;
+    if target.catalog != preparation.owner().instance_id.as_str()
+        || target.namespace != payload.namespace
+        || target.table != payload.table
+    {
+        return Err(invalid_iceberg_write_activation(
+            "managed Iceberg publication target identity drifted from its preparation",
+        ));
+    }
+    let frozen_metadata: TableMetadata =
+        serde_json::from_str(target.serialized_metadata.as_deref().ok_or_else(|| {
+            invalid_iceberg_write_activation(
+                "managed Iceberg publication target is missing frozen metadata",
+            )
+        })?)
+        .map_err(|error| {
+            invalid_iceberg_write_activation(format!(
+                "decode managed Iceberg publication metadata: {error}"
+            ))
+        })?;
+    let expected_snapshot_id =
+        iceberg_write_target_snapshot_id(&frozen_metadata, preparation.target_ref().as_str())?;
+    let entry = registry
+        .read()
+        .map_err(|error| {
+            invalid_iceberg_write_activation(format!(
+                "read Iceberg catalog registry for managed publication: {error}"
+            ))
+        })?
+        .get(&target.catalog)
+        .map_err(invalid_iceberg_write_activation)?;
+    let (commit_executor, observed_snapshot_id) =
+        super::write_commit::build_admitted_data_write_commit_executor(
+            &entry,
+            &target.namespace,
+            &target.table,
+            preparation.target_ref().as_str(),
+            preparation.intent(),
+            BTreeMap::new(),
+        )
+        .map_err(invalid_iceberg_write_activation)?;
+    let observed_metadata = commit_executor.table.metadata();
+    if observed_snapshot_id != expected_snapshot_id
+        || observed_metadata.uuid() != frozen_metadata.uuid()
+        || observed_metadata.current_schema_id() != frozen_metadata.current_schema_id()
+        || observed_metadata.default_partition_spec_id()
+            != frozen_metadata.default_partition_spec_id()
+        || observed_metadata.location() != frozen_metadata.location()
+    {
+        return Err(invalid_iceberg_write_activation(
+            "managed Iceberg publication target no longer matches its exact preparation",
+        ));
+    }
+    let provenance = novarocks_connector_iceberg::commit::MvProvenanceV1 {
+        provenance_version: novarocks_connector_iceberg::commit::MV_PROVENANCE_VERSION,
+        refresh_id: intent.refresh_id(),
+        mv_id: intent.materialization_id(),
+        token: intent.marker().to_string(),
+        technique: match intent.technique() {
+            ConnectorManagedPublicationTechnique::Full => {
+                novarocks_connector_iceberg::commit::RefreshTechnique::Full
+            }
+            ConnectorManagedPublicationTechnique::Incremental => {
+                novarocks_connector_iceberg::commit::RefreshTechnique::Incremental
+            }
+        },
+        bases: intent
+            .bases()
+            .iter()
+            .map(|base| novarocks_connector_iceberg::commit::ProvenanceBase {
+                table_fqn: base.table.to_string(),
+                uuid: base.uuid.to_string(),
+                from_snapshot: base.from_version,
+                to_snapshot: base.to_version,
+            })
+            .collect(),
+        definition_fingerprint: intent.definition_fingerprint().to_string(),
+        rows: 0,
+    };
+    let plan = IcebergFirstRefreshWritePlanPayloadV2 {
+        version: 2,
+        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+        target_ref: preparation.target_ref().as_str().to_string(),
+        expected_snapshot_id,
+        staging_path: commit_executor.collector.staging_dir.clone(),
+        provenance_properties: provenance
+            .to_summary_properties()
+            .map_err(invalid_iceberg_write_activation)?,
+    };
+    let empty_input_policy = match intent.empty_input() {
+        ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit => {
+            IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot
+        }
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite => {
+            IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite
+        }
+    };
+    register_iceberg_first_refresh_write_service_from_preparation(
+        services,
+        request.operation_id,
+        preparation,
+        plan,
+        &entry,
+        commit_executor,
+        empty_input_policy,
     )
 }
 

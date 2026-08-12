@@ -70,6 +70,14 @@ pub(crate) struct IcebergWriteControlPlan {
 /// It is intentionally synchronous because the SPI contract is synchronous;
 /// the eventual composition root supplies the existing transaction runner.
 pub(crate) trait IcebergWriteControlBackend: Send + Sync {
+    /// Reserve any provider-private operation service implied by activation.
+    /// The default supports routes whose service was already registered by
+    /// their provider-side binder. Managed publication overrides this so the
+    /// application never constructs a provider commit driver.
+    fn activate(&self, _request: &ConnectorWriteActivationRequest) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
     fn plan(
         &self,
         request: &ConnectorWritePlanningRequest,
@@ -472,6 +480,8 @@ impl ConnectorWriteControl for IcebergWriteControlAdapter {
         &self,
         request: ConnectorWriteActivationRequest,
     ) -> Result<ConnectorWriteActivation, ConnectorError> {
+        request.validate(&self.key)?;
+        self.backend.activate(&request)?;
         self.activations.activate(&self.key, &request)
     }
 
@@ -1176,12 +1186,18 @@ mod tests {
 
     struct Backend {
         key: ConnectorExecutionBindingKey,
+        activations: AtomicUsize,
         commits: AtomicUsize,
         aborts: AtomicUsize,
         unknown: AtomicBool,
     }
 
     impl IcebergWriteControlBackend for Backend {
+        fn activate(&self, _: &ConnectorWriteActivationRequest) -> Result<(), ConnectorError> {
+            self.activations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         fn plan(
             &self,
             request: &ConnectorWritePlanningRequest,
@@ -1379,6 +1395,7 @@ mod tests {
     fn backend(key: &ConnectorExecutionBindingKey) -> Arc<Backend> {
         Arc::new(Backend {
             key: key.clone(),
+            activations: AtomicUsize::new(0),
             commits: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
             unknown: AtomicBool::new(false),
@@ -1388,7 +1405,9 @@ mod tests {
     #[test]
     fn activation_reservation_is_idempotent_and_rejects_conflicts() {
         let key = key(1);
-        let adapter = IcebergWriteControlAdapter::new(key.clone(), backend(&key)).expect("adapter");
+        let backend = backend(&key);
+        let adapter =
+            IcebergWriteControlAdapter::new(key.clone(), backend.clone()).expect("adapter");
         let operation_id = ConnectorWriteOperationId::new();
         let request = planning(
             key.clone(),
@@ -1412,6 +1431,7 @@ mod tests {
             .activate_write(activation_request)
             .expect("idempotent activation replay");
         assert_eq!(first.digest(), replay.digest());
+        assert_eq!(backend.activations.load(Ordering::SeqCst), 2);
 
         let conflicting = planning(
             key,

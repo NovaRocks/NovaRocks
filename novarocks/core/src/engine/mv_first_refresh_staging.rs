@@ -207,7 +207,6 @@ where
         .derive_write_lease()
         .map_err(|error| format!("derive MV first-refresh test write lease: {error}"))?;
     let template = crate::engine::mv::iceberg_activation::activate_first_refresh_connector_write(
-        state,
         &prepared,
         connector_context.clone(),
         &write_lease,
@@ -553,7 +552,6 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     let root_hash_column = prepared.root_hash_column().to_string();
     let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column.clone());
     let template = crate::engine::mv::iceberg_activation::activate_first_refresh_connector_write(
-        state,
         &prepared,
         connector_context.clone(),
         exact_lease,

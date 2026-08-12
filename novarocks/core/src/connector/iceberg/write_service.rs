@@ -255,15 +255,41 @@ impl IcebergWriteServiceRegistry {
 #[derive(Clone)]
 pub(crate) struct RegisteredIcebergWriteControlBackend {
     services: IcebergWriteServiceRegistry,
+    control_registry: Option<Arc<std::sync::RwLock<super::catalog::IcebergCatalogRegistry>>>,
 }
 
 impl RegisteredIcebergWriteControlBackend {
     pub(crate) fn new(services: IcebergWriteServiceRegistry) -> Self {
-        Self { services }
+        Self {
+            services,
+            control_registry: None,
+        }
+    }
+
+    pub(crate) fn with_control_registry(
+        mut self,
+        registry: Arc<std::sync::RwLock<super::catalog::IcebergCatalogRegistry>>,
+    ) -> Self {
+        self.control_registry = Some(registry);
+        self
     }
 }
 
 impl IcebergWriteControlBackend for RegisteredIcebergWriteControlBackend {
+    fn activate(
+        &self,
+        request: &novarocks_spi::connector::ConnectorWriteActivationRequest,
+    ) -> Result<(), ConnectorError> {
+        let Some(registry) = &self.control_registry else {
+            return Ok(());
+        };
+        super::provider::activate_iceberg_managed_publication_write(
+            registry,
+            self.services.clone(),
+            request,
+        )
+    }
+
     fn plan(
         &self,
         request: &ConnectorWritePlanningRequest,
