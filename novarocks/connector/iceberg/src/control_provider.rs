@@ -1480,6 +1480,21 @@ impl IcebergControlProvider {
         &self,
         scan: &IcebergScanPayload,
     ) -> Result<Vec<IcebergDataFileInfo>, ConnectorError> {
+        if scan.table.row_mutation_frozen_source {
+            match scan.table.explicit_files.as_deref() {
+                Some([_]) => {}
+                Some(_) => {
+                    return Err(corrupt(
+                        "Iceberg frozen row-mutation source must carry exactly one explicit data file",
+                    ));
+                }
+                None => {
+                    return Err(corrupt(
+                        "Iceberg frozen row-mutation source is missing its explicit data file",
+                    ));
+                }
+            }
+        }
         match (&scan.table.explicit_files, scan.snapshot_id) {
             (Some(files), _) => Ok(files.clone()),
             (None, None) => Ok(Vec::new()),
@@ -2888,6 +2903,39 @@ mod plan_splits_pruning_tests {
         assert_eq!(metrics.candidate_units_considered, 3);
         assert_eq!(metrics.candidate_units_pruned, 2);
         assert_eq!(metrics.scan_units_planned, 1);
+    }
+
+    #[test]
+    fn frozen_row_mutation_source_never_falls_back_to_the_current_catalog() {
+        let (_executor, _warehouse, provider) = provider();
+        let scan = IcebergScanPayload {
+            table: IcebergTablePayload {
+                namespace: "ns".to_string(),
+                table: "t".to_string(),
+                table_info: None,
+                metadata_columns: Vec::new(),
+                metadata_table_type: None,
+                prepared_files: Vec::new(),
+                explicit_files: None,
+                row_mutation_frozen_source: true,
+                logical_type_columns: BTreeMap::new(),
+                hidden_columns: Vec::new(),
+            },
+            snapshot_id: Some(7),
+            table_uuid: Some("admitted-table-uuid".to_string()),
+            projection: vec![0],
+            limit: None,
+            purpose: IcebergReadPurposeV1::Query,
+            fact_columns: Vec::new(),
+            physical_predicates: Vec::new(),
+            mode: IcebergScanModeV1::Snapshot,
+        };
+
+        let error = provider
+            .scan_files(&scan)
+            .expect_err("frozen source must not reload the current catalog");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.to_string().contains("missing its explicit data file"));
     }
 
     /// A zero count must mean "nothing was prunable", never "pruning did not

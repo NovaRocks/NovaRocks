@@ -1113,9 +1113,9 @@ fn freeze_iceberg_cow_source(
 
     let mut source_payload = frozen.table_payload.clone();
     source_payload.prepared_files.clear();
-    source_payload.explicit_files = Some(vec![data_file_with_stats_to_iceberg_data_file_info(
-        data_file,
-    )]);
+    let explicit_file = data_file_with_stats_to_iceberg_data_file_info(data_file);
+    crate::delete_file::validate_delete_apply_cost(&explicit_file)?;
+    source_payload.explicit_files = Some(vec![explicit_file]);
     source_payload.row_mutation_frozen_source = true;
     let table_info = source_payload.table_info.as_mut().ok_or_else(|| {
         ConnectorError::new(
