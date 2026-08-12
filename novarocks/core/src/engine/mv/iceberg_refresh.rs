@@ -11903,7 +11903,14 @@ fn alias_aggregate_refresh_group_key_projection(
     query: &mut sqlparser::ast::Query,
     ctx: &IcebergMvRefreshContext,
 ) -> Result<(), String> {
-    let (calls, layout) = ctx.rewrite.aggregate_shape_and_layout_for_execution()?;
+    alias_aggregate_refresh_group_key_projection_from_rewrite(query, &ctx.rewrite)
+}
+
+fn alias_aggregate_refresh_group_key_projection_from_rewrite(
+    query: &mut sqlparser::ast::Query,
+    rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
+) -> Result<(), String> {
+    let (calls, layout) = rewrite.aggregate_shape_and_layout_for_execution()?;
     let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
         return Err("aggregate MV incremental refresh SELECT body is required".to_string());
     };
@@ -14594,6 +14601,14 @@ pub(crate) fn sql_imv_planning_input(
     target_binding: crate::sql::binding::SqlTableBindingId,
     evidence: RewriteMergeRefreshEvidence,
 ) -> Result<crate::sql::compiler::SqlImvPlanningInput, String> {
+    sql_imv_planning_input_from_rewrite(&refresh.rewrite, target_binding, evidence)
+}
+
+fn sql_imv_planning_input_from_rewrite(
+    rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
+    target_binding: crate::sql::binding::SqlTableBindingId,
+    evidence: RewriteMergeRefreshEvidence,
+) -> Result<crate::sql::compiler::SqlImvPlanningInput, String> {
     use crate::sql::compiler::SqlImvRewriteValidation;
 
     let validation = match evidence {
@@ -14605,7 +14620,7 @@ pub(crate) fn sql_imv_planning_input(
         }
     };
     Ok(crate::sql::compiler::SqlImvPlanningInput::new(
-        refresh.rewrite.to_sql_rewrite_snapshot(target_binding)?,
+        rewrite.to_sql_rewrite_snapshot(target_binding)?,
         validation,
     ))
 }
@@ -16606,34 +16621,23 @@ fn execute_imv_change_stream_writer(
 fn prepare_imv_change_stream_writer(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    table: &novarocks_connector_iceberg::iceberg::table::Table,
-    ident: &TableIdent,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
-    target_ref: &str,
-    exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
     let (refresh_plan, effect_output_ordinal) = ensure_imv_change_stream_effect(refresh_plan)?;
-    let entry = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?
-        .get(&target.catalog)?;
-    let connector_context = refresh_plan
-        .mv_refresh_ctx
-        .and_then(|ctx| ctx.connector_context.as_ref())
-        .ok_or_else(|| {
-            "Iceberg MV change-stream write is missing its caller connector context".to_string()
-        })?;
     crate::connector::validate_request_context(connector_context)?;
     let table_bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
         "Iceberg MV change-stream write is missing admission-frozen query table bindings"
             .to_string()
     })?;
-    let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
+    let mut dag = provider_change_stream_write_dag_for_imv_refresh(
         target,
         &refresh_plan,
         effect_output_ordinal,
+        provider_routes,
     )?;
     let planned =
         crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
@@ -16643,75 +16647,9 @@ fn prepare_imv_change_stream_writer(
             &refresh_plan.optimized_tree,
             Some(table_bindings),
             &mut dag,
-            refresh_plan.mv_refresh_ctx,
+            None,
             None,
             connector_context,
-        )?;
-    let effect = deletion_route_write_effect(&refresh_plan);
-    let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
-        table, ident, target_ref, effect,
-    );
-    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-    let abort_cleanup =
-        crate::connector::iceberg::commit::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(
-        crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor {
-            catalog,
-            table: table.clone(),
-            collector,
-            fs: abort_cleanup.fs,
-            cleanup_path_mapper: abort_cleanup.path_mapper,
-            cow_update_rewrite: None,
-            target_ref: target_ref.to_string(),
-            snapshot_properties: refresh_plan.snapshot_properties.clone(),
-        },
-    );
-    let base_snapshot_id = table
-        .metadata()
-        .refs()
-        .get(target_ref)
-        .map(|reference| reference.snapshot_id)
-        .or_else(|| {
-            (target_ref == "main")
-                .then(|| {
-                    table
-                        .metadata()
-                        .current_snapshot()
-                        .map(|snapshot| snapshot.snapshot_id())
-                })
-                .flatten()
-        });
-    let primary_write_binding = planned
-        .topology
-        .writer_routes
-        .first()
-        .ok_or_else(|| "IMV change-stream topology has no writer routes".to_string())?
-        .sink
-        .contract
-        .target
-        .binding;
-    let primary_preparation = table_bindings
-        .binding(primary_write_binding)?
-        .write_target_admission
-        .as_ref()
-        .ok_or_else(|| {
-            "IMV change-stream primary writer binding has no Provider preparation".to_string()
-        })?
-        .preparation
-        .clone();
-    let connector_write =
-        crate::engine::iceberg_writer::activate_iceberg_change_stream_connector_write(
-            state,
-            target,
-            &planned.topology,
-            table_bindings,
-            commit_executor,
-            &entry,
-            base_snapshot_id,
-            refresh_plan.connector_operation_id,
-            connector_context.clone(),
-            exact_lease,
-            primary_preparation,
         )?;
     crate::engine::prepare_planned_iceberg_change_stream_write(
         planned.prepared,
@@ -16740,8 +16678,10 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     if request.observed_binding != *exact_lease.binding_key() {
         return Err("MV incremental write lease drifted from prepared binding".to_string());
     }
-    let mut refresh_context =
-        crate::engine::mv_first_refresh_staging::rebuild_frozen_mv_refresh_context(
+    let connector_context =
+        crate::connector::connector_request_context_for_execution(None, execution)?;
+    let refresh_rewrite =
+        crate::engine::mv_first_refresh_staging::rebuild_frozen_mv_rewrite_context(
             state,
             request.current_catalog.as_deref(),
             &request.current_database,
@@ -16750,10 +16690,9 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             &request.target_namespace,
             &request.target_name,
             &facts,
+            planning_lease,
+            &connector_context,
         )?;
-    refresh_context.connector_context = Some(
-        crate::connector::connector_request_context_for_execution(None, execution)?,
-    );
     let target = crate::engine::backend_resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: request.target_catalog,
@@ -16761,30 +16700,93 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         table: request.target_name,
     };
     let target_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding =
-        bind_imv_target_query_table_in_store(&refresh_context, &target_bindings, planning_lease)?;
+    let target_binding = bind_imv_target_query_table_in_store_from_rewrite(
+        &refresh_rewrite,
+        &target_bindings,
+        planning_lease,
+        &connector_context,
+    )?;
     let target_materialization =
         crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
             planning_lease.clone(),
-            crate::connector::connector_request_context_for_execution(None, execution)?,
+            connector_context.clone(),
             &target.namespace,
             &target.table,
         )?;
-    let preparation_lease = admit_mv_change_stream_write_targets(
-        target_bindings.as_ref(),
-        &target_materialization,
-        &target.catalog,
-        &target.namespace,
-        &target.table,
+    let mutation_intent = novarocks_spi::connector::ConnectorRowMutationIntent::Merge {
+        effects: match mode {
+            crate::mv::application::MvIncrementalWriteMode::FastAppend => {
+                vec![novarocks_spi::connector::ConnectorRowMutationEffect::Insert]
+            }
+            crate::mv::application::MvIncrementalWriteMode::RowDelta => vec![
+                novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
+            ],
+        },
+    };
+    let (mutation_lease, mutation_preparation) = target_materialization.prepare_row_mutation(
         &request.staging_branch,
-        crate::connector::connector_request_context_for_execution(None, execution)?,
+        request.operation_id,
+        mutation_intent,
+        connector_context.clone(),
     )?;
-    if !preparation_lease.retains_same_generation(exact_lease) {
+    if !mutation_lease.retains_same_generation(exact_lease) {
         return Err(
             "MV incremental write preparation did not retain the frontend exact lease generation"
                 .to_string(),
         );
     }
+    let provider_plan = target_materialization.activate_direct_row_mutation(
+        &mutation_lease,
+        mutation_preparation,
+        connector_context.clone(),
+    )?;
+    let mut provider_routes = provider_plan.routes().to_vec();
+    provider_routes.sort_by_key(|route| route.cohort_id());
+    let selected_cohort = provider_routes
+        .first()
+        .map(|route| route.cohort_id())
+        .ok_or_else(|| "MV incremental provider plan has no writer routes".to_string())?;
+    for route in &provider_routes {
+        crate::engine::query_planning::write_sink::admit_prepared_connector_write_target(
+            target_bindings.as_ref(),
+            crate::sql::planner::table::SqlTableIdentity {
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            route.preparation().clone(),
+            planning_lease.clone(),
+        )?;
+    }
+    let managed_publication =
+        crate::engine::mv::iceberg_activation::managed_publication_activation_intent(
+            &publication_intent,
+            novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
+        )?;
+    let activation = mutation_lease
+        .activate_write(novarocks_spi::connector::ConnectorWriteActivationRequest {
+            operation_id: request.operation_id,
+            source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
+                provider_plan,
+            ),
+            intent: novarocks_spi::connector::ConnectorWriteActivationIntent::ManagedPublication(
+                managed_publication,
+            ),
+            context: connector_context.clone(),
+        })
+        .map_err(|error| format!("activate exact Iceberg MV incremental write: {error}"))?;
+    let activated_cohort = activation.cohort(selected_cohort).ok_or_else(|| {
+        "MV incremental activation omitted its selected Provider cohort".to_string()
+    })?;
+    let connector_write =
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+            activated_cohort,
+            connector_context.clone(),
+            mutation_lease,
+        )
+        .map_err(|error| format!("build activated MV incremental write template: {error}"))?;
     let rewrite_evidence = match evidence {
         crate::mv::application::MvIncrementalRewriteEvidence::None => {
             RewriteMergeRefreshEvidence::None
@@ -16801,24 +16803,36 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     };
     let planned_query = match execution_artifact {
         crate::mv::application::MvIncrementalExecutionArtifact::CanonicalQuery => {
-            let mut query = (*refresh_context.rewrite.canonical_select_query).clone();
+            let mut query = (*refresh_rewrite.canonical_select_query).clone();
             if rewrite_evidence != RewriteMergeRefreshEvidence::None
                 && rewrite_evidence != RewriteMergeRefreshEvidence::BranchUnionAggregate
             {
-                alias_aggregate_refresh_group_key_projection(&mut query, &refresh_context)?;
+                alias_aggregate_refresh_group_key_projection_from_rewrite(
+                    &mut query,
+                    &refresh_rewrite,
+                )?;
             }
             crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
-            let imv_rewrite_input =
-                sql_imv_planning_input(&refresh_context, target_binding, rewrite_evidence)?;
+            let imv_rewrite_input = sql_imv_planning_input_from_rewrite(
+                &refresh_rewrite,
+                target_binding,
+                rewrite_evidence,
+            )?;
             let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
-            let base_overlays = freeze_imv_base_query_local_overlays(state, &refresh_context)?;
+            let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
+                state,
+                &connector_context,
+                &refresh_rewrite.base_refs,
+                &refresh_rewrite.pin,
+                &refresh_rewrite.previous_snapshot_ids,
+            )?;
             let analyzer_catalog = crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
                 &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
                 crate::engine::query_stats::iceberg_table_binding_loader(
-                    state.connector_control.as_ref(),
-                    refresh_connector_context(&refresh_context)?.clone(),
+                state.connector_control.as_ref(),
+                    connector_context.clone(),
                 ),
                 base_overlays,
             );
@@ -16826,7 +16840,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 state,
                 &query,
                 &analyzer_catalog,
-                &refresh_context.rewrite.current_database,
+                &refresh_rewrite.current_database,
                 Some(&imv_rewrite_input),
                 Arc::clone(&target_bindings),
                 execution,
@@ -16841,17 +16855,24 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                     JoinIncrementalRefreshMode::Coalesce
                 }
             };
-            let (plan, factory) = compile_canonical_select_for_imv_with_bindings(
+            let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
                 state,
-                &refresh_context,
+                &connector_context,
+                &refresh_rewrite.base_refs,
+                &refresh_rewrite.pin,
+                &refresh_rewrite.previous_snapshot_ids,
+            )?;
+            let (plan, factory) = compile_canonical_select_for_imv_with_frozen_rewrite(
+                state,
+                &refresh_rewrite,
+                &connector_context,
                 Arc::clone(&target_bindings),
                 execution,
+                base_overlays,
             )
             .map_err(|error| error.message)?;
             let logical = build_join_incremental_refresh_logical_plan(
-                &refresh_context
-                    .rewrite
-                    .to_sql_rewrite_snapshot(target_binding)?,
+                &refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
                 join_mode,
                 JoinIncrementalLogicalInput { plan, factory },
             )?;
@@ -16876,80 +16897,31 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             ImvChangeStreamProducerRoute::AppendedData,
         ],
     };
-    let target_table = refresh_context
-        .target_bindings
-        .runtime()
-        .target_table()
-        .clone();
-    let ident = iceberg_mv_table_ident(&IcebergMvTarget {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-    })?;
     let operation_id = request.operation_id;
-    let staging_branch = request.staging_branch;
     let distributed = prepare_imv_change_stream_writer(
         state,
         &target,
-        &target_table,
-        &ident,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
             table_bindings: planned_query.table_bindings,
             output_columns: planned_query.output_columns,
             change_stream: planned_query.change_stream,
             producer_branches,
-            mv_refresh_ctx: Some(&refresh_context),
-            snapshot_properties: legacy_incremental_publication_properties(&publication_intent)?,
+            mv_refresh_ctx: None,
+            snapshot_properties: BTreeMap::new(),
             connector_operation_id: operation_id,
         },
-        &staging_branch,
-        exact_lease,
+        &provider_routes,
+        connector_write,
+        &connector_context,
         execution,
     )?;
     if distributed.write_operation_id() != operation_id
-        || distributed.write_cohort_id()
-            != novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id)
+        || distributed.write_cohort_id() != selected_cohort
     {
         return Err("MV incremental distributed artifact identity mismatch".to_string());
     }
     Ok(distributed)
-}
-
-/// Legacy incremental commit-driver input retained only until T5 moves this
-/// binder onto managed-publication activation. First/full activation must not
-/// call this provider codec.
-fn legacy_incremental_publication_properties(
-    intent: &MvRefreshPublicationIntent,
-) -> Result<BTreeMap<String, String>, String> {
-    let technique = match intent.technique() {
-        MvRefreshPublicationTechnique::Full => {
-            novarocks_connector_iceberg::commit::RefreshTechnique::Full
-        }
-        MvRefreshPublicationTechnique::Incremental => {
-            novarocks_connector_iceberg::commit::RefreshTechnique::Incremental
-        }
-    };
-    novarocks_connector_iceberg::commit::MvProvenanceV1 {
-        provenance_version: novarocks_connector_iceberg::commit::MV_PROVENANCE_VERSION,
-        refresh_id: intent.refresh_id(),
-        mv_id: intent.mv_id(),
-        token: intent.marker_token().to_string(),
-        technique,
-        bases: intent
-            .bases()
-            .iter()
-            .map(|base| novarocks_connector_iceberg::commit::ProvenanceBase {
-                table_fqn: base.table_fqn().to_string(),
-                uuid: base.table_uuid().to_string(),
-                from_snapshot: base.from_snapshot(),
-                to_snapshot: base.to_snapshot(),
-            })
-            .collect(),
-        definition_fingerprint: intent.definition_fingerprint().to_string(),
-        rows: 0,
-    }
-    .to_summary_properties()
 }
 
 fn executed_change_stream_write_from_result(
@@ -17256,6 +17228,32 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
     )
 }
 
+fn provider_change_stream_write_dag_for_imv_refresh(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
+    effect_output_ordinal: Option<usize>,
+    provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
+) -> Result<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String>
+{
+    let bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
+        "IMV change-stream write is missing admission-frozen query table bindings".to_string()
+    })?;
+    let routes = build_provider_imv_change_stream_routes(
+        target,
+        bindings,
+        &refresh_plan.output_columns,
+        provider_routes,
+    )?;
+    Ok(
+        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
+            effect_output_ordinal: effect_output_ordinal.ok_or_else(|| {
+                "IMV change-stream plan did not install its dedicated effect column".to_string()
+            })?,
+            routes,
+        },
+    )
+}
+
 fn imv_change_op_output_ordinal(
     refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
 ) -> Result<usize, String> {
@@ -17428,6 +17426,87 @@ fn build_imv_change_stream_routes(
                 accepted_effects,
                 input_ordinals,
                 output_partition_ordinals: partition_ordinals,
+                sink,
+            })
+        })
+        .collect()
+}
+
+fn build_provider_imv_change_stream_routes(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    output_columns: &[OutputColumn],
+    provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
+) -> Result<
+    Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
+    String,
+> {
+    use crate::engine::query_planning::write_sink::sql_write_plan_input_for_admitted_target;
+    use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
+    use crate::sql::planner::distributed::write::contract::{
+        ConnectorWriteInputBinding, SqlWriteSinkMode,
+    };
+    use novarocks_spi::connector::{ConnectorMutationRouteInput, ConnectorWriteInputShape};
+
+    let mut provider_routes = provider_routes.to_vec();
+    provider_routes.sort_by_key(|route| route.cohort_id());
+    provider_routes
+        .into_iter()
+        .map(|route| {
+            let target_binding = bindings.admitted_iceberg_write_binding_id_for_preparation(
+                &target.catalog,
+                &target.namespace,
+                &target.table,
+                route.preparation(),
+            )?;
+            let mode = match route.input() {
+                ConnectorWriteInputShape::Data { .. } => SqlWriteSinkMode::Data,
+                ConnectorWriteInputShape::RowLineage { .. } => SqlWriteSinkMode::RowLineageData,
+                ConnectorWriteInputShape::PositionDelete { .. } => {
+                    SqlWriteSinkMode::PositionDeletes
+                }
+                ConnectorWriteInputShape::DeletionVector { .. } => {
+                    SqlWriteSinkMode::DeletionVectors
+                }
+                ConnectorWriteInputShape::EqualityDelete { .. } => {
+                    SqlWriteSinkMode::EqualityDeletes
+                }
+            };
+            let sink = sql_write_plan_input_for_admitted_target(
+                bindings,
+                target_binding,
+                mode,
+                ConnectorWriteInputBinding::RootOutputByOrdinal,
+                None,
+            )?;
+            let input_ordinals = route
+                .input()
+                .fields()
+                .into_iter()
+                .map(|field| {
+                    output_columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(field.field().name()))
+                        .ok_or_else(|| {
+                            format!(
+                                "IMV change-stream producer has no output for Provider route field `{}`",
+                                field.field().name()
+                            )
+                        })
+                        .and_then(|ordinal| {
+                            u32::try_from(ordinal).map_err(|_| {
+                                "IMV change-stream producer output ordinal exceeds u32".to_string()
+                            })
+                        })
+                        .map(|ordinal| ConnectorMutationRouteInput::new(field.token(), ordinal))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ChangeStreamWriteRouteSpec {
+                route_id: route.route_id(),
+                cohort_id: route.cohort_id(),
+                accepted_effects: route.accepted_effects().to_vec(),
+                input_ordinals,
+                output_partition_ordinals: Vec::new(),
                 sink,
             })
         })

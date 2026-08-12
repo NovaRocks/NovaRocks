@@ -208,6 +208,7 @@ struct ActiveTarget {
 struct CohortService {
     preparation_digest: [u8; 32],
     writer_payload: Bytes,
+    routed_writer_payloads: Option<Vec<Bytes>>,
     control_payload: Bytes,
     stable_digest: Option<[u8; 32]>,
     attempts: HashMap<ConnectorWriteExecutionId, CachedPlan>,
@@ -423,6 +424,7 @@ impl IcebergWriteControl {
                     CohortService {
                         preparation_digest: preparation.digest(),
                         writer_payload,
+                        routed_writer_payloads: None,
                         control_payload,
                         stable_digest: None,
                         attempts: HashMap::new(),
@@ -431,6 +433,40 @@ impl IcebergWriteControl {
                 .is_some()
             {
                 return Err(corrupt("Iceberg activation contains a duplicate cohort"));
+            }
+        }
+        if matches!(
+            request.intent,
+            ConnectorWriteActivationIntent::ManagedPublication(_)
+        ) {
+            if let ConnectorWriteActivationSource::RowMutation(plan) = &request.source {
+                if plan.copy_on_write().is_some() {
+                    return Err(invalid(
+                        "managed Iceberg publication does not support copy-on-write routing",
+                    ));
+                }
+                let mut route_payloads = plan
+                    .routes()
+                    .iter()
+                    .map(|route| {
+                        cohorts
+                            .get(&route.cohort_id())
+                            .map(|cohort| (route.cohort_id(), cohort.writer_payload.clone()))
+                            .ok_or_else(|| {
+                                corrupt(
+                                    "managed Iceberg row-mutation route omitted its activated cohort",
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                route_payloads.sort_by_key(|(cohort_id, _)| *cohort_id);
+                let route_payloads = route_payloads
+                    .into_iter()
+                    .map(|(_, payload)| payload)
+                    .collect::<Vec<_>>();
+                for cohort in cohorts.values_mut() {
+                    cohort.routed_writer_payloads = Some(route_payloads.clone());
+                }
             }
         }
         Ok(ActiveOperation {
@@ -1462,16 +1498,22 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 ))
             };
         }
+        let writer_payloads = routed_writer_payloads_for_manifest(
+            &cohort.writer_payload,
+            cohort.routed_writer_payloads.as_deref(),
+            &request.expected_writers,
+        )?;
         let handles = request
             .expected_writers
             .iter()
             .cloned()
-            .map(|writer| {
+            .zip(writer_payloads)
+            .map(|(writer, payload)| {
                 ConnectorWriterHandle::try_new(
                     self.key.clone(),
                     writer,
                     ICEBERG_WRITE_PAYLOAD_VERSION,
-                    cohort.writer_payload.clone(),
+                    payload,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2599,6 +2641,40 @@ fn planning_attempt_digest(request: &ConnectorWritePlanningRequest) -> [u8; 32] 
     hasher.finalize().into()
 }
 
+fn routed_writer_payloads_for_manifest(
+    default_payload: &Bytes,
+    routed_payloads: Option<&[Bytes]>,
+    writers: &[novarocks_spi::connector::ConnectorWriterIdentity],
+) -> Result<Vec<Bytes>, ConnectorError> {
+    let Some(routed_payloads) = routed_payloads else {
+        return Ok(vec![default_payload.clone(); writers.len()]);
+    };
+    let fragments = writers
+        .iter()
+        .map(|writer| writer.fragment_id())
+        .collect::<BTreeSet<_>>();
+    if fragments.len() != routed_payloads.len() {
+        return Err(invalid(format!(
+            "managed Iceberg routed write expected {} terminal fragments, observed {}",
+            routed_payloads.len(),
+            fragments.len()
+        )));
+    }
+    let by_fragment = fragments
+        .into_iter()
+        .zip(routed_payloads.iter().cloned())
+        .collect::<BTreeMap<_, _>>();
+    writers
+        .iter()
+        .map(|writer| {
+            by_fragment
+                .get(&writer.fragment_id())
+                .cloned()
+                .ok_or_else(|| corrupt("managed Iceberg routed write lost a fragment payload"))
+        })
+        .collect()
+}
+
 fn canonical_json<T: Serialize>(value: &T, subject: &str) -> Result<Bytes, ConnectorError> {
     serde_json::to_vec(value)
         .map(Bytes::from)
@@ -2968,6 +3044,42 @@ mod tests {
                 .expect("control payload")
                 .target,
             "ice.db.t"
+        );
+    }
+
+    #[test]
+    fn routed_payloads_bind_to_sorted_terminal_fragments() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::new();
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let execution_id = ConnectorWriteExecutionId::new([7; 16], 1);
+        let writer = |fragment_id, backend_num, marker| {
+            ConnectorWriterIdentity::new(
+                operation_id,
+                cohort_id,
+                execution_id,
+                [marker; 16],
+                fragment_id,
+                backend_num,
+                0,
+                owner.clone(),
+            )
+        };
+        let writers = vec![writer(9, 0, 1), writer(3, 0, 2), writer(3, 1, 3)];
+        let payloads = routed_writer_payloads_for_manifest(
+            &Bytes::from_static(b"unused"),
+            Some(&[Bytes::from_static(b"delete"), Bytes::from_static(b"data")]),
+            &writers,
+        )
+        .expect("route payloads");
+        assert_eq!(
+            payloads,
+            vec![
+                Bytes::from_static(b"data"),
+                Bytes::from_static(b"delete"),
+                Bytes::from_static(b"delete"),
+            ]
         );
     }
 

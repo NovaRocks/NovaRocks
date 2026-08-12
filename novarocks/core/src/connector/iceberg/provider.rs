@@ -6725,10 +6725,33 @@ pub(crate) fn activate_iceberg_managed_publication_write(
     let ConnectorWriteActivationIntent::ManagedPublication(intent) = &request.intent else {
         return Ok(());
     };
-    let ConnectorWriteActivationSource::Prepared(preparation) = &request.source else {
-        return Err(invalid_iceberg_write_activation(
-            "Iceberg managed publication requires one prepared write source",
-        ));
+    let (selected_cohort, preparation, routed_preparations, source_digest) = match &request.source {
+        ConnectorWriteActivationSource::Prepared(preparation) => (
+            ConnectorWriteCohortId::primary(request.operation_id),
+            preparation.clone(),
+            None,
+            preparation.digest(),
+        ),
+        ConnectorWriteActivationSource::RowMutation(plan) => {
+            plan.validate()?;
+            if plan.operation_id() != request.operation_id || plan.copy_on_write().is_some() {
+                return Err(invalid_iceberg_write_activation(
+                    "managed Iceberg publication requires one direct row-mutation plan",
+                ));
+            }
+            let mut routes = plan
+                .routes()
+                .iter()
+                .map(|route| (route.cohort_id(), route.preparation().clone()))
+                .collect::<Vec<_>>();
+            routes.sort_by_key(|(cohort_id, _)| *cohort_id);
+            let (selected_cohort, preparation) = routes.first().cloned().ok_or_else(|| {
+                invalid_iceberg_write_activation(
+                    "managed Iceberg row-mutation plan has no writer routes",
+                )
+            })?;
+            (selected_cohort, preparation, Some(routes), plan.digest())
+        }
     };
     preparation.validate()?;
     let payload: TablePayload = decode_payload(
@@ -6836,15 +6859,56 @@ pub(crate) fn activate_iceberg_managed_publication_write(
             IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite
         }
     };
-    register_iceberg_first_refresh_write_service_from_preparation(
-        services,
-        request.operation_id,
-        preparation,
-        plan,
-        &entry,
-        commit_executor,
-        empty_input_policy,
-    )
+    let Some(routed_preparations) = routed_preparations else {
+        return register_iceberg_first_refresh_write_service_from_preparation(
+            services,
+            request.operation_id,
+            &preparation,
+            plan,
+            &entry,
+            commit_executor,
+            empty_input_policy,
+        );
+    };
+    let mut writer_payloads = Vec::with_capacity(routed_preparations.len());
+    for (_, route_preparation) in &routed_preparations {
+        route_preparation.validate()?;
+        if route_preparation.owner() != preparation.owner()
+            || route_preparation.table() != preparation.table()
+            || route_preparation.target_ref() != preparation.target_ref()
+            || route_preparation.base_version() != preparation.base_version()
+        {
+            return Err(invalid_iceberg_write_activation(
+                "managed Iceberg row-mutation route drifted from its exact target",
+            ));
+        }
+        let (_, payload) =
+            iceberg_route_writer_handle_payload(route_preparation, &entry, &commit_executor.table)?;
+        writer_payloads.push(payload);
+    }
+    let committer: Arc<dyn IcebergWriteReportCommitter> =
+        Arc::new(IcebergFirstRefreshWriteReportCommitter::new(
+            Arc::clone(&commit_executor),
+            plan.provenance_properties.clone(),
+            empty_input_policy,
+        )?);
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.managed-routed-publication-activation.v1\0");
+    hasher.update(request.operation_id.to_bytes());
+    hasher.update(source_digest);
+    hasher.update(plan.encode()?.as_ref());
+    let activation_digest: [u8; 32] = hasher.finalize().into();
+    let preparation_digest = preparation.digest();
+    services.register_lazy(request.operation_id, activation_digest, move || {
+        let context = IcebergWriteControlServiceContext::new_with_ordered_route_handle_payloads(
+            selected_cohort,
+            writer_payloads.clone(),
+            plan.clone(),
+            preparation_digest,
+            Arc::clone(&committer),
+        )?;
+        Ok(Arc::new(IcebergWriteControlService::new(context)))
+    })
 }
 
 /// Reserve a first-refresh writer from a sealed preparation.  The refresh
@@ -6966,60 +7030,9 @@ pub(crate) fn register_iceberg_row_write_service_from_preparation(
             ),
         ));
     }
-    let (mut sink_spec, equality_columns) =
-        iceberg_row_write_sink_spec_from_preparation(preparation, entry, table.metadata())?;
     validate_preparation_table_against_open_table(preparation, table.metadata())?;
-    // The preparation freezes the table metadata (including branch refs), but
-    // its table descriptor's current snapshot is necessarily `main`. Resolve
-    // the selected ref inside the provider before deriving BE-only partition
-    // and existing-DV facts.  In particular a branch COW rewrite may have
-    // introduced data files that are absent from main.
-    let snapshot_id = Some(expected_snapshot_id);
-    sink_spec
-        .set_planned_snapshot_id(snapshot_id)
-        .map_err(invalid_iceberg_write_activation)?;
-    let writer_handle_payload = match sink_spec.mode {
-        IcebergWriteSinkMode::PositionDeletes => {
-            let position_index_storage =
-                super::change_stream_write::position_delete_index_storage_config(
-                    entry,
-                    table.metadata().location(),
-                )
-                .map_err(invalid_iceberg_write_activation)?;
-            let partitions = super::sink::build_position_delete_data_file_partition_index(
-                table.metadata(),
-                snapshot_id,
-                table.metadata().location(),
-                position_index_storage.as_ref(),
-            )
-            .map_err(invalid_iceberg_write_activation)?;
-            encode_position_delete_sink_handle_payload(&sink_spec, table.metadata(), &partitions)
-                .map_err(invalid_iceberg_write_activation)?
-        }
-        IcebergWriteSinkMode::DeletionVectors => {
-            super::change_stream_write::frozen_deletion_vector_handle_payload(
-                &sink_spec,
-                &table,
-                entry,
-                snapshot_id,
-            )
-            .map_err(invalid_iceberg_write_activation)?
-        }
-        IcebergWriteSinkMode::EqualityDeletes => encode_equality_delete_sink_spec_handle_payload(
-            &sink_spec,
-            equality_columns.as_deref().ok_or_else(|| {
-                invalid_iceberg_write_activation(
-                    "equality-delete preparation is missing provider field bindings",
-                )
-            })?,
-        )
-        .map_err(invalid_iceberg_write_activation)?,
-        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
-            return Err(invalid_iceberg_write_activation(
-                "row-level Iceberg writer activation requires a row-level preparation shape",
-            ));
-        }
-    };
+    let (sink_spec, writer_handle_payload) =
+        iceberg_route_writer_handle_payload(preparation, entry, &table)?;
     register_iceberg_write_service_from_preparation_payload(
         services,
         operation_id,
@@ -7029,6 +7042,82 @@ pub(crate) fn register_iceberg_row_write_service_from_preparation(
         writer_handle_payload,
         commit_executor,
     )
+}
+
+fn iceberg_route_writer_handle_payload(
+    preparation: &ConnectorWritePreparation,
+    entry: &IcebergCatalogEntry,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> Result<(IcebergWriteSinkSpec, bytes::Bytes), ConnectorError> {
+    match preparation.input() {
+        ConnectorWriteInputShape::Data { .. } | ConnectorWriteInputShape::RowLineage { .. } => {
+            let sink_spec = iceberg_data_sink_spec_from_preparation(preparation, entry)?;
+            let payload = encode_data_sink_spec_handle_payload(&sink_spec)
+                .map_err(invalid_iceberg_write_activation)?;
+            Ok((sink_spec, payload))
+        }
+        ConnectorWriteInputShape::PositionDelete { .. }
+        | ConnectorWriteInputShape::DeletionVector { .. }
+        | ConnectorWriteInputShape::EqualityDelete { .. } => {
+            let (mut sink_spec, equality_columns) =
+                iceberg_row_write_sink_spec_from_preparation(preparation, entry, table.metadata())?;
+            let snapshot_id = iceberg_row_mutation_base_snapshot_from_preparation(
+                preparation,
+                preparation.target_ref().as_str(),
+            )?;
+            let snapshot_id = Some(snapshot_id);
+            sink_spec
+                .set_planned_snapshot_id(snapshot_id)
+                .map_err(invalid_iceberg_write_activation)?;
+            let payload = match sink_spec.mode {
+                IcebergWriteSinkMode::PositionDeletes => {
+                    let position_index_storage =
+                        super::change_stream_write::position_delete_index_storage_config(
+                            entry,
+                            table.metadata().location(),
+                        )
+                        .map_err(invalid_iceberg_write_activation)?;
+                    let partitions = super::sink::build_position_delete_data_file_partition_index(
+                        table.metadata(),
+                        snapshot_id,
+                        table.metadata().location(),
+                        position_index_storage.as_ref(),
+                    )
+                    .map_err(invalid_iceberg_write_activation)?;
+                    encode_position_delete_sink_handle_payload(
+                        &sink_spec,
+                        table.metadata(),
+                        &partitions,
+                    )
+                    .map_err(invalid_iceberg_write_activation)?
+                }
+                IcebergWriteSinkMode::DeletionVectors => {
+                    super::change_stream_write::frozen_deletion_vector_handle_payload(
+                        &sink_spec,
+                        table,
+                        entry,
+                        snapshot_id,
+                    )
+                    .map_err(invalid_iceberg_write_activation)?
+                }
+                IcebergWriteSinkMode::EqualityDeletes => {
+                    encode_equality_delete_sink_spec_handle_payload(
+                        &sink_spec,
+                        equality_columns.as_deref().ok_or_else(|| {
+                            invalid_iceberg_write_activation(
+                                "equality-delete preparation is missing provider field bindings",
+                            )
+                        })?,
+                    )
+                    .map_err(invalid_iceberg_write_activation)?
+                }
+                IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
+                    unreachable!("row-level preparation produced a data sink")
+                }
+            };
+            Ok((sink_spec, payload))
+        }
+    }
 }
 
 /// Provider-facing COW cohort facts.  The mutation kernel supplies only the

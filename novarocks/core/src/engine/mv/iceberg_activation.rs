@@ -140,18 +140,33 @@ pub(crate) fn activate_first_refresh_connector_write(
         novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
         connector_context.clone(),
     )?;
-    let managed_publication = ConnectorManagedPublicationIntent::try_new(
-        prepared.publication_intent().refresh_id(),
-        prepared.publication_intent().mv_id(),
-        prepared.publication_intent().marker_token(),
-        match prepared.publication_intent().technique() {
+    let managed_publication =
+        managed_publication_activation_intent(prepared.publication_intent(), empty_input)?;
+    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared_with_intent(
+        operation_id,
+        preparation,
+        ConnectorWriteActivationIntent::ManagedPublication(managed_publication),
+        connector_context,
+        exact_lease.clone(),
+    )
+    .map_err(|error| format!("activate exact Iceberg MV write generation: {error}"))
+}
+
+pub(crate) fn managed_publication_activation_intent(
+    publication: &MvRefreshPublicationIntent,
+    empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+) -> Result<ConnectorManagedPublicationIntent, String> {
+    ConnectorManagedPublicationIntent::try_new(
+        publication.refresh_id(),
+        publication.mv_id(),
+        publication.marker_token(),
+        match publication.technique() {
             MvRefreshPublicationTechnique::Full => ConnectorManagedPublicationTechnique::Full,
             MvRefreshPublicationTechnique::Incremental => {
                 ConnectorManagedPublicationTechnique::Incremental
             }
         },
-        prepared
-            .publication_intent()
+        publication
             .bases()
             .iter()
             .map(|base| ConnectorStagedPublicationBaseFact {
@@ -161,16 +176,8 @@ pub(crate) fn activate_first_refresh_connector_write(
                 to_version: base.to_snapshot(),
             })
             .collect(),
-        prepared.publication_intent().definition_fingerprint(),
+        publication.definition_fingerprint(),
         empty_input,
     )
-    .map_err(|error| format!("build managed MV publication activation intent: {error}"))?;
-    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared_with_intent(
-        operation_id,
-        preparation,
-        ConnectorWriteActivationIntent::ManagedPublication(managed_publication),
-        connector_context,
-        exact_lease.clone(),
-    )
-    .map_err(|error| format!("activate exact Iceberg MV write generation: {error}"))
+    .map_err(|error| format!("build managed MV publication activation intent: {error}"))
 }

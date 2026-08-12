@@ -1486,6 +1486,11 @@ pub(crate) struct IcebergWriteCohortContext {
 enum IcebergWriterHandlePayloads {
     Uniform(bytes::Bytes),
     ByFragment(BTreeMap<i32, bytes::Bytes>),
+    /// Provider-signed route payloads in the same deterministic order as the
+    /// SQL change-stream routes. Physical fragment IDs do not exist until FE
+    /// placement, so the provider binds them to sorted terminal fragment IDs
+    /// only when planning receives the frozen writer manifest.
+    ByTerminalFragmentOrder(Vec<bytes::Bytes>),
 }
 
 #[derive(Serialize)]
@@ -1631,19 +1636,52 @@ impl IcebergWriteCohortContext {
         self.control_payload.clone()
     }
 
-    fn payload_for_writer(
+    fn payloads_for_writers(
         &self,
-        writer: &novarocks_spi::connector::ConnectorWriterIdentity,
-    ) -> Result<bytes::Bytes, ConnectorError> {
+        writers: &[novarocks_spi::connector::ConnectorWriterIdentity],
+    ) -> Result<Vec<bytes::Bytes>, ConnectorError> {
         match &self.writer_handle_payloads {
-            IcebergWriterHandlePayloads::Uniform(payload) => Ok(payload.clone()),
-            IcebergWriterHandlePayloads::ByFragment(payloads) => {
-                payloads.get(&writer.fragment_id()).cloned().ok_or_else(|| {
-                    invalid(format!(
-                        "Iceberg multi-sink write has no handle payload for writer fragment {}",
-                        writer.fragment_id()
-                    ))
+            IcebergWriterHandlePayloads::Uniform(payload) => {
+                Ok(vec![payload.clone(); writers.len()])
+            }
+            IcebergWriterHandlePayloads::ByFragment(payloads) => writers
+                .iter()
+                .map(|writer| {
+                    payloads.get(&writer.fragment_id()).cloned().ok_or_else(|| {
+                        invalid(format!(
+                            "Iceberg multi-sink write has no handle payload for writer fragment {}",
+                            writer.fragment_id()
+                        ))
+                    })
                 })
+                .collect(),
+            IcebergWriterHandlePayloads::ByTerminalFragmentOrder(payloads) => {
+                let fragments = writers
+                    .iter()
+                    .map(|writer| writer.fragment_id())
+                    .collect::<BTreeSet<_>>();
+                if fragments.len() != payloads.len() {
+                    return Err(invalid(format!(
+                        "Iceberg routed write expected {} terminal fragments, observed {}",
+                        payloads.len(),
+                        fragments.len()
+                    )));
+                }
+                let by_fragment = fragments
+                    .into_iter()
+                    .zip(payloads.iter().cloned())
+                    .collect::<BTreeMap<_, _>>();
+                writers
+                    .iter()
+                    .map(|writer| {
+                        by_fragment
+                            .get(&writer.fragment_id())
+                            .cloned()
+                            .ok_or_else(|| {
+                                invalid("Iceberg routed write lost a terminal fragment payload")
+                            })
+                    })
+                    .collect()
             }
         }
     }
@@ -1755,6 +1793,28 @@ impl IcebergWriteControlServiceContext {
             commit_executor,
             preparation_digest: None,
             cohort_preparation_digests: None,
+        })
+    }
+
+    pub(crate) fn new_with_ordered_route_handle_payloads(
+        cohort_id: ConnectorWriteCohortId,
+        writer_handle_payloads: Vec<bytes::Bytes>,
+        plan_payload: IcebergFirstRefreshWritePlanPayloadV2,
+        preparation_digest: [u8; 32],
+        commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+    ) -> Result<Self, ConnectorError> {
+        if writer_handle_payloads.is_empty() {
+            return Err(invalid("Iceberg routed writer payload list is empty"));
+        }
+        let context = IcebergWriteCohortContext::first_refresh_primary(
+            IcebergWriterHandlePayloads::ByTerminalFragmentOrder(writer_handle_payloads),
+            plan_payload,
+        )?;
+        Ok(Self {
+            cohorts: IcebergWriteCohortContexts::Sealed(BTreeMap::from([(cohort_id, context)])),
+            commit_executor,
+            preparation_digest: None,
+            cohort_preparation_digests: Some(BTreeMap::from([(cohort_id, preparation_digest)])),
         })
     }
 
@@ -1903,6 +1963,18 @@ fn validate_writer_handle_payloads(
                 })?;
             }
         }
+        IcebergWriterHandlePayloads::ByTerminalFragmentOrder(payloads) => {
+            if payloads.is_empty() {
+                return Err(invalid("Iceberg routed writer payload list is empty"));
+            }
+            for (route_ordinal, payload) in payloads.iter().enumerate() {
+                decode_write_handle(payload).map_err(|error| {
+                    invalid(format!(
+                        "decode Iceberg writer handle template for route {route_ordinal}: {error}"
+                    ))
+                })?;
+            }
+        }
     }
     Ok(())
 }
@@ -1975,17 +2047,18 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
             .first()
             .map(|writer| writer.binding_key().clone())
             .ok_or_else(|| invalid("Iceberg write plan has no expected writers"))?;
+        let payloads = cohort.payloads_for_writers(&request.expected_writers)?;
         let handles = request
             .expected_writers
             .iter()
             .cloned()
-            .map(|writer| {
+            .zip(payloads)
+            .map(|(writer, payload)| {
                 if writer.binding_key() != &owner {
                     return Err(invalid(
                         "Iceberg write plan contains multiple connector binding generations",
                     ));
                 }
-                let payload = cohort.payload_for_writer(&writer)?;
                 novarocks_spi::connector::ConnectorWriterHandle::try_new(
                     owner.clone(),
                     writer,
