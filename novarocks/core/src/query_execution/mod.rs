@@ -25,6 +25,7 @@ pub mod contract;
 pub mod control;
 pub mod distributed_rewrite;
 pub mod fragment_transport;
+pub(crate) mod frozen_connector_read;
 #[cfg(test)]
 pub(crate) mod in_process_test;
 pub mod lifecycle;

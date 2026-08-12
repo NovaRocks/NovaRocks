@@ -814,6 +814,7 @@ fn stage_frozen_rewrite_cohort(
         session.lease(),
         execution.topology(),
         cohort.source(),
+        cohort.scan_schema(),
         (0..cohort.scan_schema().fields().len()).collect(),
         context.clone(),
     )
@@ -825,8 +826,10 @@ fn stage_frozen_rewrite_cohort(
             table_bindings.as_ref(),
             cohort.scan_schema(),
         )?;
-    let resolver =
-        crate::query_execution::distributed_rewrite::FrozenRewriteReadResolver::new(read);
+    let resolver = crate::query_execution::distributed_rewrite::frozen_rewrite_read_resolver(
+        source_binding,
+        read,
+    );
     let physical_plan =
         crate::query_execution::distributed_rewrite::frozen_rewrite_scan_physical_plan(
             cohort.scan_schema(),

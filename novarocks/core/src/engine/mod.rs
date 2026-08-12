@@ -4398,6 +4398,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
         execution,
         connector_context,
         connector_write.map(DistributedConnectorWrite::Begin),
+        None,
         &[],
     )
 }
@@ -4428,6 +4429,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
         execution,
         connector_context,
         Some(DistributedConnectorWrite::Sealed(connector_write)),
+        None,
         &[],
     )
 }
@@ -4449,6 +4451,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overl
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+    scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
     overlays: &[crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay],
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     execute_query_as_iceberg_write_with_connector_binding(
@@ -4463,6 +4466,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overl
         execution,
         connector_context,
         Some(DistributedConnectorWrite::Sealed(connector_write)),
+        Some(scan_resolver),
         overlays,
     )
 }
@@ -4660,6 +4664,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<DistributedConnectorWrite>,
+    scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
     query_local_overlays: &[crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay],
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let maintenance_execution;
@@ -4754,7 +4759,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         state.connector_control.as_ref(),
         &connector_context,
         Some(table_bindings.as_ref()),
-        None,
+        scan_resolver,
         scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(

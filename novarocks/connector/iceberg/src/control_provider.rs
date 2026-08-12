@@ -183,6 +183,7 @@ impl IcebergControlProvider {
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,
+            row_mutation_frozen_source: false,
             logical_type_columns: logical_type_columns(metadata.properties()),
             hidden_columns: hidden_internal_columns(metadata.properties()),
         };
@@ -378,6 +379,7 @@ impl ConnectorMetadata for IcebergControlProvider {
             metadata_table_type,
             prepared_files,
             explicit_files: None,
+            row_mutation_frozen_source: false,
             logical_type_columns,
             hidden_columns,
         };
@@ -1523,6 +1525,10 @@ pub(crate) struct IcebergTablePayload {
     pub metadata_table_type: Option<MetadataTableType>,
     pub prepared_files: Vec<IcebergDataFileInfo>,
     pub explicit_files: Option<Vec<IcebergDataFileInfo>>,
+    /// Provider-private exact-base COW source. Such a handle carries a complete
+    /// explicit file set and must never fall back to a catalog lookup.
+    #[serde(default)]
+    pub row_mutation_frozen_source: bool,
     #[serde(default)]
     pub logical_type_columns: BTreeMap<String, String>,
     #[serde(default)]
@@ -1579,10 +1585,31 @@ fn projected_schema(
         .ok_or_else(|| corrupt("Iceberg table handle has no serialized metadata"))?;
     let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
         .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
-    let storage = crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
+    let storage_schema = if table.row_mutation_frozen_source {
+        let snapshot_id = table
+            .table_info
+            .as_ref()
+            .and_then(|table| table.current_snapshot_id)
+            .ok_or_else(|| corrupt("Iceberg frozen row-mutation source has no base snapshot"))?;
+        metadata
+            .snapshot_by_id(snapshot_id)
+            .ok_or_else(|| corrupt("Iceberg frozen row-mutation base snapshot is absent"))?
+            .schema(&metadata)
+            .map_err(|error| corrupt(format!("resolve frozen row-mutation schema: {error}")))?
+    } else {
+        metadata.current_schema().clone()
+    };
+    let storage = crate::iceberg::arrow::schema_to_arrow_schema(&storage_schema)
         .map_err(|error| corrupt(format!("convert Iceberg schema to Arrow: {error}")))?;
     let mut fields = storage.fields().to_vec();
-    fields.extend(metadata_arrow_fields(&table.metadata_columns)?);
+    let mut metadata_fields = metadata_arrow_fields(&table.metadata_columns)?;
+    if table.row_mutation_frozen_source {
+        metadata_fields = metadata_fields
+            .into_iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(false)))
+            .collect();
+    }
+    fields.extend(metadata_fields);
     let indexes = if projection.is_empty() {
         (0..fields.len()).collect::<Vec<_>>()
     } else {
@@ -2813,6 +2840,7 @@ mod plan_splits_pruning_tests {
                 metadata_table_type: None,
                 prepared_files: Vec::new(),
                 explicit_files: Some(files),
+                row_mutation_frozen_source: false,
                 logical_type_columns: BTreeMap::new(),
                 hidden_columns: Vec::new(),
             },

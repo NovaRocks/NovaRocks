@@ -71,6 +71,7 @@ pub fn data_file_with_stats_to_iceberg_data_file_info(
 
 fn partition_field_values(
     metadata: &TableMetadata,
+    schema: &crate::iceberg::spec::Schema,
     spec_id: i32,
     partition: &crate::iceberg::spec::Struct,
 ) -> Result<Vec<IcebergPartitionFieldValue>, String> {
@@ -79,7 +80,6 @@ fn partition_field_values(
             "iceberg table metadata missing partition spec id {spec_id}"
         ));
     };
-    let schema = metadata.current_schema();
     let mut values = Vec::with_capacity(spec.fields().len());
     for (idx, field) in spec.fields().iter().enumerate() {
         let source_column = schema
@@ -245,6 +245,11 @@ pub async fn extract_data_files_with_stats_at(
     snapshot_id: i64,
 ) -> Result<Vec<DataFileWithStats>, String> {
     let metadata = table.metadata();
+    let snapshot_schema = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("Iceberg snapshot {snapshot_id} is absent from table metadata"))?
+        .schema(metadata)
+        .map_err(|error| format!("resolve Iceberg snapshot {snapshot_id} schema: {error}"))?;
     let read_snapshot = crate::read_snapshot::build_read_snapshot_at(table, snapshot_id).await?;
     read_snapshot
         .files
@@ -252,9 +257,12 @@ pub async fn extract_data_files_with_stats_at(
         .map(|file| {
             let partition_field_values =
                 match (file.partition_spec_id, file.partition_values.as_ref()) {
-                    (Some(spec_id), Some(partition_values)) => {
-                        partition_field_values(metadata, spec_id, partition_values)?
-                    }
+                    (Some(spec_id), Some(partition_values)) => partition_field_values(
+                        metadata,
+                        snapshot_schema.as_ref(),
+                        spec_id,
+                        partition_values,
+                    )?,
                     _ => Vec::new(),
                 };
             let delete_files = file

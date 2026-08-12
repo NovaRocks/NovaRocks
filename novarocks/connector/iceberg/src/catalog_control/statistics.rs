@@ -998,6 +998,7 @@ mod tests {
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,
+            row_mutation_frozen_source: false,
             logical_type_columns: BTreeMap::new(),
             hidden_columns: Vec::new(),
         }

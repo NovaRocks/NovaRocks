@@ -11,24 +11,21 @@
 //! for every accepted or superseded attempt.  It intentionally knows neither
 //! files, manifests, nor provider report formats.
 
-use std::collections::{BTreeMap, HashMap};
-use std::num::NonZeroUsize;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorDistributedRewriteAttemptCheckpoint,
-    ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewriteLease,
-    ConnectorDistributedRewritePlan, ConnectorDistributedRewriteReceipt, ConnectorError,
-    ConnectorErrorKind, ConnectorReadSelector, ConnectorRequestContext, ConnectorScanSelection,
-    ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorWriteAbortOutcome,
+    ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteAttemptDisposition,
+    ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan,
+    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorErrorKind,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteAbortOutcome,
     ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteExecutionId,
     ConnectorWriteOperationId, ConnectorWriteReceipt, ExternalMutationEvidence,
     ExternalMutationOutcome,
 };
 
-use crate::engine::query_planning::bindings::{
-    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
-};
+use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     ConnectorWriteExecutionRegistration, ConnectorWriteOperationRegistration,
@@ -38,10 +35,7 @@ use crate::query_execution::outcome::ConnectorWriteCompletion;
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::sql::binding::SqlTableBindingId;
-use crate::sql::catalog::ResolvedAnalyzerTable;
-use crate::sql::planner::table::{
-    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
-};
+use crate::sql::planner::table::SqlTableIdentity;
 
 /// Plan one frozen source through the scan-planning capability retained by a
 /// composite rewrite lease.  The plan is opaque to this module: it has no
@@ -50,76 +44,18 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
     lease: &ConnectorDistributedRewriteLease,
     topology: &BackendTopologySnapshot,
     source: &ConnectorTableHandle,
+    expected_schema: &SchemaRef,
     projection: Vec<usize>,
     context: ConnectorRequestContext,
 ) -> Result<PlannedConnectorRead, ConnectorError> {
-    if source.owner() != &lease.binding_key().instance_id {
-        return Err(invalid(
-            "frozen rewrite source does not belong to the exact rewrite lease",
-        ));
-    }
-    let target_parallelism = NonZeroUsize::new(topology.targets().len()).ok_or_else(|| {
-        ConnectorError::new(
-            ConnectorErrorKind::Unavailable,
-            "distributed rewrite requires at least one live backend",
-        )
-    })?;
-    let batch = ConnectorBatchBudget {
-        max_rows: NonZeroUsize::new(4096).expect("rewrite batch rows are nonzero"),
-        max_bytes: NonZeroUsize::new(context.max_handle_payload_bytes())
-            .expect("validated connector payload budget is nonzero"),
-    };
-    let scan = lease.planning().begin_scan(
+    crate::query_execution::frozen_connector_read::plan_frozen_connector_read(
+        lease.planning_lease(),
+        topology,
         source,
-        ConnectorBeginScanRequest {
-            projection,
-            static_predicates: Vec::new(),
-            selection: ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
-            purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
-            limit: None,
-            batch,
-            context: context.clone(),
-        },
-    )?;
-    scan.validate(
-        lease.binding_key(),
-        ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
-    )?;
-    let split_result = lease.planning().plan_splits(
-        scan.handle(),
-        ConnectorSplitPlanningRequest {
-            target_parallelism,
-            max_split_bytes: None,
-            context: context.clone(),
-        },
-    )?;
-    if split_result
-        .splits
-        .iter()
-        .any(|split| split.owner() != &lease.binding_key().instance_id)
-    {
-        return Err(invalid(
-            "distributed rewrite provider planned a split for another connector instance",
-        ));
-    }
-    Ok(PlannedConnectorRead {
-        declaration: lease.execution_declaration(&context)?,
-        provider_field_ordinals: (0..scan.output_schema().fields().len())
-            .map(|ordinal| u32::try_from(ordinal).expect("connector output ordinal fits u32"))
-            .collect(),
-        scan,
-        splits: split_result.splits,
-        planning_metrics: split_result.metrics,
-        static_predicates: Vec::new(),
-        predicate_dispositions: Vec::new(),
-        residual_predicates: Vec::new(),
-        batch,
-        // This clone is derived from the composite rewrite lease, so the
-        // generic ensure barrier retains the same exact generation without a
-        // later current-generation lookup.
-        planning_lease: lease.planning_lease(),
-        read_session: split_result.session,
-    })
+        expected_schema,
+        projection,
+        context,
+    )
 }
 
 /// Admit the synthetic source used by one opaque frozen rewrite read.
@@ -133,55 +69,10 @@ pub(crate) fn admit_frozen_rewrite_scan_binding(
     bindings: &QueryTableBindingStore,
     input_schema: &arrow::datatypes::SchemaRef,
 ) -> Result<SqlTableBindingId, String> {
-    let columns = input_schema
-        .fields()
-        .iter()
-        .map(|field| novarocks_catalog::schema::ColumnDef {
-            name: field.name().to_string(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
-        })
-        .collect::<Vec<_>>();
-    bindings.resolve_or_insert_with_id(
-        QueryTableBindingKey::strict_base(
-            "__distributed_rewrite",
-            "__distributed_rewrite",
-            "__connector_frozen_rewrite",
-        ),
-        |binding| {
-            let identity = SqlTableIdentity {
-                catalog: "__distributed_rewrite".to_string(),
-                namespace: "__distributed_rewrite".to_string(),
-                table: "__connector_frozen_rewrite".to_string(),
-            };
-            let catalog = identity.catalog.clone();
-            let namespace = identity.namespace.clone();
-            Ok(QueryTableBinding {
-                resolved: ResolvedAnalyzerTable::from_planner(
-                    Some(&catalog),
-                    &namespace,
-                    TableDef {
-                        name: identity.table.clone(),
-                        columns,
-                        iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: ScanSource::Sql(SqlScanSource::new(
-                            binding,
-                            identity,
-                            SqlScanKind::ConnectorRead,
-                        )),
-                    },
-                ),
-                statistics_pin: None,
-                admission: QueryTableBindingAdmission::Local,
-                scan_materialization: None,
-                mv_target_read: None,
-                write_target_admission: None,
-                frozen_snapshot_materializations: BTreeMap::new(),
-                admitted_change_scans: BTreeMap::new(),
-            })
-        },
+    crate::query_execution::frozen_connector_read::admit_frozen_connector_scan_binding(
+        bindings,
+        &frozen_rewrite_identity(),
+        input_schema,
     )
 }
 
@@ -193,104 +84,31 @@ pub(crate) fn frozen_rewrite_scan_physical_plan(
     input_schema: &arrow::datatypes::SchemaRef,
     binding: SqlTableBindingId,
 ) -> crate::sql::planner::physical::PhysicalPlanNode {
-    let mut factory = crate::sql::column_id::ColumnRefFactory::new();
-    let mut output_columns = Vec::with_capacity(input_schema.fields().len());
-    let mut table_columns = Vec::with_capacity(input_schema.fields().len());
-    for field in input_schema.fields() {
-        let name = field.name().to_string();
-        let data_type = field.data_type().clone();
-        let nullable = field.is_nullable();
-        let column_id = factory.create(None, name.clone(), data_type.clone(), nullable);
-        output_columns.push(crate::sql::analysis::OutputColumn {
-            column_id,
-            name: name.clone(),
-            data_type: data_type.clone(),
-            nullable,
-            is_internal: false,
-        });
-        table_columns.push(novarocks_catalog::schema::ColumnDef {
-            name,
-            data_type,
-            nullable,
-            write_default: None,
-            logical_type: None,
-        });
-    }
-    crate::sql::planner::physical::PhysicalPlanNode {
-        kind: crate::sql::planner::physical::PhysicalPlanKind::Scan(
-            crate::sql::planner::payload::PlanScanNode {
-                database: "__distributed_rewrite".to_string(),
-                table: crate::sql::planner::table::TableDef {
-                    name: "__connector_frozen_rewrite".to_string(),
-                    columns: table_columns,
-                    iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::Sql(SqlScanSource::new(
-                        binding,
-                        SqlTableIdentity {
-                            catalog: "__distributed_rewrite".to_string(),
-                            namespace: "__distributed_rewrite".to_string(),
-                            table: "__connector_frozen_rewrite".to_string(),
-                        },
-                        SqlScanKind::ConnectorRead,
-                    )),
-                },
-                alias: None,
-                columns: output_columns.clone(),
-                predicates: Vec::new(),
-                required_columns: None,
-                variant_columns: Vec::new(),
-                mv_rewritten_from: None,
-            },
-        ),
-        children: Vec::new(),
-        output_columns,
-        stats: crate::sql::planner::physical::PhysicalPlanStats {
-            output_row_count: 0.0,
-            row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
-            column_statistics: HashMap::new(),
-            cost_estimate: None,
-            broadcast_decision: None,
-        },
-        probe_runtime_filters: Vec::new(),
-    }
+    crate::query_execution::frozen_connector_read::frozen_connector_scan_physical_plan(
+        &frozen_rewrite_identity(),
+        input_schema,
+        binding,
+    )
 }
 
 /// One-shot injection point for the exact frozen source plan.  Keeping this
 /// local to rewrite execution makes a second provider catalog lookup during
 /// fragment preparation structurally impossible.
-pub(crate) struct FrozenRewriteReadResolver {
-    read: Mutex<Option<PlannedConnectorRead>>,
+pub(crate) type FrozenRewriteReadResolver =
+    crate::query_execution::frozen_connector_read::FrozenConnectorReadResolver;
+
+pub(crate) fn frozen_rewrite_read_resolver(
+    binding: SqlTableBindingId,
+    read: PlannedConnectorRead,
+) -> FrozenRewriteReadResolver {
+    FrozenRewriteReadResolver::new(binding, frozen_rewrite_identity(), read)
 }
 
-impl FrozenRewriteReadResolver {
-    pub(crate) fn new(read: PlannedConnectorRead) -> Self {
-        Self {
-            read: Mutex::new(Some(read)),
-        }
-    }
-}
-
-impl crate::query_execution::preparation::scan::ScanBindingResolver for FrozenRewriteReadResolver {
-    fn resolve_scan(
-        &self,
-        _node_id: i32,
-        _scan: &crate::sql::planner::payload::PlanScanNode,
-    ) -> Result<Option<crate::query_execution::preparation::scan::ResolvedScanExecution>, String>
-    {
-        Ok(Some(
-            crate::query_execution::preparation::scan::ResolvedScanExecution::ConnectorRead,
-        ))
-    }
-
-    fn resolve_connector_read(
-        &self,
-        _node_id: i32,
-        _scan: &crate::sql::planner::payload::PlanScanNode,
-    ) -> Result<Option<PlannedConnectorRead>, String> {
-        self.read
-            .lock()
-            .map_err(|_| "frozen rewrite connector read lock poisoned".to_string())
-            .map(|mut read| read.take())
+fn frozen_rewrite_identity() -> SqlTableIdentity {
+    SqlTableIdentity {
+        catalog: "__distributed_rewrite".to_string(),
+        namespace: "__distributed_rewrite".to_string(),
+        table: "__connector_frozen_rewrite".to_string(),
     }
 }
 

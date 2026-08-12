@@ -20,8 +20,8 @@ use crate::engine::query_planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::distributed_rewrite::{
-    ConnectorDistributedRewriteSession, FrozenRewriteReadResolver,
-    frozen_rewrite_scan_physical_plan, plan_frozen_rewrite_connector_read,
+    ConnectorDistributedRewriteSession, frozen_rewrite_scan_physical_plan,
+    plan_frozen_rewrite_connector_read,
 };
 use crate::query_execution::outcome::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
 use crate::query_execution::request_context::QueryExecutionContext;
@@ -46,6 +46,7 @@ pub(crate) fn stage_frozen_rewrite_cohort(
         session.lease(),
         execution.topology(),
         cohort.source(),
+        cohort.scan_schema(),
         (0..cohort.scan_schema().fields().len()).collect(),
         context.clone(),
     )
@@ -56,7 +57,10 @@ pub(crate) fn stage_frozen_rewrite_cohort(
             table_bindings.as_ref(),
             cohort.scan_schema(),
         )?;
-    let resolver = FrozenRewriteReadResolver::new(read);
+    let resolver = crate::query_execution::distributed_rewrite::frozen_rewrite_read_resolver(
+        source_binding,
+        read,
+    );
     let physical_plan = frozen_rewrite_scan_physical_plan(cohort.scan_schema(), source_binding);
     let target_binding = admit_prepared_connector_write_target(
         table_bindings.as_ref(),

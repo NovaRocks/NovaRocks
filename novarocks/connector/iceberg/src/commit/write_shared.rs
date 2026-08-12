@@ -24,7 +24,7 @@
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorWriteFieldRequest};
 
-use crate::iceberg::spec::{PrimitiveType, TableMetadata, Type};
+use crate::iceberg::spec::{PrimitiveType, Schema, TableMetadata, Type};
 
 /// Resolve the snapshot a write against `target_ref` will be based on.
 ///
@@ -59,7 +59,14 @@ pub(crate) fn exact_requested_write_fields(
     metadata: &TableMetadata,
     requested: &[ConnectorWriteFieldRequest],
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
-    let iceberg_schema = metadata.current_schema();
+    exact_requested_write_fields_at_schema(metadata.current_schema(), requested)
+}
+
+/// Resolve write fields against an already-frozen Iceberg schema.
+pub(crate) fn exact_requested_write_fields_at_schema(
+    iceberg_schema: &Schema,
+    requested: &[ConnectorWriteFieldRequest],
+) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
     let arrow_schema =
         crate::iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|error| {
             invalid_write_activation(format!(
@@ -100,6 +107,35 @@ pub(crate) fn exact_requested_write_fields(
             )))
         })
         .collect()
+}
+
+/// Resolve the exact schema owned by a previously resolved write base.
+///
+/// A missing snapshot denotes an empty table/ref and deliberately retains the
+/// admitted metadata's current schema. A concrete snapshot always owns the
+/// schema, including when that snapshot is an older branch head.
+pub(crate) fn write_target_schema(
+    metadata: &TableMetadata,
+    target_snapshot_id: Option<i64>,
+) -> Result<std::sync::Arc<Schema>, ConnectorError> {
+    match target_snapshot_id {
+        Some(snapshot_id) => metadata
+            .snapshot_by_id(snapshot_id)
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "resolved Iceberg write base snapshot is absent from admitted metadata",
+                )
+            })?
+            .schema(metadata)
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!("resolve admitted Iceberg write base schema: {error}"),
+                )
+            }),
+        None => Ok(metadata.current_schema().clone()),
+    }
 }
 
 pub(crate) fn invalid_write_activation(message: impl Into<String>) -> ConnectorError {

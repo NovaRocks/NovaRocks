@@ -40,9 +40,10 @@ use novarocks_spi::connector::{
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
     ConnectorRequestContext, ConnectorRowMutationActivationRequest,
-    ConnectorRowMutationExecutionPlan, ConnectorRowMutationPreparationOutcome,
-    ConnectorRowMutationPreparationRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationExecutionPlan,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
+    ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteActivation,
+    ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
     ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
     ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteInputShape,
     ConnectorWriteOperationCompletion, ConnectorWriteOperationId, ConnectorWritePlan,
@@ -365,13 +366,40 @@ impl IcebergWriteControl {
         let cow_recipes = match &request.source {
             ConnectorWriteActivationSource::RowMutation(plan) => plan
                 .copy_on_write()
-                .map(|(_, recipes)| {
+                .map(|(_, _, recipes)| {
                     recipes
                         .iter()
                         .map(|recipe| {
-                            crate::row_mutation_payload::decode_cow_recipe(recipe.payload())
-                                .map(|decoded| (recipe.cohort_id(), decoded))
-                                .map_err(invalid)
+                            let decoded = crate::row_mutation_payload::decode_cow_recipe(
+                                recipe.payload(),
+                            )
+                            .map_err(invalid)?;
+                            match (decoded.role.as_str(), recipe.body()) {
+                                (
+                                    "rewrite",
+                                    ConnectorRowMutationCohortRecipeBody::Rewrite {
+                                        source, ..
+                                    },
+                                ) => {
+                                    let source_digest = lowercase_hex_digest(Sha256::digest(
+                                        source.payload(),
+                                    ));
+                                    if decoded.frozen_source_digest_hex.as_deref()
+                                        != Some(source_digest.as_str())
+                                    {
+                                        return Err(corrupt(
+                                            "Iceberg COW private recipe does not bind its frozen source",
+                                        ));
+                                    }
+                                }
+                                ("append", ConnectorRowMutationCohortRecipeBody::Append) => {}
+                                _ => {
+                                    return Err(corrupt(
+                                        "Iceberg COW private recipe role differs from its sealed body",
+                                    ));
+                                }
+                            }
+                            Ok((recipe.cohort_id(), decoded))
                         })
                         .collect::<Result<HashMap<_, _>, _>>()
                 })
@@ -380,6 +408,17 @@ impl IcebergWriteControl {
             ConnectorWriteActivationSource::Prepared(_) => HashMap::new(),
         };
         let mut cohorts = HashMap::with_capacity(activation.cohorts().len());
+        if !cow_recipes.is_empty()
+            && (cow_recipes.len() != activation.cohorts().len()
+                || activation
+                    .cohorts()
+                    .iter()
+                    .any(|cohort| !cow_recipes.contains_key(&cohort.cohort_id())))
+        {
+            return Err(corrupt(
+                "Iceberg COW activation does not establish authority for every sealed cohort",
+            ));
+        }
         let mut operation_target = None;
         let mut operation_partition_replacement = None;
         for activated in activation.cohorts() {
@@ -965,11 +1004,24 @@ impl IcebergWriteControl {
         plan: &IcebergWritePlanPayloadV1,
         metadata: &crate::iceberg::spec::TableMetadata,
         target_snapshot_id: Option<i64>,
-        cow_recipe: Option<&crate::row_mutation_payload::IcebergCowRecipePayloadV1>,
+        cow_recipe: Option<&crate::row_mutation_payload::IcebergCowRecipePayloadV3>,
     ) -> Result<Bytes, ConnectorError> {
         if let Some(recipe) = cow_recipe {
             let base_snapshot_id = target_snapshot_id
                 .ok_or_else(|| invalid("Iceberg COW cohort requires a frozen base snapshot"))?;
+            match recipe.role.as_str() {
+                "rewrite" if recipe.base_snapshot_id != Some(base_snapshot_id) => {
+                    return Err(corrupt(
+                        "Iceberg COW private recipe base differs from its exact activated target",
+                    ));
+                }
+                "append" if recipe.base_snapshot_id.is_some() => {
+                    return Err(corrupt(
+                        "Iceberg COW append recipe unexpectedly carries a frozen source base",
+                    ));
+                }
+                _ => {}
+            }
             let mut hasher = Sha256::new();
             hasher.update(b"novarocks.iceberg-cow-row-ids.v1\0");
             for row_id in &recipe.matched_row_ids {
@@ -1617,7 +1669,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
         &self,
         request: ConnectorRowMutationActivationRequest,
     ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
-        super::row_mutation_activation::activate_row_mutation(request, &self.key)
+        super::row_mutation_activation::activate_row_mutation(request, &self.key, &self.runtime)
     }
 
     fn activate_write(
@@ -2450,7 +2502,7 @@ fn commit_shape(
         return Ok((CommitOpKind::SelectedRewrite, None));
     }
     if let ConnectorWriteActivationSource::RowMutation(plan) = &active.activation_source
-        && let Some((_, recipes)) = plan.copy_on_write()
+        && let Some((_, _, recipes)) = plan.copy_on_write()
     {
         let files_by_cohort = cohorts
             .iter()
@@ -3443,6 +3495,14 @@ fn base64_encode(bytes: impl AsRef<[u8]>) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+fn lowercase_hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn decode_fixed<const N: usize>(value: &str, subject: &str) -> Result<[u8; N], ConnectorError> {
     base64::engine::general_purpose::STANDARD
         .decode(value)
@@ -3695,6 +3755,7 @@ mod tests {
             metadata_table_type: None,
             prepared_files: Vec::new(),
             explicit_files: None,
+            row_mutation_frozen_source: false,
             logical_type_columns: BTreeMap::new(),
             hidden_columns: Vec::new(),
         };
