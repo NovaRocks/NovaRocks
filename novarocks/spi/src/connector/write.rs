@@ -2948,6 +2948,7 @@ impl ConnectorWriteLease {
         request: super::ConnectorRowMutationActivationRequest,
     ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
         request.validate(&self.binding_key)?;
+        let expected_request = request.clone();
         let preparation = request.preparation().clone();
         let plan = self.control.activate_row_mutation(request)?;
         let contract = preparation.match_contract();
@@ -2991,21 +2992,7 @@ impl ConnectorWriteLease {
                 ));
             }
         }
-        if let Some((sealed, recipes)) = plan.copy_on_write()
-            && (sealed.operation_id() != preparation.operation_id()
-                || recipes.len() != sealed.cohorts().len()
-                || plan.routes().iter().any(|route| {
-                    !sealed
-                        .cohorts()
-                        .iter()
-                        .any(|cohort| cohort.cohort_id() == route.cohort_id())
-                }))
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "copy-on-write activation does not seal exactly its operation cohorts",
-            ));
-        }
+        plan.validate_against_activation(&expected_request, &self.binding_key)?;
         Ok(plan)
     }
 

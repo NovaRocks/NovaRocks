@@ -105,6 +105,7 @@ code-anchors:
 - ADR-0056 — 摘除 Core 对 provider 的测试依赖时，无法用冻结 SPI facts 表达的断言为何归位到实现旁而非复刻或删除（active）
 - ADR-0060 — MV refresh base pin 为何必须从同一 exact metadata 投影 UUID 与 current snapshot（active）
 - ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（active）
+- ADR-0062 — Copy-on-Write row mutation 的读源为何由 Provider 按 cohort 冻结并以中立 recipe 签发（active）
 
 #### 历史
 
@@ -168,6 +169,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0033 — UPDATE/MERGE 为何由 frontend 拥有 application lifecycle、core 保留 opaque mutation reverse port（active）
 - ADR-0046 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（active）
 - ADR-0054 — Frontend DML 为何使用 operation-scoped StateStore authority、且不把它宣称为 external commit fencing（active）
+- ADR-0062 — Copy-on-Write row mutation 的读源为何由 Provider 按 cohort 冻结并以中立 recipe 签发（active）
 
 #### 历史
 

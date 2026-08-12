@@ -179,11 +179,14 @@ pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,
     ConnectorMutationMatchContract, ConnectorMutationRouteInput, ConnectorMutationSourceField,
     ConnectorMutationTargetField, ConnectorRowMutationActivationRequest,
-    ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
-    ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
-    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationRoute, ConnectorRowMutationSelection, ConnectorRowMutationStrategy,
-    ConnectorWriteRouteId, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
+    ConnectorRowMutationCohortRecipe, ConnectorRowMutationCohortRecipeBody,
+    ConnectorRowMutationEffect, ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent,
+    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorRowMutationRoute,
+    ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
+    ConnectorRowMutationSelectionOrdinal, ConnectorRowMutationSelectionView,
+    ConnectorRowMutationStrategy, ConnectorWriteRouteId, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
+    MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use staged_create::{
