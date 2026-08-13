@@ -102,6 +102,32 @@ fn parse_imv_stateless_rebuild(raw: &str) -> anyhow::Result<ImvStatelessDirectiv
     Ok(ImvStatelessDirective { mv, level, catalog })
 }
 
+fn parse_fenced_catalog_fault(raw: &str) -> anyhow::Result<FencedCatalogFaultDirective> {
+    let (action, fault) = raw
+        .split_once(',')
+        .ok_or_else(|| anyhow::anyhow!("@fenced_catalog_fault requires <action>,<fault>"))?;
+    let action = match action.trim() {
+        "advance-fence" => FencedCatalogAction::AdvanceFence,
+        "stage" => FencedCatalogAction::Stage,
+        "publish" => FencedCatalogAction::Publish,
+        "abort" => FencedCatalogAction::Abort,
+        other => anyhow::bail!(
+            "invalid @fenced_catalog_fault action `{other}`; expected advance-fence, stage, publish, abort"
+        ),
+    };
+    let fault = match fault.trim() {
+        "before-accept" => FencedCatalogFault::BeforeAccept,
+        "after-accept" => FencedCatalogFault::AfterAccept,
+        "after-downstream-before-terminal" => FencedCatalogFault::AfterDownstreamBeforeTerminal,
+        "after-downstream-before-response" => FencedCatalogFault::AfterDownstreamBeforeResponse,
+        "delayed-old-request" => FencedCatalogFault::DelayedOldRequest,
+        other => anyhow::bail!(
+            "invalid @fenced_catalog_fault fault `{other}`; expected before-accept, after-accept, after-downstream-before-terminal, after-downstream-before-response, delayed-old-request"
+        ),
+    };
+    Ok(FencedCatalogFaultDirective { action, fault })
+}
+
 fn detect_case_sequential(lines: &[String], file_meta_lines: &[String], meta_re: &Regex) -> bool {
     file_meta_lines.iter().any(|line| {
         parse_meta_line(line, meta_re)
@@ -246,6 +272,9 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     );
                 }
                 meta.cleanup_fault = Some(raw_value);
+            }
+            "fenced_catalog_fault" => {
+                meta.fenced_catalog_fault = Some(parse_fenced_catalog_fault(&raw_value)?);
             }
             "drop_next_init_ack_be_index" => {
                 let value = raw_value
@@ -533,6 +562,7 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .cleanup_fault
             .clone()
             .or_else(|| base.cleanup_fault.clone()),
+        fenced_catalog_fault: override_meta.fenced_catalog_fault.or(base.fenced_catalog_fault),
         kill_query_after_control_ready_count: override_meta
             .kill_query_after_control_ready_count
             .or(base.kill_query_after_control_ready_count),
@@ -941,6 +971,28 @@ mod opt5_directive_tests {
         let lines = vec!["-- @normalize_explain_timing=true".to_string()];
         let meta = parse_meta(&lines, &re).expect("parse ok");
         assert!(meta.normalize_explain_timing);
+    }
+
+    #[test]
+    fn parse_meta_parses_typed_fenced_catalog_fault() {
+        let re = meta_re();
+        let lines = vec!["-- @fenced_catalog_fault=publish,after-downstream-before-response".to_string()];
+        let meta = parse_meta(&lines, &re).expect("parse fenced catalog fault");
+        assert_eq!(
+            meta.fenced_catalog_fault,
+            Some(FencedCatalogFaultDirective {
+                action: FencedCatalogAction::Publish,
+                fault: FencedCatalogFault::AfterDownstreamBeforeResponse,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_meta_rejects_unknown_fenced_catalog_fault_action() {
+        let re = meta_re();
+        let lines = vec!["-- @fenced_catalog_fault=inspect,before-accept".to_string()];
+        let error = parse_meta(&lines, &re).expect_err("unknown action must fail closed");
+        assert!(error.to_string().contains("invalid @fenced_catalog_fault action"));
     }
 
     #[test]

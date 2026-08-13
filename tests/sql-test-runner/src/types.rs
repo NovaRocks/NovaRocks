@@ -97,6 +97,9 @@ pub struct QueryMeta {
     pub restart_fe_after_step: bool,
     /// One runner-owned, frontend-only connector-cleanup fault token.
     pub cleanup_fault: Option<String>,
+    /// One bounded, runner-owned fault for the next matching fenced CTAS
+    /// catalog action. The SQL case never names an operation id.
+    pub fenced_catalog_fault: Option<FencedCatalogFaultDirective>,
     pub drop_next_init_ack_be_index: Option<usize>,
     pub stop_query_control_heartbeat_be_index: Option<usize>,
     pub kill_fe_after_control_ready_count: Option<usize>,
@@ -166,6 +169,53 @@ pub struct QueryMeta {
 }
 
 pub use novarocks_cluster_harness::QueryLifecyclePhase;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FencedCatalogAction {
+    AdvanceFence,
+    Stage,
+    Publish,
+    Abort,
+}
+
+impl FencedCatalogAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdvanceFence => "advance-fence",
+            Self::Stage => "stage",
+            Self::Publish => "publish",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FencedCatalogFault {
+    BeforeAccept,
+    AfterAccept,
+    AfterDownstreamBeforeTerminal,
+    AfterDownstreamBeforeResponse,
+    DelayedOldRequest,
+}
+
+impl FencedCatalogFault {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeAccept => "before-accept",
+            Self::AfterAccept => "after-accept",
+            Self::AfterDownstreamBeforeTerminal => "after-downstream-before-terminal",
+            Self::AfterDownstreamBeforeResponse => "after-downstream-before-response",
+            Self::DelayedOldRequest => "delayed-old-request",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FencedCatalogFaultDirective {
+    pub action: FencedCatalogAction,
+    pub fault: FencedCatalogFault,
+}
+
 
 impl QueryMeta {
     pub fn has_be_log_directives(&self) -> bool {

@@ -14,7 +14,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, post};
+use axum::routing::{any, delete, post};
 use axum::{Json, Router};
 use opendal::Operator;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -52,6 +53,20 @@ pub(crate) struct FixtureHandle {
     uri: String,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)] // The standalone fixture binary does not expose runner controls.
+pub(crate) struct FixtureControl {
+    uri: String,
+    client: reqwest::blocking::Client,
+}
+
+#[allow(dead_code)] // The standalone fixture binary does not expose runner controls.
+pub(crate) struct FixtureFaultGuard {
+    control: FixtureControl,
+    arm_id: String,
+    cleared: bool,
 }
 
 #[allow(dead_code)] // The standalone fixture binary uses `serve` instead.
@@ -103,6 +118,74 @@ impl FixtureHandle {
     pub(crate) fn uri(&self) -> &str {
         &self.uri
     }
+
+    pub(crate) fn control(&self) -> Result<FixtureControl> {
+        Ok(FixtureControl {
+            uri: self.uri.clone(),
+            client: reqwest::blocking::Client::builder().no_proxy().build()?,
+        })
+    }
+}
+
+#[allow(dead_code)] // The standalone fixture binary does not expose runner controls.
+impl FixtureControl {
+    pub(crate) fn arm_next(&self, action: &str, fault: &str) -> Result<FixtureFaultGuard> {
+        let response: ArmNextFaultResponse = self
+            .client
+            .post(format!("{}/_fixture/faults/next", self.uri))
+            .json(&json!({
+                "action": action,
+                "fault": fault,
+            }))
+            .send()
+            .context("arm fenced catalog next-action fault")?
+            .error_for_status()
+            .context("fenced catalog next-action fault was rejected")?
+            .json()
+            .context("decode fenced catalog next-action fault receipt")?;
+        Ok(FixtureFaultGuard {
+            control: self.clone(),
+            arm_id: response.arm_id,
+            cleared: false,
+        })
+    }
+
+    fn clear_arm(&self, arm_id: &str) -> Result<bool> {
+        let response: ClearNextFaultResponse = self
+            .client
+            .delete(format!("{}/_fixture/faults/next/{arm_id}", self.uri))
+            .send()
+            .context("clear fenced catalog next-action fault")?
+            .error_for_status()
+            .context("fenced catalog next-action fault cleanup was rejected")?
+            .json()
+            .context("decode fenced catalog next-action fault cleanup")?;
+        Ok(response.entered)
+    }
+}
+
+#[allow(dead_code)] // The standalone fixture binary does not expose runner controls.
+impl FixtureFaultGuard {
+    pub(crate) fn finish(mut self) -> Result<()> {
+        let entered = self.control.clear_arm(&self.arm_id)?;
+        self.cleared = true;
+        if !entered {
+            anyhow::bail!(
+                "fenced catalog next-action fault {} was not consumed by its matching CTAS action",
+                self.arm_id
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FixtureFaultGuard {
+    fn drop(&mut self) {
+        if !self.cleared {
+            let _ = self.control.clear_arm(&self.arm_id);
+            self.cleared = true;
+        }
+    }
 }
 
 impl Drop for FixtureHandle {
@@ -123,8 +206,32 @@ struct AppState {
     client: reqwest::Client,
     operation_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     faults: Arc<Mutex<HashMap<String, Vec<Fault>>>>,
+    next_fault: Arc<Mutex<NextFaultState>>,
+    next_fault_sequence: Arc<AtomicU64>,
     delay_entered: Arc<tokio::sync::Notify>,
     cleanup_backend: CleanupBackend,
+}
+
+#[derive(Debug, Clone)]
+struct ArmedNextFault {
+    arm_id: String,
+    action: FixtureAction,
+    fault: Fault,
+}
+
+#[derive(Default)]
+struct NextFaultState {
+    armed: Option<ArmedNextFault>,
+    status: Option<(String, bool)>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum FixtureAction {
+    AdvanceFence,
+    Stage,
+    Publish,
+    Abort,
 }
 
 #[derive(Clone)]
@@ -339,6 +446,27 @@ struct FaultRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct ArmNextFaultRequest {
+    action: FixtureAction,
+    fault: Fault,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)] // Decoded only by the in-process SQL runner control client.
+struct ArmNextFaultResponse {
+    arm_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)] // Decoded only by the in-process SQL runner control client.
+struct ClearNextFaultResponse {
+    entered: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct ReplaceTargetRequest {
     operation: Operation,
     replacement_identity: String,
@@ -399,6 +527,8 @@ fn build_state(config: &FixtureConfig) -> Result<AppState> {
         client: reqwest::Client::builder().no_proxy().build()?,
         operation_locks: Arc::new(Mutex::new(HashMap::new())),
         faults: Arc::new(Mutex::new(HashMap::new())),
+        next_fault: Arc::new(Mutex::new(NextFaultState::default())),
+        next_fault_sequence: Arc::new(AtomicU64::new(1)),
         delay_entered: Arc::new(tokio::sync::Notify::new()),
         cleanup_backend: CleanupBackend::EnvironmentS3,
     })
@@ -407,6 +537,8 @@ fn build_state(config: &FixtureConfig) -> Result<AppState> {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/_fixture/faults/{operation_id}", post(arm_fault))
+        .route("/_fixture/faults/next", post(arm_next_fault))
+        .route("/_fixture/faults/next/{arm_id}", delete(clear_next_fault))
         .route("/_fixture/drop-recreate-target", post(drop_recreate_target))
         .fallback(any(dispatch))
         .with_state(state)
@@ -441,6 +573,59 @@ async fn arm_fault(
         .or_default()
         .push(request.fault);
     StatusCode::NO_CONTENT
+}
+
+async fn arm_next_fault(
+    State(state): State<AppState>,
+    Json(request): Json<ArmNextFaultRequest>,
+) -> Response {
+    let mut next = state.next_fault.lock().expect("next fault lock");
+    if next.armed.is_some() || next.status.is_some() {
+        return conflict(
+            "ambiguous",
+            "a bounded next-action fenced catalog fault is already armed",
+        );
+    }
+    let arm_id = format!(
+        "next-{}",
+        state.next_fault_sequence.fetch_add(1, Ordering::Relaxed)
+    );
+    next.status = Some((arm_id.clone(), false));
+    next.armed = Some(ArmedNextFault {
+        arm_id: arm_id.clone(),
+        action: request.action,
+        fault: request.fault,
+    });
+    json_response(StatusCode::OK, json!({"arm-id": arm_id}))
+}
+
+async fn clear_next_fault(
+    State(state): State<AppState>,
+    AxumPath(arm_id): AxumPath<String>,
+) -> Response {
+    let mut next = state.next_fault.lock().expect("next fault lock");
+    let entered = match next.status.as_ref() {
+        Some((known_arm_id, entered)) if known_arm_id == &arm_id => *entered,
+        None => {
+            return wire_error(
+                StatusCode::NOT_FOUND,
+                "identity-conflict",
+                "next-action fenced catalog fault token is unknown",
+            );
+        }
+        Some(_) => {
+            return wire_error(
+                StatusCode::NOT_FOUND,
+                "identity-conflict",
+                "next-action fenced catalog fault token does not match the active token",
+            );
+        }
+    };
+    next.status = None;
+    if next.armed.as_ref().is_some_and(|armed| armed.arm_id == arm_id) {
+        next.armed = None;
+    }
+    json_response(StatusCode::OK, json!({"entered": entered}))
 }
 
 async fn drop_recreate_target(
@@ -577,6 +762,11 @@ async fn apply_delay_fault(state: &AppState, operation_id: &str) {
 }
 
 async fn handle_advance(state: &AppState, request: AdvanceRequest) -> Response {
+    bind_next_fault(
+        state,
+        &request.action.operation.operation_id,
+        FixtureAction::AdvanceFence,
+    );
     apply_delay_fault(state, &request.action.operation.operation_id).await;
     let _guard = operation_guard(state, &request).await;
     if take_fault(
@@ -663,6 +853,11 @@ async fn handle_advance(state: &AppState, request: AdvanceRequest) -> Response {
 }
 
 async fn handle_stage(state: &AppState, request: StageRequest) -> Response {
+    bind_next_fault(
+        state,
+        &request.action.operation.operation_id,
+        FixtureAction::Stage,
+    );
     apply_delay_fault(state, &request.action.operation.operation_id).await;
     let _guard = operation_guard(state, &request).await;
     if take_fault(
@@ -1017,6 +1212,11 @@ async fn handle_inspect(state: &AppState, request: InspectRequest) -> Response {
 }
 
 async fn handle_publish(state: &AppState, request: PublishRequest) -> Response {
+    bind_next_fault(
+        state,
+        &request.action.operation.operation_id,
+        FixtureAction::Publish,
+    );
     apply_delay_fault(state, &request.action.operation.operation_id).await;
     let _guard = operation_guard(state, &request).await;
     if take_fault(
@@ -1250,6 +1450,11 @@ async fn handle_publish(state: &AppState, request: PublishRequest) -> Response {
 }
 
 async fn handle_abort(state: &AppState, request: AbortRequest) -> Response {
+    bind_next_fault(
+        state,
+        &request.action.operation.operation_id,
+        FixtureAction::Abort,
+    );
     apply_delay_fault(state, &request.action.operation.operation_id).await;
     let _guard = operation_guard(state, &request).await;
     if take_fault(
@@ -2199,6 +2404,34 @@ fn take_fault(state: &AppState, operation_id: &str, expected: Fault) -> bool {
     true
 }
 
+fn bind_next_fault(state: &AppState, operation_id: &str, action: FixtureAction) {
+    let armed = {
+        let mut next = state.next_fault.lock().expect("next fault lock");
+        match next.armed.as_ref() {
+            Some(armed) if armed.action == action => {
+                let armed = next.armed.take();
+                if let (Some(armed), Some((arm_id, entered))) = (armed.as_ref(), next.status.as_mut())
+                    && arm_id == &armed.arm_id
+                {
+                    *entered = true;
+                }
+                armed
+            }
+            _ => None,
+        }
+    };
+    let Some(armed) = armed else {
+        return;
+    };
+    state
+        .faults
+        .lock()
+        .expect("fault lock")
+        .entry(operation_id.to_string())
+        .or_default()
+        .push(armed.fault);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2469,6 +2702,56 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         response.json().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn next_action_fault_is_bounded_and_consumed_without_operation_id_guessing() {
+        let temp = TempDir::new().unwrap();
+        let downstream = downstream().await;
+        let fixture = fixture(&downstream.uri, &temp.path().join("fixture.sqlite")).await;
+        let client = reqwest::Client::new();
+
+        let receipt: Value = client
+            .post(format!("{}/_fixture/faults/next", fixture.uri))
+            .json(&json!({"action":"advance-fence","fault":"before-accept"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arm_id = receipt["arm-id"].as_str().unwrap();
+        assert_eq!(advance(&client, &fixture.uri, 1).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let cleared: Value = client
+            .delete(format!("{}/_fixture/faults/next/{arm_id}", fixture.uri))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cleared["entered"], true);
+
+        let receipt: Value = client
+            .post(format!("{}/_fixture/faults/next", fixture.uri))
+            .json(&json!({"action":"stage","fault":"before-accept"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arm_id = receipt["arm-id"].as_str().unwrap();
+        assert_eq!(advance(&client, &fixture.uri, 1).await.status(), StatusCode::OK);
+        let cleared: Value = client
+            .delete(format!("{}/_fixture/faults/next/{arm_id}", fixture.uri))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cleared["entered"], false);
     }
 
     #[tokio::test]

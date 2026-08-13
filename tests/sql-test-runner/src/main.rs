@@ -449,6 +449,7 @@ struct SuiteRunContext {
     marker_re: Regex,
     fail_fast: bool,
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    fenced_catalog_control: Option<fenced_catalog::FixtureControl>,
 }
 
 struct CaseOutcome {
@@ -1642,6 +1643,38 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
             None => None,
         };
+        let fenced_catalog_fault_guard = match step.meta.fenced_catalog_fault {
+            Some(directive) => match ctx.fenced_catalog_control.as_ref() {
+                Some(control) => match control.arm_next(
+                    directive.action.as_str(),
+                    directive.fault.as_str(),
+                ) {
+                    Ok(guard) => {
+                        let _ = writeln!(
+                            log,
+                            "    @fenced_catalog_fault armed action={} fault={}",
+                            directive.action.as_str(),
+                            directive.fault.as_str()
+                        );
+                        Some(guard)
+                    }
+                    Err(error) => {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ arm fenced catalog fault: {error:#}");
+                        break;
+                    }
+                },
+                None => {
+                    case_failed = true;
+                    let _ = writeln!(
+                        log,
+                        "    ❌ @fenced_catalog_fault requires the runner-owned fenced catalog fixture"
+                    );
+                    break;
+                }
+            },
+            None => None,
+        };
 
         let be_log_snapshot = match ctx.server_handle.lock() {
             Ok(server_handle) => be_log_directive::snapshot_with_deadline(
@@ -2482,6 +2515,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
 
+        if let Some(guard) = fenced_catalog_fault_guard {
+            match guard.finish() {
+                Ok(()) => {
+                    let _ = writeln!(log, "    @fenced_catalog_fault consumed and cleared");
+                }
+                Err(error) => {
+                    case_failed = true;
+                    let _ = writeln!(log, "    ❌ fenced catalog fault cleanup: {error:#}");
+                }
+            }
+        }
+
         if let Some(baseline) = resource_baseline {
             let convergence_deadline = Instant::now() + Duration::from_secs(30);
             let resource_result = ctx
@@ -2970,6 +3015,62 @@ fn validate_selected_suite_cluster(
     Ok(())
 }
 
+fn validate_ctas_takeover_preflight(
+    runner_config: &RunnerConfig,
+    suite_names: &[String],
+    mode: ClusterMode,
+    cluster_size: usize,
+    jobs: usize,
+) -> Result<()> {
+    if !suite_names.iter().any(|suite| suite == "ctas-takeover") {
+        return Ok(());
+    }
+    let fixture_enabled = runner_config
+        .values
+        .get("fenced_catalog.enabled")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if !fixture_enabled {
+        bail!("ctas-takeover requires fenced_catalog.enabled=true");
+    }
+    if mode != ClusterMode::CrossProcess || cluster_size != 3 {
+        bail!("ctas-takeover requires --cluster-mode cross-process --cluster-size 3");
+    }
+    if jobs != 1 {
+        bail!("ctas-takeover requires -j 1 because its fixture owns one bounded fault token");
+    }
+    Ok(())
+}
+
+fn validate_fenced_catalog_directives(
+    suite_name: &str,
+    cases: &[SqlCase],
+    fixture_available: bool,
+) -> Result<()> {
+    for case in cases {
+        for step in &case.steps {
+            if step.meta.fenced_catalog_fault.is_none() {
+                continue;
+            }
+            if suite_name != "ctas-takeover" {
+                bail!(
+                    "@fenced_catalog_fault is acceptance-only and is only valid in ctas-takeover (found in {suite_name}/{})",
+                    case.case_id
+                );
+            }
+            if !case.sequential {
+                bail!(
+                    "@fenced_catalog_fault requires file-level @sequential=true (ctas-takeover/{})",
+                    case.case_id
+                );
+            }
+            if !fixture_available {
+                bail!("@fenced_catalog_fault requires the runner-owned fenced catalog fixture");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn selected_cases_require_query_lifecycle_faults(
     cli: &Cli,
     suite_names: &[String],
@@ -3134,7 +3235,6 @@ fn run() -> Result<i32> {
             return Ok(1);
         }
     };
-    let _fenced_catalog_fixture = start_fenced_catalog_fixture(&mut runner_config, &suite_names)?;
     let selected_cluster_mode = cli.cluster_mode;
     let selected_cluster_size = cli.cluster_size.unwrap_or(1);
     if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
@@ -3147,6 +3247,21 @@ fn run() -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
+    if let Err(error) = validate_ctas_takeover_preflight(
+        &runner_config,
+        &suite_names,
+        selected_cluster_mode,
+        selected_cluster_size,
+        cli.jobs,
+    ) {
+        println!("❌ ERROR: {error}");
+        return Ok(1);
+    }
+    let fenced_catalog_fixture = start_fenced_catalog_fixture(&mut runner_config, &suite_names)?;
+    let fenced_catalog_control = fenced_catalog_fixture
+        .as_ref()
+        .map(fenced_catalog::FixtureHandle::control)
+        .transpose()?;
 
     // Validate: per-suite path overrides conflict with multi-suite
     let multi_suite = suite_names.len() > 1;
@@ -3496,6 +3611,15 @@ fn run() -> Result<i32> {
                 return Ok(1);
             }
 
+            if let Err(error) = validate_fenced_catalog_directives(
+                &suite.name,
+                &cases,
+                fenced_catalog_control.is_some(),
+            ) {
+                println!("❌ ERROR: suite {}: {error}", suite.name);
+                return Ok(1);
+            }
+
             if matches!(cli.mode, Mode::Verify | Mode::Record) && result_dir.is_none() {
                 println!(
                     "❌ ERROR: result_dir is required for verify/record mode (suite {})",
@@ -3649,6 +3773,7 @@ fn run() -> Result<i32> {
                 marker_re: marker_re.clone(),
                 fail_fast: cli.fail_fast,
                 server_handle: Arc::clone(&server_handle),
+                fenced_catalog_control: fenced_catalog_control.clone(),
             };
 
             prepared_suites.push(PreparedSuite {
@@ -3860,14 +3985,15 @@ mod tests {
     use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
-    use crate::types::{QueryExecution, QueryMeta, ResultSet, SqlCase, SqlStep};
+    use crate::types::{QueryExecution, QueryMeta, ResultSet, RunnerConfig, SqlCase, SqlStep};
     use crate::{
         AlterJobPollState, Cli, annotate_failure_with_engine_error_code,
         bounded_fault_query_timeout, classify_alter_job_poll, evaluate_expected_error_branch,
         execute_target_session_sql_with, expected_engine_error_code_diff_result,
         expected_engine_error_code_result, finish_expected_error_step,
         sql_text_has_query_lifecycle_fault_directive, statement_starts_dml_operation,
-        validate_dml_cluster_jobs, validate_fault_injection_jobs, validate_selected_suite_cluster,
+        validate_ctas_takeover_preflight, validate_dml_cluster_jobs, validate_fault_injection_jobs,
+        validate_selected_suite_cluster,
     };
     use clap::Parser;
     use regex::Regex;
@@ -4085,6 +4211,41 @@ mod tests {
         }
         validate_selected_suite_cluster(&["join".to_string()], ClusterMode::AllInOne, 1)
             .expect("other suites retain their own topology");
+    }
+
+    #[test]
+    fn ctas_takeover_requires_fenced_native_serial_selection() {
+        let suites = vec!["ctas-takeover".to_string()];
+        let mut config = RunnerConfig::default();
+        let error = validate_ctas_takeover_preflight(
+            &config,
+            &suites,
+            ClusterMode::CrossProcess,
+            3,
+            1,
+        )
+        .expect_err("fixture must be explicitly enabled");
+        assert!(
+            error
+                .to_string()
+                .contains("ctas-takeover requires fenced_catalog.enabled=true")
+        );
+
+        config
+            .values
+            .insert("fenced_catalog.enabled".to_string(), "true".to_string());
+        validate_ctas_takeover_preflight(&config, &suites, ClusterMode::CrossProcess, 3, 1)
+            .expect("canonical fenced native selection");
+        for (mode, size, jobs) in [
+            (ClusterMode::AllInOne, 1, 1),
+            (ClusterMode::CrossProcess, 2, 1),
+            (ClusterMode::CrossProcess, 3, 2),
+        ] {
+            assert!(
+                validate_ctas_takeover_preflight(&config, &suites, mode, size, jobs).is_err(),
+                "noncanonical ctas-takeover selection must fail"
+            );
+        }
     }
 
     #[test]

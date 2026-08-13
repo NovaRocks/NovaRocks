@@ -1,0 +1,3 @@
+# The fenced proxy is a CP-3D/native-cluster acceptance fixture. It must never
+# run as part of the ordinary all-suite SQL regression selection.
+explicit_only = true
