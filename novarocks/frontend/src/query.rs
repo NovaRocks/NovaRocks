@@ -37,6 +37,7 @@ use novarocks::engine::{
     PreparedQueryOperation, SessionCatalogResolver, StandaloneCommandExecutor,
     StandaloneQueryCompiler, StatementResult, backend_command::BackendCommandExecutor,
     catalog_command::CatalogCommandExecutor, statistics_command::StatisticsCommandExecutor,
+    view_command::ViewCommandExecutor,
 };
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
@@ -87,6 +88,7 @@ struct TypedThenLegacyCommand {
     catalog: CatalogCommandExecutor,
     statistics: StatisticsCommandExecutor,
     backend: BackendCommandExecutor,
+    view: ViewCommandExecutor,
     legacy: StandaloneCommandExecutor,
 }
 
@@ -95,12 +97,14 @@ impl TypedThenLegacyCommand {
         catalog: CatalogCommandExecutor,
         statistics: StatisticsCommandExecutor,
         backend: BackendCommandExecutor,
+        view: ViewCommandExecutor,
         legacy: StandaloneCommandExecutor,
     ) -> Self {
         Self {
             catalog,
             statistics,
             backend,
+            view,
             legacy,
         }
     }
@@ -132,7 +136,15 @@ impl CoreCommandRoute for TypedThenLegacyCommand {
                 Some(result) => Ok(result),
                 None => match self.backend.try_execute(sql, context.execution().role())? {
                     Some(result) => Ok(result),
-                    None => self.legacy.execute(sql, context, Some(query_options)),
+                    None => match self.view.try_execute(
+                        sql,
+                        context.session().current_catalog(),
+                        context.session().current_database(),
+                        &connector_context,
+                    )? {
+                        Some(result) => Ok(result),
+                        None => self.legacy.execute(sql, context, Some(query_options)),
+                    },
                 },
             },
         }
@@ -289,6 +301,7 @@ impl FrontendQueryService {
         let catalog_command_executor = engine.catalog_command_executor();
         let statistics_command_executor = engine.statistics_command_executor();
         let backend_command_executor = engine.backend_command_executor();
+        let view_command_executor = engine.view_command_executor();
         let command_executor = engine.command_executor();
         Self::new_with_recovery_bound(
             session_catalog_resolver,
@@ -297,6 +310,7 @@ impl FrontendQueryService {
             catalog_command_executor,
             statistics_command_executor,
             backend_command_executor,
+            view_command_executor,
             query_control,
             query_execution,
             role,
@@ -320,6 +334,7 @@ impl FrontendQueryService {
         catalog_command_executor: CatalogCommandExecutor,
         statistics_command_executor: StatisticsCommandExecutor,
         backend_command_executor: BackendCommandExecutor,
+        view_command_executor: ViewCommandExecutor,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
         role: ClusterRole,
@@ -340,6 +355,7 @@ impl FrontendQueryService {
                 catalog_command_executor,
                 statistics_command_executor,
                 backend_command_executor,
+                view_command_executor,
                 command_executor,
             )),
             query_control,

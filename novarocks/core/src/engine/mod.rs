@@ -82,6 +82,7 @@ pub mod system_catalog;
 pub mod table_maintenance;
 pub mod truncate_engine;
 pub mod view;
+pub mod view_command;
 pub(crate) mod virtual_table;
 mod write_transaction;
 use self::statement::{
@@ -1849,6 +1850,16 @@ impl StandaloneNovaRocks {
     pub fn backend_command_executor(&self) -> backend_command::BackendCommandExecutor {
         backend_command::BackendCommandExecutor::new(domain::BackendManagementKernel::new(
             self.inner.backend_topology.clone(),
+        ))
+    }
+
+    /// Transitional factory for the closed external-view capability.
+    pub fn view_command_executor(&self) -> view_command::ViewCommandExecutor {
+        view_command::ViewCommandExecutor::new(domain::ViewExecutionKernel::new(
+            Arc::clone(&self.inner.catalog_service),
+            self.inner.catalog_application.clone(),
+            Arc::clone(&self.inner.connector_control),
+            Arc::clone(&self.inner.view_service),
         ))
     }
 
