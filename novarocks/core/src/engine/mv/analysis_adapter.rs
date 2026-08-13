@@ -24,14 +24,18 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog_application::CatalogApplicationPort;
 use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::MvListRow;
+use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::mv::analysis::{MvAnalysis, finish_mv_analysis, prepare_mv_select_for_catalog_provider};
 use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::persistence::refresh::MvRefreshState;
+use crate::mv::repository::MvRepository;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::ast::ShowMaterializedViewsStmt;
+use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
@@ -131,8 +135,26 @@ pub(crate) fn list_mv_rows(
     stmt: &ShowMaterializedViewsStmt,
     storage_filter: Option<MvStorageEngine>,
 ) -> Result<Vec<MvListRow>, String> {
-    let definitions = state
-        .mv_repository
+    list_mv_rows_with_ports(
+        state.mv_repository.as_ref(),
+        current_catalog,
+        stmt,
+        storage_filter,
+    )
+}
+
+/// List materialized views from the explicit durable metadata boundary.
+///
+/// The caller supplies only the repository needed to derive stored refresh
+/// state and dependency display text; this projection has no application-state
+/// or connector ownership.
+pub(crate) fn list_mv_rows_with_ports(
+    repository: &dyn MvRepository,
+    current_catalog: Option<&str>,
+    stmt: &ShowMaterializedViewsStmt,
+    storage_filter: Option<MvStorageEngine>,
+) -> Result<Vec<MvListRow>, String> {
+    let definitions = repository
         .list_definitions()
         .map_err(|e| format!("load materialized view definitions failed: {e}"))?;
     let now_ms = now_ms();
@@ -145,7 +167,8 @@ pub(crate) fn list_mv_rows(
             continue;
         }
         let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
-        let (refresh_state, retry_after_time) = refresh_status_for_mv(state, mv, now_ms)?;
+        let (refresh_state, retry_after_time) =
+            refresh_status_for_mv_with_repository(repository, mv, now_ms)?;
         if engine != MvStorageEngine::Iceberg {
             continue;
         }
@@ -177,7 +200,7 @@ pub(crate) fn list_mv_rows(
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.select_sql.clone(),
-            dependencies: dependency_display_for_mv(state, mv.mv_id)?,
+            dependencies: dependency_display_for_mv_with_repository(repository, mv.mv_id)?,
             refresh_paused: mv.refresh_paused.to_string(),
             next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
             last_scheduler_error: mv.last_scheduler_error.clone(),
@@ -189,8 +212,8 @@ pub(crate) fn list_mv_rows(
     Ok(rows)
 }
 
-fn refresh_status_for_mv(
-    state: &Arc<StandaloneState>,
+fn refresh_status_for_mv_with_repository(
+    repository: &dyn MvRepository,
     mv: &StoredMvDefinition,
     now_ms: i64,
 ) -> Result<(String, Option<String>), String> {
@@ -204,8 +227,7 @@ fn refresh_status_for_mv(
         return Ok(("PAUSED".to_string(), retry_after_time));
     }
     if let Some(refresh_id) = mv.active_refresh_id {
-        let refresh = state
-            .mv_repository
+        let refresh = repository
             .load_refresh(refresh_id)
             .map_err(|e| format!("load active MV refresh failed: {e}"))?;
         if refresh
@@ -247,9 +269,11 @@ fn refresh_status_for_mv(
 
 /// Render the dependency-column text for a single MV row through the typed
 /// repository boundary.
-fn dependency_display_for_mv(state: &Arc<StandaloneState>, mv_id: i64) -> Result<String, String> {
-    let dependencies = state
-        .mv_repository
+fn dependency_display_for_mv_with_repository(
+    repository: &dyn MvRepository,
+    mv_id: i64,
+) -> Result<String, String> {
+    let dependencies = repository
         .list_dependencies_by_downstream(mv_id)
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
     Ok(dependencies
@@ -266,16 +290,41 @@ pub(crate) fn analyze_mv_select_with_connector_context(
     query: &sqlparser::ast::Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MvAnalysis, String> {
-    let prepared =
-        prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
     let catalog_service = crate::engine::catalog_service_snapshot(state);
-    let provider = crate::engine::build_catalog_service_provider(
+    analyze_mv_select_with_ports(
         current_catalog,
         &catalog_service,
+        state.catalog_application.as_deref(),
         state.connector_control.as_ref(),
+        current_database,
+        query,
+        connector_context,
+    )
+}
+
+/// Analyze an MV SELECT from explicit query-local catalog and connector ports.
+///
+/// `catalog_service` is expected to be a request-local snapshot captured by
+/// the caller. The optional catalog application remains part of analysis so
+/// external-table materialization is admitted only while the catalog is ready.
+pub(crate) fn analyze_mv_select_with_ports(
+    current_catalog: Option<&str>,
+    catalog_service: &QueryCatalogService,
+    catalog_application: Option<&dyn CatalogApplicationPort>,
+    connector_control: &dyn ConnectorControlResolver,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvAnalysis, String> {
+    let prepared =
+        prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
+    let provider = crate::engine::build_catalog_service_provider(
+        current_catalog,
+        catalog_service,
+        connector_control,
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
-        state.catalog_application.as_deref(),
+        catalog_application,
     );
     let (resolved, _, _) =
         crate::sql::analyzer::analyze(prepared.query_for_analysis(), &provider, current_database)?;

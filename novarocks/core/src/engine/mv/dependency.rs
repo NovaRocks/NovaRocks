@@ -217,7 +217,6 @@ pub(crate) fn validate_no_create_cycle(
     new_dependencies: &[CreateMvDependencyRequest],
 ) -> Result<(), String> {
     validate_no_create_cycle_with_repository(
-        state,
         state.mv_repository.as_ref(),
         new_target,
         new_dependencies,
@@ -225,7 +224,6 @@ pub(crate) fn validate_no_create_cycle(
 }
 
 pub(crate) fn validate_no_create_cycle_with_repository(
-    _state: &Arc<StandaloneState>,
     repository: &dyn MvRepository,
     new_target: &MvDependencyObjectRef,
     new_dependencies: &[CreateMvDependencyRequest],
@@ -235,7 +233,7 @@ pub(crate) fn validate_no_create_cycle_with_repository(
         .map_err(|e| format!("load MV definitions for dependency cycle check failed: {e}"))?;
     let mut edges = Vec::new();
     for definition in definitions {
-        let target = stored_definition_dependency_ref_from_state(_state, &definition)?;
+        let target = stored_definition_dependency_ref_for_iceberg(&definition)?;
         let dependencies = repository
             .list_dependencies_by_downstream(definition.mv_id)
             .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?
@@ -255,6 +253,12 @@ pub(crate) fn validate_no_create_cycle_with_repository(
 
 fn stored_definition_dependency_ref_from_state(
     _state: &Arc<StandaloneState>,
+    definition: &StoredMvDefinition,
+) -> Result<MvDependencyObjectRef, String> {
+    stored_definition_dependency_ref_for_iceberg(definition)
+}
+
+fn stored_definition_dependency_ref_for_iceberg(
     definition: &StoredMvDefinition,
 ) -> Result<MvDependencyObjectRef, String> {
     if definition.storage_engine.eq_ignore_ascii_case("iceberg") {

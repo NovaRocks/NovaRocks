@@ -2192,7 +2192,6 @@ fn prepare_iceberg_mv_create(
         &target.table,
     );
     crate::engine::mv::dependency::validate_no_create_cycle_with_repository(
-        state,
         repository,
         &dependency_target,
         &resolved_dependencies.dependencies,
