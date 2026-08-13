@@ -15,9 +15,9 @@
 
 #![cfg(feature = "mv-first-refresh-staging-test-support")]
 
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -29,105 +29,60 @@ use novarocks_frontend::{FrontendServerConfig, run_frontend_server_until_shutdow
 use novarocks_server::composition::{
     IcebergMvStorageObservationAdapter, compose_frontend_control_factories,
 };
+use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use tempfile::{NamedTempFile, TempDir};
 
-struct ReservedPort {
-    _listener: TcpListener,
-    port: u16,
-}
-
-impl ReservedPort {
-    fn new() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve TCP port");
-        let port = listener.local_addr().expect("reserved port address").port();
-        Self {
-            _listener: listener,
-            port,
-        }
-    }
-
-    fn release(self) -> u16 {
-        self.port
-    }
-}
-
-struct BackendProcess {
-    child: Child,
-    stderr_log: PathBuf,
-}
-
-impl BackendProcess {
-    fn spawn(
-        config: &Path,
-        lifecycle_fault_backend_index: usize,
-        fragment_failure_trigger: &Path,
-        stderr_log: PathBuf,
-    ) -> Self {
-        let stderr = std::fs::File::create(&stderr_log).expect("create backend stderr log");
-        let child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
-            .arg("standalone")
-            .arg("--config")
-            .arg(config)
-            .env(
-                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
-                lifecycle_fault_backend_index.to_string(),
-            )
-            .env(
-                "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
-                fragment_failure_trigger,
-            )
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("spawn backend process");
-        Self { child, stderr_log }
-    }
-
-    fn contains_stderr_marker(&self, marker: &str) -> bool {
-        std::fs::read_to_string(&self.stderr_log)
-            .map(|contents| contents.contains(marker))
-            .unwrap_or(false)
-    }
-
-    fn kill(&mut self) {
-        if self
-            .child
-            .try_wait()
-            .expect("inspect backend process")
-            .is_none()
-        {
-            self.child.kill().expect("kill backend process");
-            self.child.wait().expect("reap killed backend process");
-        }
-    }
-}
-
-impl Drop for BackendProcess {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
+fn spawn_backend(
+    config: &Path,
+    lifecycle_fault_backend_index: usize,
+    fragment_failure_trigger: &Path,
+    log: PathBuf,
+) -> ManagedProcess {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
+    command
+        .arg("standalone")
+        .arg("--config")
+        .arg(config)
+        .env(
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+            lifecycle_fault_backend_index.to_string(),
+        )
+        .env(
+            "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
+            fragment_failure_trigger,
+        );
+    ManagedProcess::spawn(
+        format!("MV first-refresh backend {lifecycle_fault_backend_index}"),
+        command,
+        ReadyMarker::StdoutContains("NOVAROCKS_READY role=be".to_string()),
+        Duration::from_secs(30),
+        log,
+    )
+    .expect("spawn backend process and wait for backend readiness marker")
 }
 
 struct ThreeBackendFixture {
     _root: TempDir,
     _configs: Vec<NamedTempFile>,
-    processes: Vec<BackendProcess>,
+    processes: Vec<ManagedProcess>,
     endpoints: Vec<SocketAddr>,
     fragment_failure_trigger: PathBuf,
 }
 
 impl ThreeBackendFixture {
-    fn start(query_lifecycle_fault_dir: &Path, fragment_failure_trigger: &Path) -> Self {
+    fn start(_query_lifecycle_fault_dir: &Path, fragment_failure_trigger: &Path) -> Self {
         let root = tempfile::tempdir().expect("create backend fixture root");
         let mut reservations = (0..3)
-            .map(|_| (ReservedPort::new(), ReservedPort::new()))
+            .map(|_| {
+                (
+                    ReservedTcpPort::new().expect("reserve backend HTTP port"),
+                    ReservedTcpPort::new().expect("reserve backend gRPC port"),
+                )
+            })
             .collect::<Vec<_>>();
         let endpoints = reservations
             .iter()
-            .map(|(_, grpc)| SocketAddr::from(([127, 0, 0, 1], grpc.port)))
+            .map(|(_, grpc)| SocketAddr::from(([127, 0, 0, 1], grpc.port())))
             .collect::<Vec<_>>();
         let mut configs = Vec::new();
         for (index, (http, grpc)) in reservations.iter().enumerate() {
@@ -151,8 +106,8 @@ grpc_port = {}
 role = "be"
 "#,
                     root.path().join(format!("be-{index}")).display(),
-                    http.port,
-                    grpc.port,
+                    http.port(),
+                    grpc.port(),
                 ),
             )
             .expect("write backend config");
@@ -163,15 +118,14 @@ role = "be"
             reservations.drain(..).zip(configs.iter()).enumerate()
         {
             let _ = http.release();
-            let grpc_port = grpc.release();
-            let stderr_log = root.path().join(format!("be-{index}.stderr.log"));
-            processes.push(BackendProcess::spawn(
+            let _ = grpc.release();
+            let log = root.path().join(format!("be-{index}.log"));
+            processes.push(spawn_backend(
                 config.path(),
                 index,
                 fragment_failure_trigger,
-                stderr_log,
+                log,
             ));
-            wait_for_tcp(grpc_port, "backend gRPC endpoint");
         }
         Self {
             _root: root,
@@ -192,9 +146,10 @@ role = "be"
                 .iter()
                 .enumerate()
                 .find_map(|(index, process)| {
-                    (process.contains_stderr_marker(&marker)
-                        && process.contains_stderr_marker(&token_marker))
-                    .then_some(index)
+                    let log = process
+                        .log_contents()
+                        .expect("read backend combined process log");
+                    (log.contains(&marker) && log.contains(&token_marker)).then_some(index)
                 })
             {
                 return index;
@@ -211,7 +166,8 @@ role = "be"
         self.processes
             .get_mut(backend_index)
             .expect("fixture backend index")
-            .kill();
+            .kill_now()
+            .expect("kill backend process");
     }
 
     fn restart_backend(&mut self, backend_index: usize) {
@@ -221,21 +177,11 @@ role = "be"
             .expect("fixture backend config")
             .path()
             .to_path_buf();
-        let endpoint = *self
-            .endpoints
-            .get(backend_index)
-            .expect("fixture backend endpoint");
-        let stderr_log = self
+        let log = self
             ._root
             .path()
-            .join(format!("be-{backend_index}.restart.stderr.log"));
-        let restarted = BackendProcess::spawn(
-            &config,
-            backend_index,
-            &self.fragment_failure_trigger,
-            stderr_log,
-        );
-        wait_for_tcp(endpoint.port(), "restarted backend gRPC endpoint");
+            .join(format!("be-{backend_index}.restart.log"));
+        let restarted = spawn_backend(&config, backend_index, &self.fragment_failure_trigger, log);
         self.processes[backend_index] = restarted;
     }
 }
@@ -285,20 +231,6 @@ fn arm_fragment_failure(trigger: &Path, token: &str) {
         .expect("release native fragment failure after Start");
 }
 
-fn wait_for_tcp(port: u16, label: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {label} on {port}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 fn connect_mysql(port: u16) -> MysqlConn {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -339,12 +271,12 @@ fn projection_first_refresh_stages_on_three_backend_processes() {
     }
     let mut backends =
         ThreeBackendFixture::start(query_lifecycle_fault_dir.path(), &fragment_failure_trigger);
-    let fe_mysql = ReservedPort::new();
-    let fe_http = ReservedPort::new();
-    let fe_grpc = ReservedPort::new();
-    let fe_mysql_port = fe_mysql.port;
-    let fe_http_port = fe_http.port;
-    let fe_grpc_port = fe_grpc.port;
+    let fe_mysql = ReservedTcpPort::new().expect("reserve frontend MySQL port");
+    let fe_http = ReservedTcpPort::new().expect("reserve frontend HTTP port");
+    let fe_grpc = ReservedTcpPort::new().expect("reserve frontend gRPC port");
+    let fe_mysql_port = fe_mysql.port();
+    let fe_http_port = fe_http.port();
+    let fe_grpc_port = fe_grpc.port();
     let state_root = tempfile::tempdir().expect("create frontend state root");
     let state_path = state_root.path().join("state.sqlite");
     let legacy_metadata_path = state_root.path().join("metadata.sqlite");

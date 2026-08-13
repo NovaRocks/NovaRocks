@@ -15,72 +15,57 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
+use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use tempfile::TempDir;
-
-fn alloc_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
-struct ServerGuard {
-    child: Child,
-    _lock: MutexGuard<'static, ()>,
-}
 
 static STANDALONE_SERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-impl ServerGuard {
-    fn spawn(args: &[String]) -> Self {
-        let lock = STANDALONE_SERVER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn standalone");
-        Self { child, _lock: lock }
-    }
-
-    fn connect_root(&mut self, port: u16) -> MysqlConn {
-        wait_for_mysql(port, "root", None, &mut self.child)
-    }
+fn lock_standalone_server() -> MutexGuard<'static, ()> {
+    STANDALONE_SERVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+fn spawn_standalone(
+    reservation: ReservedTcpPort,
+    args: &[String],
+    log_path: PathBuf,
+) -> ManagedProcess {
+    // The arguments have already been frozen with reservation.port(). Release
+    // immediately before spawning so no test code runs in the handoff window.
+    let _ = reservation.release();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
+    command.args(args);
+    ManagedProcess::spawn(
+        "standalone-novarocks".to_string(),
+        command,
+        ReadyMarker::StdoutContains("NOVAROCKS_READY mysql_port=".to_string()),
+        Duration::from_secs(10),
+        log_path,
+    )
+    .unwrap_or_else(|error| panic!("spawn standalone: {error:#}"))
 }
 
-fn wait_for_mysql(port: u16, user: &str, password: Option<&str>, child: &mut Child) -> MysqlConn {
+fn connect_root(port: u16, server: &mut ManagedProcess) -> MysqlConn {
+    wait_for_mysql(port, "root", None, server)
+}
+
+fn wait_for_mysql(
+    port: u16,
+    user: &str,
+    password: Option<&str>,
+    server: &mut ManagedProcess,
+) -> MysqlConn {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(status) = child.try_wait().expect("poll child status") {
-            let mut output = String::new();
-            if let Some(mut stdout) = child.stdout.take() {
-                let _ = stdout.read_to_string(&mut output);
-            }
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_string(&mut output);
-            }
-            panic!("standalone exited early with status {status}: {output}");
-        }
-
         let builder = OptsBuilder::new()
             .ip_or_hostname(Some("127.0.0.1".to_string()))
             .tcp_port(port)
@@ -91,19 +76,23 @@ fn wait_for_mysql(port: u16, user: &str, password: Option<&str>, child: &mut Chi
             Ok(conn) => return conn,
             Err(err) => {
                 let err_text = err.to_string();
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let mut output = String::new();
-                    if let Some(mut stdout) = child.stdout.take() {
-                        let _ = stdout.read_to_string(&mut output);
-                    }
-                    if let Some(mut stderr) = child.stderr.take() {
-                        let _ = stderr.read_to_string(&mut output);
-                    }
+                if !server.is_running().expect("inspect standalone process") {
+                    let log = server
+                        .log_contents()
+                        .unwrap_or_else(|error| format!("<unavailable durable log: {error:#}>"));
                     panic!(
-                        "mysql connection to standalone failed: {}\nchild output:\n{output}",
-                        err_text
+                        "standalone exited after readiness before MySQL behavior probe succeeded: \
+                         {err_text}\ndurable process log:\n{log}"
+                    );
+                }
+                if Instant::now() >= deadline {
+                    let log = server
+                        .log_contents()
+                        .unwrap_or_else(|error| format!("<unavailable durable log: {error:#}>"));
+                    let cleanup = server.kill_now();
+                    panic!(
+                        "mysql connection to standalone failed after readiness: {err_text}\n\
+                         durable process log:\n{log}\ncleanup result: {cleanup:?}"
                     );
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -186,9 +175,12 @@ fn run_curl_stream_load(
     String::from_utf8(output.stdout).expect("decode curl stdout")
 }
 
-fn write_standalone_state_store_config(mysql_port: u16) -> (TempDir, PathBuf) {
-    let config_dir = TempDir::new().expect("create standalone server config dir");
-    let config_path = config_dir.path().join("novarocks.toml");
+fn write_standalone_state_store_config(
+    config_dir: &TempDir,
+    config_name: &str,
+    mysql_port: u16,
+) -> PathBuf {
+    let config_path = config_dir.path().join(config_name);
     let state_store_path = config_dir.path().join("frontend-state.sqlite");
     let endpoint =
         std::env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
@@ -221,17 +213,27 @@ enable_path_style_access = true
         ),
     )
     .expect("write standalone server config");
-    (config_dir, config_path)
+    config_path
 }
 
 fn standalone_server_args_with_state_store(mysql_port: u16) -> (TempDir, Vec<String>) {
-    let (config_dir, config_path) = write_standalone_state_store_config(mysql_port);
+    let config_dir = TempDir::new().expect("create standalone server config dir");
+    let config_path =
+        write_standalone_state_store_config(&config_dir, "novarocks.toml", mysql_port);
     let args = vec![
         "standalone".to_string(),
         "--config".to_string(),
         config_path.display().to_string(),
     ];
     (config_dir, args)
+}
+
+fn standalone_server_args(config_path: PathBuf) -> Vec<String> {
+    vec![
+        "standalone".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ]
 }
 
 fn s3_test_value(primary: &str, fallback_env: &str, default: &str) -> String {
@@ -277,14 +279,17 @@ fn create_s3_iceberg_catalog_sql(catalog_name: &str, warehouse_uri: &str) -> Str
 
 #[test]
 fn standalone_mysql_server_accepts_queries_and_session_noops_without_bootstrap_tables() {
-    let port = alloc_port();
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let log_dir = TempDir::new().expect("create standalone server log dir");
     let args = vec![
         "standalone".to_string(),
         "--port".to_string(),
         port.to_string(),
     ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, log_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.ping().expect("ping standalone");
     conn.query_drop("USE default").expect("USE default");
@@ -301,14 +306,17 @@ fn standalone_mysql_server_accepts_queries_and_session_noops_without_bootstrap_t
 
 #[test]
 fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
-    let port = alloc_port();
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let log_dir = TempDir::new().expect("create standalone server log dir");
     let args = vec![
         "standalone".to_string(),
         "--port".to_string(),
         port.to_string(),
     ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, log_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     let err = conn
         .query_drop("grant select on tbl to root")
@@ -338,10 +346,12 @@ fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
 #[test]
 fn standalone_mysql_server_supports_minimal_iceberg_flow() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
-    let port = alloc_port();
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
     let (config_dir, args) = standalone_server_args_with_state_store(port);
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(format!(
         r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
@@ -379,10 +389,12 @@ fn standalone_mysql_server_supports_minimal_iceberg_flow() {
 #[test]
 fn standalone_mysql_server_writes_hadoop_catalog_compat_metadata_files() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(format!(
         r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
@@ -405,10 +417,12 @@ fn standalone_mysql_server_writes_hadoop_catalog_compat_metadata_files() {
 #[test]
 fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     // Phase 1: Create a table and insert initial data.
     conn.query_drop(format!(
@@ -430,7 +444,7 @@ fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
     // a table that was written by another engine (StarRocks FE / Spark) — the
     // on-disk layout is identical (only v{N}.metadata.json + version-hint.text).
     drop(conn);
-    let mut conn = server.connect_root(port);
+    let mut conn = connect_root(port, &mut server);
     conn.query_drop(format!(
         r#"create external catalog ice2 properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
         warehouse.path().display()
@@ -462,10 +476,12 @@ fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
 #[test]
 fn standalone_mysql_server_supports_catalog_session_context() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(format!(
         r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
@@ -526,10 +542,12 @@ fn standalone_mysql_server_supports_catalog_session_context() {
 #[test]
 fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(format!(
         r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
@@ -560,14 +578,17 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
 
 #[test]
 fn standalone_mysql_server_rejects_no_catalog_persistent_table() {
-    let port = alloc_port();
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let log_dir = TempDir::new().expect("create standalone server log dir");
     let args = vec![
         "standalone".to_string(),
         "--port".to_string(),
         port.to_string(),
     ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, log_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     let err = conn
         .query_drop("create table t_no_catalog (id int)")
@@ -578,14 +599,17 @@ fn standalone_mysql_server_rejects_no_catalog_persistent_table() {
 
 #[test]
 fn standalone_mysql_server_rejects_default_catalog_persistent_table() {
-    let port = alloc_port();
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let log_dir = TempDir::new().expect("create standalone server log dir");
     let args = vec![
         "standalone".to_string(),
         "--port".to_string(),
         port.to_string(),
     ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, log_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     let err = conn
         .query_drop("create table default_catalog.db1.t_default_catalog (id int)")
@@ -599,12 +623,14 @@ fn standalone_mysql_server_rejects_default_catalog_persistent_table() {
 
 #[test]
 fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_happy");
 
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
         .expect("create iceberg catalog");
@@ -710,12 +736,14 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
 
 #[test]
 fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged() {
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_noop");
 
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
         .expect("create iceberg catalog");
@@ -751,12 +779,14 @@ fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged(
 
 #[test]
 fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_append");
 
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
         .expect("create iceberg catalog");
@@ -794,12 +824,14 @@ fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
 
 #[test]
 fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_show");
 
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
         .expect("create iceberg catalog");
@@ -849,12 +881,14 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
 
 #[test]
 fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_refresh_policy_ddl");
 
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
         .expect("create iceberg catalog");
@@ -913,12 +947,14 @@ fn standalone_mysql_server_mv_refresh_policy_ddl_updates_show_metadata() {
 
 #[test]
 fn standalone_mysql_server_mv_create_rejects_starrocks_storage_engine() {
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
+    let _lock = lock_standalone_server();
+    let reservation = ReservedTcpPort::new().expect("reserve standalone MySQL port");
+    let port = reservation.port();
+    let (config_dir, args) = standalone_server_args_with_state_store(port);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_reject_starrocks");
 
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
+    let mut server = spawn_standalone(reservation, &args, config_dir.path().join("standalone.log"));
+    let mut conn = connect_root(port, &mut server);
 
     conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
         .expect("create iceberg catalog");
@@ -950,13 +986,22 @@ fn standalone_mysql_server_mv_create_rejects_starrocks_storage_engine() {
 
 #[test]
 fn standalone_mysql_server_mv_reopen_preserves_iceberg_mv() {
-    let port = alloc_port();
-    let (_config_dir, args) = standalone_server_args_with_state_store(port);
+    let _lock = lock_standalone_server();
+    let config_dir = TempDir::new().expect("create standalone server config dir");
+    let first_reservation = ReservedTcpPort::new().expect("reserve first standalone MySQL port");
+    let first_port = first_reservation.port();
+    let first_config =
+        write_standalone_state_store_config(&config_dir, "novarocks-first.toml", first_port);
+    let first_args = standalone_server_args(first_config);
     let iceberg_warehouse = unique_iceberg_warehouse("mv_reopen");
 
     {
-        let mut server = ServerGuard::spawn(&args);
-        let mut conn = server.connect_root(port);
+        let mut server = spawn_standalone(
+            first_reservation,
+            &first_args,
+            config_dir.path().join("standalone-first.log"),
+        );
+        let mut conn = connect_root(first_port, &mut server);
         conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
             .expect("create iceberg catalog");
         conn.query_drop("create database ice.ns")
@@ -980,9 +1025,18 @@ fn standalone_mysql_server_mv_reopen_preserves_iceberg_mv() {
             .expect("first refresh");
     }
 
+    let second_reservation = ReservedTcpPort::new().expect("reserve second standalone MySQL port");
+    let second_port = second_reservation.port();
+    let second_config =
+        write_standalone_state_store_config(&config_dir, "novarocks-second.toml", second_port);
+    let second_args = standalone_server_args(second_config);
     {
-        let mut server = ServerGuard::spawn(&args);
-        let mut conn = server.connect_root(port);
+        let mut server = spawn_standalone(
+            second_reservation,
+            &second_args,
+            config_dir.path().join("standalone-second.log"),
+        );
+        let mut conn = connect_root(second_port, &mut server);
         conn.query_drop("set catalog ice").expect("set catalog");
         conn.query_drop("use ns").expect("use namespace");
         let rows: Vec<(Option<i32>,)> = conn

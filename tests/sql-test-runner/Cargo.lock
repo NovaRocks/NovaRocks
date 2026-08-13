@@ -1631,6 +1631,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-test-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2527,6 +2534,7 @@ dependencies = [
  "anyhow",
  "clap",
  "mysql",
+ "novarocks-test-support",
  "opendal",
  "rayon",
  "regex",

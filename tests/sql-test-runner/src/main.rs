@@ -21,7 +21,6 @@ mod be_log_directive;
 mod config;
 mod fault_injection;
 mod iceberg_orphan_fixture;
-mod managed_process;
 mod parser;
 mod results;
 mod runner;

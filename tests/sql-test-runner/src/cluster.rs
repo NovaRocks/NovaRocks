@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::managed_process::{ManagedProcess, ReadyMarker};
 use crate::types::{QueryLifecyclePhase, RunnerConfig};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
+use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2547,15 +2547,15 @@ pub(crate) fn startup_timeout_from_env(raw: Option<&str>) -> Duration {
 }
 
 struct ReservedBePorts {
-    http: ReservedPort,
-    grpc: ReservedPort,
+    http: ReservedTcpPort,
+    grpc: ReservedTcpPort,
 }
 
 struct ReservedRuntimePorts {
     be_ports: Vec<ReservedBePorts>,
-    fe_http_port: ReservedPort,
-    fe_grpc_port: ReservedPort,
-    fe_mysql_port: ReservedPort,
+    fe_http_port: ReservedTcpPort,
+    fe_grpc_port: ReservedTcpPort,
+    fe_mysql_port: ReservedTcpPort,
 }
 
 impl ReservedRuntimePorts {
@@ -2564,40 +2564,16 @@ impl ReservedRuntimePorts {
         let mut be_ports = Vec::with_capacity(cluster_size);
         for _ in 0..cluster_size {
             be_ports.push(ReservedBePorts {
-                http: ReservedPort::new()?,
-                grpc: ReservedPort::new()?,
+                http: ReservedTcpPort::new()?,
+                grpc: ReservedTcpPort::new()?,
             });
         }
         Ok(Self {
             be_ports,
-            fe_http_port: ReservedPort::new()?,
-            fe_grpc_port: ReservedPort::new()?,
-            fe_mysql_port: ReservedPort::new()?,
+            fe_http_port: ReservedTcpPort::new()?,
+            fe_grpc_port: ReservedTcpPort::new()?,
+            fe_mysql_port: ReservedTcpPort::new()?,
         })
-    }
-}
-
-struct ReservedPort {
-    _listener: TcpListener,
-    port: u16,
-}
-
-impl ReservedPort {
-    fn new() -> Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind ephemeral port")?;
-        let port = listener.local_addr().context("read ephemeral port")?.port();
-        Ok(Self {
-            _listener: listener,
-            port,
-        })
-    }
-
-    fn port(&self) -> u16 {
-        self.port
-    }
-
-    fn release(self) -> u16 {
-        self.port
     }
 }
 
@@ -3400,15 +3376,6 @@ enable_path_style_access = true
     fn validate_cluster_args_all_in_one_size_1_ok() {
         validate_cluster_args(ClusterMode::AllInOne, 1)
             .expect("cluster_size=1 should be valid for all-in-one");
-    }
-
-    #[test]
-    fn reserved_port_blocks_rebinding_until_release() {
-        let reserved = ReservedPort::new().expect("reserve port");
-        let port = reserved.port();
-        assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
-
-        assert_eq!(reserved.release(), port);
     }
 
     #[test]

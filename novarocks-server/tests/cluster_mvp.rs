@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,7 @@ use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
     StateStoreProviderConfig,
 };
+use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 
 static CLUSTER_MVP_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -47,34 +48,14 @@ fn lock_cluster_mvp() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-struct ReservedPort {
-    _listener: TcpListener,
-    port: u16,
-}
-
-impl ReservedPort {
-    fn new() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-        let port = listener.local_addr().expect("local addr").port();
-        Self {
-            _listener: listener,
-            port,
-        }
-    }
-
-    fn port(&self) -> u16 {
-        self.port
-    }
-
-    fn release(self) -> u16 {
-        self.port
-    }
-}
-
 fn runtime_dir() -> PathBuf {
     let dir = PathBuf::from(".cluster_mvp_runtime");
     std::fs::create_dir_all(&dir).expect("create cluster mvp runtime dir");
     dir
+}
+
+fn reserve_port() -> ReservedTcpPort {
+    ReservedTcpPort::new().expect("reserve TCP port")
 }
 
 struct EnvironmentValueGuard {
@@ -117,213 +98,33 @@ fn write_config(name: &str, content: &str) -> NamedTempFile {
     file
 }
 
-struct ProcessGuard {
-    child: Child,
-    stdout_rx: mpsc::Receiver<String>,
-    _stdout_thread: std::thread::JoinHandle<()>,
-    _stderr_thread: std::thread::JoinHandle<()>,
-}
+const PROCESS_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-impl ProcessGuard {
-    fn spawn(config_path: &Path) -> Self {
-        Self::spawn_with_backend_index(config_path, None)
+fn spawn_novarocks(
+    config_path: &Path,
+    ready_marker: &str,
+    backend_index: Option<usize>,
+    debug_env: &[(&str, &str)],
+) -> ManagedProcess {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
+    command.arg("standalone").arg("--config").arg(config_path);
+    for (name, value) in debug_env {
+        command.env(name, value);
     }
-
-    /// Spawn with runner-owned debug switches exported to the child.
-    ///
-    /// The debug and fault-injection knobs live in the process environment
-    /// rather than the config file, so a test that wants a marker sets the
-    /// variable on the process it launches.
-    fn spawn_with_debug_env(config_path: &Path, debug_env: &[(&str, &str)]) -> Self {
-        Self::spawn_inner(config_path, None, debug_env)
-    }
-
-    fn spawn_backend_with_debug_env(
-        config_path: &Path,
-        backend_index: usize,
-        debug_env: &[(&str, &str)],
-    ) -> Self {
-        Self::spawn_inner(config_path, Some(backend_index), debug_env)
-    }
-
-    fn spawn_with_backend_index(config_path: &Path, backend_index: Option<usize>) -> Self {
-        Self::spawn_inner(config_path, backend_index, &[])
-    }
-
-    fn spawn_inner(
-        config_path: &Path,
-        backend_index: Option<usize>,
-        debug_env: &[(&str, &str)],
-    ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
-        command
-            .arg("standalone")
-            .arg("--config")
-            .arg(config_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (name, value) in debug_env {
-            command.env(name, value);
-        }
-        if let Some(backend_index) = backend_index {
-            command.env(
-                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
-                backend_index.to_string(),
-            );
-        }
-        let mut child = command.spawn().expect("spawn novarocks");
-        let stdout = child.stdout.take().expect("child stdout");
-        let stderr = child.stderr.take().expect("child stderr pipe");
-        let (tx, rx) = mpsc::channel();
-        let stdout_tx = tx.clone();
-        let stdout_thread = std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                if stdout_tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let stderr_thread = std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            child,
-            stdout_rx: rx,
-            _stdout_thread: stdout_thread,
-            _stderr_thread: stderr_thread,
-        }
-    }
-
-    fn wait_for_ready(&mut self, marker: &str) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut stdout = Vec::new();
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll child") {
-                panic!(
-                    "novarocks exited before readiness marker `{marker}` with status {status}; stdout={stdout:?}; stderr={}",
-                    self.read_stderr()
-                );
-            }
-            match self.stdout_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(line) => {
-                    if line.contains(marker) {
-                        return;
-                    }
-                    stdout.push(line);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let status = self
-                        .child
-                        .try_wait()
-                        .expect("poll child after stdout close");
-                    panic!(
-                        "stdout closed before readiness marker `{marker}`; status={status:?}; stdout={stdout:?}; stderr={}",
-                        self.read_stderr()
-                    );
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!(
-                    "timed out waiting for readiness marker `{marker}`; stdout={stdout:?}; stderr={}",
-                    self.read_stderr()
-                );
-            }
-        }
-    }
-
-    fn read_stderr(&mut self) -> String {
-        self.stdout_rx.try_iter().collect::<Vec<_>>().join("\n")
-    }
-
-    fn wait_for_output_contains(&mut self, marker: &str, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        let mut stdout = Vec::new();
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll child") {
-                panic!(
-                    "novarocks exited before marker `{marker}` with status {status}; stdout={stdout:?}; stderr={}",
-                    self.read_stderr()
-                );
-            }
-            match self.stdout_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(line) => {
-                    if line.contains(marker) {
-                        return;
-                    }
-                    stdout.push(line);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("stdout closed before marker `{marker}`; stdout={stdout:?}");
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!(
-                    "timed out waiting for marker `{marker}`; stdout={stdout:?}; stderr={}",
-                    self.read_stderr()
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn shutdown_cleanly(&mut self, timeout: Duration) {
-        let pid = i32::try_from(self.child.id()).expect("child PID fits i32");
-        // SAFETY: `pid` belongs to the child owned by this guard, and SIGINT is
-        // the server's supported graceful-shutdown signal on Unix.
-        let signal_result = unsafe { libc::kill(pid, libc::SIGINT) };
-        assert_eq!(
-            signal_result,
-            0,
-            "send SIGINT to novarocks pid {pid}: {}",
-            std::io::Error::last_os_error()
+    if let Some(backend_index) = backend_index {
+        command.env(
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+            backend_index.to_string(),
         );
-
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll child after SIGINT") {
-                assert!(
-                    status.success(),
-                    "novarocks did not exit cleanly after SIGINT: status={status}; stderr={}",
-                    self.read_stderr()
-                );
-                return;
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!(
-                    "timed out after {timeout:?} waiting for novarocks to exit after SIGINT; stderr={}",
-                    self.read_stderr()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
-}
-
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+    ManagedProcess::spawn(
+        format!("novarocks {}", config_path.display()),
+        command,
+        ReadyMarker::StdoutContains(ready_marker.to_string()),
+        PROCESS_READY_TIMEOUT,
+        config_path.with_extension("process.log"),
+    )
+    .unwrap_or_else(|error| panic!("spawn novarocks {}: {error:#}", config_path.display()))
 }
 
 fn connect_mysql(port: u16) -> MysqlConn {
@@ -348,10 +149,13 @@ fn connect_mysql(port: u16) -> MysqlConn {
     }
 }
 
-fn start_all_in_one_with_debug_env(extra: &str, debug_env: &[(&str, &str)]) -> (ProcessGuard, u16) {
-    let mysql = ReservedPort::new();
-    let http = ReservedPort::new();
-    let grpc = ReservedPort::new();
+fn start_all_in_one_with_debug_env(
+    extra: &str,
+    debug_env: &[(&str, &str)],
+) -> (ManagedProcess, u16) {
+    let mysql = reserve_port();
+    let http = reserve_port();
+    let grpc = reserve_port();
     let mysql_port = mysql.port();
     let http_port = http.port();
     let grpc_port = grpc.port();
@@ -377,14 +181,18 @@ role = "all-in-one"
     let _ = mysql.release();
     let _ = http.release();
     let _ = grpc.release();
-    let mut process = ProcessGuard::spawn_with_debug_env(config.path(), debug_env);
-    process.wait_for_ready("NOVAROCKS_READY mysql_port=");
+    let process = spawn_novarocks(
+        config.path(),
+        "NOVAROCKS_READY mysql_port=",
+        None,
+        debug_env,
+    );
     (process, mysql_port)
 }
 
 struct ClusterHarness {
-    be: ProcessGuard,
-    _fe: ProcessGuard,
+    be: ManagedProcess,
+    _fe: ManagedProcess,
     fe_mysql: u16,
     be_http: u16,
     _state_store_root: TempDir,
@@ -396,11 +204,11 @@ impl ClusterHarness {
     }
 
     fn start_with_debug_env(be_debug: &str, be_debug_env: &[(&str, &str)], fe_extra: &str) -> Self {
-        let be_http = ReservedPort::new();
-        let be_grpc = ReservedPort::new();
-        let fe_mysql = ReservedPort::new();
-        let fe_http = ReservedPort::new();
-        let fe_grpc = ReservedPort::new();
+        let be_http = reserve_port();
+        let be_grpc = reserve_port();
+        let fe_mysql = reserve_port();
+        let fe_http = reserve_port();
+        let fe_grpc = reserve_port();
         let be_http_port = be_http.port();
         let be_grpc_port = be_grpc.port();
         let fe_mysql_port = fe_mysql.port();
@@ -456,14 +264,17 @@ deployment_owner = "fe-1"
 
         let _ = be_http.release();
         let _ = be_grpc.release();
-        let mut be = ProcessGuard::spawn_with_debug_env(be_config.path(), be_debug_env);
-        be.wait_for_ready("NOVAROCKS_READY role=be");
+        let be = spawn_novarocks(
+            be_config.path(),
+            "NOVAROCKS_READY role=be",
+            None,
+            be_debug_env,
+        );
 
         let _ = fe_mysql.release();
         let _ = fe_http.release();
         let _ = fe_grpc.release();
-        let mut fe = ProcessGuard::spawn(fe_config.path());
-        fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+        let fe = spawn_novarocks(fe_config.path(), "NOVAROCKS_READY mysql_port=", None, &[]);
 
         Self {
             be,
@@ -477,8 +288,9 @@ deployment_owner = "fe-1"
 
 struct MultiBeClusterHarness {
     #[allow(dead_code)]
-    bes: Vec<ProcessGuard>,
-    fe: Option<ProcessGuard>,
+    bes: Vec<ManagedProcess>,
+    be_log_offsets: Vec<usize>,
+    fe: Option<ManagedProcess>,
     fe_mysql: u16,
     be_http_ports: Vec<u16>,
     #[allow(dead_code)]
@@ -544,20 +356,20 @@ impl MultiBeClusterHarness {
 
         // Reserve all ports up front before releasing any of them.
         struct BePortSet {
-            http: ReservedPort,
-            grpc: ReservedPort,
+            http: ReservedTcpPort,
+            grpc: ReservedTcpPort,
         }
         let mut be_port_sets: Vec<BePortSet> = (0..n)
             .map(|_| BePortSet {
-                http: ReservedPort::new(),
-                grpc: ReservedPort::new(),
+                http: reserve_port(),
+                grpc: reserve_port(),
             })
             .collect();
-        let fe_mysql = ReservedPort::new();
-        let fe_http = ReservedPort::new();
-        let fe_grpc = ReservedPort::new();
+        let fe_mysql = reserve_port();
+        let fe_http = reserve_port();
+        let fe_grpc = reserve_port();
 
-        // Collect port numbers before consuming the ReservedPort structs.
+        // Collect port numbers before consuming the ReservedTcpPort structs.
         let be_http_ports: Vec<u16> = be_port_sets.iter().map(|s| s.http.port()).collect();
         let be_grpc_ports: Vec<u16> = be_port_sets.iter().map(|s| s.grpc.port()).collect();
         let fe_mysql_port = fe_mysql.port();
@@ -648,29 +460,27 @@ backends = [{backends_list}]
 
         // Spawn all BEs first (releasing each BE's reserved ports immediately
         // before its own spawn), then wait for all readiness in a second pass.
-        let mut bes: Vec<ProcessGuard> = Vec::with_capacity(n);
+        let mut bes: Vec<ManagedProcess> = Vec::with_capacity(n);
         for (i, port_set) in be_port_sets.drain(..).enumerate() {
             let _ = port_set.http.release();
             let _ = port_set.grpc.release();
-            bes.push(ProcessGuard::spawn_backend_with_debug_env(
+            bes.push(spawn_novarocks(
                 be_configs[i].path(),
-                i,
+                "NOVAROCKS_READY role=be",
+                Some(i),
                 be_debug_env,
             ));
-        }
-        for be in &mut bes {
-            be.wait_for_ready("NOVAROCKS_READY role=be");
         }
 
         // Release FE ports and spawn FE.
         let _ = fe_mysql.release();
         let _ = fe_http.release();
         let _ = fe_grpc.release();
-        let mut fe = ProcessGuard::spawn(fe_config.path());
-        fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+        let fe = spawn_novarocks(fe_config.path(), "NOVAROCKS_READY mysql_port=", None, &[]);
 
         Self {
             bes,
+            be_log_offsets: vec![0; n],
             fe: Some(fe),
             fe_mysql: fe_mysql_port,
             be_http_ports,
@@ -800,25 +610,25 @@ deployment_owner = "fe-1"
     #[cfg(unix)]
     fn shutdown_fe_cleanly(&mut self, timeout: Duration) {
         let mut fe = self.fe.take().expect("FE process must be running");
-        fe.shutdown_cleanly(timeout);
+        fe.interrupt_and_wait(timeout)
+            .expect("shut down frontend process with SIGINT");
     }
 
     #[cfg(unix)]
     fn kill_fe(&mut self) {
         let mut fe = self.fe.take().expect("FE process must be running");
-        fe.child.kill().expect("kill frontend process");
-        let status = fe.child.wait().expect("reap killed frontend process");
-        assert!(
-            !status.success(),
-            "explicit recovery fault must terminate the frontend process"
-        );
+        fe.kill_now().expect("kill frontend process");
     }
 
     #[cfg(unix)]
     fn restart_fe(&mut self) {
         assert!(self.fe.is_none(), "old FE process must be stopped");
-        let mut fe = ProcessGuard::spawn(self.fe_config.path());
-        fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+        let fe = spawn_novarocks(
+            self.fe_config.path(),
+            "NOVAROCKS_READY mysql_port=",
+            None,
+            &[],
+        );
         self.fe = Some(fe);
     }
 
@@ -827,7 +637,41 @@ deployment_owner = "fe-1"
         self.fe
             .as_mut()
             .expect("FE process must be running")
-            .wait_for_output_contains(marker, timeout);
+            .wait_for_log_contains(marker, timeout)
+            .unwrap_or_else(|error| panic!("wait for FE output marker {marker:?}: {error:#}"));
+    }
+
+    fn clear_be_output(&mut self) {
+        self.be_log_offsets = self
+            .bes
+            .iter()
+            .map(|be| {
+                be.log_contents()
+                    .unwrap_or_else(|error| panic!("capture BE log baseline: {error:#}"))
+                    .len()
+            })
+            .collect();
+    }
+
+    fn collect_new_be_output(&mut self) -> Vec<Vec<String>> {
+        self.bes
+            .iter_mut()
+            .zip(self.be_log_offsets.iter_mut())
+            .map(|(be, offset)| {
+                let log = be
+                    .log_contents()
+                    .unwrap_or_else(|error| panic!("read BE durable log: {error:#}"));
+                if log.len() < *offset {
+                    *offset = 0;
+                }
+                let output = log[*offset..]
+                    .lines()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                *offset = log.len();
+                output
+            })
+            .collect()
     }
 
     fn wait_for_every_be_output_contains(
@@ -839,17 +683,19 @@ deployment_owner = "fe-1"
         let mut stdout = vec![Vec::new(); self.bes.len()];
         let mut observed = vec![false; self.bes.len()];
         loop {
+            for (index, lines) in self.collect_new_be_output().into_iter().enumerate() {
+                observed[index] |= lines.iter().any(|line| line.contains(marker));
+                stdout[index].extend(lines);
+            }
             for (index, be) in self.bes.iter_mut().enumerate() {
-                if let Some(status) = be.child.try_wait().expect("poll BE child") {
+                if !be
+                    .is_running()
+                    .unwrap_or_else(|error| panic!("inspect BE {index} process: {error:#}"))
+                {
                     panic!(
-                        "BE {index} exited before marker `{marker}` with status {status}; stdout={:?}; stderr={}",
-                        stdout[index],
-                        be.read_stderr()
+                        "BE {index} exited before marker `{marker}`; stdout={:?}",
+                        stdout[index]
                     );
-                }
-                while let Ok(line) = be.stdout_rx.try_recv() {
-                    observed[index] |= line.contains(marker);
-                    stdout[index].push(line);
                 }
             }
             if observed.iter().all(|seen| *seen) {
@@ -870,16 +716,18 @@ deployment_owner = "fe-1"
     ) -> Vec<Vec<String>> {
         let deadline = Instant::now() + timeout;
         loop {
+            for (index, lines) in self.collect_new_be_output().into_iter().enumerate() {
+                stdout[index].extend(lines);
+            }
             for (index, be) in self.bes.iter_mut().enumerate() {
-                if let Some(status) = be.child.try_wait().expect("poll BE child") {
+                if !be
+                    .is_running()
+                    .unwrap_or_else(|error| panic!("inspect BE {index} process: {error:#}"))
+                {
                     panic!(
-                        "BE {index} exited before connector readers closed with status {status}; stdout={:?}; stderr={}",
-                        stdout[index],
-                        be.read_stderr()
+                        "BE {index} exited before connector readers closed; stdout={:?}",
+                        stdout[index]
                     );
-                }
-                while let Ok(line) = be.stdout_rx.try_recv() {
-                    stdout[index].push(line);
                 }
             }
             let counts = stdout
@@ -1309,7 +1157,8 @@ fn all_in_one_loopback_stage_start_select_succeeds() {
     let mut conn = connect_mysql(mysql_port);
     let rows: Vec<i64> = conn.query("SELECT 1").expect("SELECT 1");
     assert_eq!(rows, vec![1]);
-    srv.wait_for_output_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3));
+    srv.wait_for_log_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3))
+        .expect("wait for typed gRPC fetch marker");
 }
 
 #[test]
@@ -1320,11 +1169,11 @@ fn cross_process_remote_dispatcher_smoke() {
     }
     let _lock = lock_cluster_mvp();
 
-    let be_http = ReservedPort::new();
-    let be_grpc = ReservedPort::new();
-    let fe_mysql = ReservedPort::new();
-    let fe_http = ReservedPort::new();
-    let fe_grpc = ReservedPort::new();
+    let be_http = reserve_port();
+    let be_grpc = reserve_port();
+    let fe_mysql = reserve_port();
+    let fe_http = reserve_port();
+    let fe_grpc = reserve_port();
     let be_http_port = be_http.port();
     let be_grpc_port = be_grpc.port();
     let fe_mysql_port = fe_mysql.port();
@@ -1377,14 +1226,12 @@ deployment_owner = "fe-1"
 
     let _ = be_http.release();
     let _ = be_grpc.release();
-    let mut be = ProcessGuard::spawn(be_config.path());
-    be.wait_for_ready("NOVAROCKS_READY role=be");
+    let be = spawn_novarocks(be_config.path(), "NOVAROCKS_READY role=be", None, &[]);
 
     let _ = fe_mysql.release();
     let _ = fe_http.release();
     let _ = fe_grpc.release();
-    let mut fe = ProcessGuard::spawn(fe_config.path());
-    fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+    let _fe = spawn_novarocks(fe_config.path(), "NOVAROCKS_READY mysql_port=", None, &[]);
 
     let mut conn = connect_mysql(fe_mysql_port);
 
@@ -1426,9 +1273,9 @@ fn native_be_signal_shutdown_releases_port_for_restart() {
     }
     let _lock = lock_cluster_mvp();
 
-    let grpc = ReservedPort::new();
+    let grpc = reserve_port();
     let grpc_port = grpc.port();
-    let http = ReservedPort::new();
+    let http = reserve_port();
     let http_port = http.port();
     let config = write_config(
         "native-be-signal-restart",
@@ -1447,17 +1294,19 @@ role = "be"
 
     let _ = grpc.release();
     let _ = http.release();
-    let mut first = ProcessGuard::spawn(config.path());
-    first.wait_for_ready("NOVAROCKS_READY role=be");
-    first.shutdown_cleanly(Duration::from_secs(10));
+    let mut first = spawn_novarocks(config.path(), "NOVAROCKS_READY role=be", None, &[]);
+    first
+        .interrupt_and_wait(Duration::from_secs(10))
+        .expect("shut down first BE cleanly");
 
     let rebound = TcpListener::bind(("127.0.0.1", grpc_port))
         .expect("native BE gRPC port must be reusable immediately after SIGINT shutdown");
     drop(rebound);
 
-    let mut restarted = ProcessGuard::spawn(config.path());
-    restarted.wait_for_ready("NOVAROCKS_READY role=be");
-    restarted.shutdown_cleanly(Duration::from_secs(10));
+    let mut restarted = spawn_novarocks(config.path(), "NOVAROCKS_READY role=be", None, &[]);
+    restarted
+        .interrupt_and_wait(Duration::from_secs(10))
+        .expect("shut down restarted BE cleanly");
 }
 
 #[test]
@@ -1468,11 +1317,11 @@ fn d4_dynamic_backend_sql_and_metrics_smoke() {
     }
     let _lock = lock_cluster_mvp();
 
-    let be_http = ReservedPort::new();
-    let be_grpc = ReservedPort::new();
-    let fe_mysql = ReservedPort::new();
-    let fe_http = ReservedPort::new();
-    let fe_grpc = ReservedPort::new();
+    let be_http = reserve_port();
+    let be_grpc = reserve_port();
+    let fe_mysql = reserve_port();
+    let fe_http = reserve_port();
+    let fe_grpc = reserve_port();
     let be_http_port = be_http.port();
     let be_grpc_port = be_grpc.port();
     let fe_mysql_port = fe_mysql.port();
@@ -1525,14 +1374,12 @@ deployment_owner = "fe-1"
 
     let _ = be_http.release();
     let _ = be_grpc.release();
-    let mut be = ProcessGuard::spawn(be_config.path());
-    be.wait_for_ready("NOVAROCKS_READY role=be");
+    let _be = spawn_novarocks(be_config.path(), "NOVAROCKS_READY role=be", None, &[]);
 
     let _ = fe_mysql.release();
     let _ = fe_http.release();
     let _ = fe_grpc.release();
-    let mut fe = ProcessGuard::spawn(fe_config.path());
-    fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+    let _fe = spawn_novarocks(fe_config.path(), "NOVAROCKS_READY mysql_port=", None, &[]);
 
     let mut conn = connect_mysql(fe_mysql_port);
     assert!(
@@ -1576,7 +1423,7 @@ fn mysql_disconnect_triggers_cancel() {
     }
     let _lock = lock_cluster_mvp();
 
-    let mut cluster = ClusterHarness::start("", "");
+    let cluster = ClusterHarness::start("", "");
 
     let stream = send_mysql_query(cluster.fe_mysql, disconnect_blocking_query_sql());
     wait_for_backend_running_fragment_control(cluster.be_http, Duration::from_secs(3));
@@ -1670,9 +1517,7 @@ operator_buffer_chunks = 1
             ))
             .expect("write a distinct scan range for cancellation acceptance");
     }
-    for be in &mut cluster.bes {
-        while be.stdout_rx.try_recv().is_ok() {}
-    }
+    cluster.clear_be_output();
 
     let (target_ready_tx, target_ready_rx) = mpsc::sync_channel(1);
     let (target_done_tx, target_done_rx) = mpsc::sync_channel(1);
@@ -1833,9 +1678,7 @@ fn cross_process_three_be_connector_catalog_mutation_is_visible_to_non_empty_rea
     conn.query_drop("ALTER TABLE mutation_catalog.mutation_db.data DROP BRANCH verify")
         .expect("drop Iceberg branch through mutation SPI");
 
-    for be in &mut cluster.bes {
-        while be.stdout_rx.try_recv().is_ok() {}
-    }
+    cluster.clear_be_output();
     let rows: Vec<Row> = conn
         .query(
             "SELECT count(*), min(id), max(id), min(category) \
@@ -1933,9 +1776,7 @@ fn cross_process_three_be_connector_static_predicate_prunes_files_and_row_groups
 
     conn.query_drop("SET enable_connector_static_predicate_pushdown = false")
         .expect("disable static connector predicate pushdown");
-    for be in &mut cluster.bes {
-        while be.stdout_rx.try_recv().is_ok() {}
-    }
+    cluster.clear_be_output();
     let disabled_rows: Vec<Row> = conn
         .query(query)
         .expect("disabled static pruning query must succeed");
@@ -1951,9 +1792,7 @@ fn cross_process_three_be_connector_static_predicate_prunes_files_and_row_groups
 
     conn.query_drop("SET enable_connector_static_predicate_pushdown = true")
         .expect("enable static connector predicate pushdown");
-    for be in &mut cluster.bes {
-        while be.stdout_rx.try_recv().is_ok() {}
-    }
+    cluster.clear_be_output();
     let enabled_rows: Vec<Row> = conn
         .query(query)
         .expect("enabled static pruning query must succeed");
@@ -2050,9 +1889,7 @@ fn cross_process_three_be_connector_read_applies_deletion_vectors() {
     }
     conn.query_drop("DELETE FROM dv_catalog.dv_db.data WHERE id IN (1, 100001, 200001)")
         .expect("write Iceberg v3 deletion vectors");
-    for be in &mut cluster.bes {
-        while be.stdout_rx.try_recv().is_ok() {}
-    }
+    cluster.clear_be_output();
 
     let rows: Vec<Row> = conn
         .query(
@@ -2142,9 +1979,7 @@ operator_buffer_chunks = 1
             ))
             .expect("write generation data file");
     }
-    for be in &mut cluster.bes {
-        while be.stdout_rx.try_recv().is_ok() {}
-    }
+    cluster.clear_be_output();
 
     let (target_ready_tx, target_ready_rx) = mpsc::sync_channel(1);
     let (target_done_tx, target_done_rx) = mpsc::sync_channel(1);
@@ -4658,7 +4493,7 @@ fn cross_process_three_be_session_view_lifecycle() {
 
 #[test]
 fn reserved_port_blocks_rebinding_until_release() {
-    let port = ReservedPort::new();
+    let port = reserve_port();
     let addr = ("127.0.0.1", port.port());
 
     assert!(
