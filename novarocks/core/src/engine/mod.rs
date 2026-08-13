@@ -5012,7 +5012,6 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
     ),
     String,
 > {
-    crate::connector::validate_request_context(connector_context)?;
     let maintenance_execution;
     let execution = match execution {
         Some(execution) => execution,
@@ -5021,6 +5020,42 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
             &maintenance_execution
         }
     };
+    execute_frozen_rewrite_physical_plan_as_iceberg_staging_with_ports(
+        state.connector_control.as_ref(),
+        &state.query_execution,
+        physical_plan,
+        sink,
+        execution,
+        connector_context,
+        table_bindings,
+        scan_resolver,
+        connector_write,
+    )
+}
+
+/// Execute a provider-frozen rewrite with only the explicit ports required by
+/// an already-admitted maintenance attempt.  Callers must provide the request
+/// execution snapshot; this path never captures a second topology, deadline,
+/// or cancellation scope.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    physical_plan: crate::sql::planner::physical::PhysicalPlanNode,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    table_bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    crate::connector::validate_request_context(connector_context)?;
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     let distributed_plan =
         crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
@@ -5030,7 +5065,7 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        DmlQueryExecutionKernel::connector_control(state),
+        connector_control,
         connector_context,
         Some(table_bindings),
         Some(scan_resolver),
@@ -5041,7 +5076,7 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
         &prepared,
     )?;
     let result = execute_distributed_write_with_execution(
-        &state.query_execution,
+        query_execution,
         prepared,
         native_bundle,
         None,
