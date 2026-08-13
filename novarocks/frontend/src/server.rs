@@ -223,6 +223,7 @@ where
             let session_catalog_resolver = engine.session_catalog_resolver();
             let query_compiler = engine.query_compiler();
             let command_executor = engine.command_executor();
+            let catalog_command_executor = engine.catalog_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
             let mutation_engine = engine.mutation_engine();
@@ -241,6 +242,7 @@ where
                     session_catalog_resolver,
                     query_compiler,
                     command_executor,
+                    catalog_command_executor,
                     query_control,
                     query_execution,
                     role,
@@ -340,6 +342,7 @@ where
             let session_catalog_resolver = engine.session_catalog_resolver();
             let query_compiler = engine.query_compiler();
             let command_executor = engine.command_executor();
+            let catalog_command_executor = engine.catalog_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
             let mutation_engine = engine.mutation_engine();
@@ -358,6 +361,7 @@ where
                     session_catalog_resolver,
                     query_compiler,
                     command_executor,
+                    catalog_command_executor,
                     query_control,
                     query_execution,
                     role,

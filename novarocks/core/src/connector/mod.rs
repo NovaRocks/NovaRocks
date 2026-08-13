@@ -92,7 +92,11 @@ pub(crate) fn connector_request_context(
     )
 }
 
-pub(crate) fn connector_request_context_for_query(
+/// Freeze connector request facts from the admitted frontend statement.
+///
+/// Frontend-owned typed command capabilities use this same constructor so
+/// provider requests share the statement cancellation identity and options.
+pub fn connector_request_context_for_query(
     query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
     cancellation: crate::query_execution::cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {

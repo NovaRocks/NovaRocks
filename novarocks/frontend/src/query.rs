@@ -35,7 +35,7 @@ use novarocks::engine::mutation_engine::MutationEngine;
 use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
     PreparedQueryOperation, SessionCatalogResolver, StandaloneCommandExecutor,
-    StandaloneQueryCompiler, StatementResult,
+    StandaloneQueryCompiler, StatementResult, catalog_command::CatalogCommandExecutor,
 };
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
@@ -61,7 +61,7 @@ use crate::dml::DmlService;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
-trait CoreCommandRoute {
+pub trait CoreCommandRoute: Send + Sync {
     fn execute(
         &self,
         sql: &str,
@@ -78,6 +78,41 @@ impl CoreCommandRoute for StandaloneCommandExecutor {
         query_options: QueryOptions,
     ) -> Result<StatementResult, String> {
         StandaloneCommandExecutor::execute(self, sql, context, Some(query_options))
+    }
+}
+
+#[derive(Clone)]
+struct CatalogThenLegacyCommand {
+    catalog: CatalogCommandExecutor,
+    legacy: StandaloneCommandExecutor,
+}
+
+impl CatalogThenLegacyCommand {
+    fn new(catalog: CatalogCommandExecutor, legacy: StandaloneCommandExecutor) -> Self {
+        Self { catalog, legacy }
+    }
+}
+
+impl CoreCommandRoute for CatalogThenLegacyCommand {
+    fn execute(
+        &self,
+        sql: &str,
+        context: &RequestContext,
+        query_options: QueryOptions,
+    ) -> Result<StatementResult, String> {
+        let connector_context = novarocks::connector::connector_request_context_for_query(
+            Some(&query_options),
+            context.execution().cancellation().clone(),
+        )?;
+        match self.catalog.try_execute(
+            sql,
+            context.session().current_catalog(),
+            context.session().current_database(),
+            &connector_context,
+        )? {
+            Some(result) => Ok(result),
+            None => self.legacy.execute(sql, context, Some(query_options)),
+        }
     }
 }
 
@@ -189,7 +224,7 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 pub struct FrontendQueryService {
     session_catalog_resolver: SessionCatalogResolver,
     query_compiler: StandaloneQueryCompiler,
-    command_executor: StandaloneCommandExecutor,
+    command_executor: Arc<dyn CoreCommandRoute>,
     query_control: QueryControlService,
     query_execution: QueryExecutionService,
     role: ClusterRole,
@@ -228,11 +263,13 @@ impl FrontendQueryService {
         dml.install_ctas_recovery(Arc::clone(&ctas_engine));
         let session_catalog_resolver = engine.session_catalog_resolver();
         let query_compiler = engine.query_compiler();
+        let catalog_command_executor = engine.catalog_command_executor();
         let command_executor = engine.command_executor();
         Self::new_with_recovery_bound(
             session_catalog_resolver,
             query_compiler,
             command_executor,
+            catalog_command_executor,
             query_control,
             query_execution,
             role,
@@ -253,6 +290,7 @@ impl FrontendQueryService {
         session_catalog_resolver: SessionCatalogResolver,
         query_compiler: StandaloneQueryCompiler,
         command_executor: StandaloneCommandExecutor,
+        catalog_command_executor: CatalogCommandExecutor,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
         role: ClusterRole,
@@ -269,7 +307,10 @@ impl FrontendQueryService {
         Self {
             session_catalog_resolver,
             query_compiler,
-            command_executor,
+            command_executor: Arc::new(CatalogThenLegacyCommand::new(
+                catalog_command_executor,
+                command_executor,
+            )),
             query_control,
             query_execution,
             role,
@@ -610,7 +651,7 @@ impl FrontendQuerySession {
             optimizer_settings,
         ));
         let compiler = self.service.query_compiler.clone();
-        let command_executor = self.service.command_executor.clone();
+        let command_executor = Arc::clone(&self.service.command_executor);
         let query_execution = self.service.query_execution.clone();
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
@@ -658,7 +699,7 @@ impl FrontendQuerySession {
                             Some(query_options),
                         )
                     },
-                    &command_executor,
+                    command_executor.as_ref(),
                     &sql,
                     &context,
                     query_options,

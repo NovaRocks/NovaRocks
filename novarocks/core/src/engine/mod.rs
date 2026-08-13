@@ -50,6 +50,7 @@ use novarocks_catalog::memory::DEFAULT_DATABASE;
 pub mod add_files_engine;
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
+pub mod catalog_command;
 pub mod ctas_engine;
 pub mod delete_engine;
 pub(crate) mod domain;
@@ -1814,6 +1815,20 @@ impl StandaloneNovaRocks {
         StandaloneCommandExecutor {
             session: self.session(),
         }
+    }
+
+    /// Transitional factory for the closed catalog-DDL capability.  The
+    /// returned executor copies only catalog-domain ports; it does not retain
+    /// the application facade or expose `StandaloneState` to Frontend.
+    pub fn catalog_command_executor(&self) -> catalog_command::CatalogCommandExecutor {
+        catalog_command::CatalogCommandExecutor::new(domain::CatalogCommandKernel::new(
+            Arc::clone(&self.inner.catalog_service),
+            self.inner.catalog_application.clone(),
+            Arc::clone(&self.inner.connector_control),
+            Arc::clone(&self.inner.mv_repository),
+            Arc::clone(&self.inner.mv_storage_observation),
+            Arc::clone(&self.inner.view_service),
+        ))
     }
 
     /// Session catalog admission is separate from arbitrary SQL dispatch.

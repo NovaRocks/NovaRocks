@@ -50,7 +50,9 @@ use crate::sql::literal::sqlparser_expr_to_literal;
 /// This deliberately does not expose the standalone application aggregate:
 /// catalog DDL needs only catalog admission, exact-generation connector
 /// control, local catalog invalidation, MV guards, and view metadata lookup.
-trait CatalogDropContext: crate::engine::backend_resolver::CatalogAdmission {
+pub(crate) trait CatalogDropContext:
+    crate::engine::backend_resolver::CatalogAdmission
+{
     fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
     fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository;
