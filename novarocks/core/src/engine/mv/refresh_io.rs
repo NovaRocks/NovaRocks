@@ -82,7 +82,14 @@ pub(crate) fn observe_current_refresh_base_with_kernel(
     )
 }
 
-fn observe_current_refresh_base_with_ports(
+/// Freeze a refresh-base observation from the exact control and observation
+/// ports selected for this refresh attempt.
+///
+/// This is the planner-facing entry point.  Callers that already own their
+/// admitted connector-control generation must pass those ports directly;
+/// they must not reconstruct `StandaloneState` merely to observe the base
+/// table again.
+pub(crate) fn observe_current_refresh_base_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     table_ref: &TableIdentity,

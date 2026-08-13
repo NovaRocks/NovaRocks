@@ -136,14 +136,10 @@ pub(crate) fn load_mv_target_binding(
     table: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvTargetBinding, String> {
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+    load_mv_target_binding_with_ports(
         state.connector_control.as_ref(),
-        &table.catalog,
-    )?;
-    load_mv_target_binding_with_lease_and_ports(
         state.mv_storage_observation.as_ref(),
         table,
-        exact_lease,
         connector_context,
     )
 }
@@ -155,12 +151,30 @@ pub(crate) fn load_mv_target_binding_with_kernel(
     table: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvTargetBinding, String> {
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+    load_mv_target_binding_with_ports(
         kernel.connector_control().as_ref(),
-        &table.catalog,
-    )?;
-    load_mv_target_binding_with_lease_and_ports(
         kernel.storage_observation().as_ref(),
+        table,
+        connector_context,
+    )
+}
+
+/// Resolve an MV target from the exact control and observation ports admitted
+/// for a refresh attempt.
+///
+/// The returned binding retains the planning lease.  A caller must pass that
+/// binding through planning and write preparation instead of resolving the
+/// catalog's latest connector generation again.
+pub(crate) fn load_mv_target_binding_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
+    table: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, String> {
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
+    load_mv_target_binding_with_lease_and_ports(
+        storage_observation,
         table,
         exact_lease,
         connector_context,
@@ -181,7 +195,11 @@ pub(crate) fn load_mv_target_binding_with_lease(
     )
 }
 
-fn load_mv_target_binding_with_lease_and_ports(
+/// Complete a target binding using a planning lease retained by the caller.
+///
+/// This preserves atomicity when the caller already acquired the lease while
+/// resolving related target facts.
+pub(crate) fn load_mv_target_binding_with_lease_and_ports(
     storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     table: &TableIdentity,
     exact_lease: ConnectorControlPlanningLease,
