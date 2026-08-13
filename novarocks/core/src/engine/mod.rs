@@ -3215,7 +3215,7 @@ impl StandaloneSession {
     }
 }
 
-fn connector_schema_path(
+pub(crate) fn connector_schema_path(
     path: crate::engine::statement::ColumnPath,
 ) -> novarocks_spi::connector::ConnectorColumnPath {
     novarocks_spi::connector::ConnectorColumnPath {
@@ -3227,7 +3227,7 @@ fn connector_schema_path(
     }
 }
 
-fn connector_schema_position(
+pub(crate) fn connector_schema_position(
     position: crate::engine::statement::AddPosition,
 ) -> novarocks_spi::connector::ConnectorColumnPosition {
     match position {

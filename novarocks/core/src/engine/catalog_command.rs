@@ -95,6 +95,16 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
+        if crate::engine::statement::looks_like_alter_iceberg_schema(&normalized) {
+            return execute_alter_iceberg_schema(
+                &self.kernel,
+                &normalized,
+                current_catalog,
+                current_database,
+                connector_context,
+            )
+            .map(Some);
+        }
         let dialect = StarRocksDialect;
         let mut parser = Parser::new(&dialect)
             .try_with_sql(&normalized)
@@ -258,6 +268,115 @@ fn execute_alter_iceberg_properties(
             changes,
             authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
             expected_committed_partitioning: None,
+        },
+        connector_context.clone(),
+    )?;
+    crate::engine::iceberg_writer::invalidate_iceberg_caches(kernel, &target)?;
+    Ok(StatementResult::Ok)
+}
+
+fn execute_alter_iceberg_schema(
+    kernel: &CatalogCommandKernel,
+    sql: &str,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let statement = crate::engine::statement::parse_alter_iceberg_schema_sql(sql)?;
+    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        kernel,
+        &statement.table,
+        current_catalog,
+        current_database,
+    )?;
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        kernel.connector_control().as_ref(),
+        kernel.mv_storage_observation().as_ref(),
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+    )?;
+    if let crate::engine::statement::IcebergSchemaChange::DropColumn { path } = &statement.change {
+        crate::engine::mv::iceberg_guard::reject_drop_column_mv_dependencies_with_repository(
+            kernel.mv_repository().as_ref(),
+            &target,
+            path,
+        )?;
+    }
+    let instance_id =
+        ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
+    let change = match statement.change {
+        crate::engine::statement::IcebergSchemaChange::AddColumn {
+            parent,
+            name,
+            data_type,
+            default,
+            position,
+        } => {
+            let column = crate::sql::parser::ast::TableColumnDef {
+                name,
+                data_type,
+                nullable: true,
+                aggregation: None,
+                default,
+            };
+            novarocks_spi::connector::ConnectorSchemaChange::AddColumn {
+                parent: novarocks_spi::connector::ConnectorColumnPath {
+                    segments: parent
+                        .segments()
+                        .iter()
+                        .map(|segment| Arc::from(segment.as_str()))
+                        .collect(),
+                },
+                column: crate::engine::statement::connector_column(&column)?,
+                position: crate::engine::connector_schema_position(position),
+            }
+        }
+        crate::engine::statement::IcebergSchemaChange::DropColumn { path } => {
+            novarocks_spi::connector::ConnectorSchemaChange::DropColumn {
+                path: crate::engine::connector_schema_path(path),
+            }
+        }
+        crate::engine::statement::IcebergSchemaChange::RenameColumn { path, new_name } => {
+            novarocks_spi::connector::ConnectorSchemaChange::RenameColumn {
+                path: crate::engine::connector_schema_path(path),
+                to: Arc::from(new_name),
+            }
+        }
+        crate::engine::statement::IcebergSchemaChange::ModifyColumn { path, new_type } => {
+            novarocks_spi::connector::ConnectorSchemaChange::ModifyColumn {
+                path: crate::engine::connector_schema_path(path),
+                data_type: crate::engine::statement::connector_data_type(&new_type)?,
+            }
+        }
+        crate::engine::statement::IcebergSchemaChange::SetNullable { path, nullable } => {
+            novarocks_spi::connector::ConnectorSchemaChange::SetColumnNullability {
+                path: crate::engine::connector_schema_path(path),
+                nullable,
+            }
+        }
+        crate::engine::statement::IcebergSchemaChange::Reorder { path, position } => {
+            novarocks_spi::connector::ConnectorSchemaChange::ReorderColumn {
+                path: crate::engine::connector_schema_path(path),
+                position: crate::engine::connector_schema_position(position),
+            }
+        }
+        crate::engine::statement::IcebergSchemaChange::UpdateComment { path, comment } => {
+            novarocks_spi::connector::ConnectorSchemaChange::SetColumnComment {
+                path: crate::engine::connector_schema_path(path),
+                comment: Arc::from(comment),
+            }
+        }
+    };
+    crate::connector::mutation::execute_catalog_mutation(
+        kernel.connector_control().as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterSchema {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            changes: vec![change],
         },
         connector_context.clone(),
     )?;
