@@ -2916,6 +2916,28 @@ mod tests {
     }
 
     #[test]
+    fn active_ctas_recovery_keeps_due_while_the_top_level_saga_is_unfinished() {
+        let (journal, _, mut active) =
+            recovery_drive_harness(ConnectorHistoricalCtasDisposition::Published);
+        let mut recovery = journal.recovery.lock().expect("recovery lock").clone();
+        recovery.next_action = StatementNextAction::None;
+
+        active
+            .record_ctas_recovery(recovery, None)
+            .expect("unfinished CTAS keeps the foreground recovery due");
+
+        assert!(active.stored.recovery_due_at_ms.is_some());
+        assert!(
+            journal
+                .operation
+                .lock()
+                .expect("operation lock")
+                .recovery_due_at_ms
+                .is_some()
+        );
+    }
+
+    #[test]
     fn superseded_holder_cannot_persist_a_late_catalog_observation() {
         let (journal, _, active) =
             recovery_drive_harness(ConnectorHistoricalCtasDisposition::Ambiguous);

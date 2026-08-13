@@ -55,7 +55,7 @@ SELECT id, value FROM ctas_takeover_${uuid0}.ns_${uuid0}.published_rows ORDER BY
 
 -- query 4
 -- @fenced_catalog_fault=publish,after-downstream-before-response
--- @expect_error=publish response lost
+-- @expect_error=CTAS catalog outcome is unresolved
 -- @restart_fe_after_step=true
 CREATE TABLE ctas_takeover_${uuid0}.ns_${uuid0}.recovered_rows AS
   SELECT id, value FROM ctas_takeover_${uuid0}.ns_${uuid0}.source_rows;
@@ -70,7 +70,7 @@ SELECT id, value FROM ctas_takeover_${uuid0}.ns_${uuid0}.recovered_rows ORDER BY
 
 -- query 6
 -- @fenced_catalog_fault=stage,before-accept
--- @expect_error=stage failed before acceptance
+-- @expect_error=CTAS catalog outcome is unresolved
 -- @restart_fe_after_step=true
 CREATE TABLE ctas_takeover_${uuid0}.ns_${uuid0}.rejected_before_stage AS
   SELECT id, value FROM ctas_takeover_${uuid0}.ns_${uuid0}.source_rows;

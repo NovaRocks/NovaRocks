@@ -989,6 +989,11 @@ impl ActiveDmlOperation {
         recovery: DmlCtasRecoveryRecord,
         recovery_due_at_ms: Option<i64>,
     ) -> Result<(), DmlError> {
+        let recovery_due_at_ms = self.effective_recovery_due(
+            self.stored.state,
+            &self.stored.payload,
+            recovery_due_at_ms,
+        )?;
         let request = DmlCtasRecoveryMutationRequest {
             operation_id: self.operation_id(),
             expected_revision: self.stored.revision,
