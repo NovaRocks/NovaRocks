@@ -1423,7 +1423,7 @@ pub struct StandaloneSession {
 /// It deliberately exposes neither `StandaloneState` nor connector internals.
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
-pub struct StandaloneQueryCompiler {
+pub struct CoreQueryCompiler {
     query: domain::QueryPreparationKernel,
     view: domain::ViewExecutionKernel,
     system_tables: domain::SystemTableQueryKernel,
@@ -1431,7 +1431,7 @@ pub struct StandaloneQueryCompiler {
     mv_storage_observation: Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
 }
 
-impl StandaloneQueryCompiler {
+impl CoreQueryCompiler {
     pub(crate) fn from_domain_kernels(
         query: domain::QueryPreparationKernel,
         view: domain::ViewExecutionKernel,
@@ -2143,8 +2143,8 @@ impl StandaloneNovaRocks {
         }
     }
 
-    pub fn query_compiler(&self) -> StandaloneQueryCompiler {
-        StandaloneQueryCompiler::from_state(&self.inner)
+    pub fn query_compiler(&self) -> CoreQueryCompiler {
+        CoreQueryCompiler::from_state(&self.inner)
     }
 
     pub fn command_executor(&self) -> StandaloneCommandExecutor {
@@ -2485,7 +2485,7 @@ impl StandaloneSession {
         query_opts: Option<QueryOptions>,
     ) -> Result<StatementResult, String> {
         if Self::is_query_sql(sql) {
-            return Err("query statements must be compiled through StandaloneQueryCompiler".into());
+            return Err("query statements must be compiled through CoreQueryCompiler".into());
         }
         let connector_context = crate::connector::connector_request_context_for_query(
             query_opts.as_ref(),

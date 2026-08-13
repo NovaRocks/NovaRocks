@@ -35,7 +35,7 @@ use crate::engine::system_catalog::SystemCatalog;
 use crate::engine::table_maintenance::TableMaintenanceService;
 use crate::engine::view::ViewService;
 use crate::engine::{
-    StandaloneQueryCompiler, UnifiedStatisticsResolver, add_files_engine, backend_command,
+    CoreQueryCompiler, UnifiedStatisticsResolver, add_files_engine, backend_command,
     catalog_command, ctas_engine, delete_engine, iceberg_ref_command, insert_engine,
     maintenance_command, mutation_engine, mv_command, statistics_command, truncate_engine,
     view_command,
@@ -97,7 +97,7 @@ impl QueryCompilerPorts {
 }
 
 /// Build the closed query-preparation capability from query-domain leaf ports.
-pub fn query_compiler(ports: QueryCompilerPorts) -> StandaloneQueryCompiler {
+pub fn query_compiler(ports: QueryCompilerPorts) -> CoreQueryCompiler {
     let query = domain::QueryPreparationKernel::new(
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
@@ -119,7 +119,7 @@ pub fn query_compiler(ports: QueryCompilerPorts) -> StandaloneQueryCompiler {
         ports.system_catalog,
         Arc::clone(&ports.mv_repository),
     );
-    StandaloneQueryCompiler::from_domain_kernels(
+    CoreQueryCompiler::from_domain_kernels(
         query,
         view,
         system_tables,

@@ -34,7 +34,7 @@ use novarocks::engine::insert_engine::InsertEngine;
 use novarocks::engine::mutation_engine::MutationEngine;
 use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
-    PreparedQueryOperation, SessionCatalogResolver, StandaloneQueryCompiler, StatementResult,
+    CoreQueryCompiler, PreparedQueryOperation, SessionCatalogResolver, StatementResult,
     backend_command::BackendCommandExecutor,
     catalog_command::CatalogCommandExecutor,
     iceberg_ref_command::IcebergRefCommandExecutor,
@@ -292,7 +292,7 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 #[derive(Clone)]
 pub struct FrontendQueryService {
     session_catalog_resolver: SessionCatalogResolver,
-    query_compiler: StandaloneQueryCompiler,
+    query_compiler: CoreQueryCompiler,
     command_executor: Arc<dyn CoreCommandRoute>,
     query_control: QueryControlService,
     query_execution: QueryExecutionService,
@@ -314,7 +314,7 @@ impl FrontendQueryService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_recovery_bound(
         session_catalog_resolver: SessionCatalogResolver,
-        query_compiler: StandaloneQueryCompiler,
+        query_compiler: CoreQueryCompiler,
         catalog_command_executor: CatalogCommandExecutor,
         statistics_command_executor: StatisticsCommandExecutor,
         backend_command_executor: BackendCommandExecutor,
