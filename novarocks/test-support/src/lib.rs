@@ -21,6 +21,7 @@
 //! fixtures, provider conformance, and NovaRocks runtime semantics stay with
 //! their respective assertion owners.
 
+// Design: ADR-0069 (docs/adr/ADR-0069-shared-test-mechanics-owner.md)
 mod managed_process;
 mod reserved_tcp_port;
 

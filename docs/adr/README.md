@@ -227,6 +227,7 @@ engine port，connector 保留 catalog、snapshot、file 与 commit 等 external
 永久 guard。
 
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
+- ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 
 ### configuration
 
