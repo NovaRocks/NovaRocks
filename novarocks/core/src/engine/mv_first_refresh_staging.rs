@@ -6,24 +6,21 @@
 
 use std::sync::Arc;
 
-use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorWriteLease, ConnectorWriteOperationId,
-};
+use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
+use crate::engine::domain::QueryPreparationKernel;
+use crate::engine::iceberg_write_shuffle_by_output_name;
+use crate::engine::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
-use crate::engine::{StandaloneState, iceberg_write_shuffle_by_output_name};
 use crate::mv::application::{
-    MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, MvFirstRefreshWritePreparer,
-    MvFirstRefreshWriteRequest, MvRefreshPublicationBase, MvRefreshPublicationIntent,
-    MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite,
+    MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::mv_refresh::first_refresh::{
-    MvFirstRefreshPhysicalSql, MvFirstRefreshShape, MvFirstRefreshTargetContract,
     SqlMvFirstRefreshArtifact, SqlMvFirstRefreshArtifactInput, SqlMvFirstRefreshPlanner,
     SqlMvFirstRefreshPlannerInput,
 };
@@ -62,7 +59,8 @@ pub(crate) fn frozen_logical_context_from_rewrite(
 /// other frontend-owned write lifecycles; it deliberately does not submit a
 /// query, commit a provider mutation, or expose row payloads.
 pub(crate) fn bind_prepared_mv_first_refresh_staging(
-    state: &Arc<StandaloneState>,
+    query_kernel: &QueryPreparationKernel,
+    ports: &IcebergMvCorePorts,
     prepared: PreparedMvFirstRefreshWrite,
     planning_lease: &ConnectorControlPlanningLease,
     exact_lease: &ConnectorWriteLease,
@@ -126,7 +124,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             };
             let query = parse_query_from_sql(physical_sql.sql())?;
             crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
-                state,
+                query_kernel,
                 current_catalog.as_deref(),
                 &current_database,
                 &query,
@@ -146,7 +144,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                     .to_string()
             })?;
             let refresh_rewrite = rebuild_frozen_mv_rewrite_context(
-                state,
+                ports,
                 current_catalog.as_deref(),
                 &current_database,
                 expected_target_snapshot_id,
@@ -184,7 +182,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             )?;
             let (plan, factory) =
                 crate::engine::mv::iceberg_refresh::compile_canonical_select_for_imv_with_frozen_rewrite(
-                    state,
+                    query_kernel,
                     &refresh_rewrite,
                     &connector_context,
                     Arc::clone(&bindings),
@@ -233,7 +231,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 );
             };
             crate::engine::prepare_logical_plan_as_iceberg_write_with_connector_binding(
-                state,
+                query_kernel,
                 current_catalog.as_deref(),
                 &current_database,
                 plan,
@@ -256,7 +254,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
 }
 
 pub(crate) fn rebuild_frozen_mv_rewrite_context(
-    state: &Arc<StandaloneState>,
+    ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
     expected_target_snapshot_id: Option<i64>,
@@ -292,13 +290,14 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
                 .to_string(),
         );
     }
-    validate_frozen_join_base_facts(state, facts)?;
-    let target_binding = crate::mv::refresh::target_binding::load_mv_target_binding_with_lease(
-        state,
-        &target_identity,
-        planning_lease.clone(),
-        connector_context,
-    )?;
+    validate_frozen_join_base_facts(facts)?;
+    let target_binding =
+        crate::mv::refresh::target_binding::load_mv_target_binding_with_lease_and_ports(
+            ports.storage_observation(),
+            &target_identity,
+            planning_lease.clone(),
+            connector_context,
+        )?;
     if target_binding.table_uuid() != facts.target_table_uuid {
         return Err(
             "MV refresh logical artifact target UUID drifted after preparation".to_string(),
@@ -351,10 +350,7 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
     .map(Arc::new)
 }
 
-fn validate_frozen_join_base_facts(
-    state: &Arc<StandaloneState>,
-    facts: &MvFirstRefreshLogicalContext,
-) -> Result<(), String> {
+fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Result<(), String> {
     if facts.base_refs.is_empty() || facts.pin.len() != facts.base_refs.len() {
         return Err(
             "MV first-refresh logical artifact has incomplete base snapshot pins".to_string(),

@@ -214,6 +214,31 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
     }
 }
 
+/// MV activation compiles an already-admitted write against the same query
+/// kernel that froze its catalog/statistics facts. It must not recover the
+/// legacy aggregate just to enter the generic Iceberg-write preparation path.
+impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
+        self.connector_control().as_ref()
+    }
+
+    fn catalog_application(
+        &self,
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+        self.catalog_application().map(Arc::as_ref)
+    }
+
+    fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService {
+        self.query_execution()
+    }
+
+    fn capture_dml_fallback_execution(
+        &self,
+    ) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+        Err("MV activation requires an admitted query execution context".to_string())
+    }
+}
+
 /// Builds the request-local SQL materializer behind the Frontend-owned catalog
 /// admission gate.
 ///
@@ -1893,11 +1918,7 @@ impl StandaloneOpenServices {
 
 impl StandaloneNovaRocks {
     pub fn mv_refresh_provider_activation(&self) -> Arc<dyn MvRefreshProviderActivation> {
-        Arc::new(
-            crate::engine::mv::iceberg_activation::StandaloneMvRefreshProviderActivation::new(
-                Arc::downgrade(&self.inner),
-            ),
-        )
+        Arc::new(legacy_mv_refresh_provider_activation(&self.inner))
     }
 
     pub fn open(opts: StandaloneOptions, services: StandaloneOpenServices) -> Result<Self, String> {
@@ -2031,9 +2052,7 @@ impl StandaloneNovaRocks {
         }
         if let Some(sink) = &mv_refresh_provider_activation_sink {
             sink.bind_mv_refresh_provider_activation(Arc::new(
-                crate::engine::mv::iceberg_activation::StandaloneMvRefreshProviderActivation::new(
-                    Arc::downgrade(&inner),
-                ),
+                legacy_mv_refresh_provider_activation(&inner),
             ))?;
         }
         restore_application_state_if_needed(&inner, mv_startup_restore.as_ref())?;
@@ -4582,6 +4601,21 @@ fn legacy_maintenance_execution_kernel(
     )
 }
 
+fn legacy_mv_refresh_provider_activation(
+    state: &Arc<StandaloneState>,
+) -> crate::engine::mv::iceberg_activation::IcebergMvRefreshProviderActivation {
+    crate::engine::mv::iceberg_activation::IcebergMvRefreshProviderActivation::new(
+        legacy_query_preparation_kernel(state),
+        crate::engine::mv::iceberg_refresh::IcebergMvCorePorts::new(
+            Arc::clone(&state.catalog_service),
+            state.catalog_application.clone(),
+            Arc::clone(&state.connector_control),
+            Arc::clone(&state.mv_repository),
+            Arc::clone(&state.mv_storage_observation),
+        ),
+    )
+}
+
 fn prepare_explain_query(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -4994,7 +5028,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overl
 /// deadline, and cancellation observation as every other production write.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
-    state: &Arc<StandaloneState>,
+    state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     logical_plan: crate::sql::planner::logical::LogicalPlanNode,
@@ -5008,7 +5042,7 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
 ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
     crate::connector::validate_request_context(connector_context)?;
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
-    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
+    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         state,
         Arc::clone(&table_bindings),
     );
@@ -5055,7 +5089,7 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
         );
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        state.connector_control.as_ref(),
+        DmlQueryExecutionKernel::connector_control(state),
         connector_context,
         Some(table_bindings.as_ref()),
         Some(&scan_resolver),

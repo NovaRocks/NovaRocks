@@ -8,8 +8,6 @@
 //! managed-publication intent. The exact connector generation owns physical
 //! writer registration, provenance encoding and commit/reconcile machinery.
 
-use std::sync::Weak;
-
 use novarocks_spi::connector::{
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationIntent,
     ConnectorManagedPublicationTechnique, ConnectorRequestContext,
@@ -17,7 +15,8 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
-use crate::engine::StandaloneState;
+use crate::engine::domain::QueryPreparationKernel;
+use crate::engine::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::application::{
     MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshPublicationIntent,
     MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite, PreparedMvRefreshWrite,
@@ -25,20 +24,26 @@ use crate::mv::application::{
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
 
-/// Core-side provider adapter installed into the frontend composition. It
-/// retains only a weak engine reference, preventing a direct all-in-one
-/// lifecycle path or a runtime-liveness cycle.
-pub(crate) struct StandaloneMvRefreshProviderActivation {
-    state: Weak<StandaloneState>,
+/// Core-side provider adapter installed into the frontend composition.
+///
+/// It owns only the query-preparation kernel and MV leaf ports required to
+/// bind an already admitted write. It cannot recover a state aggregate or
+/// create a hidden all-in-one activation path.
+pub(crate) struct IcebergMvRefreshProviderActivation {
+    query_kernel: QueryPreparationKernel,
+    ports: IcebergMvCorePorts,
 }
 
-impl StandaloneMvRefreshProviderActivation {
-    pub(crate) fn new(state: Weak<StandaloneState>) -> Self {
-        Self { state }
+impl IcebergMvRefreshProviderActivation {
+    pub(crate) fn new(query_kernel: QueryPreparationKernel, ports: IcebergMvCorePorts) -> Self {
+        Self {
+            query_kernel,
+            ports,
+        }
     }
 }
 
-impl MvRefreshProviderActivation for StandaloneMvRefreshProviderActivation {
+impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
     fn activate_write(
         &self,
         prepared: PreparedMvRefreshWrite,
@@ -46,13 +51,11 @@ impl MvRefreshProviderActivation for StandaloneMvRefreshProviderActivation {
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, String> {
-        let state = self.state.upgrade().ok_or_else(|| {
-            "MV refresh provider activation is unavailable during engine shutdown".to_string()
-        })?;
         match prepared {
             PreparedMvRefreshWrite::FirstRefresh(prepared) => {
                 crate::engine::mv_first_refresh_staging::bind_prepared_mv_first_refresh_staging(
-                    &state,
+                    &self.query_kernel,
+                    &self.ports,
                     prepared,
                     planning_lease,
                     exact_lease,
@@ -61,7 +64,8 @@ impl MvRefreshProviderActivation for StandaloneMvRefreshProviderActivation {
             }
             PreparedMvRefreshWrite::Incremental(prepared) => {
                 crate::engine::mv::iceberg_refresh::bind_prepared_mv_incremental_staging(
-                    &state,
+                    &self.query_kernel,
+                    &self.ports,
                     prepared,
                     planning_lease,
                     exact_lease,
@@ -86,11 +90,9 @@ impl MvRefreshProviderActivation for StandaloneMvRefreshProviderActivation {
         committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
         connector_context: &ConnectorRequestContext,
     ) -> Result<(), String> {
-        let state = self.state.upgrade().ok_or_else(|| {
-            "MV repartition descriptor projection is unavailable during engine shutdown".to_string()
-        })?;
-        let mut definition = state
-            .mv_repository
+        let mut definition = self
+            .ports
+            .repository()
             .load_by_id(mv_id)
             .map_err(|error| format!("load MV definition for descriptor projection: {error}"))?
             .ok_or_else(|| {
@@ -101,8 +103,8 @@ impl MvRefreshProviderActivation for StandaloneMvRefreshProviderActivation {
         })?;
         schema.target.partition = Some(partition_spec.clone());
         definition.partition_spec = Some(partition_spec);
-        crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor(
-            &state,
+        crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
+            &self.ports,
             &definition,
             &definition.refresh_policy,
             definition.refresh_paused,

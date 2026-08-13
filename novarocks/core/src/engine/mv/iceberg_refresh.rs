@@ -1642,6 +1642,14 @@ impl IcebergMvCorePorts {
     pub(crate) fn repository(&self) -> &Arc<dyn MvRepository> {
         &self.repository
     }
+
+    pub(crate) fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+        self.connector_control.as_ref()
+    }
+
+    pub(crate) fn storage_observation(&self) -> &dyn MvStorageObservationPort {
+        self.storage_observation.as_ref()
+    }
 }
 
 impl crate::engine::CatalogServiceSource for IcebergMvCorePorts {
@@ -8443,7 +8451,7 @@ fn synthetic_snapshot_object_name(
 /// remaining logical join artifact: it deliberately does not re-register
 /// snapshot tables in `PlannerMemoryCatalog`.
 pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
-    state: &Arc<StandaloneState>,
+    query_kernel: &crate::engine::domain::QueryPreparationKernel,
     rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     bindings: Arc<QueryTableBindingStore>,
@@ -8456,13 +8464,13 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
     ),
     RefreshError,
 > {
-    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
+    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(query_kernel);
     let materializer = crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
         None,
         &catalog_service_snapshot,
         bindings,
         crate::engine::query_stats::iceberg_table_binding_loader(
-            state.connector_control.as_ref(),
+            query_kernel.connector_control().as_ref(),
             connector_context.clone(),
         ),
         overlays,
@@ -8470,8 +8478,8 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
     let mut query = (*rewrite.canonical_select_query).clone();
     crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
     let statistics =
-        crate::engine::query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
-            state,
+        crate::engine::query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+            query_kernel,
             materializer.query_table_bindings(),
         );
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
@@ -9705,7 +9713,7 @@ fn deletion_route_write_effect(
 /// frontend-owned incremental refresh attempt.
 #[allow(clippy::too_many_arguments)]
 fn prepare_imv_change_stream_writer(
-    state: &Arc<StandaloneState>,
+    query_kernel: &crate::engine::domain::QueryPreparationKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     refresh_plan: ImvRefreshPlannedChangeStream,
     provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
@@ -9725,17 +9733,15 @@ fn prepare_imv_change_stream_writer(
         effect_output_ordinal,
         provider_routes,
     )?;
-    let planned =
-        crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_connector_context(
-            state,
-            Some(&target.catalog),
-            &target.namespace,
-            &refresh_plan.optimized_tree,
-            Some(table_bindings),
-            &mut dag,
-            None,
-            connector_context,
-        )?;
+    let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_execution(
+        query_kernel.connector_control().as_ref(),
+        execution,
+        &refresh_plan.optimized_tree,
+        Some(table_bindings),
+        &mut dag,
+        None,
+        connector_context,
+    )?;
     crate::engine::prepare_planned_iceberg_change_stream_write(
         planned.prepared,
         planned.native_bundle,
@@ -9752,7 +9758,8 @@ fn prepare_imv_change_stream_writer(
 /// scan and writer facts here; it returns a prepared result-free request and
 /// never advances MV metadata or executes an external commit.
 pub(crate) fn bind_prepared_mv_incremental_staging(
-    state: &Arc<StandaloneState>,
+    query_kernel: &crate::engine::domain::QueryPreparationKernel,
+    ports: &IcebergMvCorePorts,
     prepared: crate::mv::application::PreparedMvIncrementalWrite,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
@@ -9767,7 +9774,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         crate::connector::connector_request_context_for_execution(None, execution)?;
     let refresh_rewrite =
         crate::engine::mv_first_refresh_staging::rebuild_frozen_mv_rewrite_context(
-            state,
+            ports,
             request.current_catalog.as_deref(),
             &request.current_database,
             request.expected_target_snapshot_id,
@@ -9917,9 +9924,9 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 target_binding,
                 rewrite_evidence,
             )?;
-            let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
+            let catalog_service_snapshot = crate::engine::catalog_service_snapshot(query_kernel);
             let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-                state,
+                ports,
                 &connector_context,
                 &refresh_rewrite.base_refs,
                 &refresh_rewrite.pin,
@@ -9930,13 +9937,13 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
                 crate::engine::query_stats::iceberg_table_binding_loader(
-                state.connector_control.as_ref(),
+                query_kernel.connector_control().as_ref(),
                     connector_context.clone(),
                 ),
                 base_overlays,
             );
-            crate::engine::plan_query_for_iceberg_change_stream_refresh(
-                state,
+            crate::engine::plan_query_for_iceberg_change_stream_refresh_with_statistics(
+                query_kernel,
                 &query,
                 &analyzer_catalog,
                 &refresh_rewrite.current_database,
@@ -9955,14 +9962,14 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 }
             };
             let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-                state,
+                ports,
                 &connector_context,
                 &refresh_rewrite.base_refs,
                 &refresh_rewrite.pin,
                 &refresh_rewrite.previous_snapshot_ids,
             )?;
             let (plan, factory) = compile_canonical_select_for_imv_with_frozen_rewrite(
-                state,
+                query_kernel,
                 &refresh_rewrite,
                 &connector_context,
                 Arc::clone(&target_bindings),
@@ -9998,7 +10005,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     };
     let operation_id = request.operation_id;
     let distributed = prepare_imv_change_stream_writer(
-        state,
+        query_kernel,
         &target,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
