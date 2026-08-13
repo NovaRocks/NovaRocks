@@ -105,6 +105,16 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
+        if crate::engine::statement::looks_like_alter_partition_column(&normalized) {
+            return execute_alter_partition_spec(
+                &self.kernel,
+                crate::engine::statement::parse_alter_partition_column_sql(&normalized)?,
+                current_catalog,
+                current_database,
+                connector_context,
+            )
+            .map(Some);
+        }
         let dialect = StarRocksDialect;
         let mut parser = Parser::new(&dialect)
             .try_with_sql(&normalized)
@@ -377,6 +387,80 @@ fn execute_alter_iceberg_schema(
                 table: Arc::from(target.table.as_str()),
             },
             changes: vec![change],
+        },
+        connector_context.clone(),
+    )?;
+    crate::engine::iceberg_writer::invalidate_iceberg_caches(kernel, &target)?;
+    Ok(StatementResult::Ok)
+}
+
+fn execute_alter_partition_spec(
+    kernel: &CatalogCommandKernel,
+    statement: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let table_name = match &statement {
+        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+            table,
+            ..
+        }
+        | crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+            table,
+            ..
+        } => table,
+    };
+    let target = crate::engine::backend_resolver::resolve_table_target(
+        kernel,
+        table_name,
+        current_catalog,
+        current_database,
+    )?;
+    if target.backend_name != "iceberg" {
+        return Err(format!(
+            "ALTER TABLE ADD/DROP PARTITION COLUMN only supports iceberg backends, got `{}`",
+            target.backend_name
+        ));
+    }
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        kernel.connector_control().as_ref(),
+        kernel.mv_storage_observation().as_ref(),
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+    )?;
+    let adding = matches!(
+        &statement,
+        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn { .. }
+    );
+    let partition_field = match &statement {
+        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+            field,
+            ..
+        }
+        | crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+            field,
+            ..
+        } => field,
+    };
+    let transform = crate::engine::connector_partition_transform(partition_field);
+    let instance_id =
+        ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        kernel.connector_control().as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterPartitionSpec {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            add: if adding {
+                vec![transform.clone()]
+            } else {
+                Vec::new()
+            },
+            drop: if adding { Vec::new() } else { vec![transform] },
         },
         connector_context.clone(),
     )?;

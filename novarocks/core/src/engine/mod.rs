@@ -3250,7 +3250,7 @@ pub(crate) fn connector_schema_position(
     }
 }
 
-fn connector_partition_transform(
+pub(crate) fn connector_partition_transform(
     field: &crate::sql::parser::ast::IcebergPartitionFieldExpr,
 ) -> novarocks_spi::connector::ConnectorPartitionTransform {
     use crate::sql::parser::ast::IcebergPartitionFieldExpr;
