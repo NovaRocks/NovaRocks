@@ -64,7 +64,7 @@ pub(crate) fn execute_with_kernel(
     )
 }
 
-fn execute_with_ports(
+pub(crate) fn execute_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     _current_database: &str,

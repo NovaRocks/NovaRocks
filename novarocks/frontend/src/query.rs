@@ -36,8 +36,8 @@ use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
     PreparedQueryOperation, SessionCatalogResolver, StandaloneCommandExecutor,
     StandaloneQueryCompiler, StatementResult, backend_command::BackendCommandExecutor,
-    catalog_command::CatalogCommandExecutor, statistics_command::StatisticsCommandExecutor,
-    view_command::ViewCommandExecutor,
+    catalog_command::CatalogCommandExecutor, iceberg_ref_command::IcebergRefCommandExecutor,
+    statistics_command::StatisticsCommandExecutor, view_command::ViewCommandExecutor,
 };
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
@@ -78,6 +78,7 @@ struct TypedThenLegacyCommand {
     statistics: StatisticsCommandExecutor,
     backend: BackendCommandExecutor,
     view: ViewCommandExecutor,
+    iceberg_ref: IcebergRefCommandExecutor,
     legacy: StandaloneCommandExecutor,
 }
 
@@ -87,6 +88,7 @@ impl TypedThenLegacyCommand {
         statistics: StatisticsCommandExecutor,
         backend: BackendCommandExecutor,
         view: ViewCommandExecutor,
+        iceberg_ref: IcebergRefCommandExecutor,
         legacy: StandaloneCommandExecutor,
     ) -> Self {
         Self {
@@ -94,6 +96,7 @@ impl TypedThenLegacyCommand {
             statistics,
             backend,
             view,
+            iceberg_ref,
             legacy,
         }
     }
@@ -132,7 +135,14 @@ impl CoreCommandRoute for TypedThenLegacyCommand {
                         &connector_context,
                     )? {
                         Some(result) => Ok(result),
-                        None => self.legacy.execute(sql, context, Some(query_options)),
+                        None => match self.iceberg_ref.try_execute(
+                            sql,
+                            context.session().current_database(),
+                            &connector_context,
+                        )? {
+                            Some(result) => Ok(result),
+                            None => self.legacy.execute(sql, context, Some(query_options)),
+                        },
                     },
                 },
             },
@@ -275,6 +285,7 @@ impl FrontendQueryService {
         statistics_command_executor: StatisticsCommandExecutor,
         backend_command_executor: BackendCommandExecutor,
         view_command_executor: ViewCommandExecutor,
+        iceberg_ref_command_executor: IcebergRefCommandExecutor,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
         role: ClusterRole,
@@ -296,6 +307,7 @@ impl FrontendQueryService {
                 statistics_command_executor,
                 backend_command_executor,
                 view_command_executor,
+                iceberg_ref_command_executor,
                 command_executor,
             )),
             query_control,

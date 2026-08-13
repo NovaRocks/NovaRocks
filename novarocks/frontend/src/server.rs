@@ -227,6 +227,7 @@ where
             let statistics_command_executor = engine.statistics_command_executor();
             let backend_command_executor = engine.backend_command_executor();
             let view_command_executor = engine.view_command_executor();
+            let iceberg_ref_command_executor = engine.iceberg_ref_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
             let mutation_engine = engine.mutation_engine();
@@ -249,6 +250,7 @@ where
                     statistics_command_executor,
                     backend_command_executor,
                     view_command_executor,
+                    iceberg_ref_command_executor,
                     query_control,
                     query_execution,
                     role,
@@ -352,6 +354,7 @@ where
             let statistics_command_executor = engine.statistics_command_executor();
             let backend_command_executor = engine.backend_command_executor();
             let view_command_executor = engine.view_command_executor();
+            let iceberg_ref_command_executor = engine.iceberg_ref_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
             let mutation_engine = engine.mutation_engine();
@@ -374,6 +377,7 @@ where
                     statistics_command_executor,
                     backend_command_executor,
                     view_command_executor,
+                    iceberg_ref_command_executor,
                     query_control,
                     query_execution,
                     role,

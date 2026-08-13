@@ -59,6 +59,7 @@ pub use domain::SessionCatalogResolver;
 pub mod external_write_fence;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
+pub mod iceberg_ref_command;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub mod insert_engine;
@@ -2089,6 +2090,13 @@ impl StandaloneNovaRocks {
         backend_command::BackendCommandExecutor::new(domain::BackendManagementKernel::new(
             self.inner.backend_topology.clone(),
         ))
+    }
+
+    pub fn iceberg_ref_command_executor(&self) -> iceberg_ref_command::IcebergRefCommandExecutor {
+        iceberg_ref_command::IcebergRefCommandExecutor::new(
+            Arc::clone(&self.inner.connector_control),
+            Arc::clone(&self.inner.mv_storage_observation),
+        )
     }
 
     /// Transitional factory for the closed external-view capability.
