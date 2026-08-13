@@ -15,14 +15,59 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Closed read-only table-maintenance command capability.
+//! Closed table-maintenance command capabilities.
 
 use std::sync::Arc;
 
 use crate::engine::StatementResult;
 use crate::engine::table_maintenance::{
-    MaintenanceRequestContext, MaintenanceStatementResult, TableMaintenanceService,
+    MaintenanceRequestContext, MaintenanceStatementResult, RequestScopedMaintenanceEngine,
+    TableMaintenanceService,
 };
+
+/// Foreground maintenance command capability.  Each invocation creates a
+/// short-lived engine carrying only the Frontend-composed maintenance ports
+/// and the already-admitted request execution.  It cannot use the legacy
+/// `StandaloneState` façade or manufacture a topology/cancellation fallback.
+#[derive(Clone)]
+pub struct MaintenanceCommandExecutor {
+    kernel: crate::engine::domain::MaintenanceExecutionKernel,
+}
+
+impl MaintenanceCommandExecutor {
+    pub(crate) fn new(kernel: crate::engine::domain::MaintenanceExecutionKernel) -> Self {
+        Self { kernel }
+    }
+
+    pub fn try_execute(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Option<StatementResult>, String> {
+        if !crate::engine::table_maintenance::looks_like_maintenance_statement(sql) {
+            return Ok(None);
+        }
+        let engine = RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            execution.clone(),
+            connector_context.clone(),
+        );
+        self.kernel
+            .service()
+            .try_handle_statement(
+                &engine,
+                sql,
+                MaintenanceRequestContext {
+                    current_catalog,
+                    current_database,
+                },
+            )
+            .map(|result| result.map(statement_result))
+    }
+}
 
 #[derive(Clone)]
 pub struct MaintenanceReadCommandExecutor {
@@ -51,12 +96,14 @@ impl MaintenanceReadCommandExecutor {
                     current_database,
                 },
             )
-            .map(|result| {
-                result.map(|result| match result {
-                    MaintenanceStatementResult::Ok => StatementResult::Ok,
-                    MaintenanceStatementResult::Query(result) => StatementResult::Query(result),
-                })
-            })
+            .map(|result| result.map(statement_result))
+    }
+}
+
+fn statement_result(result: MaintenanceStatementResult) -> StatementResult {
+    match result {
+        MaintenanceStatementResult::Ok => StatementResult::Ok,
+        MaintenanceStatementResult::Query(result) => StatementResult::Query(result),
     }
 }
 

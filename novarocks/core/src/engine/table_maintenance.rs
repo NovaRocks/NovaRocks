@@ -642,6 +642,460 @@ impl TableMaintenanceService for EmptyTableMaintenanceService {
     }
 }
 
+/// One foreground SQL maintenance command bound to the exact request admitted
+/// by Frontend.  It deliberately contains only the maintenance kernel and
+/// immutable request facts; it cannot recover a `StandaloneState` or capture
+/// a second topology, deadline, or cancellation scope.
+#[derive(Clone)]
+pub(crate) struct RequestScopedMaintenanceEngine {
+    kernel: crate::engine::domain::MaintenanceExecutionKernel,
+    execution: crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+impl RequestScopedMaintenanceEngine {
+    pub(crate) fn new(
+        kernel: crate::engine::domain::MaintenanceExecutionKernel,
+        execution: crate::query_execution::request_context::QueryExecutionContext,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            kernel,
+            execution,
+            connector_context,
+        }
+    }
+
+    fn connector_context_for_attempt(
+        &self,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
+        attempt.connector_request_context_with_attempt(&self.connector_context)
+    }
+
+    fn target_identity(
+        target: &MaintenanceTarget,
+    ) -> Result<novarocks_spi::connector::ConnectorTableIdentity, String> {
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        Ok(novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id,
+            namespace: target.namespace.clone().into(),
+            table: target.table.clone().into(),
+        })
+    }
+}
+
+impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
+    for RequestScopedMaintenanceEngine
+{
+    fn invalidate_generic_table(
+        &self,
+        table: &novarocks_spi::connector::ConnectorTableIdentity,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer::invalidate_generic_table(
+            &self.kernel,
+            table,
+        )
+    }
+}
+
+impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
+    fn resolve_target(
+        &self,
+        name_parts: &[String],
+        context: MaintenanceRequestContext<'_>,
+    ) -> Result<MaintenanceTarget, String> {
+        let target = crate::engine::backend_resolver::resolve_existing_table_target(
+            &self.kernel,
+            &crate::sql::parser::ast::ObjectName {
+                parts: name_parts.to_vec(),
+            },
+            context.current_catalog,
+            context.current_database,
+        )?;
+        if target.backend_name != "iceberg" {
+            return Err(format!(
+                "table maintenance only supports iceberg backends, got `{}`",
+                target.backend_name
+            ));
+        }
+        Ok(MaintenanceTarget {
+            catalog: target.catalog,
+            namespace: target.namespace,
+            table: target.table,
+        })
+    }
+
+    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+        use novarocks_spi::connector::{
+            ConnectorControlResolver, ConnectorInstanceId, ConnectorTableResolution,
+        };
+
+        let instance_id = ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
+        let exact_lease = ConnectorControlResolver::acquire_current(
+            self.kernel.connector_control().as_ref(),
+            &instance_id,
+        )
+        .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
+        let identity = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id,
+            namespace: Arc::from(target.namespace.as_str()),
+            table: Arc::from(target.table.as_str()),
+        };
+        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+            &exact_lease,
+            self.connector_context.clone(),
+            &target.namespace,
+            &target.table,
+            ConnectorTableResolution::StrictBaseTable,
+        )?;
+        if metadata.identity != identity {
+            return Err(
+                "connector loaded a different table while checking the MV mutation guard"
+                    .to_string(),
+            );
+        }
+        if self
+            .kernel
+            .mv_storage_observation()
+            .observe_lake_package(&exact_lease, &metadata, self.connector_context.clone())
+            .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
+            .is_some()
+        {
+            return Err(format!(
+                "table {}.{}.{} is a materialized view; use ALTER MATERIALIZED VIEW or DROP MATERIALIZED VIEW",
+                target.catalog, target.namespace, target.table,
+            ));
+        }
+        Ok(())
+    }
+
+    fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
+        crate::engine::iceberg_maintenance::current_snapshot_id_with_ports(
+            self.kernel.connector_control().as_ref(),
+            target,
+            self.connector_context.clone(),
+        )
+    }
+
+    fn execute_action(
+        &self,
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        if matches!(request, MaintenanceActionRequest::RemoveOrphanFiles { .. }) {
+            return Err(
+                "remove orphan files must be dispatched by the frontend durable cleanup owner"
+                    .to_string(),
+            );
+        }
+        crate::engine::iceberg_maintenance::execute_action_with_ports(
+            self.kernel.connector_control().as_ref(),
+            &self.kernel,
+            request,
+            self.connector_context.clone(),
+        )
+    }
+
+    fn plan_metadata_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorMutationOperationId,
+        intent: MetadataMaintenanceIntent,
+    ) -> Result<MetadataMaintenanceSession, String> {
+        self.plan_metadata_maintenance_with_attempt_context(
+            target,
+            operation_id,
+            intent,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn plan_metadata_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorMutationOperationId,
+        intent: MetadataMaintenanceIntent,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<MetadataMaintenanceSession, String> {
+        let identity = Self::target_identity(target)?;
+        crate::connector::metadata_maintenance::plan_metadata_maintenance_session(
+            self.kernel.connector_control().as_ref(),
+            &identity.instance_id.clone(),
+            operation_id,
+            identity,
+            intent,
+            self.connector_context_for_attempt(attempt)?,
+        )
+    }
+
+    fn execute_planned_metadata_maintenance(
+        &self,
+        session: MetadataMaintenanceSession,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        crate::connector::metadata_maintenance::execute_planned_metadata_maintenance(session, self)
+    }
+
+    fn reconcile_metadata_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorMetadataMaintenancePlan,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        self.reconcile_metadata_maintenance_with_attempt_context(
+            target,
+            plan,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn reconcile_metadata_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorMetadataMaintenancePlan,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        crate::connector::metadata_maintenance::reconcile_metadata_maintenance_session(
+            self.kernel.connector_control().as_ref(),
+            self,
+            Self::target_identity(target)?,
+            plan,
+            self.connector_context_for_attempt(attempt)?,
+        )
+    }
+
+    fn plan_cleanup_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.plan_cleanup_maintenance_with_attempt_context(
+            target,
+            operation_id,
+            older_than_ms,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn plan_cleanup_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        let identity = Self::target_identity(target)?;
+        CleanupMaintenanceSession::plan(
+            self.kernel.connector_control().as_ref(),
+            &identity.instance_id.clone(),
+            operation_id,
+            identity,
+            older_than_ms,
+            self.connector_context_for_attempt(attempt)?,
+        )
+        .map_err(|error| format!("plan orphan cleanup operation: {error}"))
+    }
+
+    fn recover_cleanup_for_reconcile(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorCleanupPlan,
+        prepared: PreparedBatch,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.recover_cleanup_for_reconcile_with_attempt_context(
+            target,
+            plan,
+            prepared,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn recover_cleanup_for_reconcile_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorCleanupPlan,
+        prepared: PreparedBatch,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        CleanupMaintenanceSession::recover_for_reconcile(
+            self.kernel.connector_control().as_ref(),
+            Self::target_identity(target)?,
+            plan,
+            prepared,
+            self.connector_context_for_attempt(attempt)?,
+        )
+        .map_err(|error| format!("recover orphan cleanup operation: {error}"))
+    }
+
+    fn prepare_cleanup_batch(
+        &self,
+        session: &CleanupMaintenanceSession,
+        batch_ordinal: u32,
+    ) -> Result<PreparedBatch, String> {
+        session
+            .prepare_batch(batch_ordinal)
+            .map_err(|error| format!("prepare orphan cleanup batch: {error}"))
+    }
+
+    fn execute_cleanup_batch(
+        &self,
+        session: &CleanupMaintenanceSession,
+        prepared: PreparedBatch,
+    ) -> Result<CleanupBatchExecution, String> {
+        session
+            .execute_batch(prepared)
+            .map_err(|error| format!("execute orphan cleanup batch: {error}"))
+    }
+
+    fn reconcile_cleanup_batch(
+        &self,
+        session: &CleanupMaintenanceSession,
+        prepared: PreparedBatch,
+    ) -> Result<BatchReceipt, String> {
+        session
+            .reconcile_batch(prepared)
+            .map_err(|error| format!("reconcile orphan cleanup batch: {error}"))
+    }
+
+    fn read_cleanup_candidate_page(
+        &self,
+        session: &CleanupMaintenanceSession,
+        offset: u64,
+        limit: u32,
+    ) -> Result<CandidatePage, String> {
+        session
+            .read_candidate_page(offset, limit)
+            .map_err(|error| format!("read orphan cleanup candidate page: {error}"))
+    }
+
+    fn finalize_cleanup_terminal(&self, session: &CleanupMaintenanceSession) -> Result<(), String> {
+        session
+            .finalize_terminal()
+            .map_err(|error| format!("finalize orphan cleanup artifacts: {error}"))
+    }
+
+    fn plan_distributed_rewrite(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        intent: DistributedRewriteIntent,
+    ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        self.plan_distributed_rewrite_with_context(
+            target,
+            operation_id,
+            intent,
+            self.connector_context.clone(),
+        )
+    }
+
+    fn plan_distributed_rewrite_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        intent: DistributedRewriteIntent,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        self.plan_distributed_rewrite_with_context(
+            target,
+            operation_id,
+            intent,
+            self.connector_context_for_attempt(attempt)?,
+        )
+    }
+
+    fn stage_distributed_rewrite_cohort(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+        cohort_id: ConnectorWriteCohortId,
+    ) -> Result<ConnectorWriteCompletion, String> {
+        stage_frozen_rewrite_cohort_with_ports(
+            self.kernel.connector_control().as_ref(),
+            self.kernel.query_execution(),
+            session.session(),
+            cohort_id,
+            session.execution(),
+            session.context(),
+        )
+        .map(|(completion, _summary)| completion)
+    }
+
+    fn checkpoint_distributed_rewrite_attempt(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+        completion: &ConnectorWriteCompletion,
+    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, String> {
+        session
+            .session()
+            .checkpoint_accepted(completion)
+            .map_err(|error| format!("checkpoint distributed rewrite attempt: {error}"))
+    }
+
+    fn commit_distributed_rewrite(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        session
+            .session()
+            .commit(session.context().clone())
+            .map_err(|error| format!("commit distributed rewrite operation: {error}"))
+    }
+
+    fn abort_distributed_rewrite(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+    ) -> Result<ConnectorWriteAbortOutcome, String> {
+        session
+            .session()
+            .abort(session.context().clone())
+            .map_err(|error| format!("abort distributed rewrite operation: {error}"))
+    }
+
+    fn reconcile_distributed_rewrite(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+        evidence: ExternalMutationEvidence,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        session
+            .session()
+            .reconcile(evidence, session.context().clone())
+            .map_err(|error| format!("reconcile distributed rewrite operation: {error}"))
+    }
+
+    fn finalize_distributed_rewrite(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+        receipt: &ConnectorWriteReceipt,
+    ) -> Result<ConnectorDistributedRewriteReceipt, String> {
+        session
+            .session()
+            .finalize_committed(receipt)
+            .map_err(|error| format!("finalize distributed rewrite operation: {error}"))
+    }
+}
+
+impl RequestScopedMaintenanceEngine {
+    fn plan_distributed_rewrite_with_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        intent: DistributedRewriteIntent,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        let identity = Self::target_identity(target)?;
+        crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
+            self.kernel.query_execution(),
+            self.kernel.connector_control().as_ref(),
+            &identity.instance_id.clone(),
+            identity,
+            operation_id,
+            intent,
+            self.execution.clone(),
+            connector_context,
+        )
+    }
+}
+
 impl crate::engine::StandaloneState {
     fn shared_for_table_maintenance(&self) -> Result<Arc<Self>, String> {
         self.self_weak.upgrade().ok_or_else(|| {
@@ -1022,8 +1476,9 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         cohort_id: ConnectorWriteCohortId,
     ) -> Result<ConnectorWriteCompletion, String> {
         let state = self.shared_for_table_maintenance()?;
-        stage_frozen_rewrite_cohort(
-            &state,
+        stage_frozen_rewrite_cohort_with_ports(
+            state.connector_control.as_ref(),
+            &state.query_execution,
             session.session(),
             cohort_id,
             session.execution(),
@@ -1088,8 +1543,9 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
 
 /// Stage one provider-frozen rewrite cohort through the ordinary connector
 /// read and write contracts retained by its exact composite lease.
-fn stage_frozen_rewrite_cohort(
-    state: &Arc<crate::engine::StandaloneState>,
+fn stage_frozen_rewrite_cohort_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
@@ -1149,11 +1605,12 @@ fn stage_frozen_rewrite_cohort(
     let registration = session
         .execution_registration(cohort_id)
         .map_err(|error| format!("register frozen rewrite cohort: {error}"))?;
-    crate::engine::execute_frozen_rewrite_physical_plan_as_iceberg_staging(
-        state,
+    crate::engine::execute_frozen_rewrite_physical_plan_as_iceberg_staging_with_ports(
+        connector_control,
+        query_execution,
         physical_plan,
         sink,
-        Some(execution),
+        execution,
         context,
         table_bindings.as_ref(),
         &resolver,
@@ -1191,7 +1648,7 @@ fn rewrite_sink_mode(
     }
 }
 
-fn looks_like_maintenance_statement(sql: &str) -> bool {
+pub(crate) fn looks_like_maintenance_statement(sql: &str) -> bool {
     if crate::sql::parser::procedure::looks_like_call_procedure(sql) {
         return true;
     }

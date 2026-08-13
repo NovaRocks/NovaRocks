@@ -2118,6 +2118,22 @@ impl StandaloneNovaRocks {
         ))
     }
 
+    /// Foreground maintenance statements use an explicit request-scoped
+    /// capability. The frontend supplies the admitted execution snapshot for
+    /// every invocation; this factory copies no aggregate state into it.
+    pub fn maintenance_command_executor(&self) -> maintenance_command::MaintenanceCommandExecutor {
+        maintenance_command::MaintenanceCommandExecutor::new(
+            domain::MaintenanceExecutionKernel::new(
+                Arc::clone(&self.inner.catalog_service),
+                self.inner.catalog_application.clone(),
+                Arc::clone(&self.inner.connector_control),
+                Arc::clone(&self.inner.mv_storage_observation),
+                self.inner.query_execution.clone(),
+                Arc::clone(&self.inner.table_maintenance_service),
+            ),
+        )
+    }
+
     /// Transitional factory for the closed non-refresh MV command capability.
     /// The returned executor owns only explicit MV ports and cannot reach the
     /// application facade or `StandaloneState`.

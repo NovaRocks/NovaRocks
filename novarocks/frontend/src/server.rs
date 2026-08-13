@@ -222,13 +222,13 @@ where
             .map_err(FrontendApplicationError::server)?;
             let session_catalog_resolver = engine.session_catalog_resolver();
             let query_compiler = engine.query_compiler();
-            let command_executor = engine.command_executor();
             let catalog_command_executor = engine.catalog_command_executor();
             let statistics_command_executor = engine.statistics_command_executor();
             let backend_command_executor = engine.backend_command_executor();
             let view_command_executor = engine.view_command_executor();
             let iceberg_ref_command_executor = engine.iceberg_ref_command_executor();
             let mv_command_executor = engine.mv_command_executor();
+            let maintenance_command_executor = engine.maintenance_command_executor();
             let maintenance_read_command_executor = engine.maintenance_read_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
@@ -247,13 +247,13 @@ where
                 Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
                     session_catalog_resolver,
                     query_compiler,
-                    command_executor,
                     catalog_command_executor,
                     statistics_command_executor,
                     backend_command_executor,
                     view_command_executor,
                     iceberg_ref_command_executor,
                     mv_command_executor,
+                    maintenance_command_executor,
                     maintenance_read_command_executor,
                     query_control,
                     query_execution,
@@ -353,13 +353,13 @@ where
             .map_err(FrontendApplicationError::server)?;
             let session_catalog_resolver = engine.session_catalog_resolver();
             let query_compiler = engine.query_compiler();
-            let command_executor = engine.command_executor();
             let catalog_command_executor = engine.catalog_command_executor();
             let statistics_command_executor = engine.statistics_command_executor();
             let backend_command_executor = engine.backend_command_executor();
             let view_command_executor = engine.view_command_executor();
             let iceberg_ref_command_executor = engine.iceberg_ref_command_executor();
             let mv_command_executor = engine.mv_command_executor();
+            let maintenance_command_executor = engine.maintenance_command_executor();
             let maintenance_read_command_executor = engine.maintenance_read_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
@@ -378,13 +378,13 @@ where
                 Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
                     session_catalog_resolver,
                     query_compiler,
-                    command_executor,
                     catalog_command_executor,
                     statistics_command_executor,
                     backend_command_executor,
                     view_command_executor,
                     iceberg_ref_command_executor,
                     mv_command_executor,
+                    maintenance_command_executor,
                     maintenance_read_command_executor,
                     query_control,
                     query_execution,

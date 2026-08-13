@@ -34,11 +34,14 @@ use novarocks::engine::insert_engine::InsertEngine;
 use novarocks::engine::mutation_engine::MutationEngine;
 use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
-    PreparedQueryOperation, SessionCatalogResolver, StandaloneCommandExecutor,
-    StandaloneQueryCompiler, StatementResult, backend_command::BackendCommandExecutor,
-    catalog_command::CatalogCommandExecutor, iceberg_ref_command::IcebergRefCommandExecutor,
-    maintenance_command::MaintenanceReadCommandExecutor, mv_command::MvCommandExecutor,
-    statistics_command::StatisticsCommandExecutor, view_command::ViewCommandExecutor,
+    PreparedQueryOperation, SessionCatalogResolver, StandaloneQueryCompiler, StatementResult,
+    backend_command::BackendCommandExecutor,
+    catalog_command::CatalogCommandExecutor,
+    iceberg_ref_command::IcebergRefCommandExecutor,
+    maintenance_command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor},
+    mv_command::MvCommandExecutor,
+    statistics_command::StatisticsCommandExecutor,
+    view_command::ViewCommandExecutor,
 };
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
@@ -74,18 +77,18 @@ pub trait CoreCommandRoute: Send + Sync {
 }
 
 #[derive(Clone)]
-struct TypedThenLegacyCommand {
+struct TypedCommandRoute {
     catalog: CatalogCommandExecutor,
     statistics: StatisticsCommandExecutor,
     backend: BackendCommandExecutor,
     view: ViewCommandExecutor,
     iceberg_ref: IcebergRefCommandExecutor,
     mv: MvCommandExecutor,
+    maintenance: MaintenanceCommandExecutor,
     maintenance_read: MaintenanceReadCommandExecutor,
-    legacy: StandaloneCommandExecutor,
 }
 
-impl TypedThenLegacyCommand {
+impl TypedCommandRoute {
     fn new(
         catalog: CatalogCommandExecutor,
         statistics: StatisticsCommandExecutor,
@@ -93,8 +96,8 @@ impl TypedThenLegacyCommand {
         view: ViewCommandExecutor,
         iceberg_ref: IcebergRefCommandExecutor,
         mv: MvCommandExecutor,
+        maintenance: MaintenanceCommandExecutor,
         maintenance_read: MaintenanceReadCommandExecutor,
-        legacy: StandaloneCommandExecutor,
     ) -> Self {
         Self {
             catalog,
@@ -103,13 +106,13 @@ impl TypedThenLegacyCommand {
             view,
             iceberg_ref,
             mv,
+            maintenance,
             maintenance_read,
-            legacy,
         }
     }
 }
 
-impl CoreCommandRoute for TypedThenLegacyCommand {
+impl CoreCommandRoute for TypedCommandRoute {
     fn execute(
         &self,
         sql: &str,
@@ -156,13 +159,22 @@ impl CoreCommandRoute for TypedThenLegacyCommand {
                                 context.execution(),
                             )? {
                                 Some(result) => Ok(result),
-                                None => match self.maintenance_read.try_execute(
+                                None => match self.maintenance.try_execute(
                                     sql,
                                     context.session().current_catalog(),
                                     context.session().current_database(),
+                                    context.execution(),
+                                    &connector_context,
                                 )? {
                                     Some(result) => Ok(result),
-                                    None => self.legacy.execute(sql, context, Some(query_options)),
+                                    None => match self.maintenance_read.try_execute(
+                                        sql,
+                                        context.session().current_catalog(),
+                                        context.session().current_database(),
+                                    )? {
+                                        Some(result) => Ok(result),
+                                        None => Err("unsupported SQL command for the frontend capability router".to_string()),
+                                    },
                                 },
                             },
                         },
@@ -303,13 +315,13 @@ impl FrontendQueryService {
     pub(crate) fn new_with_recovery_bound(
         session_catalog_resolver: SessionCatalogResolver,
         query_compiler: StandaloneQueryCompiler,
-        command_executor: StandaloneCommandExecutor,
         catalog_command_executor: CatalogCommandExecutor,
         statistics_command_executor: StatisticsCommandExecutor,
         backend_command_executor: BackendCommandExecutor,
         view_command_executor: ViewCommandExecutor,
         iceberg_ref_command_executor: IcebergRefCommandExecutor,
         mv_command_executor: MvCommandExecutor,
+        maintenance_command_executor: MaintenanceCommandExecutor,
         maintenance_read_command_executor: MaintenanceReadCommandExecutor,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
@@ -327,15 +339,15 @@ impl FrontendQueryService {
         Self {
             session_catalog_resolver,
             query_compiler,
-            command_executor: Arc::new(TypedThenLegacyCommand::new(
+            command_executor: Arc::new(TypedCommandRoute::new(
                 catalog_command_executor,
                 statistics_command_executor,
                 backend_command_executor,
                 view_command_executor,
                 iceberg_ref_command_executor,
                 mv_command_executor,
+                maintenance_command_executor,
                 maintenance_read_command_executor,
-                command_executor,
             )),
             query_control,
             query_execution,
