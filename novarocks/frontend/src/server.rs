@@ -27,7 +27,6 @@ use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::engine::frontend_capabilities as core_capabilities;
 use novarocks::engine::table_maintenance::BackgroundMaintenanceAttemptFactory;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
-use novarocks::query_execution::backend::CoordinatorReportEndpointSink;
 use novarocks::query_execution::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
@@ -68,63 +67,6 @@ pub struct FrontendServerConfig {
     /// Typed StateStore host input. The FE remains the owner of opening and
     /// shutting down this host; the server only supplies the composition data.
     pub state_store_host_config: Option<StateStoreHostConfig>,
-}
-
-#[cfg(test)]
-fn standalone_open_services(
-    system_catalog: Arc<dyn novarocks::engine::system_catalog::SystemCatalog>,
-    host: &FrontendApplicationHost,
-    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-) -> novarocks::engine::StandaloneOpenServices {
-    novarocks::engine::StandaloneOpenServices::new(
-        host.execution_role(),
-        system_catalog,
-        host.view_service(),
-        host.statistics_service(),
-        host.table_maintenance_service(),
-        host.mv_repository(),
-        host.mv_application_service(),
-        host.query_execution_service(),
-        host.backend_query_event_sink(),
-        host.backend_topology_port(),
-        host.coordinator_report_endpoint_sink(),
-        host.query_control_service(),
-        host.connector_control_registry(),
-        host.connector_control_factory_resolver(),
-        0,
-    )
-    .with_catalog_application(
-        host.catalog_application_port(),
-        host.catalog_runtime_projection(),
-    )
-    .with_statistics_application(host.statistics_application_port())
-    .with_statistics_target_resolver_sink(host.statistics_application_port())
-    .with_statistics_table_reader_sink(host.statistics_application_port())
-    .with_statistics_attempt_executor_sink(host.statistics_application_port())
-    .with_mv_refresh_provider_activation_sink(host.mv_refresh_provider_activation_sink())
-    .with_mv_background_engine_sink(host.mv_background_engine_sink())
-    .with_mv_storage_observation(mv_storage_observation.clone())
-    // The frontend owns when MV state is restored at startup. The engine keeps
-    // its own implementation as the fallback for a composition without a
-    // frontend; both run through the same runner, so the step ordering is
-    // identical either way.
-    .with_mv_startup_restore(Arc::new(
-        crate::mv::startup_restore::FrontendMvStartupRestore::new(
-            host.connector_control_registry(),
-            host.catalog_runtime_projection(),
-            host.catalog_application_port(),
-            mv_storage_observation,
-            host.mv_repository(),
-            {
-                let application = host.mv_application_service();
-                Box::new(move || {
-                    application
-                        .recover_startup_mv_refreshes()
-                        .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
-                })
-            },
-        ),
-    ))
 }
 
 /// Opens the frontend services once for an externally composed server. The
@@ -775,13 +717,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown,
-        run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
-        standalone_open_services,
+        FrontendServerConfig, build_frontend_query_session_factory, run_frontend_server,
+        run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
+        run_frontend_server_with_signal_and_ports,
     };
     use crate::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
         FrontendExecutionConfig,
+    };
+    use novarocks::{
+        catalog_application::CatalogAdmission, query_execution::session::QuerySessionOpenRequest,
     };
     use novarocks_state_store::{
         FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
@@ -893,48 +838,22 @@ mod tests {
                 .await
                 .expect("open catalog attachment repository");
 
-        let services = standalone_open_services(
-            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+        let session_factory = build_frontend_query_session_factory(
             &host,
+            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+            0,
             Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
-        );
-        assert!(
-            services.catalog_application.is_some(),
-            "production composition must install the frontend catalog application"
-        );
-        assert!(
-            services.catalog_runtime_projection.is_some(),
-            "production composition must install the catalog runtime projection"
-        );
-        let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
-            novarocks::engine::StandaloneOptions::default(),
-            config,
-            services,
         )
-        .expect("open engine with the frontend catalog authority");
-
-        let cancellation = novarocks::query_execution::cancellation::QueryCancellationSource::new();
-        let context = novarocks::query_execution::request_context::RequestContext::admit(
-            novarocks::query_execution::request_context::RequestAdmission::new(
-                None,
-                "db1".to_string(),
-                novarocks::common::app_config::ClusterRole::AllInOne,
-                novarocks::query_execution::backend::BackendTopologySnapshot::empty(1),
-                None,
-                cancellation.view(),
-                novarocks::query_execution::request_context::SessionOptimizerSettings::default(),
-            ),
-        );
+        .expect("build ready frontend session factory");
+        let session = session_factory
+            .open_session(QuerySessionOpenRequest::new(1, "cp2-cutover"))
+            .expect("open frontend query session");
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
 
-        engine
-            .command_executor()
-            .execute(
-                r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#,
-                &context,
-                None,
-            )
+        session
+            .execute_batch(r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#)
+            .await
             .expect("CREATE CATALOG commits a durable StateStore attachment");
         let created = attachments
             .get(&instance_id)
@@ -943,13 +862,18 @@ mod tests {
             .expect("CREATE CATALOG must commit to the StateStore attachment keyspace");
         assert_eq!(created.attachment.provider_id.as_str(), "iceberg");
         assert_eq!(created.attachment.display_name, "warehouse");
-        engine
-            .require_external_catalog_ready("warehouse")
-            .expect("the committed attachment is admitted by this frontend");
+        assert!(matches!(
+            host.catalog_application_port().admit_catalog(&instance_id),
+            CatalogAdmission::Ready(_)
+        ));
+        session
+            .execute_batch("SET CATALOG warehouse")
+            .await
+            .expect("the committed attachment is admitted by this frontend session");
 
-        engine
-            .command_executor()
-            .execute("DROP CATALOG warehouse", &context, None)
+        session
+            .execute_batch("DROP CATALOG warehouse")
+            .await
             .expect("DROP CATALOG deletes the durable StateStore attachment");
         assert!(
             attachments
@@ -959,19 +883,26 @@ mod tests {
                 .is_none(),
             "DROP CATALOG must remove the durable attachment"
         );
+        assert!(matches!(
+            host.catalog_application_port().admit_catalog(&instance_id),
+            CatalogAdmission::Absent
+        ));
         assert_eq!(
-            engine
-                .require_external_catalog_ready("warehouse")
+            session
+                .execute_batch("SET CATALOG warehouse")
+                .await
                 .expect_err("a dropped catalog stops being admitted")
                 .kind(),
-            novarocks::catalog_application::CatalogApplicationErrorKind::NotFound
+            novarocks::query_execution::session::QueryServiceErrorKind::BadDatabase
         );
 
-        // The engine and this test's probe both hold StateStore references; the
+        // The ready session factory and this test's probe both hold StateStore references; the
         // host owns closing the deployment lock, so release them first.
         drop(attachments);
         drop(store);
-        drop(engine);
+        session.close();
+        drop(session);
+        drop(session_factory);
         host.shutdown().await.expect("host shutdown");
     }
 
@@ -1028,43 +959,36 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
-        let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
-            novarocks::engine::StandaloneOptions::default(),
-            config,
-            standalone_open_services(
-                Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
-                &host,
-                Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
-            ),
+        let session_factory = build_frontend_query_session_factory(
+            &host,
+            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+            0,
+            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
         )
-        .expect("open engine with frontend-owned application services");
-
-        let cancellation = novarocks::query_execution::cancellation::QueryCancellationSource::new();
-        let context = novarocks::query_execution::request_context::RequestContext::admit(
-            novarocks::query_execution::request_context::RequestAdmission::new(
-                None,
-                "db1".to_string(),
-                novarocks::common::app_config::ClusterRole::AllInOne,
-                novarocks::query_execution::backend::BackendTopologySnapshot::empty(1),
-                None,
-                cancellation.view(),
-                novarocks::query_execution::request_context::SessionOptimizerSettings::default(),
-            ),
-        );
-        let error = engine
-            .command_executor()
-            .execute("SHOW ANALYZE JOBS", &context, None)
+        .expect("build ready frontend session factory");
+        let session = session_factory
+            .open_session(QuerySessionOpenRequest::new(2, "statistics-binding"))
+            .expect("open frontend query session");
+        let error = session
+            .execute_batch("SHOW ANALYZE JOBS")
+            .await
             .expect_err("a host without StateStore must reach the frontend statistics service");
         assert!(
-            error.contains("statistics job commands require a configured frontend StateStore"),
+            error
+                .message()
+                .contains("statistics job commands require a configured frontend StateStore"),
             "statistics application port was not injected: {error}"
         );
         assert!(
-            !error.contains("statistics application service is unavailable"),
+            !error
+                .message()
+                .contains("statistics application service is unavailable"),
             "Core default statistics application port must not be used: {error}"
         );
 
-        drop(engine);
+        session.close();
+        drop(session);
+        drop(session_factory);
         host.shutdown()
             .await
             .expect("shutdown frontend application host");
