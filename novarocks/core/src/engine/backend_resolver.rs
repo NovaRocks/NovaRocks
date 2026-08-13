@@ -26,8 +26,8 @@ use std::sync::Arc;
 use crate::catalog_application::CatalogApplicationPort;
 use crate::engine::StandaloneState;
 use crate::engine::domain::{
-    DmlExecutionKernel, MaintenanceExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
-    ViewExecutionKernel,
+    CatalogCommandKernel, DmlExecutionKernel, MaintenanceExecutionKernel, MvExecutionKernel,
+    QueryPreparationKernel, ViewExecutionKernel,
 };
 use crate::sql::parser::ast::ObjectName;
 use novarocks_catalog::identifier::{resolve_catalog_namespace_name, resolve_catalog_table_name};
@@ -98,6 +98,7 @@ macro_rules! impl_kernel_catalog_admission {
 }
 
 impl_kernel_catalog_admission!(QueryPreparationKernel);
+impl_kernel_catalog_admission!(CatalogCommandKernel);
 impl_kernel_catalog_admission!(DmlExecutionKernel);
 impl_kernel_catalog_admission!(MvExecutionKernel);
 impl_kernel_catalog_admission!(ViewExecutionKernel);

@@ -210,6 +210,66 @@ impl DmlExecutionKernel {
     }
 }
 
+/// Catalog DDL dependencies.
+///
+/// This is intentionally a catalog-only kernel: it can mutate catalog facts
+/// and enforce catalog-adjacent MV/view guards, but has no query execution,
+/// statistics, DML writer or MV refresh capability.
+#[derive(Clone)]
+pub(crate) struct CatalogCommandKernel {
+    catalog_service: Arc<QueryCatalogService>,
+    catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    mv_repository: Arc<dyn MvRepository>,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    view_service: Arc<dyn ViewService>,
+}
+
+impl CatalogCommandKernel {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        catalog_service: Arc<QueryCatalogService>,
+        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        mv_repository: Arc<dyn MvRepository>,
+        mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        view_service: Arc<dyn ViewService>,
+    ) -> Self {
+        Self {
+            catalog_service,
+            catalog_application,
+            connector_control,
+            mv_repository,
+            mv_storage_observation,
+            view_service,
+        }
+    }
+
+    pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+        &self.catalog_service
+    }
+
+    pub(crate) fn catalog_application(&self) -> Option<&Arc<dyn CatalogApplicationPort>> {
+        self.catalog_application.as_ref()
+    }
+
+    pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
+        &self.connector_control
+    }
+
+    pub(crate) fn mv_repository(&self) -> &Arc<dyn MvRepository> {
+        &self.mv_repository
+    }
+
+    pub(crate) fn mv_storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {
+        &self.mv_storage_observation
+    }
+
+    pub(crate) fn view_service(&self) -> &Arc<dyn ViewService> {
+        &self.view_service
+    }
+}
+
 /// MV metadata and refresh execution dependencies.
 ///
 /// The backend is injected directly; the obsolete string-keyed
