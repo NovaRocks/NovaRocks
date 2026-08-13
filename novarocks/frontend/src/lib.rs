@@ -45,8 +45,8 @@ pub use application::{
 pub use mv::FrontendMvService;
 pub use query::FrontendQueryService;
 pub use server::{
-    FrontendServerConfig, open_frontend_application_for_server, run_frontend_server,
-    run_frontend_server_until_shutdown, standalone_open_services_for_server,
+    FrontendServerConfig, build_frontend_query_session_factory,
+    open_frontend_application_for_server, run_frontend_server, run_frontend_server_until_shutdown,
 };
 pub use statistics::FrontendStatisticsService;
 pub use system_catalog::SystemCatalogService;

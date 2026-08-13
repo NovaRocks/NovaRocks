@@ -728,6 +728,32 @@ pub fn background_maintenance_engine(
     )
 }
 
+/// Capture one automatic-maintenance attempt from the Frontend's live role
+/// and topology. `QueryExecutionContext` remains opaque so callers cannot
+/// manufacture a default topology, deadline, or cancellation identity.
+pub fn background_maintenance_attempt(
+    role: crate::common::app_config::ClusterRole,
+    topology: BackendTopologyService,
+) -> Result<crate::engine::table_maintenance::BackgroundMaintenanceAttempt, String> {
+    let topology = topology.snapshot().map_err(|error| error.to_string())?;
+    let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
+    let execution = crate::query_execution::request_context::QueryExecutionContext::new(
+        role,
+        topology,
+        None,
+        cancellation.view(),
+        crate::query_execution::request_context::SessionOptimizerSettings::default(),
+    );
+    let connector_context =
+        crate::connector::connector_request_context_for_execution(None, &execution)?;
+    Ok(
+        crate::engine::table_maintenance::BackgroundMaintenanceAttempt::new(
+            execution,
+            connector_context,
+        ),
+    )
+}
+
 /// Leaf ports for the Frontend-owned MV background worker.
 #[derive(Clone)]
 pub struct MvBackgroundPorts {

@@ -910,7 +910,10 @@ impl FrontendApplicationHost {
             .report_endpoint_sink()
     }
 
-    pub(crate) fn backend_topology_port(
+    /// Frontend composition-time topology leaf.  The all-in-one server uses it
+    /// only to register its separately owned backend endpoint before it builds
+    /// the same ready SQL session factory as role=fe.
+    pub fn backend_topology_port(
         &self,
     ) -> novarocks::query_execution::backend::BackendTopologyService {
         Arc::clone(self.topology()) as novarocks::query_execution::backend::BackendTopologyService

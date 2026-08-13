@@ -467,7 +467,6 @@ async fn run_all_in_one_until<F>(
 where
     F: Future<Output = Result<(), String>> + Send,
 {
-    let optimizer_query_mem_limit_bytes = config.runtime.optimizer_query_mem_limit_bytes;
     let connector_control_factories = compose_frontend_control_factories(&config, runtime.clone())?;
     let frontend_config = FrontendServerConfig {
         config: config.clone(),
@@ -498,58 +497,31 @@ where
         }
     };
     let endpoint = backend.connectable_native_endpoint();
-    let dml = frontend.dml_service();
-    let mut services = novarocks_frontend::standalone_open_services_for_server(
-        &frontend,
-        std::sync::Arc::clone(&frontend_config.mv_storage_observation),
-    );
-    services
-        .backend_topology
+    let topology = frontend.backend_topology_port();
+    topology
         .add_backend(endpoint)
         .map_err(|error| anyhow::anyhow!("register all-in-one backend {endpoint}: {error}"))?;
-    wait_for_live_backend(services.backend_topology.as_ref(), endpoint).await?;
-    services.exchange_port = endpoint.port();
+    wait_for_live_backend(topology.as_ref(), endpoint).await?;
+    frontend
+        .coordinator_report_endpoint_sink()
+        .set_bound_port(endpoint.port());
+    let session_factory = novarocks_frontend::build_frontend_query_session_factory(
+        &frontend,
+        std::sync::Arc::new(novarocks_frontend::SystemCatalogService::with_defaults()),
+        endpoint.port(),
+        std::sync::Arc::clone(&frontend_config.mv_storage_observation),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("build all-in-one frontend SQL capabilities failed: {error}")
+    })?;
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
-    let query_control = services.query_control.clone();
-    let query_execution = services.query_execution.clone();
-    let topology = services.backend_topology.clone();
-    let role = services.execution_role;
+    let listener = novarocks::server::resolve_mysql_listener_settings(&config, port_override)
+        .map_err(anyhow::Error::msg)?;
     let server =
-        novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
-            config,
-            config_path,
-            port_override,
-            services,
-            move |engine| {
-                let insert_engine = engine.insert_engine();
-                let delete_engine = engine.delete_engine();
-                let mutation_engine = engine.mutation_engine();
-                let add_files_engine = engine.add_files_engine();
-                let ctas_engine = engine.ctas_engine();
-                let truncate_engine = engine.truncate_engine();
-                Ok(std::sync::Arc::new(
-                    novarocks_frontend::FrontendQueryService::new(
-                        engine,
-                        query_control,
-                        query_execution,
-                        role,
-                        topology,
-                        dml,
-                        insert_engine,
-                        delete_engine,
-                        mutation_engine,
-                        add_files_engine,
-                        ctas_engine,
-                        truncate_engine,
-                        optimizer_query_mem_limit_bytes,
-                    ),
-                ))
-            },
-            async move {
-                let _ = server_shutdown_rx.await;
-            },
-        );
+        novarocks::server::run_mysql_server_until_shutdown(listener, session_factory, async move {
+            let _ = server_shutdown_rx.await;
+        });
     tokio::pin!(server);
     tokio::pin!(shutdown);
 
