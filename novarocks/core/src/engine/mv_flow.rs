@@ -484,6 +484,35 @@ pub(crate) fn create_mv_with_kernel(
     if storage_engine_for_create(stmt)? != MvStorageEngine::Iceberg {
         return Err("materialized view backend must be Iceberg".to_string());
     }
+    let ports = crate::engine::mv::iceberg_refresh::IcebergMvCorePorts::new(
+        Arc::clone(kernel.catalog_service()),
+        kernel.catalog_application().cloned(),
+        Arc::clone(kernel.connector_control()),
+        Arc::clone(kernel.repository()),
+        Arc::clone(kernel.storage_observation()),
+    );
+    let engine = crate::engine::mv::iceberg_refresh::StandaloneMvEngine::new_with_ports(
+        ports,
+        connector_context.clone(),
+    );
+    let application_statement = crate::mv::application::MvApplicationStatement::Create(
+        crate::mv::application::MvCreateStatement::from(stmt),
+    );
+    match kernel.application().try_handle_statement(
+        &engine,
+        &application_statement,
+        crate::mv::application::MvRequestContext {
+            current_catalog,
+            current_database: db,
+        },
+    ) {
+        Ok(Some(crate::mv::application::MvStatementResult::Ok)) => return Ok(StatementResult::Ok),
+        Ok(Some(crate::mv::application::MvStatementResult::Query(result))) => {
+            return Ok(StatementResult::Query(result));
+        }
+        Ok(None) => {}
+        Err(error) => return Err(error.to_string()),
+    }
     kernel.mv_backend().create_mv(CreateMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
@@ -676,6 +705,133 @@ pub(crate) fn alter_mv_with_connector_context(
         .map_err(|e| format!("update MV refresh definition metadata failed: {e}"))?;
     crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor(
         state,
+        &definition,
+        &req.refresh_policy,
+        req.refresh_paused,
+        req.refresh_interval_ms,
+        None,
+        connector_context,
+    )
+    .map_err(|e| format!("sync Iceberg MV descriptor refresh metadata failed: {e}"))?;
+    Ok(StatementResult::Ok)
+}
+
+/// Alter Iceberg MV metadata through the explicit frontend-composed kernel.
+/// Repartition remains a request-frozen frontend refresh operation and is
+/// deliberately rejected here so its lifecycle cannot fall back to a generic
+/// command route.
+pub(crate) fn alter_mv_with_kernel(
+    kernel: &MvExecutionKernel,
+    current_catalog: Option<&str>,
+    db: &str,
+    stmt: &AlterMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
+    if matches!(stmt.action, AlterMaterializedViewAction::Repartition(_)) {
+        return Err(
+            "ALTER MATERIALIZED VIEW ... REPARTITION requires the frontend MV lifecycle"
+                .to_string(),
+        );
+    }
+    if matches!(stmt.action, AlterMaterializedViewAction::SetProperties(_)) {
+        let current_catalog = current_catalog.ok_or_else(|| {
+            "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
+        })?;
+        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+            Some(current_catalog),
+            db,
+            &stmt.name,
+        )?;
+        let engine = existing_mv_storage_engine_by_target(kernel.repository().as_ref(), &target)?
+            .ok_or_else(|| {
+            format!(
+                "materialized view {}.{}.{} not found",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+        if engine != MvStorageEngine::Iceberg {
+            return Err(
+                "ALTER MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
+                    .to_string(),
+            );
+        }
+        let AlterMaterializedViewAction::SetProperties(entries) = &stmt.action else {
+            unreachable!("properties branch was checked above")
+        };
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        crate::connector::mutation::execute_catalog_mutation(
+            kernel.connector_control().as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(target.namespace.as_str()),
+                    table: Arc::from(target.table.as_str()),
+                },
+                changes: entries
+                    .iter()
+                    .map(
+                        |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
+                            key: Arc::from(key.as_str()),
+                            value: Arc::from(value.as_str()),
+                        },
+                    )
+                    .collect(),
+                authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
+                expected_committed_partitioning: None,
+            },
+            connector_context.clone(),
+        )?;
+        return Ok(StatementResult::Ok);
+    }
+    let definition = load_definition_for_alter(
+        kernel.repository().as_ref(),
+        current_catalog,
+        db,
+        &stmt.name,
+    )?;
+    let req = match &stmt.action {
+        AlterMaterializedViewAction::SetRefresh(policy) => {
+            refresh_metadata_request_for_policy(&definition, policy, definition.refresh_paused)
+        }
+        AlterMaterializedViewAction::PauseRefresh => UpdateMvRefreshMetadataRequest {
+            mv_id: definition.mv_id,
+            refresh_policy: definition.refresh_policy.clone(),
+            refresh_paused: true,
+            refresh_interval_ms: definition.refresh_interval_ms,
+            max_staleness_ms: definition.max_staleness_ms,
+            last_scheduler_error: definition.last_scheduler_error.clone(),
+            next_refresh_after_ms: definition.next_refresh_after_ms,
+        },
+        AlterMaterializedViewAction::ResumeRefresh => UpdateMvRefreshMetadataRequest {
+            mv_id: definition.mv_id,
+            refresh_policy: definition.refresh_policy.clone(),
+            refresh_paused: false,
+            refresh_interval_ms: definition.refresh_interval_ms,
+            max_staleness_ms: definition.max_staleness_ms,
+            last_scheduler_error: definition.last_scheduler_error.clone(),
+            next_refresh_after_ms: definition.next_refresh_after_ms,
+        },
+        AlterMaterializedViewAction::Repartition(_)
+        | AlterMaterializedViewAction::SetProperties(_) => {
+            unreachable!("repartition and properties returned before metadata update")
+        }
+    };
+    kernel
+        .repository()
+        .update_refresh_metadata(req.clone())
+        .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
+    let ports = crate::engine::mv::iceberg_refresh::IcebergMvCorePorts::new(
+        Arc::clone(kernel.catalog_service()),
+        kernel.catalog_application().cloned(),
+        Arc::clone(kernel.connector_control()),
+        Arc::clone(kernel.repository()),
+        Arc::clone(kernel.storage_observation()),
+    );
+    crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
+        &ports,
         &definition,
         &req.refresh_policy,
         req.refresh_paused,

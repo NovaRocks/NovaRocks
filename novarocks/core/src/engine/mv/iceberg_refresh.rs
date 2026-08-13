@@ -3300,7 +3300,7 @@ pub(crate) fn sync_iceberg_mv_descriptor(
     )
 }
 
-fn sync_iceberg_mv_descriptor_with_ports(
+pub(crate) fn sync_iceberg_mv_descriptor_with_ports(
     ports: &IcebergMvCorePorts,
     definition: &StoredMvDefinition,
     refresh_policy: &StoredMvRefreshPolicy,

@@ -30,10 +30,10 @@ impl MvCommandExecutor {
         Self { kernel }
     }
 
-    /// Execute CREATE, DROP and SHOW MATERIALIZED VIEWS through the injected
-    /// provider backend. Refresh and repartition intentionally remain outside
-    /// this closed family until their request-frozen frontend lifecycle has an
-    /// equally explicit capability.
+    /// Execute CREATE, DROP, SHOW and non-refresh ALTER MATERIALIZED VIEW
+    /// statements through the injected provider backend. Refresh and
+    /// repartition intentionally remain outside this closed family until their
+    /// request-frozen frontend lifecycle has an equally explicit capability.
     pub fn try_execute(
         &self,
         sql: &str,
@@ -62,6 +62,21 @@ impl MvCommandExecutor {
             }
             crate::sql::parser::ast::Statement::DropMaterializedView(statement) => {
                 crate::engine::mv_flow::drop_mv_with_kernel(
+                    &self.kernel,
+                    current_catalog,
+                    current_database,
+                    &statement,
+                    connector_context,
+                )
+                .map(Some)
+            }
+            crate::sql::parser::ast::Statement::AlterMaterializedView(statement)
+                if !matches!(
+                    &statement.action,
+                    crate::sql::parser::ast::AlterMaterializedViewAction::Repartition(_)
+                ) =>
+            {
+                crate::engine::mv_flow::alter_mv_with_kernel(
                     &self.kernel,
                     current_catalog,
                     current_database,
