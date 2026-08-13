@@ -693,13 +693,13 @@ impl RequestScopedMaintenanceEngine {
 /// distributed rewrite; the resulting provider session keeps its own exact
 /// generation and execution identity for recovery.
 #[derive(Clone)]
-pub(crate) struct BackgroundMaintenanceAttempt {
+pub struct BackgroundMaintenanceAttempt {
     execution: crate::query_execution::request_context::QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl BackgroundMaintenanceAttempt {
-    pub(crate) fn new(
+    pub fn new(
         execution: crate::query_execution::request_context::QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
@@ -715,7 +715,7 @@ impl BackgroundMaintenanceAttempt {
 /// Implementations must capture a fresh live topology and cancellation scope
 /// for each call. There is deliberately no Core default, process-global lookup
 /// or `StandaloneState` fallback.
-pub(crate) trait BackgroundMaintenanceAttemptFactory: Send + Sync {
+pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
     fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String>;
 }
 

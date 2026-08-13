@@ -365,6 +365,17 @@ impl MaintenanceCommandPorts {
             service,
         }
     }
+
+    fn kernel(&self) -> domain::MaintenanceExecutionKernel {
+        domain::MaintenanceExecutionKernel::new(
+            Arc::clone(&self.catalog_service),
+            self.catalog_application.clone(),
+            Arc::clone(&self.connector_control),
+            Arc::clone(&self.mv_storage_observation),
+            self.query_execution.clone(),
+            Arc::clone(&self.service),
+        )
+    }
 }
 
 pub fn maintenance_command_executor(
@@ -514,4 +525,269 @@ pub fn session_catalog_resolver(
         ports.catalog_application,
         ports.connector_control,
     )
+}
+
+/// Bind the Frontend-owned publication projection to the query catalog before
+/// any startup restore can resolve externally attached catalog names.
+///
+/// The projection and control registry are distinct startup leaves: this
+/// helper deliberately neither publishes a runtime nor creates a catalog
+/// controller.
+pub fn bind_catalog_runtime_projection(
+    projection: &crate::catalog_application::CatalogRuntimeProjection,
+    catalog_service: Arc<QueryCatalogService>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+) -> Result<(), String> {
+    projection
+        .bind_query_catalog(
+            catalog_service,
+            connector_control as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+        )
+        .map_err(|error| format!("bind catalog runtime projection failed: {error}"))
+}
+
+/// Exact query and MV leaves needed to activate a previously admitted MV
+/// write.  This is intentionally separate from the interactive MV command
+/// capability: durable refresh activation must not acquire a command router.
+#[derive(Clone)]
+pub struct MvRefreshProviderActivationPorts {
+    catalog_service: Arc<QueryCatalogService>,
+    catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    unified_statistics: Arc<UnifiedStatisticsResolver>,
+    query_execution: QueryExecutionService,
+    backend_topology: BackendTopologyService,
+    exchange_port: u16,
+    mv_repository: Arc<dyn MvRepository>,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+}
+
+impl MvRefreshProviderActivationPorts {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        catalog_service: Arc<QueryCatalogService>,
+        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        unified_statistics: Arc<UnifiedStatisticsResolver>,
+        query_execution: QueryExecutionService,
+        backend_topology: BackendTopologyService,
+        exchange_port: u16,
+        mv_repository: Arc<dyn MvRepository>,
+        mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    ) -> Self {
+        Self {
+            catalog_service,
+            catalog_application,
+            connector_control,
+            unified_statistics,
+            query_execution,
+            backend_topology,
+            exchange_port,
+            mv_repository,
+            mv_storage_observation,
+        }
+    }
+}
+
+/// Build the provider activation adapter used by the Frontend-owned MV
+/// refresh controller.  The returned trait object contains no state facade
+/// and retains the admitted query execution service for native writes.
+pub fn mv_refresh_provider_activation(
+    ports: MvRefreshProviderActivationPorts,
+) -> Arc<dyn crate::mv::application::MvRefreshProviderActivation> {
+    let query_kernel = domain::QueryPreparationKernel::new(
+        Arc::clone(&ports.catalog_service),
+        ports.catalog_application.clone(),
+        Arc::clone(&ports.connector_control),
+        ports.unified_statistics,
+        ports.query_execution,
+        ports.backend_topology,
+        ports.exchange_port,
+    );
+    let mv_ports = crate::engine::IcebergMvCorePorts::new(
+        ports.catalog_service,
+        ports.catalog_application,
+        ports.connector_control,
+        ports.mv_repository,
+        ports.mv_storage_observation,
+    );
+    Arc::new(
+        crate::engine::mv::iceberg_activation::IcebergMvRefreshProviderActivation::new(
+            query_kernel,
+            mv_ports,
+        ),
+    )
+}
+
+/// Bind MV refresh activation before the Frontend performs startup restore.
+pub fn bind_mv_refresh_provider_activation(
+    sink: &dyn crate::mv::application::MvRefreshProviderActivationSink,
+    ports: MvRefreshProviderActivationPorts,
+) -> Result<(), String> {
+    sink.bind_mv_refresh_provider_activation(mv_refresh_provider_activation(ports))
+}
+
+/// Bind the short-lived, generation-fenced statistics target resolver.
+pub fn bind_statistics_target_resolver(
+    sink: &dyn crate::engine::statistics_application::StatisticsTargetResolverSink,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+) -> Result<(), String> {
+    sink.bind_statistics_target_resolver(Arc::new(
+        crate::engine::statistics_application::ConnectorStatisticsTargetResolver::new(
+            connector_control,
+        ),
+    ))
+}
+
+/// Bind the short-lived, generation-fenced statistics reader.
+pub fn bind_statistics_table_reader(
+    sink: &dyn crate::engine::statistics_application::StatisticsTableReaderSink,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+) -> Result<(), String> {
+    sink.bind_statistics_table_reader(Arc::new(
+        crate::engine::statistics_application::ConnectorStatisticsTableReader::new(
+            connector_control,
+        ),
+    ))
+}
+
+/// Exact leaves retained by the Frontend-owned durable ANALYZE worker.
+///
+/// The connector registry is intentionally absent: Core creates and retains
+/// it inside the returned executor, preloaded with the same Iceberg MV
+/// capability as the rest of this startup composition.
+#[derive(Clone)]
+pub struct StatisticsAttemptExecutorPorts {
+    execution_role: crate::common::app_config::ClusterRole,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    backend_topology: BackendTopologyService,
+    query_execution: QueryExecutionService,
+    iceberg_mv: crate::engine::IcebergMvCorePorts,
+}
+
+impl StatisticsAttemptExecutorPorts {
+    pub fn new(
+        execution_role: crate::common::app_config::ClusterRole,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        backend_topology: BackendTopologyService,
+        query_execution: QueryExecutionService,
+        iceberg_mv: crate::engine::IcebergMvCorePorts,
+    ) -> Self {
+        Self {
+            execution_role,
+            connector_control,
+            backend_topology,
+            query_execution,
+            iceberg_mv,
+        }
+    }
+}
+
+/// Build the native statistics attempt executor without exposing
+/// `ConnectorRegistry` to Frontend composition.
+pub fn statistics_attempt_executor(
+    ports: StatisticsAttemptExecutorPorts,
+) -> Arc<dyn crate::engine::statistics_application::StatisticsAttemptExecutor> {
+    let mut registry = crate::connector::ConnectorRegistry::new();
+    registry.register_iceberg_mv_backend(ports.iceberg_mv);
+    Arc::new(
+        crate::engine::statistics_application::ConnectorStatisticsAttemptExecutor::new(
+            crate::engine::statistics_application::StatisticsAttemptExecutionPorts::new(
+                ports.execution_role,
+                Arc::new(std::sync::RwLock::new(registry)),
+                ports.connector_control,
+                ports.backend_topology,
+                ports.query_execution,
+            ),
+        ),
+    )
+}
+
+/// Bind the durable ANALYZE executor after connector control and native
+/// coordinator leaves are ready.  A missing sink remains a Frontend decision;
+/// this helper never supplies an in-memory job fallback.
+pub fn bind_statistics_attempt_executor(
+    sink: &dyn crate::engine::statistics_application::StatisticsAttemptExecutorSink,
+    ports: StatisticsAttemptExecutorPorts,
+) -> Result<(), String> {
+    sink.bind_statistics_attempt_executor(statistics_attempt_executor(ports))
+}
+
+/// Build the automatic-maintenance engine from the same maintenance command
+/// leaves plus a Frontend-supplied attempt factory.  Each automatic attempt
+/// obtains a fresh topology and cancellation scope through that factory.
+pub fn background_maintenance_engine(
+    ports: MaintenanceCommandPorts,
+    attempt_factory: Arc<dyn crate::engine::table_maintenance::BackgroundMaintenanceAttemptFactory>,
+) -> Arc<dyn crate::engine::table_maintenance::TableMaintenanceEngine> {
+    Arc::new(
+        crate::engine::table_maintenance::BackgroundMaintenanceEngine::new(
+            ports.kernel(),
+            attempt_factory,
+        ),
+    )
+}
+
+/// Leaf ports for the Frontend-owned MV background worker.
+#[derive(Clone)]
+pub struct MvBackgroundPorts {
+    catalog_service: Arc<QueryCatalogService>,
+    catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    repository: Arc<dyn MvRepository>,
+    storage_observation: Arc<dyn MvStorageObservationPort>,
+}
+
+impl MvBackgroundPorts {
+    pub fn new(
+        catalog_service: Arc<QueryCatalogService>,
+        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        repository: Arc<dyn MvRepository>,
+        storage_observation: Arc<dyn MvStorageObservationPort>,
+    ) -> Self {
+        Self {
+            catalog_service,
+            catalog_application,
+            connector_control,
+            repository,
+            storage_observation,
+        }
+    }
+}
+
+/// Build the two capabilities the Frontend binds into its MV background
+/// runtime after restore and maintenance recovery have completed.
+pub fn mv_background_bindings(
+    ports: MvBackgroundPorts,
+    table_maintenance_engine: Arc<dyn crate::engine::table_maintenance::TableMaintenanceEngine>,
+) -> crate::mv::background::MvBackgroundBindings {
+    let iceberg_ports = crate::engine::IcebergMvCorePorts::new(
+        ports.catalog_service,
+        ports.catalog_application,
+        Arc::clone(&ports.connector_control),
+        Arc::clone(&ports.repository),
+        Arc::clone(&ports.storage_observation),
+    );
+    crate::mv::background::MvBackgroundBindings {
+        engine: Arc::new(
+            crate::engine::mv_background::StandaloneMvBackgroundEngine::new_with_ports(
+                iceberg_ports,
+                ports.connector_control,
+                ports.repository,
+                ports.storage_observation,
+            ),
+        ),
+        table_maintenance_engine,
+    }
+}
+
+/// Bind the MV background capability only after the Frontend has completed
+/// its ordered restore and recovery sequence.
+pub fn bind_mv_background_engine(
+    sink: &dyn crate::mv::background::MvBackgroundEngineSink,
+    ports: MvBackgroundPorts,
+    table_maintenance_engine: Arc<dyn crate::engine::table_maintenance::TableMaintenanceEngine>,
+) -> Result<(), crate::mv::background::MvBackgroundEngineError> {
+    sink.bind_mv_background_engine(mv_background_bindings(ports, table_maintenance_engine))
 }
