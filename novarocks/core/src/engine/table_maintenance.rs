@@ -503,6 +503,17 @@ pub trait TableMaintenanceService: Send + Sync {
         context: MaintenanceRequestContext<'_>,
     ) -> Result<Option<MaintenanceStatementResult>, String>;
 
+    /// Execute the read-only maintenance subset without manufacturing a
+    /// `TableMaintenanceEngine`.  Durable command writes keep their explicit
+    /// engine and request execution context.
+    fn try_handle_readonly_statement(
+        &self,
+        _sql: &str,
+        _context: MaintenanceRequestContext<'_>,
+    ) -> Result<Option<MaintenanceStatementResult>, String> {
+        Ok(None)
+    }
+
     fn execute_automatic_action(
         &self,
         engine: &dyn TableMaintenanceEngine,

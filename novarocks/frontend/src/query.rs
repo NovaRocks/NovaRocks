@@ -37,6 +37,7 @@ use novarocks::engine::{
     PreparedQueryOperation, SessionCatalogResolver, StandaloneCommandExecutor,
     StandaloneQueryCompiler, StatementResult, backend_command::BackendCommandExecutor,
     catalog_command::CatalogCommandExecutor, iceberg_ref_command::IcebergRefCommandExecutor,
+    maintenance_command::MaintenanceReadCommandExecutor,
     statistics_command::StatisticsCommandExecutor, view_command::ViewCommandExecutor,
 };
 use novarocks::query_execution::backend::BackendTopologyService;
@@ -79,6 +80,7 @@ struct TypedThenLegacyCommand {
     backend: BackendCommandExecutor,
     view: ViewCommandExecutor,
     iceberg_ref: IcebergRefCommandExecutor,
+    maintenance_read: MaintenanceReadCommandExecutor,
     legacy: StandaloneCommandExecutor,
 }
 
@@ -89,6 +91,7 @@ impl TypedThenLegacyCommand {
         backend: BackendCommandExecutor,
         view: ViewCommandExecutor,
         iceberg_ref: IcebergRefCommandExecutor,
+        maintenance_read: MaintenanceReadCommandExecutor,
         legacy: StandaloneCommandExecutor,
     ) -> Self {
         Self {
@@ -97,6 +100,7 @@ impl TypedThenLegacyCommand {
             backend,
             view,
             iceberg_ref,
+            maintenance_read,
             legacy,
         }
     }
@@ -141,7 +145,14 @@ impl CoreCommandRoute for TypedThenLegacyCommand {
                             &connector_context,
                         )? {
                             Some(result) => Ok(result),
-                            None => self.legacy.execute(sql, context, Some(query_options)),
+                            None => match self.maintenance_read.try_execute(
+                                sql,
+                                context.session().current_catalog(),
+                                context.session().current_database(),
+                            )? {
+                                Some(result) => Ok(result),
+                                None => self.legacy.execute(sql, context, Some(query_options)),
+                            },
                         },
                     },
                 },
@@ -286,6 +297,7 @@ impl FrontendQueryService {
         backend_command_executor: BackendCommandExecutor,
         view_command_executor: ViewCommandExecutor,
         iceberg_ref_command_executor: IcebergRefCommandExecutor,
+        maintenance_read_command_executor: MaintenanceReadCommandExecutor,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
         role: ClusterRole,
@@ -308,6 +320,7 @@ impl FrontendQueryService {
                 backend_command_executor,
                 view_command_executor,
                 iceberg_ref_command_executor,
+                maintenance_read_command_executor,
                 command_executor,
             )),
             query_control,

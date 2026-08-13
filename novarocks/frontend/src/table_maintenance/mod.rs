@@ -1934,6 +1934,21 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         Ok(Some(result))
     }
 
+    fn try_handle_readonly_statement(
+        &self,
+        sql: &str,
+        context: MaintenanceRequestContext<'_>,
+    ) -> Result<Option<MaintenanceStatementResult>, String> {
+        let Some(statement) = parse_maintenance_statement(sql, context)? else {
+            return Ok(None);
+        };
+        match statement {
+            ParsedMaintenanceStatement::ShowOptimize => self.show_optimize(sql, context).map(Some),
+            ParsedMaintenanceStatement::Execute { .. }
+            | ParsedMaintenanceStatement::SubmitOptimize { .. } => Ok(None),
+        }
+    }
+
     fn execute_automatic_action(
         &self,
         engine: &dyn TableMaintenanceEngine,

@@ -63,6 +63,7 @@ pub mod iceberg_ref_command;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub mod insert_engine;
+pub mod maintenance_command;
 pub mod mutation_engine;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
@@ -2097,6 +2098,14 @@ impl StandaloneNovaRocks {
             Arc::clone(&self.inner.connector_control),
             Arc::clone(&self.inner.mv_storage_observation),
         )
+    }
+
+    pub fn maintenance_read_command_executor(
+        &self,
+    ) -> maintenance_command::MaintenanceReadCommandExecutor {
+        maintenance_command::MaintenanceReadCommandExecutor::new(Arc::clone(
+            &self.inner.table_maintenance_service,
+        ))
     }
 
     /// Transitional factory for the closed external-view capability.
