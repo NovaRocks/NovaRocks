@@ -23,7 +23,12 @@
 
 use std::sync::Arc;
 
+use crate::catalog_application::CatalogApplicationPort;
 use crate::engine::StandaloneState;
+use crate::engine::domain::{
+    DmlExecutionKernel, MaintenanceExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
+    ViewExecutionKernel,
+};
 use crate::sql::parser::ast::ObjectName;
 use novarocks_catalog::identifier::{resolve_catalog_namespace_name, resolve_catalog_table_name};
 
@@ -66,8 +71,40 @@ fn reject_default_catalog_reference(
     Ok(())
 }
 
+pub(crate) trait CatalogAdmission {
+    fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort>;
+}
+
+impl CatalogAdmission for StandaloneState {
+    fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+        self.catalog_application.as_deref()
+    }
+}
+
+impl CatalogAdmission for Arc<StandaloneState> {
+    fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+        self.as_ref().catalog_application()
+    }
+}
+
+macro_rules! impl_kernel_catalog_admission {
+    ($kernel:ty) => {
+        impl CatalogAdmission for $kernel {
+            fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+                self.catalog_application().map(Arc::as_ref)
+            }
+        }
+    };
+}
+
+impl_kernel_catalog_admission!(QueryPreparationKernel);
+impl_kernel_catalog_admission!(DmlExecutionKernel);
+impl_kernel_catalog_admission!(MvExecutionKernel);
+impl_kernel_catalog_admission!(ViewExecutionKernel);
+impl_kernel_catalog_admission!(MaintenanceExecutionKernel);
+
 pub(crate) fn resolve_table_target(
-    state: &Arc<StandaloneState>,
+    admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -79,7 +116,7 @@ pub(crate) fn resolve_table_target(
 
     let resolved =
         resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
-    require_catalog_admission(state, &resolved.catalog)?;
+    require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -89,7 +126,7 @@ pub(crate) fn resolve_table_target(
 }
 
 pub(crate) fn resolve_existing_table_target(
-    state: &Arc<StandaloneState>,
+    admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -101,7 +138,7 @@ pub(crate) fn resolve_existing_table_target(
 
     let resolved =
         resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
-    require_catalog_admission(state, &resolved.catalog)?;
+    require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -111,7 +148,7 @@ pub(crate) fn resolve_existing_table_target(
 }
 
 pub(crate) fn resolve_namespace_target(
-    state: &Arc<StandaloneState>,
+    admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
 ) -> Result<TargetBackend, String> {
@@ -121,7 +158,7 @@ pub(crate) fn resolve_namespace_target(
     }
 
     let resolved = resolve_catalog_namespace_name(name.parts.as_slice(), current_catalog)?;
-    require_catalog_admission(state, &resolved.catalog)?;
+    require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -130,8 +167,11 @@ pub(crate) fn resolve_namespace_target(
     })
 }
 
-fn require_catalog_admission(state: &StandaloneState, catalog: &str) -> Result<(), String> {
-    let Some(application) = &state.catalog_application else {
+fn require_catalog_admission(
+    admission: &impl CatalogAdmission,
+    catalog: &str,
+) -> Result<(), String> {
+    let Some(application) = admission.catalog_application() else {
         return Ok(());
     };
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)

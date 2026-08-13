@@ -52,6 +52,7 @@ pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub mod ctas_engine;
 pub mod delete_engine;
+pub(crate) mod domain;
 pub mod external_write_fence;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
