@@ -136,6 +136,7 @@ macro_rules! impl_kernel_catalog_service_source {
 
 impl_kernel_catalog_service_source!(domain::QueryPreparationKernel);
 impl_kernel_catalog_service_source!(domain::DmlExecutionKernel);
+impl_kernel_catalog_service_source!(domain::CatalogCommandKernel);
 impl_kernel_catalog_service_source!(domain::MvExecutionKernel);
 impl_kernel_catalog_service_source!(domain::StatisticsExecutionKernel);
 impl_kernel_catalog_service_source!(domain::ViewExecutionKernel);

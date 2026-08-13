@@ -85,6 +85,16 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
+        if crate::engine::statement::looks_like_alter_iceberg_properties(&normalized) {
+            return execute_alter_iceberg_properties(
+                &self.kernel,
+                &normalized,
+                current_catalog,
+                current_database,
+                connector_context,
+            )
+            .map(Some);
+        }
         let dialect = StarRocksDialect;
         let mut parser = Parser::new(&dialect)
             .try_with_sql(&normalized)
@@ -187,6 +197,72 @@ impl CatalogCommandExecutor {
             .map_err(|error| error.to_string())?;
         Ok(StatementResult::Ok)
     }
+}
+
+fn execute_alter_iceberg_properties(
+    kernel: &CatalogCommandKernel,
+    sql: &str,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let statement = crate::engine::statement::parse_alter_iceberg_properties_sql(sql)?;
+    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        kernel,
+        &statement.table,
+        current_catalog,
+        current_database,
+    )?;
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        kernel.connector_control().as_ref(),
+        kernel.mv_storage_observation().as_ref(),
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
+    )?;
+    if target.backend_name != "iceberg" {
+        return Err(
+            "ALTER TABLE TBLPROPERTIES only supports standalone iceberg catalogs".to_string(),
+        );
+    }
+    let changes = match statement.op {
+        crate::engine::statement::PropertiesOp::Set { entries } => entries
+            .into_iter()
+            .map(
+                |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
+                    key: Arc::from(key),
+                    value: Arc::from(value),
+                },
+            )
+            .collect(),
+        crate::engine::statement::PropertiesOp::Unset { keys, if_exists } => keys
+            .into_iter()
+            .map(
+                |key| novarocks_spi::connector::ConnectorPropertyChange::Unset {
+                    key: Arc::from(key),
+                    if_exists,
+                },
+            )
+            .collect(),
+    };
+    let instance_id =
+        ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        kernel.connector_control().as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            changes,
+            authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
+            expected_committed_partitioning: None,
+        },
+        connector_context.clone(),
+    )?;
+    crate::engine::iceberg_writer::invalidate_iceberg_caches(kernel, &target)?;
+    Ok(StatementResult::Ok)
 }
 
 fn execute_create_table_like(
