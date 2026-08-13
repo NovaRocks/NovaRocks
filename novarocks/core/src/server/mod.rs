@@ -48,11 +48,11 @@ use crate::version;
 use novarocks_execution::exec::failpoint::{self, FailPointMode};
 
 use self::encoding::write_query_result;
+#[cfg(test)]
+use crate::engine::StandaloneNovaRocks;
+use crate::engine::StatementResult;
 use crate::engine::statement::{
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
-};
-use crate::engine::{
-    StandaloneNovaRocks, StandaloneOpenServices, StandaloneOptions, StatementResult,
 };
 use crate::query_execution::cancellation::QueryCancellationReason;
 use crate::query_execution::control::{
@@ -183,71 +183,6 @@ where
         move |bound_addr| emit_standalone_ready(bound_addr, &ready_user),
     )
     .await
-}
-
-/// Legacy compatibility wrapper which still opens the historical Core engine.
-///
-/// New production composition must call
-/// [`resolve_mysql_listener_settings`] followed by
-/// [`run_mysql_server_until_shutdown`] after Frontend has opened its own
-/// application host and session factory.
-pub async fn run_standalone_server_with_config_until_shutdown_with_session_factory<F, B>(
-    cfg: NovaRocksConfig,
-    config_path: Option<PathBuf>,
-    port_override: Option<u16>,
-    services: StandaloneOpenServices,
-    session_factory_builder: B,
-    shutdown: F,
-) -> Result<(), String>
-where
-    F: Future<Output = ()> + Send,
-    B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
-{
-    let listener = resolve_mysql_listener_settings(&cfg, port_override)?;
-    let resolved = ResolvedStandaloneServerOptions {
-        config_path,
-        preloaded_config: Some(cfg),
-        listener,
-    };
-    run_with_resolved_options_until_shutdown_with_session_factory(
-        resolved,
-        services,
-        session_factory_builder,
-        shutdown,
-    )
-    .await
-}
-
-async fn run_with_resolved_options_until_shutdown_with_session_factory<F, B>(
-    resolved: ResolvedStandaloneServerOptions,
-    services: StandaloneOpenServices,
-    session_factory_builder: B,
-    shutdown: F,
-) -> Result<(), String>
-where
-    F: Future<Output = ()> + Send,
-    B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
-{
-    let report_port = services.exchange_port;
-    if report_port == 0 {
-        return Err(
-            "standalone MySQL runner requires a role-owned nonzero report endpoint".to_string(),
-        );
-    }
-    let opts = StandaloneOptions {
-        config_path: resolved.config_path.clone(),
-    };
-    let engine = match resolved.preloaded_config {
-        Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg, services)?,
-        None => StandaloneNovaRocks::open(opts, services)?,
-    };
-    engine.publish_coordinator_report_bound_port(report_port);
-    let session_factory = match session_factory_builder(engine.clone()) {
-        Ok(factory) => factory,
-        Err(error) => return Err(error),
-    };
-
-    run_mysql_server_until_shutdown(resolved.listener, session_factory, shutdown).await
 }
 
 fn resolve_server_options(
