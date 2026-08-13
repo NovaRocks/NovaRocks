@@ -224,6 +224,7 @@ where
             let query_compiler = engine.query_compiler();
             let command_executor = engine.command_executor();
             let catalog_command_executor = engine.catalog_command_executor();
+            let statistics_command_executor = engine.statistics_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
             let mutation_engine = engine.mutation_engine();
@@ -243,6 +244,7 @@ where
                     query_compiler,
                     command_executor,
                     catalog_command_executor,
+                    statistics_command_executor,
                     query_control,
                     query_execution,
                     role,
@@ -343,6 +345,7 @@ where
             let query_compiler = engine.query_compiler();
             let command_executor = engine.command_executor();
             let catalog_command_executor = engine.catalog_command_executor();
+            let statistics_command_executor = engine.statistics_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
             let mutation_engine = engine.mutation_engine();
@@ -362,6 +365,7 @@ where
                     query_compiler,
                     command_executor,
                     catalog_command_executor,
+                    statistics_command_executor,
                     query_control,
                     query_execution,
                     role,

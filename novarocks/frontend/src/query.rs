@@ -36,6 +36,7 @@ use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
     PreparedQueryOperation, SessionCatalogResolver, StandaloneCommandExecutor,
     StandaloneQueryCompiler, StatementResult, catalog_command::CatalogCommandExecutor,
+    statistics_command::StatisticsCommandExecutor,
 };
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
@@ -82,18 +83,27 @@ impl CoreCommandRoute for StandaloneCommandExecutor {
 }
 
 #[derive(Clone)]
-struct CatalogThenLegacyCommand {
+struct TypedThenLegacyCommand {
     catalog: CatalogCommandExecutor,
+    statistics: StatisticsCommandExecutor,
     legacy: StandaloneCommandExecutor,
 }
 
-impl CatalogThenLegacyCommand {
-    fn new(catalog: CatalogCommandExecutor, legacy: StandaloneCommandExecutor) -> Self {
-        Self { catalog, legacy }
+impl TypedThenLegacyCommand {
+    fn new(
+        catalog: CatalogCommandExecutor,
+        statistics: StatisticsCommandExecutor,
+        legacy: StandaloneCommandExecutor,
+    ) -> Self {
+        Self {
+            catalog,
+            statistics,
+            legacy,
+        }
     }
 }
 
-impl CoreCommandRoute for CatalogThenLegacyCommand {
+impl CoreCommandRoute for TypedThenLegacyCommand {
     fn execute(
         &self,
         sql: &str,
@@ -111,7 +121,14 @@ impl CoreCommandRoute for CatalogThenLegacyCommand {
             &connector_context,
         )? {
             Some(result) => Ok(result),
-            None => self.legacy.execute(sql, context, Some(query_options)),
+            None => match self.statistics.try_execute(
+                sql,
+                context.session().current_catalog(),
+                context.session().current_database(),
+            )? {
+                Some(result) => Ok(result),
+                None => self.legacy.execute(sql, context, Some(query_options)),
+            },
         }
     }
 }
@@ -264,12 +281,14 @@ impl FrontendQueryService {
         let session_catalog_resolver = engine.session_catalog_resolver();
         let query_compiler = engine.query_compiler();
         let catalog_command_executor = engine.catalog_command_executor();
+        let statistics_command_executor = engine.statistics_command_executor();
         let command_executor = engine.command_executor();
         Self::new_with_recovery_bound(
             session_catalog_resolver,
             query_compiler,
             command_executor,
             catalog_command_executor,
+            statistics_command_executor,
             query_control,
             query_execution,
             role,
@@ -291,6 +310,7 @@ impl FrontendQueryService {
         query_compiler: StandaloneQueryCompiler,
         command_executor: StandaloneCommandExecutor,
         catalog_command_executor: CatalogCommandExecutor,
+        statistics_command_executor: StatisticsCommandExecutor,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
         role: ClusterRole,
@@ -307,8 +327,9 @@ impl FrontendQueryService {
         Self {
             session_catalog_resolver,
             query_compiler,
-            command_executor: Arc::new(CatalogThenLegacyCommand::new(
+            command_executor: Arc::new(TypedThenLegacyCommand::new(
                 catalog_command_executor,
+                statistics_command_executor,
                 command_executor,
             )),
             query_control,

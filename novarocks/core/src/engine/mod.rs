@@ -76,6 +76,7 @@ pub mod row_mutation;
 pub(crate) mod statement;
 pub mod statistics;
 pub mod statistics_application;
+pub mod statistics_command;
 pub mod system_catalog;
 pub mod table_maintenance;
 pub mod truncate_engine;
@@ -1828,6 +1829,18 @@ impl StandaloneNovaRocks {
             Arc::clone(&self.inner.mv_repository),
             Arc::clone(&self.inner.mv_storage_observation),
             Arc::clone(&self.inner.view_service),
+        ))
+    }
+
+    /// Transitional factory for the closed durable-statistics capability.
+    pub fn statistics_command_executor(&self) -> statistics_command::StatisticsCommandExecutor {
+        statistics_command::StatisticsCommandExecutor::new(domain::StatisticsExecutionKernel::new(
+            Arc::clone(&self.inner.catalog_service),
+            Arc::clone(&self.inner.connector_control),
+            Arc::clone(&self.inner.unified_statistics),
+            Arc::clone(&self.inner.statistics_service),
+            Arc::clone(&self.inner.statistics_application),
+            self.inner.query_execution.clone(),
         ))
     }
 
@@ -3799,7 +3812,7 @@ fn dispatch_frontend_mv_refresh(
     Ok(result)
 }
 
-fn statistics_application_target(
+pub(crate) fn statistics_application_target(
     name: &crate::sql::parser::ast::ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -3834,7 +3847,7 @@ fn execute_statistics_application_command(
     statistics_application_result(result)
 }
 
-fn statistics_application_result(
+pub(crate) fn statistics_application_result(
     result: statistics_application::StatisticsApplicationResult,
 ) -> Result<StatementResult, String> {
     use statistics_application::StatisticsApplicationResult;
