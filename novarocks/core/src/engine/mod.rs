@@ -99,11 +99,110 @@ pub struct StandaloneOptions {
 
 use novarocks_catalog::partition::LegacyRangePartition;
 
-pub(crate) fn catalog_service_snapshot(state: &Arc<StandaloneState>) -> QueryCatalogService {
+/// Narrow source for request-local catalog snapshots.
+///
+/// SQL compilation receives a frozen catalog view, not the aggregate engine
+/// state that happened to own it historically.
+pub(crate) trait CatalogServiceSource {
+    fn catalog_service(&self) -> &Arc<QueryCatalogService>;
+}
+
+impl CatalogServiceSource for StandaloneState {
+    fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+        &self.catalog_service
+    }
+}
+
+impl CatalogServiceSource for Arc<StandaloneState> {
+    fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+        &self.catalog_service
+    }
+}
+
+macro_rules! impl_kernel_catalog_service_source {
+    ($kernel:ty) => {
+        impl CatalogServiceSource for $kernel {
+            fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+                self.catalog_service()
+            }
+        }
+    };
+}
+
+impl_kernel_catalog_service_source!(domain::QueryPreparationKernel);
+impl_kernel_catalog_service_source!(domain::DmlExecutionKernel);
+impl_kernel_catalog_service_source!(domain::MvExecutionKernel);
+impl_kernel_catalog_service_source!(domain::StatisticsExecutionKernel);
+impl_kernel_catalog_service_source!(domain::ViewExecutionKernel);
+impl_kernel_catalog_service_source!(domain::MaintenanceExecutionKernel);
+
+pub(crate) fn catalog_service_snapshot(source: &impl CatalogServiceSource) -> QueryCatalogService {
     QueryCatalogService::new(
-        Arc::new(RwLock::new(state.catalog_service.local_snapshot())),
-        state.catalog_service.registry_snapshot(),
+        Arc::new(RwLock::new(source.catalog_service().local_snapshot())),
+        source.catalog_service().registry_snapshot(),
     )
+}
+
+/// Leaf ports used to compile and submit a foreground DML query.
+///
+/// The optional maintenance-context fallback remains only for legacy callers.
+/// A Frontend-composed [`domain::DmlExecutionKernel`] rejects that fallback so
+/// foreground DML must arrive with its admitted request context.
+pub(crate) trait DmlQueryExecutionKernel:
+    CatalogServiceSource + query_prep::TimeTravelResolver + query_stats::QueryStatisticsResolver
+{
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
+    fn catalog_application(
+        &self,
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
+    fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService;
+    fn capture_dml_fallback_execution(
+        &self,
+    ) -> Result<crate::query_execution::request_context::QueryExecutionContext, String>;
+}
+
+impl DmlQueryExecutionKernel for Arc<StandaloneState> {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
+        self.connector_control.as_ref()
+    }
+
+    fn catalog_application(
+        &self,
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+        self.catalog_application.as_deref()
+    }
+
+    fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService {
+        &self.query_execution
+    }
+
+    fn capture_dml_fallback_execution(
+        &self,
+    ) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+        capture_maintenance_execution(self.as_ref())
+    }
+}
+
+impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
+        self.connector_control().as_ref()
+    }
+
+    fn catalog_application(
+        &self,
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+        self.catalog_application().map(Arc::as_ref)
+    }
+
+    fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService {
+        self.query_execution()
+    }
+
+    fn capture_dml_fallback_execution(
+        &self,
+    ) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+        Err("foreground DML requires an admitted query execution context".to_string())
+    }
 }
 
 /// Builds the request-local SQL materializer behind the Frontend-owned catalog
@@ -1716,34 +1815,48 @@ impl StandaloneNovaRocks {
         }
     }
 
+    /// Transitional compatibility only while Frontend moves its router to
+    /// explicit domain capabilities.  The returned kernel copies leaf ports;
+    /// it never retains or exposes `StandaloneState` to a DML implementation.
+    fn legacy_dml_kernel(&self) -> domain::DmlExecutionKernel {
+        domain::DmlExecutionKernel::new(
+            Arc::clone(&self.inner.catalog_service),
+            self.inner.catalog_application.clone(),
+            Arc::clone(&self.inner.connector_control),
+            Arc::clone(&self.inner.unified_statistics),
+            Arc::clone(&self.inner.mv_storage_observation),
+            self.inner.query_execution.clone(),
+        )
+    }
+
     pub fn insert_engine(&self) -> Arc<dyn insert_engine::InsertEngine> {
-        Arc::new(Arc::clone(&self.inner))
+        Arc::new(self.legacy_dml_kernel())
     }
 
     pub fn delete_engine(&self) -> Arc<dyn delete_engine::DeleteEngine> {
-        Arc::new(Arc::clone(&self.inner))
+        Arc::new(self.legacy_dml_kernel())
     }
 
     /// UPDATE/MERGE's narrow reverse port.  Frontend owns the durable DML
     /// lifecycle; the returned core capability keeps parser-private mutation
     /// planning and exact connector sessions opaque.
     pub fn mutation_engine(&self) -> Arc<dyn mutation_engine::MutationEngine> {
-        Arc::new(Arc::clone(&self.inner))
+        Arc::new(self.legacy_dml_kernel())
     }
 
     pub fn ctas_engine(&self) -> Arc<dyn ctas_engine::CtasEngine> {
-        Arc::new(Arc::clone(&self.inner))
+        Arc::new(self.legacy_dml_kernel())
     }
 
     pub fn truncate_engine(&self) -> Arc<dyn truncate_engine::TruncateEngine> {
-        Arc::new(Arc::clone(&self.inner))
+        Arc::new(self.legacy_dml_kernel())
     }
 
     /// ADD FILES' narrow reverse port. The frontend owns durable operation
     /// lifecycle and source-scope policy; core retains target resolution and
     /// the exact connector data-mutation session.
     pub fn add_files_engine(&self) -> Arc<dyn add_files_engine::AddFilesEngine> {
-        Arc::new(Arc::clone(&self.inner))
+        Arc::new(self.legacy_dml_kernel())
     }
 
     /// Resolve an ANALYZE target once through the current connector control
@@ -4264,7 +4377,7 @@ pub(crate) fn iceberg_write_shuffle_by_output_index(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_as_iceberg_write(
-    state: &Arc<StandaloneState>,
+    state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
@@ -4297,7 +4410,7 @@ pub(crate) fn execute_query_as_iceberg_write(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
-    state: &Arc<StandaloneState>,
+    state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
@@ -4328,7 +4441,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context(
-    state: &Arc<StandaloneState>,
+    state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
@@ -4363,7 +4476,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
 /// and is never registered in the shared local catalog.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overlays(
-    state: &Arc<StandaloneState>,
+    state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
@@ -4508,7 +4621,7 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
     let execution = match execution {
         Some(execution) => execution,
         None => {
-            maintenance_execution = capture_maintenance_execution(state)?;
+            maintenance_execution = state.capture_dml_fallback_execution()?;
             &maintenance_execution
         }
     };
@@ -4521,7 +4634,7 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        state.connector_control.as_ref(),
+        DmlQueryExecutionKernel::connector_control(state),
         connector_context,
         Some(table_bindings),
         Some(scan_resolver),
@@ -4576,7 +4689,7 @@ pub(crate) enum DistributedConnectorWrite {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_query_as_iceberg_write_with_connector_binding(
-    state: &Arc<StandaloneState>,
+    state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
@@ -4594,7 +4707,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     let execution = match execution {
         Some(execution) => execution,
         None => {
-            maintenance_execution = capture_maintenance_execution(state)?;
+            maintenance_execution = state.capture_dml_fallback_execution()?;
             &maintenance_execution
         }
     };
@@ -4622,11 +4735,11 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     let analyzer_provider = build_catalog_service_provider_with_bindings_and_query_local_overlays(
         current_catalog,
         &catalog_service_snapshot,
-        state.connector_control.as_ref(),
+        DmlQueryExecutionKernel::connector_control(state),
         connector_context.clone(),
         Arc::clone(&table_bindings),
         query_local_overlays.to_vec(),
-        state.catalog_application.as_deref(),
+        DmlQueryExecutionKernel::catalog_application(state),
     );
 
     let resolved_bindings = analyzer_provider.query_table_bindings();
@@ -4635,7 +4748,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
             "SQL write catalog materializer replaced the admitted binding store".to_string(),
         );
     }
-    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
+    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         state,
         Arc::clone(&table_bindings),
     );
@@ -4680,7 +4793,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        state.connector_control.as_ref(),
+        DmlQueryExecutionKernel::connector_control(state),
         &connector_context,
         Some(table_bindings.as_ref()),
         scan_resolver,
@@ -4691,7 +4804,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         &prepared,
     )?;
     execute_distributed_write_with_execution(
-        &state.query_execution,
+        state.query_execution(),
         prepared,
         native_bundle,
         query_opts,
@@ -4704,7 +4817,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
 /// application owner later seals it through the exact retained write lease.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
-    state: &Arc<StandaloneState>,
+    state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
@@ -4731,11 +4844,11 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
     let analyzer_provider = build_catalog_service_provider_with_bindings_and_query_local_overlays(
         current_catalog,
         &catalog_service_snapshot,
-        state.connector_control.as_ref(),
+        DmlQueryExecutionKernel::connector_control(state),
         connector_context.clone(),
         Arc::clone(&table_bindings),
         Vec::new(),
-        state.catalog_application.as_deref(),
+        DmlQueryExecutionKernel::catalog_application(state),
     );
     let resolved_bindings = analyzer_provider.query_table_bindings();
     if !Arc::ptr_eq(&table_bindings, &resolved_bindings) {
@@ -4743,7 +4856,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
             "SQL write catalog materializer replaced the admitted binding store".to_string(),
         );
     }
-    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
+    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         state,
         Arc::clone(&table_bindings),
     );
@@ -4791,7 +4904,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        state.connector_control.as_ref(),
+        DmlQueryExecutionKernel::connector_control(state),
         connector_context,
         Some(table_bindings.as_ref()),
         None,
@@ -4972,6 +5085,31 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
+    let maintenance_execution = capture_maintenance_execution(state)?;
+    build_physical_plan_as_iceberg_change_stream_write_with_execution(
+        state.connector_control.as_ref(),
+        &maintenance_execution,
+        optimized_tree,
+        query_table_bindings,
+        dag,
+        pre_expand_keyed_assert,
+        connector_context,
+    )
+}
+
+/// Build the pure Core portion of a change-stream write from explicitly
+/// admitted execution facts.  Foreground DML supplies its request context;
+/// only the legacy MV wrapper above captures a maintenance context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_execution(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
+    query_table_bindings: Option<&crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PlannedIcebergChangeStreamWrite, String> {
     crate::connector::validate_request_context(connector_context)?;
     let optimizer_settings = change_stream_write_optimizer_settings();
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
@@ -4984,7 +5122,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         )?;
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
-    let maintenance_execution = capture_maintenance_execution(state)?;
     let scan_resolver = query_table_bindings
         .map(crate::engine::query_planning::delta_scan::QueryTableBindingScanResolver::new);
     let scan_binding_resolver = scan_resolver.as_ref().map(|resolver| {
@@ -4992,11 +5129,11 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     });
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        state.connector_control.as_ref(),
+        connector_control,
         connector_context,
         query_table_bindings,
         scan_binding_resolver,
-        scan_preparation_options(&optimizer_settings, &maintenance_execution)?,
+        scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -5230,13 +5367,36 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
+    plan_query_for_iceberg_change_stream_refresh_with_statistics(
+        state,
+        query,
+        analyzer_catalog,
+        current_database,
+        imv_rewrite,
+        table_bindings,
+        execution,
+    )
+}
+
+/// Compile a change-stream refresh from frozen statistics evidence without
+/// recovering the old aggregate state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
+    statistics_resolver: &impl query_stats::QueryStatisticsResolver,
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    current_database: &str,
+    imv_rewrite: Option<&crate::sql::compiler::SqlImvPlanningInput>,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
             "distributed SQL compilation requires a frozen non-zero backend count".to_string()
         })?;
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
-        state,
+    let statistics = query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+        statistics_resolver,
         Arc::clone(&table_bindings),
     );
     let request = crate::sql::compiler::SqlCompileRequest::new(

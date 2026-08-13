@@ -140,11 +140,49 @@ pub(crate) fn load_mv_target_binding(
         state.connector_control.as_ref(),
         &table.catalog,
     )?;
-    load_mv_target_binding_with_lease(state, table, exact_lease, connector_context)
+    load_mv_target_binding_with_lease_and_ports(
+        state.mv_storage_observation.as_ref(),
+        table,
+        exact_lease,
+        connector_context,
+    )
+}
+
+/// Resolve a target through the explicit MV execution kernel.  This is the
+/// kernel-first entry used by frontend-owned MV lifecycle composition.
+pub(crate) fn load_mv_target_binding_with_kernel(
+    kernel: &crate::engine::domain::MvExecutionKernel,
+    table: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, String> {
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        kernel.connector_control().as_ref(),
+        &table.catalog,
+    )?;
+    load_mv_target_binding_with_lease_and_ports(
+        kernel.storage_observation().as_ref(),
+        table,
+        exact_lease,
+        connector_context,
+    )
 }
 
 pub(crate) fn load_mv_target_binding_with_lease(
     state: &Arc<crate::engine::StandaloneState>,
+    table: &TableIdentity,
+    exact_lease: ConnectorControlPlanningLease,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, String> {
+    load_mv_target_binding_with_lease_and_ports(
+        state.mv_storage_observation.as_ref(),
+        table,
+        exact_lease,
+        connector_context,
+    )
+}
+
+fn load_mv_target_binding_with_lease_and_ports(
+    storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     table: &TableIdentity,
     exact_lease: ConnectorControlPlanningLease,
     connector_context: &ConnectorRequestContext,
@@ -164,8 +202,7 @@ pub(crate) fn load_mv_target_binding_with_lease(
         &table.table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let observation = state
-        .mv_storage_observation
+    let observation = storage_observation
         .observe_refresh_target(&exact_lease, &metadata, connector_context.clone())
         .map_err(|error| {
             format!(

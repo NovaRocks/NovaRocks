@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use crate::engine::domain::MvExecutionKernel;
 use crate::engine::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::model::{MvStorageEngine, MvTarget};
@@ -34,7 +35,11 @@ use crate::sql::parser::ast::{
 use crate::sql::parser::query_refs::extract_three_part_table_ref_occurrences;
 use novarocks_catalog::identifier::normalize_identifier;
 
-fn backend_by_engine(
+/// Temporary adapter for the legacy state-based statement dispatcher.
+///
+/// New command paths use `MvExecutionKernel::mv_backend` directly. This
+/// adapter disappears with the dispatcher migration in the integration wave.
+fn legacy_backend_by_engine(
     state: &Arc<StandaloneState>,
     engine: MvStorageEngine,
 ) -> Result<Arc<dyn crate::connector::backend::MvBackend>, String> {
@@ -313,21 +318,20 @@ mod lifecycle_tests {
     }
 }
 
-fn default_mv_storage_engine(_state: &Arc<StandaloneState>) -> &str {
+fn default_mv_storage_engine() -> &'static str {
     "iceberg"
 }
 
-fn storage_engine_for_create(
-    state: &Arc<StandaloneState>,
-    stmt: &CreateMaterializedViewStmt,
-) -> Result<MvStorageEngine, String> {
-    let raw = stmt
+fn storage_engine_for_create(stmt: &CreateMaterializedViewStmt) -> Result<MvStorageEngine, String> {
+    let configured = stmt
         .properties
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("storage_engine"))
-        .map(|(_, value)| value.as_str())
-        .unwrap_or_else(|| default_mv_storage_engine(state))
-        .trim();
+        .map(|(_, value)| value.clone());
+    let raw = match configured.as_deref() {
+        Some(value) => value.trim(),
+        None => default_mv_storage_engine(),
+    };
     match raw.to_ascii_lowercase().as_str() {
         "iceberg" => Ok(MvStorageEngine::Iceberg),
         "starrocks" => Err(
@@ -341,11 +345,10 @@ fn storage_engine_for_create(
 }
 
 fn existing_mv_storage_engine_by_target(
-    state: &Arc<StandaloneState>,
+    repository: &dyn MvRepository,
     target: &crate::engine::mv::iceberg_refresh::IcebergMvTarget,
 ) -> Result<Option<MvStorageEngine>, String> {
-    let Some(definition) = state
-        .mv_repository
+    let Some(definition) = repository
         .find_by_target(&MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
@@ -419,15 +422,14 @@ fn refresh_metadata_request_for_policy(
 }
 
 fn load_definition_for_alter(
-    state: &Arc<StandaloneState>,
+    repository: &dyn MvRepository,
     current_catalog: Option<&str>,
     db: &str,
     name: &crate::sql::parser::ast::ObjectName,
 ) -> Result<StoredMvDefinition, String> {
     let target =
         crate::engine::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
-    let Some(definition) = state
-        .mv_repository
+    let Some(definition) = repository
         .find_by_target(&MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
@@ -457,8 +459,32 @@ pub(crate) fn create_mv(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    let engine = storage_engine_for_create(state, stmt)?;
-    backend_by_engine(state, engine)?.create_mv(CreateMvRequest {
+    let engine = storage_engine_for_create(stmt)?;
+    legacy_backend_by_engine(state, engine)?.create_mv(CreateMvRequest {
+        stmt: stmt.clone(),
+        current_catalog: current_catalog.map(str::to_string),
+        current_database: db.to_string(),
+        connector_context: connector_context.clone(),
+    })?;
+    Ok(StatementResult::Ok)
+}
+
+/// Create an MV through its explicit frontend-composed execution kernel.
+///
+/// The SQL surface admits only Iceberg-backed MVs, so this uses the single
+/// injected backend rather than a string-keyed connector registry lookup.
+pub(crate) fn create_mv_with_kernel(
+    kernel: &MvExecutionKernel,
+    current_catalog: Option<&str>,
+    db: &str,
+    stmt: &CreateMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
+    if storage_engine_for_create(stmt)? != MvStorageEngine::Iceberg {
+        return Err("materialized view backend must be Iceberg".to_string());
+    }
+    kernel.mv_backend().create_mv(CreateMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
@@ -480,7 +506,8 @@ pub(crate) fn drop_mv(
         db,
         &stmt.name,
     )?;
-    if let Some(engine) = existing_mv_storage_engine_by_target(state, &target)?
+    if let Some(engine) =
+        existing_mv_storage_engine_by_target(state.mv_repository.as_ref(), &target)?
         && engine != MvStorageEngine::Iceberg
     {
         return Err(
@@ -488,7 +515,39 @@ pub(crate) fn drop_mv(
                 .to_string(),
         );
     }
-    backend_by_engine(state, MvStorageEngine::Iceberg)?.drop_mv(DropMvRequest {
+    legacy_backend_by_engine(state, MvStorageEngine::Iceberg)?.drop_mv(DropMvRequest {
+        stmt: stmt.clone(),
+        current_catalog: current_catalog.map(str::to_string),
+        current_database: db.to_string(),
+        connector_context: connector_context.clone(),
+    })?;
+    Ok(StatementResult::Ok)
+}
+
+/// Drop an MV through its explicit frontend-composed execution kernel.
+pub(crate) fn drop_mv_with_kernel(
+    kernel: &MvExecutionKernel,
+    current_catalog: Option<&str>,
+    db: &str,
+    stmt: &DropMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
+    let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+        current_catalog,
+        db,
+        &stmt.name,
+    )?;
+    if let Some(engine) =
+        existing_mv_storage_engine_by_target(kernel.repository().as_ref(), &target)?
+        && engine != MvStorageEngine::Iceberg
+    {
+        return Err(
+            "DROP MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
+                .to_string(),
+        );
+    }
+    kernel.mv_backend().drop_mv(DropMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
@@ -530,7 +589,8 @@ pub(crate) fn alter_mv_with_connector_context(
             db,
             &stmt.name,
         )?;
-        let engine = existing_mv_storage_engine_by_target(state, &target)?.ok_or_else(|| {
+        let engine = existing_mv_storage_engine_by_target(state.mv_repository.as_ref(), &target)?
+            .ok_or_else(|| {
             format!(
                 "materialized view {}.{}.{} not found",
                 target.catalog, target.namespace, target.table
@@ -572,7 +632,12 @@ pub(crate) fn alter_mv_with_connector_context(
         }
         unreachable!("properties branch must return after its provider mutation");
     }
-    let definition = load_definition_for_alter(state, current_catalog, db, &stmt.name)?;
+    let definition = load_definition_for_alter(
+        state.mv_repository.as_ref(),
+        current_catalog,
+        db,
+        &stmt.name,
+    )?;
     let req = match &stmt.action {
         AlterMaterializedViewAction::SetRefresh(policy) => {
             refresh_metadata_request_for_policy(&definition, policy, definition.refresh_paused)
@@ -631,7 +696,29 @@ pub(crate) fn list_mvs(
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
     };
-    let mut rows = backend_by_engine(state, MvStorageEngine::Iceberg)?.list_mvs(req)?;
+    let mut rows = legacy_backend_by_engine(state, MvStorageEngine::Iceberg)?.list_mvs(req)?;
+    rows.sort_by(|left, right| {
+        left.database
+            .cmp(&right.database)
+            .then(left.name.cmp(&right.name))
+    });
+    Ok(StatementResult::Query(
+        crate::engine::mv::analysis_adapter::build_mv_rows_result(&rows)?,
+    ))
+}
+
+/// List MVs through the injected backend, with no registry lookup. Sorting is
+/// retained here because it is part of the SQL presentation contract.
+pub(crate) fn list_mvs_with_kernel(
+    kernel: &MvExecutionKernel,
+    current_catalog: Option<&str>,
+    stmt: &ShowMaterializedViewsStmt,
+) -> Result<StatementResult, String> {
+    let req = ListMvsRequest {
+        stmt: stmt.clone(),
+        current_catalog: current_catalog.map(str::to_string),
+    };
+    let mut rows = kernel.mv_backend().list_mvs(req)?;
     rows.sort_by(|left, right| {
         left.database
             .cmp(&right.database)

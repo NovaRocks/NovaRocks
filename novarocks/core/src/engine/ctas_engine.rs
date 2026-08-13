@@ -44,6 +44,7 @@ use novarocks_spi::connector::{
     CreatePolicy, ExternalMutationEvidence,
 };
 
+use crate::engine::domain::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
@@ -338,7 +339,7 @@ pub(crate) struct PlannedCtasSourceQuery {
 
 #[allow(clippy::too_many_arguments)]
 fn plan_query_for_ctas_source(
-    state: &Arc<crate::engine::StandaloneState>,
+    state: &DmlExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
@@ -359,14 +360,14 @@ fn plan_query_for_ctas_source(
     let analyzer_provider = super::build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
-        state.catalog_application.as_deref(),
+        state.catalog_application().map(Arc::as_ref),
     );
     let table_bindings = analyzer_provider.query_table_bindings();
     let statistics =
-        super::query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
+        super::query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
             state,
             Arc::clone(&table_bindings),
         );
@@ -410,7 +411,7 @@ fn plan_query_for_ctas_source(
 }
 
 fn prepare_planned_ctas_connector_write(
-    state: &Arc<crate::engine::StandaloneState>,
+    state: &DmlExecutionKernel,
     planned: &PlannedCtasSourceQuery,
     input_schema: arrow::datatypes::SchemaRef,
     query_options: Option<QueryOptions>,
@@ -430,7 +431,7 @@ fn prepare_planned_ctas_connector_write(
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         connector_context,
         Some(planned.table_bindings.as_ref()),
         None,
@@ -958,7 +959,7 @@ impl CtasPreparedSource for CorePreparedCtasSource {
 }
 
 struct CorePreparedCtasWrite {
-    state: Arc<crate::engine::StandaloneState>,
+    state: DmlExecutionKernel,
     gate: Arc<CtasSourceExecutionGate>,
     target: Arc<CoreCtasTargetSession>,
     prepared:
@@ -1240,7 +1241,7 @@ fn write_commit_unknown(
     }
 }
 
-impl CtasEngine for Arc<crate::engine::StandaloneState> {
+impl CtasEngine for DmlExecutionKernel {
     fn classify_ctas(&self, sql: &str) -> Result<Option<CtasCommand>, String> {
         use crate::sql::parser::ast::CreateTableKind;
         use crate::sql::parser::dialect::{
@@ -1330,7 +1331,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(connector_failure)?;
         let planning = self
-            .connector_control
+            .connector_control()
             .acquire_current(&instance_id)
             .map_err(connector_failure)?;
         // Derive the mandatory capability before any source preparation. The
@@ -1685,7 +1686,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
             cohort_set_digest,
             execution_identity: identity,
             handle: Arc::new(CorePreparedCtasWrite {
-                state: Arc::clone(self),
+                state: self.clone(),
                 gate: Arc::clone(&source.gate),
                 target,
                 prepared: Mutex::new(Some(prepared)),
@@ -1715,7 +1716,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                 let exact_lease = request.lease();
                 let session = prepared
                     .state
-                    .query_execution
+                    .query_execution()
                     .begin_write_operation(request.registration(), exact_lease)
                     .map_err(|error| error.to_string())?;
                 *prepared
@@ -1732,7 +1733,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
                 let request = request
                     .into_request(&execution, registration)
                     .map_err(|error| error.to_string())?;
-                let outcome = match prepared.state.query_execution.execute(request) {
+                let outcome = match prepared.state.query_execution().execute(request) {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         return Ok(write_commit_unknown(
@@ -2024,7 +2025,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ConnectorHistoricalCtasObservation, ConnectorCtasFailure> {
         let planning = self
-            .connector_control
+            .connector_control()
             .acquire_current(&descriptor.fence.target().instance_id)
             .map_err(|error| local_ctas_failure(connector_failure(error)))?;
         let recovery = historical_ctas_recovery(&planning)?;
@@ -2040,7 +2041,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
         request: ConnectorCtasAdvanceFenceRequest,
     ) -> Result<ConnectorCtasPublicationFenceReceipt, ConnectorCtasFailure> {
         let planning = self
-            .connector_control
+            .connector_control()
             .acquire_current(&request.fence.target().instance_id)
             .map_err(|error| local_ctas_failure(connector_failure(error)))?;
         let recovery = historical_ctas_recovery(&planning)?;
@@ -2056,7 +2057,7 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
         request: ConnectorHistoricalCtasCleanupRequest,
     ) -> Result<ConnectorHistoricalCtasCleanupReceipt, ConnectorCtasFailure> {
         let planning = self
-            .connector_control
+            .connector_control()
             .acquire_current(&request.descriptor.fence.target().instance_id)
             .map_err(|error| local_ctas_failure(connector_failure(error)))?;
         let recovery = historical_ctas_recovery(&planning)?;
@@ -2146,6 +2147,21 @@ mod tests {
         )
     }
 
+    fn test_dml_kernel() -> DmlExecutionKernel {
+        let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
+            Arc::new(crate::engine::TestConnectorControlRegistry::default());
+        DmlExecutionKernel::new(
+            Arc::new(crate::engine::query_planning::catalog_runtime::new_query_catalog_service()),
+            None,
+            Arc::clone(&connector_control),
+            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
+            Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
+            crate::engine::test_query_execution_service_with_connector_control(Some(
+                connector_control,
+            )),
+        )
+    }
+
     fn planned_source(sql: &str) -> PlannedCtasSourceQuery {
         let dialect = crate::sql::parser::dialect::StarRocksDialect;
         let query = sqlparser::parser::Parser::new(&dialect)
@@ -2155,7 +2171,7 @@ mod tests {
             .expect("source query");
         let execution = fe_execution(SessionOptimizerSettings::default());
         plan_query_for_ctas_source(
-            &Arc::new(crate::engine::StandaloneState::default()),
+            &test_dml_kernel(),
             None,
             "analytics",
             &query,
@@ -2167,7 +2183,7 @@ mod tests {
 
     #[test]
     fn classifier_preserves_ifne_partitioning_and_properties() {
-        let state = Arc::new(crate::engine::StandaloneState::default());
+        let state = test_dml_kernel();
         let command = CtasEngine::classify_ctas(
             &state,
             "CREATE TABLE IF NOT EXISTS ice.sales.dst PARTITION BY (region) \
@@ -2199,7 +2215,7 @@ mod tests {
 
     #[test]
     fn classifier_leaves_nested_complex_type_create_table_to_ddl() {
-        let state = Arc::new(crate::engine::StandaloneState::default());
+        let state = test_dml_kernel();
         let command = CtasEngine::classify_ctas(
             &state,
             "CREATE TABLE ice.sales.nested (\
@@ -2780,7 +2796,7 @@ mod tests {
             incarnation,
         ));
         let preflight = test_preflight_with_capability(capability.owner(), capability.clone());
-        let state = Arc::new(crate::engine::StandaloneState::default());
+        let state = test_dml_kernel();
         let operation_id = ctas_operation_id();
         let target = ConnectorTableIdentity {
             instance_id: descriptor.instance_id,
@@ -2812,14 +2828,14 @@ mod tests {
         )
         .unwrap();
 
-        let lower_state = Arc::clone(&state);
+        let lower_state = state.clone();
         let lower_thread = std::thread::spawn(move || {
             CtasEngine::advance_ctas_fence(&lower_state, &*lower_action.handle).unwrap()
         });
         while capability.active.load(Ordering::SeqCst) == 0 {
             std::thread::yield_now();
         }
-        let higher_state = Arc::clone(&state);
+        let higher_state = state.clone();
         let higher_thread = std::thread::spawn(move || {
             CtasEngine::advance_ctas_fence(&higher_state, &*higher_action.handle).unwrap()
         });
@@ -2857,7 +2873,7 @@ mod tests {
             request.input_digest,
             CoreCtasCatalogActionKind::Advance { preflight, request },
         );
-        let state = Arc::new(crate::engine::StandaloneState::default());
+        let state = test_dml_kernel();
 
         assert!(matches!(
             CtasEngine::advance_ctas_fence(&state, &*action.handle),
@@ -2902,7 +2918,7 @@ mod tests {
                 state: Arc::clone(&catalog_state),
             },
         );
-        let state = Arc::new(crate::engine::StandaloneState::default());
+        let state = test_dml_kernel();
 
         assert!(matches!(
             CtasEngine::publish_ctas(&state, &*publish_action.handle),

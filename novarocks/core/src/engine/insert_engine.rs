@@ -17,7 +17,7 @@
 
 //! Transitional reverse port for the frontend-owned INSERT application flow.
 //!
-//! The types in this module deliberately expose neither [`super::StandaloneState`]
+//! The types in this module deliberately expose neither an application state
 //! nor connector implementations. The frontend owns INSERT conversion,
 //! dispatch, shaping, and transaction orchestration; core retains execution,
 //! connector, and external commit truth behind this object-safe boundary.
@@ -29,11 +29,11 @@ use novarocks_catalog::schema::ColumnDef;
 
 use crate::connector::backend::ResolvedTable;
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::domain::DmlExecutionKernel;
 use crate::engine::external_write_fence::{
     ExternalWriteFenceProposal, external_fence_authority_unavailable, invalid_fence_request,
 };
-use crate::engine::statistics::StatisticsEngine;
-use crate::engine::{StandaloneState, iceberg_writer};
+use crate::engine::iceberg_writer;
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
 use crate::sql::parser::ast::{Literal, ObjectName};
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -194,7 +194,7 @@ pub enum IcebergWriteReport {
 
 /// Iceberg write port used by frontend-owned native INSERT orchestration.
 // Design: ADR-0021 (docs/adr/ADR-0021-native-frontend-insert-is-iceberg-only.md)
-pub trait InsertEngine: StatisticsEngine + Send + Sync {
+pub trait InsertEngine: Send + Sync {
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String>;
 
     fn prepare_iceberg_write(
@@ -267,7 +267,7 @@ impl IcebergInsertCommit for CoreIcebergInsertCommit {
     }
 }
 
-impl InsertEngine for Arc<StandaloneState> {
+impl InsertEngine for DmlExecutionKernel {
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String> {
         let name = ObjectName {
             parts: request.target.parts,
@@ -285,7 +285,7 @@ impl InsertEngine for Arc<StandaloneState> {
             &request.current_database,
         )?;
         let planning_lease = crate::connector::acquire_metadata_planning_lease(
-            self.connector_control.as_ref(),
+            self.connector_control().as_ref(),
             &target.catalog,
         )?;
         let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
@@ -295,8 +295,9 @@ impl InsertEngine for Arc<StandaloneState> {
             &target.table,
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         )?;
-        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-            self,
+        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+            self.connector_control().as_ref(),
+            self.mv_storage_observation().as_ref(),
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
         )?;
@@ -564,6 +565,21 @@ mod tests {
         request.execution().clone()
     }
 
+    fn test_dml_kernel() -> DmlExecutionKernel {
+        let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
+            Arc::new(crate::engine::TestConnectorControlRegistry::default());
+        DmlExecutionKernel::new(
+            Arc::new(crate::engine::query_planning::catalog_runtime::new_query_catalog_service()),
+            None,
+            Arc::clone(&connector_control),
+            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
+            Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
+            crate::engine::test_query_execution_service_with_connector_control(Some(
+                connector_control,
+            )),
+        )
+    }
+
     fn write_abort_with_staged_report() -> WriteAbortInput {
         let write_id = UniqueId::new(10, 20);
         let writer_key = WriterKey {
@@ -648,8 +664,8 @@ mod tests {
 
     #[test]
     fn target_resolution_rechecks_cancellation_before_metadata_lookup() {
-        let state = Arc::new(StandaloneState::default());
-        let error = state
+        let kernel = test_dml_kernel();
+        let error = kernel
             .resolve_target(ResolveInsertTarget {
                 current_catalog: None,
                 current_database: "db".to_string(),

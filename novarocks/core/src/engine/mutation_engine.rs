@@ -248,7 +248,7 @@ fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, String>
         .ok_or_else(|| "mutation engine received a foreign abort handle".to_string())
 }
 
-impl MutationEngine for Arc<crate::engine::StandaloneState> {
+impl MutationEngine for crate::engine::domain::DmlExecutionKernel {
     fn establish_mutation_external_fence(
         &self,
         prepared: &dyn MutationPrepared,
@@ -530,6 +530,21 @@ mod tests {
     use crate::query_execution::outcome::QueryExecutionResult;
     use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
 
+    fn test_dml_kernel() -> crate::engine::domain::DmlExecutionKernel {
+        let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
+            Arc::new(crate::engine::TestConnectorControlRegistry::default());
+        crate::engine::domain::DmlExecutionKernel::new(
+            Arc::new(crate::engine::query_planning::catalog_runtime::new_query_catalog_service()),
+            None,
+            Arc::clone(&connector_control),
+            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
+            Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
+            crate::engine::test_query_execution_service_with_connector_control(Some(
+                connector_control,
+            )),
+        )
+    }
+
     struct TestExecution {
         abort_calls: AtomicUsize,
     }
@@ -623,7 +638,7 @@ mod tests {
     #[test]
     fn terminal_abort_rejects_foreign_and_cross_statement_handles_without_consuming_prepared_state()
     {
-        let engine = Arc::new(crate::engine::StandaloneState::default());
+        let engine = test_dml_kernel();
         let prepared = prepared(MutationStatementKind::Update, "update-attempt");
         let execution = Arc::new(TestExecution::known_uncommitted());
 
@@ -644,7 +659,7 @@ mod tests {
 
     #[test]
     fn terminal_abort_keeps_its_execution_for_finalization() {
-        let engine = Arc::new(crate::engine::StandaloneState::default());
+        let engine = test_dml_kernel();
         let prepared = prepared(MutationStatementKind::Update, "update-attempt");
         let execution = Arc::new(TestExecution::known_uncommitted());
         let abort = abort_handle(
@@ -673,7 +688,7 @@ mod tests {
 
     #[test]
     fn terminal_abort_consumes_the_exact_handle_once_and_returns_connector_truth() {
-        let engine = Arc::new(crate::engine::StandaloneState::default());
+        let engine = test_dml_kernel();
         let prepared = prepared(MutationStatementKind::Update, "update-attempt");
         let execution = Arc::new(TestExecution::known_uncommitted());
         let abort = abort_handle(

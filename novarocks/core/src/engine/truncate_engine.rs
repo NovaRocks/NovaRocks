@@ -34,7 +34,7 @@ use crate::connector::data_mutation::{
     CompletedDataMutation, DataMutationDispatchState, DataMutationIntent, DataMutationSession,
     KnownUncommittedDataMutation, ResolvedDataMutation,
 };
-use crate::engine::StandaloneState;
+use crate::engine::domain::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::ast::{ObjectName, Statement};
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -253,7 +253,7 @@ impl TruncatePrepared for CorePreparedTruncate {
     }
 }
 
-impl TruncateEngine for Arc<StandaloneState> {
+impl TruncateEngine for DmlExecutionKernel {
     fn establish_truncate_external_fence(
         &self,
         prepared: &dyn TruncatePrepared,
@@ -307,8 +307,9 @@ impl TruncateEngine for Arc<StandaloneState> {
                 target.namespace, target.table
             )));
         }
-        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-            self,
+        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+            self.connector_control().as_ref(),
+            self.mv_storage_observation().as_ref(),
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Truncate,
         )
@@ -321,7 +322,7 @@ impl TruncateEngine for Arc<StandaloneState> {
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(plan_connector_failure)?;
         let session = DataMutationSession::plan(
-            self.connector_control.as_ref(),
+            self.connector_control().as_ref(),
             &instance_id,
             ConnectorMutationOperationId::from_bytes(request.mutation_operation_id),
             novarocks_spi::connector::ConnectorTableIdentity {
@@ -371,7 +372,7 @@ impl TruncateEngine for Arc<StandaloneState> {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.execute_once(self.as_ref()))
+        project_outcome(session.execute_once(self))
     }
 
     fn reconcile_truncate(
@@ -403,7 +404,7 @@ impl TruncateEngine for Arc<StandaloneState> {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.reconcile_once(evidence, self.as_ref()))
+        project_outcome(session.reconcile_once(evidence, self))
     }
 }
 

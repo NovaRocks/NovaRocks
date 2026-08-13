@@ -36,11 +36,11 @@ use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
 use sqlparser::ast as sqlast;
 
-use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
+use crate::engine::domain::DmlExecutionKernel;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
@@ -54,7 +54,7 @@ use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
 
 pub(crate) fn prepare_delete_statement(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     stmt: &DeleteStmt,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -93,7 +93,7 @@ pub(crate) fn prepare_delete_statement(
         ));
     }
     let target_binding = crate::connector::write_target::load_write_target_binding(
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         &target.catalog,
         &target.namespace,
         &target.table,
@@ -108,8 +108,9 @@ pub(crate) fn prepare_delete_statement(
     // drives its own writes through that same admission, so at that level a
     // user statement is indistinguishable from the MV machinery maintaining its
     // own target.
-    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-        state,
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        state.connector_control().as_ref(),
+        state.mv_storage_observation().as_ref(),
         &target,
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Delete,
     )?;
@@ -167,7 +168,7 @@ pub(crate) fn prepare_delete_statement(
 }
 
 struct DistributedDeleteWriteExecutor {
-    state: Arc<StandaloneState>,
+    state: DmlExecutionKernel,
     target: TargetBackend,
     delete_query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
@@ -240,7 +241,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
     }
 
     fn finalize(&self) -> Result<(), String> {
-        self.state.catalog_service.invalidate_table(
+        self.state.catalog_service().invalidate_table(
             &self.target.catalog,
             &self.target.namespace,
             &self.target.table,
@@ -256,7 +257,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
 /// signed strategy rather than from anything this engine decides.
 #[allow(clippy::too_many_arguments)]
 fn prepare_delete_write(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &TargetBackend,
     strategy: ConnectorRowMutationStrategy,
     preparation: novarocks_spi::connector::ConnectorWritePreparation,
@@ -319,7 +320,7 @@ fn prepare_delete_write(
         )
         .map_err(|error| format!("activate Provider DELETE write: {error}"))?;
     let executor = DistributedDeleteWriteExecutor {
-        state: Arc::clone(state),
+        state: state.clone(),
         target: target.clone(),
         delete_query,
         sql_write_input,

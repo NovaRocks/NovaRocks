@@ -26,9 +26,8 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Field;
 
 use crate::connector::backend::ResolvedTable;
-use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
-use crate::engine::mv::refresh_io::query_result_to_chunks;
+use crate::engine::domain::DmlExecutionKernel;
 use crate::engine::query_planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
@@ -42,7 +41,6 @@ use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
-use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity,
     ConnectorTableRequest, ConnectorTableResolution, ConnectorWriteAdmissionPurpose,
@@ -104,7 +102,7 @@ impl IcebergWritePreparationOptions {
 /// never starts a distributed writer or external metadata commit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_iceberg_write(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
@@ -134,7 +132,7 @@ pub(crate) fn prepare_iceberg_write(
 /// identity. This still performs no writer execution or catalog mutation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_iceberg_write_with_options(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
@@ -200,7 +198,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_iceberg_distributed_write(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
@@ -278,7 +276,7 @@ fn prepare_iceberg_distributed_write(
         &write_lease,
     )?;
     let executor = PreparedIcebergWriteExecutor {
-        state: Arc::clone(state),
+        state: state.clone(),
         target: target.clone(),
         query,
         sql_write_input,
@@ -529,7 +527,7 @@ impl PreparedIcebergWrite {
     pub(crate) fn into_mutation_execution(
         self,
     ) -> Result<Arc<dyn crate::engine::mutation_flow::MutationExecution>, String> {
-        let state = Arc::clone(&self.executor.state);
+        let state = self.executor.state.clone();
         let target = self.executor.target.clone();
         let connector_context = self.executor.connector_context.clone();
         let execution = self.executor.execution.clone().ok_or_else(|| {
@@ -548,7 +546,7 @@ impl PreparedIcebergWrite {
 }
 
 struct PreparedIcebergWriteMutationExecution {
-    state: Arc<StandaloneState>,
+    state: DmlExecutionKernel,
     target: TargetBackend,
     execution: QueryExecutionContext,
     prepared_request:
@@ -567,7 +565,7 @@ impl crate::engine::mutation_flow::MutationExecution for PreparedIcebergWriteMut
             .take()
             .ok_or_else(|| "prepared Iceberg mutation request was already consumed".to_string())?;
         let bound = crate::engine::bind_prepared_distributed_write_request(
-            &self.state.query_execution,
+            self.state.query_execution(),
             &self.execution,
             prepared_request,
         )?;
@@ -586,7 +584,7 @@ impl crate::engine::mutation_flow::MutationExecution for PreparedIcebergWriteMut
             .lock()
             .expect("prepared Iceberg mutation session lock poisoned") = Some(bound.session);
         crate::engine::execute_bound_distributed_write_request(
-            &self.state.query_execution,
+            self.state.query_execution(),
             bound.request,
         )
     }
@@ -629,7 +627,7 @@ impl crate::engine::mutation_flow::MutationExecution for PreparedIcebergWriteMut
 /// This type owns no SQL routing or application transaction policy. The
 /// frontend DML services drive production statement lifecycles.
 struct PreparedIcebergWriteExecutor {
-    state: Arc<StandaloneState>,
+    state: DmlExecutionKernel,
     target: TargetBackend,
     query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
@@ -1202,40 +1200,16 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
 }
 
 pub(crate) fn invalidate_iceberg_caches(
-    state: &Arc<StandaloneState>,
+    state: &impl crate::engine::CatalogServiceSource,
     target: &TargetBackend,
 ) -> Result<(), String> {
     state
-        .catalog_service
+        .catalog_service()
         .invalidate_table(&target.catalog, &target.namespace, &target.table)
 }
 
 fn target_string(t: &TargetBackend) -> String {
     format!("{}.{}.{}", t.catalog, t.namespace, t.table)
-}
-
-pub(crate) fn run_select_to_chunks(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    query: &sqlparser::ast::Query,
-) -> Result<Vec<Chunk>, String> {
-    // Pass `current_catalog` when the target is an iceberg table so that
-    // 1-part and 2-part table references in the SELECT (e.g. `db.table`)
-    // resolve against the active catalog.
-    let current_catalog = if target.backend_name == "iceberg" && !target.catalog.is_empty() {
-        Some(target.catalog.as_str())
-    } else {
-        None
-    };
-
-    let result = crate::engine::execute_query_with_catalog_service(
-        state,
-        current_catalog,
-        &target.namespace,
-        query,
-        None,
-    )?;
-    query_result_to_chunks(result)
 }
 
 #[cfg(test)]

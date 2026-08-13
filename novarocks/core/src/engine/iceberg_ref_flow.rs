@@ -38,16 +38,47 @@ pub(crate) fn execute(
     stmt: &AlterIcebergRefStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    execute_with_ports(
+        state.connector_control.as_ref(),
+        state.mv_storage_observation.as_ref(),
+        _current_database,
+        stmt,
+        connector_context,
+    )
+}
+
+/// Execute an Iceberg ref mutation using only the explicit MV kernel ports
+/// required for MV-target admission.
+pub(crate) fn execute_with_kernel(
+    kernel: &crate::engine::domain::MvExecutionKernel,
+    current_database: &str,
+    stmt: &AlterIcebergRefStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    execute_with_ports(
+        kernel.connector_control().as_ref(),
+        kernel.storage_observation().as_ref(),
+        current_database,
+        stmt,
+        connector_context,
+    )
+}
+
+fn execute_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
+    _current_database: &str,
+    stmt: &AlterIcebergRefStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
     // 1. Resolve qualified name — must be 3-part (catalog.namespace.table).
     let (catalog_name, namespace, table_name) = resolve_table_parts(&stmt.table)?;
 
     // Retain one exact generation across MV admission and the ref mutation.
     // The application never decodes the provider-owned table handle.
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
-        state.connector_control.as_ref(),
-        &catalog_name,
-    )?;
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &catalog_name)?;
     let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
@@ -61,8 +92,7 @@ pub(crate) fn execute(
         namespace: namespace.clone(),
         table: table_name.clone(),
     };
-    if state
-        .mv_storage_observation
+    if storage_observation
         .observe_lake_package(&exact_lease, &metadata, connector_context.clone())
         .map_err(|error| {
             format!(

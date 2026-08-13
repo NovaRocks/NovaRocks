@@ -60,10 +60,36 @@ pub(crate) fn observe_current_refresh_base(
     table_ref: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+    observe_current_refresh_base_with_ports(
         state.connector_control.as_ref(),
-        &table_ref.catalog,
-    )?;
+        state.mv_storage_observation.as_ref(),
+        table_ref,
+        connector_context,
+    )
+}
+
+/// Freeze a refresh-base observation through the explicit MV kernel.
+pub(crate) fn observe_current_refresh_base_with_kernel(
+    kernel: &crate::engine::domain::MvExecutionKernel,
+    table_ref: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {
+    observe_current_refresh_base_with_ports(
+        kernel.connector_control().as_ref(),
+        kernel.storage_observation().as_ref(),
+        table_ref,
+        connector_context,
+    )
+}
+
+fn observe_current_refresh_base_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
+    table_ref: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table_ref.catalog)?;
     let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
@@ -71,8 +97,7 @@ pub(crate) fn observe_current_refresh_base(
         &table_ref.table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let observation = state
-        .mv_storage_observation
+    let observation = storage_observation
         .observe_refresh_base(&exact_lease, &metadata, connector_context.clone())
         .map_err(|error| {
             format!(

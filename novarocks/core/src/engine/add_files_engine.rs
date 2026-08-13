@@ -36,7 +36,7 @@ use crate::connector::data_mutation::{
     CompletedDataMutation, DataMutationDispatchState, DataMutationIntent, DataMutationSession,
     KnownUncommittedDataMutation, ResolvedDataMutation,
 };
-use crate::engine::StandaloneState;
+use crate::engine::domain::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::dialect::add_files::classify_add_files;
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -235,7 +235,7 @@ impl AddFilesPrepared for CorePreparedAddFiles {
     }
 }
 
-impl AddFilesEngine for Arc<StandaloneState> {
+impl AddFilesEngine for DmlExecutionKernel {
     fn establish_add_files_external_fence(
         &self,
         prepared: &dyn AddFilesPrepared,
@@ -280,8 +280,9 @@ impl AddFilesEngine for Arc<StandaloneState> {
                 target.namespace, target.table
             )));
         }
-        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-            self,
+        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+            self.connector_control().as_ref(),
+            self.mv_storage_observation().as_ref(),
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
         )
@@ -294,7 +295,7 @@ impl AddFilesEngine for Arc<StandaloneState> {
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(plan_connector_failure)?;
         let session = DataMutationSession::plan(
-            self.connector_control.as_ref(),
+            self.connector_control().as_ref(),
             &instance_id,
             ConnectorMutationOperationId::from_bytes(request.mutation_operation_id),
             novarocks_spi::connector::ConnectorTableIdentity {
@@ -362,7 +363,7 @@ impl AddFilesEngine for Arc<StandaloneState> {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.execute_once(self.as_ref()))
+        project_outcome(session.execute_once(self))
     }
 
     fn reconcile_add_files(
@@ -394,7 +395,7 @@ impl AddFilesEngine for Arc<StandaloneState> {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.reconcile_once(evidence, self.as_ref()))
+        project_outcome(session.reconcile_once(evidence, self))
     }
 }
 

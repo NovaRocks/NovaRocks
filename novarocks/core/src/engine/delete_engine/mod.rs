@@ -23,7 +23,7 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::engine::StandaloneState;
+use crate::engine::domain::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
@@ -175,7 +175,7 @@ pub trait DeleteEngine: Send + Sync {
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String>;
 }
 
-impl DeleteEngine for Arc<StandaloneState> {
+impl DeleteEngine for DmlExecutionKernel {
     fn establish_delete_external_fence(
         &self,
         prepared: &dyn DeletePrepared,

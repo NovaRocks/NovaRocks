@@ -26,7 +26,7 @@ use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::StandaloneState;
+use crate::engine::domain::DmlExecutionKernel;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
@@ -449,7 +449,7 @@ fn build_dml_change_stream_write_plan(
 }
 
 fn plan_dml_change_stream_write(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     plan: &mut DmlChangeStreamWritePlan,
 ) -> Result<crate::engine::PlannedIcebergChangeStreamWrite, String> {
@@ -460,14 +460,14 @@ fn plan_dml_change_stream_write(
             message_prefix: keyed_assert.message_prefix.clone(),
         }
     });
-    crate::engine::build_physical_plan_as_iceberg_change_stream_write(
-        state,
-        Some(&target.catalog),
-        &target.namespace,
+    crate::engine::build_physical_plan_as_iceberg_change_stream_write_with_execution(
+        state.connector_control().as_ref(),
+        &plan.execution,
         &plan.producer,
         Some(plan.table_bindings.as_ref()),
         &mut plan.dag,
         keyed_assert,
+        &crate::connector::connector_request_context_for_execution(None, &plan.execution)?,
     )
 }
 
@@ -753,7 +753,7 @@ fn cow_target_columns(
 }
 
 pub(crate) fn prepare_update_mutation(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -800,14 +800,15 @@ pub(crate) fn prepare_update_mutation(
     // refresh drives its own writes through that same admission, so at that
     // level a user statement is indistinguishable from the MV machinery
     // maintaining its own target.
-    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-        state,
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        state.connector_control().as_ref(),
+        state.mv_storage_observation().as_ref(),
         &target,
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Update,
     )?;
 
     let target_binding = crate::connector::write_target::load_write_target_binding(
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         &target.catalog,
         &target.namespace,
         &target.table,
@@ -913,7 +914,7 @@ pub(crate) fn prepare_update_mutation(
 /// cohort, or creating a staging artifact. It retains one exact planning lease
 /// for every later read or writer admission.
 pub(crate) fn prepare_merge_mutation(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -954,13 +955,14 @@ pub(crate) fn prepare_merge_mutation(
     }
     // See the UPDATE path for why this rejection cannot live in row-mutation
     // admission.
-    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-        state,
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        state.connector_control().as_ref(),
+        state.mv_storage_observation().as_ref(),
         &target,
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Merge,
     )?;
     let target_binding = crate::connector::write_target::load_write_target_binding(
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         &target.catalog,
         &target.namespace,
         &target.table,
@@ -1151,7 +1153,7 @@ fn prepared_write_operation_id(
 /// registration and distributed staging happen only here, after the frontend
 /// has persisted its `Preparing` record.
 pub(crate) fn stage_prepared_update_mutation(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     prepared: PreparedUpdateMutation,
 ) -> Result<MutationStagedWrite, String> {
     let PreparedUpdateMutation {
@@ -1292,7 +1294,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 registration_error,
             } = preparations.activate_write(&write_lease, &connector_context)?;
             let execution_handle = Arc::new(MorUpdateChangeStreamExecutor {
-                state: Arc::clone(state),
+                state: state.clone(),
                 target: target.clone(),
                 planned: Mutex::new(Some(planned)),
                 write_registration,
@@ -1369,7 +1371,7 @@ pub(crate) fn stage_prepared_update_mutation(
 
 #[cfg(test)]
 fn materialize_update_matches(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
@@ -1412,7 +1414,7 @@ fn materialize_update_matches(
 }
 
 fn mutation_source_to_sql(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     source: &Option<crate::sql::parser::ast::MutationSource>,
     current_catalog: Option<&str>,
     target: &crate::engine::backend_resolver::TargetBackend,
@@ -1426,7 +1428,7 @@ fn mutation_source_to_sql(
 }
 
 fn mutation_source_relation_to_sql(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     source: &crate::sql::parser::ast::MutationSource,
     current_catalog: Option<&str>,
     target: &crate::engine::backend_resolver::TargetBackend,
@@ -1470,7 +1472,7 @@ fn mutation_source_relation_to_sql(
 
 #[allow(clippy::too_many_arguments)]
 fn build_update_mor_change_stream_write_plan(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
@@ -1513,10 +1515,10 @@ fn build_update_mor_change_stream_write_plan(
     let analyzer_provider = crate::engine::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
-        state.catalog_application.as_deref(),
+        state.catalog_application().map(Arc::as_ref),
     );
     let table_bindings = analyzer_provider.query_table_bindings();
     // This admission uses the exact lease and table facts selected above.  It
@@ -1535,7 +1537,7 @@ fn build_update_mor_change_stream_write_plan(
             write_planning_lease.clone(),
         )?;
     }
-    let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+    let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh_with_statistics(
         state,
         &query,
         &analyzer_provider,
@@ -2170,7 +2172,7 @@ fn sql_string_literal(value: &str) -> String {
 }
 
 struct MorUpdateChangeStreamExecutor {
-    state: Arc<StandaloneState>,
+    state: DmlExecutionKernel,
     target: crate::engine::backend_resolver::TargetBackend,
     planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
     write_registration:
@@ -2188,7 +2190,7 @@ struct MorUpdateChangeStreamExecutor {
 }
 
 struct MorMergeChangeStreamExecutor {
-    state: Arc<StandaloneState>,
+    state: DmlExecutionKernel,
     target: crate::engine::backend_resolver::TargetBackend,
     planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
     write_registration:
@@ -2244,7 +2246,7 @@ impl MorUpdateChangeStreamExecutor {
             .collect::<Vec<_>>();
         let session = self
             .state
-            .query_execution
+            .query_execution()
             .begin_write_operation(write_registration.clone(), self.write_lease.clone())
             .map_err(|error| error.to_string())?;
         *self
@@ -2268,7 +2270,10 @@ impl MorUpdateChangeStreamExecutor {
         let request = prepared_request
             .into_request(&self.execution, registration)
             .map_err(|error| error.to_string())?;
-        crate::engine::execute_bound_distributed_write_request(&self.state.query_execution, request)
+        crate::engine::execute_bound_distributed_write_request(
+            self.state.query_execution(),
+            request,
+        )
     }
 }
 
@@ -2359,7 +2364,7 @@ impl MorMergeChangeStreamExecutor {
             .collect::<Vec<_>>();
         let session = self
             .state
-            .query_execution
+            .query_execution()
             .begin_write_operation(write_registration.clone(), self.write_lease.clone())
             .map_err(|error| error.to_string())?;
         *self
@@ -2383,7 +2388,10 @@ impl MorMergeChangeStreamExecutor {
         let request = prepared_request
             .into_request(&self.execution, registration)
             .map_err(|error| error.to_string())?;
-        crate::engine::execute_bound_distributed_write_request(&self.state.query_execution, request)
+        crate::engine::execute_bound_distributed_write_request(
+            self.state.query_execution(),
+            request,
+        )
     }
 }
 
@@ -2860,7 +2868,7 @@ fn build_cow_rewrite_query(
 }
 
 struct DistributedCowUpdateExecutor {
-    state: Arc<StandaloneState>,
+    state: DmlExecutionKernel,
     target: crate::engine::backend_resolver::TargetBackend,
     write: Mutex<Option<CowUpdateDistributedWrite>>,
     operation_session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
@@ -2916,7 +2924,7 @@ impl MutationExecution for DistributedCowUpdateExecutor {
 }
 
 fn run_cow_cohort_writes(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     write: CowUpdateDistributedWrite,
     operation_session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
@@ -2950,7 +2958,7 @@ fn run_cow_cohort_writes(
 }
 
 fn run_one_cow_cohort(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     plan: CowCohortWritePlan,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -3050,7 +3058,7 @@ fn run_one_cow_cohort(
 }
 
 fn build_cow_update_distributed_execution(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     write: CowUpdateDistributedWrite,
     execution: QueryExecutionContext,
@@ -3094,7 +3102,7 @@ fn build_cow_update_distributed_execution(
             )
             .map_err(|error| error.to_string())?;
         state
-            .query_execution
+            .query_execution()
             .begin_write_operation(registration, write_lease.clone())
             .map_err(|error| error.to_string())
     })();
@@ -3122,7 +3130,7 @@ fn build_cow_update_distributed_execution(
         }
     };
     Ok(Arc::new(DistributedCowUpdateExecutor {
-        state: Arc::clone(state),
+        state: state.clone(),
         target: target.clone(),
         write: Mutex::new(Some(write)),
         operation_session,
@@ -3346,27 +3354,25 @@ fn cow_selection_from_matched_and_insert(
 
 #[cfg(test)]
 fn execute_update_match_query(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     current_catalog: Option<&str>,
     sql: &str,
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MatchedUpdateBatch, String> {
-    let statement = crate::sql::parser::parse_sql_raw(sql)?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err("internal UPDATE match query was not a SELECT".to_string());
-    };
-    let result = crate::engine::execute_query_with_catalog_service_with_execution(
+    let _ = (
         state,
         current_catalog,
+        sql,
         current_database,
-        &query,
-        None,
         execution,
         connector_context,
-    )?;
-    matched_update_batch_from_query_result(result)
+    );
+    Err(
+        "test-only UPDATE match materialization requires an explicit query preparation kernel"
+            .to_string(),
+    )
 }
 
 /// Execute a COW match query with the target replaced by the exact opaque
@@ -3375,7 +3381,7 @@ fn execute_update_match_query(
 /// catalog generation or ref head.
 #[allow(clippy::too_many_arguments)]
 fn execute_exact_cow_match_query(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     query: &sqlparser::ast::Query,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
@@ -3418,14 +3424,14 @@ fn execute_exact_cow_match_query(
         crate::engine::build_catalog_service_provider_with_bindings_and_query_local_overlays(
             Some(&target.catalog),
             &catalog_service_snapshot,
-            state.connector_control.as_ref(),
+            state.connector_control().as_ref(),
             connector_context.clone(),
             Arc::clone(&table_bindings),
             vec![overlay],
-            state.catalog_application.as_deref(),
+            state.catalog_application().map(Arc::as_ref),
         );
     let statistics =
-        crate::engine::query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
+        crate::engine::query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
             state,
             Arc::clone(&table_bindings),
         );
@@ -3459,7 +3465,7 @@ fn execute_exact_cow_match_query(
     };
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &compiled.distributed_plan,
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         connector_context,
         Some(table_bindings.as_ref()),
         Some(&resolver),
@@ -3478,7 +3484,7 @@ fn execute_exact_cow_match_query(
     )
     .map_err(|error| error.to_string())?;
     state
-        .query_execution
+        .query_execution()
         .execute(request)
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
         .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
@@ -3801,7 +3807,7 @@ const MERGE_ACTION_NOT_MATCHED_INSERT: i32 = 3;
 /// COW rewrite and optional append share one sealed connector operation and
 /// therefore one aggregate commit handle/snapshot.
 pub(crate) fn stage_prepared_merge_mutation(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     prepared: PreparedMergeMutation,
 ) -> Result<MutationStagedWrite, String> {
     let PreparedMergeMutation {
@@ -3873,7 +3879,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             registration_error,
         } = preparations.activate_write(&write_lease, &connector_context)?;
         let execution_handle = Arc::new(MorMergeChangeStreamExecutor {
-            state: Arc::clone(state),
+            state: state.clone(),
             target: target.clone(),
             planned: Mutex::new(Some(planned)),
             write_registration,
@@ -4209,7 +4215,7 @@ impl MergeMatchRows {
 
 #[cfg(test)]
 fn materialize_merge_match(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
@@ -4341,7 +4347,7 @@ fn materialize_merge_match(
 }
 
 fn build_exact_cow_merge_selection_query(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
@@ -4486,7 +4492,7 @@ fn build_exact_cow_merge_selection_query(
 
 #[allow(clippy::too_many_arguments)]
 fn build_merge_mor_change_stream_write_plan(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
@@ -4621,10 +4627,10 @@ fn build_merge_mor_change_stream_write_plan(
     let analyzer_provider = crate::engine::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
-        state.catalog_application.as_deref(),
+        state.catalog_application().map(Arc::as_ref),
     );
     let table_bindings = analyzer_provider.query_table_bindings();
     let effect_set = DmlRowMutationEffectSet::Merge {
@@ -4644,7 +4650,7 @@ fn build_merge_mor_change_stream_write_plan(
             write_planning_lease.clone(),
         )?;
     }
-    let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+    let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh_with_statistics(
         state,
         &query,
         &analyzer_provider,
@@ -4686,38 +4692,25 @@ fn build_merge_mor_change_stream_write_plan(
 
 #[cfg(test)]
 fn execute_merge_match_query(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     current_catalog: Option<&str>,
     sql: &str,
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MergeMatchRows, String> {
-    let statement = crate::sql::parser::parse_sql_raw(sql)?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err("internal MERGE match query was not a SELECT".to_string());
-    };
-    let result = crate::engine::execute_query_with_catalog_service_with_execution(
+    let _ = (
         state,
         current_catalog,
+        sql,
         current_database,
-        &query,
-        None,
         execution,
         connector_context,
-    )?;
-    let Some(first_chunk) = result.chunks.first() else {
-        return Ok(MergeMatchRows::empty());
-    };
-    let schema = first_chunk.batch.schema();
-    let batches = result
-        .chunks
-        .iter()
-        .map(|c| c.batch.clone())
-        .collect::<Vec<_>>();
-    let full = concat_batches(&schema, batches.iter())
-        .map_err(|e| format!("concatenate MERGE match batches failed: {e}"))?;
-    Ok(MergeMatchRows { full })
+    );
+    Err(
+        "test-only MERGE match materialization requires an explicit query preparation kernel"
+            .to_string(),
+    )
 }
 
 fn build_merge_match_query_sql(
@@ -4820,7 +4813,7 @@ fn build_merge_match_query_sql(
 }
 
 fn build_merge_unmatched_insert_query(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
@@ -4897,6 +4890,21 @@ mod tests {
     use super::*;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
+
+    fn test_dml_kernel() -> DmlExecutionKernel {
+        let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
+            Arc::new(crate::engine::TestConnectorControlRegistry::default());
+        DmlExecutionKernel::new(
+            Arc::new(crate::engine::query_planning::catalog_runtime::new_query_catalog_service()),
+            None,
+            Arc::clone(&connector_control),
+            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
+            Arc::new(crate::mv::storage_observation::UnavailableMvStorageObservationPort),
+            crate::engine::test_query_execution_service_with_connector_control(Some(
+                connector_control,
+            )),
+        )
+    }
 
     struct NeverCancelled;
 
@@ -6127,7 +6135,7 @@ mod tests {
             &target_columns,
         )
         .expect("insert columns");
-        let state = Arc::new(StandaloneState::default());
+        let state = test_dml_kernel();
 
         let query = build_merge_unmatched_insert_query(
             &state,

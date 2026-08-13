@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use crate::engine::StandaloneState;
-use crate::engine::backend_resolver::resolve_table_target;
+use crate::engine::backend_resolver::{CatalogAdmission, resolve_table_target};
+use crate::engine::domain::{DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel};
 use crate::sql::analyzer::iceberg_ref::{
     IcebergRefKind, SqlIcebergNamedRef, SqlIcebergRefMetadata, SqlIcebergSnapshotLog,
     resolve_read_binding,
@@ -153,6 +154,41 @@ fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
     }
 }
 
+/// The exact leaf ports required to rewrite `FOR VERSION/TIMESTAMP AS OF`.
+///
+/// This deliberately omits query execution, statistics and any application
+/// aggregate.  A caller can therefore use the same rewriter from query, DML
+/// or MV preparation without recovering a `StandaloneState`.
+pub(crate) trait TimeTravelResolver: CatalogAdmission {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
+}
+
+impl TimeTravelResolver for StandaloneState {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
+        self.connector_control.as_ref()
+    }
+}
+
+impl TimeTravelResolver for Arc<StandaloneState> {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
+        self.as_ref().connector_control()
+    }
+}
+
+macro_rules! impl_kernel_time_travel_resolver {
+    ($kernel:ty) => {
+        impl TimeTravelResolver for $kernel {
+            fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
+                self.connector_control().as_ref()
+            }
+        }
+    };
+}
+
+impl_kernel_time_travel_resolver!(QueryPreparationKernel);
+impl_kernel_time_travel_resolver!(DmlExecutionKernel);
+impl_kernel_time_travel_resolver!(MvExecutionKernel);
+
 /// Walk the query AST in-place and rewrite each `TableFactor::Table` that has
 /// a `version: Some(...)` clause:
 ///
@@ -169,7 +205,7 @@ fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
 ///
 /// Tables without a version clause are left untouched.
 pub(crate) fn rewrite_time_travel_refs(
-    state: &Arc<StandaloneState>,
+    resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &mut sqlparser::ast::Query,
@@ -179,7 +215,7 @@ pub(crate) fn rewrite_time_travel_refs(
     if let Some(with) = &mut query.with {
         for cte in &mut with.cte_tables {
             rewrite_time_travel_in_set_expr(
-                state,
+                resolver,
                 current_catalog,
                 current_database,
                 cte.query.body.as_mut(),
@@ -188,7 +224,7 @@ pub(crate) fn rewrite_time_travel_refs(
         }
     }
     rewrite_time_travel_in_set_expr(
-        state,
+        resolver,
         current_catalog,
         current_database,
         query.body.as_mut(),
@@ -197,7 +233,7 @@ pub(crate) fn rewrite_time_travel_refs(
 }
 
 fn rewrite_time_travel_in_set_expr(
-    state: &Arc<StandaloneState>,
+    resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
     expr: &mut sqlparser::ast::SetExpr,
@@ -207,7 +243,7 @@ fn rewrite_time_travel_in_set_expr(
         sqlparser::ast::SetExpr::Select(select) => {
             for tw in &mut select.from {
                 rewrite_time_travel_in_factor(
-                    state,
+                    resolver,
                     current_catalog,
                     current_database,
                     &mut tw.relation,
@@ -215,7 +251,7 @@ fn rewrite_time_travel_in_set_expr(
                 )?;
                 for join in &mut tw.joins {
                     rewrite_time_travel_in_factor(
-                        state,
+                        resolver,
                         current_catalog,
                         current_database,
                         &mut join.relation,
@@ -227,14 +263,14 @@ fn rewrite_time_travel_in_set_expr(
         }
         sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
             rewrite_time_travel_in_set_expr(
-                state,
+                resolver,
                 current_catalog,
                 current_database,
                 left.as_mut(),
                 connector_context,
             )?;
             rewrite_time_travel_in_set_expr(
-                state,
+                resolver,
                 current_catalog,
                 current_database,
                 right.as_mut(),
@@ -242,7 +278,7 @@ fn rewrite_time_travel_in_set_expr(
             )
         }
         sqlparser::ast::SetExpr::Query(q) => rewrite_time_travel_in_set_expr(
-            state,
+            resolver,
             current_catalog,
             current_database,
             q.body.as_mut(),
@@ -253,7 +289,7 @@ fn rewrite_time_travel_in_set_expr(
 }
 
 fn rewrite_time_travel_in_factor(
-    state: &Arc<StandaloneState>,
+    resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
     factor: &mut sqlparser::ast::TableFactor,
@@ -300,7 +336,8 @@ fn rewrite_time_travel_in_factor(
             }
 
             let our_name = ObjectName { parts };
-            let target = resolve_table_target(state, &our_name, current_catalog, current_database)?;
+            let target =
+                resolve_table_target(resolver, &our_name, current_catalog, current_database)?;
 
             if target.backend_name != "iceberg" {
                 return Err(format!(
@@ -314,7 +351,7 @@ fn rewrite_time_travel_in_factor(
             // facts from one exact control generation; the synthetic table is
             // subsequently admitted by the query-local materializer.
             let lease = crate::connector::acquire_metadata_planning_lease(
-                state.connector_control.as_ref(),
+                resolver.connector_control(),
                 &target.catalog,
             )?;
             let facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
@@ -366,7 +403,7 @@ fn rewrite_time_travel_in_factor(
         }
         sqlparser::ast::TableFactor::Table { .. } => Ok(()),
         sqlparser::ast::TableFactor::Derived { subquery, .. } => rewrite_time_travel_in_set_expr(
-            state,
+            resolver,
             current_catalog,
             current_database,
             subquery.body.as_mut(),

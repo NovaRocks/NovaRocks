@@ -113,6 +113,8 @@ pub(crate) struct DmlExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    unified_statistics: Arc<UnifiedStatisticsResolver>,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
 }
 
@@ -121,12 +123,16 @@ impl DmlExecutionKernel {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        unified_statistics: Arc<UnifiedStatisticsResolver>,
+        mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
     ) -> Self {
         Self {
             catalog_service,
             catalog_application,
             connector_control,
+            unified_statistics,
+            mv_storage_observation,
             query_execution,
         }
     }
@@ -141,6 +147,14 @@ impl DmlExecutionKernel {
 
     pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
         &self.connector_control
+    }
+
+    pub(crate) fn unified_statistics(&self) -> &Arc<UnifiedStatisticsResolver> {
+        &self.unified_statistics
+    }
+
+    pub(crate) fn mv_storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {
+        &self.mv_storage_observation
     }
 
     pub(crate) fn query_execution(&self) -> &QueryExecutionService {

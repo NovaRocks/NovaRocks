@@ -20,11 +20,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
+use crate::engine::domain::DmlExecutionKernel;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
@@ -41,7 +41,7 @@ use novarocks_spi::connector::{
 };
 
 pub(crate) fn prepare_equality_delete_statement(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     stmt: &AddEqualityDeleteStmt,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -57,7 +57,7 @@ pub(crate) fn prepare_equality_delete_statement(
         ));
     }
     let planning_lease = crate::connector::acquire_metadata_planning_lease(
-        state.connector_control.as_ref(),
+        state.connector_control().as_ref(),
         &target.catalog,
     )?;
 
@@ -67,8 +67,9 @@ pub(crate) fn prepare_equality_delete_statement(
     // drives its own writes through that same admission, so at that level a
     // user statement is indistinguishable from the MV machinery maintaining its
     // own target.
-    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-        state,
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        state.connector_control().as_ref(),
+        state.mv_storage_observation().as_ref(),
         &target,
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Delete,
     )?;
@@ -119,7 +120,7 @@ pub(crate) fn prepare_equality_delete_statement(
 }
 
 struct DistributedEqualityDeleteWriteExecutor {
-    state: Arc<StandaloneState>,
+    state: DmlExecutionKernel,
     target: crate::engine::backend_resolver::TargetBackend,
     delete_query: sqlparser::ast::Query,
     sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
@@ -187,7 +188,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
     }
 
     fn finalize(&self) -> Result<(), String> {
-        self.state.catalog_service.invalidate_table(
+        self.state.catalog_service().invalidate_table(
             &self.target.catalog,
             &self.target.namespace,
             &self.target.table,
@@ -197,7 +198,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_equality_delete_distributed_write(
-    state: &Arc<StandaloneState>,
+    state: &DmlExecutionKernel,
     target: &crate::engine::backend_resolver::TargetBackend,
     current_snapshot_id: Option<i64>,
     delete_columns: &[Field],
@@ -252,7 +253,7 @@ fn prepare_equality_delete_distributed_write(
         )
         .map_err(|error| format!("activate Provider equality-delete write: {error}"))?;
     let executor = DistributedEqualityDeleteWriteExecutor {
-        state: Arc::clone(state),
+        state: state.clone(),
         target: target.clone(),
         delete_query: values_query,
         sql_write_input,
