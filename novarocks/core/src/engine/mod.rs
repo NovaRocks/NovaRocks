@@ -1354,18 +1354,257 @@ pub struct StandaloneSession {
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct StandaloneQueryCompiler {
-    session: StandaloneSession,
+    query: domain::QueryPreparationKernel,
+    view: domain::ViewExecutionKernel,
+    system_tables: domain::SystemTableQueryKernel,
+    mv_repository: Arc<dyn MvRepository>,
+    mv_storage_observation: Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
 }
 
 impl StandaloneQueryCompiler {
+    fn from_state(state: &Arc<StandaloneState>) -> Self {
+        Self {
+            query: legacy_query_preparation_kernel(state),
+            view: legacy_view_execution_kernel(state),
+            system_tables: domain::SystemTableQueryKernel::new(
+                Arc::clone(&state.catalog_service),
+                Arc::clone(&state.connector_control),
+                Arc::clone(&state.system_catalog),
+                Arc::clone(&state.mv_repository),
+            ),
+            mv_repository: Arc::clone(&state.mv_repository),
+            mv_storage_observation: Arc::clone(&state.mv_storage_observation),
+        }
+    }
+
     pub fn prepare(
         &self,
         sql: &str,
         context: &crate::query_execution::request_context::RequestContext,
         query_opts: Option<QueryOptions>,
     ) -> Result<PreparedQueryOperation, String> {
-        self.session
-            .prepare_query_with_context(sql, context, query_opts)
+        let connector_context = crate::connector::connector_request_context_for_query(
+            query_opts.as_ref(),
+            context.execution().cancellation().clone(),
+        )?;
+        self.prepare_with_connector_context(sql, context, query_opts, connector_context)
+    }
+
+    fn prepare_with_connector_context(
+        &self,
+        sql: &str,
+        request_context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<PreparedQueryOperation, String> {
+        if !StandaloneSession::is_query_sql(sql) {
+            return Err(
+                "non-query statements must be executed through a typed command capability".into(),
+            );
+        }
+        use sqlparser::ast as sqlast;
+        let current_catalog = request_context.session().current_catalog();
+        let current_database = request_context.session().current_database();
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let (parse_sql, forced_explain_level, force_logical_explain) =
+            if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
+                (rewritten, Some(level), true)
+            } else if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
+                (rewritten, Some(level), false)
+            } else {
+                (normalized.clone(), None, false)
+            };
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&parse_sql)
+            .map_err(|error| format_parser_error(&error.to_string()))?;
+        match stmt {
+            sqlast::Statement::Explain {
+                statement,
+                verbose,
+                analyze: false,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN only supports SELECT queries".to_string());
+                };
+                let prepared = prepare_explain_query_with_ports(
+                    &self.query,
+                    &self.view,
+                    current_catalog,
+                    current_database,
+                    query,
+                    &connector_context,
+                )?;
+                let level = forced_explain_level.unwrap_or(if verbose {
+                    crate::sql::explain::ExplainLevel::Verbose
+                } else {
+                    crate::sql::explain::ExplainLevel::Normal
+                });
+                let catalog_service_snapshot = catalog_service_snapshot(&self.query);
+                let analyzer_provider = build_catalog_service_provider(
+                    current_catalog,
+                    &catalog_service_snapshot,
+                    self.query.connector_control().as_ref(),
+                    connector_context.clone(),
+                    TableLookupMode::ExplainStats,
+                    self.query.catalog_application().map(Arc::as_ref),
+                );
+                let result = explain_query_with_sql_compiler_kernel_with_ports(
+                    &prepared,
+                    &analyzer_provider,
+                    current_catalog,
+                    current_database,
+                    &self.query,
+                    self.mv_repository.as_ref(),
+                    self.mv_storage_observation.as_ref(),
+                    &connector_context,
+                    request_context.execution(),
+                    level,
+                    force_logical_explain,
+                )?;
+                Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
+                    result: StatementResult::Query(result),
+                }))
+            }
+            sqlast::Statement::Explain {
+                statement,
+                analyze: true,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN ANALYZE only supports SELECT queries".to_string());
+                };
+                self.prepare_explain_analyze(
+                    query,
+                    current_catalog,
+                    current_database,
+                    query_opts,
+                    &connector_context,
+                    request_context.execution(),
+                )
+            }
+            sqlast::Statement::Query(ref query) => {
+                if let Some(result) = self::information_schema::try_query_materialized_views(
+                    &self.system_tables,
+                    query,
+                )? {
+                    return Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
+                        result,
+                    }));
+                }
+                let mut prepared = query.as_ref().clone();
+                self.view.view_service().rewrite_query(
+                    &self.view,
+                    &mut prepared,
+                    crate::engine::view::ViewRequestContext {
+                        current_catalog,
+                        current_database,
+                        connector_context: Some(&connector_context),
+                    },
+                )?;
+                self::virtual_table::rewrite_query(&self.system_tables, &mut prepared)?;
+                if has_time_travel_refs(&prepared) {
+                    rewrite_time_travel_refs(
+                        &self.query,
+                        current_catalog,
+                        current_database,
+                        &mut prepared,
+                        &connector_context,
+                    )?;
+                }
+                let catalog_service_snapshot = catalog_service_snapshot(&self.query);
+                let analyzer_provider = build_catalog_service_provider(
+                    current_catalog,
+                    &catalog_service_snapshot,
+                    self.query.connector_control().as_ref(),
+                    connector_context.clone(),
+                    TableLookupMode::SchemaOnly,
+                    self.query.catalog_application().map(Arc::as_ref),
+                );
+                let (request, _, _) = prepare_query_with_sql_compiler_kernel_with_ports(
+                    &prepared,
+                    &analyzer_provider,
+                    current_catalog,
+                    current_database,
+                    &self.query,
+                    self.mv_repository.as_ref(),
+                    self.mv_storage_observation.as_ref(),
+                    &connector_context,
+                    query_opts,
+                    request_context.execution(),
+                    crate::sql::compiler::SqlCompileIntent::Query,
+                    true,
+                )?;
+                Ok(PreparedQueryOperation::Distributed(
+                    PreparedDistributedQuery {
+                        request,
+                        completion: PreparedQueryCompletion {
+                            formatter: PreparedQueryFormatter::Result,
+                        },
+                    },
+                ))
+            }
+            _ => Err("query compiler only supports SELECT and EXPLAIN statements".to_string()),
+        }
+    }
+
+    fn prepare_explain_analyze(
+        &self,
+        query: &sqlparser::ast::Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        query_opts: Option<QueryOptions>,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedQueryOperation, String> {
+        let query = prepare_explain_query_with_ports(
+            &self.query,
+            &self.view,
+            current_catalog,
+            current_database,
+            query,
+            connector_context,
+        )?;
+        let catalog_service_snapshot = catalog_service_snapshot(&self.query);
+        let analyzer_provider = build_catalog_service_provider(
+            current_catalog,
+            &catalog_service_snapshot,
+            self.query.connector_control().as_ref(),
+            connector_context.clone(),
+            TableLookupMode::ExplainStats,
+            self.query.catalog_application().map(Arc::as_ref),
+        );
+        let planning_start = std::time::Instant::now();
+        let (request, distributed_plan, connector_static_planning) =
+            prepare_query_with_sql_compiler_kernel_with_ports(
+                &query,
+                &analyzer_provider,
+                current_catalog,
+                current_database,
+                &self.query,
+                self.mv_repository.as_ref(),
+                self.mv_storage_observation.as_ref(),
+                connector_context,
+                Some(query_options_for_explain_analyze(query_opts)),
+                execution,
+                crate::sql::compiler::SqlCompileIntent::Explain {
+                    level: crate::sql::explain::ExplainLevel::Analyze,
+                    analyze: true,
+                },
+                true,
+            )?;
+        Ok(PreparedQueryOperation::Distributed(
+            PreparedDistributedQuery {
+                request,
+                completion: PreparedQueryCompletion {
+                    formatter: PreparedQueryFormatter::Profile(PreparedProfileFormatter {
+                        distributed_plan,
+                        planning_elapsed: planning_start.elapsed(),
+                        execution_started_at: std::time::Instant::now(),
+                        connector_static_planning,
+                    }),
+                },
+            },
+        ))
     }
 }
 
@@ -1810,9 +2049,7 @@ impl StandaloneNovaRocks {
     }
 
     pub fn query_compiler(&self) -> StandaloneQueryCompiler {
-        StandaloneQueryCompiler {
-            session: self.session(),
-        }
+        StandaloneQueryCompiler::from_state(&self.inner)
     }
 
     pub fn command_executor(&self) -> StandaloneCommandExecutor {
