@@ -33,7 +33,7 @@ use crate::sql::catalog::local::PlannerMemoryCatalog;
 use crate::sql::planner::table::TableDef;
 
 #[derive(Clone, Debug)]
-pub(crate) struct CatalogRuntimeMetadata {
+pub struct CatalogRuntimeMetadata {
     table: CatalogTable,
 }
 
@@ -66,7 +66,12 @@ impl CatalogRuntimeMetadata {
     }
 }
 
-pub(crate) type QueryCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;
+/// Query catalog registry owned by the Frontend composition root.
+///
+/// The registry keeps durable SQL catalog facts only. Provider authority is
+/// supplied separately through the exact Connector control lease captured for
+/// each request.
+pub type QueryCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;
 
 struct InternalCatalog {
     name: String,
@@ -164,7 +169,11 @@ impl Catalog<CatalogRuntimeMetadata> for ConnectorCatalog {
     }
 }
 
-pub(crate) fn new_query_catalog_service() -> QueryCatalogService {
+/// Create an empty Frontend query-catalog runtime with the built-in local
+/// catalog registered. External catalog runtimes must be bound through
+/// [`crate::catalog_application::CatalogRuntimeProjection`] after the
+/// Frontend has installed their Connector control generation.
+pub fn new_query_catalog_service() -> QueryCatalogService {
     let local = Arc::new(RwLock::new(PlannerMemoryCatalog::default()));
     let service = CatalogService::new(Arc::clone(&local), CatalogRegistry::new());
     service.register_catalog(Arc::new(InternalCatalog::new("default_catalog", local)));

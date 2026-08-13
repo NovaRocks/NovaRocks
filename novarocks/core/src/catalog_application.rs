@@ -206,7 +206,7 @@ impl CatalogRuntimeProjection {
     /// Binds the engine's query catalog registry and replays every runtime the
     /// Frontend controller already published. Engine open calls this once; a
     /// second bind is rejected so two engines cannot share one publication set.
-    pub(crate) fn bind_query_catalog(
+    pub fn bind_query_catalog(
         &self,
         service: Arc<crate::engine::query_planning::catalog_runtime::QueryCatalogService>,
         controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,

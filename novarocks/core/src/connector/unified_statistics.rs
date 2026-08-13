@@ -79,7 +79,7 @@ struct ArtifactCacheKey {
 /// the table data version. A query takes a cloned `StatisticsEvidence` into its
 /// own `QueryStatsSnapshot` rather than reading this map during optimization.
 #[derive(Default)]
-pub(crate) struct UnifiedStatisticsResolver {
+pub struct UnifiedStatisticsResolver {
     artifacts: Mutex<HashMap<ArtifactCacheKey, Arc<StatisticsEvidence>>>,
 }
 

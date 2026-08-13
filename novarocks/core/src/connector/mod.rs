@@ -854,6 +854,17 @@ impl ConnectorRegistry {
         self.mv_backends.insert(backend.name(), backend);
     }
 
+    /// Install the Iceberg MV capability into this explicit registry leaf.
+    ///
+    /// The caller supplies the complete Core port set captured by Frontend
+    /// composition. This method intentionally does not accept application
+    /// state or synthesize provider/default dependencies.
+    pub fn register_iceberg_mv_backend(&mut self, ports: crate::engine::IcebergMvCorePorts) {
+        self.register_mv_backend(Arc::new(
+            crate::engine::mv::iceberg_backend::IcebergMvBackend::new_with_ports(ports),
+        ));
+    }
+
     pub(crate) fn mv_backend(&self, name: &str) -> Result<Arc<dyn MvBackend>, String> {
         self.mv_backends
             .get(name)

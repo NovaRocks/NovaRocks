@@ -1614,7 +1614,7 @@ impl From<String> for IcebergMvRefreshExecutionError {
 /// It does not retain aggregate application state, and it has no state-based
 /// constructor so a frontend composition must name every dependency.
 #[derive(Clone)]
-pub(crate) struct IcebergMvCorePorts {
+pub struct IcebergMvCorePorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -1623,7 +1623,10 @@ pub(crate) struct IcebergMvCorePorts {
 }
 
 impl IcebergMvCorePorts {
-    pub(crate) fn new(
+    /// Construct the exact provider and durable-MV ports required by the
+    /// Iceberg MV backend. Frontend composition must provide every leaf; this
+    /// value deliberately has no `StandaloneState` constructor.
+    pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,

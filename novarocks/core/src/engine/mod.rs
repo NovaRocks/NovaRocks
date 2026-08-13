@@ -33,7 +33,11 @@ use crate::runtime::query_result::{
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
 
-use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
+pub use crate::connector::unified_statistics::UnifiedStatisticsResolver;
+pub use crate::engine::mv::iceberg_refresh::IcebergMvCorePorts;
+pub use crate::engine::query_planning::catalog_runtime::{
+    QueryCatalogService, new_query_catalog_service,
+};
 #[cfg(test)]
 use crate::mv::application::UnavailableMvApplicationService;
 use crate::mv::application::{MvApplicationService, MvRefreshProviderActivation};
@@ -57,6 +61,7 @@ pub mod delete_engine;
 pub(crate) mod domain;
 pub use domain::SessionCatalogResolver;
 pub mod external_write_fence;
+pub mod frontend_capabilities;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
 pub mod iceberg_ref_command;
@@ -1427,19 +1432,35 @@ pub struct StandaloneQueryCompiler {
 }
 
 impl StandaloneQueryCompiler {
-    fn from_state(state: &Arc<StandaloneState>) -> Self {
+    pub(crate) fn from_domain_kernels(
+        query: domain::QueryPreparationKernel,
+        view: domain::ViewExecutionKernel,
+        system_tables: domain::SystemTableQueryKernel,
+        mv_repository: Arc<dyn MvRepository>,
+        mv_storage_observation: Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
+    ) -> Self {
         Self {
-            query: legacy_query_preparation_kernel(state),
-            view: legacy_view_execution_kernel(state),
-            system_tables: domain::SystemTableQueryKernel::new(
+            query,
+            view,
+            system_tables,
+            mv_repository,
+            mv_storage_observation,
+        }
+    }
+
+    fn from_state(state: &Arc<StandaloneState>) -> Self {
+        Self::from_domain_kernels(
+            legacy_query_preparation_kernel(state),
+            legacy_view_execution_kernel(state),
+            domain::SystemTableQueryKernel::new(
                 Arc::clone(&state.catalog_service),
                 Arc::clone(&state.connector_control),
                 Arc::clone(&state.system_catalog),
                 Arc::clone(&state.mv_repository),
             ),
-            mv_repository: Arc::clone(&state.mv_repository),
-            mv_storage_observation: Arc::clone(&state.mv_storage_observation),
-        }
+            Arc::clone(&state.mv_repository),
+            Arc::clone(&state.mv_storage_observation),
+        )
     }
 
     pub fn prepare(
