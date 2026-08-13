@@ -279,6 +279,7 @@ pub(crate) struct MvExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_backend: Arc<dyn MvBackend>,
     repository: Arc<dyn MvRepository>,
     application: Arc<dyn MvApplicationService>,
@@ -292,6 +293,7 @@ impl MvExecutionKernel {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_backend: Arc<dyn MvBackend>,
         repository: Arc<dyn MvRepository>,
         application: Arc<dyn MvApplicationService>,
@@ -302,6 +304,7 @@ impl MvExecutionKernel {
             catalog_service,
             catalog_application,
             connector_control,
+            unified_statistics,
             mv_backend,
             repository,
             application,
@@ -320,6 +323,10 @@ impl MvExecutionKernel {
 
     pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
         &self.connector_control
+    }
+
+    pub(crate) fn unified_statistics(&self) -> &Arc<UnifiedStatisticsResolver> {
+        &self.unified_statistics
     }
 
     pub(crate) fn mv_backend(&self) -> &Arc<dyn MvBackend> {

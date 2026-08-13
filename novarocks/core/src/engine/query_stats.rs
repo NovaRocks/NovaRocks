@@ -28,7 +28,7 @@ use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
 use crate::engine::domain::{
-    DmlExecutionKernel, QueryPreparationKernel, StatisticsExecutionKernel,
+    DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel, StatisticsExecutionKernel,
 };
 use crate::engine::query_planning::bindings::{
     QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
@@ -152,6 +152,7 @@ macro_rules! impl_kernel_statistics_resolver {
 
 impl_kernel_statistics_resolver!(QueryPreparationKernel);
 impl_kernel_statistics_resolver!(DmlExecutionKernel);
+impl_kernel_statistics_resolver!(MvExecutionKernel);
 impl_kernel_statistics_resolver!(StatisticsExecutionKernel);
 
 /// Project every admission-frozen connector observation into SQL values before

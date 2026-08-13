@@ -2134,6 +2134,7 @@ impl StandaloneNovaRocks {
             Arc::clone(&self.inner.catalog_service),
             self.inner.catalog_application.clone(),
             Arc::clone(&self.inner.connector_control),
+            Arc::clone(&self.inner.unified_statistics),
             backend,
             Arc::clone(&self.inner.mv_repository),
             Arc::clone(&self.inner.mv_application_service),

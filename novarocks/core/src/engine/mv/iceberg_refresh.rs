@@ -37,7 +37,7 @@ use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
 use crate::engine::mv::refresh_io::{acquire_mv_refresh_lock, parse_iceberg_table_refs};
-use crate::engine::mv::refresh_pin_adapter::capture_refresh_snapshot_pin;
+use crate::engine::mv::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
 use crate::engine::query_planning::bindings::{
     MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
     QueryTableBindingStore,
@@ -9435,11 +9435,43 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     level: crate::sql::explain::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, String> {
+    let ports = IcebergMvCorePorts::new(
+        Arc::clone(&state.catalog_service),
+        state.catalog_application.clone(),
+        Arc::clone(&state.connector_control),
+        Arc::clone(&state.mv_repository),
+        Arc::clone(&state.mv_storage_observation),
+    );
+    explain_iceberg_mv_refresh_rewrite_plan_with_ports(
+        &ports,
+        state.as_ref(),
+        current_catalog,
+        current_database,
+        stmt,
+        level,
+        connector_context,
+    )
+}
+
+/// Compile an `EXPLAIN REFRESH MATERIALIZED VIEW` plan using only the
+/// frontend-composed MV and statistics capabilities.  The query-local table
+/// overlays retain the same snapshot pins and connector leases used by the
+/// refresh path; this diagnostic must not consult `StandaloneState` or a
+/// second latest-generation source.
+pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
+    source: &IcebergMvCorePorts,
+    statistics_resolver: &impl crate::engine::query_stats::QueryStatisticsResolver,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &RefreshMaterializedViewStmt,
+    level: crate::sql::explain::ExplainLevel,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Vec<String>, String> {
     explain_refresh_full_guard(stmt.full)?;
 
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
-    let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
-    let target_binding = target_binding_for(state, &target, connector_context)?;
+    let mv_definition = load_iceberg_mv_definition_by_target(source, &target)?;
+    let target_binding = target_binding_for(source, &target, connector_context)?;
     validate_target_snapshot(&target, &mv_definition, &target_binding)?;
 
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
@@ -9463,10 +9495,15 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         validate_aggregate_schema_contract_metadata(&target, &mv_definition)?;
     }
 
-    let pin = capture_refresh_snapshot_pin(state, &base_refs, connector_context)?;
+    let pin = capture_refresh_snapshot_pin_with_ports(
+        source.connector_control(),
+        source.storage_observation(),
+        &base_refs,
+        connector_context,
+    )?;
     validate_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
     let rewrite = build_neutral_refresh_rewrite_context(
-        state,
+        source,
         &target,
         mv_definition.mv_id,
         current_catalog,
@@ -9489,9 +9526,9 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         target_binding.lease(),
         connector_context,
     )?;
-    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
+    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(source);
     let overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-        state,
+        source,
         connector_context,
         &rewrite.base_refs,
         &rewrite.pin,
@@ -9502,14 +9539,14 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         &catalog_service_snapshot,
         Arc::clone(&bindings),
         crate::engine::query_stats::iceberg_table_binding_loader(
-            state.connector_control.as_ref(),
+            source.connector_control(),
             connector_context.clone(),
         ),
         overlays,
     );
     let statistics =
-        crate::engine::query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
-            state,
+        crate::engine::query_stats::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+            statistics_resolver,
             materializer.query_table_bindings(),
         );
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(&materializer);

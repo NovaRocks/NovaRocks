@@ -22,16 +22,19 @@
 //! the Connector; this module only routes maintenance intents to it and shapes
 //! the neutral outcome the frontend reports.
 
-use std::sync::Arc;
-
-use crate::engine::StandaloneState;
+use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
 use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
 };
 
-pub(crate) fn execute_action(
-    state: &Arc<StandaloneState>,
+/// Execute a non-rewrite maintenance action through explicit frontend-owned
+/// connector and cache-finalization ports. The caller owns the request context;
+/// this helper never captures a process-local cancellation or topology view.
+pub(crate) fn execute_action_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     request: MaintenanceActionRequest,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MaintenanceActionOutcome, String> {
     match request {
         MaintenanceActionRequest::RewriteDataFiles { .. }
@@ -43,12 +46,26 @@ pub(crate) fn execute_action(
             target,
             use_caching,
             spec_id,
-        } => run_rewrite_manifests_action(state, target, use_caching, spec_id),
+        } => run_rewrite_manifests_action_with_ports(
+            connector_control,
+            cache_finalizer,
+            target,
+            use_caching,
+            spec_id,
+            connector_context,
+        ),
         MaintenanceActionRequest::ExpireSnapshots {
             target,
             older_than_ms,
             retain_last,
-        } => run_expire_snapshots_action(state, target, older_than_ms, retain_last),
+        } => run_expire_snapshots_action_with_ports(
+            connector_control,
+            cache_finalizer,
+            target,
+            older_than_ms,
+            retain_last,
+            connector_context,
+        ),
         MaintenanceActionRequest::RemoveOrphanFiles { .. } => Err(
             "remove orphan files must be dispatched by the frontend durable cleanup owner"
                 .to_string(),
@@ -56,18 +73,14 @@ pub(crate) fn execute_action(
     }
 }
 
-pub(crate) fn current_snapshot_id(
-    state: &Arc<StandaloneState>,
+/// Read the current snapshot on a caller-supplied exact request context.
+pub(crate) fn current_snapshot_id_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     target: &MaintenanceTarget,
+    context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<i64, String> {
-    let context = crate::connector::connector_request_context(
-        None,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )?;
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
-        state.connector_control.as_ref(),
-        &target.catalog,
-    )?;
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &target.catalog)?;
     let facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
         exact_lease,
         context,
@@ -82,11 +95,13 @@ pub(crate) fn current_snapshot_id(
     })
 }
 
-fn run_rewrite_manifests_action(
-    state: &Arc<StandaloneState>,
+fn run_rewrite_manifests_action_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     target: MaintenanceTarget,
     use_caching: Option<bool>,
     spec_id: Option<i32>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MaintenanceActionOutcome, String> {
     if use_caching.is_some() {
         return Err(
@@ -99,8 +114,8 @@ fn run_rewrite_manifests_action(
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
     let completed = crate::connector::metadata_maintenance::execute_metadata_maintenance(
-        state.connector_control.as_ref(),
-        state.as_ref(),
+        connector_control,
+        cache_finalizer,
         &instance_id,
         novarocks_spi::connector::ConnectorMutationOperationId::new(),
         novarocks_spi::connector::ConnectorTableIdentity {
@@ -110,10 +125,7 @@ fn run_rewrite_manifests_action(
         },
         crate::connector::metadata_maintenance::MetadataMaintenanceIntent::rewrite_metadata_layout(
         ),
-        crate::connector::connector_request_context(
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )?,
+        connector_context,
     )?;
     let summary = completed.receipt.summary();
 
@@ -125,17 +137,19 @@ fn run_rewrite_manifests_action(
     })
 }
 
-fn run_expire_snapshots_action(
-    state: &Arc<StandaloneState>,
+fn run_expire_snapshots_action_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     target: MaintenanceTarget,
     older_than_ms: Option<i64>,
     retain_last: Option<u32>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MaintenanceActionOutcome, String> {
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
     crate::connector::metadata_maintenance::execute_metadata_maintenance(
-        state.connector_control.as_ref(),
-        state.as_ref(),
+        connector_control,
+        cache_finalizer,
         &instance_id,
         novarocks_spi::connector::ConnectorMutationOperationId::new(),
         novarocks_spi::connector::ConnectorTableIdentity {
@@ -147,10 +161,7 @@ fn run_expire_snapshots_action(
             older_than_ms,
             retain_last,
         ),
-        crate::connector::connector_request_context(
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )?,
+        connector_context,
     )?;
 
     tracing::info!(

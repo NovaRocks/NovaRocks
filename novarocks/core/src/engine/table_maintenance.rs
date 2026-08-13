@@ -660,9 +660,11 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
-        crate::engine::iceberg_maintenance::current_snapshot_id(
-            &self.shared_for_table_maintenance()?,
+        let state = self.shared_for_table_maintenance()?;
+        crate::engine::iceberg_maintenance::current_snapshot_id_with_ports(
+            state.connector_control.as_ref(),
             target,
+            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?,
         )
     }
 
@@ -676,9 +678,12 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
                     .to_string(),
             );
         }
-        crate::engine::iceberg_maintenance::execute_action(
-            &self.shared_for_table_maintenance()?,
+        let state = self.shared_for_table_maintenance()?;
+        crate::engine::iceberg_maintenance::execute_action_with_ports(
+            state.connector_control.as_ref(),
+            state.as_ref(),
             request,
+            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?,
         )
     }
 
