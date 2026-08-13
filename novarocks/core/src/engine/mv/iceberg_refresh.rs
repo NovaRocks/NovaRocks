@@ -28,6 +28,7 @@ use arrow::datatypes::DataType;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::catalog_application::CatalogApplicationPort;
 use crate::common::engine_error::EngineError;
 use crate::engine::mv::analysis_adapter::{
     BaseColumnDescriptor, BaseTableDescriptor, analyze_mv_select_with_connector_context, now_ms,
@@ -44,6 +45,7 @@ use crate::engine::query_planning::bindings::{
     MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
     QueryTableBindingStore,
 };
+use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
@@ -101,6 +103,7 @@ use crate::mv::refresh::target_apply::{
     join_apply_key_table_column,
 };
 use crate::mv::repository::CreateMvRepositoryRequest;
+use crate::mv::repository::MvRepository;
 use crate::mv::schema_validation::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
 };
@@ -127,8 +130,8 @@ use crate::sql::planner::vocabulary::{
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_spi::connector::{
-    ConnectorChangeWindowAdmission, ConnectorExecutionBindingKey, ConnectorInstanceId,
-    ConnectorTableIdentity,
+    ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExecutionBindingKey,
+    ConnectorInstanceId, ConnectorTableIdentity,
 };
 
 /// SQL-owned bridge for refresh planning.  It owns only analysis and immutable
@@ -1522,13 +1525,51 @@ impl From<String> for IcebergMvRefreshExecutionError {
     }
 }
 
+/// The explicit Core inputs required by an Iceberg MV CREATE operation.
+///
+/// This is intentionally a narrow composition value: it owns the frozen
+/// catalog source plus the provider and durable MV ports that CREATE needs.
+/// It does not retain aggregate application state, and it has no state-based
+/// constructor so a frontend composition must name every dependency.
+#[derive(Clone)]
+pub(crate) struct IcebergMvCorePorts {
+    catalog_service: Arc<QueryCatalogService>,
+    catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    repository: Arc<dyn MvRepository>,
+    storage_observation: Arc<dyn MvStorageObservationPort>,
+}
+
+impl IcebergMvCorePorts {
+    pub(crate) fn new(
+        catalog_service: Arc<QueryCatalogService>,
+        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        repository: Arc<dyn MvRepository>,
+        storage_observation: Arc<dyn MvStorageObservationPort>,
+    ) -> Self {
+        Self {
+            catalog_service,
+            catalog_application,
+            connector_control,
+            repository,
+            storage_observation,
+        }
+    }
+}
+
+impl crate::engine::CatalogServiceSource for IcebergMvCorePorts {
+    fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+        &self.catalog_service
+    }
+}
+
 /// Core adapter used by the frontend-owned MV application service. It keeps
-/// connector/analyzer state in core while exposing CREATE as auditable,
-/// side-effect-sized primitives.
+/// explicit connector/analyzer ports in core while exposing CREATE as
+/// auditable, side-effect-sized primitives.
 pub(crate) struct StandaloneMvEngine {
-    state: Arc<StandaloneState>,
+    ports: IcebergMvCorePorts,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    storage_observer: Arc<dyn MvStorageObservationPort>,
     preparations: Mutex<HashMap<String, Arc<IcebergMvCreatePreparation>>>,
 }
 
@@ -1557,11 +1598,25 @@ impl StandaloneMvEngine {
         state: Arc<StandaloneState>,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
-        let storage_observer = Arc::clone(&state.mv_storage_observation);
-        Self {
-            state,
+        Self::new_with_ports(
+            IcebergMvCorePorts::new(
+                Arc::clone(&state.catalog_service),
+                state.catalog_application.clone(),
+                Arc::clone(&state.connector_control),
+                Arc::clone(&state.mv_repository),
+                Arc::clone(&state.mv_storage_observation),
+            ),
             connector_context,
-            storage_observer,
+        )
+    }
+
+    pub(crate) fn new_with_ports(
+        ports: IcebergMvCorePorts,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            ports,
+            connector_context,
             preparations: Mutex::new(HashMap::new()),
         }
     }
@@ -1611,8 +1666,8 @@ impl MvEngine for StandaloneMvEngine {
         request: PrepareMvCreateRequest<'_>,
         repository: &dyn crate::mv::repository::MvRepository,
     ) -> Result<PreparedMvCreate, MvEngineError> {
-        let prepared = prepare_iceberg_mv_create(
-            &self.state,
+        let prepared = prepare_iceberg_mv_create_with_ports(
+            &self.ports,
             request.context.current_catalog,
             request.context.current_database,
             request.statement,
@@ -1663,7 +1718,7 @@ impl MvEngine for StandaloneMvEngine {
             novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
                 .map_err(|error| engine_target_error(error.to_string()))?;
         let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-            self.state.connector_control.as_ref(),
+            self.ports.connector_control.as_ref(),
             &instance_id,
         )
         .map_err(|error| engine_target_error(error.to_string()))?;
@@ -1784,7 +1839,7 @@ impl MvEngine for StandaloneMvEngine {
                     )));
                 }
             };
-        let observation = match self.storage_observer.observe_created_target(
+        let observation = match self.ports.storage_observation.observe_created_target(
             &planning_lease,
             &loaded_target,
             self.connector_context.clone(),
@@ -1889,8 +1944,8 @@ impl MvEngine for StandaloneMvEngine {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))?;
-        sync_iceberg_mv_descriptor(
-            &self.state,
+        sync_iceberg_mv_descriptor_with_ports(
+            &self.ports,
             definition,
             &definition.refresh_policy,
             definition.refresh_paused,
@@ -1920,8 +1975,14 @@ impl MvEngine for StandaloneMvEngine {
                 error,
             ));
         }
-        register_iceberg_mv_target_in_catalog(&mv_target_restore_context(&self.state), &target)
-            .map_err(|error| MvEngineError::new(MvEngineErrorKind::CatalogRegistration, error))?;
+        register_iceberg_mv_target_in_catalog(
+            &MvTargetRestoreContext {
+                connector_control: self.ports.connector_control.as_ref(),
+                mv_repository: self.ports.repository.as_ref(),
+            },
+            &target,
+        )
+        .map_err(|error| MvEngineError::new(MvEngineErrorKind::CatalogRegistration, error))?;
         self.preparations
             .lock()
             .map_err(|error| {
@@ -1940,7 +2001,7 @@ impl MvEngine for StandaloneMvEngine {
             novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
                 .map_err(|error| engine_target_error(error.to_string()))?;
         crate::connector::mutation::execute_catalog_mutation(
-            self.state.connector_control.as_ref(),
+            self.ports.connector_control.as_ref(),
             &instance_id,
             novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
                 table: novarocks_spi::connector::ConnectorTableIdentity {
@@ -2120,6 +2181,31 @@ fn prepare_iceberg_mv_create(
     repository: &dyn crate::mv::repository::MvRepository,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<IcebergMvCreatePreparation, String> {
+    let ports = IcebergMvCorePorts::new(
+        Arc::clone(&state.catalog_service),
+        state.catalog_application.clone(),
+        Arc::clone(&state.connector_control),
+        Arc::clone(&state.mv_repository),
+        Arc::clone(&state.mv_storage_observation),
+    );
+    prepare_iceberg_mv_create_with_ports(
+        &ports,
+        current_catalog,
+        current_database,
+        stmt,
+        repository,
+        connector_context,
+    )
+}
+
+fn prepare_iceberg_mv_create_with_ports(
+    ports: &IcebergMvCorePorts,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &MvCreateStatement,
+    repository: &dyn crate::mv::repository::MvRepository,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<IcebergMvCreatePreparation, String> {
     crate::connector::validate_request_context(connector_context)?;
     let storage_engine = stmt
         .properties
@@ -2163,15 +2249,18 @@ fn prepare_iceberg_mv_create(
         namespace,
         table,
     };
-    ensure_mv_create_target_absent(state, &target, connector_context)?;
+    ensure_mv_create_target_absent_with_ports(ports, &target, connector_context)?;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
         &stmt.select_query,
         Some(current_catalog),
         current_database,
     );
-    let analysis = analyze_mv_select_with_connector_context(
-        state,
+    let catalog_service = crate::engine::catalog_service_snapshot(ports);
+    let analysis = crate::engine::mv::analysis_adapter::analyze_mv_select_with_ports(
         Some(current_catalog),
+        &catalog_service,
+        ports.catalog_application.as_deref(),
+        ports.connector_control.as_ref(),
         current_database,
         &canonical_select_query,
         connector_context,
@@ -2203,8 +2292,11 @@ fn prepare_iceberg_mv_create(
         )
     })?;
     let property = derive_fragment_property(&analysis.resolved_query)?;
-    let base_field_observations =
-        observe_base_fields_for_refs(state, &resolved_dependencies.base_refs, connector_context)?;
+    let base_field_observations = observe_base_fields_for_refs_with_ports(
+        ports,
+        &resolved_dependencies.base_refs,
+        connector_context,
+    )?;
     for base_ref in &resolved_dependencies.base_refs {
         ensure_base_row_lineage_contract(
             observed_base(&base_field_observations, base_ref)?,
@@ -2456,10 +2548,32 @@ fn ensure_mv_create_target_absent(
     target: &IcebergMvTarget,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    let lease = crate::connector::acquire_metadata_planning_lease(
+    ensure_mv_create_target_absent_with_connector_control(
         state.connector_control.as_ref(),
-        &target.catalog,
-    )?;
+        target,
+        connector_context,
+    )
+}
+
+fn ensure_mv_create_target_absent_with_ports(
+    ports: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    ensure_mv_create_target_absent_with_connector_control(
+        ports.connector_control.as_ref(),
+        target,
+        connector_context,
+    )
+}
+
+fn ensure_mv_create_target_absent_with_connector_control(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    target: &IcebergMvTarget,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    let lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &target.catalog)?;
     if lease.binding().descriptor().provider_id.as_str() != "iceberg" {
         return Err(
             "storage_engine='iceberg' requires current catalog to be an Iceberg catalog"
@@ -3012,9 +3126,31 @@ fn observe_base_fields_for_refs(
     >,
     String,
 > {
+    let ports = IcebergMvCorePorts::new(
+        Arc::clone(&state.catalog_service),
+        state.catalog_application.clone(),
+        Arc::clone(&state.connector_control),
+        Arc::clone(&state.mv_repository),
+        Arc::clone(&state.mv_storage_observation),
+    );
+    observe_base_fields_for_refs_with_ports(&ports, base_refs, connector_context)
+}
+
+fn observe_base_fields_for_refs_with_ports(
+    ports: &IcebergMvCorePorts,
+    base_refs: &[TableIdentity],
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    std::collections::BTreeMap<
+        String,
+        crate::mv::storage_observation::MvSchemaValidationObservation,
+    >,
+    String,
+> {
     let mut observed = std::collections::BTreeMap::new();
     for base_ref in base_refs {
-        let observation = observe_schema_validation_for_table(state, base_ref, connector_context)?;
+        let observation =
+            observe_schema_validation_for_table_with_ports(ports, base_ref, connector_context)?;
         observed.insert(base_ref.fqn(), observation);
     }
     Ok(observed)
@@ -3119,6 +3255,35 @@ pub(crate) fn sync_iceberg_mv_descriptor(
     >,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
+    let ports = IcebergMvCorePorts::new(
+        Arc::clone(&state.catalog_service),
+        state.catalog_application.clone(),
+        Arc::clone(&state.connector_control),
+        Arc::clone(&state.mv_repository),
+        Arc::clone(&state.mv_storage_observation),
+    );
+    sync_iceberg_mv_descriptor_with_ports(
+        &ports,
+        definition,
+        refresh_policy,
+        refresh_paused,
+        refresh_interval_ms,
+        expected_committed_partitioning,
+        connector_context,
+    )
+}
+
+fn sync_iceberg_mv_descriptor_with_ports(
+    ports: &IcebergMvCorePorts,
+    definition: &StoredMvDefinition,
+    refresh_policy: &StoredMvRefreshPolicy,
+    refresh_paused: bool,
+    refresh_interval_ms: Option<i64>,
+    expected_committed_partitioning: Option<
+        novarocks_spi::connector::ConnectorCommittedPartitioning,
+    >,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
     if definition.storage_engine != MvStorageEngine::Iceberg.as_sql_str() {
         return Ok(());
     }
@@ -3135,7 +3300,7 @@ pub(crate) fn sync_iceberg_mv_descriptor(
         .as_deref()
         .ok_or_else(|| "Iceberg MV descriptor sync missing target table".to_string())?;
     let exact_lease = crate::connector::acquire_metadata_planning_lease(
-        state.connector_control.as_ref(),
+        ports.connector_control.as_ref(),
         catalog_name,
     )?;
     let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
@@ -3145,8 +3310,8 @@ pub(crate) fn sync_iceberg_mv_descriptor(
         target_table_name,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
-    let package = state
-        .mv_storage_observation
+    let package = ports
+        .storage_observation
         .observe_lake_package(&exact_lease, &metadata, connector_context.clone())
         .map_err(|error| format!("observe MV descriptor storage facts failed: {error}"))?
         .ok_or_else(|| {
@@ -5710,10 +5875,35 @@ fn observe_schema_validation_for_table(
     table: &TableIdentity,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MvSchemaValidationObservation, String> {
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+    observe_schema_validation_for_table_with_parts(
         state.connector_control.as_ref(),
-        &table.catalog,
-    )?;
+        state.mv_storage_observation.as_ref(),
+        table,
+        connector_context,
+    )
+}
+
+fn observe_schema_validation_for_table_with_ports(
+    ports: &IcebergMvCorePorts,
+    table: &TableIdentity,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<MvSchemaValidationObservation, String> {
+    observe_schema_validation_for_table_with_parts(
+        ports.connector_control.as_ref(),
+        ports.storage_observation.as_ref(),
+        table,
+        connector_context,
+    )
+}
+
+fn observe_schema_validation_for_table_with_parts(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn MvStorageObservationPort,
+    table: &TableIdentity,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<MvSchemaValidationObservation, String> {
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
     let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
@@ -5721,8 +5911,7 @@ fn observe_schema_validation_for_table(
         &table.table,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
-    state
-        .mv_storage_observation
+    storage_observation
         .observe_schema_validation(&exact_lease, &metadata, connector_context.clone())
         .map_err(|error| {
             format!(
