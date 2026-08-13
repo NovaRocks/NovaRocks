@@ -56,7 +56,7 @@ pub(crate) fn freeze_mv_rewrite_definition_index_with_kernel(
     )
 }
 
-fn freeze_mv_rewrite_definition_index_with_ports(
+pub(crate) fn freeze_mv_rewrite_definition_index_with_ports(
     repository: &dyn MvRepository,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
