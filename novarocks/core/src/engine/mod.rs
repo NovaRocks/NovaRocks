@@ -49,6 +49,7 @@ use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 pub mod add_files_engine;
 pub(crate) mod aggregate;
+pub mod backend_command;
 pub(crate) mod backend_resolver;
 pub mod catalog_command;
 pub mod ctas_engine;
@@ -1841,6 +1842,13 @@ impl StandaloneNovaRocks {
             Arc::clone(&self.inner.statistics_service),
             Arc::clone(&self.inner.statistics_application),
             self.inner.query_execution.clone(),
+        ))
+    }
+
+    /// Transitional factory for Frontend-owned backend membership commands.
+    pub fn backend_command_executor(&self) -> backend_command::BackendCommandExecutor {
+        backend_command::BackendCommandExecutor::new(domain::BackendManagementKernel::new(
+            self.inner.backend_topology.clone(),
         ))
     }
 
