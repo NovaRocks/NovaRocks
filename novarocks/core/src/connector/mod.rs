@@ -543,19 +543,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     #[test]
-    fn standalone_catalog_service_keeps_internal_entry_after_backend_registration() {
-        let state = Arc::new(crate::engine::StandaloneState::default());
-        super::register_standalone_backends(&state);
-
-        let registry = state
-            .catalog_service
-            .registry()
-            .read()
-            .expect("catalog service registry");
-        assert!(registry.get_catalog("default_catalog").is_ok());
-    }
-
-    #[test]
     fn spi5b_sql_target_columns_exclude_connector_hidden_read_fields() {
         let schema = Schema::new(vec![
             Field::new("value", DataType::Int64, false),
@@ -936,18 +923,6 @@ impl novarocks_spi::connector::ConnectorControlResolver for FixtureControlResolv
         novarocks_spi::connector::ConnectorError,
     > {
         self.registry.acquire_fixture_control(instance_id)
-    }
-}
-
-pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
-    {
-        let mut connectors = state
-            .connectors
-            .write()
-            .expect("standalone connector registry write lock");
-        connectors.register_mv_backend(Arc::new(
-            crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
-        ));
     }
 }
 

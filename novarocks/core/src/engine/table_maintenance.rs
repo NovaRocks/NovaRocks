@@ -644,7 +644,7 @@ impl TableMaintenanceService for EmptyTableMaintenanceService {
 
 /// One foreground SQL maintenance command bound to the exact request admitted
 /// by Frontend.  It deliberately contains only the maintenance kernel and
-/// immutable request facts; it cannot recover a `StandaloneState` or capture
+/// immutable request facts; it cannot recover an application facade or capture
 /// a second topology, deadline, or cancellation scope.
 #[derive(Clone)]
 pub(crate) struct RequestScopedMaintenanceEngine {
@@ -714,7 +714,7 @@ impl BackgroundMaintenanceAttempt {
 ///
 /// Implementations must capture a fresh live topology and cancellation scope
 /// for each call. There is deliberately no Core default, process-global lookup
-/// or `StandaloneState` fallback.
+/// or application-facade fallback.
 pub trait BackgroundMaintenanceAttemptFactory: Send + Sync {
     fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String>;
 }

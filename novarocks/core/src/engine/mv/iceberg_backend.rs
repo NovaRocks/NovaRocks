@@ -17,10 +17,7 @@
 
 //! Iceberg-backed materialized-view backend.
 
-use std::sync::Arc;
-
 use crate::connector::backend::MvBackend;
-use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow};
 use crate::mv::model::MvStorageEngine;
 
@@ -29,16 +26,6 @@ pub(crate) struct IcebergMvBackend {
 }
 
 impl IcebergMvBackend {
-    pub(crate) fn new(state: &Arc<StandaloneState>) -> Self {
-        Self::new_with_ports(crate::engine::mv::iceberg_refresh::IcebergMvCorePorts::new(
-            Arc::clone(&state.catalog_service),
-            state.catalog_application.clone(),
-            Arc::clone(&state.connector_control),
-            Arc::clone(&state.mv_repository),
-            Arc::clone(&state.mv_storage_observation),
-        ))
-    }
-
     pub(crate) fn new_with_ports(
         ports: crate::engine::mv::iceberg_refresh::IcebergMvCorePorts,
     ) -> Self {

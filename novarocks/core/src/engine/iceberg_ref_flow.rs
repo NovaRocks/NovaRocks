@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::{StandaloneState, StatementResult};
+use crate::engine::StatementResult;
 use crate::sql::parser::ast::{
     AlterIcebergRefAction, AlterIcebergRefStmt, ObjectName, SnapshotAnchor,
 };
@@ -31,21 +31,6 @@ use novarocks_spi::connector::{
     ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,
     ExternalMutationFinalization,
 };
-
-pub(crate) fn execute(
-    state: &Arc<StandaloneState>,
-    _current_database: &str,
-    stmt: &AlterIcebergRefStmt,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    execute_with_ports(
-        state.connector_control.as_ref(),
-        state.mv_storage_observation.as_ref(),
-        _current_database,
-        stmt,
-        connector_context,
-    )
-}
 
 /// Execute an Iceberg ref mutation using only the explicit MV kernel ports
 /// required for MV-target admission.

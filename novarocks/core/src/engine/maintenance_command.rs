@@ -28,7 +28,7 @@ use crate::engine::table_maintenance::{
 /// Foreground maintenance command capability.  Each invocation creates a
 /// short-lived engine carrying only the Frontend-composed maintenance ports
 /// and the already-admitted request execution.  It cannot use the legacy
-/// `StandaloneState` façade or manufacture a topology/cancellation fallback.
+/// Core application façade or manufacture a topology/cancellation fallback.
 #[derive(Clone)]
 pub struct MaintenanceCommandExecutor {
     kernel: crate::engine::domain::MaintenanceExecutionKernel,

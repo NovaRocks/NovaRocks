@@ -126,24 +126,6 @@ impl MvTargetBinding {
     }
 }
 
-/// Resolve an MV target into a neutral binding.
-///
-/// Mirrors `observe_schema_validation_for_table`: acquire one planning lease,
-/// load metadata through it, then observe refresh facts on that same lease so
-/// the schema, handle, snapshot and refs cannot drift apart.
-pub(crate) fn load_mv_target_binding(
-    state: &Arc<crate::engine::StandaloneState>,
-    table: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, String> {
-    load_mv_target_binding_with_ports(
-        state.connector_control.as_ref(),
-        state.mv_storage_observation.as_ref(),
-        table,
-        connector_context,
-    )
-}
-
 /// Resolve a target through the explicit MV execution kernel.  This is the
 /// kernel-first entry used by frontend-owned MV lifecycle composition.
 pub(crate) fn load_mv_target_binding_with_kernel(
@@ -175,20 +157,6 @@ pub(crate) fn load_mv_target_binding_with_ports(
         crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
     load_mv_target_binding_with_lease_and_ports(
         storage_observation,
-        table,
-        exact_lease,
-        connector_context,
-    )
-}
-
-pub(crate) fn load_mv_target_binding_with_lease(
-    state: &Arc<crate::engine::StandaloneState>,
-    table: &TableIdentity,
-    exact_lease: ConnectorControlPlanningLease,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, String> {
-    load_mv_target_binding_with_lease_and_ports(
-        state.mv_storage_observation.as_ref(),
         table,
         exact_lease,
         connector_context,

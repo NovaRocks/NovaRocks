@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
+use crate::engine::StatementResult;
 use crate::engine::domain::CatalogCommandKernel;
-use crate::engine::{StandaloneState, StatementResult};
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
 use bytes::Bytes;
@@ -59,26 +59,6 @@ pub(crate) trait CatalogDropContext:
     fn mv_storage_observation(
         &self,
     ) -> &dyn crate::mv::storage_observation::MvStorageObservationPort;
-}
-
-impl CatalogDropContext for Arc<StandaloneState> {
-    fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService> {
-        &self.catalog_service
-    }
-
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.connector_control.as_ref()
-    }
-
-    fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository {
-        self.mv_repository.as_ref()
-    }
-
-    fn mv_storage_observation(
-        &self,
-    ) -> &dyn crate::mv::storage_observation::MvStorageObservationPort {
-        self.mv_storage_observation.as_ref()
-    }
 }
 
 impl CatalogDropContext for CatalogCommandKernel {
@@ -687,24 +667,12 @@ fn update_alias_name(
 
 /// The narrow catalog mutation surface shared by the legacy engine and the
 /// explicit catalog command kernel.  Keep statement helpers on this port so
-/// command routing cannot recover a `StandaloneState` just to resolve a
+/// command routing cannot recover an application facade just to resolve a
 /// catalog target or issue a provider-owned mutation.
 pub(crate) trait CatalogMutationContext:
     crate::engine::backend_resolver::CatalogAdmission
 {
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
-}
-
-impl CatalogMutationContext for StandaloneState {
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.connector_control.as_ref()
-    }
-}
-
-impl CatalogMutationContext for Arc<StandaloneState> {
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.as_ref().connector_control()
-    }
 }
 
 impl CatalogMutationContext for CatalogCommandKernel {

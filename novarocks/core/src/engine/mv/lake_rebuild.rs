@@ -542,13 +542,10 @@ mod tests {
         }
     }
 
-    fn state_with_admission(
+    fn application_with_admission(
         admission: crate::catalog_application::CatalogAdmission,
-    ) -> Arc<crate::engine::StandaloneState> {
-        Arc::new(crate::engine::StandaloneState {
-            catalog_application: Some(Arc::new(FixedAdmission(admission))),
-            ..Default::default()
-        })
+    ) -> Arc<dyn crate::catalog_application::CatalogApplicationPort> {
+        Arc::new(FixedAdmission(admission))
     }
 
     /// Startup rediscovery must not take the frontend down over a lake package
@@ -560,34 +557,36 @@ mod tests {
     fn sweep_skips_a_package_whose_catalog_is_not_admitted_here() {
         let package = sample_package(sample_publication());
 
-        let absent = state_with_admission(crate::catalog_application::CatalogAdmission::Absent);
+        let absent =
+            application_with_admission(crate::catalog_application::CatalogAdmission::Absent);
         assert!(
-            !package_catalogs_are_admitted(absent.catalog_application.as_deref(), &package)
+            !package_catalogs_are_admitted(Some(absent.as_ref()), &package)
                 .expect("absent admission is decidable"),
             "an absent attachment must make the sweep skip the package"
         );
 
         let unavailable =
-            state_with_admission(crate::catalog_application::CatalogAdmission::Unavailable {
+            application_with_admission(crate::catalog_application::CatalogAdmission::Unavailable {
                 reason: "projection is stale".to_string(),
             });
         assert!(
-            !package_catalogs_are_admitted(unavailable.catalog_application.as_deref(), &package)
+            !package_catalogs_are_admitted(Some(unavailable.as_ref()), &package)
                 .expect("unavailable admission is decidable"),
             "an unmaterialized attachment must also make the sweep skip the package"
         );
 
-        let ready = state_with_admission(crate::catalog_application::CatalogAdmission::Ready(
-            crate::catalog_application::CatalogRuntimeObservation {
-                attachment_id: uuid::Uuid::now_v7(),
-                instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
-                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                    .expect("provider ID"),
-                generation: 1,
-            },
-        ));
+        let ready =
+            application_with_admission(crate::catalog_application::CatalogAdmission::Ready(
+                crate::catalog_application::CatalogRuntimeObservation {
+                    attachment_id: uuid::Uuid::now_v7(),
+                    instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
+                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                        .expect("provider ID"),
+                    generation: 1,
+                },
+            ));
         assert!(
-            package_catalogs_are_admitted(ready.catalog_application.as_deref(), &package)
+            package_catalogs_are_admitted(Some(ready.as_ref()), &package)
                 .expect("ready admission is decidable"),
             "a package whose target and upstream catalogs are admitted must be rebuilt"
         );
@@ -598,10 +597,8 @@ mod tests {
     #[test]
     fn sweep_skips_every_package_without_a_catalog_application() {
         let package = sample_package(sample_publication());
-        let state = Arc::new(crate::engine::StandaloneState::default());
-
         assert!(
-            !package_catalogs_are_admitted(state.catalog_application.as_deref(), &package)
+            !package_catalogs_are_admitted(None, &package)
                 .expect("missing application is decidable"),
         );
     }
@@ -611,13 +608,16 @@ mod tests {
     /// touching the repository or provider observation ports.
     #[test]
     fn sweep_is_empty_without_a_ready_catalog_projection() {
-        let state = Arc::new(crate::engine::StandaloneState::default());
+        let connector_control = crate::engine::TestConnectorControlRegistry::default();
+        let storage_observation =
+            crate::mv::storage_observation::UnavailableMvStorageObservationPort;
+        let repository = crate::mv::repository::UnavailableMvRepository;
         let context = LakeRebuildContext {
             catalog_runtime_projection: None,
-            catalog_application: state.catalog_application.as_deref(),
-            connector_control: state.connector_control.as_ref(),
-            mv_storage_observation: state.mv_storage_observation.as_ref(),
-            mv_repository: state.mv_repository.as_ref(),
+            catalog_application: None,
+            connector_control: &connector_control,
+            mv_storage_observation: &storage_observation,
+            mv_repository: &repository,
         };
 
         rebuild_imv_cache_from_lake(&context).expect("empty sweep succeeds");

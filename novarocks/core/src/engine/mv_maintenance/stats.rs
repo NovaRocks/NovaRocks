@@ -30,7 +30,6 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
 };
 
-use crate::engine::StandaloneState;
 use crate::mv::persistence::definition::StoredMvDefinition;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,23 +103,6 @@ pub(crate) fn downstream_floor(
 /// below observes the very table version the count was taken from. Reversing
 /// the two would let the projected facts describe an older table than the
 /// count, and would drop the forced refresh this pass has always performed.
-pub(crate) fn collect_table_stats(
-    state: &Arc<StandaloneState>,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-    definitions: &[StoredMvDefinition],
-) -> Result<TableMaintenanceStats, String> {
-    collect_table_stats_with_ports(
-        state.connector_control.as_ref(),
-        state.mv_storage_observation.as_ref(),
-        catalog,
-        namespace,
-        table,
-        definitions,
-    )
-}
-
 /// Read one MV storage table's maintenance facts through explicit frontend
 /// control and observation ports. Background policy must retain only these
 /// leaves, never the aggregate standalone engine state.
@@ -613,12 +595,16 @@ mod tests {
         }
     }
 
-    /// Compose a state whose provider and storage observation are both fakes,
-    /// and hand back the shared log both fakes write their call order into.
+    /// Compose explicit provider-control and observation leaves, and hand back
+    /// the shared log both fakes write their call order into.
     fn fixture(
         observation: FakeObservation,
         compaction: CompactionAnswer,
-    ) -> (Arc<StandaloneState>, Arc<CallLog>) {
+    ) -> (
+        Arc<crate::engine::TestConnectorControlRegistry>,
+        Arc<FakeObservation>,
+        Arc<CallLog>,
+    ) {
         let instance_id = ConnectorInstanceId::parse(TEST_CATALOG).expect("fixture instance ID");
         let incarnation = ConnectorInstanceIncarnation::from_bytes([9; 16]);
         let descriptor = ConnectorInstanceDescriptor {
@@ -652,17 +638,12 @@ mod tests {
             .expect("fake control binding");
         let control = Arc::new(crate::engine::TestConnectorControlRegistry::default());
         control.register(binding).expect("register fake binding");
-        let state = Arc::new(StandaloneState {
-            connector_control: control,
-            mv_storage_observation: Arc::new(observation),
-            ..StandaloneState::default()
-        });
-        (state, calls)
+        (control, Arc::new(observation), calls)
     }
 
     #[test]
     fn collect_table_stats_projects_every_observed_fact_verbatim() {
-        let (state, _calls) = fixture(
+        let (control, observation, _calls) = fixture(
             FakeObservation {
                 current_snapshot_id: Some(20),
                 snapshots: vec![
@@ -689,8 +670,15 @@ mod tests {
             CompactionAnswer::Signed(Some(9)),
         );
 
-        let stats = collect_table_stats(&state, TEST_CATALOG, TEST_NAMESPACE, TEST_TABLE, &[])
-            .expect("collect maintenance stats");
+        let stats = collect_table_stats_with_ports(
+            control.as_ref(),
+            observation.as_ref(),
+            TEST_CATALOG,
+            TEST_NAMESPACE,
+            TEST_TABLE,
+            &[],
+        )
+        .expect("collect maintenance stats");
 
         assert_eq!(stats.current_snapshot_id, Some(20));
         assert_eq!(
@@ -729,10 +717,18 @@ mod tests {
         // A table that declares nothing and a provider that exposes no
         // compaction observation. Every value must stay absent: a default or a
         // zero injected here would be a policy decision made in a fact layer.
-        let (state, _calls) = fixture(FakeObservation::default(), CompactionAnswer::Signed(None));
+        let (control, observation, _calls) =
+            fixture(FakeObservation::default(), CompactionAnswer::Signed(None));
 
-        let stats = collect_table_stats(&state, TEST_CATALOG, TEST_NAMESPACE, TEST_TABLE, &[])
-            .expect("collect maintenance stats");
+        let stats = collect_table_stats_with_ports(
+            control.as_ref(),
+            observation.as_ref(),
+            TEST_CATALOG,
+            TEST_NAMESPACE,
+            TEST_TABLE,
+            &[],
+        )
+        .expect("collect maintenance stats");
 
         assert_eq!(stats.current_snapshot_id, None);
         assert!(stats.snapshots.is_empty());
@@ -749,13 +745,20 @@ mod tests {
 
     #[test]
     fn collect_table_stats_observes_compaction_before_the_projected_metadata_load() {
-        let (state, calls) = fixture(
+        let (control, observation, calls) = fixture(
             FakeObservation::default(),
             CompactionAnswer::Signed(Some(2)),
         );
 
-        let stats = collect_table_stats(&state, TEST_CATALOG, TEST_NAMESPACE, TEST_TABLE, &[])
-            .expect("collect maintenance stats");
+        let stats = collect_table_stats_with_ports(
+            control.as_ref(),
+            observation.as_ref(),
+            TEST_CATALOG,
+            TEST_NAMESPACE,
+            TEST_TABLE,
+            &[],
+        )
+        .expect("collect maintenance stats");
         assert_eq!(stats.max_compactable_data_files, Some(2));
 
         // Answering the observation forces the provider to discard its cached
@@ -811,10 +814,12 @@ mod tests {
 
         // A consumer committed at the newest snapshot floors retention there,
         // not at the oldest snapshot the table still retains.
-        let (state, _calls) = fixture(observation.clone(), CompactionAnswer::Signed(None));
+        let (control, storage_observation, _calls) =
+            fixture(observation.clone(), CompactionAnswer::Signed(None));
         let consumer = definition_with_consumed(&fqn, 20);
-        let stats = collect_table_stats(
-            &state,
+        let stats = collect_table_stats_with_ports(
+            control.as_ref(),
+            storage_observation.as_ref(),
             TEST_CATALOG,
             TEST_NAMESPACE,
             TEST_TABLE,
@@ -826,10 +831,12 @@ mod tests {
 
         // A consumer pinned to a snapshot this table cannot resolve leaves the
         // floor unknown, which is what blocks expire.
-        let (state, _calls) = fixture(observation, CompactionAnswer::Signed(None));
+        let (control, storage_observation, _calls) =
+            fixture(observation, CompactionAnswer::Signed(None));
         let missing = definition_with_consumed(&fqn, 99);
-        let stats = collect_table_stats(
-            &state,
+        let stats = collect_table_stats_with_ports(
+            control.as_ref(),
+            storage_observation.as_ref(),
             TEST_CATALOG,
             TEST_NAMESPACE,
             TEST_TABLE,
@@ -842,10 +849,18 @@ mod tests {
 
     #[test]
     fn collect_table_stats_fails_closed_when_the_provider_cannot_sign_the_scalar() {
-        let (state, calls) = fixture(FakeObservation::default(), CompactionAnswer::Unsupported);
+        let (control, observation, calls) =
+            fixture(FakeObservation::default(), CompactionAnswer::Unsupported);
 
-        let error = collect_table_stats(&state, TEST_CATALOG, TEST_NAMESPACE, TEST_TABLE, &[])
-            .expect_err("an unanswerable observation must not be downgraded to a fact");
+        let error = collect_table_stats_with_ports(
+            control.as_ref(),
+            observation.as_ref(),
+            TEST_CATALOG,
+            TEST_NAMESPACE,
+            TEST_TABLE,
+            &[],
+        )
+        .expect_err("an unanswerable observation must not be downgraded to a fact");
 
         assert!(
             error.contains("compaction groups for maintenance"),

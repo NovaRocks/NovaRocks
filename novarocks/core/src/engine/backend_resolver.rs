@@ -24,7 +24,6 @@
 use std::sync::Arc;
 
 use crate::catalog_application::CatalogApplicationPort;
-use crate::engine::StandaloneState;
 use crate::engine::domain::{
     CatalogCommandKernel, DmlExecutionKernel, MaintenanceExecutionKernel, MvExecutionKernel,
     QueryPreparationKernel, ViewExecutionKernel,
@@ -73,18 +72,6 @@ fn reject_default_catalog_reference(
 
 pub(crate) trait CatalogAdmission {
     fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort>;
-}
-
-impl CatalogAdmission for StandaloneState {
-    fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
-        self.catalog_application.as_deref()
-    }
-}
-
-impl CatalogAdmission for Arc<StandaloneState> {
-    fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
-        self.as_ref().catalog_application()
-    }
 }
 
 macro_rules! impl_kernel_catalog_admission {
@@ -224,14 +211,23 @@ mod tests {
         }
     }
 
+    struct TestCatalogAdmission {
+        application: Arc<dyn CatalogApplicationPort>,
+    }
+
+    impl super::CatalogAdmission for TestCatalogAdmission {
+        fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+            Some(self.application.as_ref())
+        }
+    }
+
     #[test]
     fn external_table_target_requires_catalog_admission_when_port_is_configured() {
-        let state = Arc::new(StandaloneState {
-            catalog_application: Some(Arc::new(AbsentCatalogApplication)),
-            ..Default::default()
-        });
+        let admission = TestCatalogAdmission {
+            application: Arc::new(AbsentCatalogApplication),
+        };
         let error = resolve_existing_table_target(
-            &state,
+            &admission,
             &ObjectName {
                 parts: vec![
                     "warehouse".to_string(),

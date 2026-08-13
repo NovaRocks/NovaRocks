@@ -19,14 +19,14 @@
 //!
 //! The public traits and DTOs are the dependency-inversion boundary used by
 //! `novarocks-frontend`: core exposes only the engine capabilities required by
-//! view DDL and rewrite, without leaking `StandaloneState`, connector
+//! view DDL and rewrite, without leaking the retired Core application facade, connector
 //! backends, or parser-internal column definitions.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::engine::CatalogServiceSource;
 use crate::engine::domain::ViewExecutionKernel;
-use crate::engine::{CatalogServiceSource, StandaloneState};
 use crate::runtime::query_result::QueryResult;
 /// Shared StarRocks SQL parser contract for view DDL, storage, and rewrite.
 pub use crate::sql::parser::dialect::StarRocksDialect as ViewSqlDialect;
@@ -195,18 +195,6 @@ trait ViewExecutionContext: CatalogServiceSource + Send + Sync {
     fn catalog_application(
         &self,
     ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
-}
-
-impl ViewExecutionContext for StandaloneState {
-    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry {
-        self.connector_control.as_ref()
-    }
-
-    fn catalog_application(
-        &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
-        self.catalog_application.as_deref()
-    }
 }
 
 impl ViewExecutionContext for ViewExecutionKernel {

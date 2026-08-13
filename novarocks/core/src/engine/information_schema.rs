@@ -22,7 +22,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::engine::StandaloneState;
 use crate::engine::StatementResult;
 use crate::engine::domain::{MvExecutionKernel, SystemTableQueryKernel};
 use crate::mv::repository::MvRepository;
@@ -86,15 +85,6 @@ pub(crate) trait MaterializedViewCatalog {
 impl MaterializedViewCatalog for MvExecutionKernel {
     fn mv_repository(&self) -> &Arc<dyn MvRepository> {
         self.repository()
-    }
-}
-
-// Compatibility for the legacy Core query facade.  Production query
-// composition moves to `SystemTableQueryKernel`; this impl is removed with
-// that facade at the final hard-cut checkpoint.
-impl MaterializedViewCatalog for Arc<StandaloneState> {
-    fn mv_repository(&self) -> &Arc<dyn MvRepository> {
-        &self.mv_repository
     }
 }
 

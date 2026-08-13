@@ -84,28 +84,6 @@ impl QueryStatisticsContext {
             resolver: Some(Arc::clone(resolver.unified_statistics_arc())),
         }
     }
-
-    pub(crate) fn from_standalone_state_with_bindings(
-        state: &Arc<super::StandaloneState>,
-        bindings: Arc<QueryTableBindingStore>,
-    ) -> Self {
-        Self::from_statistics_resolver_with_bindings(state, bindings)
-    }
-
-    pub(crate) fn from_optional_state_with_bindings(
-        state: Option<&Arc<super::StandaloneState>>,
-        bindings: Option<Arc<QueryTableBindingStore>>,
-    ) -> Self {
-        match (state, bindings) {
-            (Some(state), Some(bindings)) => {
-                Self::from_standalone_state_with_bindings(state, bindings)
-            }
-            // A caller without resolution pins must not resolve `latest` a
-            // second time. Keep normal missing-statistics fallback instead.
-            (Some(_), None) => Self::none(),
-            (None, _) => Self::none(),
-        }
-    }
 }
 
 /// Query planning needs only frozen statistics evidence.  This trait avoids
@@ -114,26 +92,6 @@ impl QueryStatisticsContext {
 pub(crate) trait QueryStatisticsResolver {
     fn unified_statistics(&self) -> &UnifiedStatisticsResolver;
     fn unified_statistics_arc(&self) -> &Arc<UnifiedStatisticsResolver>;
-}
-
-impl QueryStatisticsResolver for super::StandaloneState {
-    fn unified_statistics(&self) -> &UnifiedStatisticsResolver {
-        self.unified_statistics.as_ref()
-    }
-
-    fn unified_statistics_arc(&self) -> &Arc<UnifiedStatisticsResolver> {
-        &self.unified_statistics
-    }
-}
-
-impl QueryStatisticsResolver for Arc<super::StandaloneState> {
-    fn unified_statistics(&self) -> &UnifiedStatisticsResolver {
-        self.as_ref().unified_statistics()
-    }
-
-    fn unified_statistics_arc(&self) -> &Arc<UnifiedStatisticsResolver> {
-        self.as_ref().unified_statistics_arc()
-    }
 }
 
 macro_rules! impl_kernel_statistics_resolver {

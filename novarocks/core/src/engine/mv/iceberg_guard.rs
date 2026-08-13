@@ -23,7 +23,6 @@ use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
 };
 
-use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::mv::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -76,24 +75,11 @@ pub(crate) fn reject_if_iceberg_mv_properties(
     Ok(())
 }
 
-pub(crate) fn reject_if_iceberg_mv_table(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    mutation: IcebergMvUserMutation,
-) -> Result<(), String> {
-    reject_if_iceberg_mv_table_with_ports(
-        state.connector_control.as_ref(),
-        state.mv_storage_observation.as_ref(),
-        target,
-        mutation,
-    )
-}
-
 /// Reject a user mutation of an Iceberg-backed materialized-view table.
 ///
 /// The guard deliberately accepts only the exact-generation control resolver
 /// and the storage-observation port. Command kernels use this entry directly;
-/// they must not reconstruct a `StandaloneState` or obtain a provider through
+/// they must not reconstruct an application facade or obtain a provider through
 /// the retired connector registry.
 pub(crate) fn reject_if_iceberg_mv_table_with_ports(
     connector_control: &dyn ConnectorControlResolver,
@@ -147,18 +133,6 @@ pub(crate) fn reject_if_iceberg_mv_table_with_ports(
 /// Preserve the frontend-owned MV dependency policy before a provider schema
 /// mutation. Physical schema and equality-delete validation remain provider
 /// responsibilities.
-pub(crate) fn reject_drop_column_mv_dependencies(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    column_path: &crate::engine::statement::ColumnPath,
-) -> Result<(), String> {
-    reject_drop_column_mv_dependencies_with_repository(
-        state.mv_repository.as_ref(),
-        target,
-        column_path,
-    )
-}
-
 /// Apply the MV dependency policy using only the durable MV repository.
 /// DML kernels call this form directly rather than reaching through a
 /// standalone aggregate.

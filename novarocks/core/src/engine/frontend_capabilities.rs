@@ -19,7 +19,7 @@
 //!
 //! Each factory accepts only the leaf ports for one command or query domain.
 //! This module intentionally has no aggregate application context, no
-//! `StandaloneState` input, and no default construction path.  Frontend
+//! application-facade input, and no default construction path.  Frontend
 //! composition must therefore make every authority edge visible at startup.
 
 use std::sync::Arc;

@@ -19,36 +19,20 @@
 
 use std::sync::Arc;
 
+use crate::engine::StatementResult;
 use crate::engine::domain::MvExecutionKernel;
 use crate::engine::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
-use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
 use crate::mv::repository::MvRepository;
-use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, MaterializedViewRefreshPolicy, ShowMaterializedViewsStmt,
 };
 use crate::sql::parser::query_refs::extract_three_part_table_ref_occurrences;
 use novarocks_catalog::identifier::normalize_identifier;
-
-/// Temporary adapter for the legacy state-based statement dispatcher.
-///
-/// New command paths use `MvExecutionKernel::mv_backend` directly. This
-/// adapter disappears with the dispatcher migration in the integration wave.
-fn legacy_backend_by_engine(
-    state: &Arc<StandaloneState>,
-    engine: MvStorageEngine,
-) -> Result<Arc<dyn crate::connector::backend::MvBackend>, String> {
-    state
-        .connectors
-        .read()
-        .expect("connector registry read")
-        .mv_backend(engine.backend_name())
-}
 
 #[cfg(any())]
 mod lifecycle_tests {
@@ -451,24 +435,6 @@ fn load_definition_for_alter(
     Ok(definition)
 }
 
-pub(crate) fn create_mv(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &CreateMaterializedViewStmt,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    let engine = storage_engine_for_create(stmt)?;
-    legacy_backend_by_engine(state, engine)?.create_mv(CreateMvRequest {
-        stmt: stmt.clone(),
-        current_catalog: current_catalog.map(str::to_string),
-        current_database: db.to_string(),
-        connector_context: connector_context.clone(),
-    })?;
-    Ok(StatementResult::Ok)
-}
-
 /// Create an MV through its explicit frontend-composed execution kernel.
 ///
 /// The SQL surface admits only Iceberg-backed MVs, so this uses the single
@@ -522,37 +488,6 @@ pub(crate) fn create_mv_with_kernel(
     Ok(StatementResult::Ok)
 }
 
-pub(crate) fn drop_mv(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &DropMaterializedViewStmt,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
-        current_catalog,
-        db,
-        &stmt.name,
-    )?;
-    if let Some(engine) =
-        existing_mv_storage_engine_by_target(state.mv_repository.as_ref(), &target)?
-        && engine != MvStorageEngine::Iceberg
-    {
-        return Err(
-            "DROP MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
-                .to_string(),
-        );
-    }
-    legacy_backend_by_engine(state, MvStorageEngine::Iceberg)?.drop_mv(DropMvRequest {
-        stmt: stmt.clone(),
-        current_catalog: current_catalog.map(str::to_string),
-        current_database: db.to_string(),
-        connector_context: connector_context.clone(),
-    })?;
-    Ok(StatementResult::Ok)
-}
-
 /// Drop an MV through its explicit frontend-composed execution kernel.
 pub(crate) fn drop_mv_with_kernel(
     kernel: &MvExecutionKernel,
@@ -582,137 +517,6 @@ pub(crate) fn drop_mv_with_kernel(
         current_database: db.to_string(),
         connector_context: connector_context.clone(),
     })?;
-    Ok(StatementResult::Ok)
-}
-
-#[cfg(test)]
-pub(crate) fn alter_mv(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &AlterMaterializedViewStmt,
-) -> Result<StatementResult, String> {
-    alter_mv_with_connector_context(
-        state,
-        current_catalog,
-        db,
-        stmt,
-        &crate::connector::test_request_context(),
-    )
-}
-
-pub(crate) fn alter_mv_with_connector_context(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    db: &str,
-    stmt: &AlterMaterializedViewStmt,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    if matches!(stmt.action, AlterMaterializedViewAction::SetProperties(_)) {
-        let current_catalog = current_catalog.ok_or_else(|| {
-            "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
-        })?;
-        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
-            Some(current_catalog),
-            db,
-            &stmt.name,
-        )?;
-        let engine = existing_mv_storage_engine_by_target(state.mv_repository.as_ref(), &target)?
-            .ok_or_else(|| {
-            format!(
-                "materialized view {}.{}.{} not found",
-                target.catalog, target.namespace, target.table
-            )
-        })?;
-        if engine != MvStorageEngine::Iceberg {
-            return Err(
-                "ALTER MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
-                    .to_string(),
-            );
-        }
-        if let AlterMaterializedViewAction::SetProperties(entries) = &stmt.action {
-            let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-                .map_err(|error| error.to_string())?;
-            crate::connector::mutation::execute_catalog_mutation(
-                state.connector_control.as_ref(),
-                &instance_id,
-                novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
-                    table: novarocks_spi::connector::ConnectorTableIdentity {
-                        instance_id: instance_id.clone(),
-                        namespace: Arc::from(target.namespace.as_str()),
-                        table: Arc::from(target.table.as_str()),
-                    },
-                    changes: entries
-                        .iter()
-                        .map(|(key, value)| {
-                            novarocks_spi::connector::ConnectorPropertyChange::Set {
-                                key: Arc::from(key.as_str()),
-                                value: Arc::from(value.as_str()),
-                            }
-                        })
-                        .collect(),
-                    authority: novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
-                    expected_committed_partitioning: None,
-                },
-                connector_context.clone(),
-            )?;
-            return Ok(StatementResult::Ok);
-        }
-        unreachable!("properties branch must return after its provider mutation");
-    }
-    let definition = load_definition_for_alter(
-        state.mv_repository.as_ref(),
-        current_catalog,
-        db,
-        &stmt.name,
-    )?;
-    let req = match &stmt.action {
-        AlterMaterializedViewAction::SetRefresh(policy) => {
-            refresh_metadata_request_for_policy(&definition, policy, definition.refresh_paused)
-        }
-        AlterMaterializedViewAction::PauseRefresh => UpdateMvRefreshMetadataRequest {
-            mv_id: definition.mv_id,
-            refresh_policy: definition.refresh_policy.clone(),
-            refresh_paused: true,
-            refresh_interval_ms: definition.refresh_interval_ms,
-            max_staleness_ms: definition.max_staleness_ms,
-            last_scheduler_error: definition.last_scheduler_error.clone(),
-            next_refresh_after_ms: definition.next_refresh_after_ms,
-        },
-        AlterMaterializedViewAction::ResumeRefresh => UpdateMvRefreshMetadataRequest {
-            mv_id: definition.mv_id,
-            refresh_policy: definition.refresh_policy.clone(),
-            refresh_paused: false,
-            refresh_interval_ms: definition.refresh_interval_ms,
-            max_staleness_ms: definition.max_staleness_ms,
-            last_scheduler_error: definition.last_scheduler_error.clone(),
-            next_refresh_after_ms: definition.next_refresh_after_ms,
-        },
-        AlterMaterializedViewAction::Repartition(_) => {
-            return Err(
-                "ALTER MATERIALIZED VIEW ... REPARTITION requires the frontend MV lifecycle"
-                    .to_string(),
-            );
-        }
-        AlterMaterializedViewAction::SetProperties(_) => {
-            unreachable!("properties are handled before refresh metadata update")
-        }
-    };
-    state
-        .mv_repository
-        .update_definition_refresh_metadata(req.clone())
-        .map_err(|e| format!("update MV refresh definition metadata failed: {e}"))?;
-    crate::engine::mv::iceberg_refresh::sync_iceberg_mv_descriptor(
-        state,
-        &definition,
-        &req.refresh_policy,
-        req.refresh_paused,
-        req.refresh_interval_ms,
-        None,
-        connector_context,
-    )
-    .map_err(|e| format!("sync Iceberg MV descriptor refresh metadata failed: {e}"))?;
     Ok(StatementResult::Ok)
 }
 
@@ -843,26 +647,6 @@ pub(crate) fn alter_mv_with_kernel(
     Ok(StatementResult::Ok)
 }
 
-pub(crate) fn list_mvs(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    stmt: &ShowMaterializedViewsStmt,
-) -> Result<StatementResult, String> {
-    let req = ListMvsRequest {
-        stmt: stmt.clone(),
-        current_catalog: current_catalog.map(str::to_string),
-    };
-    let mut rows = legacy_backend_by_engine(state, MvStorageEngine::Iceberg)?.list_mvs(req)?;
-    rows.sort_by(|left, right| {
-        left.database
-            .cmp(&right.database)
-            .then(left.name.cmp(&right.name))
-    });
-    Ok(StatementResult::Query(
-        crate::engine::mv::analysis_adapter::build_mv_rows_result(&rows)?,
-    ))
-}
-
 /// List MVs through the injected backend, with no registry lookup. Sorting is
 /// retained here because it is part of the SQL presentation contract.
 pub(crate) fn list_mvs_with_kernel(
@@ -892,93 +676,6 @@ pub(crate) fn list_mvs_with_kernel(
 /// to obtain visible-shaped types for `build_aggregate_mv_layout`, which expects
 /// types matching `shape.visible_outputs` — not the state-shaped columns that
 /// the rewritten SELECT (AVG → SUM + COUNT) produces.
-pub(crate) fn analyze_visible_output_types(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    sql: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<crate::sql::analysis::OutputColumn>, String> {
-    Ok(analyze_visible_query(state, current_database, sql, connector_context)?.output_columns)
-}
-
-pub(crate) fn analyze_visible_query(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    sql: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<crate::sql::analysis::ResolvedQuery, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("sql parser error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err(
-            "aggregate MV visible type analysis: stored SQL must be a SELECT query".to_string(),
-        );
-    };
-
-    let catalog_service = crate::engine::catalog_service_snapshot(state);
-    let connectors = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let provider = crate::engine::build_catalog_service_provider(
-        None,
-        &catalog_service,
-        state.connector_control.as_ref(),
-        connector_context.clone(),
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
-        state.catalog_application.as_deref(),
-    );
-    let (resolved, _cte_registry, _factory) =
-        crate::sql::analyzer::analyze(&query, &provider, current_database)
-            .map_err(|e| format!("aggregate MV visible type analysis failed: {e}"))?;
-    Ok(resolved)
-}
-
-pub(crate) fn execute_query_for_mv_refresh(
-    state: &Arc<StandaloneState>,
-    current_database: &str,
-    sql: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<QueryResult, String> {
-    execute_query_for_mv_refresh_with_catalog(state, None, current_database, sql, connector_context)
-}
-
-pub(crate) fn execute_query_for_mv_refresh_with_catalog(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    sql: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<QueryResult, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("sql parser error: {e}"))?;
-    let sqlparser::ast::Statement::Query(mut query) = statement else {
-        return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
-    };
-
-    if crate::engine::query_prep::has_time_travel_refs(&query) {
-        crate::engine::query_prep::rewrite_time_travel_refs(
-            state,
-            current_catalog,
-            current_database,
-            &mut query,
-            connector_context,
-        )?;
-    }
-
-    crate::engine::execute_preexpanded_mv_refresh_query_with_catalog_service_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        &query,
-        None,
-        connector_context,
-    )
-}
-
 fn normalize_incremental_mv_base_ref(
     base_ref: &novarocks_catalog::identifier::TableIdentity,
 ) -> Result<(String, String, String), String> {

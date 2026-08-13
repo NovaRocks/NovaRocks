@@ -18,56 +18,14 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use crate::engine::StandaloneState;
-use crate::engine::mv_flow::execute_query_for_mv_refresh_with_catalog;
-use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use novarocks_catalog::identifier::TableIdentity;
-use novarocks_execution::exec::chunk::Chunk;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution};
-
-pub(crate) fn run_mv_full_select_chunks_with_catalog(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    database: &str,
-    select_sql: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<Chunk>, String> {
-    let result = execute_query_for_mv_refresh_with_catalog(
-        state,
-        current_catalog,
-        database,
-        select_sql,
-        connector_context,
-    )?;
-    query_result_to_chunks(result)
-}
-
-pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, String> {
-    result
-        .chunks
-        .into_iter()
-        .map(|chunk| record_batch_to_chunk(chunk.batch))
-        .collect()
-}
 
 /// Freeze the narrow base-table facts used by one MV refresh attempt.
 ///
 /// Metadata and the observation are resolved through the same exact planning
 /// lease. Callers must retain the returned value instead of re-resolving the
 /// connector's latest generation within the same decision.
-pub(crate) fn observe_current_refresh_base(
-    state: &Arc<StandaloneState>,
-    table_ref: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {
-    observe_current_refresh_base_with_ports(
-        state.connector_control.as_ref(),
-        state.mv_storage_observation.as_ref(),
-        table_ref,
-        connector_context,
-    )
-}
-
 /// Freeze a refresh-base observation through the explicit MV kernel.
 pub(crate) fn observe_current_refresh_base_with_kernel(
     kernel: &crate::engine::domain::MvExecutionKernel,
@@ -87,7 +45,7 @@ pub(crate) fn observe_current_refresh_base_with_kernel(
 ///
 /// This is the planner-facing entry point.  Callers that already own their
 /// admitted connector-control generation must pass those ports directly;
-/// they must not reconstruct `StandaloneState` merely to observe the base
+/// they must not reconstruct an application facade merely to observe the base
 /// table again.
 pub(crate) fn observe_current_refresh_base_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,

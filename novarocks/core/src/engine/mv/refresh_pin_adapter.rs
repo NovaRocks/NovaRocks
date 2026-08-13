@@ -17,24 +17,10 @@
 
 use std::sync::Arc;
 
-use crate::engine::StandaloneState;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::storage_observation::MvStorageObservationPort;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
-
-pub(crate) fn capture_refresh_snapshot_pin(
-    state: &Arc<StandaloneState>,
-    base_refs: &[TableIdentity],
-    connector_context: &ConnectorRequestContext,
-) -> Result<RefreshSnapshotPin, String> {
-    capture_refresh_snapshot_pin_with_ports(
-        state.connector_control.as_ref(),
-        state.mv_storage_observation.as_ref(),
-        base_refs,
-        connector_context,
-    )
-}
 
 /// Capture refresh pins from the exact connector-control and storage-observation
 /// capabilities selected by the caller.  This keeps an EXPLAIN or foreground

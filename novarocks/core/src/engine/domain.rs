@@ -18,7 +18,7 @@
 //! Cohesive Core execution kernels.
 //!
 //! These values are deliberately separate.  They are the replacement seams
-//! for implementations that currently borrow `StandaloneState`; they must not
+//! for implementations that previously borrowed the Core application facade; they must not
 //! be gathered into another application context or service locator.
 
 use std::sync::Arc;

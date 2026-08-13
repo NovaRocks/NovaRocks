@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
-use crate::engine::StandaloneState;
 use crate::mv::analysis::ResolvedTableRef;
 use crate::mv::dependency::graph::{
     topological_upstream_order_for_edges, validate_no_cycle_for_edges,
@@ -44,13 +41,6 @@ pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
 }
 
-pub(crate) fn ensure_no_downstream_dependencies(
-    state: &Arc<StandaloneState>,
-    upstream: &MvDependencyObjectRef,
-) -> Result<(), String> {
-    ensure_no_downstream_dependencies_with_repository(state.mv_repository.as_ref(), upstream)
-}
-
 pub(crate) fn ensure_no_downstream_dependencies_with_repository(
     repository: &dyn MvRepository,
     upstream: &MvDependencyObjectRef,
@@ -71,18 +61,6 @@ fn iceberg_mv_target_ref_for_scope(
         definition.target_namespace.as_deref()?,
         definition.target_table.as_deref()?,
     ))
-}
-
-pub(crate) fn resolve_create_mv_dependencies(
-    state: &Arc<StandaloneState>,
-    resolved_refs: &[ResolvedTableRef],
-    created_at_ms: i64,
-) -> Result<ResolvedCreateMvDependencies, String> {
-    resolve_create_mv_dependencies_with_repository(
-        state.mv_repository.as_ref(),
-        resolved_refs,
-        created_at_ms,
-    )
 }
 
 pub(crate) fn resolve_create_mv_dependencies_with_repository(
@@ -141,13 +119,12 @@ pub(crate) fn resolve_create_mv_dependencies_with_repository(
     })
 }
 
-pub(crate) fn ensure_no_iceberg_mv_targets_in_scope(
-    state: &Arc<StandaloneState>,
+pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_repository(
+    repository: &dyn MvRepository,
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let definitions = state
-        .mv_repository
+    let definitions = repository
         .list_definitions()
         .map_err(|e| format!("load MV definitions for drop target scope check failed: {e}"))?;
     let targets = definitions
@@ -158,25 +135,22 @@ pub(crate) fn ensure_no_iceberg_mv_targets_in_scope(
     validate_no_iceberg_mv_targets_in_scope(scope_catalog, scope_namespace, &targets)
 }
 
-/// State-aware wrapper around `validate_no_external_dependents_for_scope`:
-/// loads MV definitions and their upstream dependencies from the repository,
-/// then delegates to the pure helper.
-pub(crate) fn ensure_no_external_iceberg_dependents(
-    state: &Arc<StandaloneState>,
+/// Loads MV definitions and their upstream dependencies from the repository,
+/// then delegates to the pure scope helper.
+pub(crate) fn ensure_no_external_iceberg_dependents_with_repository(
+    repository: &dyn MvRepository,
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let definitions = state
-        .mv_repository
+    let definitions = repository
         .list_definitions()
         .map_err(|e| format!("load MV definitions for drop scope check failed: {e}"))?;
 
     let mut edges: Vec<(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)> =
         Vec::with_capacity(definitions.len());
     for def in &definitions {
-        let mv_target = stored_definition_dependency_ref_from_state(state, def)?;
-        let upstreams = state
-            .mv_repository
+        let mv_target = stored_definition_dependency_ref_for_iceberg(def)?;
+        let upstreams = repository
             .list_dependencies_by_downstream(def.mv_id)
             .map_err(|e| format!("load MV dependencies for drop scope check failed: {e}"))?
             .into_iter()
@@ -186,13 +160,6 @@ pub(crate) fn ensure_no_external_iceberg_dependents(
     }
 
     validate_no_external_dependents_for_scope(scope_catalog, scope_namespace, &edges)
-}
-
-pub(crate) fn build_upstream_refresh_steps(
-    state: &Arc<StandaloneState>,
-    requested: &MvDependencyObjectRef,
-) -> Result<Vec<MvRefreshDependencyStep>, String> {
-    build_upstream_refresh_steps_with_repository(state.mv_repository.as_ref(), requested)
 }
 
 pub(crate) fn build_upstream_refresh_steps_with_repository(
@@ -222,18 +189,6 @@ pub(crate) fn build_upstream_refresh_steps_with_repository(
         .collect()
 }
 
-pub(crate) fn validate_no_create_cycle(
-    state: &Arc<StandaloneState>,
-    new_target: &MvDependencyObjectRef,
-    new_dependencies: &[CreateMvDependencyRequest],
-) -> Result<(), String> {
-    validate_no_create_cycle_with_repository(
-        state.mv_repository.as_ref(),
-        new_target,
-        new_dependencies,
-    )
-}
-
 pub(crate) fn validate_no_create_cycle_with_repository(
     repository: &dyn MvRepository,
     new_target: &MvDependencyObjectRef,
@@ -260,13 +215,6 @@ pub(crate) fn validate_no_create_cycle_with_repository(
         .map(|dep| dep.upstream.clone())
         .collect::<Vec<_>>();
     validate_no_cycle_for_edges(new_target, &new_upstreams, &edges)
-}
-
-fn stored_definition_dependency_ref_from_state(
-    _state: &Arc<StandaloneState>,
-    definition: &StoredMvDefinition,
-) -> Result<MvDependencyObjectRef, String> {
-    stored_definition_dependency_ref_for_iceberg(definition)
 }
 
 fn stored_definition_dependency_ref_for_iceberg(
@@ -359,9 +307,9 @@ mod tests {
 
     #[test]
     fn native_internal_mv_base_table_is_rejected() {
-        let state = Arc::new(StandaloneState::default());
-        let error = resolve_create_mv_dependencies(
-            &state,
+        let repository = crate::mv::test_repository::InMemoryMvRepository::default();
+        let error = resolve_create_mv_dependencies_with_repository(
+            &repository,
             &[ResolvedTableRef::UnsupportedNative {
                 display_name: "sales.orders".to_string(),
             }],

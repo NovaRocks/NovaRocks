@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog_application::CatalogApplicationPort;
 use crate::common::engine_error::EngineError;
+use crate::engine::StatementResult;
 use crate::engine::mv::analysis_adapter::{
     BaseColumnDescriptor, BaseTableDescriptor, now_ms, validate_ivm_primary_key,
 };
@@ -43,7 +44,6 @@ use crate::engine::query_planning::bindings::{
     QueryTableBindingStore,
 };
 use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
-use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
 use crate::mv::analysis::rebind::rewrite_select_sql_for_rebind;
@@ -142,42 +142,6 @@ trait IcebergMvRefreshSource: crate::engine::CatalogServiceSource + Send + Sync 
     fn storage_observation(&self) -> &dyn MvStorageObservationPort;
 }
 
-impl IcebergMvRefreshSource for StandaloneState {
-    fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
-        self.catalog_application.as_deref()
-    }
-
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.connector_control.as_ref()
-    }
-
-    fn repository(&self) -> &dyn MvRepository {
-        self.mv_repository.as_ref()
-    }
-
-    fn storage_observation(&self) -> &dyn MvStorageObservationPort {
-        self.mv_storage_observation.as_ref()
-    }
-}
-
-impl IcebergMvRefreshSource for Arc<StandaloneState> {
-    fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
-        self.as_ref().catalog_application()
-    }
-
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.as_ref().connector_control()
-    }
-
-    fn repository(&self) -> &dyn MvRepository {
-        self.as_ref().repository()
-    }
-
-    fn storage_observation(&self) -> &dyn MvStorageObservationPort {
-        self.as_ref().storage_observation()
-    }
-}
-
 /// SQL-owned bridge for refresh planning.  It owns only analysis and immutable
 /// facts; all durable intent, ref mutations, and writer execution are handed
 /// to the frontend as `PreparedMvRefresh`.
@@ -191,41 +155,6 @@ pub(crate) struct StandaloneMvRefreshPreparationService<'a> {
 }
 
 impl<'a> StandaloneMvRefreshPreparationService<'a> {
-    pub(crate) fn new(
-        state: &'a Arc<StandaloneState>,
-        current_catalog: Option<&'a str>,
-        current_database: &'a str,
-        statement: &'a RefreshMaterializedViewStmt,
-        connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Self {
-        Self {
-            source: state,
-            current_catalog,
-            current_database,
-            statement,
-            connector_context,
-            repartition_fields: None,
-        }
-    }
-
-    pub(crate) fn new_repartition(
-        state: &'a Arc<StandaloneState>,
-        current_catalog: Option<&'a str>,
-        current_database: &'a str,
-        statement: &'a RefreshMaterializedViewStmt,
-        repartition_fields: &'a [IcebergPartitionFieldExpr],
-        connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Self {
-        Self {
-            source: state,
-            current_catalog,
-            current_database,
-            statement,
-            connector_context,
-            repartition_fields: Some(repartition_fields),
-        }
-    }
-
     pub(crate) fn new_with_ports(
         ports: &'a IcebergMvCorePorts,
         current_catalog: Option<&'a str>,
@@ -1625,7 +1554,7 @@ pub struct IcebergMvCorePorts {
 impl IcebergMvCorePorts {
     /// Construct the exact provider and durable-MV ports required by the
     /// Iceberg MV backend. Frontend composition must provide every leaf; this
-    /// value deliberately has no `StandaloneState` constructor.
+    /// value deliberately has no application-facade constructor.
     pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -1709,22 +1638,6 @@ struct IcebergMvCreatePreparation {
 }
 
 impl StandaloneMvEngine {
-    pub(crate) fn new(
-        state: Arc<StandaloneState>,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Self {
-        Self::new_with_ports(
-            IcebergMvCorePorts::new(
-                Arc::clone(&state.catalog_service),
-                state.catalog_application.clone(),
-                Arc::clone(&state.connector_control),
-                Arc::clone(&state.mv_repository),
-                Arc::clone(&state.mv_storage_observation),
-            ),
-            connector_context,
-        )
-    }
-
     pub(crate) fn new_with_ports(
         ports: IcebergMvCorePorts,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -2288,31 +2201,6 @@ fn partition_fields_for_create(
         .collect()
 }
 
-fn prepare_iceberg_mv_create(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &MvCreateStatement,
-    repository: &dyn crate::mv::repository::MvRepository,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<IcebergMvCreatePreparation, String> {
-    let ports = IcebergMvCorePorts::new(
-        Arc::clone(&state.catalog_service),
-        state.catalog_application.clone(),
-        Arc::clone(&state.connector_control),
-        Arc::clone(&state.mv_repository),
-        Arc::clone(&state.mv_storage_observation),
-    );
-    prepare_iceberg_mv_create_with_ports(
-        &ports,
-        current_catalog,
-        current_database,
-        stmt,
-        repository,
-        connector_context,
-    )
-}
-
 fn prepare_iceberg_mv_create_with_ports(
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -2553,49 +2441,6 @@ fn prepare_iceberg_mv_create_with_ports(
     })
 }
 
-/// Temporary core entrypoint retained until Task 9 installs the frontend
-/// application service at statement dispatch. It deliberately delegates every
-/// side-effect-sized step to `StandaloneMvEngine`; sequencing ownership moves
-/// to frontend as soon as the host wiring is enabled.
-#[cfg(test)]
-pub(crate) fn create_iceberg_mv(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &CreateMaterializedViewStmt,
-) -> Result<StatementResult, String> {
-    create_iceberg_mv_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        stmt,
-        &crate::connector::test_request_context(),
-    )
-}
-
-pub(crate) fn create_iceberg_mv_with_connector_context(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &CreateMaterializedViewStmt,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    let ports = IcebergMvCorePorts::new(
-        Arc::clone(&state.catalog_service),
-        state.catalog_application.clone(),
-        Arc::clone(&state.connector_control),
-        Arc::clone(&state.mv_repository),
-        Arc::clone(&state.mv_storage_observation),
-    );
-    create_iceberg_mv_with_ports(
-        ports,
-        current_catalog,
-        current_database,
-        stmt,
-        connector_context,
-    )
-}
-
 pub(crate) fn create_iceberg_mv_with_ports(
     ports: IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -2679,18 +2524,6 @@ fn legacy_cleanup_created_target(
 ) -> String {
     let cleanup = engine.drop_created_target(target);
     format!("{primary}; target cleanup={cleanup:?}")
-}
-
-fn ensure_mv_create_target_absent(
-    state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
-    ensure_mv_create_target_absent_with_connector_control(
-        state.connector_control.as_ref(),
-        target,
-        connector_context,
-    )
 }
 
 fn ensure_mv_create_target_absent_with_ports(
@@ -3253,27 +3086,6 @@ fn first_union_branch_ast_query(
 }
 
 /// Observe neutral schema fields for every base, keyed by table FQN.
-fn observe_base_fields_for_refs(
-    state: &Arc<StandaloneState>,
-    base_refs: &[TableIdentity],
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<
-    std::collections::BTreeMap<
-        String,
-        crate::mv::storage_observation::MvSchemaValidationObservation,
-    >,
-    String,
-> {
-    let ports = IcebergMvCorePorts::new(
-        Arc::clone(&state.catalog_service),
-        state.catalog_application.clone(),
-        Arc::clone(&state.connector_control),
-        Arc::clone(&state.mv_repository),
-        Arc::clone(&state.mv_storage_observation),
-    );
-    observe_base_fields_for_refs_with_ports(&ports, base_refs, connector_context)
-}
-
 fn observe_base_fields_for_refs_with_ports(
     ports: &IcebergMvCorePorts,
     base_refs: &[TableIdentity],
@@ -3382,35 +3194,6 @@ fn stored_refresh_policy_descriptor_json(
 /// back through a mutation lease derived from the same generation. Repartition
 /// projection supplies the raw provider-committed partitioning as an atomic
 /// property-mutation guard; ordinary CREATE/ALTER policy sync passes `None`.
-pub(crate) fn sync_iceberg_mv_descriptor(
-    state: &Arc<StandaloneState>,
-    definition: &StoredMvDefinition,
-    refresh_policy: &StoredMvRefreshPolicy,
-    refresh_paused: bool,
-    refresh_interval_ms: Option<i64>,
-    expected_committed_partitioning: Option<
-        novarocks_spi::connector::ConnectorCommittedPartitioning,
-    >,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
-    let ports = IcebergMvCorePorts::new(
-        Arc::clone(&state.catalog_service),
-        state.catalog_application.clone(),
-        Arc::clone(&state.connector_control),
-        Arc::clone(&state.mv_repository),
-        Arc::clone(&state.mv_storage_observation),
-    );
-    sync_iceberg_mv_descriptor_with_ports(
-        &ports,
-        definition,
-        refresh_policy,
-        refresh_paused,
-        refresh_interval_ms,
-        expected_committed_partitioning,
-        connector_context,
-    )
-}
-
 pub(crate) fn sync_iceberg_mv_descriptor_with_ports(
     ports: &IcebergMvCorePorts,
     definition: &StoredMvDefinition,
@@ -4797,16 +4580,6 @@ fn aggregate_state_role_contract(
         crate::mv::model::AggregateStateRole::RetractionCount => {
             mv_schema::AggregateStateRoleContract::RetractionCount
         }
-    }
-}
-
-/// Projects aggregate engine state into the two inputs a target restore needs.
-pub(crate) fn mv_target_restore_context(
-    state: &Arc<StandaloneState>,
-) -> MvTargetRestoreContext<'_> {
-    MvTargetRestoreContext {
-        connector_control: state.connector_control.as_ref(),
-        mv_repository: state.mv_repository.as_ref(),
     }
 }
 
@@ -6643,24 +6416,6 @@ fn build_refresh_state_baseline(
             current_database,
         )?,
     })
-}
-
-#[cfg(test)]
-pub(crate) fn plan_iceberg_mv_refresh(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &RefreshMaterializedViewStmt,
-    target: MvTarget,
-) -> Result<RefreshPlan, RefreshError> {
-    plan_iceberg_mv_refresh_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        stmt,
-        target,
-        &crate::connector::test_request_context(),
-    )
 }
 
 pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
@@ -9438,36 +9193,10 @@ mod join_delta_append_only_fast_path_tests {
     }
 }
 
-pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &RefreshMaterializedViewStmt,
-    level: crate::sql::explain::ExplainLevel,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<String>, String> {
-    let ports = IcebergMvCorePorts::new(
-        Arc::clone(&state.catalog_service),
-        state.catalog_application.clone(),
-        Arc::clone(&state.connector_control),
-        Arc::clone(&state.mv_repository),
-        Arc::clone(&state.mv_storage_observation),
-    );
-    explain_iceberg_mv_refresh_rewrite_plan_with_ports(
-        &ports,
-        state.as_ref(),
-        current_catalog,
-        current_database,
-        stmt,
-        level,
-        connector_context,
-    )
-}
-
 /// Compile an `EXPLAIN REFRESH MATERIALIZED VIEW` plan using only the
 /// frontend-composed MV and statistics capabilities.  The query-local table
 /// overlays retain the same snapshot pins and connector leases used by the
-/// refresh path; this diagnostic must not consult `StandaloneState` or a
+/// refresh path; this diagnostic must not consult an application facade or a
 /// second latest-generation source.
 pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     source: &IcebergMvCorePorts,
@@ -10748,45 +10477,6 @@ fn build_imv_change_stream_branches_for_test(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn drop_iceberg_mv(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &DropMaterializedViewStmt,
-) -> Result<StatementResult, String> {
-    drop_iceberg_mv_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        stmt,
-        &crate::connector::test_request_context(),
-    )
-}
-
-pub(crate) fn drop_iceberg_mv_with_connector_context(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &DropMaterializedViewStmt,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    let ports = IcebergMvCorePorts::new(
-        Arc::clone(&state.catalog_service),
-        state.catalog_application.clone(),
-        Arc::clone(&state.connector_control),
-        Arc::clone(&state.mv_repository),
-        Arc::clone(&state.mv_storage_observation),
-    );
-    drop_iceberg_mv_with_ports(
-        &ports,
-        current_catalog,
-        current_database,
-        stmt,
-        connector_context,
-    )
-}
-
 pub(crate) fn drop_iceberg_mv_with_ports(
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -10837,13 +10527,6 @@ pub(crate) fn drop_iceberg_mv_with_ports(
     Ok(StatementResult::Ok)
 }
 
-fn drop_iceberg_mv_metadata(
-    state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-) -> Result<(), String> {
-    drop_iceberg_mv_metadata_with_repository(state.mv_repository.as_ref(), target)
-}
-
 fn drop_iceberg_mv_metadata_with_repository(
     repository: &dyn MvRepository,
     target: &IcebergMvTarget,
@@ -10862,14 +10545,6 @@ fn drop_iceberg_mv_metadata_with_repository(
         ));
     }
     Ok(())
-}
-
-fn preflight_iceberg_mv_drop(
-    state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    if_exists: bool,
-) -> Result<bool, String> {
-    preflight_iceberg_mv_drop_with_repository(state.mv_repository.as_ref(), target, if_exists)
 }
 
 fn preflight_iceberg_mv_drop_with_repository(

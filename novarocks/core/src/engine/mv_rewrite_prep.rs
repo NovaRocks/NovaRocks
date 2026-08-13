@@ -29,21 +29,6 @@ use crate::sql::compiler::mv_rewrite::{
     MvRewriteBaseTableState, MvRewriteDefinition, MvRewriteDefinitionIndex,
 };
 
-use super::StandaloneState;
-
-/// Freeze repository order and every freshness observation once per request.
-/// The compiler never observes repository or connector changes while it is
-/// deciding optional rewrite candidates.
-pub(crate) fn freeze_mv_rewrite_definition_index(
-    state: &Arc<StandaloneState>,
-) -> Result<MvRewriteDefinitionIndex, String> {
-    freeze_mv_rewrite_definition_index_with_ports(
-        state.mv_repository.as_ref(),
-        state.connector_control.as_ref(),
-        state.mv_storage_observation.as_ref(),
-    )
-}
-
 /// Freeze rewrite candidates through the explicit MV kernel.  The frozen
 /// index remains request-local; the kernel only supplies its leaf ports.
 pub(crate) fn freeze_mv_rewrite_definition_index_with_kernel(

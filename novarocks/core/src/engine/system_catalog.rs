@@ -42,7 +42,7 @@ pub struct SystemTableData {
 
 /// Resolves `information_schema` virtual-table references to their columns and
 /// rows. Implemented by the frontend `SystemCatalogService` and injected into
-/// `StandaloneState`; core holds `Arc<dyn SystemCatalog>` and does not depend
+/// the retired Core application facade; core holds `Arc<dyn SystemCatalog>` and does not depend
 /// on the frontend crate.
 pub trait SystemCatalog: Send + Sync {
     /// `Ok(None)` = `(db, tbl)` is not a registered system table; the rewriter

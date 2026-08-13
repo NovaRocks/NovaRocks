@@ -19,11 +19,9 @@
 //! statement schema lookup, and catalog-service table invalidation.
 //! Ordinary SELECT external tables resolve through the query catalog materializer.
 
-use std::sync::Arc;
-
+use crate::engine::CatalogServiceSource;
 use crate::engine::backend_resolver::{CatalogAdmission, resolve_table_target};
 use crate::engine::domain::{DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel};
-use crate::engine::{CatalogServiceSource, StandaloneState};
 use crate::sql::analyzer::iceberg_ref::{
     IcebergRefKind, SqlIcebergNamedRef, SqlIcebergRefMetadata, SqlIcebergSnapshotLog,
     resolve_read_binding,
@@ -158,21 +156,9 @@ fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
 ///
 /// This deliberately omits query execution, statistics and any application
 /// aggregate.  A caller can therefore use the same rewriter from query, DML
-/// or MV preparation without recovering a `StandaloneState`.
+/// or MV preparation without recovering an application facade.
 pub(crate) trait TimeTravelResolver: CatalogAdmission {
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
-}
-
-impl TimeTravelResolver for StandaloneState {
-    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
-        self.connector_control.as_ref()
-    }
-}
-
-impl TimeTravelResolver for Arc<StandaloneState> {
-    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
-        self.as_ref().connector_control()
-    }
 }
 
 macro_rules! impl_kernel_time_travel_resolver {

@@ -25,7 +25,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::catalog_application::CatalogApplicationPort;
-use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::MvListRow;
 use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::mv::analysis::{MvAnalysis, finish_mv_analysis, prepare_mv_select_for_catalog_provider};
@@ -126,20 +125,6 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
             | "DATETIME"
             | "TIMESTAMP"
             | "DECIMAL"
-    )
-}
-
-pub(crate) fn list_mv_rows(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    stmt: &ShowMaterializedViewsStmt,
-    storage_filter: Option<MvStorageEngine>,
-) -> Result<Vec<MvListRow>, String> {
-    list_mv_rows_with_ports(
-        state.mv_repository.as_ref(),
-        current_catalog,
-        stmt,
-        storage_filter,
     )
 }
 
@@ -281,25 +266,6 @@ fn dependency_display_for_mv_with_repository(
         .map(|dep| dep.upstream.display_name())
         .collect::<Vec<_>>()
         .join(", "))
-}
-
-pub(crate) fn analyze_mv_select_with_connector_context(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &sqlparser::ast::Query,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<MvAnalysis, String> {
-    let catalog_service = crate::engine::catalog_service_snapshot(state);
-    analyze_mv_select_with_ports(
-        current_catalog,
-        &catalog_service,
-        state.catalog_application.as_deref(),
-        state.connector_control.as_ref(),
-        current_database,
-        query,
-        connector_context,
-    )
 }
 
 /// Analyze an MV SELECT from explicit query-local catalog and connector ports.
