@@ -446,6 +446,7 @@ pub(crate) struct MaintenanceExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
 }
@@ -455,6 +456,7 @@ impl MaintenanceExecutionKernel {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
     ) -> Self {
@@ -462,6 +464,7 @@ impl MaintenanceExecutionKernel {
             catalog_service,
             catalog_application,
             connector_control,
+            mv_storage_observation,
             query_execution,
             service,
         }
@@ -477,6 +480,10 @@ impl MaintenanceExecutionKernel {
 
     pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
         &self.connector_control
+    }
+
+    pub(crate) fn mv_storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {
+        &self.mv_storage_observation
     }
 
     pub(crate) fn query_execution(&self) -> &QueryExecutionService {
