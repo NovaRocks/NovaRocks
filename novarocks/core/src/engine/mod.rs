@@ -2166,7 +2166,13 @@ impl StandaloneSession {
                         connector_context: Some(&connector_context),
                     },
                 )?;
-                self::virtual_table::rewrite_query(&self.inner, &mut prepared)?;
+                let system_tables = domain::SystemTableQueryKernel::new(
+                    Arc::clone(&self.inner.catalog_service),
+                    Arc::clone(&self.inner.connector_control),
+                    Arc::clone(&self.inner.system_catalog),
+                    Arc::clone(&self.inner.mv_repository),
+                );
+                self::virtual_table::rewrite_query(&system_tables, &mut prepared)?;
                 if has_time_travel_refs(&prepared) {
                     rewrite_time_travel_refs(
                         &self.inner,

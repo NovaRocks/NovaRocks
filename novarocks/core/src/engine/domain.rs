@@ -29,6 +29,7 @@ use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::engine::statistics::StatisticsService;
 use crate::engine::statistics_application::StatisticsApplicationPort;
+use crate::engine::system_catalog::SystemCatalog;
 use crate::engine::table_maintenance::TableMaintenanceService;
 use crate::engine::view::ViewService;
 use crate::mv::application::MvApplicationService;
@@ -51,6 +52,53 @@ pub(crate) struct QueryPreparationKernel {
     query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
     exchange_port: u16,
+}
+
+/// Read-only system-table query dependencies.
+///
+/// `information_schema` materialization is query preparation, not a command
+/// service.  It receives exactly the local catalog snapshot source, the
+/// connector control resolver needed for namespace facts, the injected system
+/// catalog, and the durable MV metadata reader.  In particular, it has no DML
+/// or MV mutation capability.
+#[derive(Clone)]
+pub(crate) struct SystemTableQueryKernel {
+    catalog_service: Arc<QueryCatalogService>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    system_catalog: Arc<dyn SystemCatalog>,
+    mv_repository: Arc<dyn MvRepository>,
+}
+
+impl SystemTableQueryKernel {
+    pub(crate) fn new(
+        catalog_service: Arc<QueryCatalogService>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        system_catalog: Arc<dyn SystemCatalog>,
+        mv_repository: Arc<dyn MvRepository>,
+    ) -> Self {
+        Self {
+            catalog_service,
+            connector_control,
+            system_catalog,
+            mv_repository,
+        }
+    }
+
+    pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+        &self.catalog_service
+    }
+
+    pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
+        &self.connector_control
+    }
+
+    pub(crate) fn system_catalog(&self) -> &Arc<dyn SystemCatalog> {
+        &self.system_catalog
+    }
+
+    pub(crate) fn mv_repository(&self) -> &Arc<dyn MvRepository> {
+        &self.mv_repository
+    }
 }
 
 impl QueryPreparationKernel {

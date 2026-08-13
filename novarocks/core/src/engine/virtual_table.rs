@@ -35,7 +35,7 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::engine::StandaloneState;
+use crate::engine::domain::SystemTableQueryKernel;
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
@@ -46,7 +46,8 @@ pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 //
 // StarRocks routes information_schema scans through a `SchemaScanNode` that
 // produces rows at the BE; NovaRocks standalone has no equivalent BE-side
-// generator, so we materialize rows here (against the live `StandaloneState`)
+// generator, so we materialize rows here against the frontend-composed
+// `SystemTableQueryKernel`
 // and rewrite each `FROM information_schema.X` into a derived table backed by
 // a VALUES expression. The standard SQL pipeline (analyzer → planner →
 // codegen → pipeline) then handles projection / WHERE / aggregation / ORDER BY
@@ -58,41 +59,41 @@ pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 /// Walk a query AST and replace virtual-table references with VALUES-backed
 /// derived tables. Returns `Ok(())` even when no virtual tables are matched.
 pub(crate) fn rewrite_query(
-    state: &Arc<StandaloneState>,
+    kernel: &SystemTableQueryKernel,
     query: &mut sqlast::Query,
 ) -> Result<(), String> {
-    rewrite_query_inner(state, query)
+    rewrite_query_inner(kernel, query)
 }
 
 fn rewrite_query_inner(
-    state: &Arc<StandaloneState>,
+    kernel: &SystemTableQueryKernel,
     query: &mut sqlast::Query,
 ) -> Result<(), String> {
     if let Some(with_clause) = query.with.as_mut() {
         for cte in with_clause.cte_tables.iter_mut() {
-            rewrite_query_inner(state, cte.query.as_mut())?;
+            rewrite_query_inner(kernel, cte.query.as_mut())?;
         }
     }
-    rewrite_set_expr(state, query.body.as_mut())
+    rewrite_set_expr(kernel, query.body.as_mut())
 }
 
 fn rewrite_set_expr(
-    state: &Arc<StandaloneState>,
+    kernel: &SystemTableQueryKernel,
     expr: &mut sqlast::SetExpr,
 ) -> Result<(), String> {
     match expr {
         sqlast::SetExpr::Select(select) => {
             for twj in select.from.iter_mut() {
-                rewrite_table_factor(state, &mut twj.relation)?;
+                rewrite_table_factor(kernel, &mut twj.relation)?;
                 for join in twj.joins.iter_mut() {
-                    rewrite_table_factor(state, &mut join.relation)?;
+                    rewrite_table_factor(kernel, &mut join.relation)?;
                 }
             }
         }
-        sqlast::SetExpr::Query(q) => rewrite_query_inner(state, q.as_mut())?,
+        sqlast::SetExpr::Query(q) => rewrite_query_inner(kernel, q.as_mut())?,
         sqlast::SetExpr::SetOperation { left, right, .. } => {
-            rewrite_set_expr(state, left.as_mut())?;
-            rewrite_set_expr(state, right.as_mut())?;
+            rewrite_set_expr(kernel, left.as_mut())?;
+            rewrite_set_expr(kernel, right.as_mut())?;
         }
         _ => {}
     }
@@ -100,7 +101,7 @@ fn rewrite_set_expr(
 }
 
 fn rewrite_table_factor(
-    state: &Arc<StandaloneState>,
+    kernel: &SystemTableQueryKernel,
     factor: &mut sqlast::TableFactor,
 ) -> Result<(), String> {
     match factor {
@@ -137,7 +138,7 @@ fn rewrite_table_factor(
                         Arc::new(AtomicBool::new(false)),
                     )?;
                     match crate::connector::acquire_metadata_planning_lease(
-                        state.connector_control.as_ref(),
+                        kernel.connector_control().as_ref(),
                         cat,
                     ) {
                         Ok(lease) => {
@@ -155,7 +156,7 @@ fn rewrite_table_factor(
                                 catalog_name: cat,
                                 schema_names: &databases,
                             };
-                            let Some(data) = state.system_catalog.resolve(
+                            let Some(data) = kernel.system_catalog().resolve(
                                 INFORMATION_SCHEMA_DB,
                                 "schemata",
                                 &inputs,
@@ -190,8 +191,8 @@ fn rewrite_table_factor(
                 return Ok(());
             }
             let mut schema_names: Vec<String> = {
-                let catalog = state
-                    .catalog_service
+                let catalog = kernel
+                    .catalog_service()
                     .local()
                     .read()
                     .expect("standalone catalog read lock");
@@ -203,7 +204,7 @@ fn rewrite_table_factor(
                 catalog_name: "default_catalog",
                 schema_names: &schema_names,
             };
-            let Some(data) = state.system_catalog.resolve(&db, &tbl, &inputs)? else {
+            let Some(data) = kernel.system_catalog().resolve(&db, &tbl, &inputs)? else {
                 return Ok(());
             };
 
@@ -216,14 +217,14 @@ fn rewrite_table_factor(
             Ok(())
         }
         sqlast::TableFactor::Derived { subquery, .. } => {
-            rewrite_query_inner(state, subquery.as_mut())
+            rewrite_query_inner(kernel, subquery.as_mut())
         }
         sqlast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            rewrite_table_factor(state, &mut table_with_joins.relation)?;
+            rewrite_table_factor(kernel, &mut table_with_joins.relation)?;
             for join in table_with_joins.joins.iter_mut() {
-                rewrite_table_factor(state, &mut join.relation)?;
+                rewrite_table_factor(kernel, &mut join.relation)?;
             }
             Ok(())
         }
@@ -445,18 +446,21 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::engine::StandaloneState;
+    use crate::engine::TestConnectorControlRegistry;
+    use crate::engine::domain::SystemTableQueryKernel;
+    use crate::engine::query_planning::catalog_runtime::new_query_catalog_service;
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
+    use crate::mv::repository::UnavailableMvRepository;
     use crate::sql::parser::dialect::StarRocksDialect;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_catalog::schema::ColumnDef;
     use novarocks_spi::connector::{
-        ConnectorControlBinding, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-        ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
-        ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorTableIdentity,
-        ConnectorTableMetadata, ConnectorTableRequest,
+        ConnectorControlBinding, ConnectorControlRegistry, ConnectorError, ConnectorErrorKind,
+        ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
+        ConnectorMetadata, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
+        ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
     };
     use sqlparser::parser::Parser;
 
@@ -581,16 +585,22 @@ mod tests {
         )
     }
 
-    /// Build a minimal state whose opaque control binding exposes only the
-    /// namespace facts consumed by this Core AST rewrite.
-    fn state_with_namespace_catalog(
+    fn test_kernel(system_catalog: Arc<dyn SystemCatalog>) -> SystemTableQueryKernel {
+        SystemTableQueryKernel::new(
+            Arc::new(new_query_catalog_service()),
+            Arc::new(TestConnectorControlRegistry::default()),
+            system_catalog,
+            Arc::new(UnavailableMvRepository),
+        )
+    }
+
+    /// Build a kernel whose opaque control binding exposes only the namespace
+    /// facts consumed by this Core AST rewrite.
+    fn kernel_with_namespace_catalog(
         catalog_name: &str,
         namespaces: Arc<Mutex<Vec<String>>>,
-    ) -> Arc<StandaloneState> {
-        let state = Arc::new(StandaloneState {
-            system_catalog: Arc::new(EchoSchemaNames::default()),
-            ..StandaloneState::default()
-        });
+    ) -> SystemTableQueryKernel {
+        let connector_control = Arc::new(TestConnectorControlRegistry::default());
         let fixture = crate::connector::scan_model::planned_files_fixture_binding(
             catalog_name,
             HashMap::new(),
@@ -608,11 +618,15 @@ mod tests {
             None,
         )
         .expect("namespace fixture control binding");
-        state
-            .connector_control
+        connector_control
             .register(binding)
             .expect("register namespace fixture control binding");
-        state
+        SystemTableQueryKernel::new(
+            Arc::new(new_query_catalog_service()),
+            connector_control,
+            Arc::new(EchoSchemaNames::default()),
+            Arc::new(UnavailableMvRepository),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -624,14 +638,11 @@ mod tests {
         // `default_catalog.information_schema.schemata` must be rewritten into
         // a VALUES-backed derived table even when the local in-memory catalog is
         // empty.
-        let state = Arc::new(StandaloneState {
-            system_catalog: Arc::new(EchoSchemaNames::default()),
-            ..StandaloneState::default()
-        });
+        let kernel = test_kernel(Arc::new(EchoSchemaNames::default()));
         // Seed one database so the rewriter has at least one row to produce.
         {
-            let mut cat = state
-                .catalog_service
+            let mut cat = kernel
+                .catalog_service()
                 .local()
                 .write()
                 .expect("catalog service local lock");
@@ -639,7 +650,7 @@ mod tests {
         }
         let mut query =
             parse_query("SELECT schema_name FROM default_catalog.information_schema.schemata");
-        super::rewrite_query(&state, &mut query).expect("rewrite_query");
+        super::rewrite_query(&kernel, &mut query).expect("rewrite_query");
         // After rewriting the FROM clause must be a Derived (VALUES) table, not a
         // plain Table reference.
         let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -665,13 +676,11 @@ mod tests {
         // A 3-part reference to an unregistered catalog must NOT be rewritten.
         // The rewriter leaves the AST untouched so downstream resolvers can
         // surface the proper "unknown catalog" error.
-        let state = Arc::new(StandaloneState {
-            system_catalog: Arc::new(EchoSchemaNames::default()),
-            ..StandaloneState::default()
-        });
+        let kernel = test_kernel(Arc::new(EchoSchemaNames::default()));
         let mut query =
             parse_query("SELECT schema_name FROM no_such_cat.information_schema.schemata");
-        super::rewrite_query(&state, &mut query).expect("rewrite_query returns Ok for unknown cat");
+        super::rewrite_query(&kernel, &mut query)
+            .expect("rewrite_query returns Ok for unknown cat");
         // The FROM clause must still be a plain Table reference (not rewritten).
         let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected Select body");
@@ -692,13 +701,13 @@ mod tests {
     #[test]
     fn rewrite_registered_iceberg_catalog_information_schema_schemata() {
         let namespaces = Arc::new(Mutex::new(vec!["ns_alpha".to_string()]));
-        let state = state_with_namespace_catalog("myice", Arc::clone(&namespaces));
+        let kernel = kernel_with_namespace_catalog("myice", Arc::clone(&namespaces));
         namespaces
             .lock()
             .expect("namespace fixture lock")
             .push("ns_live".to_string());
         let mut query = parse_query("SELECT schema_name FROM myice.information_schema.schemata");
-        super::rewrite_query(&state, &mut query).expect("rewrite_query");
+        super::rewrite_query(&kernel, &mut query).expect("rewrite_query");
         assert!(format!("{query:?}").contains("ns_live"));
 
         // The FROM clause must now be a VALUES-backed Derived table (not a raw
@@ -718,10 +727,10 @@ mod tests {
 
     #[test]
     fn empty_system_catalog_leaves_schemata_untouched() {
-        let state = Arc::new(StandaloneState::default());
+        let kernel = test_kernel(Arc::new(crate::engine::system_catalog::EmptySystemCatalog));
         let mut query = parse_query("SELECT schema_name FROM information_schema.schemata");
 
-        super::rewrite_query(&state, &mut query).expect("rewrite_query");
+        super::rewrite_query(&kernel, &mut query).expect("rewrite_query");
 
         let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected Select body");
@@ -738,13 +747,10 @@ mod tests {
     #[test]
     fn non_information_schema_reference_does_not_invoke_resolve() {
         let fake = Arc::new(EchoSchemaNames::default());
-        let state = Arc::new(StandaloneState {
-            system_catalog: fake.clone(),
-            ..StandaloneState::default()
-        });
+        let kernel = test_kernel(fake.clone());
         let mut query = parse_query("SELECT * FROM mydb.mytbl");
 
-        super::rewrite_query(&state, &mut query).expect("rewrite_query");
+        super::rewrite_query(&kernel, &mut query).expect("rewrite_query");
 
         assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
     }
