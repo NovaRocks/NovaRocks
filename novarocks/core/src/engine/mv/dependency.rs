@@ -192,16 +192,21 @@ pub(crate) fn build_upstream_refresh_steps(
     state: &Arc<StandaloneState>,
     requested: &MvDependencyObjectRef,
 ) -> Result<Vec<MvRefreshDependencyStep>, String> {
-    let definitions = state
-        .mv_repository
+    build_upstream_refresh_steps_with_repository(state.mv_repository.as_ref(), requested)
+}
+
+pub(crate) fn build_upstream_refresh_steps_with_repository(
+    repository: &dyn MvRepository,
+    requested: &MvDependencyObjectRef,
+) -> Result<Vec<MvRefreshDependencyStep>, String> {
+    let definitions = repository
         .list_definitions()
         .map_err(|e| format!("load MV definitions for refresh graph failed: {e}"))?;
 
     let mut edges = Vec::new();
     for definition in definitions {
-        let target = stored_definition_dependency_ref_from_state(state, &definition)?;
-        let upstream_mvs = state
-            .mv_repository
+        let target = stored_definition_dependency_ref_for_iceberg(&definition)?;
+        let upstream_mvs = repository
             .list_dependencies_by_downstream(definition.mv_id)
             .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?
             .into_iter()

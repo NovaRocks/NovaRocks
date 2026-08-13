@@ -153,6 +153,7 @@ impl CoreCommandRoute for TypedThenLegacyCommand {
                                 context.session().current_catalog(),
                                 context.session().current_database(),
                                 &connector_context,
+                                context.execution(),
                             )? {
                                 Some(result) => Ok(result),
                                 None => match self.maintenance_read.try_execute(
