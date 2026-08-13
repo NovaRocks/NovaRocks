@@ -111,6 +111,21 @@ impl MetadataMaintenanceCacheFinalizer for crate::engine::StandaloneState {
     }
 }
 
+impl MetadataMaintenanceCacheFinalizer for crate::engine::domain::MaintenanceExecutionKernel {
+    fn invalidate_generic_table(
+        &self,
+        table: &ConnectorTableIdentity,
+    ) -> Result<(), ConnectorError> {
+        self.catalog_service()
+            .invalidate_table(
+                table.instance_id.as_str(),
+                table.namespace.as_ref(),
+                table.table.as_ref(),
+            )
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CompletedMetadataMaintenance {
     #[allow(dead_code)]

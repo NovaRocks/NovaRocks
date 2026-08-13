@@ -21,9 +21,9 @@
 
 use std::sync::Arc;
 
-use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{CatalogAdmission, resolve_table_target};
 use crate::engine::domain::{DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel};
+use crate::engine::{CatalogServiceSource, StandaloneState};
 use crate::sql::analyzer::iceberg_ref::{
     IcebergRefKind, SqlIcebergNamedRef, SqlIcebergRefMetadata, SqlIcebergSnapshotLog,
     resolve_read_binding,
@@ -418,12 +418,12 @@ fn rewrite_time_travel_in_factor(
 /// it must not leave a provider table or file carrier visible to a later SQL
 /// request.
 pub(crate) fn external_schema_columns_for_statement(
-    state: &Arc<StandaloneState>,
+    resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
     name: &ObjectName,
 ) -> Result<Option<Vec<ColumnDef>>, String> {
-    let target = resolve_table_target(state, name, current_catalog, current_database)?;
+    let target = resolve_table_target(resolver, name, current_catalog, current_database)?;
     if target.backend_name != "iceberg" {
         // Non-Iceberg sources are already represented in the local catalog.
         return Ok(None);
@@ -436,7 +436,7 @@ pub(crate) fn external_schema_columns_for_statement(
 
     let materialization =
         crate::engine::query_planning::catalog_materializer::load_connector_table_materialization_with_lease(
-            state.connector_control.as_ref(),
+            resolver.connector_control(),
             crate::connector::connector_request_context(
                 None,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -477,12 +477,12 @@ fn is_synthetic_time_travel_table(table_name: &str) -> bool {
 /// binding store and are not registered in the shared catalog in the first
 /// place.
 pub(crate) fn drop_local_table_registration_if_exists(
-    state: &Arc<StandaloneState>,
+    source: &impl CatalogServiceSource,
     namespace: &str,
     table: &str,
 ) -> Result<(), String> {
-    let mut guard = state
-        .catalog_service
+    let mut guard = source
+        .catalog_service()
         .local()
         .write()
         .map_err(|error| format!("standalone catalog write lock: {error}"))?;

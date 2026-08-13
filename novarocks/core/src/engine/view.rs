@@ -25,7 +25,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::engine::StandaloneState;
+use crate::engine::domain::ViewExecutionKernel;
+use crate::engine::{CatalogServiceSource, StandaloneState};
 use crate::runtime::query_result::QueryResult;
 /// Shared StarRocks SQL parser contract for view DDL, storage, and rewrite.
 pub use crate::sql::parser::dialect::StarRocksDialect as ViewSqlDialect;
@@ -186,14 +187,51 @@ impl ViewService for EmptyViewService {
     }
 }
 
-impl ViewEngine for StandaloneState {
+/// The exact leaf dependencies needed by external view metadata operations.
+/// This deliberately stays narrower than either a session or an application
+/// aggregate, so frontend composition can pass its typed view kernel directly.
+trait ViewExecutionContext: CatalogServiceSource + Send + Sync {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry;
+    fn catalog_application(
+        &self,
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
+}
+
+impl ViewExecutionContext for StandaloneState {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry {
+        self.connector_control.as_ref()
+    }
+
+    fn catalog_application(
+        &self,
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+        self.catalog_application.as_deref()
+    }
+}
+
+impl ViewExecutionContext for ViewExecutionKernel {
+    fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry {
+        self.connector_control().as_ref()
+    }
+
+    fn catalog_application(
+        &self,
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+        self.catalog_application().map(Arc::as_ref)
+    }
+}
+
+impl<T> ViewEngine for T
+where
+    T: ViewExecutionContext,
+{
     fn resolve_external_view(
         &self,
         target: &ViewTarget,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalViewResolution, String> {
         let lease = crate::connector::acquire_metadata_planning_lease(
-            self.connector_control.as_ref(),
+            self.connector_control(),
             &target.catalog,
         )?;
         if crate::connector::metadata_table_exists_with_planning_lease(
@@ -260,7 +298,7 @@ impl ViewEngine for StandaloneState {
         let instance_id = ConnectorInstanceId::parse(&request.target.catalog)
             .map_err(|error| error.to_string())?;
         crate::connector::mutation::execute_catalog_mutation(
-            self.connector_control.as_ref(),
+            self.connector_control(),
             &instance_id,
             ConnectorCatalogMutationOperation::CreateView {
                 view: ConnectorViewIdentity {
@@ -301,7 +339,7 @@ impl ViewEngine for StandaloneState {
         let instance_id =
             ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
         crate::connector::mutation::execute_catalog_mutation(
-            self.connector_control.as_ref(),
+            self.connector_control(),
             &instance_id,
             ConnectorCatalogMutationOperation::DropView {
                 view: ConnectorViewIdentity {
@@ -322,7 +360,7 @@ impl ViewEngine for StandaloneState {
         context: &ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String> {
         let lease = crate::connector::acquire_metadata_planning_lease(
-            self.connector_control.as_ref(),
+            self.connector_control(),
             &target.catalog,
         )?;
         let binding = lease.binding();
@@ -363,10 +401,8 @@ impl ViewEngine for StandaloneState {
         database: &str,
         context: &ConnectorRequestContext,
     ) -> Result<Vec<String>, String> {
-        let lease = crate::connector::acquire_metadata_planning_lease(
-            self.connector_control.as_ref(),
-            catalog,
-        )?;
+        let lease =
+            crate::connector::acquire_metadata_planning_lease(self.connector_control(), catalog)?;
         let binding = lease.binding();
         let Some(capability) = binding.view_metadata() else {
             return Err(ConnectorError::new(
@@ -405,21 +441,16 @@ impl ViewEngine for StandaloneState {
     ) -> Result<Vec<ViewColumnDefinition>, String> {
         let catalog_service_snapshot =
             crate::engine::query_planning::catalog_runtime::QueryCatalogService::new(
-                Arc::new(RwLock::new(self.catalog_service.local_snapshot())),
-                self.catalog_service.registry_snapshot(),
+                Arc::new(RwLock::new(self.catalog_service().local_snapshot())),
+                self.catalog_service().registry_snapshot(),
             );
-        let connectors_snapshot = self
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
         let provider = crate::engine::build_catalog_service_provider(
             Some(catalog),
             &catalog_service_snapshot,
-            self.connector_control.as_ref(),
+            self.connector_control(),
             context.clone(),
             crate::sql::catalog::TableLookupMode::SchemaOnly,
-            self.catalog_application.as_deref(),
+            self.catalog_application(),
         );
         let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, database)
             .map_err(|error| format!("analyze view definition failed: {error}"))?;

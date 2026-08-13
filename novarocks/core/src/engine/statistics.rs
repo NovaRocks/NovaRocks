@@ -20,7 +20,8 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 
-use crate::engine::StandaloneState;
+use crate::engine::domain::DmlExecutionKernel;
+use crate::engine::{CatalogServiceSource, StandaloneState};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::ObjectName;
 
@@ -162,6 +163,53 @@ impl StatisticsEngine for Arc<StandaloneState> {
         columns: &[String],
     ) -> Result<Vec<CollectedColumnStatistics>, String> {
         collect_statistics_through_engine(self, target, columns)
+    }
+}
+
+/// Foreground DML only needs the local-schema observation capability after a
+/// write.  Durable `ANALYZE` collection is deliberately routed through the
+/// separately composed statistics kernel; it must not synthesize an execution
+/// context from a DML command.
+impl StatisticsEngine for DmlExecutionKernel {
+    fn resolve_table_columns(
+        &self,
+        target: &StatisticsTableTarget,
+    ) -> Result<Vec<StatisticsColumn>, String> {
+        let name = object_name_from_parts(&target.name_parts)?;
+        if let Some(columns) = super::query_prep::external_schema_columns_for_statement(
+            self,
+            target.current_catalog.as_deref(),
+            &target.current_database,
+            &name,
+        )? {
+            return Ok(columns
+                .into_iter()
+                .map(|column| StatisticsColumn {
+                    name: column.name,
+                    data_type: column.data_type,
+                })
+                .collect());
+        }
+        table_columns_for_materialized_target(self, &target.current_database, &name)
+    }
+
+    fn resolve_local_table_columns(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<Vec<StatisticsColumn>>, String> {
+        optional_table_columns_from_local_catalog(self, database, table)
+    }
+
+    fn collect_table_statistics(
+        &self,
+        _target: &StatisticsTableTarget,
+        _columns: &[String],
+    ) -> Result<Vec<CollectedColumnStatistics>, String> {
+        Err(
+            "table statistics collection requires the composed statistics execution kernel"
+                .to_string(),
+        )
     }
 }
 
@@ -316,12 +364,12 @@ fn object_name_from_parts(parts: &[String]) -> Result<ObjectName, String> {
 }
 
 fn table_columns_from_local_catalog(
-    state: &Arc<StandaloneState>,
+    source: &impl CatalogServiceSource,
     database: &str,
     table: &str,
 ) -> Result<Vec<StatisticsColumn>, String> {
-    let catalog = state
-        .catalog_service
+    let catalog = source
+        .catalog_service()
         .local()
         .read()
         .expect("standalone catalog read lock");
@@ -337,22 +385,22 @@ fn table_columns_from_local_catalog(
 }
 
 fn table_columns_for_materialized_target(
-    state: &Arc<StandaloneState>,
+    source: &impl CatalogServiceSource,
     current_database: &str,
     name: &ObjectName,
 ) -> Result<Vec<StatisticsColumn>, String> {
     let (database, table) = resolve_database_and_table(name, current_database)?;
-    table_columns_from_local_catalog(state, &database, &table)
+    table_columns_from_local_catalog(source, &database, &table)
 }
 
 fn optional_table_columns_from_local_catalog(
-    state: &Arc<StandaloneState>,
+    source: &impl CatalogServiceSource,
     database: &str,
     table: &str,
 ) -> Result<Option<Vec<StatisticsColumn>>, String> {
     normalize_name(database)?;
     normalize_name(table)?;
-    match table_columns_from_local_catalog(state, database, table) {
+    match table_columns_from_local_catalog(source, database, table) {
         Ok(columns) => Ok(Some(columns)),
         Err(error)
             if error.starts_with("unknown database:") || error.starts_with("unknown table:") =>
