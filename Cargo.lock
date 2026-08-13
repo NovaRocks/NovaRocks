@@ -3414,6 +3414,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-spi",
  "novarocks-state-store",
+ "novarocks-test-support",
  "reqwest",
  "tempfile",
  "tokio",
@@ -3456,6 +3457,13 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-test-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

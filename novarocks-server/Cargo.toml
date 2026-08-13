@@ -30,5 +30,6 @@ mv-first-refresh-staging-test-support = []
 # E2E tests that spawn the `novarocks` binary and drive it over MySQL / HTTP.
 mysql = "25"
 novarocks-state-store = { path = "../novarocks/state-store" }
+novarocks-test-support = { path = "../novarocks/test-support" }
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
