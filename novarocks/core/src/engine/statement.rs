@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use crate::engine::domain::CatalogCommandKernel;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
@@ -30,6 +31,7 @@ use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::identifier::resolve_local_table_name;
 use novarocks_catalog::schema::SqlType;
+use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
     ConnectorDataType, ConnectorDefaultValue, ConnectorDropTableDataDisposition,
@@ -626,18 +628,46 @@ fn update_alias_name(
 // DDL handlers
 // ---------------------------------------------------------------------------
 
+/// The narrow catalog mutation surface shared by the legacy engine and the
+/// explicit catalog command kernel.  Keep statement helpers on this port so
+/// command routing cannot recover a `StandaloneState` just to resolve a
+/// catalog target or issue a provider-owned mutation.
+pub(crate) trait CatalogMutationContext:
+    crate::engine::backend_resolver::CatalogAdmission
+{
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry;
+}
+
+impl CatalogMutationContext for StandaloneState {
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+        self.connector_control.as_ref()
+    }
+}
+
+impl CatalogMutationContext for Arc<StandaloneState> {
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+        self.as_ref().connector_control()
+    }
+}
+
+impl CatalogMutationContext for CatalogCommandKernel {
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+        self.connector_control().as_ref()
+    }
+}
+
 pub(crate) fn execute_create_database_statement(
-    state: &Arc<StandaloneState>,
+    context: &impl CatalogMutationContext,
     name: &ObjectName,
     if_not_exists: bool,
     current_catalog: Option<&str>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target =
-        crate::engine::backend_resolver::resolve_namespace_target(state, name, current_catalog)?;
+        crate::engine::backend_resolver::resolve_namespace_target(context, name, current_catalog)?;
     let instance_id = mutation_instance_id(&target.catalog)?;
     crate::connector::mutation::execute_catalog_mutation(
-        state.connector_control.as_ref(),
+        context.connector_control(),
         &instance_id,
         ConnectorCatalogMutationOperation::CreateNamespace {
             namespace: ConnectorNamespaceIdentity {
@@ -656,7 +686,7 @@ pub(crate) fn execute_create_database_statement(
 }
 
 pub(crate) fn execute_create_table_statement(
-    state: &Arc<StandaloneState>,
+    context: &impl CatalogMutationContext,
     stmt: crate::sql::parser::ast::CreateTableStmt,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -731,7 +761,7 @@ pub(crate) fn execute_create_table_statement(
             }
 
             let target = crate::engine::backend_resolver::resolve_table_target(
-                state,
+                context,
                 &stmt.name,
                 current_catalog,
                 current_database,
@@ -739,7 +769,7 @@ pub(crate) fn execute_create_table_statement(
             let instance_id = mutation_instance_id(&target.catalog)?;
             let _ = bucket_count;
             crate::connector::mutation::execute_catalog_mutation(
-                state.connector_control.as_ref(),
+                context.connector_control(),
                 &instance_id,
                 ConnectorCatalogMutationOperation::CreateTable {
                     table: ConnectorTableIdentity {
