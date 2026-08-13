@@ -509,7 +509,7 @@ impl BackendManagementKernel {
 /// This is deliberately not part of generic command dispatch: `USE` and
 /// `SET CATALOG` are session admission operations.
 #[derive(Clone)]
-pub(crate) struct SessionCatalogResolver {
+pub struct SessionCatalogResolver {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -528,7 +528,7 @@ impl SessionCatalogResolver {
         }
     }
 
-    pub(crate) fn database_exists(&self, database_name: &str) -> Result<bool, String> {
+    pub fn database_exists(&self, database_name: &str) -> Result<bool, String> {
         self.catalog_service
             .local()
             .read()
@@ -536,20 +536,30 @@ impl SessionCatalogResolver {
             .database_exists(database_name)
     }
 
-    pub(crate) fn require_external_catalog_ready(&self, catalog_name: &str) -> Result<(), String> {
+    pub fn require_external_catalog_ready(
+        &self,
+        catalog_name: &str,
+    ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
         let application = self.catalog_application.as_ref().ok_or_else(|| {
-            "external catalogs require a configured frontend catalog application".to_string()
+            crate::catalog_application::CatalogApplicationError::new(
+                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
+                "external catalogs require a configured frontend catalog application",
+            )
         })?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
-            .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+            .map_err(|error| {
+                crate::catalog_application::CatalogApplicationError::new(
+                    crate::catalog_application::CatalogApplicationErrorKind::InvalidRequest,
+                    format!("invalid catalog connector instance ID: {error}"),
+                )
+            })?;
         application
             .admit_catalog(&instance_id)
             .require_ready(&instance_id)
             .map(|_| ())
-            .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn iceberg_namespace_exists(
+    pub fn iceberg_namespace_exists(
         &self,
         catalog_name: &str,
         namespace_name: &str,

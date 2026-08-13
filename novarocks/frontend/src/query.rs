@@ -34,7 +34,8 @@ use novarocks::engine::insert_engine::InsertEngine;
 use novarocks::engine::mutation_engine::MutationEngine;
 use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
-    PreparedQueryOperation, StandaloneCommandExecutor, StandaloneNovaRocks, StatementResult,
+    PreparedQueryOperation, SessionCatalogResolver, StandaloneCommandExecutor,
+    StandaloneQueryCompiler, StatementResult,
 };
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
@@ -186,7 +187,9 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
-    engine: StandaloneNovaRocks,
+    session_catalog_resolver: SessionCatalogResolver,
+    query_compiler: StandaloneQueryCompiler,
+    command_executor: StandaloneCommandExecutor,
     query_control: QueryControlService,
     query_execution: QueryExecutionService,
     role: ClusterRole,
@@ -205,7 +208,7 @@ pub struct FrontendQueryService {
 
 impl FrontendQueryService {
     pub fn new(
-        engine: StandaloneNovaRocks,
+        engine: novarocks::engine::StandaloneNovaRocks,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
         role: ClusterRole,
@@ -223,8 +226,13 @@ impl FrontendQueryService {
         // controller. Preserve their direct binding seam; production uses
         // `new_with_recovery_bound` after the host has ordered the binding.
         dml.install_ctas_recovery(Arc::clone(&ctas_engine));
+        let session_catalog_resolver = engine.session_catalog_resolver();
+        let query_compiler = engine.query_compiler();
+        let command_executor = engine.command_executor();
         Self::new_with_recovery_bound(
-            engine,
+            session_catalog_resolver,
+            query_compiler,
+            command_executor,
             query_control,
             query_execution,
             role,
@@ -242,7 +250,9 @@ impl FrontendQueryService {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_recovery_bound(
-        engine: StandaloneNovaRocks,
+        session_catalog_resolver: SessionCatalogResolver,
+        query_compiler: StandaloneQueryCompiler,
+        command_executor: StandaloneCommandExecutor,
         query_control: QueryControlService,
         query_execution: QueryExecutionService,
         role: ClusterRole,
@@ -257,7 +267,9 @@ impl FrontendQueryService {
         optimizer_query_mem_limit_bytes: u64,
     ) -> Self {
         Self {
-            engine,
+            session_catalog_resolver,
+            query_compiler,
+            command_executor,
             query_control,
             query_execution,
             role,
@@ -405,7 +417,8 @@ impl FrontendQuerySession {
             .strip_prefix("CATALOG ")
             .or_else(|| assignment.strip_prefix("catalog "))
         {
-            let catalog = resolve_catalog_name(&self.service.engine, catalog.trim())?;
+            let catalog =
+                resolve_catalog_name(&self.service.session_catalog_resolver, catalog.trim())?;
             let mut state = self.state.lock().map_err(poisoned_state)?;
             state.current_catalog = catalog;
             return Ok(true);
@@ -446,13 +459,13 @@ impl FrontendQuerySession {
             .to_ascii_lowercase();
         let value = raw_value.trim().trim_matches('\'').trim_matches('"');
         if name == "catalog" {
-            let catalog = resolve_catalog_name(&self.service.engine, value)?;
+            let catalog = resolve_catalog_name(&self.service.session_catalog_resolver, value)?;
             let mut state = self.state.lock().map_err(poisoned_state)?;
             state.current_catalog = catalog;
             if state.current_catalog.is_none()
                 && !self
                     .service
-                    .engine
+                    .session_catalog_resolver
                     .database_exists(&state.current_database)
                     .map_err(internal_error)?
             {
@@ -596,8 +609,8 @@ impl FrontendQuerySession {
             cancellation.clone(),
             optimizer_settings,
         ));
-        let compiler = self.service.engine.query_compiler();
-        let command_executor = self.service.engine.command_executor();
+        let compiler = self.service.query_compiler.clone();
+        let command_executor = self.service.command_executor.clone();
         let query_execution = self.service.query_execution.clone();
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
@@ -721,10 +734,14 @@ impl QuerySession for FrontendQuerySession {
             .map_err(poisoned_state)?
             .current_catalog
             .clone();
-        let engine = self.service.engine.clone();
+        let session_catalog_resolver = self.service.session_catalog_resolver.clone();
         let schema = schema.to_string();
         let context = task::spawn_blocking(move || {
-            resolve_database_context(&engine, current_catalog.as_deref(), &schema)
+            resolve_database_context(
+                &session_catalog_resolver,
+                current_catalog.as_deref(),
+                &schema,
+            )
         })
         .await
         .map_err(|error| internal_error(error.to_string()))??;
@@ -787,7 +804,7 @@ struct DatabaseContext {
 }
 
 fn resolve_catalog_name(
-    engine: &StandaloneNovaRocks,
+    resolver: &SessionCatalogResolver,
     catalog: &str,
 ) -> Result<Option<String>, QueryServiceError> {
     let normalized = normalize_identifier(catalog).map_err(classify_engine_error)?;
@@ -797,7 +814,7 @@ fn resolve_catalog_name(
     // Session catalog context is an admission decision, not a local binding
     // lookup: a catalog whose durable attachment is absent is unknown, while one
     // this process has not materialized yet is unavailable.
-    engine
+    resolver
         .require_external_catalog_ready(&normalized)
         .map_err(|error| {
             let kind = match error.kind() {
@@ -812,7 +829,7 @@ fn resolve_catalog_name(
 }
 
 fn resolve_database_context(
-    engine: &StandaloneNovaRocks,
+    resolver: &SessionCatalogResolver,
     current_catalog: Option<&str>,
     schema: &str,
 ) -> Result<DatabaseContext, QueryServiceError> {
@@ -825,7 +842,7 @@ fn resolve_database_context(
             let database = normalize_identifier(database).map_err(classify_engine_error)?;
             match current_catalog {
                 Some(catalog)
-                    if engine
+                    if resolver
                         .iceberg_namespace_exists(catalog, &database)
                         .map_err(classify_engine_error)? =>
                 {
@@ -838,7 +855,7 @@ fn resolve_database_context(
                     QueryServiceErrorKind::BadDatabase,
                     format!("unknown database `{schema}`"),
                 )),
-                None if engine
+                None if resolver
                     .database_exists(&database)
                     .map_err(classify_engine_error)? =>
                 {
@@ -854,11 +871,11 @@ fn resolve_database_context(
             }
         }
         [catalog, database] => {
-            let catalog = resolve_catalog_name(engine, catalog)?;
+            let catalog = resolve_catalog_name(resolver, catalog)?;
             let database = normalize_identifier(database).map_err(classify_engine_error)?;
             match catalog {
                 Some(catalog)
-                    if engine
+                    if resolver
                         .iceberg_namespace_exists(&catalog, &database)
                         .map_err(classify_engine_error)? =>
                 {
@@ -867,7 +884,7 @@ fn resolve_database_context(
                         database,
                     })
                 }
-                None if engine
+                None if resolver
                     .database_exists(&database)
                     .map_err(classify_engine_error)? =>
                 {

@@ -220,6 +220,9 @@ where
                 services,
             )
             .map_err(FrontendApplicationError::server)?;
+            let session_catalog_resolver = engine.session_catalog_resolver();
+            let query_compiler = engine.query_compiler();
+            let command_executor = engine.command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
             let mutation_engine = engine.mutation_engine();
@@ -235,7 +238,9 @@ where
             let add_files_engine = engine.add_files_engine();
             let session_factory =
                 Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
-                    engine,
+                    session_catalog_resolver,
+                    query_compiler,
+                    command_executor,
                     query_control,
                     query_execution,
                     role,
@@ -332,6 +337,9 @@ where
                 services,
             )
             .map_err(FrontendApplicationError::server)?;
+            let session_catalog_resolver = engine.session_catalog_resolver();
+            let query_compiler = engine.query_compiler();
+            let command_executor = engine.command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
             let mutation_engine = engine.mutation_engine();
@@ -347,7 +355,9 @@ where
             let add_files_engine = engine.add_files_engine();
             let session_factory =
                 Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
-                    engine,
+                    session_catalog_resolver,
+                    query_compiler,
+                    command_executor,
                     query_control,
                     query_execution,
                     role,

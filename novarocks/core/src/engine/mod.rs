@@ -1815,6 +1815,17 @@ impl StandaloneNovaRocks {
         }
     }
 
+    /// Session catalog admission is separate from arbitrary SQL dispatch.
+    /// Frontend session routing keeps this leaf capability rather than the
+    /// standalone facade.
+    pub fn session_catalog_resolver(&self) -> domain::SessionCatalogResolver {
+        domain::SessionCatalogResolver::new(
+            Arc::clone(&self.inner.catalog_service),
+            self.inner.catalog_application.clone(),
+            Arc::clone(&self.inner.connector_control),
+        )
+    }
+
     /// Transitional compatibility only while Frontend moves its router to
     /// explicit domain capabilities.  The returned kernel copies leaf ports;
     /// it never retains or exposes `StandaloneState` to a DML implementation.

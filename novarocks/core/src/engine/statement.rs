@@ -35,14 +35,69 @@ use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
     ConnectorDataType, ConnectorDefaultValue, ConnectorDropTableDataDisposition,
-    ConnectorInstanceId, ConnectorNamespaceIdentity, ConnectorPartitionTransform,
-    ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind, CreatePolicy, DropPolicy,
+    ConnectorErrorKind, ConnectorInstanceId, ConnectorNamespaceIdentity,
+    ConnectorPartitionTransform, ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind,
+    ConnectorViewIdentity, ConnectorViewRequest, CreatePolicy, DropPolicy,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use crate::sql::literal::sqlparser_expr_to_literal;
+
+/// Exact dependencies needed by catalog-drop statements.
+///
+/// This deliberately does not expose the standalone application aggregate:
+/// catalog DDL needs only catalog admission, exact-generation connector
+/// control, local catalog invalidation, MV guards, and view metadata lookup.
+trait CatalogDropContext: crate::engine::backend_resolver::CatalogAdmission {
+    fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService>;
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry;
+    fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository;
+    fn mv_storage_observation(
+        &self,
+    ) -> &dyn crate::mv::storage_observation::MvStorageObservationPort;
+}
+
+impl CatalogDropContext for Arc<StandaloneState> {
+    fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService> {
+        &self.catalog_service
+    }
+
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+        self.connector_control.as_ref()
+    }
+
+    fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository {
+        self.mv_repository.as_ref()
+    }
+
+    fn mv_storage_observation(
+        &self,
+    ) -> &dyn crate::mv::storage_observation::MvStorageObservationPort {
+        self.mv_storage_observation.as_ref()
+    }
+}
+
+impl CatalogDropContext for CatalogCommandKernel {
+    fn catalog_service(&self) -> &Arc<crate::engine::QueryCatalogService> {
+        self.catalog_service()
+    }
+
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+        self.connector_control().as_ref()
+    }
+
+    fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository {
+        self.mv_repository().as_ref()
+    }
+
+    fn mv_storage_observation(
+        &self,
+    ) -> &dyn crate::mv::storage_observation::MvStorageObservationPort {
+        self.mv_storage_observation().as_ref()
+    }
+}
 
 /// Convert a sqlparser DELETE AST to our custom DeleteStmt.
 ///
@@ -964,12 +1019,14 @@ pub(crate) fn connector_partition_transform(
 }
 
 pub(crate) fn execute_drop_catalog_statement(
-    state: &Arc<StandaloneState>,
+    context: &impl CatalogDropContext,
     catalog_name: &str,
     if_exists: bool,
 ) -> Result<StatementResult, String> {
     let normalized_catalog = normalize_identifier(catalog_name)?;
-    let application = crate::engine::require_catalog_application(state)?;
+    let application = context.catalog_application().ok_or_else(|| {
+        "catalog statements require a configured frontend catalog application".to_string()
+    })?;
     let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
         .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
     // The Frontend application owns the exact-version delete and the MV
@@ -985,7 +1042,7 @@ pub(crate) fn execute_drop_catalog_statement(
 }
 
 pub(crate) fn execute_drop_database_statement(
-    state: &Arc<StandaloneState>,
+    context: &impl CatalogDropContext,
     name: &ObjectName,
     current_catalog: Option<&str>,
     if_exists: bool,
@@ -993,23 +1050,15 @@ pub(crate) fn execute_drop_database_statement(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target =
-        crate::engine::backend_resolver::resolve_namespace_target(state, name, current_catalog)?;
+        crate::engine::backend_resolver::resolve_namespace_target(context, name, current_catalog)?;
     if target.backend_name == "iceberg" {
-        crate::engine::mv::dependency::ensure_no_iceberg_mv_targets_in_scope(
-            state,
-            &target.catalog,
-            Some(&target.namespace),
-        )?;
-        crate::engine::mv::dependency::ensure_no_external_iceberg_dependents(
-            state,
-            &target.catalog,
-            Some(&target.namespace),
-        )?;
+        ensure_no_iceberg_mv_targets_in_scope(context, &target.catalog, Some(&target.namespace))?;
+        ensure_no_external_iceberg_dependents(context, &target.catalog, Some(&target.namespace))?;
     }
     let instance_id = mutation_instance_id(&target.catalog)?;
     if force {
-        let lease = state
-            .connector_control
+        let lease = context
+            .connector_control()
             .acquire_current(&instance_id)
             .map_err(|error| error.to_string())?;
         // `IF EXISTS` applies to the complete FORCE decomposition.  In
@@ -1064,7 +1113,7 @@ pub(crate) fn execute_drop_database_statement(
         views.sort();
         for table in tables {
             crate::connector::mutation::execute_catalog_mutation(
-                state.connector_control.as_ref(),
+                context.connector_control(),
                 &instance_id,
                 ConnectorCatalogMutationOperation::DropTable {
                     table: ConnectorTableIdentity {
@@ -1081,21 +1130,19 @@ pub(crate) fn execute_drop_database_statement(
                 },
                 connector_context.clone(),
             )?;
-            state
-                .catalog_service
-                .invalidate_table(&target.catalog, &target.namespace, &table)?;
-            crate::engine::query_prep::drop_local_table_registration_if_exists(
-                state,
+            context.catalog_service().invalidate_table(
+                &target.catalog,
                 &target.namespace,
                 &table,
             )?;
+            drop_local_table_registration_if_exists(context, &target.namespace, &table)?;
         }
         for view in views {
             crate::connector::mutation::execute_catalog_mutation(
-                state.connector_control.as_ref(),
+                context.connector_control(),
                 &instance_id,
                 ConnectorCatalogMutationOperation::DropView {
-                    view: novarocks_spi::connector::ConnectorViewIdentity {
+                    view: ConnectorViewIdentity {
                         instance_id: instance_id.clone(),
                         namespace: Arc::from(target.namespace.as_str()),
                         view: Arc::from(view.as_str()),
@@ -1107,7 +1154,7 @@ pub(crate) fn execute_drop_database_statement(
         }
     }
     crate::connector::mutation::execute_catalog_mutation(
-        state.connector_control.as_ref(),
+        context.connector_control(),
         &instance_id,
         ConnectorCatalogMutationOperation::DropNamespace {
             namespace: ConnectorNamespaceIdentity {
@@ -1126,7 +1173,7 @@ pub(crate) fn execute_drop_database_statement(
 }
 
 pub(crate) fn execute_drop_table_statement(
-    state: &Arc<StandaloneState>,
+    context: &impl CatalogDropContext,
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -1135,7 +1182,7 @@ pub(crate) fn execute_drop_table_statement(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target = match crate::engine::backend_resolver::resolve_existing_table_target(
-        state,
+        context,
         name,
         current_catalog,
         current_database,
@@ -1145,7 +1192,7 @@ pub(crate) fn execute_drop_table_statement(
             // External parquet tables registered through the embedding API are
             // still catalog-only entries. Dropping them does not involve a
             // connector backend.
-            return drop_local_catalog_table(state, name, current_database, if_exists);
+            return drop_local_catalog_table(context, name, current_database, if_exists);
         }
         Err(err) => return Err(err),
     };
@@ -1162,8 +1209,9 @@ pub(crate) fn execute_drop_table_statement(
             &target.table,
         )
     };
-    match crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-        state,
+    match crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        context.connector_control(),
+        context.mv_storage_observation(),
         &target,
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::DropTable,
     ) {
@@ -1173,15 +1221,18 @@ pub(crate) fn execute_drop_table_statement(
                 && target.backend_name == "iceberg"
                 && is_missing_table_guard_error(&err) =>
         {
-            cleanup_iceberg_drop_table_registration_if_exists(state, &target)?;
+            cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
             return Ok(StatementResult::Ok);
         }
         Err(err) => return Err(err),
     }
-    crate::engine::mv::dependency::ensure_no_downstream_dependencies(state, &dependency_ref)?;
+    context
+        .mv_repository()
+        .ensure_no_downstream_dependencies(&dependency_ref)
+        .map_err(|error| error.to_string())?;
     let instance_id = mutation_instance_id(&target.catalog)?;
     match crate::connector::mutation::execute_catalog_mutation(
-        state.connector_control.as_ref(),
+        context.connector_control(),
         &instance_id,
         ConnectorCatalogMutationOperation::DropTable {
             table: ConnectorTableIdentity {
@@ -1200,22 +1251,18 @@ pub(crate) fn execute_drop_table_statement(
     ) {
         Ok(_) => {
             if target.backend_name == "iceberg" {
-                state.catalog_service.invalidate_table(
+                context.catalog_service().invalidate_table(
                     &target.catalog,
                     &target.namespace,
                     &target.table,
                 )?;
-                crate::engine::query_prep::drop_local_table_registration_if_exists(
-                    state,
-                    &target.namespace,
-                    &target.table,
-                )?;
+                drop_local_table_registration_if_exists(context, &target.namespace, &target.table)?;
             }
             Ok(StatementResult::Ok)
         }
         Err(err) if if_exists && err.contains("NotFound") => {
             if target.backend_name == "iceberg" {
-                cleanup_iceberg_drop_table_registration_if_exists(state, &target)?;
+                cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
             }
             Ok(StatementResult::Ok)
         }
@@ -1223,18 +1270,13 @@ pub(crate) fn execute_drop_table_statement(
             // A DROP TABLE aimed at a view must say so instead of "unknown
             // table" — views and tables are separate REST resources.
             if target.backend_name == "iceberg"
-                && matches!(
-                    <crate::engine::StandaloneState as crate::engine::view::ViewEngine>::resolve_external_view(
-                        state,
-                        &crate::engine::view::ViewTarget {
-                            catalog: target.catalog.clone(),
-                            database: target.namespace.clone(),
-                            view: target.table.clone(),
-                        },
-                        connector_context,
-                    ),
-                    Ok(crate::engine::view::ExternalViewResolution::View(_))
-                )
+                && external_view_exists(
+                    context,
+                    &target.catalog,
+                    &target.namespace,
+                    &target.table,
+                    connector_context,
+                )?
             {
                 return Err(format!(
                     "{}.{}.{} is a view, use DROP VIEW",
@@ -1257,28 +1299,26 @@ fn is_missing_table_guard_error(err: &str) -> bool {
 }
 
 fn cleanup_iceberg_drop_table_registration_if_exists(
-    state: &Arc<StandaloneState>,
+    context: &impl CatalogDropContext,
     target: &crate::engine::backend_resolver::TargetBackend,
 ) -> Result<(), String> {
-    state
-        .catalog_service
-        .invalidate_table(&target.catalog, &target.namespace, &target.table)?;
-    crate::engine::query_prep::drop_local_table_registration_if_exists(
-        state,
+    context.catalog_service().invalidate_table(
+        &target.catalog,
         &target.namespace,
         &target.table,
-    )
+    )?;
+    drop_local_table_registration_if_exists(context, &target.namespace, &target.table)
 }
 
 fn drop_local_catalog_table(
-    state: &Arc<StandaloneState>,
+    context: &impl CatalogDropContext,
     name: &ObjectName,
     current_database: &str,
     if_exists: bool,
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_table_name(name.parts.as_slice(), current_database)?;
-    let mut guard = state
-        .catalog_service
+    let mut guard = context
+        .catalog_service()
         .local()
         .write()
         .expect("standalone catalog write lock");
@@ -1286,6 +1326,120 @@ fn drop_local_catalog_table(
         Ok(()) => Ok(StatementResult::Ok),
         Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
         Err(err) => Err(err),
+    }
+}
+
+fn drop_local_table_registration_if_exists(
+    context: &impl CatalogDropContext,
+    namespace: &str,
+    table: &str,
+) -> Result<(), String> {
+    let mut guard = context
+        .catalog_service()
+        .local()
+        .write()
+        .map_err(|error| format!("standalone catalog write lock: {error}"))?;
+    match guard.drop_table(namespace, table) {
+        Ok(()) => Ok(()),
+        Err(error) if error.contains("unknown") => Ok(()),
+        Err(error) => Err(format!("drop local table metadata: {error}")),
+    }
+}
+
+fn ensure_no_iceberg_mv_targets_in_scope(
+    context: &impl CatalogDropContext,
+    scope_catalog: &str,
+    scope_namespace: Option<&str>,
+) -> Result<(), String> {
+    let definitions = context
+        .mv_repository()
+        .list_definitions()
+        .map_err(|error| {
+            format!("load MV definitions for drop target scope check failed: {error}")
+        })?;
+    let targets = definitions
+        .iter()
+        .filter_map(|definition| {
+            definition
+                .storage_engine
+                .eq_ignore_ascii_case("iceberg")
+                .then(|| {
+                    crate::mv::persistence::dependency::stored_definition_dependency_ref(
+                        definition, None,
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::mv::dependency::scope::validate_no_iceberg_mv_targets_in_scope(
+        scope_catalog,
+        scope_namespace,
+        &targets,
+    )
+}
+
+fn ensure_no_external_iceberg_dependents(
+    context: &impl CatalogDropContext,
+    scope_catalog: &str,
+    scope_namespace: Option<&str>,
+) -> Result<(), String> {
+    let definitions = context
+        .mv_repository()
+        .list_definitions()
+        .map_err(|error| format!("load MV definitions for drop scope check failed: {error}"))?;
+    let mut edges = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        let target = crate::mv::persistence::dependency::stored_definition_dependency_ref(
+            &definition,
+            None,
+        )?;
+        let upstreams = context
+            .mv_repository()
+            .list_dependencies_by_downstream(definition.mv_id)
+            .map_err(|error| format!("load MV dependencies for drop scope check failed: {error}"))?
+            .into_iter()
+            .map(|dependency| dependency.upstream)
+            .collect();
+        edges.push((target, upstreams));
+    }
+    crate::mv::dependency::scope::validate_no_external_dependents_for_scope(
+        scope_catalog,
+        scope_namespace,
+        &edges,
+    )
+}
+
+fn external_view_exists(
+    context: &impl CatalogDropContext,
+    catalog: &str,
+    namespace: &str,
+    view: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<bool, String> {
+    let lease =
+        crate::connector::acquire_metadata_planning_lease(context.connector_control(), catalog)?;
+    let binding = lease.binding();
+    let Some(view_metadata) = binding.view_metadata() else {
+        return Ok(false);
+    };
+    let instance_id = binding.descriptor().instance_id.clone();
+    match view_metadata.load_view(ConnectorViewRequest {
+        view: ConnectorViewIdentity {
+            instance_id,
+            namespace: Arc::from(namespace),
+            view: Arc::from(view),
+        },
+        context: connector_context.clone(),
+    }) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
