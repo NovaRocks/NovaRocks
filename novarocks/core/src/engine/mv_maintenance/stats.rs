@@ -111,6 +111,27 @@ pub(crate) fn collect_table_stats(
     table: &str,
     definitions: &[StoredMvDefinition],
 ) -> Result<TableMaintenanceStats, String> {
+    collect_table_stats_with_ports(
+        state.connector_control.as_ref(),
+        state.mv_storage_observation.as_ref(),
+        catalog,
+        namespace,
+        table,
+        definitions,
+    )
+}
+
+/// Read one MV storage table's maintenance facts through explicit frontend
+/// control and observation ports. Background policy must retain only these
+/// leaves, never the aggregate standalone engine state.
+pub(crate) fn collect_table_stats_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+    storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    definitions: &[StoredMvDefinition],
+) -> Result<TableMaintenanceStats, String> {
     let context = crate::connector::connector_request_context(
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -124,7 +145,7 @@ pub(crate) fn collect_table_stats(
 
     let max_compactable_data_files =
         crate::connector::metadata_maintenance::read_max_compactable_data_files(
-            state.connector_control.as_ref(),
+            connector_control,
             &instance_id,
             identity,
             context.clone(),
@@ -135,10 +156,8 @@ pub(crate) fn collect_table_stats(
             )
         })?;
 
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
-        state.connector_control.as_ref(),
-        catalog,
-    )?;
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, catalog)?;
     let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         context.clone(),
@@ -146,8 +165,7 @@ pub(crate) fn collect_table_stats(
         table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let observed = state
-        .mv_storage_observation
+    let observed = storage_observation
         .observe_maintenance_metadata(&exact_lease, &metadata, context)
         .map_err(|error| {
             format!("observe {catalog}.{namespace}.{table} maintenance metadata: {error}")

@@ -226,10 +226,20 @@ pub(crate) fn rebuild_one_lake_package_if_missing(
     ctx: &LakeRebuildContext<'_>,
     package: &MvLakePackageObservation,
 ) -> Result<(), String> {
+    rebuild_one_lake_package_if_missing_with_repository(ctx.mv_repository, package)
+}
+
+/// Targeted lake-package rebuild with the only capability it actually needs:
+/// durable MV repository mutation.  Unlike startup discovery, the caller has
+/// already selected and observed one exact package, so it must not acquire a
+/// new catalog projection or connector lease while rebuilding the cache.
+pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
+    repository: &dyn crate::mv::repository::MvRepository,
+    package: &MvLakePackageObservation,
+) -> Result<(), String> {
     // Repository-hit check: skip MVs already recorded. The rebuilt target
     // maps to (discovered.catalog, discovered.namespace, discovered.table).
-    let existing = ctx
-        .mv_repository
+    let existing = repository
         .find_by_target(&crate::mv::model::MvTarget {
             catalog: Some(package.table.instance_id.as_str().to_string()),
             database: package.table.namespace.to_string(),
@@ -245,8 +255,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing(
     let dependencies =
         dependency_requests_from_descriptor(&package.descriptor.base_dependencies, created_at_ms)?;
 
-    let definition = ctx
-        .mv_repository
+    let definition = repository
         .create(
             uuid::Uuid::new_v4(),
             crate::mv::repository::CreateMvRepositoryRequest {
@@ -256,7 +265,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing(
             },
         )
         .map_err(|e| format!("rebuild iceberg MV repository metadata failed: {e}"))?;
-    ctx.mv_repository
+    repository
         .set_rebuilt_refresh_watermark(
             definition.mv_id,
             rebuilt.last_refresh_snapshots,

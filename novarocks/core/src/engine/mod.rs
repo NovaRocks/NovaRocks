@@ -2026,9 +2026,18 @@ impl StandaloneNovaRocks {
         if let Some(sink) = mv_background_engine_sink {
             let bindings = crate::mv::background::MvBackgroundBindings {
                 engine: Arc::new(
-                    crate::engine::mv_background::StandaloneMvBackgroundEngine::new(Arc::clone(
-                        &engine.inner,
-                    )),
+                    crate::engine::mv_background::StandaloneMvBackgroundEngine::new_with_ports(
+                        crate::engine::mv::iceberg_refresh::IcebergMvCorePorts::new(
+                            Arc::clone(&engine.inner.catalog_service),
+                            engine.inner.catalog_application.clone(),
+                            Arc::clone(&engine.inner.connector_control),
+                            Arc::clone(&engine.inner.mv_repository),
+                            Arc::clone(&engine.inner.mv_storage_observation),
+                        ),
+                        Arc::clone(&engine.inner.connector_control),
+                        Arc::clone(&engine.inner.mv_repository),
+                        Arc::clone(&engine.inner.mv_storage_observation),
+                    ),
                 ),
                 table_maintenance_engine: engine_port,
             };
@@ -2702,7 +2711,9 @@ impl StandaloneSession {
             let statement = crate::sql::parser::procedure::parse_call_procedure_sql(&normalized)?;
             if statement.procedure == crate::engine::mv::stateless_rebuild::PROCEDURE_NAME {
                 return crate::engine::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
-                    &self.inner,
+                    self.inner.connector_control.as_ref(),
+                    self.inner.mv_storage_observation.as_ref(),
+                    self.inner.mv_repository.as_ref(),
                     &statement,
                     current_database,
                     connector_context,

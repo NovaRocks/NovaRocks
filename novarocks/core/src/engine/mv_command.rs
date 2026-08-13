@@ -46,6 +46,20 @@ impl MvCommandExecutor {
         execution: &QueryExecutionContext,
     ) -> Result<Option<StatementResult>, String> {
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        if crate::sql::parser::procedure::looks_like_call_procedure(&normalized) {
+            let statement = crate::sql::parser::procedure::parse_call_procedure_sql(&normalized)?;
+            if statement.procedure == crate::engine::mv::stateless_rebuild::PROCEDURE_NAME {
+                return crate::engine::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
+                    self.kernel.connector_control().as_ref(),
+                    self.kernel.storage_observation().as_ref(),
+                    self.kernel.repository().as_ref(),
+                    &statement,
+                    current_database,
+                    connector_context.clone(),
+                )
+                .map(Some);
+            }
+        }
         let mut statements = match crate::sql::parser::parse_sql(&normalized) {
             Ok(statements) => statements,
             Err(_) => return Ok(None),

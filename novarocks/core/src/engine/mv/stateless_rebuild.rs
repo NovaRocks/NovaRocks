@@ -54,7 +54,8 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::{StandaloneState, StatementResult};
+use crate::engine::StatementResult;
+use crate::mv::repository::MvRepository;
 use crate::mv::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvStorageObservationPort,
 };
@@ -156,14 +157,22 @@ fn split_table_reference(table: &str, current_database: &str) -> Result<(String,
 }
 
 pub(crate) fn execute_novarocks_imv_stateless_rebuild(
-    state: &Arc<StandaloneState>,
+    connector_control: &dyn ConnectorControlResolver,
+    mv_storage_observation: &dyn MvStorageObservationPort,
+    mv_repository: &dyn MvRepository,
     stmt: &CallProcedureStmt,
     current_database: &str,
     connector_context: ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     ensure_stateless_rebuild_enabled(std::env::var(TEST_ENABLE_ENV).ok().as_deref())?;
     let req = ImvStatelessRebuildRequest::from_call(stmt, current_database)?;
-    execute_request_with_context(state, &req, connector_context)
+    execute_request_with_context(
+        connector_control,
+        mv_storage_observation,
+        mv_repository,
+        &req,
+        connector_context,
+    )
 }
 
 /// Guard-free core of the procedure. `execute_novarocks_imv_stateless_rebuild`
@@ -171,24 +180,33 @@ pub(crate) fn execute_novarocks_imv_stateless_rebuild(
 /// call it directly so they can exercise the `full` round-trip without racing
 /// on process env.
 pub(crate) fn execute_request(
-    state: &Arc<StandaloneState>,
+    connector_control: &dyn ConnectorControlResolver,
+    mv_storage_observation: &dyn MvStorageObservationPort,
+    mv_repository: &dyn MvRepository,
     req: &ImvStatelessRebuildRequest,
 ) -> Result<StatementResult, String> {
     let context =
         crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
-    execute_request_with_context(state, req, context)
+    execute_request_with_context(
+        connector_control,
+        mv_storage_observation,
+        mv_repository,
+        req,
+        context,
+    )
 }
 
 fn execute_request_with_context(
-    state: &Arc<StandaloneState>,
+    connector_control: &dyn ConnectorControlResolver,
+    mv_storage_observation: &dyn MvStorageObservationPort,
+    mv_repository: &dyn MvRepository,
     req: &ImvStatelessRebuildRequest,
     connector_context: ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let instance_id = ConnectorInstanceId::parse(&req.catalog)
         .map_err(|error| format!("parse stateless rebuild catalog identity: {error}"))?;
-    let exact_lease =
-        ConnectorControlResolver::acquire_current(state.connector_control.as_ref(), &instance_id)
-            .map_err(|error| format!("acquire stateless rebuild catalog generation: {error}"))?;
+    let exact_lease = ConnectorControlResolver::acquire_current(connector_control, &instance_id)
+        .map_err(|error| format!("acquire stateless rebuild catalog generation: {error}"))?;
     let table = ConnectorTableIdentity {
         instance_id,
         namespace: Arc::from(req.namespace.as_str()),
@@ -202,8 +220,7 @@ fn execute_request_with_context(
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )
     .map_err(|error| format!("load stateless rebuild table metadata: {error}"))?;
-    let package = state
-        .mv_storage_observation
+    let package = mv_storage_observation
         .observe_lake_package(&exact_lease, &loaded_table, connector_context)
         .map_err(|error| format!("observe stateless rebuild lake package: {error}"))?
         .ok_or_else(|| {
@@ -225,7 +242,7 @@ fn execute_request_with_context(
     // behind the test-only env flag (checked by the caller) and runs only when
     // the requested level is `full`.
     if req.required_level == StatelessLevel::Full {
-        clear_sqlite_and_rebuild_from_lake(state, &package)?;
+        clear_sqlite_and_rebuild_from_lake(mv_repository, &package)?;
         // The descriptor/provenance hashes are functions of the lake package,
         // which the round-trip left untouched, so they are identical to the
         // pre-rebuild values computed above. Reporting them from here documents
@@ -265,7 +282,7 @@ fn execute_request_with_context(
 /// registered catalog via `rebuild_imv_cache_from_lake`, so the probe touches
 /// only its own target.
 fn clear_sqlite_and_rebuild_from_lake(
-    state: &Arc<StandaloneState>,
+    mv_repository: &dyn MvRepository,
     package: &MvLakePackageObservation,
 ) -> Result<(), String> {
     // 1. Confirm the SQLite definition currently exists; the round-trip is only
@@ -275,8 +292,7 @@ fn clear_sqlite_and_rebuild_from_lake(
         database: package.table.namespace.to_string(),
         name: package.table.table.to_string(),
     };
-    let existing = state
-        .mv_repository
+    let existing = mv_repository
         .find_by_target(&target)
         .map_err(|e| format!("look up MV definition before full rebuild failed: {e}"))?;
     if existing.is_none() {
@@ -292,8 +308,7 @@ fn clear_sqlite_and_rebuild_from_lake(
 
     // 2. Clear the SQLite records for this MV target. The lake MV table is
     //    left untouched — exactly the "SQLite forgot, lake remembers" state.
-    let dropped = state
-        .mv_repository
+    let dropped = mv_repository
         .drop_by_target(&target)
         .map_err(|e| format!("clear MV repository definition for full rebuild failed: {e}"))?;
     if !dropped {
@@ -306,15 +321,14 @@ fn clear_sqlite_and_rebuild_from_lake(
     }
 
     // 3. Rebuild the single target MV purely from the lake package.
-    crate::engine::mv::lake_rebuild::rebuild_one_lake_package_if_missing(
-        &crate::engine::lake_rebuild_context(state),
+    crate::engine::mv::lake_rebuild::rebuild_one_lake_package_if_missing_with_repository(
+        mv_repository,
         package,
     )?;
 
     // 4. Confirm the definition reappeared. If it did not, statelessness failed:
     //    the lake package did not carry enough to reconstruct the SQLite record.
-    let rebuilt = state
-        .mv_repository
+    let rebuilt = mv_repository
         .find_by_target(&target)
         .map_err(|e| format!("verify MV definition after full rebuild failed: {e}"))?;
     if rebuilt.is_none() {
