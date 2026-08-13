@@ -25,14 +25,15 @@
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::ConnectorInstanceId;
 use sqlparser::parser::Parser;
+use std::sync::Arc;
 
 use crate::catalog_application::CatalogCreateCommand;
-use crate::engine::StatementResult;
 use crate::engine::domain::CatalogCommandKernel;
 use crate::engine::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
 };
+use crate::engine::{QueryResultColumn, StatementResult, build_iceberg_create_table_ddl};
 use crate::sql::parser::dialect::{
     StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
     looks_like_create_table, looks_like_drop_statement,
@@ -63,6 +64,27 @@ impl CatalogCommandExecutor {
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Option<StatementResult>, String> {
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        if let Some((target, source)) = crate::engine::parse_create_table_like(&normalized)? {
+            return execute_create_table_like(
+                &self.kernel,
+                target,
+                source,
+                current_catalog,
+                current_database,
+                connector_context,
+            )
+            .map(Some);
+        }
+        if crate::engine::statement::looks_like_show_create_table(&normalized) {
+            return execute_show_create_table(
+                &self.kernel,
+                &normalized,
+                current_catalog,
+                current_database,
+                connector_context,
+            )
+            .map(Some);
+        }
         let dialect = StarRocksDialect;
         let mut parser = Parser::new(&dialect)
             .try_with_sql(&normalized)
@@ -165,6 +187,149 @@ impl CatalogCommandExecutor {
             .map_err(|error| error.to_string())?;
         Ok(StatementResult::Ok)
     }
+}
+
+fn execute_create_table_like(
+    kernel: &CatalogCommandKernel,
+    target: crate::sql::parser::ast::ObjectName,
+    source: crate::sql::parser::ast::ObjectName,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let source_target = crate::engine::backend_resolver::resolve_existing_table_target(
+        kernel,
+        &source,
+        current_catalog,
+        current_database,
+    )?;
+    let source_table = crate::connector::metadata_load_table(
+        kernel.connector_control().as_ref(),
+        connector_context.clone(),
+        &source_target.catalog,
+        &source_target.namespace,
+        &source_target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?
+    .0;
+    let columns = source_table
+        .columns
+        .iter()
+        .map(|column| {
+            Ok(crate::sql::parser::ast::TableColumnDef {
+                name: column.name.clone(),
+                data_type: crate::engine::iceberg_ctas::arrow_data_type_to_sql_type(
+                    &column.data_type,
+                )?,
+                nullable: column.nullable,
+                aggregation: None,
+                default: None,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    execute_create_table_statement(
+        kernel,
+        crate::sql::parser::ast::CreateTableStmt {
+            name: target,
+            kind: crate::sql::parser::ast::CreateTableKind::Iceberg {
+                columns,
+                key_desc: None,
+                bucket_count: None,
+                distribution_columns: Vec::new(),
+                partition_fields: Vec::new(),
+                properties: Vec::new(),
+            },
+            legacy_range_partitions: Vec::new(),
+            as_select: None,
+            if_not_exists: false,
+        },
+        current_catalog,
+        current_database,
+        connector_context,
+    )
+}
+
+fn execute_show_create_table(
+    kernel: &CatalogCommandKernel,
+    sql: &str,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let table_name = crate::engine::statement::parse_show_create_table(sql)?;
+    let target = crate::engine::backend_resolver::resolve_existing_table_target(
+        kernel,
+        &table_name,
+        current_catalog,
+        current_database,
+    )?;
+    if target.backend_name != "iceberg" {
+        return Err(format!(
+            "SHOW CREATE TABLE only supports Iceberg tables, got `{}` backend",
+            target.backend_name
+        ));
+    }
+    let instance_id =
+        ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
+    let lease = kernel
+        .connector_control()
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    let identity = novarocks_spi::connector::ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    let loaded = lease
+        .binding()
+        .metadata()
+        .load_table(novarocks_spi::connector::ConnectorTableRequest {
+            table: identity.clone(),
+            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    if loaded.identity != identity || loaded.table.owner() != &identity.instance_id {
+        return Err(
+            "SHOW CREATE TABLE received corrupt metadata for a different connector table"
+                .to_string(),
+        );
+    }
+    let ddl =
+        build_iceberg_create_table_ddl(&target.catalog, &target.namespace, &target.table, &loaded)?;
+    let fields = vec![
+        Field::new("Table", DataType::Utf8, false),
+        Field::new("Create Table", DataType::Utf8, false),
+    ];
+    let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![
+        Arc::new(StringArray::from(vec![target.table.clone()])),
+        Arc::new(StringArray::from(vec![ddl])),
+    ];
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|error| format!("build SHOW CREATE TABLE result failed: {error}"))?;
+    Ok(StatementResult::Query(
+        crate::runtime::query_result::QueryResult {
+            columns: vec![
+                QueryResultColumn {
+                    name: "Table".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    logical_type: None,
+                },
+                QueryResultColumn {
+                    name: "Create Table".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![crate::runtime::query_result::record_batch_to_chunk(batch)?],
+        },
+    ))
 }
 
 fn require_statement_end(parser: &mut Parser<'_>) -> Result<(), String> {

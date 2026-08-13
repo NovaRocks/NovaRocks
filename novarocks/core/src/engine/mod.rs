@@ -3380,7 +3380,7 @@ fn rewrite_named_partition_insert_overwrite(sql: &str) -> Result<String, String>
     Ok(format!("INSERT OVERWRITE PARTITIONS {table} {rest}"))
 }
 
-fn parse_create_table_like(
+pub(crate) fn parse_create_table_like(
     sql: &str,
 ) -> Result<
     Option<(
@@ -3428,7 +3428,7 @@ fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::Obje
 }
 
 /// Generate a `CREATE TABLE` DDL string from exact-generation connector facts.
-fn build_iceberg_create_table_ddl(
+pub(crate) fn build_iceberg_create_table_ddl(
     catalog: &str,
     namespace: &str,
     table: &str,
