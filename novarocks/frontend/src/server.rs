@@ -191,10 +191,11 @@ where
                     Arc::clone(&mv_storage_observation),
                 ),
                 host.dml_service(),
+                host.ctas_recovery_binding(),
                 host.terminal_ingress(),
             )
         },
-        move |config, (mut services, dml, terminal_ingress), shutdown| async move {
+        move |config, (mut services, dml, ctas_recovery, terminal_ingress), shutdown| async move {
             let mut report_server = FrontendReportServerHandle::start(
                 &config.config.server.host,
                 config.config.server.grpc_port,
@@ -216,9 +217,12 @@ where
                     let delete_engine = engine.delete_engine();
                     let mutation_engine = engine.mutation_engine();
                     let ctas_engine = engine.ctas_engine();
+                    ctas_recovery
+                        .install_ctas_engine(Arc::clone(&ctas_engine))
+                        .map_err(|error| format!("bind CTAS recovery before controller start: {error}"))?;
                     let truncate_engine = engine.truncate_engine();
                     let add_files_engine = engine.add_files_engine();
-                    Ok(Arc::new(crate::query::FrontendQueryService::new(
+                    Ok(Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
                         engine,
                         query_control,
                         query_execution,
@@ -286,10 +290,11 @@ where
                     Arc::clone(&mv_storage_observation),
                 ),
                 host.dml_service(),
+                host.ctas_recovery_binding(),
                 host.terminal_ingress(),
             )
         },
-        move |config, (mut services, dml, terminal_ingress), shutdown| async move {
+        move |config, (mut services, dml, ctas_recovery, terminal_ingress), shutdown| async move {
             let mut report_server = FrontendReportServerHandle::start(
                 &config.config.server.host,
                 config.config.server.grpc_port,
@@ -311,9 +316,12 @@ where
                     let delete_engine = engine.delete_engine();
                     let mutation_engine = engine.mutation_engine();
                     let ctas_engine = engine.ctas_engine();
+                    ctas_recovery
+                        .install_ctas_engine(Arc::clone(&ctas_engine))
+                        .map_err(|error| format!("bind CTAS recovery before controller start: {error}"))?;
                     let truncate_engine = engine.truncate_engine();
                     let add_files_engine = engine.add_files_engine();
-                    Ok(Arc::new(crate::query::FrontendQueryService::new(
+                    Ok(Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
                         engine,
                         query_control,
                         query_execution,

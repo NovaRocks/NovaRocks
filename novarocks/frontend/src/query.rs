@@ -219,7 +219,43 @@ impl FrontendQueryService {
         truncate_engine: Arc<dyn TruncateEngine>,
         optimizer_query_mem_limit_bytes: u64,
     ) -> Self {
+        // Focused fixtures without a Frontend host do not own a recovery
+        // controller. Preserve their direct binding seam; production uses
+        // `new_with_recovery_bound` after the host has ordered the binding.
         dml.install_ctas_recovery(Arc::clone(&ctas_engine));
+        Self::new_with_recovery_bound(
+            engine,
+            query_control,
+            query_execution,
+            role,
+            topology,
+            dml,
+            insert_engine,
+            delete_engine,
+            mutation_engine,
+            add_files_engine,
+            ctas_engine,
+            truncate_engine,
+            optimizer_query_mem_limit_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_recovery_bound(
+        engine: StandaloneNovaRocks,
+        query_control: QueryControlService,
+        query_execution: QueryExecutionService,
+        role: ClusterRole,
+        topology: BackendTopologyService,
+        dml: Arc<DmlService>,
+        insert_engine: Arc<dyn InsertEngine>,
+        delete_engine: Arc<dyn DeleteEngine>,
+        mutation_engine: Arc<dyn MutationEngine>,
+        add_files_engine: Arc<dyn AddFilesEngine>,
+        ctas_engine: Arc<dyn CtasEngine>,
+        truncate_engine: Arc<dyn TruncateEngine>,
+        optimizer_query_mem_limit_bytes: u64,
+    ) -> Self {
         Self {
             engine,
             query_control,
