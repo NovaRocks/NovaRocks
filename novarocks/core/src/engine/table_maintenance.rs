@@ -686,6 +686,72 @@ impl RequestScopedMaintenanceEngine {
     }
 }
 
+/// One freshly-admitted automatic-maintenance attempt.
+///
+/// The frontend captures the live backend topology and cancellation scope
+/// before constructing this value. Core retains it only while it plans one
+/// distributed rewrite; the resulting provider session keeps its own exact
+/// generation and execution identity for recovery.
+#[derive(Clone)]
+pub(crate) struct BackgroundMaintenanceAttempt {
+    execution: crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+impl BackgroundMaintenanceAttempt {
+    pub(crate) fn new(
+        execution: crate::query_execution::request_context::QueryExecutionContext,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            execution,
+            connector_context,
+        }
+    }
+}
+
+/// Frontend-composed admission boundary for long-lived automatic maintenance.
+///
+/// Implementations must capture a fresh live topology and cancellation scope
+/// for each call. There is deliberately no Core default, process-global lookup
+/// or `StandaloneState` fallback.
+pub(crate) trait BackgroundMaintenanceAttemptFactory: Send + Sync {
+    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String>;
+}
+
+/// Long-lived automatic-maintenance engine.
+///
+/// Unlike the request-scoped SQL engine, this value is safe to retain in
+/// frontend workers: it holds only the explicit maintenance kernel and the
+/// frontend-owned attempt factory. It never captures a state aggregate or a
+/// weak self reference.
+#[derive(Clone)]
+pub(crate) struct BackgroundMaintenanceEngine {
+    kernel: crate::engine::domain::MaintenanceExecutionKernel,
+    attempt_factory: Arc<dyn BackgroundMaintenanceAttemptFactory>,
+}
+
+impl BackgroundMaintenanceEngine {
+    pub(crate) fn new(
+        kernel: crate::engine::domain::MaintenanceExecutionKernel,
+        attempt_factory: Arc<dyn BackgroundMaintenanceAttemptFactory>,
+    ) -> Self {
+        Self {
+            kernel,
+            attempt_factory,
+        }
+    }
+
+    fn request_engine(&self) -> Result<RequestScopedMaintenanceEngine, String> {
+        let attempt = self.attempt_factory.begin_automatic_maintenance_attempt()?;
+        Ok(RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            attempt.execution,
+            attempt.connector_context,
+        ))
+    }
+}
+
 impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
     for RequestScopedMaintenanceEngine
 {
@@ -928,6 +994,43 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         .map_err(|error| format!("recover orphan cleanup operation: {error}"))
     }
 
+    fn inspect_historical_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<HistoricalMaintenanceInspection, String> {
+        use novarocks_spi::connector::ConnectorHistoricalMaintenanceResolver;
+
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        let lease = match self
+            .kernel
+            .connector_control()
+            .acquire_current_historical_maintenance(&instance_id)
+        {
+            Ok(lease) => lease,
+            Err(error)
+                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unsupported =>
+            {
+                return Ok(HistoricalMaintenanceInspection::Unsupported(
+                    error.to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "acquire historical maintenance recovery capability: {error}"
+                ));
+            }
+        };
+        let observation = lease
+            .inspect(descriptor, self.connector_context_for_attempt(attempt)?)
+            .map_err(|error| format!("inspect historical maintenance operation: {error}"))?;
+        Ok(HistoricalMaintenanceInspection::Observed(Box::new(
+            observation,
+        )))
+    }
+
     fn prepare_cleanup_batch(
         &self,
         session: &CleanupMaintenanceSession,
@@ -1096,82 +1199,28 @@ impl RequestScopedMaintenanceEngine {
     }
 }
 
-impl crate::engine::StandaloneState {
-    fn shared_for_table_maintenance(&self) -> Result<Arc<Self>, String> {
-        self.self_weak.upgrade().ok_or_else(|| {
-            "standalone state is not attached to a shared engine instance".to_string()
-        })
-    }
-}
-
-impl TableMaintenanceEngine for crate::engine::StandaloneState {
+impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
     fn resolve_target(
         &self,
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceTarget, String> {
-        let state = self.shared_for_table_maintenance()?;
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &state,
-            &crate::sql::parser::ast::ObjectName {
-                parts: name_parts.to_vec(),
-            },
-            context.current_catalog,
-            context.current_database,
-        )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "table maintenance only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
-        Ok(MaintenanceTarget {
-            catalog: target.catalog,
-            namespace: target.namespace,
-            table: target.table,
-        })
+        self.request_engine()?.resolve_target(name_parts, context)
     }
 
     fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
-        let state = self.shared_for_table_maintenance()?;
-        crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-            &state,
-            &crate::engine::backend_resolver::TargetBackend {
-                backend_name: "iceberg",
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-            },
-            crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
-        )
+        self.request_engine()?.reject_user_action_on_mv(target)
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
-        let state = self.shared_for_table_maintenance()?;
-        crate::engine::iceberg_maintenance::current_snapshot_id_with_ports(
-            state.connector_control.as_ref(),
-            target,
-            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?,
-        )
+        self.request_engine()?.current_snapshot_id(target)
     }
 
     fn execute_action(
         &self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
-        if matches!(request, MaintenanceActionRequest::RemoveOrphanFiles { .. }) {
-            return Err(
-                "remove orphan files must be dispatched by the frontend durable cleanup owner"
-                    .to_string(),
-            );
-        }
-        let state = self.shared_for_table_maintenance()?;
-        crate::engine::iceberg_maintenance::execute_action_with_ports(
-            state.connector_control.as_ref(),
-            state.as_ref(),
-            request,
-            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?,
-        )
+        self.request_engine()?.execute_action(request)
     }
 
     fn plan_metadata_maintenance(
@@ -1180,12 +1229,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         operation_id: ConnectorMutationOperationId,
         intent: MetadataMaintenanceIntent,
     ) -> Result<MetadataMaintenanceSession, String> {
-        self.plan_metadata_maintenance_with_attempt_context(
-            target,
-            operation_id,
-            intent,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
+        self.request_engine()?
+            .plan_metadata_maintenance(target, operation_id, intent)
     }
 
     fn plan_metadata_maintenance_with_attempt_context(
@@ -1195,28 +1240,16 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         intent: MetadataMaintenanceIntent,
         attempt: &MaintenanceAttemptContext,
     ) -> Result<MetadataMaintenanceSession, String> {
-        let state = self.shared_for_table_maintenance()?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?;
-        crate::connector::metadata_maintenance::plan_metadata_maintenance_session(
-            state.connector_control.as_ref(),
-            &instance_id,
-            operation_id,
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: target.namespace.clone().into(),
-                table: target.table.clone().into(),
-            },
-            intent,
-            attempt.connector_request_context()?,
-        )
+        self.request_engine()?
+            .plan_metadata_maintenance_with_attempt_context(target, operation_id, intent, attempt)
     }
 
     fn execute_planned_metadata_maintenance(
         &self,
         session: MetadataMaintenanceSession,
     ) -> Result<CompletedMetadataMaintenance, String> {
-        crate::connector::metadata_maintenance::execute_planned_metadata_maintenance(session, self)
+        self.request_engine()?
+            .execute_planned_metadata_maintenance(session)
     }
 
     fn reconcile_metadata_maintenance(
@@ -1224,11 +1257,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         target: &MaintenanceTarget,
         plan: ConnectorMetadataMaintenancePlan,
     ) -> Result<CompletedMetadataMaintenance, String> {
-        self.reconcile_metadata_maintenance_with_attempt_context(
-            target,
-            plan,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
+        self.request_engine()?
+            .reconcile_metadata_maintenance(target, plan)
     }
 
     fn reconcile_metadata_maintenance_with_attempt_context(
@@ -1237,19 +1267,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         plan: ConnectorMetadataMaintenancePlan,
         attempt: &MaintenanceAttemptContext,
     ) -> Result<CompletedMetadataMaintenance, String> {
-        let state = self.shared_for_table_maintenance()?;
-        crate::connector::metadata_maintenance::reconcile_metadata_maintenance_session(
-            state.connector_control.as_ref(),
-            self,
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-                    .map_err(|error| error.to_string())?,
-                namespace: target.namespace.clone().into(),
-                table: target.table.clone().into(),
-            },
-            plan,
-            attempt.connector_request_context()?,
-        )
+        self.request_engine()?
+            .reconcile_metadata_maintenance_with_attempt_context(target, plan, attempt)
     }
 
     fn plan_cleanup_maintenance(
@@ -1258,12 +1277,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         operation_id: ConnectorCleanupOperationId,
         older_than_ms: i64,
     ) -> Result<CleanupMaintenanceSession, String> {
-        self.plan_cleanup_maintenance_with_attempt_context(
-            target,
-            operation_id,
-            older_than_ms,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
+        self.request_engine()?
+            .plan_cleanup_maintenance(target, operation_id, older_than_ms)
     }
 
     fn plan_cleanup_maintenance_with_attempt_context(
@@ -1273,22 +1288,13 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         older_than_ms: i64,
         attempt: &MaintenanceAttemptContext,
     ) -> Result<CleanupMaintenanceSession, String> {
-        let state = self.shared_for_table_maintenance()?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?;
-        CleanupMaintenanceSession::plan(
-            state.connector_control.as_ref(),
-            &instance_id,
-            operation_id,
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: target.namespace.clone().into(),
-                table: target.table.clone().into(),
-            },
-            older_than_ms,
-            attempt.connector_request_context()?,
-        )
-        .map_err(|error| format!("plan orphan cleanup operation: {error}"))
+        self.request_engine()?
+            .plan_cleanup_maintenance_with_attempt_context(
+                target,
+                operation_id,
+                older_than_ms,
+                attempt,
+            )
     }
 
     fn recover_cleanup_for_reconcile(
@@ -1297,52 +1303,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         plan: ConnectorCleanupPlan,
         prepared: PreparedBatch,
     ) -> Result<CleanupMaintenanceSession, String> {
-        self.recover_cleanup_for_reconcile_with_attempt_context(
-            target,
-            plan,
-            prepared,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
-    }
-
-    fn inspect_historical_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<HistoricalMaintenanceInspection, String> {
-        use novarocks_spi::connector::ConnectorHistoricalMaintenanceResolver;
-
-        let state = self.shared_for_table_maintenance()?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?;
-        // Acquiring the live inspector is where "this provider cannot do
-        // historical recovery" is decided. Anything else -- a lost lease, a
-        // corrupt descriptor -- is a real failure the caller must see.
-        let lease = match state
-            .connector_control
-            .acquire_current_historical_maintenance(&instance_id)
-        {
-            Ok(lease) => lease,
-            Err(error)
-                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unsupported =>
-            {
-                return Ok(HistoricalMaintenanceInspection::Unsupported(
-                    error.to_string(),
-                ));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "acquire historical maintenance recovery capability: {error}"
-                ));
-            }
-        };
-        let observation = lease
-            .inspect(descriptor, attempt.connector_request_context()?)
-            .map_err(|error| format!("inspect historical maintenance operation: {error}"))?;
-        Ok(HistoricalMaintenanceInspection::Observed(Box::new(
-            observation,
-        )))
+        self.request_engine()?
+            .recover_cleanup_for_reconcile(target, plan, prepared)
     }
 
     fn recover_cleanup_for_reconcile_with_attempt_context(
@@ -1352,20 +1314,18 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         prepared: PreparedBatch,
         attempt: &MaintenanceAttemptContext,
     ) -> Result<CleanupMaintenanceSession, String> {
-        let state = self.shared_for_table_maintenance()?;
-        CleanupMaintenanceSession::recover_for_reconcile(
-            state.connector_control.as_ref(),
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-                    .map_err(|error| error.to_string())?,
-                namespace: target.namespace.clone().into(),
-                table: target.table.clone().into(),
-            },
-            plan,
-            prepared,
-            attempt.connector_request_context()?,
-        )
-        .map_err(|error| format!("recover orphan cleanup operation: {error}"))
+        self.request_engine()?
+            .recover_cleanup_for_reconcile_with_attempt_context(target, plan, prepared, attempt)
+    }
+
+    fn inspect_historical_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<HistoricalMaintenanceInspection, String> {
+        self.request_engine()?
+            .inspect_historical_maintenance(target, descriptor, attempt)
     }
 
     fn prepare_cleanup_batch(
@@ -1373,9 +1333,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         session: &CleanupMaintenanceSession,
         batch_ordinal: u32,
     ) -> Result<PreparedBatch, String> {
-        session
-            .prepare_batch(batch_ordinal)
-            .map_err(|error| format!("prepare orphan cleanup batch: {error}"))
+        self.request_engine()?
+            .prepare_cleanup_batch(session, batch_ordinal)
     }
 
     fn execute_cleanup_batch(
@@ -1383,9 +1342,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         session: &CleanupMaintenanceSession,
         prepared: PreparedBatch,
     ) -> Result<CleanupBatchExecution, String> {
-        session
-            .execute_batch(prepared)
-            .map_err(|error| format!("execute orphan cleanup batch: {error}"))
+        self.request_engine()?
+            .execute_cleanup_batch(session, prepared)
     }
 
     fn reconcile_cleanup_batch(
@@ -1393,9 +1351,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         session: &CleanupMaintenanceSession,
         prepared: PreparedBatch,
     ) -> Result<BatchReceipt, String> {
-        session
-            .reconcile_batch(prepared)
-            .map_err(|error| format!("reconcile orphan cleanup batch: {error}"))
+        self.request_engine()?
+            .reconcile_cleanup_batch(session, prepared)
     }
 
     fn read_cleanup_candidate_page(
@@ -1404,15 +1361,12 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         offset: u64,
         limit: u32,
     ) -> Result<CandidatePage, String> {
-        session
-            .read_candidate_page(offset, limit)
-            .map_err(|error| format!("read orphan cleanup candidate page: {error}"))
+        self.request_engine()?
+            .read_cleanup_candidate_page(session, offset, limit)
     }
 
     fn finalize_cleanup_terminal(&self, session: &CleanupMaintenanceSession) -> Result<(), String> {
-        session
-            .finalize_terminal()
-            .map_err(|error| format!("finalize orphan cleanup artifacts: {error}"))
+        self.request_engine()?.finalize_cleanup_terminal(session)
     }
 
     fn plan_distributed_rewrite(
@@ -1421,25 +1375,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
         intent: DistributedRewriteIntent,
     ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        let state = self.shared_for_table_maintenance()?;
-        let execution = crate::engine::capture_maintenance_execution(&state)?;
-        let context = crate::connector::connector_request_context_for_execution(None, &execution)?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?;
-        crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
-            &state.query_execution,
-            state.connector_control.as_ref(),
-            &instance_id,
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: target.namespace.clone().into(),
-                table: target.table.clone().into(),
-            },
-            operation_id,
-            intent,
-            execution,
-            context,
-        )
+        self.request_engine()?
+            .plan_distributed_rewrite(target, operation_id, intent)
     }
 
     fn plan_distributed_rewrite_with_attempt_context(
@@ -1449,25 +1386,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         intent: DistributedRewriteIntent,
         attempt: &MaintenanceAttemptContext,
     ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        let state = self.shared_for_table_maintenance()?;
-        let execution = crate::engine::capture_maintenance_execution(&state)?;
-        let context = attempt.connector_request_context()?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?;
-        crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
-            &state.query_execution,
-            state.connector_control.as_ref(),
-            &instance_id,
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: target.namespace.clone().into(),
-                table: target.table.clone().into(),
-            },
-            operation_id,
-            intent,
-            execution,
-            context,
-        )
+        self.request_engine()?
+            .plan_distributed_rewrite_with_attempt_context(target, operation_id, intent, attempt)
     }
 
     fn stage_distributed_rewrite_cohort(
@@ -1475,16 +1395,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         session: &DistributedRewriteMaintenanceSession,
         cohort_id: ConnectorWriteCohortId,
     ) -> Result<ConnectorWriteCompletion, String> {
-        let state = self.shared_for_table_maintenance()?;
-        stage_frozen_rewrite_cohort_with_ports(
-            state.connector_control.as_ref(),
-            &state.query_execution,
-            session.session(),
-            cohort_id,
-            session.execution(),
-            session.context(),
-        )
-        .map(|(completion, _summary)| completion)
+        self.request_engine()?
+            .stage_distributed_rewrite_cohort(session, cohort_id)
     }
 
     fn checkpoint_distributed_rewrite_attempt(
@@ -1492,30 +1404,22 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         session: &DistributedRewriteMaintenanceSession,
         completion: &ConnectorWriteCompletion,
     ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, String> {
-        session
-            .session()
-            .checkpoint_accepted(completion)
-            .map_err(|error| format!("checkpoint distributed rewrite attempt: {error}"))
+        self.request_engine()?
+            .checkpoint_distributed_rewrite_attempt(session, completion)
     }
 
     fn commit_distributed_rewrite(
         &self,
         session: &DistributedRewriteMaintenanceSession,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
-        session
-            .session()
-            .commit(session.context().clone())
-            .map_err(|error| format!("commit distributed rewrite operation: {error}"))
+        self.request_engine()?.commit_distributed_rewrite(session)
     }
 
     fn abort_distributed_rewrite(
         &self,
         session: &DistributedRewriteMaintenanceSession,
     ) -> Result<ConnectorWriteAbortOutcome, String> {
-        session
-            .session()
-            .abort(session.context().clone())
-            .map_err(|error| format!("abort distributed rewrite operation: {error}"))
+        self.request_engine()?.abort_distributed_rewrite(session)
     }
 
     fn reconcile_distributed_rewrite(
@@ -1523,10 +1427,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         session: &DistributedRewriteMaintenanceSession,
         evidence: ExternalMutationEvidence,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
-        session
-            .session()
-            .reconcile(evidence, session.context().clone())
-            .map_err(|error| format!("reconcile distributed rewrite operation: {error}"))
+        self.request_engine()?
+            .reconcile_distributed_rewrite(session, evidence)
     }
 
     fn finalize_distributed_rewrite(
@@ -1534,10 +1436,8 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         session: &DistributedRewriteMaintenanceSession,
         receipt: &ConnectorWriteReceipt,
     ) -> Result<ConnectorDistributedRewriteReceipt, String> {
-        session
-            .session()
-            .finalize_committed(receipt)
-            .map_err(|error| format!("finalize distributed rewrite operation: {error}"))
+        self.request_engine()?
+            .finalize_distributed_rewrite(session, receipt)
     }
 }
 

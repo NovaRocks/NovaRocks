@@ -23,7 +23,7 @@
 
 use std::any::Any;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -154,6 +154,40 @@ pub trait StatisticsAttemptExecutorSink: Send + Sync {
         &self,
         executor: Arc<dyn StatisticsAttemptExecutor>,
     ) -> Result<(), String>;
+}
+
+/// Exact Core capabilities retained by the frontend-owned durable ANALYZE
+/// worker.  Each attempt captures a fresh live topology snapshot through this
+/// port, while its table/version pin remains the immutable submission fact.
+///
+/// This is intentionally a leaf-port bundle: it does not retain an engine
+/// facade or application state, and it has no standalone/default execution
+/// path.  Every dependency must be supplied by the composition root.
+#[derive(Clone)]
+pub struct StatisticsAttemptExecutionPorts {
+    execution_role: crate::common::app_config::ClusterRole,
+    connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    backend_topology: crate::query_execution::backend::BackendTopologyService,
+    query_execution: crate::query_execution::service::QueryExecutionService,
+}
+
+impl StatisticsAttemptExecutionPorts {
+    pub fn new(
+        execution_role: crate::common::app_config::ClusterRole,
+        connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        backend_topology: crate::query_execution::backend::BackendTopologyService,
+        query_execution: crate::query_execution::service::QueryExecutionService,
+    ) -> Self {
+        Self {
+            execution_role,
+            connectors,
+            connector_control,
+            backend_topology,
+            query_execution,
+        }
+    }
 }
 
 pub struct ConnectorStatisticsTargetResolver {
@@ -400,24 +434,16 @@ impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
     }
 }
 
-/// Engine-owned implementation of a durable attempt. The frontend can retain
-/// only this trait object and its opaque collected value; it cannot obtain a
+/// Core implementation of a durable attempt. The frontend can retain only
+/// this trait object and its opaque collected value; it cannot obtain a
 /// connector reader, catalog handle, or an unpinned metadata path.
 pub struct ConnectorStatisticsAttemptExecutor {
-    state: std::sync::Weak<super::StandaloneState>,
+    ports: StatisticsAttemptExecutionPorts,
 }
 
 impl ConnectorStatisticsAttemptExecutor {
-    pub(crate) fn new(state: std::sync::Weak<super::StandaloneState>) -> Self {
-        Self { state }
-    }
-
-    fn state(&self) -> Result<Arc<super::StandaloneState>, StatisticsApplicationError> {
-        self.state.upgrade().ok_or_else(|| {
-            StatisticsApplicationError::transient(
-                "statistics engine is shutting down before the durable attempt completed",
-            )
-        })
+    pub fn new(ports: StatisticsAttemptExecutionPorts) -> Self {
+        Self { ports }
     }
 
     fn collection_context() -> Result<ConnectorRequestContext, StatisticsApplicationError> {
@@ -536,11 +562,11 @@ impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
         &self,
         request: &StatisticsAttemptRequest,
     ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsApplicationError> {
-        let state = self.state()?;
         let (table, data_version) = Self::table_and_version(request)?;
         let metrics = Self::metrics(request)?;
         let context = Self::collection_context()?;
-        let planning_lease = state
+        let planning_lease = self
+            .ports
             .connector_control
             .acquire_current(table.owner())
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
@@ -565,33 +591,36 @@ impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
         )
         .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let topology = state
+        let topology = self
+            .ports
             .backend_topology
             .snapshot()
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
         let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
         let execution = crate::query_execution::request_context::QueryExecutionContext::new(
-            state.execution_role,
+            self.ports.execution_role,
             topology,
             Some(Instant::now() + program.policy().attempt_timeout()),
             cancellation.view(),
             crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         );
-        let connectors = state
+        let connectors = self
+            .ports
             .connectors
             .read()
             .map_err(|_| StatisticsApplicationError::transient("connector registry lock poisoned"))?
             .clone();
         let distributed = crate::query_execution::statistics::build_statistics_collection_request(
             &connectors,
-            state.connector_control.as_ref(),
+            self.ports.connector_control.as_ref(),
             &execution,
             context.clone(),
             program,
             planning_lease,
         )
         .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
-        let result = state
+        let result = self
+            .ports
             .query_execution
             .execute(distributed)
             .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_statistics)
@@ -647,8 +676,8 @@ impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
         &self,
         evidence: &ExternalMutationEvidence,
     ) -> Result<(), StatisticsApplicationError> {
-        let state = self.state()?;
-        let lease = state
+        let lease = self
+            .ports
             .connector_control
             .acquire_current_statistics(&evidence.descriptor().instance_id)
             .map_err(|error| StatisticsApplicationError::reconcile(error.to_string()))?;

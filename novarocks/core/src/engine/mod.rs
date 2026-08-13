@@ -518,6 +518,43 @@ pub(crate) struct StandaloneState {
     pub(crate) _test_guard: Option<TestSerializationGuard>,
 }
 
+/// Transitional owner-local factory for automatic maintenance while the legacy
+/// startup shell still exists. It holds only role/topology leaves and creates
+/// a fresh admitted execution for every background attempt; no maintenance
+/// engine may retain `StandaloneState` or a weak self reference.
+#[derive(Clone)]
+struct EngineBackgroundMaintenanceAttemptFactory {
+    role: crate::common::app_config::ClusterRole,
+    topology: crate::query_execution::backend::BackendTopologyService,
+}
+
+impl table_maintenance::BackgroundMaintenanceAttemptFactory
+    for EngineBackgroundMaintenanceAttemptFactory
+{
+    fn begin_automatic_maintenance_attempt(
+        &self,
+    ) -> Result<table_maintenance::BackgroundMaintenanceAttempt, String> {
+        let topology = self
+            .topology
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
+        let execution = crate::query_execution::request_context::QueryExecutionContext::new(
+            self.role,
+            topology,
+            None,
+            cancellation.view(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
+        let connector_context =
+            crate::connector::connector_request_context_for_execution(None, &execution)?;
+        Ok(table_maintenance::BackgroundMaintenanceAttempt::new(
+            execution,
+            connector_context,
+        ))
+    }
+}
+
 #[cfg(test)]
 impl Default for StandaloneState {
     fn default() -> Self {
@@ -2010,8 +2047,14 @@ impl StandaloneNovaRocks {
         if let Some(sink) = statistics_attempt_executor_sink {
             sink.bind_statistics_attempt_executor(engine.statistics_attempt_executor())?;
         }
-        let engine_port =
-            Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
+        let engine_port: Arc<dyn table_maintenance::TableMaintenanceEngine> =
+            Arc::new(table_maintenance::BackgroundMaintenanceEngine::new(
+                legacy_maintenance_execution_kernel(&engine.inner),
+                Arc::new(EngineBackgroundMaintenanceAttemptFactory {
+                    role: engine.inner.execution_role,
+                    topology: Arc::clone(&engine.inner.backend_topology),
+                }),
+            ));
         if let Err(error) = engine
             .inner
             .table_maintenance_service
@@ -2255,9 +2298,15 @@ impl StandaloneNovaRocks {
         &self,
     ) -> Arc<dyn statistics_application::StatisticsAttemptExecutor> {
         Arc::new(
-            statistics_application::ConnectorStatisticsAttemptExecutor::new(Arc::downgrade(
-                &self.inner,
-            )),
+            statistics_application::ConnectorStatisticsAttemptExecutor::new(
+                statistics_application::StatisticsAttemptExecutionPorts::new(
+                    self.inner.execution_role,
+                    Arc::clone(&self.inner.connectors),
+                    Arc::clone(&self.inner.connector_control),
+                    Arc::clone(&self.inner.backend_topology),
+                    self.inner.query_execution.clone(),
+                ),
+            ),
         )
     }
 
@@ -2737,8 +2786,13 @@ impl StandaloneSession {
                 );
             }
         }
+        let maintenance_engine = table_maintenance::RequestScopedMaintenanceEngine::new(
+            legacy_maintenance_execution_kernel(&self.inner),
+            request_context.execution().clone(),
+            connector_context.clone(),
+        );
         if let Some(result) = self.inner.table_maintenance_service.try_handle_statement(
-            self.inner.as_ref(),
+            &maintenance_engine,
             &normalized,
             crate::engine::table_maintenance::MaintenanceRequestContext {
                 current_catalog,
@@ -4512,6 +4566,19 @@ fn legacy_view_execution_kernel(state: &Arc<StandaloneState>) -> domain::ViewExe
         state.catalog_application.clone(),
         Arc::clone(&state.connector_control),
         Arc::clone(&state.view_service),
+    )
+}
+
+fn legacy_maintenance_execution_kernel(
+    state: &Arc<StandaloneState>,
+) -> domain::MaintenanceExecutionKernel {
+    domain::MaintenanceExecutionKernel::new(
+        Arc::clone(&state.catalog_service),
+        state.catalog_application.clone(),
+        Arc::clone(&state.connector_control),
+        Arc::clone(&state.mv_storage_observation),
+        state.query_execution.clone(),
+        Arc::clone(&state.table_maintenance_service),
     )
 }
 
