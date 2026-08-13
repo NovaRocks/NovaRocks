@@ -101,18 +101,96 @@ pub struct StandaloneServerOptions {
     pub mysql_port: Option<u16>,
 }
 
+/// Fully resolved MySQL listener settings.
+///
+/// Frontend composition resolves these settings before opening the protocol
+/// listener.  The protocol server receives an already-ready
+/// [`QuerySessionFactory`]; it neither reads configuration nor opens a Core
+/// application host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedMysqlListenerSettings {
+    bind_addr: SocketAddr,
+    user: String,
+}
+
+impl ResolvedMysqlListenerSettings {
+    pub fn bind_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+}
+
 struct ResolvedStandaloneServerOptions {
     config_path: Option<PathBuf>,
-    mysql_port: u16,
-    user: String,
+    listener: ResolvedMysqlListenerSettings,
     /// Pre-loaded config to pass directly to engine open, bypassing a second
     /// disk read.  `None` falls back to the legacy disk/env load path.
     preloaded_config: Option<NovaRocksConfig>,
 }
 
-/// Run a standalone server whose authenticated SQL sessions are supplied by
-/// the frontend application.  This is the production entrypoint for native
-/// frontend composition; the core keeps only MySQL protocol framing.
+/// Resolves the protocol listener settings from an already-loaded config.
+///
+/// This is the production composition boundary: Frontend owns configuration
+/// and application startup, then passes the resulting settings and a ready
+/// [`QuerySessionFactory`] to [`run_mysql_server_until_shutdown`].
+pub fn resolve_mysql_listener_settings(
+    cfg: &NovaRocksConfig,
+    port_override: Option<u16>,
+) -> Result<ResolvedMysqlListenerSettings, String> {
+    let (mysql_port, user) =
+        extract_server_settings(cfg.standalone_server.as_ref(), port_override)?;
+    Ok(ResolvedMysqlListenerSettings {
+        bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port)),
+        user,
+    })
+}
+
+/// Runs the MySQL protocol listener with a ready frontend-owned session
+/// factory.
+///
+/// The listener preserves the public ready marker and the shutdown drain
+/// contract.  On shutdown it first asks the session factory to cancel all
+/// sessions, stops accepting new connections, then waits for active protocol
+/// tasks to drain (or aborts them after the bounded drain timeout).
+pub async fn run_mysql_server_until_shutdown<F>(
+    settings: ResolvedMysqlListenerSettings,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    shutdown: F,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+{
+    let ready_user = settings.user.clone();
+    let session_user = settings.user;
+    let shutdown_factory = Arc::clone(&session_factory);
+    serve_until_shutdown(
+        settings.bind_addr,
+        async move {
+            shutdown.await;
+            shutdown_factory.cancel_all(QueryCancellationReason::ServerShutdown);
+        },
+        move |stream, peer_addr| {
+            serve_frontend_mysql_connection(
+                session_user.clone(),
+                Arc::clone(&session_factory),
+                stream,
+                peer_addr,
+            )
+        },
+        move |bound_addr| emit_standalone_ready(bound_addr, &ready_user),
+    )
+    .await
+}
+
+/// Legacy compatibility wrapper which still opens the historical Core engine.
+///
+/// New production composition must call
+/// [`resolve_mysql_listener_settings`] followed by
+/// [`run_mysql_server_until_shutdown`] after Frontend has opened its own
+/// application host and session factory.
 pub async fn run_standalone_server_with_config_until_shutdown_with_session_factory<F, B>(
     cfg: NovaRocksConfig,
     config_path: Option<PathBuf>,
@@ -125,11 +203,11 @@ where
     F: Future<Output = ()> + Send,
     B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
 {
-    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
+    let listener = resolve_mysql_listener_settings(&cfg, port_override)?;
     let resolved = ResolvedStandaloneServerOptions {
         config_path,
         preloaded_config: Some(cfg),
-        ..resolved
+        listener,
     };
     run_with_resolved_options_until_shutdown_with_session_factory(
         resolved,
@@ -169,31 +247,7 @@ where
         Err(error) => return Err(error),
     };
 
-    let server = async move {
-        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, resolved.mysql_port));
-        let ready_user = resolved.user.clone();
-        let session_user = resolved.user;
-        let shutdown_factory = Arc::clone(&session_factory);
-        serve_until_shutdown(
-            bind_addr,
-            async move {
-                shutdown.await;
-                shutdown_factory.cancel_all(QueryCancellationReason::ServerShutdown);
-            },
-            move |stream, peer_addr| {
-                serve_frontend_mysql_connection(
-                    session_user.clone(),
-                    Arc::clone(&session_factory),
-                    stream,
-                    peer_addr,
-                )
-            },
-            move |bound_addr| emit_standalone_ready(bound_addr, &ready_user),
-        )
-        .await
-    };
-
-    server.await
+    run_mysql_server_until_shutdown(resolved.listener, session_factory, shutdown).await
 }
 
 fn resolve_server_options(
@@ -205,8 +259,10 @@ fn resolve_server_options(
     let (mysql_port, user) = extract_server_settings(standalone, opts.mysql_port)?;
     Ok(ResolvedStandaloneServerOptions {
         config_path: opts.config_path.clone(),
-        mysql_port,
-        user,
+        listener: ResolvedMysqlListenerSettings {
+            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port)),
+            user,
+        },
         preloaded_config: None,
     })
 }
@@ -245,22 +301,6 @@ fn extract_server_settings(
 }
 
 /// Extract server-layer settings directly from a pre-loaded [`NovaRocksConfig`].
-fn resolve_server_options_from_config(
-    cfg: &NovaRocksConfig,
-    port_override: Option<u16>,
-) -> Result<ResolvedStandaloneServerOptions, String> {
-    let (mysql_port, user) =
-        extract_server_settings(cfg.standalone_server.as_ref(), port_override)?;
-    Ok(ResolvedStandaloneServerOptions {
-        // config_path is intentionally None here; callers that need the path
-        // (e.g. run_standalone_server_with_config) set it after this call.
-        config_path: None,
-        mysql_port,
-        user,
-        preloaded_config: None,
-    })
-}
-
 fn load_active_config(path: Option<&Path>) -> Result<Option<NovaRocksConfig>, String> {
     match path {
         Some(path) if path.exists() => NovaRocksConfig::load_from_file(path)
@@ -682,6 +722,49 @@ fn spawn_frontend_disconnect_watcher(
     _session: Arc<OnceLock<Arc<dyn QuerySession>>>,
 ) -> ClientDisconnectWatcher {
     ClientDisconnectWatcher { join_handle: None }
+}
+
+#[cfg(test)]
+mod protocol_api_tests {
+    use super::*;
+
+    struct CancellationProbeFactory {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl QuerySessionFactory for CancellationProbeFactory {
+        fn open_session(
+            &self,
+            _request: QuerySessionOpenRequest,
+        ) -> Result<Arc<dyn QuerySession>, QueryServiceError> {
+            Err(QueryServiceError::new(
+                QueryServiceErrorKind::Internal,
+                "test session factory must not open a session",
+            ))
+        }
+
+        fn cancel_all(&self, _reason: QueryCancellationReason) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_session_factory_api_cancels_sessions_before_listener_drain() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let factory: Arc<dyn QuerySessionFactory> = Arc::new(CancellationProbeFactory {
+            cancelled: Arc::clone(&cancelled),
+        });
+        let settings = ResolvedMysqlListenerSettings {
+            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            user: ROOT_USER.to_string(),
+        };
+
+        run_mysql_server_until_shutdown(settings, factory, async {})
+            .await
+            .expect("ready protocol server should shut down cleanly");
+
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
 }
 
 // Legacy parser fixtures remain test-only while their assertions are migrated
@@ -3059,8 +3142,8 @@ mod legacy {
             ));
         }
 
-        // I1: resolve_server_options_from_config must extract settings from a
-        // pre-loaded NovaRocksConfig without touching the filesystem.
+        // Listener settings must be resolved from a pre-loaded config without
+        // touching the filesystem or opening an application host.
         #[test]
         fn resolve_settings_from_cfg_uses_sentinel_mysql_port() {
             use crate::common::app_config::StandaloneServerConfig;
@@ -3070,9 +3153,10 @@ mod legacy {
                 ..StandaloneServerConfig::default()
             });
             let resolved =
-                resolve_server_options_from_config(&cfg, None).expect("extract settings from cfg");
+                resolve_mysql_listener_settings(&cfg, None).expect("extract settings from cfg");
             assert_eq!(
-                resolved.mysql_port, 12345,
+                resolved.bind_addr(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)),
                 "mysql_port must come from the pre-loaded cfg, not from a fresh file load"
             );
         }
@@ -3085,10 +3169,11 @@ mod legacy {
                 mysql_port: 12345,
                 ..StandaloneServerConfig::default()
             });
-            let resolved = resolve_server_options_from_config(&cfg, Some(19030))
+            let resolved = resolve_mysql_listener_settings(&cfg, Some(19030))
                 .expect("extract settings with port override");
             assert_eq!(
-                resolved.mysql_port, 19030,
+                resolved.bind_addr(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 19030)),
                 "explicit port override must win over config"
             );
         }
@@ -3098,9 +3183,10 @@ mod legacy {
             // I1: When standalone_server section is absent, DEFAULT_MYSQL_PORT is used.
             let cfg = NovaRocksConfig::default();
             let resolved =
-                resolve_server_options_from_config(&cfg, None).expect("defaults from empty cfg");
+                resolve_mysql_listener_settings(&cfg, None).expect("defaults from empty cfg");
             assert_eq!(
-                resolved.mysql_port, DEFAULT_MYSQL_PORT,
+                resolved.bind_addr(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_MYSQL_PORT)),
                 "default port when no [standalone_server] section"
             );
         }

@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
+use novarocks::query_execution::backend::CoordinatorReportEndpointSink;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
 
@@ -185,11 +186,7 @@ where
         },
         move |host| {
             (
-                standalone_open_services(
-                    system_catalog,
-                    host,
-                    Arc::clone(&mv_storage_observation),
-                ),
+                standalone_open_services(system_catalog, host, Arc::clone(&mv_storage_observation)),
                 host.dml_service(),
                 host.ctas_recovery_binding(),
                 host.terminal_ingress(),
@@ -203,48 +200,65 @@ where
             )
             .map_err(FrontendApplicationError::server)?;
             services.exchange_port = report_server.bound_addr().port();
+            services
+                .coordinator_report_endpoint
+                .set_bound_port(services.exchange_port);
+            let listener = novarocks::server::resolve_mysql_listener_settings(
+                &config.config,
+                config.port_override,
+            )
+            .map_err(FrontendApplicationError::server)?;
             let query_control = services.query_control.clone();
             let query_execution = services.query_execution.clone();
             let topology = services.backend_topology.clone();
             let role = services.execution_role;
-            let server_result = novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
-                config.config,
-                config.config_path,
-                config.port_override,
-                services,
-                move |engine| {
-                    let insert_engine = engine.insert_engine();
-                    let delete_engine = engine.delete_engine();
-                    let mutation_engine = engine.mutation_engine();
-                    let ctas_engine = engine.ctas_engine();
-                    ctas_recovery
-                        .install_ctas_engine(Arc::clone(&ctas_engine))
-                        .map_err(|error| format!("bind CTAS recovery before controller start: {error}"))?;
-                    let truncate_engine = engine.truncate_engine();
-                    let add_files_engine = engine.add_files_engine();
-                    Ok(Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
-                        engine,
-                        query_control,
-                        query_execution,
-                        role,
-                        topology,
-                        dml,
-                        insert_engine,
-                        delete_engine,
-                        mutation_engine,
-                        add_files_engine,
-                        ctas_engine,
-                        truncate_engine,
-                        optimizer_query_mem_limit_bytes,
-                    )))
+            let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
+                novarocks::engine::StandaloneOptions {
+                    config_path: config.config_path,
                 },
+                config.config,
+                services,
+            )
+            .map_err(FrontendApplicationError::server)?;
+            let insert_engine = engine.insert_engine();
+            let delete_engine = engine.delete_engine();
+            let mutation_engine = engine.mutation_engine();
+            let ctas_engine = engine.ctas_engine();
+            ctas_recovery
+                .install_ctas_engine(Arc::clone(&ctas_engine))
+                .map_err(|error| {
+                    FrontendApplicationError::server(format!(
+                        "bind CTAS recovery before controller start: {error}"
+                    ))
+                })?;
+            let truncate_engine = engine.truncate_engine();
+            let add_files_engine = engine.add_files_engine();
+            let session_factory =
+                Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
+                    engine,
+                    query_control,
+                    query_execution,
+                    role,
+                    topology,
+                    dml,
+                    insert_engine,
+                    delete_engine,
+                    mutation_engine,
+                    add_files_engine,
+                    ctas_engine,
+                    truncate_engine,
+                    optimizer_query_mem_limit_bytes,
+                ));
+            let server_result = novarocks::server::run_mysql_server_until_shutdown(
+                listener,
+                session_factory,
                 shutdown,
             )
             .await
-            .map_err(|error| {
-                FrontendApplicationError::server(format!("standalone server failed: {error}"))
-            });
-            let stop_result = report_server.stop().map_err(FrontendApplicationError::server);
+            .map_err(FrontendApplicationError::server);
+            let stop_result = report_server
+                .stop()
+                .map_err(FrontendApplicationError::server);
             combine_server_and_shutdown(server_result, stop_result)
         },
         |host| async move { host.shutdown().await },
@@ -284,11 +298,7 @@ where
         },
         move |host| {
             (
-                standalone_open_services(
-                    system_catalog,
-                    host,
-                    Arc::clone(&mv_storage_observation),
-                ),
+                standalone_open_services(system_catalog, host, Arc::clone(&mv_storage_observation)),
                 host.dml_service(),
                 host.ctas_recovery_binding(),
                 host.terminal_ingress(),
@@ -302,48 +312,65 @@ where
             )
             .map_err(FrontendApplicationError::server)?;
             services.exchange_port = report_server.bound_addr().port();
+            services
+                .coordinator_report_endpoint
+                .set_bound_port(services.exchange_port);
+            let listener = novarocks::server::resolve_mysql_listener_settings(
+                &config.config,
+                config.port_override,
+            )
+            .map_err(FrontendApplicationError::server)?;
             let query_control = services.query_control.clone();
             let query_execution = services.query_execution.clone();
             let topology = services.backend_topology.clone();
             let role = services.execution_role;
-            let server_result = novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
-                config.config,
-                config.config_path,
-                config.port_override,
-                services,
-                move |engine| {
-                    let insert_engine = engine.insert_engine();
-                    let delete_engine = engine.delete_engine();
-                    let mutation_engine = engine.mutation_engine();
-                    let ctas_engine = engine.ctas_engine();
-                    ctas_recovery
-                        .install_ctas_engine(Arc::clone(&ctas_engine))
-                        .map_err(|error| format!("bind CTAS recovery before controller start: {error}"))?;
-                    let truncate_engine = engine.truncate_engine();
-                    let add_files_engine = engine.add_files_engine();
-                    Ok(Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
-                        engine,
-                        query_control,
-                        query_execution,
-                        role,
-                        topology,
-                        dml,
-                        insert_engine,
-                        delete_engine,
-                        mutation_engine,
-                        add_files_engine,
-                        ctas_engine,
-                        truncate_engine,
-                        optimizer_query_mem_limit_bytes,
-                    )))
+            let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
+                novarocks::engine::StandaloneOptions {
+                    config_path: config.config_path,
                 },
+                config.config,
+                services,
+            )
+            .map_err(FrontendApplicationError::server)?;
+            let insert_engine = engine.insert_engine();
+            let delete_engine = engine.delete_engine();
+            let mutation_engine = engine.mutation_engine();
+            let ctas_engine = engine.ctas_engine();
+            ctas_recovery
+                .install_ctas_engine(Arc::clone(&ctas_engine))
+                .map_err(|error| {
+                    FrontendApplicationError::server(format!(
+                        "bind CTAS recovery before controller start: {error}"
+                    ))
+                })?;
+            let truncate_engine = engine.truncate_engine();
+            let add_files_engine = engine.add_files_engine();
+            let session_factory =
+                Arc::new(crate::query::FrontendQueryService::new_with_recovery_bound(
+                    engine,
+                    query_control,
+                    query_execution,
+                    role,
+                    topology,
+                    dml,
+                    insert_engine,
+                    delete_engine,
+                    mutation_engine,
+                    add_files_engine,
+                    ctas_engine,
+                    truncate_engine,
+                    optimizer_query_mem_limit_bytes,
+                ));
+            let server_result = novarocks::server::run_mysql_server_until_shutdown(
+                listener,
+                session_factory,
                 shutdown,
             )
             .await
-            .map_err(|error| {
-                FrontendApplicationError::server(format!("standalone server failed: {error}"))
-            });
-            let stop_result = report_server.stop().map_err(FrontendApplicationError::server);
+            .map_err(FrontendApplicationError::server);
+            let stop_result = report_server
+                .stop()
+                .map_err(FrontendApplicationError::server);
             combine_server_and_shutdown(server_result, stop_result)
         },
         |host| async move { host.shutdown().await },
