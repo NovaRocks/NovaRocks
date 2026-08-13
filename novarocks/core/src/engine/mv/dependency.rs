@@ -48,8 +48,14 @@ pub(crate) fn ensure_no_downstream_dependencies(
     state: &Arc<StandaloneState>,
     upstream: &MvDependencyObjectRef,
 ) -> Result<(), String> {
-    state
-        .mv_repository
+    ensure_no_downstream_dependencies_with_repository(state.mv_repository.as_ref(), upstream)
+}
+
+pub(crate) fn ensure_no_downstream_dependencies_with_repository(
+    repository: &dyn MvRepository,
+    upstream: &MvDependencyObjectRef,
+) -> Result<(), String> {
+    repository
         .ensure_no_downstream_dependencies(upstream)
         .map_err(|e| e.to_string())
 }

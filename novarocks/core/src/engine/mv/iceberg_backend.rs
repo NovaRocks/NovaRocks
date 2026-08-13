@@ -17,7 +17,7 @@
 
 //! Iceberg-backed materialized-view backend.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use crate::connector::backend::MvBackend;
 use crate::engine::StandaloneState;
@@ -25,20 +25,24 @@ use crate::engine::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsReques
 use crate::mv::model::MvStorageEngine;
 
 pub(crate) struct IcebergMvBackend {
-    state: Weak<StandaloneState>,
+    ports: crate::engine::mv::iceberg_refresh::IcebergMvCorePorts,
 }
 
 impl IcebergMvBackend {
     pub(crate) fn new(state: &Arc<StandaloneState>) -> Self {
-        Self {
-            state: Arc::downgrade(state),
-        }
+        Self::new_with_ports(crate::engine::mv::iceberg_refresh::IcebergMvCorePorts::new(
+            Arc::clone(&state.catalog_service),
+            state.catalog_application.clone(),
+            Arc::clone(&state.connector_control),
+            Arc::clone(&state.mv_repository),
+            Arc::clone(&state.mv_storage_observation),
+        ))
     }
 
-    fn state(&self) -> Result<Arc<StandaloneState>, String> {
-        self.state
-            .upgrade()
-            .ok_or_else(|| "standalone state dropped".to_string())
+    pub(crate) fn new_with_ports(
+        ports: crate::engine::mv::iceberg_refresh::IcebergMvCorePorts,
+    ) -> Self {
+        Self { ports }
     }
 }
 
@@ -48,9 +52,8 @@ impl MvBackend for IcebergMvBackend {
     }
 
     fn create_mv(&self, req: CreateMvRequest) -> Result<(), String> {
-        let state = self.state()?;
-        crate::engine::mv::iceberg_refresh::create_iceberg_mv_with_connector_context(
-            &state,
+        crate::engine::mv::iceberg_refresh::create_iceberg_mv_with_ports(
+            self.ports.clone(),
             req.current_catalog.as_deref(),
             &req.current_database,
             &req.stmt,
@@ -60,9 +63,8 @@ impl MvBackend for IcebergMvBackend {
     }
 
     fn drop_mv(&self, req: DropMvRequest) -> Result<(), String> {
-        let state = self.state()?;
-        crate::engine::mv::iceberg_refresh::drop_iceberg_mv_with_connector_context(
-            &state,
+        crate::engine::mv::iceberg_refresh::drop_iceberg_mv_with_ports(
+            &self.ports,
             req.current_catalog.as_deref(),
             &req.current_database,
             &req.stmt,
@@ -72,9 +74,8 @@ impl MvBackend for IcebergMvBackend {
     }
 
     fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
-        let state = self.state()?;
-        crate::engine::mv::analysis_adapter::list_mv_rows(
-            &state,
+        crate::engine::mv::analysis_adapter::list_mv_rows_with_ports(
+            self.ports.repository().as_ref(),
             req.current_catalog.as_deref(),
             &req.stmt,
             Some(MvStorageEngine::Iceberg),

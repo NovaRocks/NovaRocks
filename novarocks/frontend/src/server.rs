@@ -228,6 +228,7 @@ where
             let backend_command_executor = engine.backend_command_executor();
             let view_command_executor = engine.view_command_executor();
             let iceberg_ref_command_executor = engine.iceberg_ref_command_executor();
+            let mv_command_executor = engine.mv_command_executor();
             let maintenance_read_command_executor = engine.maintenance_read_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
@@ -252,6 +253,7 @@ where
                     backend_command_executor,
                     view_command_executor,
                     iceberg_ref_command_executor,
+                    mv_command_executor,
                     maintenance_read_command_executor,
                     query_control,
                     query_execution,
@@ -357,6 +359,7 @@ where
             let backend_command_executor = engine.backend_command_executor();
             let view_command_executor = engine.view_command_executor();
             let iceberg_ref_command_executor = engine.iceberg_ref_command_executor();
+            let mv_command_executor = engine.mv_command_executor();
             let maintenance_read_command_executor = engine.maintenance_read_command_executor();
             let insert_engine = engine.insert_engine();
             let delete_engine = engine.delete_engine();
@@ -381,6 +384,7 @@ where
                     backend_command_executor,
                     view_command_executor,
                     iceberg_ref_command_executor,
+                    mv_command_executor,
                     maintenance_read_command_executor,
                     query_control,
                     query_execution,

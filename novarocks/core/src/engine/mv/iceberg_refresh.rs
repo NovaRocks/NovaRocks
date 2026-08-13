@@ -1556,6 +1556,10 @@ impl IcebergMvCorePorts {
             storage_observation,
         }
     }
+
+    pub(crate) fn repository(&self) -> &Arc<dyn MvRepository> {
+        &self.repository
+    }
 }
 
 impl crate::engine::CatalogServiceSource for IcebergMvCorePorts {
@@ -2465,9 +2469,32 @@ pub(crate) fn create_iceberg_mv_with_connector_context(
     stmt: &CreateMaterializedViewStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    let ports = IcebergMvCorePorts::new(
+        Arc::clone(&state.catalog_service),
+        state.catalog_application.clone(),
+        Arc::clone(&state.connector_control),
+        Arc::clone(&state.mv_repository),
+        Arc::clone(&state.mv_storage_observation),
+    );
+    create_iceberg_mv_with_ports(
+        ports,
+        current_catalog,
+        current_database,
+        stmt,
+        connector_context,
+    )
+}
+
+pub(crate) fn create_iceberg_mv_with_ports(
+    ports: IcebergMvCorePorts,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &CreateMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
     let statement = MvCreateStatement::from(stmt);
-    let engine = StandaloneMvEngine::new(Arc::clone(state), connector_context.clone());
+    let engine = StandaloneMvEngine::new_with_ports(ports.clone(), connector_context.clone());
     let plan = engine
         .prepare_create(
             PrepareMvCreateRequest {
@@ -2477,7 +2504,7 @@ pub(crate) fn create_iceberg_mv_with_connector_context(
                     current_database,
                 },
             },
-            state.mv_repository.as_ref(),
+            ports.repository.as_ref(),
         )
         .map_err(|error| error.to_string())?;
     let operation_id = uuid::Uuid::now_v7();
@@ -2494,8 +2521,8 @@ pub(crate) fn create_iceberg_mv_with_connector_context(
             ));
         }
     };
-    let definition = match state
-        .mv_repository
+    let definition = match ports
+        .repository
         .create(operation_id, definition.repository_request)
     {
         Ok(definition) => definition,
@@ -10570,17 +10597,44 @@ pub(crate) fn drop_iceberg_mv_with_connector_context(
     stmt: &DropMaterializedViewStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    let ports = IcebergMvCorePorts::new(
+        Arc::clone(&state.catalog_service),
+        state.catalog_application.clone(),
+        Arc::clone(&state.connector_control),
+        Arc::clone(&state.mv_repository),
+        Arc::clone(&state.mv_storage_observation),
+    );
+    drop_iceberg_mv_with_ports(
+        &ports,
+        current_catalog,
+        current_database,
+        stmt,
+        connector_context,
+    )
+}
+
+pub(crate) fn drop_iceberg_mv_with_ports(
+    ports: &IcebergMvCorePorts,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &DropMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_drop_target(current_catalog, current_database, &stmt.name)?;
-    if !preflight_iceberg_mv_drop(state, &target, stmt.if_exists)? {
+    if !preflight_iceberg_mv_drop_with_repository(
+        ports.repository.as_ref(),
+        &target,
+        stmt.if_exists,
+    )? {
         return Ok(StatementResult::Ok);
     }
 
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
     crate::connector::mutation::execute_catalog_mutation(
-        state.connector_control.as_ref(),
+        ports.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
             table: novarocks_spi::connector::ConnectorTableIdentity {
@@ -10593,9 +10647,9 @@ pub(crate) fn drop_iceberg_mv_with_connector_context(
         },
         connector_context.clone(),
     )?;
-    drop_iceberg_mv_metadata(state, &target)?;
+    drop_iceberg_mv_metadata_with_repository(ports.repository.as_ref(), &target)?;
     crate::engine::query_prep::drop_local_table_registration_if_exists(
-        state,
+        ports,
         &target.namespace,
         &target.table,
     )?;
@@ -10613,8 +10667,14 @@ fn drop_iceberg_mv_metadata(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
-    let dropped = state
-        .mv_repository
+    drop_iceberg_mv_metadata_with_repository(state.mv_repository.as_ref(), target)
+}
+
+fn drop_iceberg_mv_metadata_with_repository(
+    repository: &dyn MvRepository,
+    target: &IcebergMvTarget,
+) -> Result<(), String> {
+    let dropped = repository
         .drop_by_target(&crate::mv::model::MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
@@ -10635,8 +10695,15 @@ fn preflight_iceberg_mv_drop(
     target: &IcebergMvTarget,
     if_exists: bool,
 ) -> Result<bool, String> {
-    let Some(definition) = state
-        .mv_repository
+    preflight_iceberg_mv_drop_with_repository(state.mv_repository.as_ref(), target, if_exists)
+}
+
+fn preflight_iceberg_mv_drop_with_repository(
+    repository: &dyn MvRepository,
+    target: &IcebergMvTarget,
+    if_exists: bool,
+) -> Result<bool, String> {
+    let Some(definition) = repository
         .find_by_target(&crate::mv::model::MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
@@ -10658,8 +10725,8 @@ fn preflight_iceberg_mv_drop(
             target.catalog, target.namespace, target.table
         ));
     }
-    crate::engine::mv::dependency::ensure_no_downstream_dependencies(
-        state,
+    crate::engine::mv::dependency::ensure_no_downstream_dependencies_with_repository(
+        repository,
         &crate::mv::dependency::model::iceberg_mv_dependency_ref(
             &target.catalog,
             &target.namespace,

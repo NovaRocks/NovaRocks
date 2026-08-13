@@ -68,6 +68,7 @@ pub mod mutation_engine;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_background;
+pub mod mv_command;
 pub(crate) mod mv_first_refresh_staging;
 pub(crate) mod mv_flow;
 pub(crate) mod mv_maintenance;
@@ -2105,6 +2106,30 @@ impl StandaloneNovaRocks {
     ) -> maintenance_command::MaintenanceReadCommandExecutor {
         maintenance_command::MaintenanceReadCommandExecutor::new(Arc::clone(
             &self.inner.table_maintenance_service,
+        ))
+    }
+
+    /// Transitional factory for the closed non-refresh MV command capability.
+    /// The returned executor owns only explicit MV ports and cannot reach the
+    /// application facade or `StandaloneState`.
+    pub fn mv_command_executor(&self) -> mv_command::MvCommandExecutor {
+        let ports = mv::iceberg_refresh::IcebergMvCorePorts::new(
+            Arc::clone(&self.inner.catalog_service),
+            self.inner.catalog_application.clone(),
+            Arc::clone(&self.inner.connector_control),
+            Arc::clone(&self.inner.mv_repository),
+            Arc::clone(&self.inner.mv_storage_observation),
+        );
+        let backend = Arc::new(mv::iceberg_backend::IcebergMvBackend::new_with_ports(ports));
+        mv_command::MvCommandExecutor::new(domain::MvExecutionKernel::new(
+            Arc::clone(&self.inner.catalog_service),
+            self.inner.catalog_application.clone(),
+            Arc::clone(&self.inner.connector_control),
+            backend,
+            Arc::clone(&self.inner.mv_repository),
+            Arc::clone(&self.inner.mv_application_service),
+            Arc::clone(&self.inner.mv_storage_observation),
+            self.inner.query_execution.clone(),
         ))
     }
 
