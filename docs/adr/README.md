@@ -111,6 +111,7 @@ code-anchors:
 - ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（active）
 - ADR-0069 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
 - ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（active）
+- ADR-0075 — durable caller 为何通过既有 exact metadata lease capture/rebind 物理表对象，而不依赖统计能力或新增平行 authority（active）
 
 #### 历史
 

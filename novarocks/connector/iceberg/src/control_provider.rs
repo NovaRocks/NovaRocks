@@ -34,7 +34,9 @@ use novarocks_spi::connector::{
     ConnectorStagedPublicationProof, ConnectorStagedPublicationRecovery,
     ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
     ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
-    ConnectorTableMetadata, ConnectorTablePlanningFacts, ConnectorTableRequest,
+    ConnectorTableMetadata, ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
+    ConnectorTableObjectSelector, ConnectorTablePlanningFacts, ConnectorTableRequest,
     ConnectorTableResolution, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, validate_static_predicates,
 };
@@ -147,6 +149,47 @@ impl IcebergControlProvider {
             ));
         }
         Ok(())
+    }
+
+    fn require_current_table_object_selector(
+        &self,
+        selector: ConnectorTableObjectSelector,
+    ) -> Result<(), ConnectorError> {
+        match selector {
+            ConnectorTableObjectSelector::Current => Ok(()),
+            _ => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table object binding selector is unsupported",
+            )),
+        }
+    }
+
+    fn current_table_object_binding(
+        &self,
+        table: ConnectorTableIdentity,
+        resolution: ConnectorTableResolution,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        let metadata = self.load_table(ConnectorTableRequest {
+            table,
+            resolution,
+            context,
+        })?;
+        // Design: ADR-0075 (docs/adr/ADR-0075-connector-physical-table-object-bindings.md)
+        // Reuse the UUID frozen into this exact metadata observation instead of
+        // issuing a second catalog lookup or deriving identity from a name.
+        let table_payload = self.table_payload(&metadata.table)?;
+        let table_uuid = table_payload
+            .table_info
+            .as_ref()
+            .and_then(|table_info| table_info.table_uuid.as_deref())
+            .ok_or_else(|| corrupt("Iceberg table metadata is missing its physical UUID"))?;
+        let object_id =
+            ConnectorTableObjectId::try_new(Bytes::copy_from_slice(table_uuid.as_bytes()))?;
+        Ok(ConnectorTableObjectBinding {
+            metadata,
+            object_id,
+        })
     }
 
     pub(crate) fn table_payload(
@@ -304,6 +347,41 @@ impl ConnectorMetadata for IcebergControlProvider {
             .load_table(&request.table.namespace, &request.table.table)
             .map_err(unavailable)?;
         read_reference_facts(loaded.table.metadata(), &request.context)
+    }
+
+    fn capture_table_object_binding(
+        &self,
+        request: ConnectorTableObjectCaptureRequest,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        self.require_current_table_object_selector(request.selector)?;
+        self.current_table_object_binding(request.table, request.resolution, request.context)
+    }
+
+    fn rebind_table_object_binding(
+        &self,
+        request: ConnectorTableObjectRebindRequest,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        self.require_current_table_object_selector(request.selector)?;
+        let expected_object_id = request.expected_object_id;
+        let binding = self
+            .current_table_object_binding(request.table, request.resolution, request.context)
+            .map_err(|error| {
+                if error.kind() == ConnectorErrorKind::NotFound {
+                    ConnectorError::table_object_binding(
+                        ConnectorTableObjectBindingFailure::Missing,
+                        "Iceberg table no longer resolves for its durable object binding",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        if binding.object_id != expected_object_id {
+            return Err(ConnectorError::table_object_binding(
+                ConnectorTableObjectBindingFailure::Replaced,
+                "Iceberg table no longer matches its durable object binding",
+            ));
+        }
+        Ok(binding)
     }
 
     fn load_table(

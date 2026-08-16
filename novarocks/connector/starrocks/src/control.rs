@@ -822,7 +822,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_spi::connector::{
         ConnectorBatchBudget, ConnectorCancellation, ConnectorReadSelector,
-        ConnectorTableResolution,
+        ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+        ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     };
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1064,5 +1065,51 @@ mod tests {
             error.to_string(),
             "Unsupported: StarRocks connector does not support change-window scans"
         );
+    }
+
+    #[test]
+    fn physical_table_object_binding_is_explicitly_unsupported() {
+        let (binding, _, _) = binding(
+            crate::StarRocksReadPolicy::Auto,
+            crate::StarRocksTopology::SharedData,
+            true,
+        );
+        let table = ConnectorTableIdentity {
+            instance_id: binding.descriptor().instance_id.clone(),
+            namespace: Arc::from("db"),
+            table: Arc::from("t"),
+        };
+
+        let capture = match binding.metadata().capture_table_object_binding(
+            ConnectorTableObjectCaptureRequest {
+                table: table.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context: context(),
+            },
+        ) {
+            Ok(_) => panic!("StarRocks must not synthesize a physical table object ID"),
+            Err(error) => error,
+        };
+        assert_eq!(capture.kind(), ConnectorErrorKind::Unsupported);
+        assert!(!capture.is_table_object_binding_failure());
+        assert_eq!(capture.table_object_binding_failure(), None);
+
+        let rebind = match binding.metadata().rebind_table_object_binding(
+            ConnectorTableObjectRebindRequest {
+                table,
+                expected_object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"id"))
+                    .expect("test object ID"),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context: context(),
+            },
+        ) {
+            Ok(_) => panic!("StarRocks must not rebind a physical table object ID"),
+            Err(error) => error,
+        };
+        assert_eq!(rebind.kind(), ConnectorErrorKind::Unsupported);
+        assert!(!rebind.is_table_object_binding_failure());
+        assert_eq!(rebind.table_object_binding_failure(), None);
     }
 }

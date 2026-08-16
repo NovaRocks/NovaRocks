@@ -2663,7 +2663,9 @@ mod tests {
 
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorRequestContext,
+        ConnectorMetadata, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest,
+        ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -2682,8 +2684,8 @@ mod tests {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
             Arc::new(NeverCancelled),
-            1024,
-            4096,
+            64 * 1024,
+            256 * 1024,
         )
         .expect("context")
     }
@@ -2783,6 +2785,30 @@ mod tests {
         )
         .expect("create guarded table");
         table
+    }
+
+    fn object_binding_capture_request(
+        table: ConnectorTableIdentity,
+    ) -> ConnectorTableObjectCaptureRequest {
+        ConnectorTableObjectCaptureRequest {
+            table,
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context(),
+        }
+    }
+
+    fn object_binding_rebind_request(
+        table: ConnectorTableIdentity,
+        expected_object_id: novarocks_spi::connector::ConnectorTableObjectId,
+    ) -> ConnectorTableObjectRebindRequest {
+        ConnectorTableObjectRebindRequest {
+            table,
+            expected_object_id,
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context(),
+        }
     }
 
     fn create_namespace(provider: &IcebergControlProvider, name: &str) {
@@ -3037,6 +3063,88 @@ mod tests {
             ExternalMutationOutcome::KnownUncommitted { failure }
                 if failure.kind() == ConnectorMutationFailureKind::Conflict
         ));
+    }
+
+    #[test]
+    fn object_binding_rebind_rejects_replaced_and_missing_hadoop_tables() {
+        let (_executor, _warehouse, provider) = provider();
+        let table = guarded_table(&provider);
+        let captured = provider
+            .capture_table_object_binding(object_binding_capture_request(table.clone()))
+            .expect("capture current Iceberg table object");
+
+        let rebound = provider
+            .rebind_table_object_binding(object_binding_rebind_request(
+                table.clone(),
+                captured.object_id.clone(),
+            ))
+            .expect("rebind unchanged Iceberg table object");
+        assert_eq!(rebound.object_id, captured.object_id);
+        let rebound_payload = provider
+            .table_payload(&rebound.metadata.table)
+            .expect("rebound table handle remains provider-owned and usable");
+        let rebound_uuid = rebound_payload
+            .table_info
+            .as_ref()
+            .and_then(|table_info| table_info.table_uuid.as_deref())
+            .expect("rebound metadata carries the observed Iceberg table UUID");
+        assert_eq!(rebound_uuid.as_bytes(), rebound.object_id.as_bytes());
+
+        drop_table(
+            &provider,
+            &table,
+            DropPolicy::FailIfMissing,
+            ConnectorDropTableDataDisposition::Purge,
+        )
+        .expect("drop captured Iceberg table");
+        create_table(
+            &provider,
+            &table,
+            &[ConnectorColumnDefinition {
+                name: "id".into(),
+                data_type: ConnectorDataType::BigInt,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+            CreatePolicy::FailIfExists,
+        )
+        .expect("recreate logical Iceberg table with a new physical UUID");
+
+        let replaced = match provider.rebind_table_object_binding(object_binding_rebind_request(
+            table.clone(),
+            captured.object_id.clone(),
+        )) {
+            Ok(_) => panic!("rebind must reject a replacement physical table"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            replaced.table_object_binding_failure(),
+            Some(ConnectorTableObjectBindingFailure::Replaced)
+        );
+        assert!(!replaced.retryable_before_progress());
+
+        drop_table(
+            &provider,
+            &table,
+            DropPolicy::FailIfMissing,
+            ConnectorDropTableDataDisposition::Purge,
+        )
+        .expect("drop replacement Iceberg table");
+        let missing = match provider
+            .rebind_table_object_binding(object_binding_rebind_request(table, captured.object_id))
+        {
+            Ok(_) => panic!("rebind must reject a missing physical table"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            missing.table_object_binding_failure(),
+            Some(ConnectorTableObjectBindingFailure::Missing)
+        );
+        assert!(!missing.retryable_before_progress());
     }
 
     #[test]
