@@ -125,7 +125,10 @@ pub use domain_facts::{
     MAX_CONNECTOR_SCAN_UNIT_FACT_COLUMNS, MAX_CONNECTOR_SCAN_UNIT_FACT_PAYLOAD_BYTES,
     MAX_CONNECTOR_SCAN_UNIT_FACT_VARIABLE_VALUE_BYTES,
 };
-pub use error::{ConnectorError, ConnectorErrorKind, ConnectorExternalFenceFailure};
+pub use error::{
+    ConnectorError, ConnectorErrorKind, ConnectorExternalFenceFailure,
+    ConnectorTableObjectBindingFailure,
+};
 pub use execution::{
     ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionInstaller,
     ConnectorExecutionResolver, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
@@ -193,10 +196,12 @@ pub use metadata::{
     ConnectorTableColumnVisibility, ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
     ConnectorTableDefinitionStructField, ConnectorTableDefinitionType,
     ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
-    ConnectorTableUniqueConstraint, MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH,
-    MAX_CONNECTOR_COLUMN_DEFAULT_NODES, MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS,
-    MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH, MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES,
+    ConnectorTableObjectBinding, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+    ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTablePlanningFacts,
+    ConnectorTableRequest, ConnectorTableResolution, ConnectorTableUniqueConstraint,
+    MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH, MAX_CONNECTOR_COLUMN_DEFAULT_NODES,
+    MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS, MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH,
+    MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES, MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS,

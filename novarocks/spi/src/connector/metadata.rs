@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, SchemaRef};
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle,
@@ -68,6 +70,64 @@ pub struct ConnectorTableIdentity {
     pub instance_id: ConnectorInstanceId,
     pub namespace: Arc<str>,
     pub table: Arc<str>,
+}
+
+/// Maximum durable payload size for one provider-owned physical table object
+/// identifier. This is deliberately far below a frontend durable record budget
+/// and is independent from table-handle wire bounds.
+pub const MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES: usize = 256;
+
+/// Opaque provider-owned identity for one physical table object.
+///
+/// Unlike [`ConnectorTableIdentity`], which is a logical name triplet used for
+/// catalog lookup, this value answers whether a lookup still denotes the same
+/// physical object across versions. Core and frontend may compare and persist
+/// it, but must not parse or rewrite its bytes.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct ConnectorTableObjectId(Bytes);
+
+impl ConnectorTableObjectId {
+    pub fn try_new(bytes: Bytes) -> Result<Self, ConnectorError> {
+        if bytes.is_empty() {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::InvalidRequest,
+                "connector table object ID must not be empty",
+            ));
+        }
+        if bytes.len() > MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::ResourceExhausted,
+                "connector table object ID exceeds the durable payload limit",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ConnectorTableObjectId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let digest: [u8; 32] = Sha256::digest(&self.0).into();
+        formatter
+            .debug_struct("ConnectorTableObjectId")
+            .field("len", &self.0.len())
+            .field("digest", &digest)
+            .finish()
+    }
+}
+
+/// Selects which table version a physical-object binding resolves.
+///
+/// STAT-2B supports only the current version. New variants must be handled
+/// explicitly by every provider, so an implementation can never silently
+/// reinterpret an unknown selector as current.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnectorTableObjectSelector {
+    Current,
 }
 
 /// SQL exposure of one field in the frozen Arrow schema.
@@ -1073,6 +1133,34 @@ pub struct ConnectorTableRequest {
     pub context: ConnectorRequestContext,
 }
 
+/// A current metadata binding paired with the provider's physical table object
+/// identity from the same catalog observation.
+#[derive(Clone)]
+pub struct ConnectorTableObjectBinding {
+    pub metadata: ConnectorTableMetadata,
+    pub object_id: ConnectorTableObjectId,
+}
+
+/// Request to capture the current physical object identity for a logical table.
+#[derive(Clone)]
+pub struct ConnectorTableObjectCaptureRequest {
+    pub table: ConnectorTableIdentity,
+    pub resolution: ConnectorTableResolution,
+    pub selector: ConnectorTableObjectSelector,
+    pub context: ConnectorRequestContext,
+}
+
+/// Request to bind a logical table only if it remains the expected physical
+/// object. The expected object ID is never optional.
+#[derive(Clone)]
+pub struct ConnectorTableObjectRebindRequest {
+    pub table: ConnectorTableIdentity,
+    pub expected_object_id: ConnectorTableObjectId,
+    pub resolution: ConnectorTableResolution,
+    pub selector: ConnectorTableObjectSelector,
+    pub context: ConnectorRequestContext,
+}
+
 #[derive(Clone)]
 pub struct ConnectorListTablesRequest {
     pub namespace: ConnectorNamespaceIdentity,
@@ -1257,6 +1345,33 @@ pub trait ConnectorMetadata: Send + Sync {
         ))
     }
 
+    /// Capture a current metadata binding and its provider-owned physical object
+    /// identity. Providers that cannot prove a cross-version-stable identity
+    /// must reject this explicitly instead of synthesizing one from a logical
+    /// name or version token.
+    fn capture_table_object_binding(
+        &self,
+        _request: ConnectorTableObjectCaptureRequest,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector metadata does not support physical table object binding",
+        ))
+    }
+
+    /// Rebind a logical table to its current metadata only when it still denotes
+    /// the expected physical object. A replacement or missing target must use
+    /// `ConnectorTableObjectBindingFailure`, never an untyped message match.
+    fn rebind_table_object_binding(
+        &self,
+        _request: ConnectorTableObjectRebindRequest,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector metadata does not support physical table object rebinding",
+        ))
+    }
+
     fn load_table(
         &self,
         request: ConnectorTableRequest,
@@ -1280,6 +1395,44 @@ mod tests {
         }
     }
 
+    struct MetadataWithoutObjectBinding {
+        instance_id: ConnectorInstanceId,
+    }
+
+    impl ConnectorMetadata for MetadataWithoutObjectBinding {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance_id
+        }
+
+        fn namespace_exists(
+            &self,
+            _request: ConnectorNamespaceRequest,
+        ) -> Result<bool, ConnectorError> {
+            Ok(false)
+        }
+
+        fn table_exists(&self, _request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            Ok(false)
+        }
+
+        fn list_tables(
+            &self,
+            _request: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            Ok(Vec::new())
+        }
+
+        fn load_table(
+            &self,
+            _request: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            Err(ConnectorError::new(
+                super::super::ConnectorErrorKind::Unsupported,
+                "test metadata does not load tables",
+            ))
+        }
+    }
+
     fn context(total_payload_bytes: usize) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
@@ -1288,6 +1441,65 @@ mod tests {
             total_payload_bytes,
         )
         .expect("valid connector request context")
+    }
+
+    #[test]
+    fn stat2b_table_object_id_is_bounded_comparable_and_redacted() {
+        let id = ConnectorTableObjectId::try_new(Bytes::from_static(b"physical-table"))
+            .expect("non-empty bounded object ID");
+        let same = ConnectorTableObjectId::try_new(Bytes::from_static(b"physical-table"))
+            .expect("same object ID");
+        assert_eq!(id, same);
+        let debug = format!("{id:?}");
+        assert!(debug.contains("len"));
+        assert!(!debug.contains("physical-table"));
+
+        let empty = ConnectorTableObjectId::try_new(Bytes::new()).expect_err("empty ID rejected");
+        assert_eq!(
+            empty.kind(),
+            super::super::ConnectorErrorKind::InvalidRequest
+        );
+        let oversized = ConnectorTableObjectId::try_new(Bytes::from(vec![7; 257]))
+            .expect_err("object ID above durable limit rejected");
+        assert_eq!(
+            oversized.kind(),
+            super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn stat2b_optional_object_binding_methods_fail_explicitly() {
+        let metadata = MetadataWithoutObjectBinding {
+            instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance ID"),
+        };
+        let table = referenced_table();
+        let capture =
+            match metadata.capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+                table: table.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context: context(1024),
+            }) {
+                Ok(_) => panic!("default capture must remain explicitly unsupported"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            capture.kind(),
+            super::super::ConnectorErrorKind::Unsupported
+        );
+
+        let rebind = match metadata.rebind_table_object_binding(ConnectorTableObjectRebindRequest {
+            table,
+            expected_object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"id"))
+                .expect("bounded object ID"),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context(1024),
+        }) {
+            Ok(_) => panic!("default rebind must remain explicitly unsupported"),
+            Err(error) => error,
+        };
+        assert_eq!(rebind.kind(), super::super::ConnectorErrorKind::Unsupported);
     }
 
     #[test]

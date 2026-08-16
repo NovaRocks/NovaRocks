@@ -50,6 +50,20 @@ pub enum ConnectorExternalFenceFailure {
     NotEstablished,
 }
 
+/// Typed classification for a current-table binding rejection.
+///
+/// A durable caller must distinguish a missing logical target from a target
+/// whose name was rebound to another physical object. Neither condition is a
+/// transient catalog outage, and treating either as one could make a retry
+/// silently attach work to a replacement table.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ConnectorTableObjectBindingFailure {
+    /// The logical target now resolves to another physical table object.
+    Replaced,
+    /// The logical target no longer resolves to a table object.
+    Missing,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorError {
     kind: ConnectorErrorKind,
@@ -57,6 +71,7 @@ pub struct ConnectorError {
     retryable_before_progress: bool,
     cleanup_context: Option<String>,
     external_fence_failure: Option<ConnectorExternalFenceFailure>,
+    table_object_binding_failure: Option<ConnectorTableObjectBindingFailure>,
 }
 
 impl ConnectorError {
@@ -67,6 +82,7 @@ impl ConnectorError {
             retryable_before_progress: false,
             cleanup_context: None,
             external_fence_failure: None,
+            table_object_binding_failure: None,
         }
     }
 
@@ -85,6 +101,25 @@ impl ConnectorError {
             retryable_before_progress: false,
             cleanup_context: None,
             external_fence_failure: Some(failure),
+            table_object_binding_failure: None,
+        }
+    }
+
+    /// Report a terminal, typed current-table binding failure.
+    pub fn table_object_binding(
+        failure: ConnectorTableObjectBindingFailure,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: match failure {
+                ConnectorTableObjectBindingFailure::Replaced => ConnectorErrorKind::InvalidRequest,
+                ConnectorTableObjectBindingFailure::Missing => ConnectorErrorKind::NotFound,
+            },
+            message: message.into(),
+            retryable_before_progress: false,
+            cleanup_context: None,
+            external_fence_failure: None,
+            table_object_binding_failure: Some(failure),
         }
     }
 
@@ -107,6 +142,16 @@ impl ConnectorError {
         self.external_fence_failure.is_some()
     }
 
+    /// The typed current-table binding classification, when this error is one.
+    pub const fn table_object_binding_failure(&self) -> Option<ConnectorTableObjectBindingFailure> {
+        self.table_object_binding_failure
+    }
+
+    /// Whether this error rejects a durable table binding without a safe retry.
+    pub const fn is_table_object_binding_failure(&self) -> bool {
+        self.table_object_binding_failure.is_some()
+    }
+
     pub const fn retryable_before_progress(&self) -> bool {
         self.retryable_before_progress
     }
@@ -115,7 +160,7 @@ impl ConnectorError {
         // An external fence failure stays non-retryable: repeating the same
         // superseded authority can only fail again, and a caller that retried
         // it would be attempting an unfenced write.
-        if self.external_fence_failure.is_none() {
+        if self.external_fence_failure.is_none() && self.table_object_binding_failure.is_none() {
             self.retryable_before_progress = true;
         }
         self
@@ -174,5 +219,26 @@ mod tests {
             .with_retryable_before_progress();
         assert!(error.retryable_before_progress());
         assert!(!error.is_external_fence_failure());
+    }
+
+    #[test]
+    fn table_object_binding_failures_stay_typed_and_non_retryable() {
+        for (failure, kind) in [
+            (
+                ConnectorTableObjectBindingFailure::Replaced,
+                ConnectorErrorKind::InvalidRequest,
+            ),
+            (
+                ConnectorTableObjectBindingFailure::Missing,
+                ConnectorErrorKind::NotFound,
+            ),
+        ] {
+            let error = ConnectorError::table_object_binding(failure, "table binding rejected")
+                .with_retryable_before_progress();
+            assert!(error.is_table_object_binding_failure());
+            assert_eq!(error.table_object_binding_failure(), Some(failure));
+            assert_eq!(error.kind(), kind);
+            assert!(!error.retryable_before_progress());
+        }
     }
 }
