@@ -58,7 +58,7 @@ use novarocks::statistics::command::StatisticsCommandExecutor;
 use novarocks::view::view_command::ViewCommandExecutor;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_types::ClusterRole;
 use tokio::task;
 
@@ -700,8 +700,8 @@ impl FrontendQuerySession {
         let add_files_engine = Arc::clone(&self.service.add_files_engine);
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
-        let mut query_options = state.execution_settings.query_options();
-        query_options.set_allow_throw_exception(
+        let query_options = with_allow_throw_exception(
+            state.execution_settings.query_options(),
             novarocks_sql::syntax::extract_allow_throw_exception_hint(&sql),
         );
         let is_query = is_query_statement(&sql);
@@ -782,6 +782,12 @@ impl FrontendQuerySession {
             }
         }
     }
+}
+
+fn with_allow_throw_exception(query_options: QueryOptions, enabled: bool) -> QueryOptions {
+    let mut raw = query_options.as_proto().clone();
+    raw.allow_throw_exception = enabled;
+    QueryOptions::parse(raw).expect("allow_throw_exception does not invalidate query options")
 }
 
 fn parenthesized_query(value: &str) -> Option<&str> {
@@ -1391,6 +1397,11 @@ mod tests {
     };
     use novarocks_catalog::schema::ColumnDef;
 
+    fn default_query_options() -> QueryOptions {
+        QueryOptions::parse(novarocks_protocol::novarocks::QueryOptions::default())
+            .expect("default wire query options are valid")
+    }
+
     #[derive(Default)]
     struct RecordingCoreCommand {
         calls: AtomicUsize,
@@ -1621,7 +1632,7 @@ mod tests {
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect_err("Iceberg INSERT without StateStore must fail in DML");
 
@@ -1651,7 +1662,7 @@ mod tests {
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect_err("Iceberg INSERT without StateStore must fail in DML");
         assert!(error.to_string().contains("state store is required"));
@@ -1688,7 +1699,7 @@ mod tests {
             &command,
             "DELETE FROM t WHERE a = 1",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         // The statement is routed to the frontend DELETE owner and never falls
         // through to the core command. It then fails closed inside the DML
@@ -1725,7 +1736,7 @@ mod tests {
             &command,
             "CREATE DATABASE db2",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect("core command route");
 
@@ -1765,7 +1776,7 @@ mod tests {
             &command,
             "CREATE TABLE ice.db.dst AS SELECT 1",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect("frontend CTAS route");
 
@@ -1794,7 +1805,7 @@ mod tests {
             &command,
             "CREATE TABLE ice.db.dst AS SELECT 1",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .unwrap_err();
 
@@ -1812,7 +1823,7 @@ mod tests {
             &command,
             "TRUNCATE TABLE ice.db.dst",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .unwrap_err();
         assert!(error.contains("TRUNCATE failed"));
@@ -1840,7 +1851,7 @@ mod tests {
             &command,
             "ALTER TABLE ice.db.dst ADD FILES FROM 's3://warehouse/staged'",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect("ADD FILES frontend route");
         assert!(matches!(result, StatementResult::Query(_)));
@@ -1857,7 +1868,7 @@ mod tests {
             &command,
             "ALTER TABLE ice.db.dst ADD FILES FROM 's3://warehouse/staged'",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .unwrap_err();
         assert!(error.contains("ADD FILES failed"));
@@ -1893,7 +1904,7 @@ mod tests {
                 &command,
                 sql,
                 &context,
-                QueryOptions::default(),
+                default_query_options(),
             )
             .expect_err("recognized mutation must terminate frontend route");
             assert!(
@@ -1933,7 +1944,7 @@ mod tests {
             &command,
             "TRUNCATE TABLE ice.db.dst",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect("frontend TRUNCATE route");
 

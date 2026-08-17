@@ -26,7 +26,7 @@ use novarocks::query_execution::dml::mutation::{
     parse_merge_statement, parse_update_statement,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::DmlError;

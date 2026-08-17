@@ -46,7 +46,7 @@ use novarocks_spi::connector::{
 
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CtasCommand {

@@ -30,7 +30,7 @@ use novarocks::query_execution::dml::ctas::{
     PreparedCtasTarget, PreparedCtasWrite,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorCtasAbortDisposition, ConnectorCtasActionId, ConnectorCtasConflictKind,
     ConnectorCtasFailure, ConnectorCtasOperationId, ConnectorCtasPublicationFence,

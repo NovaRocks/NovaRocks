@@ -26,7 +26,7 @@ use novarocks::query_execution::dml::delete::{
     PreparedDelete, parse_delete_statement, parse_equality_delete_statement,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::DmlError;

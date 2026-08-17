@@ -29,7 +29,7 @@ use async_trait::async_trait;
 
 use crate::query_execution::StatementResult;
 use crate::query_execution::cancellation::QueryCancellationReason;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::{lifecycle::QueryOptions, novarocks};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuerySessionOpenRequest {
@@ -39,8 +39,8 @@ pub struct QuerySessionOpenRequest {
 
 /// Connection-local execution settings owned by the frontend session.
 ///
-/// This is intentionally a neutral value object: the runtime representation
-/// stays private and is materialized only when core compilation needs it.
+/// This is intentionally a neutral value object: it materializes only the
+/// validated Protocol contract, which Core decodes at its execution boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionExecutionSettings {
     query_timeout_secs: Option<u64>,
@@ -110,16 +110,20 @@ impl SessionExecutionSettings {
     }
 
     pub fn query_options(&self) -> QueryOptions {
-        QueryOptions {
+        QueryOptions::parse(novarocks::QueryOptions {
             group_concat_max_len: Some(self.group_concat_max_len),
             query_timeout: self
                 .query_timeout_secs
-                .and_then(|value| value.try_into().ok()),
-            pipeline_dop: self.pipeline_dop,
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or_default(),
+            pipeline_dop: self.pipeline_dop.unwrap_or_default(),
             runtime_filter_scan_wait_time_ms: self.runtime_filter_scan_wait_time_ms,
             runtime_filter_wait_timeout_ms: self.runtime_filter_wait_timeout_ms,
             ..Default::default()
-        }
+        })
+        // Session settings never enable spilling, so the Protocol validation
+        // performed here cannot reject an internally constructed value.
+        .expect("session query options must satisfy the Protocol contract")
     }
 }
 
@@ -233,7 +237,10 @@ mod tests {
             .expect("zero is valid");
         assert_eq!(settings.query_timeout_secs(), Some(17));
         settings.set_group_concat_max_len(-1);
-        assert_eq!(settings.query_options().group_concat_max_len(), Some(-1));
-        let _opaque_runtime_options = settings.query_options();
+        assert_eq!(
+            settings.query_options().as_proto().group_concat_max_len,
+            Some(-1)
+        );
+        let _validated_protocol_options = settings.query_options();
     }
 }

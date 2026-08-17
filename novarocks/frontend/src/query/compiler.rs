@@ -42,7 +42,7 @@ use novarocks::query_execution::post_compile::{
 };
 use novarocks::query_execution::request_context::{QueryExecutionContext, RequestContext};
 use novarocks::view::ViewRequestContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::compiler::{
     ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
     SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
@@ -407,9 +407,12 @@ impl FrontendQueryCompiler {
 }
 
 fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {
-    let mut query_options = query_options.unwrap_or_default();
-    query_options.enable_profile = true;
-    query_options
+    let mut raw = query_options
+        .as_ref()
+        .map(|options| options.as_proto().clone())
+        .unwrap_or_default();
+    raw.enable_profile = true;
+    QueryOptions::parse(raw).expect("enabling query profiling does not invalidate query options")
 }
 
 fn is_query_sql(sql: &str) -> bool {

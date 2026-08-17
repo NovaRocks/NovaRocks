@@ -29,6 +29,7 @@ pub(crate) mod unified_statistics;
 pub(crate) mod write_target;
 
 pub use backend::MvBackend;
+use novarocks_protocol::lifecycle::QueryOptions;
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 pub use unified_statistics::UnifiedStatisticsResolver;
 
 use novarocks_spi::connector::{
@@ -67,11 +68,10 @@ impl ConnectorCancellation for QueryConnectorCancellation {
 }
 
 fn build_connector_request_context(
-    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
+    query_options: Option<&QueryOptions>,
     cancellation: Arc<dyn ConnectorCancellation>,
 ) -> Result<ConnectorRequestContext, String> {
-    let (_, query_expire) =
-        novarocks_execution::runtime::query_options::query_expire_durations(query_options);
+    let query_expire = query_expire_duration(query_options);
     ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
         cancellation,
@@ -82,7 +82,7 @@ fn build_connector_request_context(
 }
 
 pub(crate) fn connector_request_context(
-    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
+    query_options: Option<&QueryOptions>,
     cancellation_signal: Arc<AtomicBool>,
 ) -> Result<ConnectorRequestContext, String> {
     build_connector_request_context(
@@ -98,7 +98,7 @@ pub(crate) fn connector_request_context(
 /// Frontend-owned typed command capabilities use this same constructor so
 /// provider requests share the statement cancellation identity and options.
 pub fn connector_request_context_for_query(
-    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
+    query_options: Option<&QueryOptions>,
     cancellation: crate::query_execution::cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
     build_connector_request_context(
@@ -111,7 +111,7 @@ pub fn connector_request_context_for_query(
 /// the frontend. A request deadline is authoritative; only requests without an
 /// admission deadline use the bounded connector fallback.
 pub fn connector_request_context_for_execution(
-    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
+    query_options: Option<&QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<ConnectorRequestContext, String> {
     let cancellation: Arc<dyn ConnectorCancellation> = Arc::new(QueryConnectorCancellation {
@@ -127,6 +127,17 @@ pub fn connector_request_context_for_execution(
         .map_err(|error| error.to_string()),
         None => build_connector_request_context(query_options, cancellation),
     }
+}
+
+fn query_expire_duration(query_options: Option<&QueryOptions>) -> Duration {
+    let default_timeout = 300i32;
+    let query_timeout = query_options
+        .and_then(|options| {
+            (options.as_proto().query_timeout > 0).then_some(options.as_proto().query_timeout)
+        })
+        .unwrap_or(default_timeout)
+        .max(1);
+    Duration::from_secs(query_timeout as u64)
 }
 
 pub(crate) fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), String> {
@@ -149,7 +160,7 @@ pub(crate) fn test_request_context() -> ConnectorRequestContext {
 mod request_context_tests {
     use std::time::{Duration, Instant};
 
-    use super::connector_request_context_for_execution;
+    use super::{connector_request_context_for_execution, query_expire_duration};
     use crate::query_execution::backend::BackendTopologySnapshot;
     use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::request_context::{RequestAdmission, RequestContext};
@@ -193,6 +204,31 @@ mod request_context_tests {
         let before = Instant::now();
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
         assert!(connector.deadline() > before);
+    }
+
+    #[test]
+    fn protocol_query_timeout_preserves_connector_deadline_defaults() {
+        let unset = novarocks_protocol::lifecycle::QueryOptions::parse(
+            novarocks_protocol::novarocks::QueryOptions::default(),
+        )
+        .expect("default protocol query options are valid");
+        let configured = novarocks_protocol::lifecycle::QueryOptions::parse(
+            novarocks_protocol::novarocks::QueryOptions {
+                query_timeout: 17,
+                ..Default::default()
+            },
+        )
+        .expect("configured protocol query options are valid");
+
+        assert_eq!(query_expire_duration(None), Duration::from_secs(300));
+        assert_eq!(
+            query_expire_duration(Some(&unset)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            query_expire_duration(Some(&configured)),
+            Duration::from_secs(17)
+        );
     }
 }
 

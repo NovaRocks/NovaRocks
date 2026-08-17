@@ -42,7 +42,7 @@ use crate::query_execution::statistics::{
 };
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use bytes::Bytes;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -214,10 +214,13 @@ fn request_owns_prepared_and_native_artifacts() {
     let request = build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
-        Some(QueryOptions {
-            pipeline_dop: Some(3),
-            ..Default::default()
-        }),
+        Some(
+            QueryOptions::parse(novarocks_protocol::novarocks::QueryOptions {
+                pipeline_dop: 3,
+                ..Default::default()
+            })
+            .expect("valid protocol query options"),
+        ),
         DistributedQueryIntent::Result,
         &test_execution(QueryCancellationSource::new().view()),
     )

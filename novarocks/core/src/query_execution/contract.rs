@@ -34,7 +34,8 @@ use crate::query_execution::request_context::QueryExecutionContext;
 pub use crate::query_execution::statistics::StatisticsCollectionProgram;
 pub use crate::query_execution::statistics::StatisticsExecutionMode;
 pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::query_options::QueryOptions as RuntimeQueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorActivatedWriteCohort, ConnectorError, ConnectorExecutionBindingKey,
     ConnectorRequestContext, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
@@ -52,12 +53,16 @@ pub(crate) use novarocks_types::QueryId;
 /// The runtime representation stays private; frontend only receives stable
 /// scalar views needed to schedule, submit, and time out native work.
 pub struct ResolvedQueryOptions {
-    runtime: QueryOptions,
+    runtime: RuntimeQueryOptions,
 }
 
 impl ResolvedQueryOptions {
     pub(crate) fn from_upstream(options: Option<QueryOptions>) -> Self {
-        let mut runtime = options.unwrap_or_default();
+        let mut runtime = options
+            .map(|options| crate::protocol::decode_native_query_options(options.as_proto()))
+            .transpose()
+            .expect("validated Protocol query options must decode for execution")
+            .unwrap_or_default();
         let pipeline_dop = novarocks_execution::runtime::exec_env::calc_pipeline_dop(
             runtime.pipeline_dop.unwrap_or_default(),
         );
@@ -97,7 +102,7 @@ impl ResolvedQueryOptions {
     /// Frozen execution options exposed to the Frontend only for its
     /// role-owned native wire projection.  This does not provide lifecycle
     /// construction or a mutable execution handle.
-    pub fn runtime_options(&self) -> &QueryOptions {
+    pub fn runtime_options(&self) -> &RuntimeQueryOptions {
         &self.runtime
     }
 }

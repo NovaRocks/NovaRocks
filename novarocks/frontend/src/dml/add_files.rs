@@ -27,7 +27,7 @@ use novarocks::query_execution::dml::add_files::{
     AddFilesPlanFacts, AddFilesReceipt, PlanAddFilesRequest, PreparedAddFiles,
 };
 use novarocks::query_execution::request_context::RequestContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorDataMutationSourceScopeKind, ExternalMutationEvidence, REGISTER_EXISTING_FILES_KIND,
 };

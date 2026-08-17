@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 
 /// DELETE statements recognized by the frontend command router.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
