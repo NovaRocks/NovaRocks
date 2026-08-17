@@ -17,8 +17,10 @@
 
 use crate::mv::analysis::resolve_mv_name;
 use crate::mv::persistence::definition::StoredMvDefinition;
-use crate::mv::refresh::target_binding::MvTargetBinding;
+use crate::mv::refresh::target_binding::{MvTargetBinding, load_mv_target_binding_with_ports};
+use crate::mv::storage_observation::MvStorageObservationPort;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 use novarocks_sql::syntax::ObjectName;
 
 /// A normalized Iceberg MV target identity.  Refresh planning and the domain
@@ -56,6 +58,29 @@ pub(crate) fn resolve_refresh_target(
         namespace,
         table,
     })
+}
+
+/// Loads the sealed target binding used by one Iceberg MV refresh attempt.
+///
+/// This capability deliberately receives only the two admitted ports, the
+/// normalized domain target, and the request context.  It does not depend on
+/// the aggregate refresh source or query assembly state.
+pub(crate) fn load_iceberg_mv_target_binding(
+    connector_control: &dyn ConnectorControlResolver,
+    storage_observation: &dyn MvStorageObservationPort,
+    target: &IcebergMvTarget,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, String> {
+    load_mv_target_binding_with_ports(
+        connector_control,
+        storage_observation,
+        &TableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        connector_context,
+    )
 }
 
 /// Validates that the persisted MV definition still names the target snapshot
