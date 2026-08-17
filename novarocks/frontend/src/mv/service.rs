@@ -20,14 +20,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::background::{
+    MvBackgroundBindings, MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
+    MvBackgroundEngineSink,
+};
 use novarocks::mv::application::{
     MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine,
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     MvRequestContext, MvStatementResult, PreparedMvRefresh, PreparedMvRefreshWork,
-};
-use novarocks::mv::background::{
-    MvBackgroundBindings, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
-    MvBackgroundEngineSink,
 };
 use novarocks::mv::repository::MvRepository;
 use novarocks::query_execution::backend::BackendTopologyService;
@@ -401,7 +401,7 @@ impl MvBackgroundEngineSink for FrontendMvBackgroundEngineSink {
 struct RefreshWorkerDependencies {
     repository: Arc<dyn MvRepository>,
     refresh: refresh::FrontendMvRefreshDependencies,
-    background_engine: Arc<dyn novarocks::mv::background::MvBackgroundEngine>,
+    background_engine: Arc<dyn MvBackgroundEngine>,
     topology: BackendTopologyService,
     role: novarocks_types::ClusterRole,
     scheduler_config: FrontendMvSchedulerConfig,

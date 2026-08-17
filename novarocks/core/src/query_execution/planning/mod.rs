@@ -19,8 +19,6 @@
 //! compilation. SQL receives opaque binding tokens only; these modules retain
 //! the paired exact connector admission and never reacquire a newer binding.
 
-pub(crate) mod bindings;
-pub mod catalog_materializer;
 pub(crate) mod delta_scan;
 pub mod statistics;
 pub mod time_travel;
@@ -55,7 +53,8 @@ pub fn sql_cancellation_observation(
 }
 
 pub(crate) struct PostCompilePlanningContext<'a> {
-    pub(crate) table_bindings: Arc<bindings::QueryTableBindingStore>,
+    pub(crate) table_bindings:
+        Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     pub(crate) connector_controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     pub(crate) connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
 }

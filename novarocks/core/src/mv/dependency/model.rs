@@ -68,7 +68,8 @@ pub(crate) fn iceberg_table_dependency_ref(base: &TableIdentity) -> MvDependency
     }
 }
 
-pub(crate) fn iceberg_mv_dependency_ref(
+/// Builds the canonical dependency identity for an Iceberg materialized view.
+pub fn iceberg_mv_dependency_ref(
     catalog: &str,
     namespace: &str,
     table: &str,

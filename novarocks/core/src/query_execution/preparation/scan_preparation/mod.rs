@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::query_execution::planning::bindings::{
+use crate::catalog_application::query_bindings::{
     QueryScanMaterialization, QueryTableBindingStore,
 };
 use crate::query_execution::preparation::scan::{

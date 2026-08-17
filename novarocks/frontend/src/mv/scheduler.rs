@@ -25,9 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use novarocks::mv::background::{
-    MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
-};
+use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
 use novarocks::mv::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };

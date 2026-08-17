@@ -23,7 +23,7 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicate,
 };
 
-use crate::query_execution::planning::bindings::QueryScanMaterialization;
+use crate::catalog_application::query_bindings::QueryScanMaterialization;
 use crate::runtime::scan_range::ScanRangeParams;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_sql::plan_read::ColumnId;

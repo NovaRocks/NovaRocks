@@ -10,4 +10,4 @@ pub(crate) mod incremental_staging;
 pub(crate) mod query_local_bindings;
 pub mod refresh_artifact;
 pub(crate) mod refresh_explain;
-pub(crate) mod refresh_preparation;
+pub mod refresh_preparation;

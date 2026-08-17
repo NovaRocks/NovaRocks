@@ -26,9 +26,9 @@ use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
-use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
@@ -350,14 +350,15 @@ fn compile_dml_change_stream_write(
 
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(state);
-    let analyzer_provider = crate::query_execution::compiler::build_catalog_service_provider(
-        Some(&target.catalog),
-        &catalog_service_snapshot,
-        state.connector_control().as_ref(),
-        connector_context.clone(),
-        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-        state.catalog_application().map(Arc::as_ref),
-    );
+    let analyzer_provider =
+        crate::catalog_application::query_materializer::build_catalog_service_provider(
+            Some(&target.catalog),
+            &catalog_service_snapshot,
+            state.connector_control().as_ref(),
+            connector_context.clone(),
+            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+            state.catalog_application().map(Arc::as_ref),
+        );
     let table_bindings = analyzer_provider.query_table_bindings();
     let mut routes = Vec::new();
     for route in preparations.routes() {
@@ -2864,7 +2865,7 @@ fn execute_exact_cow_match_query(
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(state);
     let analyzer_catalog =
-        crate::query_execution::compiler::build_catalog_service_provider_with_bindings_and_query_local_overlays(
+        crate::catalog_application::query_materializer::build_catalog_service_provider_with_bindings_and_query_local_overlays(
             Some(&target.catalog),
             &catalog_service_snapshot,
             state.connector_control().as_ref(),

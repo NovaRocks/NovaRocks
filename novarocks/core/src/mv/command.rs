@@ -247,19 +247,19 @@ impl MvCommandExecutor {
             &target.namespace,
             &target.table,
         );
-        let steps = crate::mv::dependency_resolver::build_upstream_refresh_steps_with_repository(
+        let steps = crate::mv::dependency::refresh::build_upstream_refresh_steps_with_repository(
             self.ports.repository().as_ref(),
             &requested_object,
         )?;
         let mut last_result = None;
         for step in steps {
-            if step.storage_engine != crate::mv::model::MvStorageEngine::Iceberg {
+            if !step.is_iceberg() {
                 return Err(format!(
                     "REFRESH MATERIALIZED VIEW is only supported for Iceberg-backed materialized views: {}",
-                    step.object.display_name().trim_start_matches("mv:")
+                    step.display_name().trim_start_matches("mv:")
                 ));
             }
-            let target = step.target;
+            let target = step.into_target();
             let target_catalog = target.catalog.clone();
             let target_database = target.database.clone();
             let target_name = target.name.clone();

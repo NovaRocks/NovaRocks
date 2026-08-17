@@ -288,9 +288,9 @@ pub enum MaintenanceStatementResult {
 }
 
 /// CLS-R2 boundary: the table-maintenance application moves to the frontend,
-/// but this identity value stays with the aggregate package because
-/// `mv::background` and `mv::background_engine` name it. Both leave with
-/// CLS-R3, at which point this follows the maintenance owner.
+/// while this stable maintenance identity remains a Core domain value. The
+/// Frontend MV background runtime consumes it until it moves with the
+/// maintenance owner in CLS-R3.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct MaintenanceTarget {
     pub catalog: String,
@@ -389,8 +389,8 @@ pub enum OptimizeSubmission {
 }
 
 /// CLS-R2 boundary: the implementation moves to the frontend with the rest of
-/// the maintenance application; this port definition stays with the aggregate
-/// package because `mv::background` drives it. That caller leaves with CLS-R3.
+/// the maintenance application; this stable Core domain port remains available
+/// to the Frontend MV background runtime until CLS-R3.
 // Design: ADR-0009 (docs/adr/ADR-0009-frontend-table-maintenance-owner.md)
 pub trait TableMaintenanceEngine: Send + Sync {
     fn resolve_target(
@@ -1560,7 +1560,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     )
     .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
     let table_bindings =
-        Arc::new(crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()?);
+        Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
     let source_binding =
         crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
             table_bindings.as_ref(),

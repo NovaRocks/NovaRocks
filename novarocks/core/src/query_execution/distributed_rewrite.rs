@@ -25,13 +25,13 @@ use novarocks_spi::connector::{
     ExternalMutationOutcome,
 };
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     ConnectorWriteExecutionRegistration, ConnectorWriteOperationRegistration,
     ConnectorWritePlanningTemplate,
 };
 use crate::query_execution::outcome::ConnectorWriteCompletion;
-use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_sql::binding::SqlTableBindingId;

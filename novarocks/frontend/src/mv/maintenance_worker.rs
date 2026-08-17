@@ -33,12 +33,10 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
 use novarocks::maintenance::{
     AutomaticMaintenanceContext, MaintenanceActionOutcome, MaintenanceActionRequest,
     MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
-};
-use novarocks::mv::background::{
-    MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
 };
 use novarocks::mv::persistence::definition::StoredMvDefinition;
 use novarocks::mv::repository::{MvRepository, MvRepositoryError};

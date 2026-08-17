@@ -92,24 +92,6 @@ fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String>
         .map_err(|_| "materialized view refresh lock poisoned".to_string())
 }
 
-pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdentity>, String> {
-    refs.iter()
-        .map(|fqn| {
-            let parts = fqn.split('.').collect::<Vec<_>>();
-            let [catalog, namespace, table] = parts.as_slice() else {
-                return Err(format!(
-                    "materialized view base table reference must be catalog.namespace.table, got `{fqn}`"
-                ));
-            };
-            Ok(TableIdentity {
-                catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
-                namespace: novarocks_catalog::identifier::normalize_identifier(namespace)?,
-                table: novarocks_catalog::identifier::normalize_identifier(table)?,
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};

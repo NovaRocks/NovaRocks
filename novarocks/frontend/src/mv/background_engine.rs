@@ -15,41 +15,72 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Core adapter bound to the frontend-owned MV background runtime.
+//! Frontend adapter bound to the MV background runtime.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use crate::maintenance::MaintenanceTarget;
-use crate::mv::application::{
+use novarocks::maintenance::MaintenanceTarget;
+use novarocks::mv::application::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh,
 };
-use crate::mv::background::{
+use novarocks::mv::dependency::model::iceberg_mv_dependency_ref;
+use novarocks::mv::dependency::refresh::build_upstream_refresh_steps_with_repository;
+use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
+use novarocks::mv::refresh::{
+    definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
+};
+use novarocks::mv::repository::MvTarget;
+use novarocks_spi::connector::{
+    ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+use novarocks_sql::planning::mv::MvRefreshStatement;
+
+use super::background::{
     MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
     MvRefreshStep,
 };
-use crate::mv::dependency::model::iceberg_mv_dependency_ref;
-use crate::mv::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::model::{MvStorageEngine, MvTarget};
-use crate::mv::refresh_io::{observe_current_refresh_base_with_ports, parse_iceberg_table_refs};
-use novarocks_spi::connector::ConnectorRequestContext;
-use novarocks_sql::planning::mv::MvRefreshStatement;
+
+struct BackgroundConnectorCancellation {
+    signal: Arc<AtomicBool>,
+}
+
+impl ConnectorCancellation for BackgroundConnectorCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.signal.load(Ordering::SeqCst)
+    }
+}
+
+fn background_connector_request_context() -> Result<ConnectorRequestContext, String> {
+    ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(300),
+        Arc::new(BackgroundConnectorCancellation {
+            signal: Arc::new(AtomicBool::new(false)),
+        }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| error.to_string())
+}
 
 #[derive(Clone)]
-pub struct StandaloneMvBackgroundEngine {
+pub(crate) struct StandaloneMvBackgroundEngine {
     ports: IcebergMvCorePorts,
-    connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-    repository: Arc<dyn crate::mv::repository::MvRepository>,
-    storage_observation: Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    repository: Arc<dyn novarocks::mv::repository::MvRepository>,
+    storage_observation: Arc<dyn novarocks::mv::storage_observation::MvStorageObservationPort>,
 }
 
 impl StandaloneMvBackgroundEngine {
-    pub fn new_with_ports(
+    pub(crate) fn new_with_ports(
         ports: IcebergMvCorePorts,
-        connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-        repository: Arc<dyn crate::mv::repository::MvRepository>,
-        storage_observation: Arc<dyn crate::mv::storage_observation::MvStorageObservationPort>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        repository: Arc<dyn novarocks::mv::repository::MvRepository>,
+        storage_observation: Arc<dyn novarocks::mv::storage_observation::MvStorageObservationPort>,
     ) -> Self {
         Self {
             ports,
@@ -62,7 +93,7 @@ impl StandaloneMvBackgroundEngine {
     fn definition_for_target(
         &self,
         target: &MvTarget,
-    ) -> Result<crate::mv::persistence::definition::StoredMvDefinition, MvBackgroundEngineError>
+    ) -> Result<novarocks::mv::persistence::definition::StoredMvDefinition, MvBackgroundEngineError>
     {
         let definition = self
             .repository
@@ -94,29 +125,30 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             &target.database,
             &target.name,
         );
-        let steps = crate::mv::dependency_resolver::build_upstream_refresh_steps_with_repository(
-            self.repository.as_ref(),
-            &requested,
-        )
-        .map_err(|error| {
-            MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::InvalidDefinition, error)
-        })?;
+        let steps =
+            build_upstream_refresh_steps_with_repository(self.repository.as_ref(), &requested)
+                .map_err(|error| {
+                    MvBackgroundEngineError::new(
+                        MvBackgroundEngineErrorKind::InvalidDefinition,
+                        error,
+                    )
+                })?;
         steps
             .into_iter()
             .map(|step| {
-                if step.storage_engine != MvStorageEngine::Iceberg {
+                if !step.is_iceberg() {
                     return Err(MvBackgroundEngineError::new(
                         MvBackgroundEngineErrorKind::InvalidDefinition,
                         format!(
                             "MV refresh step {} is not Iceberg-backed",
-                            step.object.display_name()
+                            step.display_name()
                         ),
                     ));
                 }
-                let mv_id = self.definition_for_target(&step.target)?.mv_id;
+                let mv_id = self.definition_for_target(step.target())?.mv_id;
                 Ok(MvRefreshStep {
                     mv_id,
-                    target: step.target,
+                    target: step.into_target(),
                 })
             })
             .collect()
@@ -138,14 +170,13 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             },
             full: false,
         };
-        let service =
-            crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
-                &self.ports,
-                step.target.catalog.as_deref(),
-                &step.target.database,
-                &ast_statement,
-                connector_context,
-            );
+        let service = novarocks::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
+            &self.ports,
+            step.target.catalog.as_deref(),
+            &step.target.database,
+            &ast_statement,
+            connector_context,
+        );
         service
             .prepare_step(MvRefreshPreparationRequest {
                 statement,
@@ -165,16 +196,12 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
         let refs = parse_iceberg_table_refs(&definition.base_table_refs).map_err(|error| {
             MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::InvalidDefinition, error)
         })?;
-        let connector_context = crate::connector::connector_request_context(
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
-        .map_err(|error| {
+        let connector_context = background_connector_request_context().map_err(|error| {
             MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
         })?;
         refs.into_iter()
             .map(|table_ref| {
-                let snapshot = observe_current_refresh_base_with_ports(
+                let snapshot = observe_current_refresh_base(
                     self.connector_control.as_ref(),
                     self.storage_observation.as_ref(),
                     &table_ref,
@@ -189,7 +216,7 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
                 .current_snapshot_id();
                 Ok((table_ref.fqn(), snapshot))
             })
-            .collect()
+            .collect::<Result<BTreeMap<_, _>, _>>()
     }
 
     fn maintenance_facts(
@@ -200,7 +227,7 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             .repository
             .list_definitions()
             .map_err(repository_error)?;
-        let stats = crate::mv::maintenance::stats::collect_table_stats_with_ports(
+        let stats = novarocks::mv::maintenance::stats::collect_table_stats_with_ports(
             self.connector_control.as_ref(),
             self.storage_observation.as_ref(),
             &target.catalog,
@@ -234,8 +261,10 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
     }
 }
 
-fn repository_error(error: crate::mv::repository::MvRepositoryError) -> MvBackgroundEngineError {
-    use crate::mv::repository::MvRepositoryErrorKind;
+fn repository_error(
+    error: novarocks::mv::repository::MvRepositoryError,
+) -> MvBackgroundEngineError {
+    use novarocks::mv::repository::MvRepositoryErrorKind;
 
     let kind = match error.kind() {
         MvRepositoryErrorKind::NotFound => MvBackgroundEngineErrorKind::TargetGone,

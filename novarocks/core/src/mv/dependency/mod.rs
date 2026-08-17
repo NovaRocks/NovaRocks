@@ -17,5 +17,5 @@
 
 pub(crate) mod graph;
 pub mod model;
-pub(crate) mod refresh;
+pub mod refresh;
 pub(crate) mod scope;

@@ -15,23 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Provider-neutral facts and preparation ports for frontend MV workers.
-//!
-//! The frontend owns worker admission, retry policy, cancellation and join.
-//! Core only binds this narrow adapter after restore and provider recovery.
+//! Frontend-owned contracts and bindings for MV background workers.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use novarocks::maintenance::{MaintenanceTarget, TableMaintenanceEngine};
+use novarocks::mv::application::{MvRefreshAttemptIdentity, PreparedMvRefresh};
+use novarocks::mv::repository::MvTarget;
 use novarocks_spi::connector::ConnectorRequestContext;
 
-use crate::maintenance::{MaintenanceTarget, TableMaintenanceEngine};
-use crate::mv::application::{MvRefreshAttemptIdentity, PreparedMvRefresh};
-use crate::mv::model::MvTarget;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MvBackgroundEngineErrorKind {
+pub(crate) enum MvBackgroundEngineErrorKind {
     TargetGone,
     TransientUnavailable,
     InvalidDefinition,
@@ -42,24 +38,24 @@ pub enum MvBackgroundEngineErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvBackgroundEngineError {
+pub(crate) struct MvBackgroundEngineError {
     kind: MvBackgroundEngineErrorKind,
     message: String,
 }
 
 impl MvBackgroundEngineError {
-    pub fn new(kind: MvBackgroundEngineErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: MvBackgroundEngineErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
         }
     }
 
-    pub const fn kind(&self) -> MvBackgroundEngineErrorKind {
+    pub(crate) const fn kind(&self) -> MvBackgroundEngineErrorKind {
         self.kind
     }
 
-    pub fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         &self.message
     }
 }
@@ -73,38 +69,38 @@ impl fmt::Display for MvBackgroundEngineError {
 impl std::error::Error for MvBackgroundEngineError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvRefreshStep {
-    pub mv_id: i64,
-    pub target: MvTarget,
+pub(crate) struct MvRefreshStep {
+    pub(crate) mv_id: i64,
+    pub(crate) target: MvTarget,
 }
 
 /// The provider facts required to apply maintenance policy without leaking an
 /// Iceberg metadata object into the frontend.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MvMaintenanceFacts {
-    pub current_snapshot_id: Option<i64>,
-    pub total_data_files: Option<i64>,
-    pub max_compactable_data_files: Option<i64>,
-    pub total_delete_files: Option<i64>,
-    pub total_files_size_bytes: Option<i64>,
-    pub oldest_snapshot_timestamp_ms: Option<i64>,
-    pub snapshot_count: usize,
-    pub non_default_reference_count: usize,
-    pub downstream_floor_ts_ms: Option<i64>,
-    pub downstream_floor_unknown: bool,
+pub(crate) struct MvMaintenanceFacts {
+    pub(crate) current_snapshot_id: Option<i64>,
+    pub(crate) total_data_files: Option<i64>,
+    pub(crate) max_compactable_data_files: Option<i64>,
+    pub(crate) total_delete_files: Option<i64>,
+    pub(crate) total_files_size_bytes: Option<i64>,
+    pub(crate) oldest_snapshot_timestamp_ms: Option<i64>,
+    pub(crate) snapshot_count: usize,
+    pub(crate) non_default_reference_count: usize,
+    pub(crate) downstream_floor_ts_ms: Option<i64>,
+    pub(crate) downstream_floor_unknown: bool,
     /// Typed maintenance policy facts declared by the table. `None` means the
     /// table declares no usable value; the frontend owns every default and
     /// every clamp. These four fields are the only way maintenance policy
     /// crosses this boundary — there is deliberately no property map fallback.
-    pub maintenance_enabled: Option<bool>,
-    pub expire_max_snapshot_age_ms: Option<i64>,
-    pub expire_min_snapshots_to_keep: Option<u32>,
-    pub target_file_size_bytes: Option<i64>,
+    pub(crate) maintenance_enabled: Option<bool>,
+    pub(crate) expire_max_snapshot_age_ms: Option<i64>,
+    pub(crate) expire_min_snapshots_to_keep: Option<u32>,
+    pub(crate) target_file_size_bytes: Option<i64>,
 }
 
 /// Side-effect-free discovery and preparation capability consumed by
 /// frontend-owned MV background workers.
-pub trait MvBackgroundEngine: Send + Sync {
+pub(crate) trait MvBackgroundEngine: Send + Sync {
     fn resolve_refresh_steps(
         &self,
         target: &MvTarget,
@@ -129,15 +125,15 @@ pub trait MvBackgroundEngine: Send + Sync {
 }
 
 /// Bound only after Core has restored catalogs, performed MV recovery, bound
-/// providers and started table-maintenance recovery.  The frontend starts and
+/// providers and started table-maintenance recovery. The frontend starts and
 /// owns worker threads after it receives this value.
 #[derive(Clone)]
-pub struct MvBackgroundBindings {
-    pub engine: Arc<dyn MvBackgroundEngine>,
-    pub table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
+pub(crate) struct MvBackgroundBindings {
+    pub(crate) engine: Arc<dyn MvBackgroundEngine>,
+    pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
 }
 
-pub trait MvBackgroundEngineSink: Send + Sync {
+pub(crate) trait MvBackgroundEngineSink: Send + Sync {
     fn bind_mv_background_engine(
         &self,
         bindings: MvBackgroundBindings,

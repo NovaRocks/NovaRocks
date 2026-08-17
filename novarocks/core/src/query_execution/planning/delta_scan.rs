@@ -21,7 +21,7 @@
 //! exact planning lease. Preparation retrieves only the sealed SPI scan by its
 //! query-local token and snapshot window.
 
-use crate::query_execution::planning::bindings::QueryTableBindingStore;
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::query_execution::preparation::scan::{ResolvedScanExecution, ScanBindingResolver};
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::planning::query_execution::{
@@ -94,7 +94,7 @@ mod tests {
     };
 
     use super::{QueryTableBindingScanResolver, ScanBindingResolver};
-    use crate::query_execution::planning::bindings::{
+    use crate::catalog_application::query_bindings::{
         QueryTableBindingKey, QueryTableBindingStore, admitted_change_window_binding_for_test,
     };
     use crate::query_execution::preparation::scan::ResolvedScanExecution;

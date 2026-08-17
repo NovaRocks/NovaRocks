@@ -36,13 +36,13 @@ use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
 use sqlparser::ast as sqlast;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
-use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };

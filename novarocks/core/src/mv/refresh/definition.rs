@@ -15,6 +15,7 @@
 
 //! Persisted Iceberg MV definition lookup and SQL identity helpers.
 
+use novarocks_catalog::identifier::TableIdentity;
 use sha2::{Digest, Sha256};
 
 use crate::mv::model::MvTarget;
@@ -59,6 +60,25 @@ pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, 
         return Err("stored MV SQL must be a SELECT query".to_string());
     };
     Ok(*query)
+}
+
+/// Parses persisted Iceberg base-table references into canonical identities.
+pub fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdentity>, String> {
+    refs.iter()
+        .map(|fqn| {
+            let parts = fqn.split('.').collect::<Vec<_>>();
+            let [catalog, namespace, table] = parts.as_slice() else {
+                return Err(format!(
+                    "materialized view base table reference must be catalog.namespace.table, got `{fqn}`"
+                ));
+            };
+            Ok(TableIdentity {
+                catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
+                namespace: novarocks_catalog::identifier::normalize_identifier(namespace)?,
+                table: novarocks_catalog::identifier::normalize_identifier(table)?,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

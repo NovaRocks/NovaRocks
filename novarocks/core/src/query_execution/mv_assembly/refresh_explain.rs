@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::mv::analysis::canonicalize_iceberg_mv_select_query;
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::refresh::capabilities::RefreshCapabilities;
+use crate::mv::refresh::definition::parse_iceberg_table_refs;
 use crate::mv::refresh::definition::{load_iceberg_mv_definition_by_target, parse_mv_select_query};
 use crate::mv::refresh::execution_policy::explain_refresh_full_guard;
 use crate::mv::refresh::pin::validate_refresh_pin_table_uuids;
@@ -13,13 +15,11 @@ use crate::mv::refresh::schema_contract::validate_aggregate_schema_contract_meta
 use crate::mv::refresh::target::{
     load_iceberg_mv_target_binding, resolve_refresh_target, validate_target_snapshot,
 };
-use crate::mv::refresh_io::parse_iceberg_table_refs;
 use crate::mv::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
 use crate::query_execution::mv_assembly::query_local_bindings::{
     bind_imv_target_query_table_in_store_from_rewrite,
     freeze_imv_base_query_local_overlays_from_captured_inputs,
 };
-use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::statistics::QueryStatisticsResolver;
 use novarocks_sql::syntax::RefreshMaterializedViewStmt;
 
@@ -103,11 +103,11 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         &rewrite.pin,
         &rewrite.previous_snapshot_ids,
     )?;
-    let materializer = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+    let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
         None,
         &catalog_service_snapshot,
         Arc::clone(&bindings),
-        crate::query_execution::planning::statistics::iceberg_table_binding_loader(
+        crate::catalog_application::query_materializer::iceberg_table_binding_loader(
             ports.connector_control(),
             connector_context.clone(),
         ),

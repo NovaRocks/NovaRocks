@@ -21,14 +21,15 @@ use std::sync::Arc;
 
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use novarocks::catalog_application::information_schema;
+use novarocks::catalog_application::query_materializer::build_catalog_service_provider;
 use novarocks::catalog_application::virtual_table;
 use novarocks::connector::connector_request_context_for_query;
 use novarocks::mv::repository::MvRepository;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks::query_execution::PreparedQueryOperation;
 use novarocks::query_execution::compiler::{
-    TableLookupMode, build_query_catalog_materializer, freeze_query_mv_rewrite_definition_index,
-    query_catalog_service_snapshot, query_statistics_snapshot,
+    TableLookupMode, freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
+    query_statistics_snapshot,
 };
 use novarocks::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
@@ -127,12 +128,13 @@ impl FrontendQueryCompiler {
                     ExplainLevel::Normal
                 });
                 let catalog_service = query_catalog_service_snapshot(&self.query);
-                let materializer = build_query_catalog_materializer(
-                    &self.query,
+                let materializer = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service,
+                    self.query.connector_control().as_ref(),
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
+                    self.query.catalog_application().map(Arc::as_ref),
                 );
                 let mv_definitions = if force_logical_explain {
                     None
@@ -237,12 +239,13 @@ impl FrontendQueryCompiler {
         completion_intent: PostCompileIntent,
     ) -> Result<PreparedQueryOperation, String> {
         let catalog_service = query_catalog_service_snapshot(&self.query);
-        let materializer = build_query_catalog_materializer(
-            &self.query,
+        let materializer = build_catalog_service_provider(
             current_catalog,
             &catalog_service,
+            self.query.connector_control().as_ref(),
             connector_context.clone(),
             TableLookupMode::SchemaOnly,
+            self.query.catalog_application().map(Arc::as_ref),
         );
         let mv_definitions =
             if allow_mv_rewrite_candidates && self.mv_repository.availability().is_available() {

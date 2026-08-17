@@ -741,7 +741,7 @@ pub fn background_maintenance_attempt(
 
 /// Leaf ports for the Frontend-owned MV background worker.
 #[derive(Clone)]
-pub struct MvBackgroundPorts {
+pub(crate) struct MvBackgroundPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -750,7 +750,7 @@ pub struct MvBackgroundPorts {
 }
 
 impl MvBackgroundPorts {
-    pub fn new(
+    pub(crate) fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -769,10 +769,10 @@ impl MvBackgroundPorts {
 
 /// Build the two capabilities the Frontend binds into its MV background
 /// runtime after restore and maintenance recovery have completed.
-pub fn mv_background_bindings(
+pub(crate) fn mv_background_bindings(
     ports: MvBackgroundPorts,
     table_maintenance_engine: Arc<dyn novarocks::maintenance::TableMaintenanceEngine>,
-) -> novarocks::mv::background::MvBackgroundBindings {
+) -> crate::mv::background::MvBackgroundBindings {
     let iceberg_ports = novarocks::mv::iceberg_refresh::IcebergMvCorePorts::new(
         ports.catalog_service,
         ports.catalog_application,
@@ -780,9 +780,9 @@ pub fn mv_background_bindings(
         Arc::clone(&ports.repository),
         Arc::clone(&ports.storage_observation),
     );
-    novarocks::mv::background::MvBackgroundBindings {
+    crate::mv::background::MvBackgroundBindings {
         engine: Arc::new(
-            novarocks::mv::background_engine::StandaloneMvBackgroundEngine::new_with_ports(
+            crate::mv::background_engine::StandaloneMvBackgroundEngine::new_with_ports(
                 iceberg_ports,
                 ports.connector_control,
                 ports.repository,
@@ -795,10 +795,10 @@ pub fn mv_background_bindings(
 
 /// Bind the MV background capability only after the Frontend has completed
 /// its ordered restore and recovery sequence.
-pub fn bind_mv_background_engine(
-    sink: &dyn novarocks::mv::background::MvBackgroundEngineSink,
+pub(crate) fn bind_mv_background_engine(
+    sink: &dyn crate::mv::background::MvBackgroundEngineSink,
     ports: MvBackgroundPorts,
     table_maintenance_engine: Arc<dyn novarocks::maintenance::TableMaintenanceEngine>,
-) -> Result<(), novarocks::mv::background::MvBackgroundEngineError> {
+) -> Result<(), crate::mv::background::MvBackgroundEngineError> {
     sink.bind_mv_background_engine(mv_background_bindings(ports, table_maintenance_engine))
 }

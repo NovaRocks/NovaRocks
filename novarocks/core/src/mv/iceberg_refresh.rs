@@ -26,6 +26,11 @@ use arrow::datatypes::DataType;
 use serde::Serialize;
 
 use crate::catalog_application::CatalogApplicationPort;
+#[cfg(test)]
+use crate::catalog_application::query_bindings::{
+    MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
+    QueryTableBindingStore,
+};
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::common::engine_error::EngineError;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
@@ -69,7 +74,9 @@ use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
 #[cfg(test)]
 use crate::mv::refresh::definition::mv_definition_fingerprint;
-use crate::mv::refresh::definition::{load_iceberg_mv_definition_by_target, parse_mv_select_query};
+use crate::mv::refresh::definition::{
+    load_iceberg_mv_definition_by_target, parse_iceberg_table_refs, parse_mv_select_query,
+};
 #[cfg(test)]
 use crate::mv::refresh::execution_policy::{
     explain_refresh_full_guard, non_join_incremental_write_mode,
@@ -111,7 +118,7 @@ use crate::mv::refresh::target_apply::{
     apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
     join_apply_key_table_column,
 };
-use crate::mv::refresh_io::{acquire_mv_refresh_lock, parse_iceberg_table_refs};
+use crate::mv::refresh_io::acquire_mv_refresh_lock;
 #[cfg(test)]
 use crate::mv::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
 use crate::mv::repository::CreateMvRepositoryRequest;
@@ -134,11 +141,6 @@ use crate::query_execution::mv_assembly::refresh_artifact::{
     MvIncrementalWritePreparer, MvIncrementalWriteRequest, MvRefreshPublicationBase,
     MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite,
     PreparedMvIncrementalWrite,
-};
-#[cfg(test)]
-use crate::query_execution::planning::bindings::{
-    MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
-    QueryTableBindingStore,
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
@@ -225,7 +227,7 @@ impl IcebergMvCorePorts {
         &self.repository
     }
 
-    pub(crate) fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+    pub fn connector_control(&self) -> &dyn ConnectorControlRegistry {
         self.connector_control.as_ref()
     }
 
@@ -233,7 +235,7 @@ impl IcebergMvCorePorts {
         self.storage_observation.as_ref()
     }
 
-    pub(crate) fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+    pub fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
         self.catalog_application.as_deref()
     }
 }
@@ -914,7 +916,7 @@ fn prepare_iceberg_mv_create_with_ports(
     );
     let catalog_service =
         crate::catalog_application::query_catalog::catalog_service_snapshot(ports);
-    let provider = crate::query_execution::compiler::build_catalog_service_provider(
+    let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
         Some(current_catalog),
         &catalog_service,
         ports.connector_control.as_ref(),

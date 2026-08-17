@@ -21,4 +21,4 @@
 //! ownership live in `novarocks-frontend`. Core retains only the metadata
 //! adapter needed to bind provider-neutral facts to that owner.
 
-pub(crate) mod stats;
+pub mod stats;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::mv::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
 };
@@ -15,7 +16,6 @@ use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::PreparedMvIncrementalWrite;
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
-use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::request_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -252,11 +252,11 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 &refresh_rewrite.pin,
                 &refresh_rewrite.previous_snapshot_ids,
             )?;
-            let analyzer_catalog = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+            let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
                 &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
-                crate::query_execution::planning::statistics::iceberg_table_binding_loader(
+                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
                     query_kernel.connector_control().as_ref(),
                     connector_context.clone(),
                 ),
@@ -359,11 +359,11 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             )?;
             let catalog_service_snapshot =
                 crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
-            let analyzer_catalog = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+            let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
                 &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
-                crate::query_execution::planning::statistics::iceberg_table_binding_loader(
+                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
                     query_kernel.connector_control().as_ref(),
                     connector_context.clone(),
                 ),

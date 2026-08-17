@@ -430,14 +430,15 @@ where
     ) -> Result<Vec<ViewColumnDefinition>, String> {
         let catalog_service_snapshot =
             crate::catalog_application::query_catalog::catalog_service_snapshot(self);
-        let provider = crate::query_execution::compiler::build_catalog_service_provider(
-            Some(catalog),
-            &catalog_service_snapshot,
-            self.connector_control(),
-            context.clone(),
-            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-            self.catalog_application(),
-        );
+        let provider =
+            crate::catalog_application::query_materializer::build_catalog_service_provider(
+                Some(catalog),
+                &catalog_service_snapshot,
+                self.connector_control(),
+                context.clone(),
+                novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+                self.catalog_application(),
+            );
         let columns =
             novarocks_sql::planning::catalog::analyze_view_query(query, &provider, database)?
                 .into_iter()

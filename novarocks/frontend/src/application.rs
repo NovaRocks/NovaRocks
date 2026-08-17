@@ -130,7 +130,7 @@ pub struct FrontendApplicationHost {
     mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
     mv_service: Option<Arc<FrontendMvService>>,
     mv_refresh_provider_activation: Option<Arc<FrontendMvRefreshProviderActivationPort>>,
-    mv_background_engine_sink: Option<Arc<dyn novarocks::mv::background::MvBackgroundEngineSink>>,
+    mv_background_engine_sink: Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
     coordination: Option<Arc<FrontendCoordinationRuntime>>,
     query_execution: Option<QueryExecutionService>,
@@ -801,9 +801,9 @@ impl FrontendApplicationHost {
         })
     }
 
-    pub fn mv_background_engine_sink(
+    pub(crate) fn mv_background_engine_sink(
         &self,
-    ) -> Option<Arc<dyn novarocks::mv::background::MvBackgroundEngineSink>> {
+    ) -> Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>> {
         self.mv_background_engine_sink.as_ref().map(Arc::clone)
     }
 

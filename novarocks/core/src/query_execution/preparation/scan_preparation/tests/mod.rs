@@ -70,8 +70,8 @@ fn prepare_scan_bindings_with_controls(
 fn fixture_query_table_bindings(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-) -> crate::query_execution::planning::bindings::QueryTableBindingStore {
-    use crate::query_execution::planning::bindings::{
+) -> crate::catalog_application::query_bindings::QueryTableBindingStore {
+    use crate::catalog_application::query_bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
     use novarocks_spi::connector::{
@@ -227,8 +227,8 @@ fn fixture_query_table_bindings(
                     statistics_pin: None,
                     admission: planning_lease
                         .clone()
-                        .map(crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact)
-                        .unwrap_or(crate::query_execution::planning::bindings::QueryTableBindingAdmission::Local),
+                        .map(crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact)
+                        .unwrap_or(crate::catalog_application::query_bindings::QueryTableBindingAdmission::Local),
                     scan_materialization: Some(scan_materialization.clone()),
                     mv_target_read: match facts.mv_target() {
                         Some(target)
@@ -237,7 +237,7 @@ fn fixture_query_table_bindings(
                                 SqlScanPreparationCategory::MvTargetState
                                     | SqlScanPreparationCategory::MvTargetLocator
                             ) => Some(
-                            crate::query_execution::planning::bindings::MvTargetReadAdmission {
+                            crate::catalog_application::query_bindings::MvTargetReadAdmission {
                                 full: scan_materialization.clone(),
                                 affected_partitions: scan_materialization.clone(),
                                 target_table_uuid: target.target_table_uuid().to_string(),

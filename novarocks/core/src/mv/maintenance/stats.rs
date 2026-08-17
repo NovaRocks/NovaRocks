@@ -33,30 +33,30 @@ use novarocks_spi::connector::{
 use crate::mv::persistence::definition::StoredMvDefinition;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotInfo {
-    pub(crate) snapshot_id: i64,
-    pub(crate) timestamp_ms: i64,
+pub struct SnapshotInfo {
+    pub snapshot_id: i64,
+    pub timestamp_ms: i64,
 }
 
 /// Provider facts only. Frontend owns every policy decision and retry state.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct TableMaintenanceStats {
-    pub(crate) current_snapshot_id: Option<i64>,
-    pub(crate) snapshots: Vec<SnapshotInfo>,
-    pub(crate) total_data_files: Option<u64>,
-    pub(crate) max_compactable_data_files: Option<u64>,
-    pub(crate) total_files_size_bytes: Option<u64>,
-    pub(crate) total_delete_files: Option<u64>,
+pub struct TableMaintenanceStats {
+    pub current_snapshot_id: Option<i64>,
+    pub snapshots: Vec<SnapshotInfo>,
+    pub total_data_files: Option<u64>,
+    pub max_compactable_data_files: Option<u64>,
+    pub total_files_size_bytes: Option<u64>,
+    pub total_delete_files: Option<u64>,
     /// Typed maintenance policy facts declared by the table. `None` means the
     /// table declares no usable value for that key; defaults and clamping are
     /// policy and belong to the frontend, never to this fact layer.
-    pub(crate) maintenance_enabled: Option<bool>,
-    pub(crate) expire_max_snapshot_age_ms: Option<i64>,
-    pub(crate) expire_min_snapshots_to_keep: Option<u32>,
-    pub(crate) target_file_size_bytes: Option<i64>,
-    pub(crate) non_default_reference_count: usize,
-    pub(crate) downstream_floor_ts_ms: Option<i64>,
-    pub(crate) downstream_floor_unknown: bool,
+    pub maintenance_enabled: Option<bool>,
+    pub expire_max_snapshot_age_ms: Option<i64>,
+    pub expire_min_snapshots_to_keep: Option<u32>,
+    pub target_file_size_bytes: Option<i64>,
+    pub non_default_reference_count: usize,
+    pub downstream_floor_ts_ms: Option<i64>,
+    pub downstream_floor_unknown: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,7 +106,7 @@ pub(crate) fn downstream_floor(
 /// Read one MV storage table's maintenance facts through explicit frontend
 /// control and observation ports. Background policy must retain only these
 /// leaves, never the aggregate standalone engine state.
-pub(crate) fn collect_table_stats_with_ports(
+pub fn collect_table_stats_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
     storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     catalog: &str,

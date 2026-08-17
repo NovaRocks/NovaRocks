@@ -248,7 +248,7 @@ fn prepare_iceberg_distributed_write(
         connector_context.clone(),
     )?;
     let table_bindings =
-        Arc::new(crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()?);
+        Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
     let target_binding = admit_prepared_frozen_connector_write_target(
         table_bindings.as_ref(),
         FrozenConnectorScanIdentity::new(
@@ -585,7 +585,7 @@ struct PreparedIcebergWriteExecutor {
     target: TargetBackend,
     query: sqlparser::ast::Query,
     sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,

@@ -361,7 +361,7 @@ pub(crate) struct CtasSourceExecutionGate {
 /// second SQL compilation or a current-generation metadata lookup.
 pub(crate) struct PlannedCtasSourceQuery {
     source: novarocks_sql::planning::dml::DmlCtasSourcePlan,
-    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
     connector_target_parallelism: std::num::NonZeroUsize,
 }
@@ -387,14 +387,15 @@ fn plan_query_for_ctas_source(
     }
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(state);
-    let analyzer_provider = crate::query_execution::compiler::build_catalog_service_provider(
-        current_catalog,
-        &catalog_service_snapshot,
-        state.connector_control().as_ref(),
-        connector_context.clone(),
-        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-        state.catalog_application().map(Arc::as_ref),
-    );
+    let analyzer_provider =
+        crate::catalog_application::query_materializer::build_catalog_service_provider(
+            current_catalog,
+            &catalog_service_snapshot,
+            state.connector_control().as_ref(),
+            connector_context.clone(),
+            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+            state.catalog_application().map(Arc::as_ref),
+        );
     let table_bindings = analyzer_provider.query_table_bindings();
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);

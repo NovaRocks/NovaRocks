@@ -16,14 +16,11 @@
 // under the License.
 
 use crate::mv::analysis::ResolvedTableRef;
-use crate::mv::dependency::graph::{
-    topological_upstream_order_for_edges, validate_no_cycle_for_edges,
-};
+use crate::mv::dependency::graph::validate_no_cycle_for_edges;
 use crate::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, iceberg_mv_dependency_ref,
     iceberg_table_dependency_ref,
 };
-use crate::mv::dependency::refresh::{MvRefreshDependencyStep, refresh_step_for_dependency_object};
 use crate::mv::dependency::scope::{
     validate_no_external_dependents_for_scope, validate_no_iceberg_mv_targets_in_scope,
 };
@@ -160,33 +157,6 @@ pub(crate) fn ensure_no_external_iceberg_dependents_with_repository(
     }
 
     validate_no_external_dependents_for_scope(scope_catalog, scope_namespace, &edges)
-}
-
-pub(crate) fn build_upstream_refresh_steps_with_repository(
-    repository: &dyn MvRepository,
-    requested: &MvDependencyObjectRef,
-) -> Result<Vec<MvRefreshDependencyStep>, String> {
-    let definitions = repository
-        .list_definitions()
-        .map_err(|e| format!("load MV definitions for refresh graph failed: {e}"))?;
-
-    let mut edges = Vec::new();
-    for definition in definitions {
-        let target = stored_definition_dependency_ref_for_iceberg(&definition)?;
-        let upstream_mvs = repository
-            .list_dependencies_by_downstream(definition.mv_id)
-            .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?
-            .into_iter()
-            .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
-            .map(|dep| dep.upstream)
-            .collect::<Vec<_>>();
-        edges.push((target, upstream_mvs));
-    }
-
-    topological_upstream_order_for_edges(requested, &edges)?
-        .iter()
-        .map(refresh_step_for_dependency_object)
-        .collect()
 }
 
 pub(crate) fn validate_no_create_cycle_with_repository(

@@ -15,16 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::mv::dependency::graph::topological_upstream_order_for_edges;
 use crate::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use crate::mv::model::{MvStorageEngine, MvTarget};
+use crate::mv::persistence::definition::StoredMvDefinition;
+use crate::mv::persistence::dependency::stored_definition_dependency_ref;
+use crate::mv::repository::MvRepository;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvRefreshDependencyStep {
-    pub(crate) object: MvDependencyObjectRef,
-    pub(crate) target: MvTarget,
-    pub(crate) storage_engine: MvStorageEngine,
+pub struct MvRefreshDependencyStep {
+    object: MvDependencyObjectRef,
+    target: MvTarget,
+    storage_engine: MvStorageEngine,
+}
+
+impl MvRefreshDependencyStep {
+    pub fn display_name(&self) -> String {
+        self.object.display_name()
+    }
+
+    pub fn target(&self) -> &MvTarget {
+        &self.target
+    }
+
+    pub fn into_target(self) -> MvTarget {
+        self.target
+    }
+
+    pub fn is_iceberg(&self) -> bool {
+        self.storage_engine == MvStorageEngine::Iceberg
+    }
 }
 
 pub(crate) fn refresh_step_for_dependency_object(
@@ -55,6 +77,47 @@ pub(crate) fn refresh_step_for_dependency_object(
         },
         storage_engine,
     })
+}
+
+/// Resolves the required upstream MV refresh order from persisted dependency
+/// edges. The caller owns refresh admission; Core returns only domain steps.
+pub fn build_upstream_refresh_steps_with_repository(
+    repository: &dyn MvRepository,
+    requested: &MvDependencyObjectRef,
+) -> Result<Vec<MvRefreshDependencyStep>, String> {
+    let definitions = repository
+        .list_definitions()
+        .map_err(|e| format!("load MV definitions for refresh graph failed: {e}"))?;
+
+    let mut edges = Vec::new();
+    for definition in definitions {
+        let target = stored_definition_dependency_ref_for_iceberg(&definition)?;
+        let upstream_mvs = repository
+            .list_dependencies_by_downstream(definition.mv_id)
+            .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?
+            .into_iter()
+            .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
+            .map(|dep| dep.upstream)
+            .collect::<Vec<_>>();
+        edges.push((target, upstream_mvs));
+    }
+
+    topological_upstream_order_for_edges(requested, &edges)?
+        .iter()
+        .map(refresh_step_for_dependency_object)
+        .collect()
+}
+
+fn stored_definition_dependency_ref_for_iceberg(
+    definition: &StoredMvDefinition,
+) -> Result<MvDependencyObjectRef, String> {
+    if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
+        return stored_definition_dependency_ref(definition, None);
+    }
+    Err(format!(
+        "legacy materialized view definition {} uses an unsupported storage engine",
+        definition.mv_id
+    ))
 }
 
 #[cfg(test)]

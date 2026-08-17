@@ -26,7 +26,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use novarocks_catalog::schema::ColumnDef;
 use std::sync::Arc;
 
-use super::bindings::{
+use crate::catalog_application::query_bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
     QueryWriteTargetAdmission,
 };
@@ -159,7 +159,7 @@ pub(crate) fn admit_prepared_frozen_connector_write_target(
 
 fn admitted_write_target(
     binding: &QueryTableBinding,
-) -> Result<&crate::query_execution::planning::bindings::QueryWriteTargetAdmission, String> {
+) -> Result<&crate::catalog_application::query_bindings::QueryWriteTargetAdmission, String> {
     binding
         .write_target_admission
         .as_ref()

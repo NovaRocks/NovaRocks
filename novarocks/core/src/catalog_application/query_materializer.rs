@@ -28,15 +28,21 @@ use std::sync::Arc;
 use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::provider::CatalogProvider;
 use novarocks_catalog::table::CatalogTable;
+use novarocks_spi::connector::ConnectorControlResolver;
 
-use crate::catalog_application::query_catalog::ConnectorQueryTableMaterialization;
-use crate::query_execution::planning::bindings::{
+use crate::catalog_application::query_bindings::{
     QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
     QueryTableBindingStore,
 };
+use crate::catalog_application::query_catalog::{
+    ConnectorQueryTableMaterialization, QueryCatalogService,
+    load_connector_table_alias_materialization_with_lease,
+    load_connector_table_materialization_with_lease,
+};
 use novarocks_sql::binding::SqlTableBindingId;
-use novarocks_sql::planning::catalog::ResolvedAnalyzerTable;
-use novarocks_sql::planning::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
+use novarocks_sql::planning::catalog::{
+    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
+};
 
 /// Project a provider-neutral SPI metadata materialization into the
 /// request-local SQL binding. Provider aliases retain their separately frozen
@@ -441,6 +447,191 @@ impl IcebergMetadataTableProvider for CatalogServiceMaterializer<'_> {
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     ) -> Result<ResolvedAnalyzerTable, String> {
         self.metadata_table_def(catalog, database, table, metadata_table_type)
+    }
+}
+
+/// Builds the request-local SQL materializer behind the Frontend-owned catalog
+/// admission gate.
+///
+/// Every analyzer entry point passes the state's application port: an external
+/// table can only be materialized while its attachment is `Ready` in this
+/// process, and there is no ungated variant to fall back to.
+pub fn build_catalog_service_provider<'a>(
+    current_catalog: Option<&'a str>,
+    catalog_service: &'a QueryCatalogService,
+    controls: &'a dyn ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    _lookup_mode: TableLookupMode,
+    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+) -> CatalogServiceMaterializer<'a> {
+    build_catalog_service_provider_with_query_local_overlays(
+        current_catalog,
+        catalog_service,
+        controls,
+        connector_context,
+        _lookup_mode,
+        Vec::new(),
+        catalog_application,
+    )
+}
+
+/// Build the application catalog facade for one admitted query, optionally
+/// supplying generated relations that are scoped to that request. These
+/// overlays are projected into SQL binding tokens before analysis and never
+/// enter the shared local catalog.
+pub(crate) fn build_catalog_service_provider_with_query_local_overlays<'a>(
+    current_catalog: Option<&'a str>,
+    catalog_service: &'a QueryCatalogService,
+    controls: &'a dyn ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    _lookup_mode: TableLookupMode,
+    overlays: Vec<QueryLocalTableOverlay>,
+    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+) -> CatalogServiceMaterializer<'a> {
+    let bindings = Arc::new(
+        QueryTableBindingStore::try_new()
+            .expect("query table binding scope allocation must not fail"),
+    );
+    build_catalog_service_provider_with_bindings_and_query_local_overlays(
+        current_catalog,
+        catalog_service,
+        controls,
+        connector_context,
+        bindings,
+        overlays,
+        catalog_application,
+    )
+}
+
+pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overlays<'a>(
+    current_catalog: Option<&'a str>,
+    catalog_service: &'a QueryCatalogService,
+    controls: &'a dyn ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    bindings: Arc<QueryTableBindingStore>,
+    overlays: Vec<QueryLocalTableOverlay>,
+    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+) -> CatalogServiceMaterializer<'a> {
+    let loader = iceberg_table_binding_loader(controls, connector_context);
+    CatalogServiceMaterializer::new_with_query_local_overlays(
+        current_catalog,
+        catalog_service,
+        bindings,
+        loader,
+        overlays,
+    )
+    .with_catalog_application(catalog_application)
+}
+
+/// Application adapter for the SQL catalog's provider-neutral materialization
+/// seam. The resulting binding carries the exact planning lease acquired for
+/// metadata; SQL itself never names the Iceberg provider.
+pub(crate) fn iceberg_table_binding_loader<'a>(
+    controls: &'a dyn ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Box<dyn QueryTableBindingLoader + 'a> {
+    Box::new(IcebergTableBindingLoader {
+        controls,
+        connector_context,
+    })
+}
+
+struct IcebergTableBindingLoader<'a> {
+    controls: &'a dyn ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
+    fn load_strict_base_table(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        binding_id: SqlTableBindingId,
+    ) -> Result<QueryTableBinding, String> {
+        let (base_table, snapshot_id) =
+            crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(table)
+                .map(|(base_table, snapshot_id)| (base_table, Some(snapshot_id)))
+                .unwrap_or((table, None));
+        let mut materialization = load_connector_table_materialization_with_lease(
+            self.controls,
+            self.connector_context.clone(),
+            catalog,
+            namespace,
+            base_table,
+        )?;
+        if let Some(snapshot_id) = snapshot_id {
+            materialization.read_selector =
+                novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id);
+        }
+        connector_query_binding_from_materialization(
+            materialization,
+            catalog,
+            namespace,
+            table,
+            binding_id,
+        )
+    }
+
+    fn load_metadata_table(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
+        binding_id: SqlTableBindingId,
+    ) -> Result<QueryTableBinding, String> {
+        let alias = format!(
+            "{table}${}",
+            metadata_table_alias_suffix(metadata_table_type)
+        );
+        let materialization = load_connector_table_alias_materialization_with_lease(
+            self.controls,
+            self.connector_context.clone(),
+            catalog,
+            namespace,
+            &alias,
+        )?;
+        Ok(QueryTableBinding {
+            resolved: novarocks_sql::planning::catalog::resolved_metadata_table(
+                catalog,
+                namespace,
+                table,
+                metadata_table_type,
+                materialization.columns,
+                materialization.row_lineage_metadata_columns,
+                binding_id,
+            ),
+            statistics_pin: materialization.statistics_pin.clone(),
+            admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
+            scan_materialization: Some(QueryScanMaterialization {
+                table: materialization.read_table,
+                schema: materialization.read_schema,
+                selector: materialization.read_selector,
+                statistics_pin: materialization.statistics_pin,
+                planning_lease: materialization.planning_lease,
+            }),
+            mv_target_read: None,
+            write_target_admission: None,
+            frozen_snapshot_materializations: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
+        })
+    }
+}
+
+fn metadata_table_alias_suffix(
+    kind: novarocks_sql::planning::catalog::MetadataTableKind,
+) -> &'static str {
+    use novarocks_sql::planning::catalog::MetadataTableKind;
+
+    match kind {
+        MetadataTableKind::Snapshots => "SNAPSHOTS",
+        MetadataTableKind::History => "HISTORY",
+        MetadataTableKind::Refs => "REFS",
+        MetadataTableKind::Files => "FILES",
+        MetadataTableKind::Manifests => "MANIFESTS",
+        MetadataTableKind::Partitions => "PARTITIONS",
+        MetadataTableKind::LogicalIcebergMetadata => "LOGICAL_ICEBERG_METADATA",
     }
 }
 

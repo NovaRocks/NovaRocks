@@ -59,7 +59,7 @@ pub(crate) fn observe_schema_validation_for_table(
 
 /// Loads the current base-table refresh facts without admitting query assembly
 /// dependencies into refresh-domain planning.
-pub(crate) fn observe_current_refresh_base(
+pub fn observe_current_refresh_base(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,

@@ -129,11 +129,11 @@ impl QueryPreparationKernel {
         &self.catalog_service
     }
 
-    pub(crate) fn catalog_application(&self) -> Option<&Arc<dyn CatalogApplicationPort>> {
+    pub fn catalog_application(&self) -> Option<&Arc<dyn CatalogApplicationPort>> {
         self.catalog_application.as_ref()
     }
 
-    pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
+    pub fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
         &self.connector_control
     }
 

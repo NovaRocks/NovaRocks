@@ -16,6 +16,8 @@
 // under the License.
 
 pub(crate) mod activity;
+pub(crate) mod background;
+pub(crate) mod background_engine;
 // Consumed when lake-first discovery replaces ledger-driven enumeration; the
 // classifier is pure and lands with its rules tested first.
 #[allow(dead_code)]

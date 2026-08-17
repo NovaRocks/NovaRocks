@@ -83,7 +83,7 @@ fn freeze_base_table_state(
     storage_observation: &dyn MvStorageObservationPort,
     fqn: &str,
 ) -> Result<SqlMvRewriteBaseTableFacts, String> {
-    let table_ref = crate::mv::refresh_io::parse_iceberg_table_refs(&[fqn.to_string()])?
+    let table_ref = crate::mv::refresh::definition::parse_iceberg_table_refs(&[fqn.to_string()])?
         .into_iter()
         .next()
         .expect("one table reference produces one parsed identity");

@@ -66,7 +66,7 @@ use novarocks_spi::connector::{
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use novarocks_sql::planning::mv::{SqlMvAggregateLayoutScope, extract_aggregate_sql_calls};
 use novarocks_sql::syntax::{IcebergPartitionFieldExpr, RefreshMaterializedViewStmt};
-pub(crate) struct StandaloneMvRefreshPreparationService<'a> {
+pub struct StandaloneMvRefreshPreparationService<'a> {
     source: &'a IcebergMvCorePorts,
     current_catalog: Option<&'a str>,
     current_database: &'a str,
@@ -76,7 +76,7 @@ pub(crate) struct StandaloneMvRefreshPreparationService<'a> {
 }
 
 impl<'a> StandaloneMvRefreshPreparationService<'a> {
-    pub(crate) fn new_with_ports(
+    pub fn new_with_ports(
         ports: &'a IcebergMvCorePorts,
         current_catalog: Option<&'a str>,
         current_database: &'a str,
@@ -120,7 +120,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let visible_query = parse_mv_select_query(select_sql)?;
-    let provider = crate::query_execution::compiler::build_catalog_service_provider(
+    let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
         current_catalog,
         ports.catalog_service().as_ref(),
         ports.connector_control(),
@@ -401,7 +401,7 @@ fn prepare_managed_repartition_transition(
         current_catalog,
         current_database,
     );
-    let provider = crate::query_execution::compiler::build_catalog_service_provider(
+    let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
         current_catalog,
         source.catalog_service().as_ref(),
         source.connector_control(),

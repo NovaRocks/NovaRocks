@@ -26,11 +26,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::background::{MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts};
 use novarocks::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
-};
-use novarocks::mv::background::{
-    MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
 };
 
 const DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS: i64 = 432_000_000;

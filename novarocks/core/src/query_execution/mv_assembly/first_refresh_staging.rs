@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::query_catalog::catalog_service_snapshot;
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::compiler::prepare_sealed_iceberg_write_native_assembly;
@@ -16,7 +17,6 @@ use crate::query_execution::mv_assembly::refresh_artifact::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,
 };
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
-use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
@@ -31,7 +31,7 @@ pub(crate) fn frozen_logical_context_from_rewrite(
     rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
     affected_partitions: crate::mv::model::AffectedTargetPartitions,
     frozen_base_overlays: Option<
-        Vec<crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay>,
+        Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
     >,
 ) -> Result<MvFirstRefreshLogicalContext, String> {
     Ok(MvFirstRefreshLogicalContext {
@@ -104,15 +104,16 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
-            let materializer = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new(
-                None,
-                &catalog_service_snapshot,
-                Arc::clone(&bindings),
-                crate::query_execution::planning::statistics::iceberg_table_binding_loader(
-                    query_kernel.connector_control().as_ref(),
-                    connector_context.clone(),
-                ),
-            );
+            let materializer =
+                crate::catalog_application::query_materializer::CatalogServiceMaterializer::new(
+                    None,
+                    &catalog_service_snapshot,
+                    Arc::clone(&bindings),
+                    crate::catalog_application::query_materializer::iceberg_table_binding_loader(
+                        query_kernel.connector_control().as_ref(),
+                        connector_context.clone(),
+                    ),
+                );
             let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
                 .ok_or_else(|| {
                 "MV first-refresh write requires a non-empty admitted backend topology".to_string()
@@ -196,11 +197,11 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
-            let materializer = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+            let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
                 &catalog_service_snapshot,
                 Arc::clone(&bindings),
-                crate::query_execution::planning::statistics::iceberg_table_binding_loader(
+                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
                     query_kernel.connector_control().as_ref(),
                     connector_context.clone(),
                 ),

@@ -18,13 +18,9 @@
 
 use std::sync::Arc;
 
-use novarocks_spi::connector::{
-    ConnectorControlResolver, StatisticsMetric, StatisticsMetricRequest,
-};
-
-use crate::catalog_application::query_catalog::{
-    load_connector_table_alias_materialization_with_lease,
-    load_connector_table_materialization_with_lease,
+use crate::catalog_application::query_bindings::{
+    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingStore,
+    parse_time_travel_overlay_identity,
 };
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
@@ -32,13 +28,7 @@ use crate::connector::unified_statistics::{
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel, StatisticsExecutionKernel,
 };
-use crate::query_execution::planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
-    QueryTableBindingStore, parse_time_travel_overlay_identity,
-};
-use crate::query_execution::planning::catalog_materializer::{
-    QueryTableBindingLoader, connector_query_binding_from_materialization,
-};
+use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
 use novarocks_sql::planning::dml::{
     DmlStatisticsEvidence, DmlStatisticsFailure, DmlStatisticsSnapshot,
@@ -261,117 +251,6 @@ fn map_resolution_failure(error: StatisticsResolutionFailure) -> DmlStatisticsFa
         StatisticsResolutionFailure::Connector(error) => DmlStatisticsFailure::CorruptEvidence(
             format!("unexpected connector error after conservative mapping: {error}"),
         ),
-    }
-}
-
-/// Application adapter for the SQL catalog's provider-neutral materialization
-/// seam.  The resulting binding carries the exact planning lease acquired for
-/// metadata; SQL itself never names the Iceberg provider.
-pub(crate) fn iceberg_table_binding_loader<'a>(
-    controls: &'a dyn ConnectorControlResolver,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Box<dyn QueryTableBindingLoader + 'a> {
-    Box::new(IcebergTableBindingLoader {
-        controls,
-        connector_context,
-    })
-}
-
-struct IcebergTableBindingLoader<'a> {
-    controls: &'a dyn ConnectorControlResolver,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-}
-
-impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
-    fn load_strict_base_table(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        binding_id: novarocks_sql::binding::SqlTableBindingId,
-    ) -> Result<QueryTableBinding, String> {
-        let (base_table, snapshot_id) = parse_time_travel_overlay_identity(table)
-            .map(|(base_table, snapshot_id)| (base_table, Some(snapshot_id)))
-            .unwrap_or((table, None));
-        let mut materialization = load_connector_table_materialization_with_lease(
-            self.controls,
-            self.connector_context.clone(),
-            catalog,
-            namespace,
-            base_table,
-        )?;
-        if let Some(snapshot_id) = snapshot_id {
-            materialization.read_selector =
-                novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id);
-        }
-        connector_query_binding_from_materialization(
-            materialization,
-            catalog,
-            namespace,
-            table,
-            binding_id,
-        )
-    }
-
-    fn load_metadata_table(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
-        binding_id: novarocks_sql::binding::SqlTableBindingId,
-    ) -> Result<QueryTableBinding, String> {
-        let alias = format!(
-            "{table}${}",
-            metadata_table_alias_suffix(metadata_table_type)
-        );
-        let materialization = load_connector_table_alias_materialization_with_lease(
-            self.controls,
-            self.connector_context.clone(),
-            catalog,
-            namespace,
-            &alias,
-        )?;
-        Ok(QueryTableBinding {
-            resolved: novarocks_sql::planning::catalog::resolved_metadata_table(
-                catalog,
-                namespace,
-                table,
-                metadata_table_type,
-                materialization.columns,
-                materialization.row_lineage_metadata_columns,
-                binding_id,
-            ),
-            statistics_pin: materialization.statistics_pin.clone(),
-            admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
-            scan_materialization: Some(QueryScanMaterialization {
-                table: materialization.read_table,
-                schema: materialization.read_schema,
-                selector: materialization.read_selector,
-                statistics_pin: materialization.statistics_pin,
-                planning_lease: materialization.planning_lease,
-            }),
-            mv_target_read: None,
-            write_target_admission: None,
-            frozen_snapshot_materializations: std::collections::BTreeMap::new(),
-            admitted_change_scans: std::collections::BTreeMap::new(),
-        })
-    }
-}
-
-fn metadata_table_alias_suffix(
-    kind: novarocks_sql::planning::catalog::MetadataTableKind,
-) -> &'static str {
-    use novarocks_sql::planning::catalog::MetadataTableKind;
-
-    match kind {
-        MetadataTableKind::Snapshots => "SNAPSHOTS",
-        MetadataTableKind::History => "HISTORY",
-        MetadataTableKind::Refs => "REFS",
-        MetadataTableKind::Files => "FILES",
-        MetadataTableKind::Manifests => "MANIFESTS",
-        MetadataTableKind::Partitions => "PARTITIONS",
-        MetadataTableKind::LogicalIcebergMetadata => "LOGICAL_ICEBERG_METADATA",
     }
 }
 
