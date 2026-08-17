@@ -22,8 +22,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks::maintenance::{MaintenanceTarget, TableMaintenanceEngine};
-use novarocks::mv::application::{MvRefreshAttemptIdentity, PreparedMvRefresh};
 use novarocks::mv::repository::MvTarget;
+use novarocks::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshAttemptIdentity, PreparedMvRefresh,
+};
 use novarocks_spi::connector::ConnectorRequestContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

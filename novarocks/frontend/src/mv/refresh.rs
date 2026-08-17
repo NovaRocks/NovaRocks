@@ -24,10 +24,7 @@ use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
 };
-use novarocks::mv::application::{
-    MvApplicationError, MvApplicationErrorKind, MvStatementResult, PreparedMvRefresh,
-    PreparedMvRefreshWork, PreparedMvRefreshWrite,
-};
+use novarocks::mv::application::{MvApplicationError, MvApplicationErrorKind, MvStatementResult};
 use novarocks::mv::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
     FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
@@ -40,6 +37,9 @@ use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
 use novarocks::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublishedFacts,
+};
+use novarocks::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshAttemptIdentity, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use novarocks::query_execution::mv_native_write::{
     MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
@@ -311,7 +311,7 @@ fn execute_data_refresh(
     repository: &dyn MvRepository,
     dependencies: &FrontendMvRefreshDependencies,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    attempt: novarocks::mv::application::MvRefreshAttemptIdentity,
+    attempt: MvRefreshAttemptIdentity,
     finalize: MvRefreshFinalizeFacts,
     prepared: PreparedMvRefreshWrite,
     base_snapshots: BTreeMap<String, i64>,
@@ -1103,7 +1103,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use novarocks::mv::application::PreparedMvRefreshWrite;
     use novarocks::mv::persistence::refresh::{
         FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
         FrontendMvRefreshCommittedVersion,
@@ -1111,6 +1110,7 @@ mod tests {
     use novarocks::query_execution::mv_assembly::refresh_artifact::{
         MvRefreshCommittedFacts, MvRefreshPublicationIntent,
     };
+    use novarocks::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite;
     use novarocks::query_execution::mv_native_write::{
         MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
     };

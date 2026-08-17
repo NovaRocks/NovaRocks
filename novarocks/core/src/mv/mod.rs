@@ -19,7 +19,6 @@ pub(crate) mod aggregate_state;
 pub(crate) mod analysis;
 pub(crate) mod analysis_adapter;
 pub mod application;
-pub mod command;
 pub mod dependency;
 pub(crate) mod dependency_resolver;
 pub(crate) mod flow;
@@ -46,6 +45,10 @@ pub(crate) mod schema_validation;
 pub mod startup_restore;
 pub(crate) mod stateless_rebuild;
 pub mod storage_observation;
+pub use flow::{
+    alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports, list_mvs_with_backend,
+};
 pub use iceberg_refresh::IcebergMvCorePorts;
+pub use stateless_rebuild::{PROCEDURE_NAME, execute_novarocks_imv_stateless_rebuild};
 #[doc(hidden)]
 pub mod test_repository;

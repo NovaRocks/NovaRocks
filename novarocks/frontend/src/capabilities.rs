@@ -34,7 +34,6 @@ use novarocks::connector::UnifiedStatisticsResolver;
 use novarocks::maintenance::TableMaintenanceService;
 use novarocks::maintenance::command as maintenance_command;
 use novarocks::mv::application::MvApplicationService;
-use novarocks::mv::command as mv_command;
 use novarocks::mv::repository::MvRepository;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks::query_execution::backend::BackendTopologyService;
@@ -47,6 +46,8 @@ use novarocks::statistics::application::StatisticsApplicationPort;
 use novarocks::statistics::command as statistics_command;
 use novarocks::view::ViewService;
 use novarocks::view::view_command;
+
+use crate::mv::{FrontendMvService, command as mv_command};
 
 use crate::query::compiler::FrontendQueryCompiler;
 
@@ -408,9 +409,9 @@ pub struct MvCommandPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    unified_statistics: Arc<UnifiedStatisticsResolver>,
     repository: Arc<dyn MvRepository>,
-    application: Arc<dyn MvApplicationService>,
+    create_application: Arc<dyn MvApplicationService>,
+    refresh_service: Arc<FrontendMvService>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
 }
@@ -421,9 +422,9 @@ impl MvCommandPorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        unified_statistics: Arc<UnifiedStatisticsResolver>,
         repository: Arc<dyn MvRepository>,
-        application: Arc<dyn MvApplicationService>,
+        create_application: Arc<dyn MvApplicationService>,
+        refresh_service: Arc<FrontendMvService>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
     ) -> Self {
@@ -431,9 +432,9 @@ impl MvCommandPorts {
             catalog_service,
             catalog_application,
             connector_control,
-            unified_statistics,
             repository,
-            application,
+            create_application,
+            refresh_service,
             storage_observation,
             query_execution,
         }
@@ -453,9 +454,11 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
     );
     mv_command::MvCommandExecutor::new(
         iceberg_ports,
-        ports.application,
+        ports.create_application,
+        ports.refresh_service,
+        Arc::clone(&ports.repository),
+        Arc::clone(&ports.storage_observation),
         backend,
-        ports.unified_statistics,
     )
 }
 

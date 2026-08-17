@@ -1105,7 +1105,7 @@ mod tests {
     {
         fn activate_write(
             &self,
-            _prepared: novarocks::mv::application::PreparedMvRefreshWrite,
+            _prepared: novarocks::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite,
             _planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
             _exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
             _execution: &novarocks::query_execution::request_context::QueryExecutionContext,

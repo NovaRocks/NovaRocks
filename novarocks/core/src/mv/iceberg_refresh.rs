@@ -52,8 +52,6 @@ use crate::mv::application::{
 #[cfg(test)]
 use crate::mv::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
-    PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use crate::mv::dependency::model::{MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::mv::lifecycle::{BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan};
@@ -141,6 +139,11 @@ use crate::query_execution::mv_assembly::refresh_artifact::{
     MvIncrementalWritePreparer, MvIncrementalWriteRequest, MvRefreshPublicationBase,
     MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite,
     PreparedMvIncrementalWrite,
+};
+#[cfg(test)]
+use crate::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
+    PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};

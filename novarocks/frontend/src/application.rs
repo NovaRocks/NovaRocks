@@ -639,11 +639,15 @@ impl FrontendApplicationHost {
                 }
             }
             None => {
-                host.mv_repository =
-                    Some(Arc::new(novarocks::mv::repository::UnavailableMvRepository));
-                host.mv_application_service = Some(Arc::new(
-                    novarocks::mv::application::UnavailableMvApplicationService,
-                ));
+                let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
+                    Arc::new(novarocks::mv::repository::UnavailableMvRepository);
+                let service = Arc::new(FrontendMvService::new(Arc::clone(&repository)));
+                let application_service: Arc<dyn novarocks::mv::application::MvApplicationService> =
+                    Arc::clone(&service)
+                        as Arc<dyn novarocks::mv::application::MvApplicationService>;
+                host.mv_repository = Some(repository);
+                host.mv_application_service = Some(application_service);
+                host.mv_service = Some(service);
             }
         }
         if let Err(error) = host.topology().start_heartbeat_manager().map_err(|error| {
@@ -789,6 +793,14 @@ impl FrontendApplicationHost {
             self.mv_application_service
                 .as_ref()
                 .expect("frontend MV application service is installed before host open returns"),
+        )
+    }
+
+    pub fn mv_service(&self) -> Arc<FrontendMvService> {
+        Arc::clone(
+            self.mv_service
+                .as_ref()
+                .expect("frontend MV service is installed before host open returns"),
         )
     }
 

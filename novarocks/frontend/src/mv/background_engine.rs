@@ -23,10 +23,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use novarocks::maintenance::MaintenanceTarget;
-use novarocks::mv::application::{
-    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
-    PreparedMvRefresh,
-};
 use novarocks::mv::dependency::model::iceberg_mv_dependency_ref;
 use novarocks::mv::dependency::refresh::build_upstream_refresh_steps_with_repository;
 use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
@@ -34,6 +30,10 @@ use novarocks::mv::refresh::{
     definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
 };
 use novarocks::mv::repository::MvTarget;
+use novarocks::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
+    PreparedMvRefresh,
+};
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,

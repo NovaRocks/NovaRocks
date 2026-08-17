@@ -65,7 +65,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::syntax::CallProcedureStmt;
 
-pub(crate) const PROCEDURE_NAME: &str = "novarocks_imv_stateless_rebuild";
+pub const PROCEDURE_NAME: &str = "novarocks_imv_stateless_rebuild";
 const TEST_ENABLE_ENV: &str = "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD";
 
 /// Fidelity level a stateless rebuild is expected to reconstruct. Mirrors the
@@ -156,7 +156,7 @@ fn split_table_reference(table: &str, current_database: &str) -> Result<(String,
     }
 }
 
-pub(crate) fn execute_novarocks_imv_stateless_rebuild(
+pub fn execute_novarocks_imv_stateless_rebuild(
     connector_control: &dyn ConnectorControlResolver,
     mv_storage_observation: &dyn MvStorageObservationPort,
     mv_repository: &dyn MvRepository,

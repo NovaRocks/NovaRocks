@@ -15,12 +15,14 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
-use crate::mv::application::{PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact};
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
     MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
+};
+use crate::query_execution::mv_assembly::refresh_handoff::{
+    PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact,
 };
 use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,

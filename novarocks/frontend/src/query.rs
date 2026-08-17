@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::mv::command::MvCommandExecutor;
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -29,7 +30,6 @@ use novarocks::catalog_application::command::CatalogCommandExecutor;
 use novarocks::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use novarocks::common::engine_error::{EngineError, EngineErrorCode};
 use novarocks::maintenance::command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor};
-use novarocks::mv::command::MvCommandExecutor;
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::backend_command::BackendCommandExecutor;
 use novarocks::query_execution::cancellation::QueryCancellationReason;

@@ -18,6 +18,7 @@
 use crate::mv::analysis::resolve_mv_name;
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::refresh::target_binding::{MvTargetBinding, load_mv_target_binding_with_ports};
+use crate::mv::repository::MvTarget;
 use crate::mv::storage_observation::MvStorageObservationPort;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
@@ -57,6 +58,22 @@ pub(crate) fn resolve_refresh_target(
         catalog: normalize_identifier(catalog)?,
         namespace,
         table,
+    })
+}
+
+/// Resolves a SQL-level MV name to the public repository target used by
+/// frontend command admission, without exposing the internal Iceberg planning
+/// identity.
+pub fn resolve_refresh_mv_target(
+    current_catalog: Option<&str>,
+    current_database: &str,
+    name: &ObjectName,
+) -> Result<MvTarget, String> {
+    let target = resolve_refresh_target(current_catalog, current_database, name)?;
+    Ok(MvTarget {
+        catalog: Some(target.catalog),
+        database: target.namespace,
+        name: target.table,
     })
 }
 

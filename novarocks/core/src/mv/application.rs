@@ -19,20 +19,14 @@
 
 use std::fmt;
 
-use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
 use uuid::Uuid;
 
 use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
-use crate::query_execution::mv_assembly::refresh_artifact::{
-    MvRefreshPublicationIntent, PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite,
-};
 use crate::runtime::query_result::QueryResult;
-use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 use novarocks_sql::syntax::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy,
-    MvAdmittedStatement,
 };
 
 /// Join refresh shape retained until query assembly admits exact connector
@@ -57,191 +51,6 @@ pub(crate) enum MvIncrementalRewriteEvidence {
     BranchUnionAggregate,
 }
 
-/// Frontend-preallocated identities for a single MV refresh lifecycle. These
-/// are application lifecycle values: SQL may validate them but cannot create
-/// a connector operation or persist their durable intent.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvRefreshAttemptIdentity {
-    pub refresh_id: i64,
-    pub request_id: [u8; 16],
-    pub staging_branch: String,
-    pub marker_token: String,
-    pub staging_create_operation_id: [u8; 16],
-    pub write_operation_id: ConnectorWriteOperationId,
-    pub publication_operation_id: [u8; 16],
-    pub staging_drop_operation_id: [u8; 16],
-}
-
-impl MvRefreshAttemptIdentity {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.refresh_id <= 0 || self.staging_branch.is_empty() || self.marker_token.is_empty() {
-            return Err(
-                "MV refresh preparation requires a positive identity and non-empty staging marker"
-                    .to_string(),
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Application request supplied to the side-effect-free SQL preparation port.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvRefreshPreparationRequest {
-    pub statement: MvRefreshStatement,
-    pub target: SqlMvTarget,
-    pub attempt: MvRefreshAttemptIdentity,
-}
-
-impl MvRefreshPreparationRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        self.statement.validate_supported()?;
-        self.attempt.validate()
-    }
-}
-
-/// Application-owned work handoff after SQL planning. SQL plans determine the
-/// semantic shape; this lifecycle envelope owns operation/cohort-bearing
-/// artifacts and is the only value admitted by frontend staging.
-pub enum PreparedMvRefreshWork {
-    NoOp,
-    MetadataOnly,
-    DataProducing { write: PreparedMvRefreshWrite },
-}
-
-/// Exactly one SQL-prepared staged write for a data-producing refresh.
-///
-/// The public application handoff intentionally hides the assembly-specific
-/// first-refresh and incremental artifact shapes. Frontend lifecycle code can
-/// validate its operation, cohort, and publication facts, but only the
-/// query-assembly activation adapter may recover the exact artifact needed to
-/// construct a native write.
-pub struct PreparedMvRefreshWrite {
-    artifact: PreparedMvRefreshWriteArtifact,
-}
-
-/// The assembly-facing shape remains crate-private so it cannot become part
-/// of the Core MV application port's public contract.
-pub(crate) enum PreparedMvRefreshWriteArtifact {
-    FirstRefresh(PreparedMvFirstRefreshWrite),
-    Incremental(PreparedMvIncrementalWrite),
-}
-
-impl PreparedMvRefreshWrite {
-    pub(crate) fn first_refresh(write: PreparedMvFirstRefreshWrite) -> Self {
-        Self {
-            artifact: PreparedMvRefreshWriteArtifact::FirstRefresh(write),
-        }
-    }
-
-    pub(crate) fn incremental(write: PreparedMvIncrementalWrite) -> Self {
-        Self {
-            artifact: PreparedMvRefreshWriteArtifact::Incremental(write),
-        }
-    }
-
-    pub fn operation_id(&self) -> ConnectorWriteOperationId {
-        match &self.artifact {
-            PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.operation_id(),
-            PreparedMvRefreshWriteArtifact::Incremental(write) => write.operation_id(),
-        }
-    }
-
-    pub fn primary_cohort(&self) -> novarocks_spi::connector::ConnectorWriteCohortId {
-        match &self.artifact {
-            PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.primary_cohort(),
-            PreparedMvRefreshWriteArtifact::Incremental(write) => write.primary_cohort(),
-        }
-    }
-
-    pub fn publication_intent(&self) -> &MvRefreshPublicationIntent {
-        match &self.artifact {
-            PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.publication_intent(),
-            PreparedMvRefreshWriteArtifact::Incremental(write) => write.publication_intent(),
-        }
-    }
-
-    pub(crate) fn into_assembly_artifact(self) -> PreparedMvRefreshWriteArtifact {
-        self.artifact
-    }
-}
-
-/// Frontend lifecycle artifact assembled from SQL facts and a reserved attempt.
-pub struct PreparedMvRefresh {
-    pub statement: MvRefreshStatement,
-    pub attempt: MvRefreshAttemptIdentity,
-    pub observed_binding: ConnectorExecutionBindingKey,
-    pub finalize: MvRefreshFinalizeFacts,
-    pub work: PreparedMvRefreshWork,
-}
-
-/// SQL preparation port consumed by the frontend lifecycle owner. Its request
-/// and output are application envelopes around immutable SQL values, never a
-/// way for SQL to acquire lifecycle or connector authority itself.
-pub trait MvRefreshPreparationService: Send + Sync {
-    fn prepare_step(
-        &self,
-        request: MvRefreshPreparationRequest,
-    ) -> Result<PreparedMvRefresh, String>;
-}
-
-#[cfg(test)]
-mod refresh_preparation_tests {
-    use super::*;
-
-    fn attempt() -> MvRefreshAttemptIdentity {
-        MvRefreshAttemptIdentity {
-            refresh_id: 7,
-            request_id: [1; 16],
-            staging_branch: "__nova_mv_7".to_string(),
-            marker_token: "marker".to_string(),
-            staging_create_operation_id: [2; 16],
-            write_operation_id: ConnectorWriteOperationId::from_bytes([3; 16]),
-            publication_operation_id: [4; 16],
-            staging_drop_operation_id: [5; 16],
-        }
-    }
-
-    #[test]
-    fn sqlx2_application_refresh_attempt_is_lifecycle_owned() {
-        attempt().validate().expect("complete attempt identity");
-        assert!(
-            MvRefreshAttemptIdentity {
-                marker_token: String::new(),
-                ..attempt()
-            }
-            .validate()
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn sqlx2_application_refresh_request_keeps_sql_rejection_and_attempt_together() {
-        let request = MvRefreshPreparationRequest {
-            statement: MvRefreshStatement {
-                name_parts: vec!["mv".to_string()],
-                full: false,
-            },
-            target: SqlMvTarget {
-                catalog: Some("iceberg".to_string()),
-                database: "db".to_string(),
-                name: "mv".to_string(),
-            },
-            attempt: attempt(),
-        };
-        request.validate().expect("complete request");
-        assert!(
-            MvRefreshPreparationRequest {
-                statement: MvRefreshStatement {
-                    full: true,
-                    ..request.statement
-                },
-                ..request
-            }
-            .validate()
-            .is_err()
-        );
-    }
-}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvCreatePartitionField {
     Identity { column: String },
@@ -359,20 +168,7 @@ impl From<&CreateMaterializedViewStmt> for MvCreateStatement {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MvApplicationStatement {
     Create(MvCreateStatement),
-    Refresh(MvRefreshStatement),
     Unhandled,
-}
-
-pub(crate) fn project_statement(statement: &MvAdmittedStatement) -> MvApplicationStatement {
-    match statement {
-        MvAdmittedStatement::Create(statement) => {
-            MvApplicationStatement::Create(MvCreateStatement::from(statement))
-        }
-        MvAdmittedStatement::Refresh(statement) => {
-            MvApplicationStatement::Refresh(MvRefreshStatement::from(statement))
-        }
-        _ => MvApplicationStatement::Unhandled,
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -512,57 +308,6 @@ pub trait MvApplicationService: Send + Sync {
         statement: &MvApplicationStatement,
         context: MvRequestContext<'_>,
     ) -> Result<Option<MvStatementResult>, MvApplicationError>;
-
-    /// Execute a fully SQL-prepared refresh attempt.  This deliberately sits
-    /// beside the CREATE-only `MvEngine` port: refresh owns distributed
-    /// execution, external publication, and durable intent in the frontend,
-    /// not in a widened engine backend.
-    ///
-    /// `QueryExecutionContext` is the T5 C-class request carrier: it remains
-    /// in Core because MV and connector domain code both consume its frozen
-    /// cancellation and admission facts. It is not a query-assembly owner or
-    /// a route back into Frontend composition.
-    fn execute_prepared_refresh(
-        &self,
-        _refresh: PreparedMvRefresh,
-        _connector_context: novarocks_spi::connector::ConnectorRequestContext,
-        _execution: &crate::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<MvStatementResult, MvApplicationError> {
-        Err(MvApplicationError::new(
-            MvApplicationErrorKind::Unavailable,
-            "frontend MV refresh lifecycle is unavailable",
-        ))
-    }
-
-    /// Frontend-owned admission of a SQL-prepared refresh. The caller supplies
-    /// only the side-effect-free SQL preparation port; the frontend reserves
-    /// the attempt identity, persists durable intent, and owns every external
-    /// lifecycle phase.
-    ///
-    /// The request context is the same C-class carrier documented on
-    /// `execute_prepared_refresh`; no native fragment, write registration, or
-    /// prepared-dispatch type crosses this application port.
-    fn prepare_and_execute_refresh(
-        &self,
-        _preparation: &dyn MvRefreshPreparationService,
-        _statement: MvApplicationStatement,
-        _target: MvTarget,
-        _connector_context: novarocks_spi::connector::ConnectorRequestContext,
-        _execution: &crate::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<MvStatementResult, MvApplicationError> {
-        Err(MvApplicationError::new(
-            MvApplicationErrorKind::Unavailable,
-            "frontend MV refresh lifecycle is unavailable",
-        ))
-    }
-
-    /// Run the bounded frontend-owned startup recovery pass after catalog
-    /// attachment and MV target restore.  The default is deliberately a
-    /// no-op for unavailable/test application services; production frontend
-    /// composition overrides it and retains unresolved attempts as fences.
-    fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
-        Ok(())
-    }
 }
 
 pub trait MvEngine: Send + Sync {
@@ -605,10 +350,7 @@ impl MvApplicationService for UnavailableMvApplicationService {
         statement: &MvApplicationStatement,
         _context: MvRequestContext<'_>,
     ) -> Result<Option<MvStatementResult>, MvApplicationError> {
-        if matches!(
-            statement,
-            MvApplicationStatement::Create(_) | MvApplicationStatement::Refresh(_)
-        ) {
+        if matches!(statement, MvApplicationStatement::Create(_)) {
             return Err(MvApplicationError::new(
                 MvApplicationErrorKind::Unavailable,
                 MV_REPOSITORY_UNAVAILABLE_MESSAGE,

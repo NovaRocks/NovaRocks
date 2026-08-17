@@ -20,14 +20,12 @@ use crate::query_execution::mv_assembly::query_local_bindings::{
     bind_imv_target_query_table_in_store_from_rewrite,
     freeze_imv_base_query_local_overlays_from_captured_inputs,
 };
-use crate::query_execution::planning::statistics::QueryStatisticsResolver;
 use novarocks_sql::syntax::RefreshMaterializedViewStmt;
 
 /// Compiles an EXPLAIN refresh plan from the exact frozen MV ports and
 /// query-local bindings used by refresh preparation.
-pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
+pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     ports: &IcebergMvCorePorts,
-    _statistics_resolver: &impl QueryStatisticsResolver,
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,

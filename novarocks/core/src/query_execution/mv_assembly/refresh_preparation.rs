@@ -17,8 +17,6 @@ use crate::mv::analysis::refresh_property::derive_fragment_property;
 use crate::mv::analysis::{canonicalize_iceberg_mv_select_query, validate_mv_partition_columns};
 use crate::mv::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
-    PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use crate::mv::iceberg_refresh::{
     IcebergMvCorePorts, join_base_refs_for_schema_contract,
@@ -60,6 +58,10 @@ use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite,
     PreparedMvIncrementalWrite,
 };
+use crate::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
+    PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
+};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorTableIdentity,
 };
@@ -93,7 +95,7 @@ impl<'a> StandaloneMvRefreshPreparationService<'a> {
         }
     }
 
-    pub(crate) fn new_repartition_with_ports(
+    pub fn new_repartition_with_ports(
         ports: &'a IcebergMvCorePorts,
         current_catalog: Option<&'a str>,
         current_database: &'a str,
@@ -538,7 +540,7 @@ fn prepare_frontend_first_refresh_write(
     current_catalog: Option<&str>,
     current_database: &str,
     contract: &RefreshPlanContract,
-    attempt: &crate::mv::application::MvRefreshAttemptIdentity,
+    attempt: &MvRefreshAttemptIdentity,
     base_table_uuids: &BTreeMap<String, String>,
     observed_binding: ConnectorExecutionBindingKey,
     partition_spec_replacement: Option<
@@ -871,7 +873,7 @@ pub(crate) fn select_retained_target_handle(
 
 fn frontend_refresh_publication_intent(
     contract: &RefreshPlanContract,
-    attempt: &crate::mv::application::MvRefreshAttemptIdentity,
+    attempt: &MvRefreshAttemptIdentity,
     mv_id: i64,
     select_sql: &str,
     base_table_uuids: &BTreeMap<String, String>,
@@ -971,7 +973,7 @@ fn prepare_frontend_incremental_write(
     current_catalog: Option<&str>,
     current_database: &str,
     contract: &RefreshPlanContract,
-    attempt: &crate::mv::application::MvRefreshAttemptIdentity,
+    attempt: &MvRefreshAttemptIdentity,
     observed_binding: ConnectorExecutionBindingKey,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedIncrementalRefreshWork, String> {

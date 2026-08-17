@@ -440,7 +440,7 @@ fn load_definition_for_alter(
 ///
 /// The SQL surface admits only Iceberg-backed MVs, so this uses the single
 /// injected backend rather than a string-keyed connector registry lookup.
-pub(crate) fn create_mv_with_ports(
+pub fn create_mv_with_ports(
     ports: &IcebergMvCorePorts,
     application: &dyn MvApplicationService,
     mv_backend: &dyn MvBackend,
@@ -485,7 +485,7 @@ pub(crate) fn create_mv_with_ports(
 }
 
 /// Drop an MV from the durable MV repository and the injected MV backend.
-pub(crate) fn drop_mv_with_ports(
+pub fn drop_mv_with_ports(
     repository: &dyn MvRepository,
     mv_backend: &dyn MvBackend,
     current_catalog: Option<&str>,
@@ -516,7 +516,7 @@ pub(crate) fn drop_mv_with_ports(
 /// Repartition remains a request-frozen frontend refresh operation and is
 /// deliberately rejected here so its lifecycle cannot fall back to a generic
 /// command route.
-pub(crate) fn alter_mv_with_ports(
+pub fn alter_mv_with_ports(
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     db: &str,
@@ -630,7 +630,7 @@ pub(crate) fn alter_mv_with_ports(
 
 /// List MVs through the injected backend, with no registry lookup. Sorting is
 /// retained here because it is part of the SQL presentation contract.
-pub(crate) fn list_mvs_with_backend(
+pub fn list_mvs_with_backend(
     mv_backend: &dyn MvBackend,
     current_catalog: Option<&str>,
     stmt: &ShowMaterializedViewsStmt,

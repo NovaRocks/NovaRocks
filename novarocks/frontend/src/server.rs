@@ -103,6 +103,7 @@ pub fn build_frontend_query_session_factory(
     let role = host.execution_role();
     let mv_repository = host.mv_repository();
     let mv_application = host.mv_application_service();
+    let mv_service = host.mv_service();
     let view_service = host.view_service();
     let statistics_service = host.statistics_service();
     let statistics_application = host.statistics_application_port();
@@ -115,13 +116,6 @@ pub fn build_frontend_query_session_factory(
     )
     .map_err(FrontendApplicationError::server)?;
 
-    let iceberg_mv_ports = novarocks::mv::iceberg_refresh::IcebergMvCorePorts::new(
-        Arc::clone(&catalog_service),
-        Some(Arc::clone(&catalog_application)),
-        Arc::clone(&connector_control),
-        Arc::clone(&mv_repository),
-        Arc::clone(&mv_storage_observation),
-    );
     if let Some(sink) = host.mv_refresh_provider_activation_sink() {
         core_capabilities::bind_mv_refresh_provider_activation(
             sink.as_ref(),
@@ -147,9 +141,9 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_repository),
         {
-            let application = Arc::clone(&mv_application);
+            let service = Arc::clone(&mv_service);
             Box::new(move || {
-                application
+                service
                     .recover_startup_mv_refreshes()
                     .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
             })
@@ -289,9 +283,9 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            Arc::clone(&unified_statistics),
             Arc::clone(&mv_repository),
             mv_application,
+            mv_service,
             Arc::clone(&mv_storage_observation),
             query_execution.clone(),
         ));

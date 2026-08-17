@@ -57,7 +57,7 @@ pub fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String> {
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
-pub(crate) fn build_string_query_result(
+pub fn build_string_query_result(
     column_name: &str,
     rows: Vec<String>,
 ) -> Result<QueryResult, String> {

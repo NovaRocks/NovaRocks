@@ -25,13 +25,16 @@ use super::background::{
     MvBackgroundEngineSink,
 };
 use novarocks::mv::application::{
-    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine,
-    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
-    MvRequestContext, MvStatementResult, PreparedMvRefresh, PreparedMvRefreshWork,
+    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
+    MvStatementResult,
 };
 use novarocks::mv::repository::MvRepository;
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationSource;
+use novarocks::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
+    PreparedMvRefresh, PreparedMvRefreshWork,
+};
 use novarocks::query_execution::request_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
@@ -243,19 +246,13 @@ impl MvApplicationService for FrontendMvService {
                 create::handle_create(self.repository.as_ref(), engine, statement, context)
                     .map(Some)
             }
-            // REFRESH needs the immutable admitted execution context, which
-            // only the typed refresh entrypoint accepts.  Returning `None`
-            // here would let a caller silently fall through to the retired
-            // core lifecycle.
-            MvApplicationStatement::Refresh(_) => Err(MvApplicationError::new(
-                novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
-                "REFRESH MATERIALIZED VIEW requires the frontend refresh entrypoint",
-            )),
             MvApplicationStatement::Unhandled => Ok(None),
         }
     }
+}
 
-    fn execute_prepared_refresh(
+impl FrontendMvService {
+    pub fn execute_prepared_refresh(
         &self,
         refresh_plan: PreparedMvRefresh,
         connector_context: ConnectorRequestContext,
@@ -276,20 +273,14 @@ impl MvApplicationService for FrontendMvService {
         )
     }
 
-    fn prepare_and_execute_refresh(
+    pub fn prepare_and_execute_refresh(
         &self,
         preparation: &dyn MvRefreshPreparationService,
-        statement: MvApplicationStatement,
+        statement: novarocks_sql::planning::mv::MvRefreshStatement,
         target: novarocks::mv::repository::MvTarget,
         connector_context: ConnectorRequestContext,
         execution: &novarocks::query_execution::request_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
-        let MvApplicationStatement::Refresh(statement) = statement else {
-            return Err(MvApplicationError::new(
-                novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
-                "frontend refresh entrypoint requires REFRESH MATERIALIZED VIEW",
-            ));
-        };
         let mut gate_ticket = self
             .activity_gate
             .request(
@@ -342,7 +333,7 @@ impl MvApplicationService for FrontendMvService {
         self.execute_prepared_refresh(prepared, connector_context, execution)
     }
 
-    fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
+    pub fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
         let summary = self.recover_frontend_mv_refreshes();
         tracing::info!(
             candidates = summary.candidates,
@@ -353,12 +344,7 @@ impl MvApplicationService for FrontendMvService {
         );
         Ok(())
     }
-}
-
-impl FrontendMvService {
-    fn reserve_refresh_attempt(
-        &self,
-    ) -> Result<novarocks::mv::application::MvRefreshAttemptIdentity, MvApplicationError> {
+    fn reserve_refresh_attempt(&self) -> Result<MvRefreshAttemptIdentity, MvApplicationError> {
         let refresh_id = self
             .repository
             .reserve_frontend_refresh_id()
@@ -369,7 +355,7 @@ impl FrontendMvService {
                 )
             })?;
         let request_id = *uuid::Uuid::now_v7().as_bytes();
-        Ok(novarocks::mv::application::MvRefreshAttemptIdentity {
+        Ok(MvRefreshAttemptIdentity {
             refresh_id,
             request_id,
             staging_branch: format!("__novarocks_mv_refresh_{refresh_id}"),

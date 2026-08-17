@@ -17,58 +17,53 @@
 
 //! Closed typed executor for Iceberg MV statements.
 
-use std::sync::Arc;
-
-use crate::connector::MvBackend;
-use crate::connector::unified_statistics::UnifiedStatisticsResolver;
-use crate::mv::application::MvApplicationService;
-use crate::mv::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::refresh::target::resolve_refresh_target;
-use crate::query_execution::StatementResult;
-use crate::query_execution::planning::statistics::QueryStatisticsResolver;
-use crate::query_execution::request_context::QueryExecutionContext;
+use novarocks::connector::MvBackend;
+use novarocks::mv::application::{MvApplicationService, MvStatementResult};
+use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
+use novarocks::mv::repository::MvRepository;
+use novarocks::mv::storage_observation::MvStorageObservationPort;
+use novarocks::query_execution::StatementResult;
+use novarocks::query_execution::request_context::QueryExecutionContext;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
     RefreshMaterializedViewStmt, parse_call_procedure_sql, parse_mv_admitted_statement,
 };
 
-/// `EXPLAIN REFRESH MATERIALIZED VIEW` compiles its rewrite plan through the
-/// same frozen statistics evidence the refresh path uses.  This carries
-/// exactly that one leaf port: it holds no catalog, connector, repository, or
-/// query-execution capability.
-#[derive(Clone)]
-struct MvExplainStatisticsPort(Arc<UnifiedStatisticsResolver>);
-
-impl QueryStatisticsResolver for MvExplainStatisticsPort {
-    fn unified_statistics(&self) -> &UnifiedStatisticsResolver {
-        self.0.as_ref()
-    }
-
-    fn unified_statistics_arc(&self) -> &Arc<UnifiedStatisticsResolver> {
-        &self.0
-    }
-}
+use super::FrontendMvService;
+use novarocks::mv::refresh::resolve_refresh_mv_target;
+use novarocks::mv::{
+    PROCEDURE_NAME, alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
+    execute_novarocks_imv_stateless_rebuild, list_mvs_with_backend,
+};
+use novarocks::runtime::query_result::build_string_query_result;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct MvCommandExecutor {
     ports: IcebergMvCorePorts,
-    application: Arc<dyn MvApplicationService>,
+    create_application: Arc<dyn MvApplicationService>,
+    refresh_service: Arc<FrontendMvService>,
+    repository: Arc<dyn MvRepository>,
+    storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_backend: Arc<dyn MvBackend>,
-    statistics: MvExplainStatisticsPort,
 }
 
 impl MvCommandExecutor {
     pub fn new(
         ports: IcebergMvCorePorts,
-        application: Arc<dyn MvApplicationService>,
+        create_application: Arc<dyn MvApplicationService>,
+        refresh_service: Arc<FrontendMvService>,
+        repository: Arc<dyn MvRepository>,
+        storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_backend: Arc<dyn MvBackend>,
-        unified_statistics: Arc<UnifiedStatisticsResolver>,
     ) -> Self {
         Self {
             ports,
-            application,
+            create_application,
+            refresh_service,
+            repository,
+            storage_observation,
             mv_backend,
-            statistics: MvExplainStatisticsPort(unified_statistics),
         }
     }
 
@@ -91,29 +86,25 @@ impl MvCommandExecutor {
                     "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW is not supported".to_string()
                 );
             }
-            let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
+            let lines = novarocks::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
                 &self.ports,
-                &self.statistics,
                 current_catalog,
                 current_database,
                 &statement,
                 level,
                 connector_context,
             )?;
-            return crate::runtime::query_result::build_string_query_result(
-                "Explain String",
-                lines,
-            )
-            .map(StatementResult::Query)
-            .map(Some);
+            return build_string_query_result("Explain String", lines)
+                .map(StatementResult::Query)
+                .map(Some);
         }
         if novarocks_sql::syntax::looks_like_call_procedure(&normalized) {
             let statement = parse_call_procedure_sql(&normalized)?;
-            if statement.procedure == crate::mv::stateless_rebuild::PROCEDURE_NAME {
-                return crate::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
+            if statement.procedure == PROCEDURE_NAME {
+                return execute_novarocks_imv_stateless_rebuild(
                     self.ports.connector_control(),
-                    self.ports.storage_observation(),
-                    self.ports.repository().as_ref(),
+                    self.storage_observation.as_ref(),
+                    self.repository.as_ref(),
                     &statement,
                     current_database,
                     connector_context.clone(),
@@ -126,9 +117,9 @@ impl MvCommandExecutor {
             Err(_) => return Ok(None),
         };
         match statement {
-            MvAdmittedStatement::Create(statement) => crate::mv::flow::create_mv_with_ports(
+            MvAdmittedStatement::Create(statement) => create_mv_with_ports(
                 &self.ports,
-                self.application.as_ref(),
+                self.create_application.as_ref(),
                 self.mv_backend.as_ref(),
                 current_catalog,
                 current_database,
@@ -136,8 +127,8 @@ impl MvCommandExecutor {
                 connector_context,
             )
             .map(Some),
-            MvAdmittedStatement::Drop(statement) => crate::mv::flow::drop_mv_with_ports(
-                self.ports.repository().as_ref(),
+            MvAdmittedStatement::Drop(statement) => drop_mv_with_ports(
+                self.repository.as_ref(),
                 self.mv_backend.as_ref(),
                 current_catalog,
                 current_database,
@@ -151,7 +142,7 @@ impl MvCommandExecutor {
                     AlterMaterializedViewAction::Repartition(_)
                 ) =>
             {
-                crate::mv::flow::alter_mv_with_ports(
+                alter_mv_with_ports(
                     &self.ports,
                     current_catalog,
                     current_database,
@@ -178,12 +169,10 @@ impl MvCommandExecutor {
                     execution,
                 )
                 .map(Some),
-            MvAdmittedStatement::Show(statement) => crate::mv::flow::list_mvs_with_backend(
-                self.mv_backend.as_ref(),
-                current_catalog,
-                &statement,
-            )
-            .map(Some),
+            MvAdmittedStatement::Show(statement) => {
+                list_mvs_with_backend(self.mv_backend.as_ref(), current_catalog, &statement)
+                    .map(Some)
+            }
         }
     }
 
@@ -198,18 +187,13 @@ impl MvCommandExecutor {
         let AlterMaterializedViewAction::Repartition(fields) = &statement.action else {
             return Err("MV repartition executor received a non-repartition action".to_string());
         };
-        let target = resolve_refresh_target(current_catalog, current_database, &statement.name)?;
-        let target = crate::mv::repository::MvTarget {
-            catalog: Some(target.catalog),
-            database: target.namespace,
-            name: target.table,
-        };
+        let target = resolve_refresh_mv_target(current_catalog, current_database, &statement.name)?;
         let refresh_statement = RefreshMaterializedViewStmt {
             name: statement.name.clone(),
             full: false,
         };
         let preparation =
-            crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_repartition_with_ports(
+            novarocks::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_repartition_with_ports(
                 &self.ports,
                 current_catalog,
                 current_database,
@@ -217,12 +201,10 @@ impl MvCommandExecutor {
                 fields,
                 connector_context,
             );
-        self.application
+        self.refresh_service
             .prepare_and_execute_refresh(
                 &preparation,
-                crate::mv::application::MvApplicationStatement::Refresh(
-                    novarocks_sql::planning::mv::MvRefreshStatement::from(&refresh_statement),
-                ),
+                novarocks_sql::planning::mv::MvRefreshStatement::from(&refresh_statement),
                 target,
                 connector_context.clone(),
                 execution,
@@ -241,16 +223,21 @@ impl MvCommandExecutor {
     ) -> Result<StatementResult, String> {
         let refresh_statement = novarocks_sql::planning::mv::MvRefreshStatement::from(statement);
         refresh_statement.validate_supported()?;
-        let target = resolve_refresh_target(current_catalog, current_database, &statement.name)?;
-        let requested_object = crate::mv::dependency::model::iceberg_mv_dependency_ref(
-            &target.catalog,
-            &target.namespace,
-            &target.table,
+        let target = resolve_refresh_mv_target(current_catalog, current_database, &statement.name)?;
+        let target_catalog = target.catalog.as_deref().ok_or_else(|| {
+            "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
+                .to_string()
+        })?;
+        let requested_object = novarocks::mv::dependency::model::iceberg_mv_dependency_ref(
+            target_catalog,
+            &target.database,
+            &target.name,
         );
-        let steps = crate::mv::dependency::refresh::build_upstream_refresh_steps_with_repository(
-            self.ports.repository().as_ref(),
-            &requested_object,
-        )?;
+        let steps =
+            novarocks::mv::dependency::refresh::build_upstream_refresh_steps_with_repository(
+                self.repository.as_ref(),
+                &requested_object,
+            )?;
         let mut last_result = None;
         for step in steps {
             if !step.is_iceberg() {
@@ -270,7 +257,7 @@ impl MvCommandExecutor {
                 full: false,
             };
             let preparation =
-                crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
+                novarocks::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
                     &self.ports,
                     target_catalog.as_deref(),
                     &target_database,
@@ -278,12 +265,10 @@ impl MvCommandExecutor {
                     connector_context,
                 );
             last_result = Some(
-                self.application
+                self.refresh_service
                     .prepare_and_execute_refresh(
                         &preparation,
-                        crate::mv::application::MvApplicationStatement::Refresh(
-                            novarocks_sql::planning::mv::MvRefreshStatement::from(&step_statement),
-                        ),
+                        novarocks_sql::planning::mv::MvRefreshStatement::from(&step_statement),
                         target,
                         connector_context.clone(),
                         execution,
@@ -296,10 +281,10 @@ impl MvCommandExecutor {
     }
 }
 
-fn statement_result(result: crate::mv::application::MvStatementResult) -> StatementResult {
+fn statement_result(result: MvStatementResult) -> StatementResult {
     match result {
-        crate::mv::application::MvStatementResult::Ok => StatementResult::Ok,
-        crate::mv::application::MvStatementResult::Query(result) => StatementResult::Query(result),
+        MvStatementResult::Ok => StatementResult::Ok,
+        MvStatementResult::Query(result) => StatementResult::Query(result),
     }
 }
 
