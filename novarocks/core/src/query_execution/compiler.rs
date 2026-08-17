@@ -67,7 +67,7 @@ use novarocks_sql::syntax::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
 
 use novarocks_catalog::partition::LegacyRangePartition;
 
-use crate::catalog_application::query_catalog::CatalogServiceSource;
+use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 
 macro_rules! impl_kernel_catalog_service_source {
     ($kernel:ty) => {
@@ -86,13 +86,6 @@ impl_kernel_catalog_service_source!(domain::MvExecutionKernel);
 impl_kernel_catalog_service_source!(domain::StatisticsExecutionKernel);
 impl_kernel_catalog_service_source!(domain::ViewExecutionKernel);
 impl_kernel_catalog_service_source!(domain::MaintenanceExecutionKernel);
-
-pub(crate) fn catalog_service_snapshot(source: &impl CatalogServiceSource) -> QueryCatalogService {
-    QueryCatalogService::new(
-        Arc::new(RwLock::new(source.catalog_service().local_snapshot())),
-        source.catalog_service().registry_snapshot(),
-    )
-}
 
 /// Freeze the catalog source for one Frontend-admitted query.  The returned
 /// value is owned by the caller so the paired materializer can borrow the

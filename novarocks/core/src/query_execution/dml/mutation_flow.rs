@@ -349,7 +349,7 @@ fn compile_dml_change_stream_write(
     use novarocks_spi::connector::ConnectorWriteInputShape;
 
     let catalog_service_snapshot =
-        crate::query_execution::compiler::catalog_service_snapshot(state);
+        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
     let analyzer_provider = crate::query_execution::compiler::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
@@ -2862,7 +2862,7 @@ fn execute_exact_cow_match_query(
         binding, identity, read,
     );
     let catalog_service_snapshot =
-        crate::query_execution::compiler::catalog_service_snapshot(state);
+        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
     let analyzer_catalog =
         crate::query_execution::compiler::build_catalog_service_provider_with_bindings_and_query_local_overlays(
             Some(&target.catalog),

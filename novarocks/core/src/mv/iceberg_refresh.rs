@@ -2220,7 +2220,8 @@ fn prepare_iceberg_mv_create_with_ports(
         Some(current_catalog),
         current_database,
     );
-    let catalog_service = crate::query_execution::compiler::catalog_service_snapshot(ports);
+    let catalog_service =
+        crate::catalog_application::query_catalog::catalog_service_snapshot(ports);
     let analysis = crate::mv::analysis_adapter::analyze_mv_select_with_ports(
         Some(current_catalog),
         &catalog_service,
@@ -7870,7 +7871,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         connector_context,
     )?;
     let catalog_service_snapshot =
-        crate::query_execution::compiler::catalog_service_snapshot(source);
+        crate::catalog_application::query_catalog::catalog_service_snapshot(source);
     let overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
         source,
         connector_context,
@@ -8186,7 +8187,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 rewrite_evidence,
             )?;
             let catalog_service_snapshot =
-                crate::query_execution::compiler::catalog_service_snapshot(query_kernel);
+                crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
             let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
                 ports,
                 &connector_context,
@@ -8299,7 +8300,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 &refresh_rewrite.previous_snapshot_ids,
             )?;
             let catalog_service_snapshot =
-                crate::query_execution::compiler::catalog_service_snapshot(query_kernel);
+                crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
             let analyzer_catalog = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
                 &catalog_service_snapshot,

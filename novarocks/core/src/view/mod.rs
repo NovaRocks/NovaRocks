@@ -429,10 +429,7 @@ where
         context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String> {
         let catalog_service_snapshot =
-            crate::catalog_application::query_catalog::QueryCatalogService::new(
-                Arc::new(RwLock::new(self.catalog_service().local_snapshot())),
-                self.catalog_service().registry_snapshot(),
-            );
+            crate::catalog_application::query_catalog::catalog_service_snapshot(self);
         let provider = crate::query_execution::compiler::build_catalog_service_provider(
             Some(catalog),
             &catalog_service_snapshot,

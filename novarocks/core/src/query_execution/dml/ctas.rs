@@ -386,7 +386,7 @@ fn plan_query_for_ctas_source(
         )?;
     }
     let catalog_service_snapshot =
-        crate::query_execution::compiler::catalog_service_snapshot(state);
+        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
     let analyzer_provider = crate::query_execution::compiler::build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,

@@ -191,3 +191,15 @@ pub(crate) fn build_connector_catalog(
 pub trait CatalogServiceSource {
     fn catalog_service(&self) -> &Arc<QueryCatalogService>;
 }
+
+/// Freezes a catalog source into an owned, request-local catalog view.
+///
+/// Both the source trait and the produced service belong to this module, so
+/// the snapshot operation does too: it reads catalog state and writes catalog
+/// state, and knows nothing about query compilation.
+pub fn catalog_service_snapshot(source: &impl CatalogServiceSource) -> QueryCatalogService {
+    QueryCatalogService::new(
+        Arc::new(RwLock::new(source.catalog_service().local_snapshot())),
+        source.catalog_service().registry_snapshot(),
+    )
+}
