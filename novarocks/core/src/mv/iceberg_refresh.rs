@@ -65,6 +65,11 @@ use crate::mv::persistence::schema::{
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
+#[cfg(test)]
+use crate::mv::refresh::execution_policy::should_use_join_delta_append_only_fast_path;
+use crate::mv::refresh::execution_policy::{
+    non_join_incremental_write_mode, select_join_incremental_execution_mode,
+};
 use crate::mv::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, full_rebuild_reason_message,
     plan_non_join_incremental_changes,
@@ -1411,17 +1416,6 @@ fn prepare_frontend_incremental_write(
         publication_intent,
     )
     .map(PreparedIncrementalRefreshWork::ChangeStream)
-}
-
-fn non_join_incremental_write_mode(
-    is_aggregate: bool,
-    has_delete_changes: bool,
-) -> crate::mv::application::MvIncrementalWriteMode {
-    if is_aggregate || has_delete_changes {
-        crate::mv::application::MvIncrementalWriteMode::RowDelta
-    } else {
-        crate::mv::application::MvIncrementalWriteMode::FastAppend
-    }
 }
 
 fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
@@ -7887,28 +7881,6 @@ impl novarocks_sql::compiler::SqlCancellationObservation
 {
     fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
-    }
-}
-
-#[cfg(test)]
-fn should_use_join_delta_append_only_fast_path(
-    query: &sqlparser::ast::Query,
-    left_has_delete_changes: bool,
-    right_has_delete_changes: bool,
-) -> bool {
-    !left_has_delete_changes
-        && !right_has_delete_changes
-        && crate::mv::iceberg_join_branch::is_append_only_join_delta_eligible(query)
-}
-
-fn select_join_incremental_execution_mode(
-    left_has_delete_changes: bool,
-    right_has_delete_changes: bool,
-) -> crate::mv::application::MvIncrementalJoinMode {
-    if left_has_delete_changes || right_has_delete_changes {
-        crate::mv::application::MvIncrementalJoinMode::Coalesce
-    } else {
-        crate::mv::application::MvIncrementalJoinMode::AppendOnly
     }
 }
 
