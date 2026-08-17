@@ -43,8 +43,8 @@ use crate::mv::analysis_adapter::{
 };
 use crate::mv::application::{
     CreatedMvTarget, MvCreateStatement, MvEngine, MvEngineError, MvEngineErrorKind,
-    MvRefreshPreparationRequest, MvRefreshPreparationService, MvRefreshPublicationBase,
-    MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PrepareMvCreateRequest,
+    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
+    MvRefreshPreparationRequest, MvRefreshPreparationService, PrepareMvCreateRequest,
     PreparedMvCreate, PreparedMvDefinition, PreparedMvRefresh, PreparedMvRefreshWork,
     PreparedMvRefreshWrite,
 };
@@ -103,6 +103,12 @@ use crate::mv::schema_validation::{validate_join_schema_contract, validate_schem
 use crate::mv::storage_observation::MvSchemaValidationObservation;
 use crate::mv::storage_observation::{MvStorageObservationPort, MvTargetCreationObservation};
 use crate::query_execution::StatementResult;
+use crate::query_execution::mv_assembly::refresh_artifact::{
+    MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact,
+    MvIncrementalWritePreparer, MvIncrementalWriteRequest, MvRefreshPublicationBase,
+    MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite,
+    PreparedMvIncrementalWrite,
+};
 use crate::query_execution::planning::bindings::{
     MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
     QueryTableBindingStore,
@@ -588,7 +594,7 @@ fn prepare_frontend_first_refresh_write(
     >,
     retained_repartition_target: Option<&RetainedRepartitionTarget>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<crate::mv::application::PreparedMvFirstRefreshWrite, String> {
+) -> Result<PreparedMvFirstRefreshWrite, String> {
     let target = IcebergMvTarget {
         catalog: contract.target.catalog.clone().ok_or_else(|| {
             "Iceberg MV first-refresh target has no connector catalog".to_string()
@@ -754,7 +760,7 @@ fn prepare_frontend_first_refresh_write(
             &target,
             connector_context.clone(),
         )?;
-        let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
+        let request = MvFirstRefreshWriteRequest::try_new(
             target.catalog,
             target.namespace,
             target.table,
@@ -767,7 +773,7 @@ fn prepare_frontend_first_refresh_write(
             observed_binding,
             attempt.write_operation_id,
         )?;
-        let prepared = crate::mv::application::MvFirstRefreshWritePreparer::prepare_join_logical(
+        let prepared = MvFirstRefreshWritePreparer::prepare_join_logical(
             request,
             crate::query_execution::mv_assembly::first_refresh_staging::frozen_logical_context_from_rewrite(
                 &rewrite,
@@ -850,7 +856,7 @@ fn prepare_frontend_first_refresh_write(
         &target,
         connector_context.clone(),
     )?;
-    let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
+    let request = MvFirstRefreshWriteRequest::try_new(
         target.catalog,
         target.namespace,
         target.table,
@@ -863,11 +869,7 @@ fn prepare_frontend_first_refresh_write(
         observed_binding,
         attempt.write_operation_id,
     )?;
-    let prepared = crate::mv::application::MvFirstRefreshWritePreparer::prepare(
-        request,
-        physical_sql,
-        publication_intent,
-    )?;
+    let prepared = MvFirstRefreshWritePreparer::prepare(request, physical_sql, publication_intent)?;
     Ok(if partition_spec_replacement.is_some() {
         prepared.into_full_overwrite()
     } else {
@@ -998,8 +1000,8 @@ fn mv_refresh_publication_intent(
 #[allow(clippy::too_many_arguments)]
 enum PreparedIncrementalRefreshWork {
     MetadataOnly,
-    ChangeStream(crate::mv::application::PreparedMvIncrementalWrite),
-    FullRebuild(crate::mv::application::PreparedMvFirstRefreshWrite),
+    ChangeStream(PreparedMvIncrementalWrite),
+    FullRebuild(PreparedMvFirstRefreshWrite),
 }
 
 fn prepare_frontend_incremental_write(
@@ -1194,11 +1196,11 @@ fn prepare_frontend_incremental_write(
             return Ok(PreparedIncrementalRefreshWork::MetadataOnly);
         }
         let join_mode = if is_aggregate {
-            crate::mv::application::MvIncrementalJoinMode::Coalesce
+            MvIncrementalJoinMode::Coalesce
         } else {
             select_join_incremental_execution_mode(left_facts.has_deletes, right_facts.has_deletes)
         };
-        let request = crate::mv::application::MvIncrementalWriteRequest::try_new(
+        let request = MvIncrementalWriteRequest::try_new(
             target.catalog.clone(),
             target.namespace.clone(),
             target.table.clone(),
@@ -1230,7 +1232,7 @@ fn prepare_frontend_incremental_write(
             &rewrite.pin,
             &rewrite.previous_snapshot_ids,
         )?;
-        return crate::mv::application::MvIncrementalWritePreparer::prepare(
+        return MvIncrementalWritePreparer::prepare(
             request,
             crate::query_execution::mv_assembly::first_refresh_staging::frozen_logical_context_from_rewrite(
                 &rewrite,
@@ -1238,25 +1240,25 @@ fn prepare_frontend_incremental_write(
                 Some(frozen_base_overlays),
             )?,
             match join_mode {
-                crate::mv::application::MvIncrementalJoinMode::AppendOnly => {
-                    crate::mv::application::MvIncrementalWriteMode::FastAppend
+                MvIncrementalJoinMode::AppendOnly => {
+                    MvIncrementalWriteMode::FastAppend
                 }
-                crate::mv::application::MvIncrementalJoinMode::Coalesce => {
-                    crate::mv::application::MvIncrementalWriteMode::RowDelta
+                MvIncrementalJoinMode::Coalesce => {
+                    MvIncrementalWriteMode::RowDelta
                 }
             },
             if is_aggregate {
-                crate::mv::application::MvIncrementalRewriteEvidence::JoinAggregate
+                MvIncrementalRewriteEvidence::JoinAggregate
             } else {
-                crate::mv::application::MvIncrementalRewriteEvidence::None
+                MvIncrementalRewriteEvidence::None
             },
-            crate::mv::application::MvIncrementalExecutionArtifact::JoinLogical {
+            MvIncrementalExecutionArtifact::JoinLogical {
                 mode: match join_mode {
-                    crate::mv::application::MvIncrementalJoinMode::AppendOnly => {
-                        crate::mv::application::MvIncrementalJoinMode::AppendOnly
+                    MvIncrementalJoinMode::AppendOnly => {
+                        MvIncrementalJoinMode::AppendOnly
                     }
-                    crate::mv::application::MvIncrementalJoinMode::Coalesce => {
-                        crate::mv::application::MvIncrementalJoinMode::Coalesce
+                    MvIncrementalJoinMode::Coalesce => {
+                        MvIncrementalJoinMode::Coalesce
                     }
                 },
             },
@@ -1364,17 +1366,17 @@ fn prepare_frontend_incremental_write(
             let mode = non_join_incremental_write_mode(is_aggregate, has_delete_changes);
             let evidence = if is_aggregate {
                 if is_branch_union {
-                    crate::mv::application::MvIncrementalRewriteEvidence::BranchUnionAggregate
+                    MvIncrementalRewriteEvidence::BranchUnionAggregate
                 } else {
-                    crate::mv::application::MvIncrementalRewriteEvidence::Aggregate
+                    MvIncrementalRewriteEvidence::Aggregate
                 }
             } else {
-                crate::mv::application::MvIncrementalRewriteEvidence::None
+                MvIncrementalRewriteEvidence::None
             };
             (mode, evidence)
         }
     };
-    let request = crate::mv::application::MvIncrementalWriteRequest::try_new(
+    let request = MvIncrementalWriteRequest::try_new(
         target.catalog.clone(),
         target.namespace.clone(),
         target.table.clone(),
@@ -1406,7 +1408,7 @@ fn prepare_frontend_incremental_write(
         &rewrite.pin,
         &rewrite.previous_snapshot_ids,
     )?;
-    crate::mv::application::MvIncrementalWritePreparer::prepare(
+    MvIncrementalWritePreparer::prepare(
         request,
         crate::query_execution::mv_assembly::first_refresh_staging::frozen_logical_context_from_rewrite(
             &rewrite,
@@ -1415,7 +1417,7 @@ fn prepare_frontend_incremental_write(
         )?,
         mode,
         evidence,
-        crate::mv::application::MvIncrementalExecutionArtifact::CanonicalQuery,
+        MvIncrementalExecutionArtifact::CanonicalQuery,
         publication_intent,
     )
     .map(PreparedIncrementalRefreshWork::ChangeStream)
@@ -4444,15 +4446,15 @@ mod tests {
     fn aggregate_incremental_inserts_use_row_delta() {
         assert!(matches!(
             non_join_incremental_write_mode(true, false),
-            crate::mv::application::MvIncrementalWriteMode::RowDelta
+            MvIncrementalWriteMode::RowDelta
         ));
         assert!(matches!(
             non_join_incremental_write_mode(false, false),
-            crate::mv::application::MvIncrementalWriteMode::FastAppend
+            MvIncrementalWriteMode::FastAppend
         ));
         assert!(matches!(
             non_join_incremental_write_mode(false, true),
-            crate::mv::application::MvIncrementalWriteMode::RowDelta
+            MvIncrementalWriteMode::RowDelta
         ));
     }
     #[test]
@@ -7587,20 +7589,11 @@ mod join_delta_append_only_fast_path_tests {
     #[test]
     fn join_incremental_refresh_plan_kind_uses_logical_cutover() {
         let mode = select_join_incremental_execution_mode(false, false);
-        assert_eq!(
-            mode,
-            crate::mv::application::MvIncrementalJoinMode::AppendOnly
-        );
+        assert_eq!(mode, MvIncrementalJoinMode::AppendOnly);
         let mode = select_join_incremental_execution_mode(true, false);
-        assert_eq!(
-            mode,
-            crate::mv::application::MvIncrementalJoinMode::Coalesce
-        );
+        assert_eq!(mode, MvIncrementalJoinMode::Coalesce);
         let mode = select_join_incremental_execution_mode(false, true);
-        assert_eq!(
-            mode,
-            crate::mv::application::MvIncrementalJoinMode::Coalesce
-        );
+        assert_eq!(mode, MvIncrementalJoinMode::Coalesce);
     }
 
     #[test]
@@ -7890,7 +7883,7 @@ pub(crate) enum RewriteMergeRefreshEvidence {
 pub(crate) fn bind_prepared_mv_incremental_staging(
     query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
     ports: &IcebergMvCorePorts,
-    prepared: crate::mv::application::PreparedMvIncrementalWrite,
+    prepared: PreparedMvIncrementalWrite,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
@@ -7936,10 +7929,10 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     )?;
     let mutation_intent = novarocks_spi::connector::ConnectorRowMutationIntent::Merge {
         effects: match mode {
-            crate::mv::application::MvIncrementalWriteMode::FastAppend => {
+            MvIncrementalWriteMode::FastAppend => {
                 vec![novarocks_spi::connector::ConnectorRowMutationEffect::Insert]
             }
-            crate::mv::application::MvIncrementalWriteMode::RowDelta => vec![
+            MvIncrementalWriteMode::RowDelta => vec![
                 novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
                 novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
                 novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
@@ -8065,21 +8058,15 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         )
         .map_err(|error| format!("build activated MV incremental write template: {error}"))?;
     let rewrite_evidence = match evidence {
-        crate::mv::application::MvIncrementalRewriteEvidence::None => {
-            RewriteMergeRefreshEvidence::None
-        }
-        crate::mv::application::MvIncrementalRewriteEvidence::Aggregate => {
-            RewriteMergeRefreshEvidence::Aggregate
-        }
-        crate::mv::application::MvIncrementalRewriteEvidence::JoinAggregate => {
-            RewriteMergeRefreshEvidence::JoinAggregate
-        }
-        crate::mv::application::MvIncrementalRewriteEvidence::BranchUnionAggregate => {
+        MvIncrementalRewriteEvidence::None => RewriteMergeRefreshEvidence::None,
+        MvIncrementalRewriteEvidence::Aggregate => RewriteMergeRefreshEvidence::Aggregate,
+        MvIncrementalRewriteEvidence::JoinAggregate => RewriteMergeRefreshEvidence::JoinAggregate,
+        MvIncrementalRewriteEvidence::BranchUnionAggregate => {
             RewriteMergeRefreshEvidence::BranchUnionAggregate
         }
     };
     match execution_artifact {
-        crate::mv::application::MvIncrementalExecutionArtifact::CanonicalQuery => {
+        MvIncrementalExecutionArtifact::CanonicalQuery => {
             let imv_rewrite_input = sql_imv_planning_input_from_rewrite(
                 &refresh_rewrite,
                 target_binding,
@@ -8110,10 +8097,10 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
             let write_mode = match mode {
-                crate::mv::application::MvIncrementalWriteMode::FastAppend => {
+                MvIncrementalWriteMode::FastAppend => {
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::FastAppend
                 }
-                crate::mv::application::MvIncrementalWriteMode::RowDelta => {
+                MvIncrementalWriteMode::RowDelta => {
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };
@@ -8172,22 +8159,22 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             }
             return Ok(distributed);
         }
-        crate::mv::application::MvIncrementalExecutionArtifact::JoinLogical {
+        MvIncrementalExecutionArtifact::JoinLogical {
             mode: join_execution_mode,
         } => {
             let join_mode = match join_execution_mode {
-                crate::mv::application::MvIncrementalJoinMode::AppendOnly => {
+                MvIncrementalJoinMode::AppendOnly => {
                     novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshMode::AppendOnly
                 }
-                crate::mv::application::MvIncrementalJoinMode::Coalesce => {
+                MvIncrementalJoinMode::Coalesce => {
                     novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshMode::Coalesce
                 }
             };
             let write_mode = match mode {
-                crate::mv::application::MvIncrementalWriteMode::FastAppend => {
+                MvIncrementalWriteMode::FastAppend => {
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::FastAppend
                 }
-                crate::mv::application::MvIncrementalWriteMode::RowDelta => {
+                MvIncrementalWriteMode::RowDelta => {
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };

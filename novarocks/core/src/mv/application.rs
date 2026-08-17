@@ -17,8 +17,6 @@
 
 //! Materialized-view application and engine ports.
 
-mod refresh_artifact;
-
 use std::fmt;
 
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
@@ -27,6 +25,9 @@ use uuid::Uuid;
 use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
+use crate::query_execution::mv_assembly::refresh_artifact::{
+    MvRefreshPublicationIntent, PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite,
+};
 use crate::runtime::query_result::QueryResult;
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 use novarocks_sql::syntax::{
@@ -34,12 +35,27 @@ use novarocks_sql::syntax::{
     MvAdmittedStatement,
 };
 
-pub(crate) use refresh_artifact::{
-    MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, MvFirstRefreshWritePreparer,
-    MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact, MvIncrementalJoinMode,
-    MvIncrementalRewriteEvidence, MvIncrementalWriteMode, MvIncrementalWritePreparer,
-    MvIncrementalWriteRequest, MvStagedRefreshWriteMode,
-};
+/// Join refresh shape retained until query assembly admits exact connector
+/// bindings for the corresponding write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvIncrementalJoinMode {
+    AppendOnly,
+    Coalesce,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvIncrementalWriteMode {
+    FastAppend,
+    RowDelta,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvIncrementalRewriteEvidence {
+    None,
+    Aggregate,
+    JoinAggregate,
+    BranchUnionAggregate,
+}
 
 /// Frontend-preallocated identities for a single MV refresh lifecycle. These
 /// are application lifecycle values: SQL may validate them but cannot create
@@ -198,12 +214,6 @@ mod refresh_preparation_tests {
         );
     }
 }
-pub use refresh_artifact::{
-    MvRefreshCommittedFacts, MvRefreshPublicationBase, MvRefreshPublicationIntent,
-    MvRefreshPublicationTechnique, MvRefreshPublishedFacts, PreparedMvFirstRefreshWrite,
-    PreparedMvIncrementalWrite,
-};
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvCreatePartitionField {
     Identity { column: String },

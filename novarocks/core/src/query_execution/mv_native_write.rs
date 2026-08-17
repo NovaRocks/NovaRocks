@@ -28,11 +28,12 @@ use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
-use crate::mv::application::{
-    MvRefreshCommittedFacts, MvRefreshPublicationIntent, PreparedMvRefreshWrite,
-};
+use crate::mv::application::PreparedMvRefreshWrite;
 use crate::mv::persistence::schema::MvPartitionContract;
 use crate::query_execution::contract::ConnectorWriteOperationRegistration;
+use crate::query_execution::mv_assembly::refresh_artifact::{
+    MvRefreshCommittedFacts, MvRefreshPublicationIntent,
+};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::post_compile::NativeFragmentEncodingInput;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;

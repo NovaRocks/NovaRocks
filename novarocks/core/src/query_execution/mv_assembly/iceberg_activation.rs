@@ -15,12 +15,13 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
-use crate::mv::application::{
-    MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
-    PreparedMvFirstRefreshWrite, PreparedMvRefreshWrite,
-};
+use crate::mv::application::PreparedMvRefreshWrite;
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
+use crate::query_execution::mv_assembly::refresh_artifact::{
+    MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
+    MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
+};
 use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
 };
@@ -141,18 +142,16 @@ pub(crate) fn activate_first_refresh_connector_write(
         table: prepared.target_name().to_string(),
     };
     let intent = match prepared.write_mode() {
-        crate::mv::application::MvStagedRefreshWriteMode::Append => {
-            novarocks_spi::connector::ConnectorWriteIntent::Append
-        }
-        crate::mv::application::MvStagedRefreshWriteMode::FullOverwrite => {
+        MvStagedRefreshWriteMode::Append => novarocks_spi::connector::ConnectorWriteIntent::Append,
+        MvStagedRefreshWriteMode::FullOverwrite => {
             novarocks_spi::connector::ConnectorWriteIntent::Overwrite
         }
     };
     let empty_input = match prepared.write_mode() {
-        crate::mv::application::MvStagedRefreshWriteMode::Append => {
+        MvStagedRefreshWriteMode::Append => {
             ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit
         }
-        crate::mv::application::MvStagedRefreshWriteMode::FullOverwrite => {
+        MvStagedRefreshWriteMode::FullOverwrite => {
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
         }
     };

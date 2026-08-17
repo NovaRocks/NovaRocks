@@ -25,8 +25,8 @@ use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
 };
 use novarocks::mv::application::{
-    MvApplicationError, MvApplicationErrorKind, MvRefreshCommittedFacts, MvRefreshPublishedFacts,
-    MvStatementResult, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
+    MvApplicationError, MvApplicationErrorKind, MvStatementResult, PreparedMvRefresh,
+    PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use novarocks::mv::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
@@ -38,6 +38,9 @@ use novarocks::mv::repository::{
 };
 use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
+use novarocks::query_execution::mv_assembly::refresh_artifact::{
+    MvRefreshCommittedFacts, MvRefreshPublishedFacts,
+};
 use novarocks::query_execution::mv_native_write::{
     MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
 };
@@ -113,7 +116,7 @@ impl FrontendMvRefreshProviderActivationPort {
 
     fn interpret_write_commit(
         &self,
-        intent: novarocks::mv::application::MvRefreshPublicationIntent,
+        intent: novarocks::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
         receipt: &ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, MvApplicationError> {
         let activation = self
@@ -1100,12 +1103,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use novarocks::mv::application::{
-        MvRefreshCommittedFacts, MvRefreshPublicationIntent, PreparedMvRefreshWrite,
-    };
+    use novarocks::mv::application::PreparedMvRefreshWrite;
     use novarocks::mv::persistence::refresh::{
         FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
         FrontendMvRefreshCommittedVersion,
+    };
+    use novarocks::query_execution::mv_assembly::refresh_artifact::{
+        MvRefreshCommittedFacts, MvRefreshPublicationIntent,
     };
     use novarocks::query_execution::mv_native_write::{
         MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,

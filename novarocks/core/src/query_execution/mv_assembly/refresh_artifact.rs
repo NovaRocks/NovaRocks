@@ -22,6 +22,10 @@ use novarocks_spi::connector::{
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
 use novarocks_sql::planning::mv::first_refresh::{SqlMvFirstRefreshArtifact, SqlMvSnapshotPin};
 
+use crate::mv::application::{
+    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
+};
+
 /// The application commit semantics selected after first-refresh SQL planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MvStagedRefreshWriteMode {
@@ -607,28 +611,6 @@ pub(crate) enum MvIncrementalExecutionArtifact {
     JoinLogical {
         mode: MvIncrementalJoinMode,
     },
-}
-
-/// Join refresh shape retained by the application artifact until exact
-/// connector admission makes target-token-dependent logical planning valid.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvIncrementalJoinMode {
-    AppendOnly,
-    Coalesce,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvIncrementalWriteMode {
-    FastAppend,
-    RowDelta,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvIncrementalRewriteEvidence {
-    None,
-    Aggregate,
-    JoinAggregate,
-    BranchUnionAggregate,
 }
 
 /// Application handoff before an incremental write is admitted. It carries

@@ -6,3 +6,4 @@
 
 pub(crate) mod first_refresh_staging;
 pub mod iceberg_activation;
+pub mod refresh_artifact;

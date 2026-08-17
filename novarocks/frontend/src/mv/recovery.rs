@@ -1118,9 +1118,12 @@ mod tests {
 
         fn interpret_write_commit(
             &self,
-            _intent: novarocks::mv::application::MvRefreshPublicationIntent,
+            _intent: novarocks::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
             _receipt: &novarocks_spi::connector::ConnectorWriteReceipt,
-        ) -> Result<novarocks::mv::application::MvRefreshCommittedFacts, String> {
+        ) -> Result<
+            novarocks::query_execution::mv_assembly::refresh_artifact::MvRefreshCommittedFacts,
+            String,
+        > {
             unreachable!("recovery never interprets a live write receipt")
         }
 
