@@ -79,6 +79,7 @@ use crate::mv::refresh::repartition::select_repartition_shape;
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
 };
+use crate::mv::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use crate::mv::refresh::target_apply::{
     apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
     join_apply_key_table_column,
@@ -1428,43 +1429,6 @@ fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
         return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string());
     }
     Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct IcebergMvTarget {
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) table: String,
-}
-
-impl From<&TableIdentity> for IcebergMvTarget {
-    fn from(target: &TableIdentity) -> Self {
-        Self {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod target_identity_tests {
-    use super::*;
-
-    #[test]
-    fn iceberg_mv_target_from_table_identity_preserves_exact_case() {
-        let identity = TableIdentity {
-            catalog: "TargetCase".to_string(),
-            namespace: "NameSpace".to_string(),
-            table: "MvTable".to_string(),
-        };
-
-        let target = IcebergMvTarget::from(&identity);
-
-        assert_eq!(target.catalog, identity.catalog);
-        assert_eq!(target.namespace, identity.namespace);
-        assert_eq!(target.table, identity.table);
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4425,22 +4389,6 @@ pub fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<()
     Ok(())
 }
 
-pub(crate) fn resolve_refresh_target(
-    current_catalog: Option<&str>,
-    current_database: &str,
-    name: &ObjectName,
-) -> Result<IcebergMvTarget, String> {
-    let catalog = current_catalog.ok_or_else(|| {
-        "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
-            .to_string()
-    })?;
-    let (namespace, table) = resolve_mv_name(name, current_database)?;
-    Ok(IcebergMvTarget {
-        catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
-        namespace,
-        table,
-    })
-}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,6 +27,7 @@ use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
+use crate::mv::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use crate::mv::repository::MvRepository;
 use crate::query_execution::StatementResult;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -331,7 +332,7 @@ fn storage_engine_for_create(stmt: &CreateMaterializedViewStmt) -> Result<MvStor
 
 fn existing_mv_storage_engine_by_target(
     repository: &dyn MvRepository,
-    target: &crate::mv::iceberg_refresh::IcebergMvTarget,
+    target: &IcebergMvTarget,
 ) -> Result<Option<MvStorageEngine>, String> {
     let Some(definition) = repository
         .find_by_target(&MvTarget {
@@ -412,7 +413,7 @@ fn load_definition_for_alter(
     db: &str,
     name: &novarocks_sql::syntax::ObjectName,
 ) -> Result<StoredMvDefinition, String> {
-    let target = crate::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
+    let target = resolve_refresh_target(current_catalog, db, name)?;
     let Some(definition) = repository
         .find_by_target(&MvTarget {
             catalog: Some(target.catalog.clone()),
@@ -493,8 +494,7 @@ pub(crate) fn drop_mv_with_ports(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    let target =
-        crate::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, &stmt.name)?;
+    let target = resolve_refresh_target(current_catalog, db, &stmt.name)?;
     if let Some(engine) = existing_mv_storage_engine_by_target(repository, &target)?
         && engine != MvStorageEngine::Iceberg
     {
@@ -534,11 +534,7 @@ pub(crate) fn alter_mv_with_ports(
         let current_catalog = current_catalog.ok_or_else(|| {
             "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
         })?;
-        let target = crate::mv::iceberg_refresh::resolve_refresh_target(
-            Some(current_catalog),
-            db,
-            &stmt.name,
-        )?;
+        let target = resolve_refresh_target(Some(current_catalog), db, &stmt.name)?;
         let engine = existing_mv_storage_engine_by_target(ports.repository().as_ref(), &target)?
             .ok_or_else(|| {
                 format!(

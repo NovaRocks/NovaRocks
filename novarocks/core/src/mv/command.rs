@@ -23,6 +23,7 @@ use crate::connector::MvBackend;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::application::MvApplicationService;
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::refresh::target::resolve_refresh_target;
 use crate::query_execution::StatementResult;
 use crate::query_execution::planning::statistics::QueryStatisticsResolver;
 use crate::query_execution::request_context::QueryExecutionContext;
@@ -198,11 +199,7 @@ impl MvCommandExecutor {
         let AlterMaterializedViewAction::Repartition(fields) = &statement.action else {
             return Err("MV repartition executor received a non-repartition action".to_string());
         };
-        let target = crate::mv::iceberg_refresh::resolve_refresh_target(
-            current_catalog,
-            current_database,
-            &statement.name,
-        )?;
+        let target = resolve_refresh_target(current_catalog, current_database, &statement.name)?;
         let target = crate::mv::repository::MvTarget {
             catalog: Some(target.catalog),
             database: target.namespace,
@@ -245,11 +242,7 @@ impl MvCommandExecutor {
     ) -> Result<StatementResult, String> {
         let refresh_statement = novarocks_sql::planning::mv::MvRefreshStatement::from(statement);
         refresh_statement.validate_supported()?;
-        let target = crate::mv::iceberg_refresh::resolve_refresh_target(
-            current_catalog,
-            current_database,
-            &statement.name,
-        )?;
+        let target = resolve_refresh_target(current_catalog, current_database, &statement.name)?;
         let requested_object = crate::mv::dependency::model::iceberg_mv_dependency_ref(
             &target.catalog,
             &target.namespace,

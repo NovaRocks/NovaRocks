@@ -28,5 +28,6 @@ pub(crate) mod projection_first_refresh;
 pub(crate) mod repartition;
 pub(crate) mod scan_binding;
 pub(crate) mod snapshot;
+pub(crate) mod target;
 pub(crate) mod target_apply;
 pub(crate) mod target_binding;
