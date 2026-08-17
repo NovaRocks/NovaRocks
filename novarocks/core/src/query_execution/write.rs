@@ -344,7 +344,7 @@ impl WriteTerminalBuilder {
             .sink()
             .connector_staged_report_frames
             .iter()
-            .map(encode_connector_staged_report_frame)
+            .map(crate::query_execution::lifecycle::terminal::encode_connector_staged_report_frame)
             .collect::<Vec<_>>();
         if let Err(error) = validate_connector_staged_report_frames(
             &frames,
@@ -526,53 +526,6 @@ pub(crate) fn reassemble_connector_staged_report(
         ))
     })?;
     Ok(report)
-}
-
-pub(crate) fn encode_connector_staged_report_frame(
-    frame: &novarocks_spi::connector::ConnectorStagedReportFrame,
-) -> novarocks::ConnectorStagedReportFrame {
-    let writer = frame.writer();
-    let fragment_instance_id = writer.fragment_instance_id();
-    novarocks::ConnectorStagedReportFrame {
-        contract_version: frame.version(),
-        writer: Some(novarocks_protocol::plan::ConnectorWriterIdentity {
-            operation_id: writer.operation_id().to_bytes().to_vec(),
-            cohort_id: writer.cohort_id().to_bytes().to_vec(),
-            execution_query_id: writer.execution_id().query_id().to_vec(),
-            execution_attempt_id: writer.execution_id().attempt_id(),
-            fragment_instance_id: Some(common::UniqueId {
-                hi: i64::from_be_bytes(
-                    fragment_instance_id[..8]
-                        .try_into()
-                        .expect("fixed UUID prefix"),
-                ),
-                lo: i64::from_be_bytes(
-                    fragment_instance_id[8..]
-                        .try_into()
-                        .expect("fixed UUID suffix"),
-                ),
-            }),
-            fragment_id: writer.fragment_id(),
-            backend_num: writer.backend_num(),
-            sink_ordinal: writer.sink_ordinal(),
-            connector_instance_id: writer.binding_key().instance_id.as_str().to_string(),
-            connector_incarnation: writer.binding_key().incarnation.to_bytes().to_vec(),
-        }),
-        terminal_state: match frame.state() {
-            ConnectorWriterTerminalState::Staged => CONNECTOR_WRITER_TERMINAL_STAGED,
-            ConnectorWriterTerminalState::Aborted => 1,
-            ConnectorWriterTerminalState::Failed => 2,
-        },
-        input_rows: frame.summary().input_rows,
-        staged_bytes: frame.summary().staged_bytes,
-        artifact_count: frame.summary().artifact_count,
-        part_index: frame.part_index(),
-        part_count: frame.part_count(),
-        logical_payload_len: frame.logical_payload_len(),
-        logical_payload_sha256: frame.logical_payload_digest().to_vec(),
-        frame_payload: frame.frame_payload().to_vec(),
-        frame_payload_sha256: frame.frame_payload_digest().to_vec(),
-    }
 }
 
 pub(crate) fn decode_connector_staged_report_frame(

@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
-use novarocks::query_execution::lifecycle::{
-    QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard, QueryTerminalSet,
+use novarocks::query_execution::lifecycle_plan::{
+    QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
 };
+use novarocks::query_execution::terminal_set::QueryTerminalSet;
 use novarocks_protocol::lifecycle::{
     FragmentLiveObservation, ParticipantManifestDigest, ParticipantTerminalOutcome,
     QueryAbortRequest, QueryControlCommand, QueryControlEvent, QueryExecutionId, QueryTerminalAck,

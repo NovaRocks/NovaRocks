@@ -21,9 +21,10 @@ use std::time::{Duration, Instant};
 
 use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks::query_execution::lifecycle::{
-    AttemptId as CoreAttemptId, QueryExecutionId, QueryInitBarrier, QueryInitPlan,
-    QueryLaunchBarrier, QueryLifecycleLease, StageBatch,
+use novarocks::query_execution::launch::{QueryLaunchBarrier, StageBatch};
+use novarocks::query_execution::lifecycle::{AttemptId as CoreAttemptId, QueryExecutionId};
+use novarocks::query_execution::lifecycle_plan::{
+    QueryInitBarrier, QueryInitPlan, QueryLifecycleLease,
 };
 use novarocks_protocol::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryControlAttach, QueryInitOutcome, QueryStageAck,

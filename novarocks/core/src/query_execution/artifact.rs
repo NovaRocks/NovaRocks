@@ -37,10 +37,12 @@ use crate::common::types::UniqueId;
 use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind, QueryId};
 use crate::query_execution::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
+use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
 use crate::query_execution::lifecycle::{
-    ExchangeRouteManifest, QueryExecutionId, QueryInitBarrier, QueryInitOptions,
-    QueryLaunchBarrier, QueryLifecycleLease, RuntimeFilterContribution, StageBatch, StageFragment,
-    StageParticipantBinding,
+    ExchangeRouteManifest, QueryExecutionId, RuntimeFilterContribution, StageFragment,
+};
+use crate::query_execution::lifecycle_plan::{
+    QueryInitBarrier, QueryInitOptions, QueryLifecycleLease,
 };
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::{
@@ -630,7 +632,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                     .map_err(|error| contract_error(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let plan = crate::query_execution::lifecycle::init_plan::compile_query_init_plan(
+        let plan = crate::query_execution::lifecycle_plan::compile_query_init_plan(
             self.schedule.lifecycle_projection(),
             runtime_filters,
             &options,

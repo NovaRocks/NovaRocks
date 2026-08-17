@@ -17,7 +17,7 @@ use novarocks::query_execution::backend::{BeId, HeartbeatOutcome, LiveBackendTar
 use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
 };
-use novarocks::query_execution::lifecycle::QueryLifecycleTarget;
+use novarocks::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use novarocks::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use novarocks::service::observe_backend_heartbeat_rtt;
 use novarocks_protocol::common::UniqueId as ProtoUniqueId;

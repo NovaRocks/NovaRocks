@@ -34,7 +34,40 @@ use novarocks_protocol::lifecycle::{
 };
 use novarocks_protocol::novarocks;
 
-use super::{QueryLifecycleTarget, QueryTerminalSet, StageParticipantBinding};
+use crate::query_execution::launch::StageParticipantBinding;
+use crate::query_execution::terminal_set::QueryTerminalSet;
+
+/// Frozen target selected from one live backend snapshot.
+///
+/// This is coordinator orchestration state, not a native lifecycle message.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueryLifecycleTarget {
+    backend_idx: usize,
+    endpoint: SocketAddr,
+    start_epoch: u64,
+}
+
+impl QueryLifecycleTarget {
+    pub const fn new(backend_idx: usize, endpoint: SocketAddr, start_epoch: u64) -> Self {
+        Self {
+            backend_idx,
+            endpoint,
+            start_epoch,
+        }
+    }
+
+    pub const fn backend_idx(self) -> usize {
+        self.backend_idx
+    }
+
+    pub const fn endpoint(self) -> SocketAddr {
+        self.endpoint
+    }
+
+    pub const fn start_epoch(self) -> u64 {
+        self.start_epoch
+    }
+}
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)

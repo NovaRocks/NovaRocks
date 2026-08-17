@@ -29,10 +29,11 @@ use crate::query_execution::contract::{
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
     build_distributed_query_request_with_execution,
 };
+use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch};
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
-use crate::query_execution::lifecycle::{
-    QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLaunchBarrier, QueryLifecycleLease,
-    QueryLifecycleLeaseGuard,
+use crate::query_execution::lifecycle_plan::{
+    QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLifecycleAbortOutcome,
+    QueryLifecycleLease, QueryLifecycleLeaseGuard,
 };
 use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::request_context::QueryExecutionContext;
@@ -40,6 +41,7 @@ use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::statistics::{
     StatisticsExecutionMode, StatisticsExecutionPolicy, ThetaSketchPartial,
 };
+use crate::query_execution::terminal_set::QueryTerminalSet;
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use bytes::Bytes;
 use novarocks_protocol::lifecycle::QueryOptions;
@@ -64,24 +66,16 @@ struct RecordingQueryLifecycleGuard {
 }
 
 impl QueryLifecycleLeaseGuard for RecordingQueryLifecycleGuard {
-    fn finalize(
-        mut self: Box<Self>,
-    ) -> Result<crate::query_execution::lifecycle::QueryTerminalSet, DistributedQueryError> {
+    fn finalize(mut self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError> {
         self.armed = false;
         self.finalizes.fetch_add(1, Ordering::SeqCst);
-        Ok(
-            crate::query_execution::lifecycle::QueryTerminalSet::new(Vec::new())
-                .expect("an empty test terminal set is valid"),
-        )
+        Ok(QueryTerminalSet::new(Vec::new()).expect("an empty test terminal set is valid"))
     }
 
-    fn abort_preserving(
-        mut self: Box<Self>,
-        primary_error: String,
-    ) -> crate::query_execution::lifecycle::QueryLifecycleAbortOutcome {
+    fn abort_preserving(mut self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome {
         self.armed = false;
         self.aborts.fetch_add(1, Ordering::SeqCst);
-        crate::query_execution::lifecycle::QueryLifecycleAbortOutcome::new(
+        QueryLifecycleAbortOutcome::new(
             format!("{primary_error}; query lifecycle rollback completed"),
             None,
         )
@@ -158,17 +152,11 @@ impl QueryInitBarrier for RecordingQueryInitBarrier {
 struct RecordingQueryLaunchBarrier;
 
 impl QueryLaunchBarrier for RecordingQueryLaunchBarrier {
-    fn stage_all(
-        &self,
-        _batches: &[crate::query_execution::lifecycle::StageBatch],
-    ) -> Result<(), DistributedQueryError> {
+    fn stage_all(&self, _batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
         Ok(())
     }
 
-    fn start_all(
-        &self,
-        _batches: &[crate::query_execution::lifecycle::StageBatch],
-    ) -> Result<(), DistributedQueryError> {
+    fn start_all(&self, _batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
         Ok(())
     }
 }

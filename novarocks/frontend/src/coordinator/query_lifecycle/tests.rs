@@ -27,9 +27,8 @@ use novarocks::query_execution::contract::DistributedQueryIntent;
 use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
-use novarocks::query_execution::lifecycle::{
-    QueryInitBarrier, QueryInitPlan, QueryLifecycleError, QueryLifecycleErrorCode,
-};
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use novarocks::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
 use novarocks_protocol::lifecycle as protocol_lifecycle;
 use novarocks_protocol::lifecycle::{
     AttemptId, FragmentLiveObservation, ParticipantBackendIdentity, ParticipantManifest,

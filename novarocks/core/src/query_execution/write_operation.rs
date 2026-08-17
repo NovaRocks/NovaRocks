@@ -863,12 +863,11 @@ mod tests {
     use super::*;
     use crate::common::types::UniqueId;
     use crate::query_execution::contract::QueryId;
+    use crate::query_execution::lifecycle::terminal::encode_connector_staged_report_frame;
     use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
     use crate::query_execution::outcome::ConnectorWriteCompletion;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-    use crate::query_execution::write::{
-        WriteCommitInput, WriterCommitInput, WriterKey, encode_connector_staged_report_frame,
-    };
+    use crate::query_execution::write::{WriteCommitInput, WriterCommitInput, WriterKey};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
     struct NeverCancelled;

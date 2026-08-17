@@ -16,18 +16,10 @@
 // under the License.
 
 pub mod contract;
-pub mod init_plan;
 pub mod metrics;
-pub mod residual;
-pub mod stage;
 pub mod terminal;
 
 pub use contract::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
-pub(crate) use init_plan::QueryInitPlanHeader;
-pub use init_plan::{
-    QueryInitBarrier, QueryInitOptions, QueryInitParticipant, QueryInitPlan,
-    QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
-};
 pub use novarocks_protocol::lifecycle::{
     AttemptId, ExchangeRouteManifest, FragmentLiveObservation, ParticipantBackendIdentity,
     ParticipantManifest, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
@@ -42,8 +34,6 @@ pub use novarocks_protocol::lifecycle::{
 pub use novarocks_protocol::lifecycle::{
     QueryTerminalAck, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
-pub use residual::QueryLifecycleTarget;
-pub use stage::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
     NegativeAttestation, NegativeAttestationReason, PARTICIPANT_TERMINAL_OUTCOME_VERSION_V1,
@@ -55,7 +45,7 @@ pub use terminal::{
     QueryTerminalRuntimeFilterProducerStreamKeyV1, QueryTerminalRuntimeFilterProducerStreamV1,
     QueryTerminalRuntimeFilterScanNotEvaluatedV1, QueryTerminalRuntimeFilterSubscriptionTerminalV1,
     QueryTerminalRuntimeFilterTransportRouteKeyV1, QueryTerminalRuntimeFilterTransportRouteV1,
-    QueryTerminalSet, QueryTerminalSnapshot, QueryTerminalSnapshotDigest, TerminalTelemetry,
+    QueryTerminalSnapshot, QueryTerminalSnapshotDigest, TerminalTelemetry,
     TerminalTelemetryUnavailable, TerminalizationProof, TerminalizationProofFragment,
     p0_max_encoded_len,
 };

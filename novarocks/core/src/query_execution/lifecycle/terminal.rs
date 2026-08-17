@@ -28,8 +28,8 @@ use crate::common::types::UniqueId;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
 use novarocks_execution::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
-use novarocks_protocol::lifecycle::QueryTerminalSnapshot as ProtocolQueryTerminalSnapshot;
-use novarocks_protocol::novarocks;
+use novarocks_protocol::{common, novarocks};
+use novarocks_spi::connector::ConnectorWriterTerminalState;
 
 use super::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest, QueryExecutionId,
@@ -51,6 +51,7 @@ const TERMINALIZATION_PROOF_V1_DOMAIN: &[u8] =
 const NEGATIVE_ATTESTATION_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.negative-attestation.v1\0";
 const TERMINALIZATION_PROOF_VERSION_V1: u32 = 1;
+const CONNECTOR_WRITER_TERMINAL_STAGED: u32 = 0;
 
 fn validated_endpoint(
     backend: &ParticipantBackendIdentity,
@@ -1900,68 +1901,6 @@ impl ImmutableQueryTerminalRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct QueryTerminalSet {
-    snapshots: Vec<QueryTerminalSnapshot>,
-}
-
-impl QueryTerminalSet {
-    pub fn new(mut snapshots: Vec<QueryTerminalSnapshot>) -> Result<Self, QueryLifecycleError> {
-        snapshots.sort_by_key(|snapshot| {
-            (
-                snapshot.execution_id(),
-                snapshot.backend().backend_id(),
-                snapshot.backend().start_epoch(),
-            )
-        });
-        let mut identities = BTreeSet::new();
-        for snapshot in &snapshots {
-            snapshot.validate()?;
-            let identity = (
-                snapshot.execution_id(),
-                snapshot.backend().backend_id(),
-                snapshot.backend().start_epoch(),
-            );
-            if !identities.insert(identity) {
-                return Err(QueryLifecycleError::new(
-                    super::QueryLifecycleErrorCode::Conflict,
-                    "query terminal set contains duplicate participant identity",
-                ));
-            }
-        }
-        Ok(Self { snapshots })
-    }
-
-    /// CLS-R1 keeps the lease aggregate in Core while native ingress carries
-    /// only the validated Protocol snapshot. Protocol has already validated
-    /// its canonical digest, which intentionally differs from the retired
-    /// Core digest domain; rebuild the aggregate projection here so Frontend
-    /// never regains a lifecycle codec. CLS-R2 retires this input with lease.
-    pub fn from_protocol_snapshots(
-        snapshots: Vec<ProtocolQueryTerminalSnapshot>,
-    ) -> Result<Self, QueryLifecycleError> {
-        snapshots
-            .into_iter()
-            .map(|snapshot| decode_protocol_terminal_snapshot_projection(snapshot.as_proto()))
-            .collect::<Result<Vec<_>, _>>()
-            .and_then(Self::new)
-    }
-
-    pub fn snapshots(&self) -> &[QueryTerminalSnapshot] {
-        &self.snapshots
-    }
-
-    pub fn fragments(&self) -> impl Iterator<Item = &FragmentTerminalSnapshot> {
-        self.snapshots
-            .iter()
-            .flat_map(QueryTerminalSnapshot::fragments)
-    }
-
-    pub fn is_success(&self) -> bool {
-        self.snapshots.iter().all(QueryTerminalSnapshot::is_success)
-    }
-}
-
 fn put_fragment_outcome(bytes: &mut Vec<u8>, outcome: &FragmentTerminalOutcome) {
     match outcome {
         FragmentTerminalOutcome::Succeeded => put_u8(bytes, 1),
@@ -1998,7 +1937,7 @@ fn put_sink(bytes: &mut Vec<u8>, sink: &SinkCommitReportSnapshot) {
     let mut connector = sink
         .connector_staged_report_frames
         .iter()
-        .map(crate::query_execution::write::encode_connector_staged_report_frame)
+        .map(encode_connector_staged_report_frame)
         .map(|frame| canonical_connector_staged_report_frame(&frame))
         .collect::<Vec<_>>();
     connector.sort();
@@ -2031,6 +1970,56 @@ fn put_sink(bytes: &mut Vec<u8>, sink: &SinkCommitReportSnapshot) {
     put_i64(bytes, sink.load_stats.loaded_rows);
     put_i64(bytes, sink.load_stats.loaded_bytes);
     put_i64(bytes, sink.load_stats.filtered_rows);
+}
+
+/// Encodes an opaque provider staged-report frame for lifecycle terminal
+/// values. The protocol adapter belongs with the terminal wire family so a
+/// retained lifecycle value never depends on Frontend query assembly.
+pub(crate) fn encode_connector_staged_report_frame(
+    frame: &novarocks_spi::connector::ConnectorStagedReportFrame,
+) -> novarocks::ConnectorStagedReportFrame {
+    let writer = frame.writer();
+    let fragment_instance_id = writer.fragment_instance_id();
+    novarocks::ConnectorStagedReportFrame {
+        contract_version: frame.version(),
+        writer: Some(novarocks_protocol::plan::ConnectorWriterIdentity {
+            operation_id: writer.operation_id().to_bytes().to_vec(),
+            cohort_id: writer.cohort_id().to_bytes().to_vec(),
+            execution_query_id: writer.execution_id().query_id().to_vec(),
+            execution_attempt_id: writer.execution_id().attempt_id(),
+            fragment_instance_id: Some(common::UniqueId {
+                hi: i64::from_be_bytes(
+                    fragment_instance_id[..8]
+                        .try_into()
+                        .expect("fixed UUID prefix"),
+                ),
+                lo: i64::from_be_bytes(
+                    fragment_instance_id[8..]
+                        .try_into()
+                        .expect("fixed UUID suffix"),
+                ),
+            }),
+            fragment_id: writer.fragment_id(),
+            backend_num: writer.backend_num(),
+            sink_ordinal: writer.sink_ordinal(),
+            connector_instance_id: writer.binding_key().instance_id.as_str().to_string(),
+            connector_incarnation: writer.binding_key().incarnation.to_bytes().to_vec(),
+        }),
+        terminal_state: match frame.state() {
+            ConnectorWriterTerminalState::Staged => CONNECTOR_WRITER_TERMINAL_STAGED,
+            ConnectorWriterTerminalState::Aborted => 1,
+            ConnectorWriterTerminalState::Failed => 2,
+        },
+        input_rows: frame.summary().input_rows,
+        staged_bytes: frame.summary().staged_bytes,
+        artifact_count: frame.summary().artifact_count,
+        part_index: frame.part_index(),
+        part_count: frame.part_count(),
+        logical_payload_len: frame.logical_payload_len(),
+        logical_payload_sha256: frame.logical_payload_digest().to_vec(),
+        frame_payload: frame.frame_payload().to_vec(),
+        frame_payload_sha256: frame.frame_payload_digest().to_vec(),
+    }
 }
 
 fn canonical_connector_staged_report_frame(
@@ -2234,7 +2223,7 @@ fn decode_terminal_telemetry_unavailable(
     TerminalTelemetryUnavailable::new(value.stage.clone(), value.code.clone())
 }
 
-fn decode_fragment_terminal_profile_telemetry(
+pub(crate) fn decode_fragment_terminal_profile_telemetry(
     value: &novarocks::FragmentTerminalProfileTelemetry,
 ) -> Result<TerminalTelemetry<RuntimeProfileTree>, QueryLifecycleError> {
     use novarocks::fragment_terminal_profile_telemetry::Telemetry;
@@ -2253,7 +2242,7 @@ fn decode_fragment_terminal_profile_telemetry(
     }
 }
 
-fn decode_query_terminal_profile_contribution_telemetry(
+pub(crate) fn decode_query_terminal_profile_contribution_telemetry(
     value: &novarocks::QueryTerminalProfileContributionTelemetry,
 ) -> Result<TerminalTelemetry<QueryTerminalProfileContributionV1>, QueryLifecycleError> {
     use novarocks::query_terminal_profile_contribution_telemetry::Telemetry;
@@ -2443,138 +2432,12 @@ fn decode_query_terminal_profile_contribution(
     )
 }
 
-/// Rebuilds the Core-only lease aggregate after Protocol has validated the
-/// terminal snapshot. This is the explicitly deferred CLS-R2 aggregation
-/// residual; no RPC boundary reaches this projection.
-fn decode_protocol_terminal_snapshot_projection(
-    value: &novarocks::QueryTerminalSnapshot,
-) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
-    decode_query_terminal_snapshot_projection(value)
-}
-
-fn decode_query_terminal_snapshot_projection(
-    value: &novarocks::QueryTerminalSnapshot,
-) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
-    use crate::runtime::sink_commit::{
-        SinkCommitReportSnapshot, SinkLoadStats, TabletCommitInfo, TabletFailInfo,
-    };
-    let fragments = value
-        .fragments
-        .iter()
-        .map(|fragment| {
-            let id = fragment.fragment_instance_id.as_ref().ok_or_else(|| {
-                QueryLifecycleError::invalid_manifest("terminal fragment instance id is required")
-            })?;
-            let outcome = match fragment.outcome {
-                1 => FragmentTerminalOutcome::Succeeded,
-                2 if !fragment.error_code.trim().is_empty() => FragmentTerminalOutcome::Failed {
-                    code: fragment.error_code.clone(),
-                    detail: fragment.error_detail.clone(),
-                    detail_truncated: fragment.error_detail_truncated,
-                },
-                3 => FragmentTerminalOutcome::Cancelled {
-                    detail: fragment.error_detail.clone(),
-                    detail_truncated: fragment.error_detail_truncated,
-                },
-                4 => FragmentTerminalOutcome::IncompleteDrain {
-                    detail: fragment.error_detail.clone(),
-                    detail_truncated: fragment.error_detail_truncated,
-                },
-                _ => {
-                    return Err(QueryLifecycleError::invalid_manifest(
-                        "invalid terminal fragment outcome",
-                    ));
-                }
-            };
-            let stats = fragment.load_stats.as_ref().ok_or_else(|| {
-                QueryLifecycleError::invalid_manifest("terminal fragment load stats are required")
-            })?;
-            let sink = SinkCommitReportSnapshot {
-                connector_staged_report_frames: fragment
-                    .connector_staged_report_frames
-                    .iter()
-                    .map(crate::query_execution::write::decode_connector_staged_report_frame)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| QueryLifecycleError::invalid_manifest(error.message()))?,
-                tablet_commit_infos: fragment
-                    .tablet_commit_infos
-                    .iter()
-                    .map(|value| TabletCommitInfo {
-                        tablet_id: value.tablet_id,
-                        backend_id: value.backend_id,
-                    })
-                    .collect(),
-                tablet_fail_infos: fragment
-                    .tablet_fail_infos
-                    .iter()
-                    .map(|value| TabletFailInfo {
-                        tablet_id: value.tablet_id,
-                        backend_id: value.backend_id,
-                    })
-                    .collect(),
-                load_stats: SinkLoadStats {
-                    loaded_rows: stats.loaded_rows,
-                    loaded_bytes: stats.loaded_bytes,
-                    filtered_rows: stats.filtered_rows,
-                },
-            };
-            let profile = decode_fragment_terminal_profile_telemetry(
-                fragment.profile.as_ref().ok_or_else(|| {
-                    QueryLifecycleError::invalid_manifest(
-                        "terminal fragment profile telemetry is required",
-                    )
-                })?,
-            )?;
-            FragmentTerminalSnapshot::new_with_profile_telemetry(
-                novarocks_types::UniqueId::new(id.hi, id.lo),
-                fragment.backend_num,
-                outcome,
-                sink,
-                profile,
-            )
-            .and_then(|snapshot| {
-                snapshot.with_statistics_payload(fragment.statistics_payload.clone())
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let profile_contribution = decode_query_terminal_profile_contribution_telemetry(
-        value.profile_contribution.as_ref().ok_or_else(|| {
-            QueryLifecycleError::invalid_manifest(
-                "query terminal profile contribution telemetry is required",
-            )
-        })?,
-    )?;
-    QueryTerminalSnapshot::new_with_profile_telemetry(
-        value
-            .execution_id
-            .as_ref()
-            .ok_or_else(|| {
-                QueryLifecycleError::invalid_manifest("terminal execution id is required")
-            })
-            .and_then(|raw| {
-                QueryExecutionId::try_from_proto(raw).map_err(QueryLifecycleError::from)
-            })?,
-        value
-            .backend
-            .clone()
-            .ok_or_else(|| {
-                QueryLifecycleError::invalid_manifest("terminal backend identity is required")
-            })
-            .and_then(|raw| {
-                ParticipantBackendIdentity::parse(raw).map_err(QueryLifecycleError::from)
-            })?,
-        ParticipantManifestDigest::try_from_slice(&value.init_digest)
-            .map_err(QueryLifecycleError::from)?,
-        fragments,
-        profile_contribution,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::{AttemptId, ParticipantRole, QueryControlEndpoint};
+    use crate::query_execution::terminal_set::QueryTerminalSet;
     use novarocks_execution::runtime::profile::{
         CounterStrategy, ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree,
     };

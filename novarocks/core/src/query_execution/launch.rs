@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Core-owned Stage/Start orchestration.
+//! Frontend-owned Stage/Start orchestration values.
 //!
 //! The participant-local Stage and Start contracts belong to
-//! `novarocks_protocol::lifecycle`. Core retains only the frozen ownership
-//! binding, exact-batch assembly, and the two-barrier launch port.
+//! `novarocks_protocol::lifecycle`. These values retain the frozen ownership
+//! binding, exact-batch assembly, and the two-barrier launch port. They are
+//! deliberately separate from the lifecycle wire value family.
 
 use std::collections::BTreeSet;
 
@@ -31,7 +32,7 @@ use novarocks_types::UniqueId;
 
 use crate::query_execution::contract::DistributedQueryError;
 
-use super::residual::QueryLifecycleTarget;
+use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 
 pub const DEFAULT_STAGE_MAX_FRAGMENTS: usize =
     novarocks_protocol::lifecycle::stage::DEFAULT_STAGE_MAX_FRAGMENTS;

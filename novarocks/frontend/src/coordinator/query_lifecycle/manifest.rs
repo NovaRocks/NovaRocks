@@ -18,7 +18,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryInitPlan};
+use novarocks::query_execution::lifecycle::QueryExecutionId;
+use novarocks::query_execution::lifecycle_plan::QueryInitPlan;
 use novarocks_protocol::lifecycle::{ParticipantManifestDigest, ParticipantRole, QueryInitRequest};
 use novarocks_protocol::novarocks as protocol_wire;
 

@@ -37,7 +37,10 @@ use novarocks::query_execution::contract::{
     DistributedQueryRequest, ProfileTerminalBuilder,
 };
 use novarocks::query_execution::fragment_transport::{FetchOutcome, FragmentDispatcher};
-use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId, QueryInitOptions};
+use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks::query_execution::lifecycle_plan::{
+    QueryInitOptions, QueryLifecycleLease, QueryLifecycleTarget,
+};
 use novarocks::query_execution::write::WriteTerminalBuilder;
 use novarocks::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_protocol::lifecycle::{
@@ -396,7 +399,7 @@ impl QueryControlSession for ReadyLifecycleSessionForTest {
 impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
     fn init_query(
         &self,
-        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _target: QueryLifecycleTarget,
         request: QueryInitRequest,
         _timeout: Duration,
     ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
@@ -415,7 +418,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
 
     fn attach_control(
         &self,
-        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _target: QueryLifecycleTarget,
         _attach: QueryControlAttach,
         _timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
@@ -433,7 +436,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
 
     fn stage_fragments(
         &self,
-        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _target: QueryLifecycleTarget,
         request: &QueryStageRequest,
         _timeout: Duration,
     ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
@@ -449,7 +452,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
 
     fn start_prepared_query(
         &self,
-        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _target: QueryLifecycleTarget,
         request: &QueryStartRequest,
         _timeout: Duration,
     ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
@@ -465,7 +468,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
 
     fn abort_query(
         &self,
-        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        _target: QueryLifecycleTarget,
         request: QueryAbortRequest,
         _timeout: Duration,
     ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
@@ -1164,7 +1167,7 @@ impl FrontendDistributedQueryCoordinator {
     fn fail_cancel_then_abort_query_lifecycle(
         &self,
         query_id: QueryId,
-        lease: &mut Option<novarocks::query_execution::lifecycle::QueryLifecycleLease>,
+        lease: &mut Option<QueryLifecycleLease>,
         message: impl Into<String>,
     ) -> DistributedQueryError {
         let primary = self.fail_and_cancel(query_id, message);
@@ -1204,7 +1207,7 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
 }
 
 fn abort_query_lifecycle(
-    lease: &mut Option<novarocks::query_execution::lifecycle::QueryLifecycleLease>,
+    lease: &mut Option<QueryLifecycleLease>,
     message: impl Into<String>,
 ) -> String {
     let message = message.into();
