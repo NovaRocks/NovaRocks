@@ -610,7 +610,7 @@ pub fn mv_refresh_provider_activation(
         ports.mv_storage_observation,
     );
     Arc::new(
-        novarocks::mv::iceberg_activation::IcebergMvRefreshProviderActivation::new(
+        novarocks::query_execution::mv_assembly::iceberg_activation::IcebergMvRefreshProviderActivation::new(
             query_kernel,
             mv_ports,
         ),

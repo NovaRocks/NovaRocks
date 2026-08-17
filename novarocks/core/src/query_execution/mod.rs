@@ -33,6 +33,7 @@ pub mod fragment_transport;
 pub(crate) mod frozen_connector_read;
 pub mod kernels;
 pub mod lifecycle;
+pub mod mv_assembly;
 pub mod mv_native_write;
 pub mod native_fragment;
 pub(crate) mod outcome;

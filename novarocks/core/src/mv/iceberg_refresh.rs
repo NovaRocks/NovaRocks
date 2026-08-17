@@ -760,7 +760,7 @@ fn prepare_frontend_first_refresh_write(
         )?;
         let prepared = crate::mv::application::MvFirstRefreshWritePreparer::prepare_join_logical(
             request,
-            crate::mv::first_refresh_staging::frozen_logical_context_from_rewrite(
+            crate::query_execution::mv_assembly::first_refresh_staging::frozen_logical_context_from_rewrite(
                 &rewrite,
                 contract.affected_partitions.clone(),
                 Some(frozen_base_overlays),
@@ -1223,7 +1223,7 @@ fn prepare_frontend_incremental_write(
         )?;
         return crate::mv::application::MvIncrementalWritePreparer::prepare(
             request,
-            crate::mv::first_refresh_staging::frozen_logical_context_from_rewrite(
+            crate::query_execution::mv_assembly::first_refresh_staging::frozen_logical_context_from_rewrite(
                 &rewrite,
                 contract.affected_partitions.clone(),
                 Some(frozen_base_overlays),
@@ -1399,7 +1399,7 @@ fn prepare_frontend_incremental_write(
     )?;
     crate::mv::application::MvIncrementalWritePreparer::prepare(
         request,
-        crate::mv::first_refresh_staging::frozen_logical_context_from_rewrite(
+        crate::query_execution::mv_assembly::first_refresh_staging::frozen_logical_context_from_rewrite(
             &rewrite,
             contract.affected_partitions.clone(),
             Some(frozen_base_overlays),
@@ -8018,7 +8018,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     }
     let connector_context =
         crate::connector::connector_request_context_for_execution(None, execution)?;
-    let refresh_rewrite = crate::mv::first_refresh_staging::rebuild_frozen_mv_rewrite_context(
+    let refresh_rewrite = crate::query_execution::mv_assembly::first_refresh_staging::rebuild_frozen_mv_rewrite_context(
         ports,
         request.current_catalog.as_deref(),
         &request.current_database,
@@ -8154,7 +8154,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let managed_publication =
-        crate::mv::iceberg_activation::managed_publication_activation_intent(
+        crate::query_execution::mv_assembly::iceberg_activation::managed_publication_activation_intent(
             &publication_intent,
             novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
         )?;

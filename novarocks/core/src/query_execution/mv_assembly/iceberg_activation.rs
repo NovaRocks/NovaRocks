@@ -55,7 +55,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
     ) -> Result<PreparedMvNativeWriteAssembly, String> {
         match prepared {
             PreparedMvRefreshWrite::FirstRefresh(prepared) => {
-                crate::mv::first_refresh_staging::bind_prepared_mv_first_refresh_staging(
+                super::first_refresh_staging::bind_prepared_mv_first_refresh_staging(
                     &self.query_kernel,
                     &self.ports,
                     prepared,

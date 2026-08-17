@@ -79,7 +79,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     let connector_context =
         crate::connector::connector_request_context_for_execution(None, execution)?;
     let root_hash_column = prepared.root_hash_column().to_string();
-    let template = crate::mv::iceberg_activation::activate_first_refresh_connector_write(
+    let template = super::iceberg_activation::activate_first_refresh_connector_write(
         &prepared,
         connector_context.clone(),
         exact_lease,
