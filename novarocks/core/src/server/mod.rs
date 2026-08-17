@@ -16,6 +16,7 @@
 // under the License.
 
 mod encoding;
+pub mod session;
 
 use std::future::Future;
 use std::io;
@@ -42,12 +43,12 @@ use tracing::{info, warn};
 use crate::version;
 
 use self::encoding::write_query_result;
-use crate::query_execution::StatementResult;
-use crate::query_execution::cancellation::QueryCancellationReason;
-use crate::query_execution::session::{
+use self::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest,
 };
+use crate::query_execution::StatementResult;
+use crate::query_execution::cancellation::QueryCancellationReason;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;

@@ -18,7 +18,7 @@
 //! Frontend-owned SQL session boundary consumed by the MySQL wire adapter.
 //! Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 //!
-//! The core server owns protocol framing only.  Authentication success opens a
+//! The core server owns protocol framing only. Authentication success opens a
 //! frontend session through this port; all request admission, routing and
 //! cancellation identity remain with that session.
 

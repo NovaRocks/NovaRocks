@@ -149,7 +149,7 @@ fn lifecycle_convergence_debug_snapshot(
 }
 
 fn lifecycle_metric_map(
-    metrics: novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot,
+    metrics: novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot,
 ) -> BTreeMap<String, i64> {
     [
         ("active_attempts", metrics.active_attempts as i64),

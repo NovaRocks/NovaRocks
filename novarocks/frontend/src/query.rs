@@ -48,12 +48,12 @@ use novarocks::query_execution::request_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
 use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::query_execution::session::{
+use novarocks::query_execution::{PreparedQueryOperation, StatementResult};
+use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks::server::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
-use novarocks::query_execution::{PreparedQueryOperation, StatementResult};
-use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks::statistics::command::StatisticsCommandExecutor;
 use novarocks::view::view_command::ViewCommandExecutor;
 use novarocks_catalog::identifier::normalize_identifier;

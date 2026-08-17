@@ -258,7 +258,7 @@ impl FrontendQueryLifecycleBarrier {
     #[cfg(test)]
     pub(super) fn metrics_snapshot(
         &self,
-    ) -> novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot {
+    ) -> novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot {
         self.metrics.snapshot()
     }
 

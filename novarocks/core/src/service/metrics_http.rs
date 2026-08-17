@@ -298,7 +298,7 @@ pub(crate) fn publish_backend_topology_metrics(
 }
 
 pub fn publish_backend_query_lifecycle_metrics(
-    snapshot: crate::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot,
+    snapshot: crate::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot,
     termination_reasons: [u64; 6],
 ) {
     for (state_name, count) in [
@@ -380,7 +380,7 @@ pub fn publish_backend_query_lifecycle_terminal_limits(capacity: usize, max_byte
 }
 
 pub fn publish_frontend_query_lifecycle_metrics(
-    snapshot: crate::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot,
+    snapshot: crate::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot,
 ) {
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS).set(snapshot.active_attempts as i64);
     for (outcome, count) in [
@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn frontend_query_lifecycle_metrics_publish_structured_snapshot() {
         publish_frontend_query_lifecycle_metrics(
-            crate::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot {
+            crate::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot {
                 active_attempts: 2,
                 init_applied: 3,
                 init_idempotent: 4,

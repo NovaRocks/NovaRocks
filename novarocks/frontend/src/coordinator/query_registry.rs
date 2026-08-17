@@ -23,7 +23,7 @@ use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
-use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
+use novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot;
 use novarocks_protocol::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::QueryId;
 

@@ -23,8 +23,8 @@ use std::task::Poll;
 use crate::capabilities as core_capabilities;
 use novarocks::maintenance::BackgroundMaintenanceAttemptFactory;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
-use novarocks::query_execution::session::QuerySessionFactory;
 use novarocks::server::ResolvedMysqlListenerSettings;
+use novarocks::server::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
 
@@ -618,8 +618,8 @@ mod tests {
         FrontendApplicationHost, FrontendExecutionConfig,
     };
     use novarocks::{
-        catalog_application::CatalogAdmission, query_execution::session::QuerySessionOpenRequest,
-        server::ResolvedMysqlListenerSettings,
+        catalog_application::CatalogAdmission, server::ResolvedMysqlListenerSettings,
+        server::session::QuerySessionOpenRequest,
     };
     use novarocks_state_store::{
         FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
@@ -804,7 +804,7 @@ mod tests {
                 .await
                 .expect_err("a dropped catalog stops being admitted")
                 .kind(),
-            novarocks::query_execution::session::QueryServiceErrorKind::BadDatabase
+            novarocks::server::session::QueryServiceErrorKind::BadDatabase
         );
 
         // The ready session factory and this test's probe both hold StateStore references; the

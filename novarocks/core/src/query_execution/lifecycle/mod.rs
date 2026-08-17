@@ -16,7 +16,6 @@
 // under the License.
 
 pub mod contract;
-pub mod metrics;
 pub mod terminal;
 
 pub use contract::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
