@@ -21,8 +21,14 @@
 //! context into the backend name and normalized catalog/namespace/table
 //! identifiers used by connector traits.
 
+use std::sync::Arc;
+
 use crate::catalog_application::CatalogApplicationPort;
 use novarocks_catalog::identifier::{resolve_catalog_namespace_name, resolve_catalog_table_name};
+use novarocks_spi::connector::{
+    ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, ConnectorWriteLease,
+};
 use novarocks_sql::syntax::ObjectName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +173,37 @@ fn require_catalog_admission(
         .require_ready(&instance_id)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Loads the Iceberg table handle for an already-resolved write target.
+///
+/// Like `invalidate_iceberg_caches`, this acts on the resolver's own
+/// `TargetBackend` and names no query-assembly type: it checks the lease
+/// against the resolved instance and reads the table through it.
+pub fn iceberg_connector_table_handle(
+    exact_lease: &ConnectorWriteLease,
+    target: &TargetBackend,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorTableHandle, String> {
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    if exact_lease.binding_key().instance_id != instance_id {
+        return Err("Iceberg write lease does not match the target connector instance".to_string());
+    }
+    let metadata = exact_lease
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .map_err(|error| {
+            format!("load Iceberg write target through connector metadata: {error}")
+        })?;
+    Ok(metadata.table)
 }
 
 #[cfg(test)]

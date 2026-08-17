@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
 use crate::query_execution::StatementResult;
 use crate::query_execution::kernels::CatalogCommandKernel;
 use bytes::Bytes;
@@ -53,10 +54,8 @@ use novarocks_sql::syntax::sqlparser_expr_to_literal;
 /// control, local catalog invalidation, MV guards, and view metadata lookup.
 pub(crate) trait CatalogDropContext:
     crate::catalog_application::resolver::CatalogAdmission
+    + crate::catalog_application::query_catalog::CatalogServiceSource
 {
-    fn catalog_service(
-        &self,
-    ) -> &Arc<crate::catalog_application::query_catalog::QueryCatalogService>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
     fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository;
     fn mv_storage_observation(
@@ -68,12 +67,6 @@ pub(crate) trait CatalogDropContext:
 // kernel that supplies the ports. It moves to Frontend together with
 // `CatalogCommandKernel` in CLS-R2 T15.
 impl CatalogDropContext for CatalogCommandKernel {
-    fn catalog_service(
-        &self,
-    ) -> &Arc<crate::catalog_application::query_catalog::QueryCatalogService> {
-        self.catalog_service()
-    }
-
     fn connector_control(&self) -> &dyn ConnectorControlRegistry {
         self.connector_control().as_ref()
     }
@@ -1334,23 +1327,6 @@ fn drop_local_catalog_table(
         Ok(()) => Ok(StatementResult::Ok),
         Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
         Err(err) => Err(err),
-    }
-}
-
-fn drop_local_table_registration_if_exists(
-    context: &impl CatalogDropContext,
-    namespace: &str,
-    table: &str,
-) -> Result<(), String> {
-    let mut guard = context
-        .catalog_service()
-        .local()
-        .write()
-        .map_err(|error| format!("standalone catalog write lock: {error}"))?;
-    match guard.drop_table(namespace, table) {
-        Ok(()) => Ok(()),
-        Err(error) if error.contains("unknown") => Ok(()),
-        Err(error) => Err(format!("drop local table metadata: {error}")),
     }
 }
 

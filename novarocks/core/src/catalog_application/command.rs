@@ -74,10 +74,6 @@ impl CatalogServiceSource for CatalogCommandExecutor {
 }
 
 impl CatalogDropContext for CatalogCommandExecutor {
-    fn catalog_service(&self) -> &Arc<QueryCatalogService> {
-        &self.catalog_service
-    }
-
     fn connector_control(&self) -> &dyn ConnectorControlRegistry {
         self.connector_control.as_ref()
     }

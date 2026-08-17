@@ -465,25 +465,6 @@ fn is_synthetic_time_travel_table(table_name: &str) -> bool {
 }
 
 /// Remove a durable local catalog relation after DDL replaces or drops it.
-/// Query-local overlays never call this helper: they are scoped to their
-/// binding store and are not registered in the shared catalog in the first
-/// place.
-pub(crate) fn drop_local_table_registration_if_exists(
-    source: &impl CatalogServiceSource,
-    namespace: &str,
-    table: &str,
-) -> Result<(), String> {
-    let mut guard = source
-        .catalog_service()
-        .local()
-        .write()
-        .map_err(|error| format!("standalone catalog write lock: {error}"))?;
-    match guard.drop_table(namespace, table) {
-        Ok(()) => Ok(()),
-        Err(error) if error.contains("unknown") => Ok(()),
-        Err(error) => Err(format!("drop local table metadata: {error}")),
-    }
-}
 
 #[cfg(test)]
 fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<Vec<i8>, String> {

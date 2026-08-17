@@ -203,3 +203,23 @@ pub fn catalog_service_snapshot(source: &impl CatalogServiceSource) -> QueryCata
         source.catalog_service().registry_snapshot(),
     )
 }
+
+/// Query-local overlays never call this helper: they are scoped to their
+/// binding store and are not registered in the shared catalog in the first
+/// place.
+pub fn drop_local_table_registration_if_exists(
+    source: &impl CatalogServiceSource,
+    namespace: &str,
+    table: &str,
+) -> Result<(), String> {
+    let mut guard = source
+        .catalog_service()
+        .local()
+        .write()
+        .map_err(|error| format!("standalone catalog write lock: {error}"))?;
+    match guard.drop_table(namespace, table) {
+        Ok(()) => Ok(()),
+        Err(error) if error.contains("unknown") => Ok(()),
+        Err(error) => Err(format!("drop local table metadata: {error}")),
+    }
+}

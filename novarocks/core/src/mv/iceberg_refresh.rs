@@ -868,7 +868,7 @@ fn first_refresh_target_handle(
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<novarocks_spi::connector::ConnectorTableHandle, String> {
     select_retained_target_handle(retained, || {
-        crate::query_execution::dml::iceberg_writer::iceberg_connector_table_handle(
+        crate::catalog_application::resolver::iceberg_connector_table_handle(
             write_lease,
             &crate::catalog_application::resolver::TargetBackend {
                 backend_name: "iceberg",
@@ -8412,7 +8412,7 @@ pub(crate) fn drop_iceberg_mv_with_ports(
         connector_context.clone(),
     )?;
     drop_iceberg_mv_metadata_with_repository(ports.repository.as_ref(), &target)?;
-    crate::query_execution::planning::time_travel::drop_local_table_registration_if_exists(
+    crate::catalog_application::query_catalog::drop_local_table_registration_if_exists(
         ports,
         &target.namespace,
         &target.table,

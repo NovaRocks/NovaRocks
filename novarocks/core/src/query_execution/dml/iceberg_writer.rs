@@ -338,7 +338,11 @@ pub(crate) fn prepare_iceberg_connector_write(
     purpose: ConnectorWriteAdmissionPurpose,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ConnectorWritePreparation, String> {
-    let table = iceberg_connector_table_handle(exact_lease, target, context.clone())?;
+    let table = crate::catalog_application::resolver::iceberg_connector_table_handle(
+        exact_lease,
+        target,
+        context.clone(),
+    )?;
     prepare_iceberg_connector_write_with_table(
         exact_lease,
         table,
@@ -391,31 +395,6 @@ pub(crate) fn prepare_iceberg_connector_write_with_table(
 /// Resolve an opaque Iceberg write target through the connector metadata
 /// capability owned by the exact generation observed at write admission.
 /// Core only forwards the target identity; it never builds a handle payload.
-pub(crate) fn iceberg_connector_table_handle(
-    exact_lease: &ConnectorWriteLease,
-    target: &TargetBackend,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<ConnectorTableHandle, String> {
-    let instance_id = ConnectorInstanceId::parse(&target.catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    if exact_lease.binding_key().instance_id != instance_id {
-        return Err("Iceberg write lease does not match the target connector instance".to_string());
-    }
-    let metadata = exact_lease
-        .load_table(ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(target.namespace.as_str()),
-                table: Arc::from(target.table.as_str()),
-            },
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            context,
-        })
-        .map_err(|error| {
-            format!("load Iceberg write target through connector metadata: {error}")
-        })?;
-    Ok(metadata.table)
-}
 
 pub(crate) struct PreparedIcebergWrite {
     executor: PreparedIcebergWriteExecutor,
