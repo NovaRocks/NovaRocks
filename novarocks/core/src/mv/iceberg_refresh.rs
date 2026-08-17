@@ -85,7 +85,9 @@ use crate::mv::refresh::repartition::select_repartition_shape;
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
 };
-use crate::mv::refresh::target::{IcebergMvTarget, resolve_refresh_target};
+use crate::mv::refresh::target::{
+    IcebergMvTarget, resolve_refresh_target, validate_target_snapshot,
+};
 use crate::mv::refresh::target_apply::{
     apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
     join_apply_key_table_column,
@@ -4852,38 +4854,6 @@ fn build_neutral_refresh_rewrite_context(
         schema_contract,
     )
     .map(Arc::new)
-}
-
-fn validate_target_snapshot(
-    target: &IcebergMvTarget,
-    mv_definition: &StoredMvDefinition,
-    binding: &crate::mv::refresh::target_binding::MvTargetBinding,
-) -> Result<(), String> {
-    let actual = binding.current_snapshot_id();
-    let expected = mv_definition.last_refreshed_iceberg_snapshot_id;
-    if actual != expected
-        && !(expected.is_none() && binding.observation().current_snapshot_is_empty_bootstrap())
-    {
-        return Err(format!(
-            "target table {}.{}.{} was modified outside NovaRocks: expected snapshot {:?}, current snapshot {:?}",
-            target.catalog, target.namespace, target.table, expected, actual
-        ));
-    }
-    Ok(())
-}
-
-fn recorded_target_snapshot_id(
-    target: &IcebergMvTarget,
-    mv_definition: &StoredMvDefinition,
-) -> Result<i64, String> {
-    mv_definition
-        .last_refreshed_iceberg_snapshot_id
-        .ok_or_else(|| {
-            format!(
-                "iceberg materialized view {}.{}.{} has no recorded target snapshot",
-                target.catalog, target.namespace, target.table
-            )
-        })
 }
 
 fn observe_schema_validation_for_table(

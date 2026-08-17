@@ -16,6 +16,8 @@
 //! Iceberg MV target identity and statement-name resolution.
 
 use crate::mv::analysis::resolve_mv_name;
+use crate::mv::persistence::definition::StoredMvDefinition;
+use crate::mv::refresh::target_binding::MvTargetBinding;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_sql::syntax::ObjectName;
 
@@ -54,6 +56,40 @@ pub(crate) fn resolve_refresh_target(
         namespace,
         table,
     })
+}
+
+/// Validates that the persisted MV definition still names the target snapshot
+/// that was observed for refresh planning.
+pub(crate) fn validate_target_snapshot(
+    target: &IcebergMvTarget,
+    mv_definition: &StoredMvDefinition,
+    binding: &MvTargetBinding,
+) -> Result<(), String> {
+    let actual = binding.current_snapshot_id();
+    let expected = mv_definition.last_refreshed_iceberg_snapshot_id;
+    if actual != expected
+        && !(expected.is_none() && binding.observation().current_snapshot_is_empty_bootstrap())
+    {
+        return Err(format!(
+            "target table {}.{}.{} was modified outside NovaRocks: expected snapshot {:?}, current snapshot {:?}",
+            target.catalog, target.namespace, target.table, expected, actual
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn recorded_target_snapshot_id(
+    target: &IcebergMvTarget,
+    mv_definition: &StoredMvDefinition,
+) -> Result<i64, String> {
+    mv_definition
+        .last_refreshed_iceberg_snapshot_id
+        .ok_or_else(|| {
+            format!(
+                "iceberg materialized view {}.{}.{} has no recorded target snapshot",
+                target.catalog, target.namespace, target.table
+            )
+        })
 }
 
 #[cfg(test)]
