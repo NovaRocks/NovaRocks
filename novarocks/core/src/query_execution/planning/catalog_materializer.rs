@@ -100,69 +100,6 @@ pub(crate) fn connector_query_binding_from_materialization(
 /// Admit one provider-owned change window while the caller holds the exact
 /// table handle and planning lease. The returned sealed scan is the sole
 /// physical authority retained by Core for later preparation.
-pub(crate) fn admit_connector_change_window(
-    table: &novarocks_spi::connector::ConnectorTableHandle,
-    schema: &arrow::datatypes::SchemaRef,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    window: novarocks_spi::connector::ConnectorChangeWindow,
-) -> Result<novarocks_spi::connector::ConnectorScan, String> {
-    use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorReadPurpose,
-        ConnectorScanSelection,
-    };
-
-    let binding = planning_lease.binding();
-    if table.owner() != &binding.descriptor().instance_id {
-        return Err(
-            "connector change-window table handle owner does not match its exact planning lease"
-                .to_string(),
-        );
-    }
-    let scan = binding
-        .planning()
-        .begin_scan(
-            table,
-            ConnectorBeginScanRequest {
-                projection: (0..schema.fields().len()).collect(),
-                static_predicates: Vec::new(),
-                selection: ConnectorScanSelection::ChangeWindow(window),
-                purpose: ConnectorReadPurpose::Query,
-                limit: None,
-                batch: ConnectorBatchBudget {
-                    max_rows: std::num::NonZeroUsize::new(4096).expect("batch rows are nonzero"),
-                    max_bytes: std::num::NonZeroUsize::new(
-                        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-                    )
-                    .expect("batch bytes are nonzero"),
-                },
-                context: context.clone(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    scan.validate(
-        &novarocks_spi::connector::ConnectorExecutionBindingKey {
-            instance_id: binding.descriptor().instance_id.clone(),
-            incarnation: binding.incarnation(),
-        },
-        ConnectorScanSelection::ChangeWindow(window),
-    )
-    .map_err(|error| error.to_string())?;
-    if scan.output_schema().fields() != schema.fields() {
-        return Err(
-            "connector change-window scan schema does not match its exact table metadata"
-                .to_string(),
-        );
-    }
-    if !scan.predicate_dispositions().is_empty() {
-        return Err(
-            "connector change-window scan returned dispositions without static predicates"
-                .to_string(),
-        );
-    }
-    Ok(scan)
-}
-
 /// Application materializer for connector-controlled table metadata.  The
 /// interface is intentionally application-owned because it returns an exact
 /// lease alongside planner facts.  It is not part of SQL's vocabulary.

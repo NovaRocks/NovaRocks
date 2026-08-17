@@ -22,6 +22,7 @@ pub mod file_execution;
 pub mod metadata_maintenance;
 pub mod mutation;
 pub mod runtime;
+pub(crate) mod scan_admission;
 pub(crate) mod scan_model;
 pub mod schema;
 pub(crate) mod stats;

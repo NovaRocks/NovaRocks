@@ -21,6 +21,7 @@ use std::sync::Arc;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
+use crate::connector::scan_admission::admit_connector_change_window;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use crate::query_execution::planning::bindings::{
@@ -28,8 +29,7 @@ use crate::query_execution::planning::bindings::{
     QueryTableBindingStore,
 };
 use crate::query_execution::planning::catalog_materializer::{
-    QueryLocalTableOverlay, admit_connector_change_window,
-    connector_query_binding_from_materialization,
+    QueryLocalTableOverlay, connector_query_binding_from_materialization,
 };
 
 /// Freeze the IMV target exactly once for one compilation request. The SQL

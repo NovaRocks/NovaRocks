@@ -210,7 +210,7 @@ impl MvCommandExecutor {
             full: false,
         };
         let preparation =
-            crate::mv::iceberg_refresh::StandaloneMvRefreshPreparationService::new_repartition_with_ports(
+            crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_repartition_with_ports(
                 &self.ports,
                 current_catalog,
                 current_database,
@@ -271,7 +271,7 @@ impl MvCommandExecutor {
                 full: false,
             };
             let preparation =
-                crate::mv::iceberg_refresh::StandaloneMvRefreshPreparationService::new_with_ports(
+                crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
                     &self.ports,
                     target_catalog.as_deref(),
                     &target_database,

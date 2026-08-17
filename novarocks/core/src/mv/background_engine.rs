@@ -139,7 +139,7 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             full: false,
         };
         let service =
-            crate::mv::iceberg_refresh::StandaloneMvRefreshPreparationService::new_with_ports(
+            crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
                 &self.ports,
                 step.target.catalog.as_deref(),
                 &step.target.database,
