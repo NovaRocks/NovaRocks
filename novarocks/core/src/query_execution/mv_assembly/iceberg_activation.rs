@@ -15,7 +15,7 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
-use crate::mv::application::PreparedMvRefreshWrite;
+use crate::mv::application::{PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact};
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
@@ -54,8 +54,8 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
     ) -> Result<PreparedMvNativeWriteAssembly, String> {
-        match prepared {
-            PreparedMvRefreshWrite::FirstRefresh(prepared) => {
+        match prepared.into_assembly_artifact() {
+            PreparedMvRefreshWriteArtifact::FirstRefresh(prepared) => {
                 super::first_refresh_staging::bind_prepared_mv_first_refresh_staging(
                     &self.query_kernel,
                     &self.ports,
@@ -65,7 +65,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
                     execution,
                 )
             }
-            PreparedMvRefreshWrite::Incremental(prepared) => {
+            PreparedMvRefreshWriteArtifact::Incremental(prepared) => {
                 crate::mv::iceberg_refresh::bind_prepared_mv_incremental_staging(
                     &self.query_kernel,
                     &self.ports,

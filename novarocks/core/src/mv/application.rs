@@ -109,31 +109,59 @@ pub enum PreparedMvRefreshWork {
 }
 
 /// Exactly one SQL-prepared staged write for a data-producing refresh.
-pub enum PreparedMvRefreshWrite {
+///
+/// The public application handoff intentionally hides the assembly-specific
+/// first-refresh and incremental artifact shapes. Frontend lifecycle code can
+/// validate its operation, cohort, and publication facts, but only the
+/// query-assembly activation adapter may recover the exact artifact needed to
+/// construct a native write.
+pub struct PreparedMvRefreshWrite {
+    artifact: PreparedMvRefreshWriteArtifact,
+}
+
+/// The assembly-facing shape remains crate-private so it cannot become part
+/// of the Core MV application port's public contract.
+pub(crate) enum PreparedMvRefreshWriteArtifact {
     FirstRefresh(PreparedMvFirstRefreshWrite),
     Incremental(PreparedMvIncrementalWrite),
 }
 
 impl PreparedMvRefreshWrite {
+    pub(crate) fn first_refresh(write: PreparedMvFirstRefreshWrite) -> Self {
+        Self {
+            artifact: PreparedMvRefreshWriteArtifact::FirstRefresh(write),
+        }
+    }
+
+    pub(crate) fn incremental(write: PreparedMvIncrementalWrite) -> Self {
+        Self {
+            artifact: PreparedMvRefreshWriteArtifact::Incremental(write),
+        }
+    }
+
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
-        match self {
-            Self::FirstRefresh(write) => write.operation_id(),
-            Self::Incremental(write) => write.operation_id(),
+        match &self.artifact {
+            PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.operation_id(),
+            PreparedMvRefreshWriteArtifact::Incremental(write) => write.operation_id(),
         }
     }
 
     pub fn primary_cohort(&self) -> novarocks_spi::connector::ConnectorWriteCohortId {
-        match self {
-            Self::FirstRefresh(write) => write.primary_cohort(),
-            Self::Incremental(write) => write.primary_cohort(),
+        match &self.artifact {
+            PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.primary_cohort(),
+            PreparedMvRefreshWriteArtifact::Incremental(write) => write.primary_cohort(),
         }
     }
 
     pub fn publication_intent(&self) -> &MvRefreshPublicationIntent {
-        match self {
-            Self::FirstRefresh(write) => write.publication_intent(),
-            Self::Incremental(write) => write.publication_intent(),
+        match &self.artifact {
+            PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.publication_intent(),
+            PreparedMvRefreshWriteArtifact::Incremental(write) => write.publication_intent(),
         }
+    }
+
+    pub(crate) fn into_assembly_artifact(self) -> PreparedMvRefreshWriteArtifact {
+        self.artifact
     }
 }
 
@@ -489,6 +517,11 @@ pub trait MvApplicationService: Send + Sync {
     /// beside the CREATE-only `MvEngine` port: refresh owns distributed
     /// execution, external publication, and durable intent in the frontend,
     /// not in a widened engine backend.
+    ///
+    /// `QueryExecutionContext` is the T5 C-class request carrier: it remains
+    /// in Core because MV and connector domain code both consume its frozen
+    /// cancellation and admission facts. It is not a query-assembly owner or
+    /// a route back into Frontend composition.
     fn execute_prepared_refresh(
         &self,
         _refresh: PreparedMvRefresh,
@@ -505,6 +538,10 @@ pub trait MvApplicationService: Send + Sync {
     /// only the side-effect-free SQL preparation port; the frontend reserves
     /// the attempt identity, persists durable intent, and owns every external
     /// lifecycle phase.
+    ///
+    /// The request context is the same C-class carrier documented on
+    /// `execute_prepared_refresh`; no native fragment, write registration, or
+    /// prepared-dispatch type crosses this application port.
     fn prepare_and_execute_refresh(
         &self,
         _preparation: &dyn MvRefreshPreparationService,

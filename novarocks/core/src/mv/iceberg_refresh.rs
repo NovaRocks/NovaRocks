@@ -284,7 +284,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
             ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
             ExecutableRefreshDecision::FirstRefresh => PreparedMvRefreshWork::DataProducing {
-                write: PreparedMvRefreshWrite::FirstRefresh(prepare_frontend_first_refresh_write(
+                write: PreparedMvRefreshWrite::first_refresh(prepare_frontend_first_refresh_write(
                     self.source,
                     self.current_catalog,
                     self.current_database,
@@ -308,12 +308,12 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             )? {
                 PreparedIncrementalRefreshWork::ChangeStream(incremental) => {
                     PreparedMvRefreshWork::DataProducing {
-                        write: PreparedMvRefreshWrite::Incremental(incremental),
+                        write: PreparedMvRefreshWrite::incremental(incremental),
                     }
                 }
                 PreparedIncrementalRefreshWork::FullRebuild(rebuild) => {
                     PreparedMvRefreshWork::DataProducing {
-                        write: PreparedMvRefreshWrite::FirstRefresh(rebuild),
+                        write: PreparedMvRefreshWrite::first_refresh(rebuild),
                     }
                 }
                 PreparedIncrementalRefreshWork::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
