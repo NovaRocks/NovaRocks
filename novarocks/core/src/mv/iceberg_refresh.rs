@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
@@ -65,6 +64,9 @@ use crate::mv::persistence::schema::{
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
+use crate::mv::refresh::definition::{
+    load_iceberg_mv_definition_by_target, mv_definition_fingerprint, parse_mv_select_query,
+};
 #[cfg(test)]
 use crate::mv::refresh::execution_policy::should_use_join_delta_append_only_fast_path;
 use crate::mv::refresh::execution_policy::{
@@ -74,6 +76,9 @@ use crate::mv::refresh::execution_policy::{
 use crate::mv::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, full_rebuild_reason_message,
     plan_non_join_incremental_changes,
+};
+use crate::mv::refresh::observation::{
+    observe_current_refresh_base, observe_schema_validation_for_table,
 };
 use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::refresh::planning::{
@@ -270,8 +275,13 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             .base_refs
             .iter()
             .map(|base| {
-                observe_schema_validation_for_table(self.source, base, self.connector_context)
-                    .map(|observed| (base.fqn(), observed.table_uuid().to_string()))
+                observe_schema_validation_for_table(
+                    self.source.connector_control(),
+                    self.source.storage_observation(),
+                    base,
+                    self.connector_context,
+                )
+                .map(|observed| (base.fqn(), observed.table_uuid().to_string()))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let expected_target_snapshot_id = match &plan.contract.state_baseline {
@@ -427,7 +437,7 @@ fn prepare_managed_repartition_transition(
         table: contract.target.name.clone(),
     };
     validate_retained_target_identity(&target, retained_target.binding.identity())?;
-    let definition = load_iceberg_mv_definition_by_target(source, &target)?;
+    let definition = load_iceberg_mv_definition_by_target(source.repository(), &target)?;
     let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
             "iceberg MV target {}.{}.{} is missing its schema contract; recreate the MV before repartitioning",
@@ -624,7 +634,7 @@ fn prepare_frontend_first_refresh_write(
             "MV first-refresh target connector generation changed during admission".to_string(),
         );
     }
-    let definition = load_iceberg_mv_definition_by_target(source, &target)?;
+    let definition = load_iceberg_mv_definition_by_target(source.repository(), &target)?;
     let definition = rebind_mv_definition_before_refresh_derivation(
         source,
         &definition,
@@ -697,8 +707,12 @@ fn prepare_frontend_first_refresh_write(
                     .ok_or_else(|| {
                         format!("MV first-refresh has no pinned snapshot for {}", base.fqn())
                     })?;
-                let observed =
-                    observe_current_refresh_base_with_source(source, base, &connector_context)?;
+                let observed = observe_current_refresh_base(
+                    source.connector_control(),
+                    source.storage_observation(),
+                    base,
+                    &connector_context,
+                )?;
                 let uuid = observed.table_uuid().to_string();
                 let expected_uuid = base_table_uuids.get(&base.fqn()).ok_or_else(|| {
                     format!("MV first-refresh has no UUID fact for {}", base.fqn())
@@ -1024,7 +1038,7 @@ fn prepare_frontend_incremental_write(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
-    let definition = load_iceberg_mv_definition_by_target(source, &target)?;
+    let definition = load_iceberg_mv_definition_by_target(source.repository(), &target)?;
     let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
         "Iceberg MV incremental refresh requires a persisted schema contract".to_string()
     })?;
@@ -1065,8 +1079,12 @@ fn prepare_frontend_incremental_write(
                             base.fqn()
                         )
                     })?;
-                let observed =
-                    observe_schema_validation_for_table(source, base, &connector_context)?;
+                let observed = observe_schema_validation_for_table(
+                    source.connector_control(),
+                    source.storage_observation(),
+                    base,
+                    &connector_context,
+                )?;
                 Ok::<_, String>((base.clone(), snapshot_id, observed.table_uuid().to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?,
@@ -1297,7 +1315,12 @@ fn prepare_frontend_incremental_write(
                     base.fqn()
                 )
             })?;
-            let observed = observe_schema_validation_for_table(source, base, &connector_context)?;
+            let observed = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                base,
+                &connector_context,
+            )?;
             if observed.table_uuid() != current_table_uuid {
                 return Err(format!(
                     "MV incremental refresh base table identity changed after planning for {}",
@@ -2953,8 +2976,12 @@ fn observe_base_fields_for_refs_with_ports(
 > {
     let mut observed = std::collections::BTreeMap::new();
     for base_ref in base_refs {
-        let observation =
-            observe_schema_validation_for_table_with_ports(ports, base_ref, connector_context)?;
+        let observation = observe_schema_validation_for_table(
+            ports.connector_control.as_ref(),
+            ports.storage_observation.as_ref(),
+            base_ref,
+            connector_context,
+        )?;
         observed.insert(base_ref.fqn(), observation);
     }
     Ok(observed)
@@ -4862,70 +4889,6 @@ fn build_neutral_refresh_rewrite_context(
     .map(Arc::new)
 }
 
-fn observe_schema_validation_for_table(
-    source: &dyn IcebergMvRefreshSource,
-    table: &TableIdentity,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<MvSchemaValidationObservation, String> {
-    observe_schema_validation_for_table_with_parts(
-        source.connector_control(),
-        source.storage_observation(),
-        table,
-        connector_context,
-    )
-}
-
-fn observe_current_refresh_base_with_source(
-    source: &dyn IcebergMvRefreshSource,
-    table: &TableIdentity,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {
-    crate::mv::refresh_io::observe_current_refresh_base_with_ports(
-        source.connector_control(),
-        source.storage_observation(),
-        table,
-        connector_context,
-    )
-}
-
-fn observe_schema_validation_for_table_with_ports(
-    ports: &IcebergMvCorePorts,
-    table: &TableIdentity,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<MvSchemaValidationObservation, String> {
-    observe_schema_validation_for_table_with_parts(
-        ports.connector_control.as_ref(),
-        ports.storage_observation.as_ref(),
-        table,
-        connector_context,
-    )
-}
-
-fn observe_schema_validation_for_table_with_parts(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    storage_observation: &dyn MvStorageObservationPort,
-    table: &TableIdentity,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<MvSchemaValidationObservation, String> {
-    let exact_lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
-        connector_context.clone(),
-        &table.namespace,
-        &table.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?;
-    storage_observation
-        .observe_schema_validation(&exact_lease, &metadata, connector_context.clone())
-        .map_err(|error| {
-            format!(
-                "observe MV schema validation facts for {}: {error}",
-                table.fqn()
-            )
-        })
-}
-
 fn observe_and_admit_change_window_for_table(
     source: &dyn IcebergMvRefreshSource,
     table: &TableIdentity,
@@ -5001,14 +4964,19 @@ fn rebind_mv_definition_before_refresh_derivation(
                     .to_string()
                     .into());
             };
-            let base_observation =
-                observe_schema_validation_for_table(source, base_ref, connector_context)?;
+            let base_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                base_ref,
+                connector_context,
+            )?;
             let loaded_target_observation;
             let target_observation = match retained_target_observation {
                 Some(observation) => observation,
                 None => {
                     loaded_target_observation = observe_schema_validation_for_table(
-                        source,
+                        source.connector_control(),
+                        source.storage_observation(),
                         &target_ref,
                         connector_context,
                     )?;
@@ -5032,16 +5000,25 @@ fn rebind_mv_definition_before_refresh_derivation(
                     .to_string()
                     .into());
             };
-            let left_observation =
-                observe_schema_validation_for_table(source, left_ref, connector_context)?;
-            let right_observation =
-                observe_schema_validation_for_table(source, right_ref, connector_context)?;
+            let left_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                left_ref,
+                connector_context,
+            )?;
+            let right_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                right_ref,
+                connector_context,
+            )?;
             let loaded_target_observation;
             let target_observation = match retained_target_observation {
                 Some(observation) => observation,
                 None => {
                     loaded_target_observation = observe_schema_validation_for_table(
-                        source,
+                        source.connector_control(),
+                        source.storage_observation(),
                         &target_ref,
                         connector_context,
                     )?;
@@ -5519,7 +5496,7 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
     // Historical v1/v2 recovery stays in the legacy execution adapter; a
     // current frontend-owned attempt must never perform recovery before its
     // durable v3 intent exists.
-    let mv_definition = load_iceberg_mv_definition_by_target(source, &iceberg_target)
+    let mv_definition = load_iceberg_mv_definition_by_target(source.repository(), &iceberg_target)
         .map_err(RefreshError::user)?;
     let target_ref = TableIdentity {
         catalog: iceberg_target.catalog.clone(),
@@ -5653,21 +5630,41 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
         }
         let (left_ref, right_ref) =
             join_base_refs_for_aliases(&join_aliases, &base_refs).map_err(RefreshError::user)?;
-        let left_refresh =
-            observe_current_refresh_base_with_source(source, left_ref, connector_context)
-                .map_err(RefreshError::user)?;
-        let right_refresh =
-            observe_current_refresh_base_with_source(source, right_ref, connector_context)
-                .map_err(RefreshError::user)?;
-        let left_observation =
-            observe_schema_validation_for_table(source, left_ref, connector_context)
-                .map_err(RefreshError::user)?;
-        let right_observation =
-            observe_schema_validation_for_table(source, right_ref, connector_context)
-                .map_err(RefreshError::user)?;
-        let target_observation =
-            observe_schema_validation_for_table(source, &target_ref, connector_context)
-                .map_err(RefreshError::user)?;
+        let left_refresh = observe_current_refresh_base(
+            source.connector_control(),
+            source.storage_observation(),
+            left_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
+        let right_refresh = observe_current_refresh_base(
+            source.connector_control(),
+            source.storage_observation(),
+            right_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
+        let left_observation = observe_schema_validation_for_table(
+            source.connector_control(),
+            source.storage_observation(),
+            left_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
+        let right_observation = observe_schema_validation_for_table(
+            source.connector_control(),
+            source.storage_observation(),
+            right_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
+        let target_observation = observe_schema_validation_for_table(
+            source.connector_control(),
+            source.storage_observation(),
+            &target_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
         let left_fqn = left_ref.fqn();
         let right_fqn = right_ref.fqn();
         match validate_join_schema_contract(
@@ -5779,10 +5776,14 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         ))
     })?;
-    let current_snapshot_id_before_pin =
-        observe_current_refresh_base_with_source(source, base_ref, connector_context)
-            .map_err(RefreshError::user)?
-            .current_snapshot_id();
+    let current_snapshot_id_before_pin = observe_current_refresh_base(
+        source.connector_control(),
+        source.storage_observation(),
+        base_ref,
+        connector_context,
+    )
+    .map_err(RefreshError::user)?
+    .current_snapshot_id();
     let previous_snapshot_id = mv_definition
         .last_refresh_snapshots
         .get(&base_ref.fqn())
@@ -5802,11 +5803,20 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
         label: &refresh_label,
     })
     .map_err(RefreshError::user)?;
-    let base_observation = observe_schema_validation_for_table(source, base_ref, connector_context)
-        .map_err(RefreshError::user)?;
-    let target_observation =
-        observe_schema_validation_for_table(source, &target_ref, connector_context)
-            .map_err(RefreshError::user)?;
+    let base_observation = observe_schema_validation_for_table(
+        source.connector_control(),
+        source.storage_observation(),
+        base_ref,
+        connector_context,
+    )
+    .map_err(RefreshError::user)?;
+    let target_observation = observe_schema_validation_for_table(
+        source.connector_control(),
+        source.storage_observation(),
+        &target_ref,
+        connector_context,
+    )
+    .map_err(RefreshError::user)?;
     match validate_schema_contract(schema_contract, &base_observation, &target_observation) {
         ContractDecision::Incompatible(err) => {
             return Err(RefreshError::user(format!("{err}")));
@@ -5915,18 +5925,31 @@ fn plan_iceberg_union_projection_mv_refresh(
         namespace: iceberg_target.namespace.clone(),
         table: iceberg_target.table.clone(),
     };
-    let target_observation =
-        observe_schema_validation_for_table(source, &target_ref, connector_context)
-            .map_err(RefreshError::user)?;
+    let target_observation = observe_schema_validation_for_table(
+        source.connector_control(),
+        source.storage_observation(),
+        &target_ref,
+        connector_context,
+    )
+    .map_err(RefreshError::user)?;
 
     let mut current_snapshots = BTreeMap::new();
     let mut snapshot_pins = BTreeMap::new();
     for base_ref in base_refs {
-        let refresh = observe_current_refresh_base_with_source(source, base_ref, connector_context)
-            .map_err(RefreshError::user)?;
-        let base_observation =
-            observe_schema_validation_for_table(source, base_ref, connector_context)
-                .map_err(RefreshError::user)?;
+        let refresh = observe_current_refresh_base(
+            source.connector_control(),
+            source.storage_observation(),
+            base_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
+        let base_observation = observe_schema_validation_for_table(
+            source.connector_control(),
+            source.storage_observation(),
+            base_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
         validate_union_projection_schema_contract_for_base(
             iceberg_target,
             schema_contract,
@@ -5981,11 +6004,15 @@ fn plan_iceberg_union_projection_mv_refresh(
         for base_ref in base_refs {
             let fqn = base_ref.fqn();
             if let Some(previous_uuid) = previous_table_uuids.get(&fqn) {
-                let current_uuid =
-                    observe_schema_validation_for_table(source, base_ref, connector_context)
-                        .map_err(RefreshError::user)?
-                        .table_uuid()
-                        .to_string();
+                let current_uuid = observe_schema_validation_for_table(
+                    source.connector_control(),
+                    source.storage_observation(),
+                    base_ref,
+                    connector_context,
+                )
+                .map_err(RefreshError::user)?
+                .table_uuid()
+                .to_string();
                 if previous_uuid != &current_uuid {
                     return Err(RefreshError::user(format!(
                         "iceberg MV base table identity changed for {fqn}; incremental refresh is unsafe, rebuild or recreate the MV"
@@ -6095,9 +6122,13 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
         namespace: iceberg_target.namespace.clone(),
         table: iceberg_target.table.clone(),
     };
-    let target_observation =
-        observe_schema_validation_for_table(source, &target_ref, connector_context)
-            .map_err(RefreshError::user)?;
+    let target_observation = observe_schema_validation_for_table(
+        source.connector_control(),
+        source.storage_observation(),
+        &target_ref,
+        connector_context,
+    )
+    .map_err(RefreshError::user)?;
     if is_branch_union {
         let branch_count = union_branch_count(canonical_select_query) as usize;
         validate_branch_union_contract(
@@ -6117,11 +6148,20 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     let mut current_snapshots = BTreeMap::new();
     let mut snapshot_pins = BTreeMap::new();
     for base_ref in base_refs {
-        let refresh = observe_current_refresh_base_with_source(source, base_ref, connector_context)
-            .map_err(RefreshError::user)?;
-        let base_observation =
-            observe_schema_validation_for_table(source, base_ref, connector_context)
-                .map_err(RefreshError::user)?;
+        let refresh = observe_current_refresh_base(
+            source.connector_control(),
+            source.storage_observation(),
+            base_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
+        let base_observation = observe_schema_validation_for_table(
+            source.connector_control(),
+            source.storage_observation(),
+            base_ref,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
         validate_aggregate_schema_contract_for_base(
             schema_contract,
             base_ref,
@@ -6263,20 +6303,32 @@ fn plan_iceberg_aggregate_mv_refresh(
                     "iceberg aggregate materialized view refresh requires exactly one base table reference",
                 ));
             };
-            let refresh =
-                observe_current_refresh_base_with_source(source, base_ref, connector_context)
-                    .map_err(RefreshError::user)?;
-            let base_observation =
-                observe_schema_validation_for_table(source, base_ref, connector_context)
-                    .map_err(RefreshError::user)?;
+            let refresh = observe_current_refresh_base(
+                source.connector_control(),
+                source.storage_observation(),
+                base_ref,
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
+            let base_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                base_ref,
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
             let target_ref = TableIdentity {
                 catalog: iceberg_target.catalog.clone(),
                 namespace: iceberg_target.namespace.clone(),
                 table: iceberg_target.table.clone(),
             };
-            let target_observation =
-                observe_schema_validation_for_table(source, &target_ref, connector_context)
-                    .map_err(RefreshError::user)?;
+            let target_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                &target_ref,
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
             match validate_schema_contract(schema_contract, &base_observation, &target_observation)
             {
                 ContractDecision::Incompatible(err) => {
@@ -6352,26 +6404,46 @@ fn plan_iceberg_aggregate_mv_refresh(
                 .map_err(RefreshError::user)?;
             let (left_ref, right_ref) =
                 join_base_refs_for_aliases(&join_aliases, base_refs).map_err(RefreshError::user)?;
-            let left_refresh =
-                observe_current_refresh_base_with_source(source, left_ref, connector_context)
-                    .map_err(RefreshError::user)?;
-            let right_refresh =
-                observe_current_refresh_base_with_source(source, right_ref, connector_context)
-                    .map_err(RefreshError::user)?;
-            let left_observation =
-                observe_schema_validation_for_table(source, left_ref, connector_context)
-                    .map_err(RefreshError::user)?;
-            let right_observation =
-                observe_schema_validation_for_table(source, right_ref, connector_context)
-                    .map_err(RefreshError::user)?;
+            let left_refresh = observe_current_refresh_base(
+                source.connector_control(),
+                source.storage_observation(),
+                left_ref,
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
+            let right_refresh = observe_current_refresh_base(
+                source.connector_control(),
+                source.storage_observation(),
+                right_ref,
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
+            let left_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                left_ref,
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
+            let right_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                right_ref,
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
             let target_ref = TableIdentity {
                 catalog: iceberg_target.catalog.clone(),
                 namespace: iceberg_target.namespace.clone(),
                 table: iceberg_target.table.clone(),
             };
-            let target_observation =
-                observe_schema_validation_for_table(source, &target_ref, connector_context)
-                    .map_err(RefreshError::user)?;
+            let target_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                &target_ref,
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
             let left_fqn = left_ref.fqn();
             let right_fqn = right_ref.fqn();
             match validate_join_schema_contract(
@@ -6501,12 +6573,6 @@ fn build_iceberg_refresh_plan(
 
 #[cfg(test)]
 thread_local! {
-    static DEFINITION_LOAD_COUNTER: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-thread_local! {
     static CATALOG_REGISTRATION_FAILURE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -6538,39 +6604,6 @@ impl Drop for CatalogRegistrationFailureGuard {
 #[cfg(test)]
 fn take_catalog_registration_failure_for_test() -> Option<String> {
     CATALOG_REGISTRATION_FAILURE.with(|slot| slot.borrow_mut().take())
-}
-
-#[cfg(test)]
-struct DefinitionLoadCounterGuard;
-
-#[cfg(test)]
-impl DefinitionLoadCounterGuard {
-    fn install(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        DEFINITION_LOAD_COUNTER.with(|slot| {
-            assert!(
-                slot.borrow().is_none(),
-                "definition load counter already installed"
-            );
-            *slot.borrow_mut() = Some(counter);
-        });
-        Self
-    }
-}
-
-#[cfg(test)]
-impl Drop for DefinitionLoadCounterGuard {
-    fn drop(&mut self) {
-        DEFINITION_LOAD_COUNTER.with(|slot| *slot.borrow_mut() = None);
-    }
-}
-
-#[cfg(test)]
-fn record_definition_load() {
-    DEFINITION_LOAD_COUNTER.with(|slot| {
-        if let Some(counter) = slot.borrow().as_ref() {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    });
 }
 
 #[cfg(test)]
@@ -6719,32 +6752,6 @@ fn validate_refresh_pin_table_uuids_against_baseline(
     Ok(())
 }
 
-fn load_iceberg_mv_definition_by_target(
-    source: &dyn IcebergMvRefreshSource,
-    target: &IcebergMvTarget,
-) -> Result<StoredMvDefinition, String> {
-    #[cfg(test)]
-    record_definition_load();
-    source
-        .repository()
-        .find_by_target(&crate::mv::model::MvTarget {
-            catalog: Some(target.catalog.clone()),
-            database: target.namespace.clone(),
-            name: target.table.clone(),
-        })
-        .map_err(|e| format!("load iceberg mv definition failed: {e}"))?
-        .ok_or_else(|| {
-            format!(
-                "iceberg materialized view {}.{}.{} has no MV definition",
-                target.catalog, target.namespace, target.table
-            )
-        })
-}
-
-fn mv_definition_fingerprint(select_sql: &str) -> String {
-    hex::encode(Sha256::digest(select_sql.as_bytes()))
-}
-
 fn build_aggregate_layout_for_refresh_select_sql(
     source: &dyn IcebergMvRefreshSource,
     current_catalog: Option<&str>,
@@ -6772,17 +6779,6 @@ fn build_aggregate_layout_for_refresh_select_sql(
         .aggregate_layout_facts(&visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
     crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(&facts)
 }
-pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
-        .map_err(|e| format!("stored MV SELECT normalize error: {e}"))?;
-    let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-        .map_err(|err| format!("sql parser error: {err}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err("stored MV SQL must be a SELECT query".to_string());
-    };
-    Ok(*query)
-}
-
 fn validate_repartition_schema_contract(
     source: &dyn IcebergMvRefreshSource,
     schema_contract: &mv_schema::MvSchemaContract,
@@ -6797,10 +6793,18 @@ fn validate_repartition_schema_contract(
                 base_refs.len()
             ));
         };
-        let left_observation =
-            observe_schema_validation_for_table(source, left_ref, connector_context)?;
-        let right_observation =
-            observe_schema_validation_for_table(source, right_ref, connector_context)?;
+        let left_observation = observe_schema_validation_for_table(
+            source.connector_control(),
+            source.storage_observation(),
+            left_ref,
+            connector_context,
+        )?;
+        let right_observation = observe_schema_validation_for_table(
+            source.connector_control(),
+            source.storage_observation(),
+            right_ref,
+            connector_context,
+        )?;
         let left_fqn = left_ref.fqn();
         let right_fqn = right_ref.fqn();
         match validate_join_schema_contract(
@@ -6827,8 +6831,12 @@ fn validate_repartition_schema_contract(
 
     if !schema_contract.bases.is_empty() {
         for base_ref in base_refs {
-            let base_observation =
-                observe_schema_validation_for_table(source, base_ref, connector_context)?;
+            let base_observation = observe_schema_validation_for_table(
+                source.connector_control(),
+                source.storage_observation(),
+                base_ref,
+                connector_context,
+            )?;
             if schema_contract.aggregate.is_some() {
                 validate_aggregate_repartition_schema_contract_for_base(
                     schema_contract,
@@ -6854,8 +6862,12 @@ fn validate_repartition_schema_contract(
             base_refs.len()
         ));
     };
-    let base_observation =
-        observe_schema_validation_for_table(source, base_ref, connector_context)?;
+    let base_observation = observe_schema_validation_for_table(
+        source.connector_control(),
+        source.storage_observation(),
+        base_ref,
+        connector_context,
+    )?;
     if schema_contract.aggregate.is_some() {
         validate_aggregate_repartition_schema_contract_for_base(
             schema_contract,
@@ -7516,7 +7528,8 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     explain_refresh_full_guard(stmt.full)?;
 
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
-    let mv_definition = load_iceberg_mv_definition_by_target(source, &target)?;
+    let mv_definition =
+        load_iceberg_mv_definition_by_target(source.repository().as_ref(), &target)?;
     let target_binding = target_binding_for(source, &target, connector_context)?;
     validate_target_snapshot(&target, &mv_definition, &target_binding)?;
 
