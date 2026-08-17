@@ -16,6 +16,14 @@
 //! Domain policy for choosing an incremental MV refresh execution mode.
 
 use crate::mv::application::{MvIncrementalJoinMode, MvIncrementalWriteMode};
+use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
+
+pub(crate) fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
+    if full {
+        return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string());
+    }
+    Ok(())
+}
 
 pub(crate) fn non_join_incremental_write_mode(
     is_aggregate: bool,
@@ -83,6 +91,15 @@ mod tests {
         assert_eq!(
             select_join_incremental_execution_mode(false, true),
             MvIncrementalJoinMode::Coalesce
+        );
+    }
+
+    #[test]
+    fn full_refresh_stays_explicitly_disabled() {
+        assert!(explain_refresh_full_guard(false).is_ok());
+        assert_eq!(
+            explain_refresh_full_guard(true).expect_err("full refresh remains disabled"),
+            FULL_REFRESH_DISABLED_MESSAGE
         );
     }
 }

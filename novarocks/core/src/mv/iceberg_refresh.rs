@@ -68,7 +68,8 @@ use crate::mv::refresh::contract::ImvRefreshContract;
 #[cfg(test)]
 use crate::mv::refresh::execution_policy::should_use_join_delta_append_only_fast_path;
 use crate::mv::refresh::execution_policy::{
-    non_join_incremental_write_mode, select_join_incremental_execution_mode,
+    explain_refresh_full_guard, non_join_incremental_write_mode,
+    select_join_incremental_execution_mode,
 };
 use crate::mv::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, full_rebuild_reason_message,
@@ -1416,13 +1417,6 @@ fn prepare_frontend_incremental_write(
         publication_intent,
     )
     .map(PreparedIncrementalRefreshWork::ChangeStream)
-}
-
-fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
-    if full {
-        return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string());
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
