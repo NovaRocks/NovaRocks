@@ -103,6 +103,7 @@ use crate::mv::schema_validation::{validate_join_schema_contract, validate_schem
 use crate::mv::storage_observation::MvSchemaValidationObservation;
 use crate::mv::storage_observation::{MvStorageObservationPort, MvTargetCreationObservation};
 use crate::query_execution::StatementResult;
+use crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact,
     MvIncrementalWritePreparer, MvIncrementalWriteRequest, MvRefreshPublicationBase,
@@ -748,7 +749,7 @@ fn prepare_frontend_first_refresh_write(
             &connector_context,
         )?;
         let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-            source,
+            source.connector_control(),
             &connector_context,
             &rewrite.base_refs,
             &rewrite.pin,
@@ -1226,7 +1227,7 @@ fn prepare_frontend_incremental_write(
             attempt.staging_branch.clone(),
         )?;
         let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-            source,
+            source.connector_control(),
             &connector_context,
             &rewrite.base_refs,
             &rewrite.pin,
@@ -1402,7 +1403,7 @@ fn prepare_frontend_incremental_write(
         attempt.staging_branch.clone(),
     )?;
     let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-        source,
+        source.connector_control(),
         &connector_context,
         &rewrite.base_refs,
         &rewrite.pin,
@@ -7298,116 +7299,6 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
     Ok(token)
 }
 
-/// Materialize every pinned IMV base immediately after capture.  The returned
-/// overlays retain the exact connector lease, table handle, selected files and
-/// delta facts; callers must carry them through later compilation instead of
-/// asking a provider for its current generation again.
-pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
-    source: &dyn IcebergMvRefreshSource,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    base_refs: &[TableIdentity],
-    pin: &RefreshSnapshotPin,
-    previous_snapshot_ids: &BTreeMap<String, i64>,
-) -> Result<
-    Vec<crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay>,
-    String,
-> {
-    let mut seen = BTreeSet::new();
-    let mut overlays = Vec::with_capacity(base_refs.len());
-    for base in base_refs {
-        let snapshot_id = pin.get(base).ok_or_else(|| {
-            format!(
-                "IMV query binding is missing snapshot pin for {}",
-                base.fqn()
-            )
-        })?;
-        let identity = format!(
-            "{}.{}.{}@{}",
-            base.catalog.to_ascii_lowercase(),
-            base.namespace.to_ascii_lowercase(),
-            base.table.to_ascii_lowercase(),
-            snapshot_id
-        );
-        if !seen.insert(identity) {
-            continue;
-        }
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&base.catalog)
-            .map_err(|error| error.to_string())?;
-        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-            source.connector_control(),
-            &instance_id,
-        )
-        .map_err(|error| error.to_string())?;
-        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-            &planning_lease,
-            connector_context.clone(),
-            &base.namespace,
-            &base.table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )?;
-        let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
-            metadata,
-            planning_lease,
-        )?;
-        materialization.read_selector =
-            novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id);
-        let mut frozen_snapshot_ids = std::collections::BTreeSet::from([snapshot_id]);
-        let mut admitted_change_scans = BTreeMap::new();
-        if let Some(previous_snapshot_id) = previous_snapshot_ids.get(&base.fqn()) {
-            frozen_snapshot_ids.insert(*previous_snapshot_id);
-            let window = novarocks_spi::connector::ConnectorChangeWindow::new(
-                *previous_snapshot_id,
-                snapshot_id,
-            );
-            let admitted_scan =
-                crate::query_execution::planning::catalog_materializer::admit_connector_change_window(
-                    &materialization.read_table,
-                    &materialization.read_schema,
-                    &materialization.planning_lease,
-                    connector_context.clone(),
-                    window,
-                )?;
-            admitted_change_scans.insert((*previous_snapshot_id, snapshot_id), admitted_scan);
-        }
-
-        let catalog = base.catalog.clone();
-        let namespace = base.namespace.clone();
-        let table = base.table.clone();
-        let key = QueryTableBindingKey::snapshot(&catalog, &namespace, &table, snapshot_id);
-        overlays.push(
-            crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay::new(
-                namespace.clone(),
-                table.clone(),
-                key,
-                move |binding| {
-                    let mut result = crate::query_execution::planning::catalog_materializer::connector_query_binding_from_materialization(
-                        materialization.clone(),
-                        &catalog,
-                        &namespace,
-                        &table,
-                        binding,
-                    )?;
-                    result.admitted_change_scans = admitted_change_scans.clone();
-                    for frozen_snapshot_id in frozen_snapshot_ids.iter().copied() {
-                        result.frozen_snapshot_materializations.insert(
-                            frozen_snapshot_id,
-                            QueryScanMaterialization {
-                                table: materialization.read_table.clone(),
-                                schema: materialization.read_schema.clone(),
-                                selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(frozen_snapshot_id),
-                                statistics_pin: materialization.statistics_pin.clone(),
-                                planning_lease: materialization.planning_lease.clone(),
-                            },
-                        );
-                    }
-                    Ok(result)
-                },
-            ),
-        );
-    }
-    Ok(overlays)
-}
-
 #[cfg(test)]
 mod partition_planning_tests {
     use super::*;
@@ -7787,7 +7678,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(source);
     let overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-        source,
+        source.connector_control(),
         connector_context,
         &rewrite.base_refs,
         &rewrite.pin,
@@ -8075,7 +7966,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             let catalog_service_snapshot =
                 crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
             let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-                ports,
+                ports.connector_control(),
                 &connector_context,
                 &refresh_rewrite.base_refs,
                 &refresh_rewrite.pin,
@@ -8179,7 +8070,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 }
             };
             let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-                ports,
+                ports.connector_control(),
                 &connector_context,
                 &refresh_rewrite.base_refs,
                 &refresh_rewrite.pin,
