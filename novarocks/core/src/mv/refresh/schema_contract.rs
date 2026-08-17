@@ -5,14 +5,43 @@
 
 //! Refresh-time schema-contract validation over explicit observation leaves.
 
+use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::refresh::observation::observe_schema_validation_for_table;
+use crate::mv::refresh::target::IcebergMvTarget;
 use crate::mv::schema_validation::{
     ContractDecision, JoinContractDecision, validate_join_schema_contract, validate_schema_contract,
 };
 use crate::mv::storage_observation::{MvSchemaValidationObservation, MvStorageObservationPort};
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+
+/// Validates the persisted aggregate metadata before any refresh planning or
+/// query assembly derives an aggregate refresh path.
+pub(crate) fn validate_aggregate_schema_contract_metadata<'a>(
+    target: &IcebergMvTarget,
+    mv_definition: &'a StoredMvDefinition,
+) -> Result<&'a MvSchemaContract, String> {
+    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    if schema_contract.contract_version != 3 {
+        return Err(format!(
+            "iceberg aggregate MV {}.{}.{} requires schema contract version 3, got {}",
+            target.catalog, target.namespace, target.table, schema_contract.contract_version
+        ));
+    }
+    if schema_contract.aggregate.is_none() {
+        return Err(format!(
+            "iceberg aggregate MV {}.{}.{} is missing aggregate schema contract; recreate the MV",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    Ok(schema_contract)
+}
 
 pub(crate) fn validate_aggregate_schema_contract_for_base(
     schema_contract: &MvSchemaContract,

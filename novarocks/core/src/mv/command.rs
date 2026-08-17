@@ -91,16 +91,15 @@ impl MvCommandExecutor {
                     "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW is not supported".to_string()
                 );
             }
-            let lines =
-                crate::mv::iceberg_refresh::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
-                    &self.ports,
-                    &self.statistics,
-                    current_catalog,
-                    current_database,
-                    &statement,
-                    level,
-                    connector_context,
-                )?;
+            let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
+                &self.ports,
+                &self.statistics,
+                current_catalog,
+                current_database,
+                &statement,
+                level,
+                connector_context,
+            )?;
             return crate::runtime::query_result::build_string_query_result(
                 "Explain String",
                 lines,

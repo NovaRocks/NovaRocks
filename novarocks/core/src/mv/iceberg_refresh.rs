@@ -42,10 +42,13 @@ use crate::mv::analysis_adapter::{
 };
 use crate::mv::application::{
     CreatedMvTarget, MvCreateStatement, MvEngine, MvEngineError, MvEngineErrorKind,
+    PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
+};
+#[cfg(test)]
+use crate::mv::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-    MvRefreshPreparationRequest, MvRefreshPreparationService, PrepareMvCreateRequest,
-    PreparedMvCreate, PreparedMvDefinition, PreparedMvRefresh, PreparedMvRefreshWork,
-    PreparedMvRefreshWrite,
+    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
+    PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use crate::mv::dependency::model::{MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::mv::lifecycle::{BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan};
@@ -64,15 +67,15 @@ use crate::mv::persistence::schema::{
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
-use crate::mv::refresh::definition::{
-    load_iceberg_mv_definition_by_target, mv_definition_fingerprint, parse_mv_select_query,
-};
 #[cfg(test)]
-use crate::mv::refresh::execution_policy::should_use_join_delta_append_only_fast_path;
+use crate::mv::refresh::definition::mv_definition_fingerprint;
+use crate::mv::refresh::definition::{load_iceberg_mv_definition_by_target, parse_mv_select_query};
+#[cfg(test)]
 use crate::mv::refresh::execution_policy::{
     explain_refresh_full_guard, non_join_incremental_write_mode,
-    select_join_incremental_execution_mode,
+    select_join_incremental_execution_mode, should_use_join_delta_append_only_fast_path,
 };
+#[cfg(test)]
 use crate::mv::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, full_rebuild_reason_message,
     plan_non_join_incremental_changes,
@@ -86,14 +89,16 @@ use crate::mv::refresh::planning::{
     RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline, decide_refresh_plan,
 };
 #[cfg(test)]
-use crate::mv::refresh::repartition::RepartitionShape;
-use crate::mv::refresh::repartition::select_repartition_shape;
+use crate::mv::refresh::repartition::{RepartitionShape, select_repartition_shape};
+use crate::mv::refresh::rewrite_context::observe_and_admit_change_window_for_table;
+#[cfg(test)]
 use crate::mv::refresh::rewrite_context::{
     admitted_change_facts, build_neutral_refresh_rewrite_context,
-    observe_and_admit_change_window_for_table,
 };
+#[cfg(test)]
+use crate::mv::refresh::schema_contract::validate_repartition_schema_contract;
 use crate::mv::refresh::schema_contract::{
-    validate_aggregate_schema_contract_for_base, validate_repartition_schema_contract,
+    validate_aggregate_schema_contract_for_base, validate_aggregate_schema_contract_metadata,
 };
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
@@ -107,6 +112,7 @@ use crate::mv::refresh::target_apply::{
     join_apply_key_table_column,
 };
 use crate::mv::refresh_io::{acquire_mv_refresh_lock, parse_iceberg_table_refs};
+#[cfg(test)]
 use crate::mv::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
 use crate::mv::repository::CreateMvRepositoryRequest;
 use crate::mv::repository::MvRepository;
@@ -117,38 +123,47 @@ use crate::mv::schema_validation::{validate_join_schema_contract, validate_schem
 use crate::mv::storage_observation::MvSchemaValidationObservation;
 use crate::mv::storage_observation::{MvStorageObservationPort, MvTargetCreationObservation};
 use crate::query_execution::StatementResult;
+#[cfg(test)]
 use crate::query_execution::mv_assembly::query_local_bindings::{
     bind_imv_target_query_table_in_store_from_rewrite,
     freeze_imv_base_query_local_overlays_from_captured_inputs,
 };
+#[cfg(test)]
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact,
     MvIncrementalWritePreparer, MvIncrementalWriteRequest, MvRefreshPublicationBase,
     MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite,
     PreparedMvIncrementalWrite,
 };
+#[cfg(test)]
 use crate::query_execution::planning::bindings::{
     MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
     QueryTableBindingStore,
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+#[cfg(test)]
 use novarocks_spi::connector::{
-    ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExecutionBindingKey,
-    ConnectorInstanceId, ConnectorTableIdentity,
+    ConnectorChangeWindowAdmission, ConnectorExecutionBindingKey, ConnectorTableIdentity,
 };
+use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
+use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
+#[cfg(test)]
+use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use novarocks_sql::planning::mv::UnionBranchKind;
-use novarocks_sql::planning::mv::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts};
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
-    MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
     MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
     MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateCalls,
     SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, SqlMvExpressionLineageKind,
     SqlMvJoinAliases, SqlMvJoinContractKindFacts, SqlMvLineageScope, SqlMvObservedFieldFacts,
     SqlMvObservedSchemaFacts, SqlMvOutputColumnFacts, SqlMvPersistedApplyKeySourceFacts,
-    extract_aggregate_sql_calls, extract_join_aliases, extract_single_scan_table_fqn,
-    mv_apply_key_source_from_column_name,
+    extract_join_aliases, extract_single_scan_table_fqn, mv_apply_key_source_from_column_name,
+};
+#[cfg(test)]
+use novarocks_sql::planning::mv::{
+    MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+    extract_aggregate_sql_calls,
 };
 use novarocks_sql::syntax::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
@@ -3455,32 +3470,6 @@ mod tests {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn validate_aggregate_schema_contract_metadata<'a>(
-    target: &IcebergMvTarget,
-    mv_definition: &'a StoredMvDefinition,
-) -> Result<&'a mv_schema::MvSchemaContract, String> {
-    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-    if schema_contract.contract_version != 3 {
-        return Err(format!(
-            "iceberg aggregate MV {}.{}.{} requires schema contract version 3, got {}",
-            target.catalog, target.namespace, target.table, schema_contract.contract_version
-        ));
-    }
-    if schema_contract.aggregate.is_none() {
-        return Err(format!(
-            "iceberg aggregate MV {}.{}.{} is missing aggregate schema contract; recreate the MV",
-            target.catalog, target.namespace, target.table
-        ));
-    }
-    Ok(schema_contract)
-}
-
 /// A-family `Aggregate(UNION ALL(b1..bn))` refresh execution (fan-in over
 /// multiple bases).
 ///
@@ -5270,59 +5259,6 @@ pub(crate) fn join_base_refs_for_schema_contract<'a>(
     Ok((left, right))
 }
 
-fn validate_refresh_pin_table_uuids(
-    mv_definition: &StoredMvDefinition,
-    pin: &RefreshSnapshotPin,
-    base_refs: &[TableIdentity],
-) -> Result<(), String> {
-    validate_refresh_pin_table_uuids_for_operation(
-        mv_definition,
-        pin,
-        base_refs,
-        "incremental refresh is unsafe, rebuild or recreate the MV",
-    )
-}
-
-fn validate_repartition_refresh_pin_table_uuids(
-    mv_definition: &StoredMvDefinition,
-    pin: &RefreshSnapshotPin,
-    base_refs: &[TableIdentity],
-) -> Result<(), String> {
-    validate_refresh_pin_table_uuids_for_operation(
-        mv_definition,
-        pin,
-        base_refs,
-        "repartition is unsafe, recreate the MV",
-    )
-}
-
-fn validate_refresh_pin_table_uuids_for_operation(
-    mv_definition: &StoredMvDefinition,
-    pin: &RefreshSnapshotPin,
-    base_refs: &[TableIdentity],
-    unsafe_message: &str,
-) -> Result<(), String> {
-    for base_ref in base_refs {
-        let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
-        else {
-            continue;
-        };
-        let current_uuid = pin.uuid(base_ref).ok_or_else(|| {
-            format!(
-                "refresh pin missing uuid for base {} (this should not happen)",
-                base_ref.fqn()
-            )
-        })?;
-        if previous_uuid != current_uuid {
-            return Err(format!(
-                "iceberg MV base table identity changed for {}; {unsafe_message}",
-                base_ref.fqn(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn apply_join_schema_contract_decision(
     decision: JoinContractDecision,
     mv_definition: &StoredMvDefinition,
@@ -5749,143 +5685,6 @@ mod join_delta_append_only_fast_path_tests {
             panic!("expected query");
         };
         *query
-    }
-}
-
-/// Compile an `EXPLAIN REFRESH MATERIALIZED VIEW` plan using only the
-/// frontend-composed MV and statistics capabilities.  The query-local table
-/// overlays retain the same snapshot pins and connector leases used by the
-/// refresh path; this diagnostic must not consult an application facade or a
-/// second latest-generation source.
-pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
-    source: &IcebergMvCorePorts,
-    _statistics_resolver: &impl crate::query_execution::planning::statistics::QueryStatisticsResolver,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &RefreshMaterializedViewStmt,
-    level: novarocks_sql::compiler::ExplainLevel,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<String>, String> {
-    explain_refresh_full_guard(stmt.full)?;
-
-    let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
-    let mv_definition =
-        load_iceberg_mv_definition_by_target(source.repository().as_ref(), &target)?;
-    let target_binding = load_iceberg_mv_target_binding(
-        source.connector_control(),
-        source.storage_observation(),
-        &target,
-        connector_context,
-    )?;
-    validate_target_snapshot(&target, &mv_definition, &target_binding)?;
-
-    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
-    let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&mv_definition.select_sql)?,
-        current_catalog,
-        current_database,
-    );
-    // Capability-driven (not classifier-driven): the aggregate metadata
-    // validation runs when the persisted contract carries an aggregate state.
-    // Deriving this from the schema contract instead of re-classifying the
-    // SELECT keeps EXPLAIN REFRESH working for composed branch-union shapes
-    // whose branches contain joins (the legacy classifier rejects those).
-    let dispatch_schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-    if RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?.has_agg_state {
-        validate_aggregate_schema_contract_metadata(&target, &mv_definition)?;
-    }
-
-    let pin = capture_refresh_snapshot_pin_with_ports(
-        source.connector_control(),
-        source.storage_observation(),
-        &base_refs,
-        connector_context,
-    )?;
-    validate_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
-    let rewrite = build_neutral_refresh_rewrite_context(
-        source.connector_control(),
-        source.storage_observation(),
-        &target,
-        mv_definition.mv_id,
-        current_catalog,
-        current_database,
-        Arc::new(mv_definition.clone()),
-        Arc::new(canonical_select_query),
-        Arc::from(base_refs.clone()),
-        Arc::new(pin.clone()),
-        mv_definition.last_refresh_snapshots.clone(),
-        mv_definition.last_refresh_table_uuids.clone(),
-        target_binding.current_snapshot_id(),
-        target_binding.table_uuid().to_string(),
-        None,
-        connector_context,
-    )?;
-    let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = bind_imv_target_query_table_in_store_from_rewrite(
-        &rewrite,
-        &bindings,
-        target_binding.lease(),
-        connector_context,
-    )?;
-    let catalog_service_snapshot =
-        crate::catalog_application::query_catalog::catalog_service_snapshot(source);
-    let overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
-        source.connector_control(),
-        connector_context,
-        &rewrite.base_refs,
-        &rewrite.pin,
-        &rewrite.previous_snapshot_ids,
-    )?;
-    let materializer = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-        None,
-        &catalog_service_snapshot,
-        Arc::clone(&bindings),
-        crate::query_execution::planning::statistics::iceberg_table_binding_loader(
-            source.connector_control(),
-            connector_context.clone(),
-        ),
-        overlays,
-    );
-    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-    novarocks_sql::compiler::compile_imv_refresh_explain_lines(
-        novarocks_sql::compiler::SqlImvRefreshExplainContext {
-            canonical_query: Box::new((*rewrite.canonical_select_query).clone()),
-            imv_rewrite: novarocks_sql::compiler::SqlImvPlanningInput::new(
-                rewrite.to_sql_rewrite_snapshot(target_binding)?,
-                novarocks_sql::compiler::SqlImvRewriteValidation::None,
-            ),
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
-            optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
-            environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
-            catalog: &catalog,
-            functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
-            control: novarocks_sql::compiler::SqlCompileControl::new(
-                Some(connector_context.deadline()),
-                Arc::new(MvRefreshConnectorCancellationObservation {
-                    cancellation: connector_context.cancellation().clone(),
-                }),
-            ),
-            level,
-        },
-    )
-    .map_err(|error| error.to_string())
-}
-
-struct MvRefreshConnectorCancellationObservation {
-    cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
-}
-
-impl novarocks_sql::compiler::SqlCancellationObservation
-    for MvRefreshConnectorCancellationObservation
-{
-    fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
     }
 }
 

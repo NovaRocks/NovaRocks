@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use crate::mv::persistence::definition::StoredMvDefinition;
 use novarocks_catalog::identifier::TableIdentity;
 
 /// Per-refresh snapshot pin: each base table is pinned to the
@@ -87,6 +88,48 @@ impl RefreshSnapshotPin {
     pub(crate) fn to_table_uuid_map(&self) -> BTreeMap<String, String> {
         self.table_uuids.clone()
     }
+}
+
+/// Rejects a refresh when a persisted base-table identity no longer matches
+/// the identity frozen in this attempt's pin.
+pub(crate) fn validate_refresh_pin_table_uuids(
+    mv_definition: &StoredMvDefinition,
+    pin: &RefreshSnapshotPin,
+    base_refs: &[TableIdentity],
+) -> Result<(), String> {
+    validate_refresh_pin_table_uuids_for_operation(
+        mv_definition,
+        pin,
+        base_refs,
+        "incremental refresh is unsafe, rebuild or recreate the MV",
+    )
+}
+
+fn validate_refresh_pin_table_uuids_for_operation(
+    mv_definition: &StoredMvDefinition,
+    pin: &RefreshSnapshotPin,
+    base_refs: &[TableIdentity],
+    unsafe_message: &str,
+) -> Result<(), String> {
+    for base_ref in base_refs {
+        let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
+        else {
+            continue;
+        };
+        let current_uuid = pin.uuid(base_ref).ok_or_else(|| {
+            format!(
+                "refresh pin missing uuid for base {} (this should not happen)",
+                base_ref.fqn()
+            )
+        })?;
+        if previous_uuid != current_uuid {
+            return Err(format!(
+                "iceberg MV base table identity changed for {}; {unsafe_message}",
+                base_ref.fqn(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
