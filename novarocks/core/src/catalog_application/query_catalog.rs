@@ -180,3 +180,14 @@ pub(crate) fn build_connector_catalog(
 ) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
     Arc::new(ConnectorCatalog::new(name, controls))
 }
+
+/// Narrow source for request-local catalog snapshots.
+///
+/// Compilation and command handlers receive a frozen catalog view rather than
+/// the aggregate application state that historically owned it. The trait lives
+/// beside `QueryCatalogService` — the only type it exposes — so that catalog
+/// consumers do not have to reach into query assembly to name it. Implementors
+/// are the composition-side capability values.
+pub trait CatalogServiceSource {
+    fn catalog_service(&self) -> &Arc<QueryCatalogService>;
+}

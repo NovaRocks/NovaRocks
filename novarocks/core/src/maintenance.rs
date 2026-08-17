@@ -287,6 +287,10 @@ pub enum MaintenanceStatementResult {
     Query(QueryResult),
 }
 
+/// CLS-R2 boundary: the table-maintenance application moves to the frontend,
+/// but this identity value stays with the aggregate package because
+/// `mv::background` and `mv::background_engine` name it. Both leave with
+/// CLS-R3, at which point this follows the maintenance owner.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct MaintenanceTarget {
     pub catalog: String,
@@ -384,6 +388,9 @@ pub enum OptimizeSubmission {
     AlreadyActive,
 }
 
+/// CLS-R2 boundary: the implementation moves to the frontend with the rest of
+/// the maintenance application; this port definition stays with the aggregate
+/// package because `mv::background` drives it. That caller leaves with CLS-R3.
 // Design: ADR-0009 (docs/adr/ADR-0009-frontend-table-maintenance-owner.md)
 pub trait TableMaintenanceEngine: Send + Sync {
     fn resolve_target(

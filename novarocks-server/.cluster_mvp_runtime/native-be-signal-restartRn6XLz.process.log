@@ -1,0 +1,1 @@
+NOVAROCKS_READY role=be grpc_port=60190 advertise_host=127.0.0.1 pid=62876

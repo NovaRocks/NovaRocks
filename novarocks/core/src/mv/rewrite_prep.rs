@@ -29,18 +29,8 @@ use novarocks_sql::compiler::{
     MvRewriteDefinitionIndex, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
 };
 
-/// Freeze rewrite candidates through the explicit MV kernel.  The frozen
-/// index remains request-local; the kernel only supplies its leaf ports.
-pub(crate) fn freeze_mv_rewrite_definition_index_with_kernel(
-    kernel: &crate::query_execution::kernels::MvExecutionKernel,
-) -> Result<MvRewriteDefinitionIndex, String> {
-    freeze_mv_rewrite_definition_index_with_ports(
-        kernel.repository().as_ref(),
-        kernel.connector_control().as_ref(),
-        kernel.storage_observation().as_ref(),
-    )
-}
-
+/// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
+/// remains request-local.
 pub fn freeze_mv_rewrite_definition_index_with_ports(
     repository: &dyn MvRepository,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,

@@ -590,7 +590,10 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
-        invalidate_iceberg_caches(&self.executor.state, &self.executor.target)
+        crate::catalog_application::resolver::invalidate_iceberg_caches(
+            &self.executor.state,
+            &self.executor.target,
+        )
     }
 }
 
@@ -1169,15 +1172,6 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
         ),
         SqlType::Variant => "VARIANT".to_string(),
     })
-}
-
-pub(crate) fn invalidate_iceberg_caches(
-    state: &impl crate::query_execution::compiler::CatalogServiceSource,
-    target: &TargetBackend,
-) -> Result<(), String> {
-    state
-        .catalog_service()
-        .invalidate_table(&target.catalog, &target.namespace, &target.table)
 }
 
 fn target_string(t: &TargetBackend) -> String {

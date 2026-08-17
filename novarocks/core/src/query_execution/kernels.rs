@@ -84,19 +84,21 @@ impl SystemTableQueryKernel {
         }
     }
 
-    pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+    // System-table materialization takes these ports one by one, so the caller
+    // that owns the kernel reads them and hands Core exactly what it needs.
+    pub fn catalog_service(&self) -> &Arc<QueryCatalogService> {
         &self.catalog_service
     }
 
-    pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
+    pub fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
         &self.connector_control
     }
 
-    pub(crate) fn system_catalog(&self) -> &Arc<dyn SystemCatalog> {
+    pub fn system_catalog(&self) -> &Arc<dyn SystemCatalog> {
         &self.system_catalog
     }
 
-    pub(crate) fn mv_repository(&self) -> &Arc<dyn MvRepository> {
+    pub fn mv_repository(&self) -> &Arc<dyn MvRepository> {
         &self.mv_repository
     }
 }
@@ -501,6 +503,26 @@ impl MaintenanceExecutionKernel {
         &self.service
     }
 }
+
+// Ownership: `CatalogAdmission` is Core's contract for target resolution, but
+// each `impl` belongs to the value that holds the port. These blocks therefore
+// live beside the kernels and move to Frontend together with them.
+macro_rules! impl_kernel_catalog_admission {
+    ($kernel:ty) => {
+        impl crate::catalog_application::resolver::CatalogAdmission for $kernel {
+            fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+                self.catalog_application().map(Arc::as_ref)
+            }
+        }
+    };
+}
+
+impl_kernel_catalog_admission!(QueryPreparationKernel);
+impl_kernel_catalog_admission!(CatalogCommandKernel);
+impl_kernel_catalog_admission!(DmlExecutionKernel);
+impl_kernel_catalog_admission!(MvExecutionKernel);
+impl_kernel_catalog_admission!(ViewExecutionKernel);
+impl_kernel_catalog_admission!(MaintenanceExecutionKernel);
 
 /// FE-owned backend membership is intentionally a separate command capability.
 #[derive(Clone)]

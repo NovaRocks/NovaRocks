@@ -19,22 +19,56 @@
 
 use std::sync::Arc;
 
+use crate::connector::MvBackend;
+use crate::connector::unified_statistics::UnifiedStatisticsResolver;
+use crate::mv::application::MvApplicationService;
+use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::StatementResult;
-use crate::query_execution::kernels::MvExecutionKernel;
+use crate::query_execution::planning::statistics::QueryStatisticsResolver;
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
     RefreshMaterializedViewStmt, parse_call_procedure_sql, parse_mv_admitted_statement,
 };
 
+/// `EXPLAIN REFRESH MATERIALIZED VIEW` compiles its rewrite plan through the
+/// same frozen statistics evidence the refresh path uses.  This carries
+/// exactly that one leaf port: it holds no catalog, connector, repository, or
+/// query-execution capability.
+#[derive(Clone)]
+struct MvExplainStatisticsPort(Arc<UnifiedStatisticsResolver>);
+
+impl QueryStatisticsResolver for MvExplainStatisticsPort {
+    fn unified_statistics(&self) -> &UnifiedStatisticsResolver {
+        self.0.as_ref()
+    }
+
+    fn unified_statistics_arc(&self) -> &Arc<UnifiedStatisticsResolver> {
+        &self.0
+    }
+}
+
 #[derive(Clone)]
 pub struct MvCommandExecutor {
-    kernel: MvExecutionKernel,
+    ports: IcebergMvCorePorts,
+    application: Arc<dyn MvApplicationService>,
+    mv_backend: Arc<dyn MvBackend>,
+    statistics: MvExplainStatisticsPort,
 }
 
 impl MvCommandExecutor {
-    pub fn new(kernel: MvExecutionKernel) -> Self {
-        Self { kernel }
+    pub fn new(
+        ports: IcebergMvCorePorts,
+        application: Arc<dyn MvApplicationService>,
+        mv_backend: Arc<dyn MvBackend>,
+        unified_statistics: Arc<UnifiedStatisticsResolver>,
+    ) -> Self {
+        Self {
+            ports,
+            application,
+            mv_backend,
+            statistics: MvExplainStatisticsPort(unified_statistics),
+        }
     }
 
     /// Execute exactly one MV statement through explicit ports. Refresh and
@@ -56,11 +90,10 @@ impl MvCommandExecutor {
                     "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW is not supported".to_string()
                 );
             }
-            let ports = self.ports();
             let lines =
                 crate::mv::iceberg_refresh::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
-                    &ports,
-                    &self.kernel,
+                    &self.ports,
+                    &self.statistics,
                     current_catalog,
                     current_database,
                     &statement,
@@ -78,9 +111,9 @@ impl MvCommandExecutor {
             let statement = parse_call_procedure_sql(&normalized)?;
             if statement.procedure == crate::mv::stateless_rebuild::PROCEDURE_NAME {
                 return crate::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
-                    self.kernel.connector_control().as_ref(),
-                    self.kernel.storage_observation().as_ref(),
-                    self.kernel.repository().as_ref(),
+                    self.ports.connector_control(),
+                    self.ports.storage_observation(),
+                    self.ports.repository().as_ref(),
                     &statement,
                     current_database,
                     connector_context.clone(),
@@ -93,16 +126,19 @@ impl MvCommandExecutor {
             Err(_) => return Ok(None),
         };
         match statement {
-            MvAdmittedStatement::Create(statement) => crate::mv::flow::create_mv_with_kernel(
-                &self.kernel,
+            MvAdmittedStatement::Create(statement) => crate::mv::flow::create_mv_with_ports(
+                &self.ports,
+                self.application.as_ref(),
+                self.mv_backend.as_ref(),
                 current_catalog,
                 current_database,
                 &statement,
                 connector_context,
             )
             .map(Some),
-            MvAdmittedStatement::Drop(statement) => crate::mv::flow::drop_mv_with_kernel(
-                &self.kernel,
+            MvAdmittedStatement::Drop(statement) => crate::mv::flow::drop_mv_with_ports(
+                self.ports.repository().as_ref(),
+                self.mv_backend.as_ref(),
                 current_catalog,
                 current_database,
                 &statement,
@@ -115,8 +151,8 @@ impl MvCommandExecutor {
                     AlterMaterializedViewAction::Repartition(_)
                 ) =>
             {
-                crate::mv::flow::alter_mv_with_kernel(
-                    &self.kernel,
+                crate::mv::flow::alter_mv_with_ports(
+                    &self.ports,
                     current_catalog,
                     current_database,
                     &statement,
@@ -142,21 +178,13 @@ impl MvCommandExecutor {
                     execution,
                 )
                 .map(Some),
-            MvAdmittedStatement::Show(statement) => {
-                crate::mv::flow::list_mvs_with_kernel(&self.kernel, current_catalog, &statement)
-                    .map(Some)
-            }
+            MvAdmittedStatement::Show(statement) => crate::mv::flow::list_mvs_with_backend(
+                self.mv_backend.as_ref(),
+                current_catalog,
+                &statement,
+            )
+            .map(Some),
         }
-    }
-
-    fn ports(&self) -> crate::mv::iceberg_refresh::IcebergMvCorePorts {
-        crate::mv::iceberg_refresh::IcebergMvCorePorts::new(
-            Arc::clone(self.kernel.catalog_service()),
-            self.kernel.catalog_application().cloned(),
-            Arc::clone(self.kernel.connector_control()),
-            Arc::clone(self.kernel.repository()),
-            Arc::clone(self.kernel.storage_observation()),
-        )
     }
 
     fn execute_repartition(
@@ -184,18 +212,16 @@ impl MvCommandExecutor {
             name: statement.name.clone(),
             full: false,
         };
-        let ports = self.ports();
         let preparation =
             crate::mv::iceberg_refresh::StandaloneMvRefreshPreparationService::new_repartition_with_ports(
-                &ports,
+                &self.ports,
                 current_catalog,
                 current_database,
                 &refresh_statement,
                 fields,
                 connector_context,
             );
-        self.kernel
-            .application()
+        self.application
             .prepare_and_execute_refresh(
                 &preparation,
                 crate::mv::application::MvApplicationStatement::Refresh(
@@ -230,7 +256,7 @@ impl MvCommandExecutor {
             &target.table,
         );
         let steps = crate::mv::dependency_resolver::build_upstream_refresh_steps_with_repository(
-            self.kernel.repository().as_ref(),
+            self.ports.repository().as_ref(),
             &requested_object,
         )?;
         let mut last_result = None;
@@ -251,18 +277,16 @@ impl MvCommandExecutor {
                 },
                 full: false,
             };
-            let ports = self.ports();
             let preparation =
                 crate::mv::iceberg_refresh::StandaloneMvRefreshPreparationService::new_with_ports(
-                    &ports,
+                    &self.ports,
                     target_catalog.as_deref(),
                     &target_database,
                     &step_statement,
                     connector_context,
                 );
             last_result = Some(
-                self.kernel
-                    .application()
+                self.application
                     .prepare_and_execute_refresh(
                         &preparation,
                         crate::mv::application::MvApplicationStatement::Refresh(

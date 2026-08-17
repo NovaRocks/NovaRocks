@@ -126,21 +126,6 @@ impl MvTargetBinding {
     }
 }
 
-/// Resolve a target through the explicit MV execution kernel.  This is the
-/// kernel-first entry used by frontend-owned MV lifecycle composition.
-pub(crate) fn load_mv_target_binding_with_kernel(
-    kernel: &crate::query_execution::kernels::MvExecutionKernel,
-    table: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<MvTargetBinding, String> {
-    load_mv_target_binding_with_ports(
-        kernel.connector_control().as_ref(),
-        kernel.storage_observation().as_ref(),
-        table,
-        connector_context,
-    )
-}
-
 /// Resolve an MV target from the exact control and observation ports admitted
 /// for a refresh attempt.
 ///

@@ -30,10 +30,11 @@ use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
 use uuid::Uuid;
 
 pub mod command;
+pub(crate) mod create_table_ddl;
 pub mod iceberg_ref_command;
 pub mod information_schema;
 pub mod query_catalog;
-pub(crate) mod resolver;
+pub mod resolver;
 pub(crate) mod statement;
 pub mod system_catalog;
 pub mod virtual_table;

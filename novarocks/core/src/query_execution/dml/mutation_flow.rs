@@ -1736,10 +1736,7 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
     }
 
     fn finalize(&self) -> Result<(), String> {
-        crate::query_execution::dml::iceberg_writer::invalidate_iceberg_caches(
-            &self.state,
-            &self.target,
-        )
+        crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
 
@@ -1869,10 +1866,7 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
     }
 
     fn finalize(&self) -> Result<(), String> {
-        crate::query_execution::dml::iceberg_writer::invalidate_iceberg_caches(
-            &self.state,
-            &self.target,
-        )
+        crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
 struct CowFrozenRead {

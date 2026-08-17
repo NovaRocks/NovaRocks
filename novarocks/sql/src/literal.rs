@@ -1130,6 +1130,78 @@ pub(crate) fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, Str
     }
 }
 
+// Ownership: this is the exact inverse of `sql_type_to_arrow_type` above and is
+// a pure type-system mapping — it carries no catalog, connector, or Iceberg
+// facts. It belongs beside its inverse in the SQL crate rather than inside a
+// query-assembly module, so both the frontend assembly path and core catalog
+// consumers can share one definition without depending on each other.
+/// Recursive Arrow DataType -> SqlType conversion for CTAS schema inference.
+pub(crate) fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, String> {
+    Ok(match dt {
+        DataType::Boolean => SqlType::Boolean,
+        DataType::Int8 => SqlType::TinyInt,
+        DataType::Int16 => SqlType::SmallInt,
+        DataType::Int32 => SqlType::Int,
+        DataType::Int64 => SqlType::BigInt,
+        DataType::Float32 => SqlType::Float,
+        DataType::Float64 => SqlType::Double,
+        DataType::Decimal128(precision, scale) => SqlType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        },
+        DataType::Utf8 | DataType::LargeUtf8 => SqlType::String,
+        DataType::Binary | DataType::LargeBinary => SqlType::Binary,
+        // StarRocks LARGEINT is stored as a fixed 16-byte signed integer.
+        DataType::FixedSizeBinary(w) if *w == novarocks_types::largeint::LARGEINT_BYTE_WIDTH => {
+            SqlType::LargeInt
+        }
+        DataType::Date32 => SqlType::Date,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
+        DataType::Timestamp(_, _) => SqlType::DateTime,
+        DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => SqlType::Time,
+        DataType::List(elem) => {
+            SqlType::Array(Box::new(arrow_data_type_to_sql_type(elem.data_type())?))
+        }
+        DataType::Struct(fields) => SqlType::Struct(
+            fields
+                .iter()
+                .map(|f| {
+                    Ok((
+                        f.name().clone(),
+                        arrow_data_type_to_sql_type(f.data_type())?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        ),
+        DataType::Map(entries, _) => {
+            // Arrow MAP is encoded as List<Struct{key, value}>.
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(
+                    "CTAS: MAP column has unexpected Arrow encoding (expected struct entries)"
+                        .to_string(),
+                );
+            };
+            let (_, key_field) = fields
+                .find("key")
+                .ok_or_else(|| "CTAS: MAP column missing 'key' field".to_string())?;
+            let (_, val_field) = fields
+                .find("value")
+                .ok_or_else(|| "CTAS: MAP column missing 'value' field".to_string())?;
+            SqlType::Map(
+                Box::new(arrow_data_type_to_sql_type(key_field.data_type())?),
+                Box::new(arrow_data_type_to_sql_type(val_field.data_type())?),
+            )
+        }
+        other => {
+            return Err(format!(
+                "CTAS: arrow type {other:?} not supported; \
+                 use CREATE TABLE then INSERT for variant/geometry/geography or \
+                 unsupported numeric types (Float16, Decimal256, Interval, etc.)"
+            ));
+        }
+    })
+}
+
 /// Compare two Arrow [`DataType`]s for structural equality while ignoring
 /// nested [`Field`] metadata and nested-field nullability.
 ///
@@ -1698,6 +1770,18 @@ mod tests {
     fn parse_date_string_to_days_uses_unix_epoch() {
         assert_eq!(parse_date_string_to_days("1970-01-01").unwrap(), 0);
         assert_eq!(parse_date_string_to_days("1970-01-02").unwrap(), 1);
+    }
+
+    #[test]
+    fn nanosecond_arrow_timestamp_maps_to_datetimens() {
+        assert_eq!(
+            arrow_data_type_to_sql_type(&DataType::Timestamp(TimeUnit::Nanosecond, None)).unwrap(),
+            SqlType::DateTimeNs
+        );
+        assert_eq!(
+            arrow_data_type_to_sql_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
+            SqlType::DateTime
+        );
     }
 
     #[test]

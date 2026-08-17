@@ -24,7 +24,6 @@ use sqlparser::ast as sqlast;
 
 use crate::mv::repository::MvRepository;
 use crate::query_execution::StatementResult;
-use crate::query_execution::kernels::{MvExecutionKernel, SystemTableQueryKernel};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 
 #[derive(Clone, Debug)]
@@ -76,26 +75,11 @@ impl InfoColumn {
 }
 
 /// The materialized-views virtual table needs only the durable MV repository.
-/// Keeping this as a leaf port lets query composition use the MV kernel without
-/// recovering the retired standalone application state.
-trait MaterializedViewCatalog {
-    fn mv_repository(&self) -> &Arc<dyn MvRepository>;
-}
-
-impl MaterializedViewCatalog for MvExecutionKernel {
-    fn mv_repository(&self) -> &Arc<dyn MvRepository> {
-        self.repository()
-    }
-}
-
-impl MaterializedViewCatalog for SystemTableQueryKernel {
-    fn mv_repository(&self) -> &Arc<dyn MvRepository> {
-        self.mv_repository()
-    }
-}
-
+///
+/// Taking that leaf port directly keeps this read-only projection independent
+/// of whichever capability value composed the query.
 pub fn try_query_materialized_views(
-    catalog: &crate::query_execution::kernels::SystemTableQueryKernel,
+    mv_repository: &dyn MvRepository,
     query: &sqlast::Query,
 ) -> Result<Option<StatementResult>, String> {
     let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -109,7 +93,7 @@ pub fn try_query_materialized_views(
     }
 
     let projection = projection_columns(select)?;
-    let mut rows = materialized_view_rows(catalog)?;
+    let mut rows = materialized_view_rows(mv_repository)?;
     if let Some(selection) = select.selection.as_ref() {
         let mut filtered = Vec::with_capacity(rows.len());
         for row in rows {
@@ -126,10 +110,9 @@ pub fn try_query_materialized_views(
 }
 
 fn materialized_view_rows(
-    catalog: &impl MaterializedViewCatalog,
+    mv_repository: &dyn MvRepository,
 ) -> Result<Vec<MaterializedViewInfoRow>, String> {
-    let definitions = catalog
-        .mv_repository()
+    let definitions = mv_repository
         .list_definitions()
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
     let mut rows = Vec::new();

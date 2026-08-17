@@ -23,18 +23,22 @@
 //! returns its parser/admission error.
 
 use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_spi::connector::ConnectorInstanceId;
+use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
 use sqlparser::parser::Parser;
 use std::sync::Arc;
 
-use crate::catalog_application::CatalogCreateCommand;
+use crate::catalog_application::create_table_ddl::build_iceberg_create_table_ddl;
+use crate::catalog_application::query_catalog::{CatalogServiceSource, QueryCatalogService};
+use crate::catalog_application::resolver::CatalogAdmission;
 use crate::catalog_application::statement::{
-    execute_create_database_statement, execute_create_table_statement,
-    execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
+    CatalogDropContext, CatalogMutationContext, execute_create_database_statement,
+    execute_create_table_statement, execute_drop_catalog_statement,
+    execute_drop_database_statement, execute_drop_table_statement,
 };
+use crate::catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
+use crate::mv::repository::MvRepository;
+use crate::mv::storage_observation::MvStorageObservationPort;
 use crate::query_execution::StatementResult;
-use crate::query_execution::compiler::build_iceberg_create_table_ddl;
-use crate::query_execution::kernels::CatalogCommandKernel;
 use crate::runtime::query_result::QueryResultColumn;
 use novarocks_sql::syntax::{
     StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
@@ -42,14 +46,72 @@ use novarocks_sql::syntax::{
 };
 
 /// Catalog DDL capability built from catalog-only leaf ports.
+///
+/// The ports are held individually and on purpose: this capability admits a
+/// catalog name, mutates connector-owned catalog facts, invalidates the local
+/// catalog snapshot, and enforces the MV guards that catalog DDL owns. It has
+/// no query execution, statistics, DML writer or MV refresh capability, and it
+/// must not be widened into a shared dependency bundle.
 #[derive(Clone)]
 pub struct CatalogCommandExecutor {
-    kernel: CatalogCommandKernel,
+    catalog_service: Arc<QueryCatalogService>,
+    catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    mv_repository: Arc<dyn MvRepository>,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+}
+
+impl CatalogAdmission for CatalogCommandExecutor {
+    fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+        self.catalog_application.as_deref()
+    }
+}
+
+impl CatalogServiceSource for CatalogCommandExecutor {
+    fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+        &self.catalog_service
+    }
+}
+
+impl CatalogDropContext for CatalogCommandExecutor {
+    fn catalog_service(&self) -> &Arc<QueryCatalogService> {
+        &self.catalog_service
+    }
+
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+        self.connector_control.as_ref()
+    }
+
+    fn mv_repository(&self) -> &dyn MvRepository {
+        self.mv_repository.as_ref()
+    }
+
+    fn mv_storage_observation(&self) -> &dyn MvStorageObservationPort {
+        self.mv_storage_observation.as_ref()
+    }
+}
+
+impl CatalogMutationContext for CatalogCommandExecutor {
+    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+        self.connector_control.as_ref()
+    }
 }
 
 impl CatalogCommandExecutor {
-    pub fn new(kernel: CatalogCommandKernel) -> Self {
-        Self { kernel }
+    pub fn new(
+        catalog_service: Arc<QueryCatalogService>,
+        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        mv_repository: Arc<dyn MvRepository>,
+        mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    ) -> Self {
+        Self {
+            catalog_service,
+            catalog_application,
+            connector_control,
+            mv_repository,
+            mv_storage_observation,
+        }
     }
 
     /// Execute exactly one catalog-DDL statement.
@@ -67,10 +129,10 @@ impl CatalogCommandExecutor {
     ) -> Result<Option<StatementResult>, String> {
         let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
         if let Some((target, source)) =
-            crate::query_execution::compiler::parse_create_table_like(&normalized)?
+            crate::catalog_application::create_table_ddl::parse_create_table_like(&normalized)?
         {
             return execute_create_table_like(
-                &self.kernel,
+                self,
                 target,
                 source,
                 current_catalog,
@@ -81,7 +143,7 @@ impl CatalogCommandExecutor {
         }
         if crate::catalog_application::statement::looks_like_show_create_table(&normalized) {
             return execute_show_create_table(
-                &self.kernel,
+                self,
                 &normalized,
                 current_catalog,
                 current_database,
@@ -91,7 +153,7 @@ impl CatalogCommandExecutor {
         }
         if crate::catalog_application::statement::looks_like_alter_iceberg_properties(&normalized) {
             return execute_alter_iceberg_properties(
-                &self.kernel,
+                self,
                 &normalized,
                 current_catalog,
                 current_database,
@@ -101,7 +163,7 @@ impl CatalogCommandExecutor {
         }
         if crate::catalog_application::statement::looks_like_alter_iceberg_schema(&normalized) {
             return execute_alter_iceberg_schema(
-                &self.kernel,
+                self,
                 &normalized,
                 current_catalog,
                 current_database,
@@ -111,7 +173,7 @@ impl CatalogCommandExecutor {
         }
         if crate::catalog_application::statement::looks_like_alter_partition_column(&normalized) {
             return execute_alter_partition_spec(
-                &self.kernel,
+                self,
                 crate::catalog_application::statement::parse_alter_partition_column_sql(
                     &normalized,
                 )?,
@@ -130,7 +192,7 @@ impl CatalogCommandExecutor {
             let statement = novarocks_sql::syntax::parse_create_table_statement(&mut parser)?;
             require_statement_end(&mut parser)?;
             return execute_create_table_statement(
-                &self.kernel,
+                self,
                 statement,
                 current_catalog,
                 current_database,
@@ -148,7 +210,7 @@ impl CatalogCommandExecutor {
                 novarocks_sql::syntax::parse_create_database_name(&mut parser)?;
             require_statement_end(&mut parser)?;
             return execute_create_database_statement(
-                &self.kernel,
+                self,
                 &name,
                 if_not_exists,
                 current_catalog,
@@ -161,18 +223,16 @@ impl CatalogCommandExecutor {
             require_statement_end(&mut parser)?;
             use novarocks_sql::syntax::DropStatement;
             return match statement {
-                DropStatement::Catalog(statement) => execute_drop_catalog_statement(
-                    &self.kernel,
-                    &statement.name,
-                    statement.if_exists,
-                )
-                .map(Some),
+                DropStatement::Catalog(statement) => {
+                    execute_drop_catalog_statement(self, &statement.name, statement.if_exists)
+                        .map(Some)
+                }
                 DropStatement::Database(statement) => {
                     if current_catalog.is_none() && statement.name.parts.len() == 1 {
                         Err("DROP DATABASE in default_catalog must be routed through the view command capability".to_string())
                     } else {
                         execute_drop_database_statement(
-                            &self.kernel,
+                            self,
                             &statement.name,
                             current_catalog,
                             statement.if_exists,
@@ -183,7 +243,7 @@ impl CatalogCommandExecutor {
                     }
                 }
                 DropStatement::Table(statement) => execute_drop_table_statement(
-                    &self.kernel,
+                    self,
                     &statement.name,
                     current_catalog,
                     current_database,
@@ -202,7 +262,7 @@ impl CatalogCommandExecutor {
         statement: novarocks_sql::syntax::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
         let normalized_catalog = normalize_identifier(&statement.name)?;
-        let application = self.kernel.catalog_application().ok_or_else(|| {
+        let application = self.catalog_application.as_ref().ok_or_else(|| {
             "catalog statements require a configured frontend catalog application".to_string()
         })?;
         let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
@@ -220,7 +280,7 @@ impl CatalogCommandExecutor {
 }
 
 fn execute_alter_iceberg_properties(
-    kernel: &CatalogCommandKernel,
+    executor: &CatalogCommandExecutor,
     sql: &str,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -228,14 +288,14 @@ fn execute_alter_iceberg_properties(
 ) -> Result<StatementResult, String> {
     let statement = crate::catalog_application::statement::parse_alter_iceberg_properties_sql(sql)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
-        kernel,
+        executor,
         &statement.table,
         current_catalog,
         current_database,
     )?;
     crate::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        kernel.connector_control().as_ref(),
-        kernel.mv_storage_observation().as_ref(),
+        executor.connector_control.as_ref(),
+        executor.mv_storage_observation.as_ref(),
         &target,
         crate::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
@@ -267,7 +327,7 @@ fn execute_alter_iceberg_properties(
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
     crate::connector::mutation::execute_catalog_mutation(
-        kernel.connector_control().as_ref(),
+        executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
             table: novarocks_spi::connector::ConnectorTableIdentity {
@@ -281,12 +341,12 @@ fn execute_alter_iceberg_properties(
         },
         connector_context.clone(),
     )?;
-    crate::query_execution::dml::iceberg_writer::invalidate_iceberg_caches(kernel, &target)?;
+    crate::catalog_application::resolver::invalidate_iceberg_caches(executor, &target)?;
     Ok(StatementResult::Ok)
 }
 
 fn execute_alter_iceberg_schema(
-    kernel: &CatalogCommandKernel,
+    executor: &CatalogCommandExecutor,
     sql: &str,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -294,14 +354,14 @@ fn execute_alter_iceberg_schema(
 ) -> Result<StatementResult, String> {
     let statement = crate::catalog_application::statement::parse_alter_iceberg_schema_sql(sql)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
-        kernel,
+        executor,
         &statement.table,
         current_catalog,
         current_database,
     )?;
     crate::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        kernel.connector_control().as_ref(),
-        kernel.mv_storage_observation().as_ref(),
+        executor.connector_control.as_ref(),
+        executor.mv_storage_observation.as_ref(),
         &target,
         crate::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
@@ -309,7 +369,7 @@ fn execute_alter_iceberg_schema(
         &statement.change
     {
         crate::mv::iceberg_guard::reject_drop_column_mv_dependencies_with_repository(
-            kernel.mv_repository().as_ref(),
+            executor.mv_repository.as_ref(),
             &target,
             path,
         )?;
@@ -340,51 +400,55 @@ fn execute_alter_iceberg_schema(
                         .collect(),
                 },
                 column: crate::catalog_application::statement::connector_column(&column)?,
-                position: crate::query_execution::compiler::connector_schema_position(position),
+                position: crate::catalog_application::statement::connector_schema_position(
+                    position,
+                ),
             }
         }
         crate::catalog_application::statement::IcebergSchemaChange::DropColumn { path } => {
             novarocks_spi::connector::ConnectorSchemaChange::DropColumn {
-                path: crate::query_execution::compiler::connector_schema_path(path),
+                path: crate::catalog_application::statement::connector_schema_path(path),
             }
         }
         crate::catalog_application::statement::IcebergSchemaChange::RenameColumn {
             path,
             new_name,
         } => novarocks_spi::connector::ConnectorSchemaChange::RenameColumn {
-            path: crate::query_execution::compiler::connector_schema_path(path),
+            path: crate::catalog_application::statement::connector_schema_path(path),
             to: Arc::from(new_name),
         },
         crate::catalog_application::statement::IcebergSchemaChange::ModifyColumn {
             path,
             new_type,
         } => novarocks_spi::connector::ConnectorSchemaChange::ModifyColumn {
-            path: crate::query_execution::compiler::connector_schema_path(path),
+            path: crate::catalog_application::statement::connector_schema_path(path),
             data_type: crate::catalog_application::statement::connector_data_type(&new_type)?,
         },
         crate::catalog_application::statement::IcebergSchemaChange::SetNullable {
             path,
             nullable,
         } => novarocks_spi::connector::ConnectorSchemaChange::SetColumnNullability {
-            path: crate::query_execution::compiler::connector_schema_path(path),
+            path: crate::catalog_application::statement::connector_schema_path(path),
             nullable,
         },
         crate::catalog_application::statement::IcebergSchemaChange::Reorder { path, position } => {
             novarocks_spi::connector::ConnectorSchemaChange::ReorderColumn {
-                path: crate::query_execution::compiler::connector_schema_path(path),
-                position: crate::query_execution::compiler::connector_schema_position(position),
+                path: crate::catalog_application::statement::connector_schema_path(path),
+                position: crate::catalog_application::statement::connector_schema_position(
+                    position,
+                ),
             }
         }
         crate::catalog_application::statement::IcebergSchemaChange::UpdateComment {
             path,
             comment,
         } => novarocks_spi::connector::ConnectorSchemaChange::SetColumnComment {
-            path: crate::query_execution::compiler::connector_schema_path(path),
+            path: crate::catalog_application::statement::connector_schema_path(path),
             comment: Arc::from(comment),
         },
     };
     crate::connector::mutation::execute_catalog_mutation(
-        kernel.connector_control().as_ref(),
+        executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterSchema {
             table: novarocks_spi::connector::ConnectorTableIdentity {
@@ -396,12 +460,12 @@ fn execute_alter_iceberg_schema(
         },
         connector_context.clone(),
     )?;
-    crate::query_execution::dml::iceberg_writer::invalidate_iceberg_caches(kernel, &target)?;
+    crate::catalog_application::resolver::invalidate_iceberg_caches(executor, &target)?;
     Ok(StatementResult::Ok)
 }
 
 fn execute_alter_partition_spec(
-    kernel: &CatalogCommandKernel,
+    executor: &CatalogCommandExecutor,
     statement: novarocks_sql::syntax::AlterIcebergPartitionSpecStmt,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -416,7 +480,7 @@ fn execute_alter_partition_spec(
         } => table,
     };
     let target = crate::catalog_application::resolver::resolve_table_target(
-        kernel,
+        executor,
         table_name,
         current_catalog,
         current_database,
@@ -428,8 +492,8 @@ fn execute_alter_partition_spec(
         ));
     }
     crate::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        kernel.connector_control().as_ref(),
-        kernel.mv_storage_observation().as_ref(),
+        executor.connector_control.as_ref(),
+        executor.mv_storage_observation.as_ref(),
         &target,
         crate::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
@@ -446,11 +510,11 @@ fn execute_alter_partition_spec(
         } => field,
     };
     let transform =
-        crate::query_execution::compiler::connector_partition_transform(partition_field);
+        crate::catalog_application::statement::connector_partition_transform(partition_field);
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
     crate::connector::mutation::execute_catalog_mutation(
-        kernel.connector_control().as_ref(),
+        executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterPartitionSpec {
             table: novarocks_spi::connector::ConnectorTableIdentity {
@@ -467,12 +531,12 @@ fn execute_alter_partition_spec(
         },
         connector_context.clone(),
     )?;
-    crate::query_execution::dml::iceberg_writer::invalidate_iceberg_caches(kernel, &target)?;
+    crate::catalog_application::resolver::invalidate_iceberg_caches(executor, &target)?;
     Ok(StatementResult::Ok)
 }
 
 fn execute_create_table_like(
-    kernel: &CatalogCommandKernel,
+    executor: &CatalogCommandExecutor,
     target: novarocks_sql::syntax::ObjectName,
     source: novarocks_sql::syntax::ObjectName,
     current_catalog: Option<&str>,
@@ -480,13 +544,13 @@ fn execute_create_table_like(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let source_target = crate::catalog_application::resolver::resolve_existing_table_target(
-        kernel,
+        executor,
         &source,
         current_catalog,
         current_database,
     )?;
     let source_table = crate::connector::metadata_load_table(
-        kernel.connector_control().as_ref(),
+        executor.connector_control.as_ref(),
         connector_context.clone(),
         &source_target.catalog,
         &source_target.namespace,
@@ -500,9 +564,7 @@ fn execute_create_table_like(
         .map(|column| {
             Ok(novarocks_sql::syntax::TableColumnDef {
                 name: column.name.clone(),
-                data_type: crate::query_execution::dml::iceberg_ctas::arrow_data_type_to_sql_type(
-                    &column.data_type,
-                )?,
+                data_type: novarocks_sql::syntax::arrow_data_type_to_sql_type(&column.data_type)?,
                 nullable: column.nullable,
                 aggregation: None,
                 default: None,
@@ -510,7 +572,7 @@ fn execute_create_table_like(
         })
         .collect::<Result<Vec<_>, String>>()?;
     execute_create_table_statement(
-        kernel,
+        executor,
         novarocks_sql::syntax::CreateTableStmt {
             name: target,
             kind: novarocks_sql::syntax::CreateTableKind::Iceberg {
@@ -532,7 +594,7 @@ fn execute_create_table_like(
 }
 
 fn execute_show_create_table(
-    kernel: &CatalogCommandKernel,
+    executor: &CatalogCommandExecutor,
     sql: &str,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -544,7 +606,7 @@ fn execute_show_create_table(
 
     let table_name = crate::catalog_application::statement::parse_show_create_table(sql)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
-        kernel,
+        executor,
         &table_name,
         current_catalog,
         current_database,
@@ -557,8 +619,8 @@ fn execute_show_create_table(
     }
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
-    let lease = kernel
-        .connector_control()
+    let lease = executor
+        .connector_control
         .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
     let identity = novarocks_spi::connector::ConnectorTableIdentity {
@@ -629,7 +691,7 @@ mod tests {
     #[test]
     fn non_catalog_statement_is_not_claimed() {
         // Construction is unnecessary for an unsupported family because the
-        // parser gate must reject it before any kernel port is read.
+        // parser gate must reject it before any port is read.
         let sql = "SELECT 'CREATE TABLE t AS SELECT 1'";
         let normalized =
             novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize query");

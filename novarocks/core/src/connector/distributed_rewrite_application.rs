@@ -8,16 +8,20 @@
 //! This layer owns exact-generation acquisition, strict table loading, and
 //! C1 operation sealing.  Provider-specific source execution is deliberately
 //! injected by the concrete engine implementation after this session exists.
+//!
+//! Sealing a frozen provider plan into a live distributed operation is query
+//! assembly work, not a connector fact.  Its owner is therefore injected
+//! through [`DistributedRewriteSealing`] rather than named from here.
 
 use novarocks_spi::connector::{
-    ConnectorDistributedRewriteOperation, ConnectorDistributedRewritePlanningRequest,
+    ConnectorDistributedRewriteLease, ConnectorDistributedRewriteOperation,
+    ConnectorDistributedRewritePlan, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteResolver, ConnectorInstanceId, ConnectorRequestContext,
     ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     ConnectorWriteOperationId,
 };
 use sha2::{Digest, Sha256};
 
-use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
 use crate::query_execution::request_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,14 +35,49 @@ pub enum DistributedRewriteIntent {
     },
 }
 
-pub struct DistributedRewriteMaintenanceSession {
-    session: ConnectorDistributedRewriteSession,
+/// The frozen-plan facts this application layer reads back from a sealed
+/// distributed rewrite operation.
+///
+/// The operation stays opaque here: this module never inspects its cohort
+/// executions, provider checkpoints, or C1 commit decision.  It only needs the
+/// sealed SPI plan it handed over and whether that plan sealed to a no-op.
+pub trait SealedDistributedRewrite {
+    fn plan(&self) -> &ConnectorDistributedRewritePlan;
+
+    fn is_noop(&self) -> bool;
+}
+
+/// Seal one provider-frozen distributed rewrite into an owned operation.
+///
+/// Acquiring the exact composite lease, strictly loading the target table, and
+/// freezing the provider plan are connector facts and stay in this module.
+/// Turning that frozen plan into a live distributed operation is query
+/// assembly, so its owner implements this port and is passed in explicitly.
+///
+/// The port names only sealed SPI values plus an operation type the assembly
+/// owner defines, so it survives relocation of either side: moving query
+/// assembly out of this package, and later moving the connector adapters
+/// themselves, leave both the trait and its single call site unchanged.
+pub trait DistributedRewriteSealing {
+    /// The sealed operation the query assembly owner produces.
+    type Sealed: SealedDistributedRewrite;
+
+    fn seal_distributed_rewrite(
+        &self,
+        plan: ConnectorDistributedRewritePlan,
+        lease: ConnectorDistributedRewriteLease,
+        context: ConnectorRequestContext,
+    ) -> Result<Self::Sealed, String>;
+}
+
+pub struct DistributedRewriteApplicationSession<S> {
+    session: S,
     context: ConnectorRequestContext,
     execution: QueryExecutionContext,
 }
 
-impl DistributedRewriteMaintenanceSession {
-    pub fn plan(&self) -> &novarocks_spi::connector::ConnectorDistributedRewritePlan {
+impl<S: SealedDistributedRewrite> DistributedRewriteApplicationSession<S> {
+    pub fn plan(&self) -> &ConnectorDistributedRewritePlan {
         self.session.plan()
     }
 
@@ -60,7 +99,7 @@ impl DistributedRewriteMaintenanceSession {
         hash.finalize().into()
     }
 
-    pub(crate) fn session(&self) -> &ConnectorDistributedRewriteSession {
+    pub(crate) fn session(&self) -> &S {
         &self.session
     }
 
@@ -76,8 +115,8 @@ impl DistributedRewriteMaintenanceSession {
 /// Plan exactly once.  The caller captures topology before this function and
 /// retains the returned session through every staged cohort and terminal C1
 /// commit.  No current-generation lookup is available after this point.
-pub fn plan_distributed_rewrite_session(
-    query_execution: &crate::query_execution::service::QueryExecutionService,
+pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
+    sealing: &S,
     resolver: &dyn ConnectorDistributedRewriteResolver,
     instance_id: &ConnectorInstanceId,
     table: ConnectorTableIdentity,
@@ -85,7 +124,7 @@ pub fn plan_distributed_rewrite_session(
     intent: DistributedRewriteIntent,
     execution: QueryExecutionContext,
     context: ConnectorRequestContext,
-) -> Result<DistributedRewriteMaintenanceSession, String> {
+) -> Result<DistributedRewriteApplicationSession<S::Sealed>, String> {
     if table.instance_id != *instance_id {
         return Err(
             "distributed rewrite table does not belong to requested connector instance".to_string(),
@@ -131,12 +170,47 @@ pub fn plan_distributed_rewrite_session(
     let plan = lease
         .plan_rewrite(request)
         .map_err(|error| format!("plan distributed rewrite: {error}"))?;
-    let session = query_execution
-        .begin_distributed_rewrite_operation_with_lease(plan, lease, context.clone())
-        .map_err(|error| error.to_string())?;
-    Ok(DistributedRewriteMaintenanceSession {
+    let session = sealing.seal_distributed_rewrite(plan, lease, context.clone())?;
+    Ok(DistributedRewriteApplicationSession {
         session,
         context,
         execution,
     })
+}
+
+// CLS-R2 boundary: everything below binds the neutral seam above to the query
+// assembly owner that still lives in this package.  `QueryExecutionService` and
+// `ConnectorDistributedRewriteSession` move to the frontend in CLS-R2 T15;
+// these bindings move with them and nothing above this line changes.
+use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
+use crate::query_execution::service::QueryExecutionService;
+
+/// The maintenance session shape produced by the in-package query assembly
+/// owner.  Callers keep naming this alias, so relocating the owner does not
+/// change any call site.
+pub type DistributedRewriteMaintenanceSession =
+    DistributedRewriteApplicationSession<ConnectorDistributedRewriteSession>;
+
+impl SealedDistributedRewrite for ConnectorDistributedRewriteSession {
+    fn plan(&self) -> &ConnectorDistributedRewritePlan {
+        ConnectorDistributedRewriteSession::plan(self)
+    }
+
+    fn is_noop(&self) -> bool {
+        ConnectorDistributedRewriteSession::is_noop(self)
+    }
+}
+
+impl DistributedRewriteSealing for QueryExecutionService {
+    type Sealed = ConnectorDistributedRewriteSession;
+
+    fn seal_distributed_rewrite(
+        &self,
+        plan: ConnectorDistributedRewritePlan,
+        lease: ConnectorDistributedRewriteLease,
+        context: ConnectorRequestContext,
+    ) -> Result<Self::Sealed, String> {
+        self.begin_distributed_rewrite_operation_with_lease(plan, lease, context)
+            .map_err(|error| error.to_string())
+    }
 }

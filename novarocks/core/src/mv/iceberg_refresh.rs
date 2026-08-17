@@ -127,7 +127,7 @@ use novarocks_sql::syntax::{
 /// dependencies instead of admitting the aggregate application state into a
 /// frontend-owned preparation path.
 trait IcebergMvRefreshSource:
-    crate::query_execution::compiler::CatalogServiceSource + Send + Sync
+    crate::catalog_application::query_catalog::CatalogServiceSource + Send + Sync
 {
     fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
@@ -1546,7 +1546,7 @@ impl IcebergMvCorePorts {
     }
 }
 
-impl crate::query_execution::compiler::CatalogServiceSource for IcebergMvCorePorts {
+impl crate::catalog_application::query_catalog::CatalogServiceSource for IcebergMvCorePorts {
     fn catalog_service(&self) -> &Arc<QueryCatalogService> {
         &self.catalog_service
     }

@@ -96,6 +96,10 @@ pub trait MetadataMaintenanceCacheFinalizer {
     ) -> Result<(), ConnectorError>;
 }
 
+// CLS-R2 boundary: the port above is a connector fact and stays with the
+// aggregate package. This binding is the only part that names the query
+// assembly owner, so it moves to the frontend with `MaintenanceExecutionKernel`
+// in CLS-R2 T15.
 impl MetadataMaintenanceCacheFinalizer
     for crate::query_execution::kernels::MaintenanceExecutionKernel
 {

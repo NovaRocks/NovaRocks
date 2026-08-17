@@ -236,14 +236,13 @@ impl CatalogCommandPorts {
 pub fn catalog_command_executor(
     ports: CatalogCommandPorts,
 ) -> catalog_command::CatalogCommandExecutor {
-    catalog_command::CatalogCommandExecutor::new(domain::CatalogCommandKernel::new(
+    catalog_command::CatalogCommandExecutor::new(
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
         ports.mv_repository,
         ports.mv_storage_observation,
-        ports.view_service,
-    ))
+    )
 }
 
 /// Leaf ports for durable statistics command submission and observation.
@@ -449,19 +448,15 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
         Arc::clone(&ports.repository),
         Arc::clone(&ports.storage_observation),
     );
-    let backend =
-        Arc::new(novarocks::mv::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports));
-    mv_command::MvCommandExecutor::new(domain::MvExecutionKernel::new(
-        ports.catalog_service,
-        ports.catalog_application,
-        ports.connector_control,
-        ports.unified_statistics,
-        backend,
-        ports.repository,
+    let backend = Arc::new(
+        novarocks::mv::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports.clone()),
+    );
+    mv_command::MvCommandExecutor::new(
+        iceberg_ports,
         ports.application,
-        ports.storage_observation,
-        ports.query_execution,
-    ))
+        backend,
+        ports.unified_statistics,
+    )
 }
 
 /// Leaf ports for external-view commands.

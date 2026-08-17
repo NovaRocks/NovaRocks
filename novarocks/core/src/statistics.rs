@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::query_execution::compiler::CatalogServiceSource;
+use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 use novarocks_sql::syntax::ObjectName;

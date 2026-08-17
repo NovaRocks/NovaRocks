@@ -98,6 +98,11 @@ impl RequestSessionContext {
 
 /// Execution inputs which must remain identical from planning through native
 /// coordinator submission.
+///
+/// CLS-R2 boundary: request admission — deciding these inputs once per
+/// statement — is frontend authority and moves there. The immutable value
+/// itself stays with the aggregate package because `mv` and `connector` still
+/// receive it as a parameter. Those consumers leave with CLS-R3 and CLS-R5.
 #[derive(Clone)]
 pub struct QueryExecutionContext {
     role: ClusterRole,

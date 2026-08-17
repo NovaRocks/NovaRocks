@@ -67,13 +67,7 @@ use novarocks_sql::syntax::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
 
 use novarocks_catalog::partition::LegacyRangePartition;
 
-/// Narrow source for request-local catalog snapshots.
-///
-/// SQL compilation receives a frozen catalog view, not the aggregate engine
-/// state that happened to own it historically.
-pub(crate) trait CatalogServiceSource {
-    fn catalog_service(&self) -> &Arc<QueryCatalogService>;
-}
+use crate::catalog_application::query_catalog::CatalogServiceSource;
 
 macro_rules! impl_kernel_catalog_service_source {
     ($kernel:ty) => {
@@ -1210,7 +1204,7 @@ impl TestQueryCompiler {
             sqlast::Statement::Query(ref query) => {
                 if let Some(result) =
                     crate::catalog_application::information_schema::try_query_materialized_views(
-                        &self.system_tables,
+                        self.system_tables.mv_repository().as_ref(),
                         query,
                     )?
                 {
@@ -1229,7 +1223,9 @@ impl TestQueryCompiler {
                     },
                 )?;
                 crate::catalog_application::virtual_table::rewrite_query(
-                    &self.system_tables,
+                    self.system_tables.catalog_service(),
+                    self.system_tables.connector_control().as_ref(),
+                    self.system_tables.system_catalog().as_ref(),
                     &mut prepared,
                 )?;
                 if has_time_travel_refs(&prepared) {
@@ -1349,82 +1345,6 @@ fn is_query_sql(sql: &str) -> bool {
     }
 }
 
-pub(crate) fn connector_schema_path(
-    path: crate::catalog_application::statement::ColumnPath,
-) -> novarocks_spi::connector::ConnectorColumnPath {
-    novarocks_spi::connector::ConnectorColumnPath {
-        segments: path
-            .segments()
-            .iter()
-            .map(|segment| Arc::from(segment.as_str()))
-            .collect(),
-    }
-}
-
-pub(crate) fn connector_schema_position(
-    position: crate::catalog_application::statement::AddPosition,
-) -> novarocks_spi::connector::ConnectorColumnPosition {
-    match position {
-        crate::catalog_application::statement::AddPosition::Default => {
-            novarocks_spi::connector::ConnectorColumnPosition::Default
-        }
-        crate::catalog_application::statement::AddPosition::First => {
-            novarocks_spi::connector::ConnectorColumnPosition::First
-        }
-        crate::catalog_application::statement::AddPosition::After(column) => {
-            novarocks_spi::connector::ConnectorColumnPosition::After {
-                column: Arc::from(column),
-            }
-        }
-        crate::catalog_application::statement::AddPosition::Before(column) => {
-            novarocks_spi::connector::ConnectorColumnPosition::Before {
-                column: Arc::from(column),
-            }
-        }
-    }
-}
-
-pub(crate) fn connector_partition_transform(
-    field: &novarocks_sql::syntax::IcebergPartitionFieldExpr,
-) -> novarocks_spi::connector::ConnectorPartitionTransform {
-    use novarocks_spi::connector::ConnectorPartitionTransform;
-    use novarocks_sql::syntax::IcebergPartitionFieldExpr;
-
-    match field {
-        IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Year { column } => ConnectorPartitionTransform::Year {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Month { column } => ConnectorPartitionTransform::Month {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Day { column } => ConnectorPartitionTransform::Day {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Hour { column } => ConnectorPartitionTransform::Hour {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Bucket {
-            column,
-            num_buckets,
-        } => ConnectorPartitionTransform::Bucket {
-            column: Arc::from(column.as_str()),
-            num_buckets: *num_buckets,
-        },
-        IcebergPartitionFieldExpr::Truncate { column, width } => {
-            ConnectorPartitionTransform::Truncate {
-                column: Arc::from(column.as_str()),
-                width: *width,
-            }
-        }
-        IcebergPartitionFieldExpr::Void { column } => ConnectorPartitionTransform::Void {
-            column: Arc::from(column.as_str()),
-        },
-    }
-}
-
 #[cfg(test)]
 fn test_request_context(
     current_catalog: Option<&str>,
@@ -1513,147 +1433,6 @@ fn rewrite_named_partition_insert_overwrite(sql: &str) -> Result<String, String>
     let table = captures.name("table").expect("table capture").as_str();
     let rest = captures.name("rest").expect("rest capture").as_str();
     Ok(format!("INSERT OVERWRITE PARTITIONS {table} {rest}"))
-}
-
-pub(crate) fn parse_create_table_like(
-    sql: &str,
-) -> Result<
-    Option<(
-        novarocks_sql::syntax::ObjectName,
-        novarocks_sql::syntax::ObjectName,
-    )>,
-    String,
-> {
-    let re = regex::Regex::new(
-        r#"(?is)^\s*create\s+table\s+(?P<target>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s+like\s+(?P<source>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s*$"#,
-    )
-    .map_err(|e| format!("compile CREATE TABLE LIKE regex failed: {e}"))?;
-    let Some(captures) = re.captures(sql) else {
-        return Ok(None);
-    };
-    let target = parse_simple_object_name(captures.name("target").expect("target").as_str())?;
-    let source = parse_simple_object_name(captures.name("source").expect("source").as_str())?;
-    Ok(Some((target, source)))
-}
-
-fn parse_simple_object_name(token: &str) -> Result<novarocks_sql::syntax::ObjectName, String> {
-    let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut in_backtick = false;
-    for ch in token.chars() {
-        match ch {
-            '`' => in_backtick = !in_backtick,
-            '.' if !in_backtick => {
-                if cur.is_empty() {
-                    return Err(format!("empty object name segment in `{token}`"));
-                }
-                parts.push(cur.clone());
-                cur.clear();
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.is_empty() {
-        parts.push(cur);
-    }
-    if parts.is_empty() {
-        return Err(format!("empty object name `{token}`"));
-    }
-    Ok(novarocks_sql::syntax::ObjectName { parts })
-}
-
-/// Generate a `CREATE TABLE` DDL string from exact-generation connector facts.
-pub(crate) fn build_iceberg_create_table_ddl(
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-    loaded: &novarocks_spi::connector::ConnectorTableMetadata,
-) -> Result<String, String> {
-    use novarocks_spi::connector::ConnectorTableDefinitionType;
-
-    fn definition_type_to_sql(ty: &ConnectorTableDefinitionType) -> String {
-        match ty {
-            ConnectorTableDefinitionType::Boolean => "BOOLEAN".to_string(),
-            ConnectorTableDefinitionType::Int => "INT".to_string(),
-            ConnectorTableDefinitionType::BigInt => "BIGINT".to_string(),
-            ConnectorTableDefinitionType::Float => "FLOAT".to_string(),
-            ConnectorTableDefinitionType::Double => "DOUBLE".to_string(),
-            ConnectorTableDefinitionType::Decimal { precision, scale } => {
-                format!("DECIMAL({precision},{scale})")
-            }
-            ConnectorTableDefinitionType::Date => "DATE".to_string(),
-            ConnectorTableDefinitionType::Time => "TIME".to_string(),
-            ConnectorTableDefinitionType::DateTime => "DATETIME".to_string(),
-            ConnectorTableDefinitionType::DateTimeNs => "TIMESTAMP_NS".to_string(),
-            ConnectorTableDefinitionType::String => "STRING".to_string(),
-            ConnectorTableDefinitionType::Binary {
-                fixed_length: Some(length),
-            } => format!("BINARY({length})"),
-            ConnectorTableDefinitionType::Binary { fixed_length: None } => "BINARY".to_string(),
-            ConnectorTableDefinitionType::Variant => "VARIANT".to_string(),
-            ConnectorTableDefinitionType::Array(element) => {
-                format!("ARRAY<{}>", definition_type_to_sql(element))
-            }
-            ConnectorTableDefinitionType::Map(key, value) => format!(
-                "MAP<{},{}>",
-                definition_type_to_sql(key),
-                definition_type_to_sql(value)
-            ),
-            ConnectorTableDefinitionType::Struct(fields) => {
-                let fields = fields
-                    .iter()
-                    .map(|field| {
-                        format!(
-                            "{} {}",
-                            field.name(),
-                            definition_type_to_sql(field.data_type())
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                format!("STRUCT<{}>", fields.join(", "))
-            }
-        }
-    }
-
-    if loaded.definition_facts.is_empty() {
-        return Err(
-            "SHOW CREATE TABLE is unsupported because the connector returned no table definition facts"
-                .to_string(),
-        );
-    }
-    let mut col_defs = Vec::with_capacity(loaded.definition_facts.columns().len());
-    for column in loaded.definition_facts.columns() {
-        let field = loaded.schema.field(column.field_ordinal() as usize);
-        let nullable = if column.nullable() { "" } else { " NOT NULL" };
-        let comment = if let Some(doc) = column.comment() {
-            let escaped = doc.replace('\'', "\\'");
-            format!(" COMMENT '{escaped}'")
-        } else {
-            String::new()
-        };
-        col_defs.push(format!(
-            "  `{}` {}{}{}",
-            field.name(),
-            definition_type_to_sql(column.data_type()),
-            nullable,
-            comment
-        ));
-    }
-
-    let table_comment = loaded
-        .definition_facts
-        .table_comment()
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            let escaped = v.replace('\'', "\\'");
-            format!("\nCOMMENT '{escaped}'")
-        })
-        .unwrap_or_default();
-
-    Ok(format!(
-        "CREATE TABLE `{catalog}`.`{namespace}`.`{table}` (\n{}\n){table_comment}",
-        col_defs.join(",\n")
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3113,132 +2892,6 @@ fn parse_explain_refresh_materialized_view(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod build_iceberg_create_table_ddl_tests {
-    use super::build_iceberg_create_table_ddl;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use bytes::Bytes;
-    use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
-        ConnectorTableDefinitionStructField, ConnectorTableDefinitionType, ConnectorTableHandle,
-        ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
-    };
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    fn request_context() -> ConnectorRequestContext {
-        ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(60),
-            Arc::new(NeverCancelled),
-            1_024,
-            64 * 1_024,
-        )
-        .expect("request context")
-    }
-
-    fn loaded_table(
-        table_comment: Option<&str>,
-        column_comment: Option<&str>,
-        data_type: ConnectorTableDefinitionType,
-        nullable: bool,
-    ) -> ConnectorTableMetadata {
-        let instance_id = ConnectorInstanceId::parse("cat").expect("instance ID");
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int32,
-            nullable,
-        )]));
-        let planning_facts = ConnectorTablePlanningFacts::empty();
-        let definition_facts = ConnectorTableDefinitionFacts::try_new(
-            &schema,
-            &planning_facts,
-            vec![ConnectorTableDefinitionColumn::new(
-                0,
-                data_type,
-                nullable,
-                column_comment.map(Arc::from),
-            )],
-            table_comment.map(Arc::from),
-            &request_context(),
-        )
-        .expect("definition facts");
-        ConnectorTableMetadata {
-            identity: ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: Arc::from("ns"),
-                table: Arc::from("tbl"),
-            },
-            schema,
-            planning_facts,
-            definition_facts,
-            version: None,
-            statistics_data_version: None,
-            table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
-                .expect("table handle"),
-        }
-    }
-
-    #[test]
-    fn emits_table_and_column_comments_with_escaping() {
-        let loaded = loaded_table(
-            Some("it's great"),
-            Some("owner's id"),
-            ConnectorTableDefinitionType::Int,
-            false,
-        );
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(ddl.contains("`id` INT NOT NULL COMMENT 'owner\\'s id'"));
-        assert!(ddl.contains("COMMENT 'it\\'s great'"));
-    }
-
-    #[test]
-    fn renders_fixed_and_nested_definition_types() {
-        let loaded = loaded_table(
-            None,
-            None,
-            ConnectorTableDefinitionType::Array(Box::new(ConnectorTableDefinitionType::Struct(
-                vec![ConnectorTableDefinitionStructField::new(
-                    "payload",
-                    ConnectorTableDefinitionType::Map(
-                        Box::new(ConnectorTableDefinitionType::String),
-                        Box::new(ConnectorTableDefinitionType::Binary {
-                            fixed_length: Some(16),
-                        }),
-                    ),
-                )],
-            ))),
-            true,
-        );
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(ddl.contains("ARRAY<STRUCT<payload MAP<STRING,BINARY(16)>>>"));
-    }
-
-    #[test]
-    fn no_comment_clause_when_comment_is_empty() {
-        let loaded = loaded_table(Some(""), None, ConnectorTableDefinitionType::Int, true);
-        let ddl = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded).expect("build ddl");
-        assert!(!ddl.contains("COMMENT"));
-    }
-
-    #[test]
-    fn empty_definition_facts_fail_closed() {
-        let mut loaded = loaded_table(None, None, ConnectorTableDefinitionType::Int, true);
-        loaded.definition_facts = ConnectorTableDefinitionFacts::empty();
-        let error = build_iceberg_create_table_ddl("cat", "ns", "tbl", &loaded)
-            .expect_err("empty definition facts must fail");
-        assert!(error.contains("unsupported"));
-    }
-}
 
 #[cfg(test)]
 mod tests {

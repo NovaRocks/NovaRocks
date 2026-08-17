@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Connector-neutral Arrow-to-SQL schema conversion shared by CTAS and views.
-//! Frontend DML owns CTAS routing and the durable staged-publication saga.
+//! CTAS schema derivation: turn a produced Arrow schema into declared table
+//! columns. Frontend DML owns CTAS routing and the durable staged-publication
+//! saga. The per-type Arrow -> SqlType mapping itself is owned by
+//! `novarocks_sql::syntax`, next to its `sql_type_to_arrow_type` inverse.
 
-use arrow::datatypes::DataType;
-
-use novarocks_catalog::schema::SqlType;
 use novarocks_sql::syntax::TableColumnDef;
 
 pub(crate) fn arrow_schema_to_table_column_defs(
@@ -30,7 +29,7 @@ pub(crate) fn arrow_schema_to_table_column_defs(
         .fields()
         .iter()
         .map(|field| {
-            let data_type = arrow_data_type_to_sql_type(field.data_type())?;
+            let data_type = novarocks_sql::syntax::arrow_data_type_to_sql_type(field.data_type())?;
             Ok(TableColumnDef {
                 name: field.name().clone(),
                 data_type,
@@ -42,73 +41,6 @@ pub(crate) fn arrow_schema_to_table_column_defs(
         .collect()
 }
 
-/// Recursive Arrow DataType → SqlType conversion for CTAS schema inference.
-pub(crate) fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, String> {
-    use arrow::datatypes::TimeUnit;
-    Ok(match dt {
-        DataType::Boolean => SqlType::Boolean,
-        DataType::Int8 => SqlType::TinyInt,
-        DataType::Int16 => SqlType::SmallInt,
-        DataType::Int32 => SqlType::Int,
-        DataType::Int64 => SqlType::BigInt,
-        DataType::Float32 => SqlType::Float,
-        DataType::Float64 => SqlType::Double,
-        DataType::Decimal128(precision, scale) => SqlType::Decimal {
-            precision: *precision,
-            scale: *scale,
-        },
-        DataType::Utf8 | DataType::LargeUtf8 => SqlType::String,
-        DataType::Binary | DataType::LargeBinary => SqlType::Binary,
-        // StarRocks LARGEINT is stored as a fixed 16-byte signed integer.
-        DataType::FixedSizeBinary(w) if *w == novarocks_types::largeint::LARGEINT_BYTE_WIDTH => {
-            SqlType::LargeInt
-        }
-        DataType::Date32 => SqlType::Date,
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
-        DataType::Timestamp(_, _) => SqlType::DateTime,
-        DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => SqlType::Time,
-        DataType::List(elem) => {
-            SqlType::Array(Box::new(arrow_data_type_to_sql_type(elem.data_type())?))
-        }
-        DataType::Struct(fields) => SqlType::Struct(
-            fields
-                .iter()
-                .map(|f| {
-                    Ok((
-                        f.name().clone(),
-                        arrow_data_type_to_sql_type(f.data_type())?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        ),
-        DataType::Map(entries, _) => {
-            // Arrow MAP is encoded as List<Struct{key, value}>.
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Err(
-                    "CTAS: MAP column has unexpected Arrow encoding (expected struct entries)"
-                        .to_string(),
-                );
-            };
-            let (_, key_field) = fields
-                .find("key")
-                .ok_or_else(|| "CTAS: MAP column missing 'key' field".to_string())?;
-            let (_, val_field) = fields
-                .find("value")
-                .ok_or_else(|| "CTAS: MAP column missing 'value' field".to_string())?;
-            SqlType::Map(
-                Box::new(arrow_data_type_to_sql_type(key_field.data_type())?),
-                Box::new(arrow_data_type_to_sql_type(val_field.data_type())?),
-            )
-        }
-        other => {
-            return Err(format!(
-                "CTAS: arrow type {other:?} not supported; \
-                 use CREATE TABLE then INSERT for variant/geometry/geography or \
-                 unsupported numeric types (Float16, Decimal256, Interval, etc.)"
-            ));
-        }
-    })
-}
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -119,7 +51,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
-    use super::{arrow_data_type_to_sql_type, arrow_schema_to_table_column_defs};
+    use super::arrow_schema_to_table_column_defs;
     use novarocks_catalog::schema::SqlType;
 
     // ---------- basic scalar types ----------
@@ -212,18 +144,6 @@ mod tests {
         assert!(matches!(cols[11].data_type, SqlType::Date));
         assert!(matches!(cols[12].data_type, SqlType::DateTime));
         assert!(matches!(cols[13].data_type, SqlType::Time));
-    }
-
-    #[test]
-    fn nanosecond_arrow_timestamp_maps_to_datetimens() {
-        assert_eq!(
-            arrow_data_type_to_sql_type(&DataType::Timestamp(TimeUnit::Nanosecond, None)).unwrap(),
-            SqlType::DateTimeNs
-        );
-        assert_eq!(
-            arrow_data_type_to_sql_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
-            SqlType::DateTime
-        );
     }
 
     // ---------- unsupported types ----------

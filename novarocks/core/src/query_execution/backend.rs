@@ -141,6 +141,10 @@ impl fmt::Display for BackendTopologyValidationError {
 
 impl std::error::Error for BackendTopologyValidationError {}
 
+/// CLS-R2 boundary: this value travels with the membership authority to the
+/// frontend. The metrics surface takes already-counted scalars rather than
+/// naming this type, so nothing that stays with the aggregate package depends
+/// on it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendTopologyMetricsSnapshot {
     pub registering: usize,
@@ -151,8 +155,18 @@ pub struct BackendTopologyMetricsSnapshot {
 
 /// Publishes the latest frontend-owned topology counts to the shared process
 /// metrics endpoint. A scrape reads this snapshot and never resets it.
+///
+/// The counts cross into the metrics surface as scalars. The membership owner
+/// is the only side that knows how to count registry states, and the metrics
+/// surface is the only side that knows the gauge label set, so neither has to
+/// name a type belonging to the other.
 pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot) {
-    crate::service::metrics_http::publish_backend_topology_metrics(snapshot);
+    crate::service::metrics_http::publish_backend_topology_metrics(
+        snapshot.registering,
+        snapshot.live,
+        snapshot.lost,
+        snapshot.decommissioning,
+    );
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,6 +278,11 @@ impl LiveBackendTarget {
 /// An immutable, versioned view of the backend targets available when a
 /// request was admitted. The owner is responsible for advancing `revision`
 /// for every membership or generation change.
+///
+/// CLS-R2 boundary: durable membership authority is frontend-owned
+/// (`ADR-0013`) and the service that advances `revision` moves there. This
+/// observed snapshot stays with the aggregate package because `connector`
+/// consumes it; that consumer leaves with CLS-R5.
 // Design: ADR-0011 (docs/adr/ADR-0011-immutable-request-execution-context.md)
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendTopologySnapshot {

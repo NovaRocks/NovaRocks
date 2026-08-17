@@ -272,7 +272,7 @@ fn serialize_scope(scope: &QueryLifecycleFaultScope) -> String {
 
 fn parse_scope(contents: &str) -> Result<QueryLifecycleFaultScope, String> {
     let fields = parse_fields(contents)?;
-    let query_id = crate::query_execution::contract::QueryId::new(
+    let query_id = novarocks_types::QueryId::new(
         required_i64(&fields, "execution_hi")?,
         required_i64(&fields, "execution_lo")?,
     );
@@ -369,7 +369,7 @@ mod tests {
 
     fn execution_id(lo: i64) -> QueryExecutionId {
         QueryExecutionId::new(
-            crate::query_execution::contract::QueryId::new(7, lo),
+            novarocks_types::QueryId::new(7, lo),
             AttemptId::new(1).expect("attempt"),
         )
         .expect("execution id")

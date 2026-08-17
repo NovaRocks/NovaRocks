@@ -21,27 +21,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution};
 
-/// Freeze the narrow base-table facts used by one MV refresh attempt.
+/// Freeze the narrow base-table facts used by one MV refresh attempt, from the
+/// exact control and observation ports selected for that attempt.
 ///
 /// Metadata and the observation are resolved through the same exact planning
 /// lease. Callers must retain the returned value instead of re-resolving the
 /// connector's latest generation within the same decision.
-/// Freeze a refresh-base observation through the explicit MV kernel.
-pub(crate) fn observe_current_refresh_base_with_kernel(
-    kernel: &crate::query_execution::kernels::MvExecutionKernel,
-    table_ref: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {
-    observe_current_refresh_base_with_ports(
-        kernel.connector_control().as_ref(),
-        kernel.storage_observation().as_ref(),
-        table_ref,
-        connector_context,
-    )
-}
-
-/// Freeze a refresh-base observation from the exact control and observation
-/// ports selected for this refresh attempt.
 ///
 /// This is the planner-facing entry point.  Callers that already own their
 /// admitted connector-control generation must pass those ports directly;

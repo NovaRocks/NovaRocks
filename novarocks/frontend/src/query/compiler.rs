@@ -195,9 +195,10 @@ impl FrontendQueryCompiler {
                 )
             }
             sqlparser::ast::Statement::Query(ref query) => {
-                if let Some(result) =
-                    information_schema::try_query_materialized_views(&self.system_tables, query)?
-                {
+                if let Some(result) = information_schema::try_query_materialized_views(
+                    self.system_tables.mv_repository().as_ref(),
+                    query,
+                )? {
                     return Ok(PreparedQueryOperation::immediate(result));
                 }
                 let query = self.prepare_query(
@@ -331,7 +332,12 @@ impl FrontendQueryCompiler {
             current_database,
             connector_context,
         )?;
-        virtual_table::rewrite_query(&self.system_tables, &mut prepared)?;
+        virtual_table::rewrite_query(
+            self.system_tables.catalog_service(),
+            self.system_tables.connector_control().as_ref(),
+            self.system_tables.system_catalog().as_ref(),
+            &mut prepared,
+        )?;
         Ok(prepared)
     }
 

@@ -32,23 +32,8 @@ use novarocks_sql::syntax::{
     AlterIcebergRefAction, AlterIcebergRefStmt, ObjectName, SnapshotAnchor,
 };
 
-/// Execute an Iceberg ref mutation using only the explicit MV kernel ports
-/// required for MV-target admission.
-pub(crate) fn execute_with_kernel(
-    kernel: &crate::query_execution::kernels::MvExecutionKernel,
-    current_database: &str,
-    stmt: &AlterIcebergRefStmt,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    execute_with_ports(
-        kernel.connector_control().as_ref(),
-        kernel.storage_observation().as_ref(),
-        current_database,
-        stmt,
-        connector_context,
-    )
-}
-
+/// Execute an Iceberg ref mutation using only the explicit connector-control
+/// and MV storage-observation ports required for MV-target admission.
 pub(crate) fn execute_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,

@@ -23,6 +23,14 @@
 
 use crate::runtime::query_result::{QueryResult, build_string_query_result};
 
+/// Neutral statement result carrier.
+///
+/// CLS-R2 boundary: this value stays with the aggregate package while the rest
+/// of `completion` moves to the frontend, because catalog and MV command
+/// handlers that still live here produce it directly. Its remaining producers
+/// leave with CLS-R3 (`catalog_application`, `mv`) and CLS-R4 (`server`); once
+/// they do, the only consumers are frontend-owned and this type follows them.
+/// It is a carrier, not a seam: nothing here decides statement admission.
 #[derive(Clone, Debug)]
 pub enum StatementResult {
     Query(QueryResult),

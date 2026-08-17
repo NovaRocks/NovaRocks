@@ -82,6 +82,10 @@ pub(crate) trait DataMutationCacheFinalizer {
     ) -> Result<(), ConnectorError>;
 }
 
+// CLS-R2 boundary: the port above is a connector fact and stays with the
+// aggregate package. This binding is the only part that names the query
+// assembly owner, so it moves to the frontend with `DmlExecutionKernel` in
+// CLS-R2 T15.
 impl DataMutationCacheFinalizer for crate::query_execution::kernels::DmlExecutionKernel {
     fn invalidate_generic_table(
         &self,

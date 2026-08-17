@@ -19,8 +19,8 @@
 //! statement schema lookup, and catalog-service table invalidation.
 //! Ordinary SELECT external tables resolve through the query catalog materializer.
 
+use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::catalog_application::resolver::{CatalogAdmission, resolve_table_target};
-use crate::query_execution::compiler::CatalogServiceSource;
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };

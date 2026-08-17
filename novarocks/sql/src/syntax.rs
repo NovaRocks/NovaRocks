@@ -162,6 +162,16 @@ pub fn sql_type_to_arrow_type(
     crate::literal::sql_type_to_arrow_type(sql_type)
 }
 
+/// Convert an Arrow value representation back to its admitted SQL type.
+///
+/// This is the inverse of [`sql_type_to_arrow_type`] and is used to infer a
+/// declared table schema from a produced Arrow schema (CTAS and view columns).
+pub fn arrow_data_type_to_sql_type(
+    data_type: &arrow::datatypes::DataType,
+) -> Result<novarocks_catalog::schema::SqlType, String> {
+    crate::literal::arrow_data_type_to_sql_type(data_type)
+}
+
 /// Compare Arrow value shapes while ignoring non-semantic field metadata.
 pub fn arrow_type_equals_ignoring_metadata(
     left: &arrow::datatypes::DataType,

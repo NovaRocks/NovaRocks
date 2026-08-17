@@ -41,8 +41,8 @@ pub fn decode_native_query_options(
 pub fn decode_native_query_execution_id(
     execution_id: &novarocks_protocol::novarocks::QueryExecutionId,
 ) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, ProtocolError> {
-    use crate::query_execution::contract::QueryId;
     use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_types::QueryId;
 
     let root = FieldPath::root("execution_id");
     let query_id = execution_id.query_id.as_ref().ok_or_else(|| {

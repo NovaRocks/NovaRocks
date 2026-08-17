@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::query_execution::compiler::CatalogServiceSource;
+use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 pub mod view_command;
@@ -541,9 +541,9 @@ fn view_sqlparser_data_type(
         }
     }
 
-    Ok(convert(
-        crate::query_execution::dml::iceberg_ctas::arrow_data_type_to_sql_type(data_type)?,
-    ))
+    Ok(convert(novarocks_sql::syntax::arrow_data_type_to_sql_type(
+        data_type,
+    )?))
 }
 
 #[cfg(test)]

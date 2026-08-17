@@ -66,6 +66,11 @@ impl QueryCancellationSource {
 }
 
 /// A cloned, read-only observation capability for one statement.
+///
+/// CLS-R2 boundary: the cancellation *authority* (who admits a statement and
+/// who trips it) moves to the frontend; this read-only observation value stays
+/// with the aggregate package because `connector` and `server` still observe
+/// it. Those consumers leave with CLS-R5 and CLS-R4 respectively.
 #[derive(Clone)]
 pub struct QueryCancellationView {
     reason: Arc<OnceLock<QueryCancellationReason>>,

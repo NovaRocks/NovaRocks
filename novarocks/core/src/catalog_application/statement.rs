@@ -32,10 +32,11 @@ use novarocks_catalog::schema::SqlType;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
-    ConnectorDataType, ConnectorDefaultValue, ConnectorDropTableDataDisposition,
-    ConnectorErrorKind, ConnectorInstanceId, ConnectorNamespaceIdentity,
-    ConnectorPartitionTransform, ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind,
-    ConnectorViewIdentity, ConnectorViewRequest, CreatePolicy, DropPolicy,
+    ConnectorColumnPath, ConnectorColumnPosition, ConnectorDataType, ConnectorDefaultValue,
+    ConnectorDropTableDataDisposition, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorNamespaceIdentity, ConnectorPartitionTransform, ConnectorTableIdentity,
+    ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewIdentity, ConnectorViewRequest,
+    CreatePolicy, DropPolicy,
 };
 use novarocks_sql::syntax::StarRocksDialect;
 use novarocks_sql::syntax::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
@@ -63,6 +64,9 @@ pub(crate) trait CatalogDropContext:
     ) -> &dyn crate::mv::storage_observation::MvStorageObservationPort;
 }
 
+// Ownership: the trait above is Core's contract, but this `impl` belongs to the
+// kernel that supplies the ports. It moves to Frontend together with
+// `CatalogCommandKernel` in CLS-R2 T15.
 impl CatalogDropContext for CatalogCommandKernel {
     fn catalog_service(
         &self,
@@ -678,6 +682,9 @@ pub(crate) trait CatalogMutationContext:
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
 }
 
+// Ownership: the trait above is Core's contract, but this `impl` belongs to the
+// kernel that supplies the ports. It moves to Frontend together with
+// `CatalogCommandKernel` in CLS-R2 T15.
 impl CatalogMutationContext for CatalogCommandKernel {
     fn connector_control(&self) -> &dyn ConnectorControlRegistry {
         self.connector_control().as_ref()
@@ -984,6 +991,34 @@ pub(crate) fn connector_partition_transform(
         }
         IcebergPartitionFieldExpr::Void { column } => ConnectorPartitionTransform::Void {
             column: Arc::from(column.as_str()),
+        },
+    }
+}
+
+// Ownership: `ColumnPath` and `AddPosition` are this module's own parsed
+// schema-change AST types, so lowering them onto the connector SPI is catalog
+// statement work, not query assembly. These two join the sibling converters
+// above (`connector_partition_transform`, `connector_table_key`,
+// `connector_column_aggregation`) that already own that lowering.
+pub(crate) fn connector_schema_path(path: ColumnPath) -> ConnectorColumnPath {
+    ConnectorColumnPath {
+        segments: path
+            .segments()
+            .iter()
+            .map(|segment| Arc::from(segment.as_str()))
+            .collect(),
+    }
+}
+
+pub(crate) fn connector_schema_position(position: AddPosition) -> ConnectorColumnPosition {
+    match position {
+        AddPosition::Default => ConnectorColumnPosition::Default,
+        AddPosition::First => ConnectorColumnPosition::First,
+        AddPosition::After(column) => ConnectorColumnPosition::After {
+            column: Arc::from(column),
+        },
+        AddPosition::Before(column) => ConnectorColumnPosition::Before {
+            column: Arc::from(column),
         },
     }
 }
