@@ -21,18 +21,12 @@ mod refresh_artifact;
 
 use std::fmt;
 
-use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorExecutionBindingKey, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWriteReceipt,
-};
+use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
 use uuid::Uuid;
 
 use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
-use crate::query_execution::compiler::NativeFragmentEncodingInput;
-use crate::query_execution::native_fragment::NativeFragmentAttachment;
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::query_result::QueryResult;
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 use novarocks_sql::syntax::{
@@ -102,70 +96,6 @@ pub enum PreparedMvRefreshWork {
 pub enum PreparedMvRefreshWrite {
     FirstRefresh(PreparedMvFirstRefreshWrite),
     Incremental(PreparedMvIncrementalWrite),
-}
-
-/// Exact Core-retained inputs for one Frontend-owned MV native assembly.
-///
-/// The frontend may read the immutable input only to encode the native
-/// fragment bundle.  Finishing consumes the same retained pair, so neither a
-/// newer binding nor a replacement prepared fragment set can reach dispatch.
-pub struct PreparedMvNativeWriteAssembly {
-    encoding: NativeFragmentEncodingInput,
-    query_options: Option<novarocks_execution::runtime::query_options::QueryOptions>,
-    registration: crate::query_execution::contract::ConnectorWriteOperationRegistration,
-    cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
-    lease: ConnectorWriteLease,
-}
-
-impl PreparedMvNativeWriteAssembly {
-    pub(crate) fn new(
-        encoding: NativeFragmentEncodingInput,
-        query_options: Option<novarocks_execution::runtime::query_options::QueryOptions>,
-        registration: crate::query_execution::contract::ConnectorWriteOperationRegistration,
-        cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
-        lease: ConnectorWriteLease,
-    ) -> Self {
-        Self {
-            encoding,
-            query_options,
-            registration,
-            cohort_id,
-            lease,
-        }
-    }
-
-    pub fn native_encoding(&self) -> &NativeFragmentEncodingInput {
-        &self.encoding
-    }
-
-    pub fn write_operation_id(&self) -> novarocks_spi::connector::ConnectorWriteOperationId {
-        self.registration.operation_id()
-    }
-
-    pub fn write_cohort_id(&self) -> novarocks_spi::connector::ConnectorWriteCohortId {
-        self.cohort_id
-    }
-
-    pub fn finish(
-        self,
-        native_bundle: NativeFragmentAttachment,
-    ) -> Result<PreparedDistributedWriteRequest, String> {
-        if !self.encoding.matches_native_attachment(&native_bundle) {
-            return Err(
-                "native fragment bundle does not match the sealed MV encoding input".into(),
-            );
-        }
-        let (_, prepared) = self.encoding.into_parts();
-        PreparedDistributedWriteRequest::new(
-            prepared,
-            native_bundle,
-            self.query_options,
-            self.registration,
-            self.cohort_id,
-            self.lease,
-        )
-        .map_err(|error| error.to_string())
-    }
 }
 
 impl PreparedMvRefreshWrite {
@@ -586,51 +516,6 @@ pub trait MvApplicationService: Send + Sync {
     fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
         Ok(())
     }
-}
-
-/// Core-owned provider activation and native fragment preparation for a
-/// SQL-shaped refresh artifact. The frontend owns intent persistence,
-/// write-session admission, native assembly, execution, commit, publication,
-/// and cleanup; the port returns only an exact sealed encoding carrier after
-/// the lease is retained.
-pub trait MvRefreshProviderActivation: Send + Sync {
-    fn activate_write(
-        &self,
-        prepared: PreparedMvRefreshWrite,
-        planning_lease: &ConnectorControlPlanningLease,
-        exact_lease: &ConnectorWriteLease,
-        execution: &crate::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, String>;
-
-    fn interpret_write_commit(
-        &self,
-        intent: MvRefreshPublicationIntent,
-        receipt: &ConnectorWriteReceipt,
-    ) -> Result<MvRefreshCommittedFacts, String>;
-
-    /// Project a provider-committed repartition contract into the lake-owned
-    /// MV descriptor. The atomic table commit is already durable when this is
-    /// called; a failure therefore leaves the frontend refresh fenced for
-    /// recovery and must be safe to retry. `committed_partitioning` is the
-    /// provider-produced exact CAS guard and must be forwarded unchanged, not
-    /// reconstructed from the application partition contract.
-    fn sync_repartition_descriptor(
-        &self,
-        mv_id: i64,
-        partition_spec: crate::mv::persistence::schema::MvPartitionContract,
-        committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<(), String>;
-}
-
-/// Frontend composition sink installed before Core opens. Core binds its
-/// provider activation adapter only after connector control and the engine
-/// state are available, avoiding a direct all-in-one call path.
-pub trait MvRefreshProviderActivationSink: Send + Sync {
-    fn bind_mv_refresh_provider_activation(
-        &self,
-        activation: std::sync::Arc<dyn MvRefreshProviderActivation>,
-    ) -> Result<(), String>;
 }
 
 pub trait MvEngine: Send + Sync {

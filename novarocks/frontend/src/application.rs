@@ -794,9 +794,10 @@ impl FrontendApplicationHost {
 
     pub fn mv_refresh_provider_activation_sink(
         &self,
-    ) -> Option<Arc<dyn novarocks::mv::application::MvRefreshProviderActivationSink>> {
+    ) -> Option<Arc<dyn novarocks::query_execution::mv_native_write::MvRefreshProviderActivationSink>>
+    {
         self.mv_refresh_provider_activation.as_ref().map(|port| {
-            Arc::clone(port) as Arc<dyn novarocks::mv::application::MvRefreshProviderActivationSink>
+            Arc::clone(port) as Arc<dyn novarocks::query_execution::mv_native_write::MvRefreshProviderActivationSink>
         })
     }
 

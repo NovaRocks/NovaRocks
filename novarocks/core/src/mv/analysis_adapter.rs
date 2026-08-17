@@ -24,8 +24,6 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog_application::CatalogApplicationPort;
-use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::mv::analysis::{MvAnalysis, prepare_mv_select_for_catalog_provider};
 use crate::mv::lifecycle::MvListRow;
 use crate::mv::model::MvStorageEngine;
@@ -33,7 +31,6 @@ use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPoli
 use crate::mv::persistence::refresh::MvRefreshState;
 use crate::mv::repository::MvRepository;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 use novarocks_sql::syntax::ShowMaterializedViewsStmt;
 
 /// Lightweight projection of the iceberg base table that
@@ -268,31 +265,22 @@ fn dependency_display_for_mv_with_repository(
         .join(", "))
 }
 
-/// Analyze an MV SELECT from explicit query-local catalog and connector ports.
+/// Analyze an MV SELECT against an already-admitted query-local table provider.
 ///
-/// `catalog_service` is expected to be a request-local snapshot captured by
-/// the caller. The optional catalog application remains part of analysis so
-/// external-table materialization is admitted only while the catalog is ready.
-pub(crate) fn analyze_mv_select_with_ports(
+/// The provider is built by the query-assembly owner that admitted the
+/// request: the request-local catalog snapshot, the exact connector control
+/// lease, and the catalog-application admission gate are all frozen into it
+/// before analysis starts. This adapter contributes MV SELECT preparation and
+/// analysis only; it never acquires catalog or connector authority itself.
+pub(crate) fn analyze_mv_select_with_provider(
     current_catalog: Option<&str>,
-    catalog_service: &QueryCatalogService,
-    catalog_application: Option<&dyn CatalogApplicationPort>,
-    connector_control: &dyn ConnectorControlResolver,
+    provider: &dyn novarocks_sql::planning::catalog::PlannerTableProvider,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    connector_context: &ConnectorRequestContext,
 ) -> Result<MvAnalysis, String> {
     let prepared =
         prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
-    let provider = crate::query_execution::compiler::build_catalog_service_provider(
-        current_catalog,
-        catalog_service,
-        connector_control,
-        connector_context.clone(),
-        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-        catalog_application,
-    );
-    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&provider);
+    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(provider);
     let refresh_input = novarocks_sql::compiler::analyze_mv_refresh_input(
         novarocks_sql::compiler::SqlMvRefreshAnalysisContext {
             query: Box::new(prepared.query_for_analysis().clone()),

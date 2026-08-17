@@ -20,6 +20,14 @@
 //! The SQL catalog vocabulary exposes neutral `ResolvedAnalyzerTable` facts.
 //! This module owns catalog registry cache entries and all connector control
 //! acquisition needed to materialize them.
+//!
+//! The seam against query assembly runs through
+//! [`ConnectorQueryTableMaterialization`]: acquiring the connector control
+//! lease and projecting provider metadata into neutral catalog facts is a
+//! catalog responsibility and lives here, while turning those facts into a
+//! request-local SQL binding belongs to query assembly. The dependency is
+//! therefore one-way: query assembly reads this module, and this module never
+//! reaches back into it.
 
 use std::sync::{Arc, RwLock};
 
@@ -30,6 +38,163 @@ use novarocks_catalog::service::CatalogService;
 use novarocks_catalog::table::CatalogTable;
 
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
+
+/// Provider-neutral table facts admitted for one request.  Core projects the
+/// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
+/// never decodes a provider table handle or metadata payload.
+#[derive(Clone)]
+pub(crate) struct ConnectorQueryTableMaterialization {
+    pub(crate) schema_version: Option<Vec<u8>>,
+    pub(crate) columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) read_table: novarocks_spi::connector::ConnectorTableHandle,
+    pub(crate) read_schema: arrow::datatypes::SchemaRef,
+    pub(crate) read_selector: novarocks_spi::connector::ConnectorReadSelector,
+    pub(crate) sql_planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
+    pub(crate) statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+}
+
+pub(crate) fn load_connector_table_materialization_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    load_connector_table_materialization_with_resolution(
+        controls,
+        context,
+        catalog,
+        namespace,
+        table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )
+}
+
+/// Load one provider-defined read alias through the same opaque metadata
+/// contract used for base tables. The alias syntax is application-owned, but
+/// Core neither decodes the returned table handle nor names a provider type.
+pub(crate) fn load_connector_table_alias_materialization_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    alias: &str,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    load_connector_table_materialization_with_resolution(
+        controls,
+        context,
+        catalog,
+        namespace,
+        alias,
+        novarocks_spi::connector::ConnectorTableResolution::ProviderReadAlias,
+    )
+}
+
+fn load_connector_table_materialization_with_resolution(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    resolution: novarocks_spi::connector::ConnectorTableResolution,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
+    };
+
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let planning_lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    let metadata = planning_lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution,
+            context,
+        })
+        // An absent relation is a SQL name-resolution failure, not a provider
+        // incident: render the vocabulary the rest of the engine already
+        // recognizes instead of leaking the provider's own wording.
+        .map_err(|error| match error.kind() {
+            novarocks_spi::connector::ConnectorErrorKind::NotFound => {
+                format!("unknown table: {namespace}.{table}")
+            }
+            _ => error.to_string(),
+        })?;
+    connector_table_materialization_from_metadata(metadata, planning_lease)
+}
+
+pub(crate) fn connector_table_materialization_from_metadata(
+    metadata: novarocks_spi::connector::ConnectorTableMetadata,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    use novarocks_spi::connector::{
+        ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+    };
+
+    let mut columns = Vec::new();
+    let mut row_lineage_metadata_columns = Vec::new();
+    for (ordinal, field) in metadata.schema.fields().iter().enumerate() {
+        let fact = metadata.planning_facts.column_facts().get(ordinal);
+        let logical_type = match fact.map(|fact| fact.semantic_kind()) {
+            Some(ConnectorTableColumnSemanticKind::Bitmap) => {
+                Some(novarocks_catalog::schema::SqlType::Bitmap)
+            }
+            Some(ConnectorTableColumnSemanticKind::Hll) => {
+                Some(novarocks_catalog::schema::SqlType::Hll)
+            }
+            _ => None,
+        };
+        let column = novarocks_catalog::schema::ColumnDef {
+            name: field.name().to_string(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: crate::connector::connector_write_default_at(
+                &metadata.planning_facts,
+                ordinal,
+            ),
+            logical_type,
+        };
+        match fact.map(|fact| fact.role()) {
+            Some(ConnectorTableColumnRole::RowLineageSystem) => {
+                row_lineage_metadata_columns.push(column)
+            }
+            _ if matches!(
+                fact.map(|fact| fact.visibility()),
+                Some(ConnectorTableColumnVisibility::Hidden)
+            ) => {}
+            _ => columns.push(column),
+        }
+    }
+    let statistics_pin = metadata
+        .statistics_data_version
+        .clone()
+        .map(
+            |data_version| crate::connector::backend::ResolvedTableStatisticsPin {
+                table: metadata.table.clone(),
+                data_version,
+            },
+        );
+    Ok(ConnectorQueryTableMaterialization {
+        schema_version: metadata.version.map(|version| version.to_vec()),
+        columns,
+        row_lineage_metadata_columns,
+        read_table: metadata.table,
+        read_schema: metadata.schema.clone(),
+        read_selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+        sql_planning_facts: metadata.planning_facts,
+        statistics_pin,
+        planning_lease,
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct CatalogRuntimeMetadata {
@@ -49,7 +214,7 @@ impl CatalogRuntimeMetadata {
 
     fn from_connector_materialization(
         identity: TableIdentity,
-        materialization: &crate::query_execution::planning::catalog_materializer::ConnectorQueryTableMaterialization,
+        materialization: &ConnectorQueryTableMaterialization,
     ) -> Self {
         Self {
             table: CatalogTable {
@@ -137,17 +302,16 @@ impl Catalog<CatalogRuntimeMetadata> for ConnectorCatalog {
         table: &str,
     ) -> Result<CatalogRuntimeMetadata, String> {
         let identity = TableIdentity::new(&self.name, namespace, table);
-        let materialization =
-            crate::query_execution::planning::catalog_materializer::load_connector_table_materialization_with_lease(
-                self.controls.as_ref(),
-                crate::connector::connector_request_context(
-                    None,
-                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                )?,
-                &self.name,
-                namespace,
-                table,
-            )?;
+        let materialization = load_connector_table_materialization_with_lease(
+            self.controls.as_ref(),
+            crate::connector::connector_request_context(
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+            &self.name,
+            namespace,
+            table,
+        )?;
         self.cache
             .get_or_build_validated(&identity, materialization.schema_version.clone(), || {
                 Ok(CatalogRuntimeMetadata::from_connector_materialization(

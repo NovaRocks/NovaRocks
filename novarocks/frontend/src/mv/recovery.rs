@@ -1100,14 +1100,19 @@ mod tests {
         failure: Option<&'static str>,
     }
 
-    impl novarocks::mv::application::MvRefreshProviderActivation for TestDescriptorProjection {
+    impl novarocks::query_execution::mv_native_write::MvRefreshProviderActivation
+        for TestDescriptorProjection
+    {
         fn activate_write(
             &self,
             _prepared: novarocks::mv::application::PreparedMvRefreshWrite,
             _planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
             _exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
             _execution: &novarocks::query_execution::request_context::QueryExecutionContext,
-        ) -> Result<novarocks::mv::application::PreparedMvNativeWriteAssembly, String> {
+        ) -> Result<
+            novarocks::query_execution::mv_native_write::PreparedMvNativeWriteAssembly,
+            String,
+        > {
             unreachable!("recovery never activates a writer")
         }
 
@@ -1263,7 +1268,7 @@ mod tests {
         host.register(binding).expect("register control binding");
         let provider_activation =
             Arc::new(super::super::refresh::FrontendMvRefreshProviderActivationPort::new());
-        novarocks::mv::application::MvRefreshProviderActivationSink::bind_mv_refresh_provider_activation(
+        novarocks::query_execution::mv_native_write::MvRefreshProviderActivationSink::bind_mv_refresh_provider_activation(
             provider_activation.as_ref(),
             projection,
         )

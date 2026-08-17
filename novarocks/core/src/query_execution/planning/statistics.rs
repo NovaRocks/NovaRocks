@@ -22,6 +22,10 @@ use novarocks_spi::connector::{
     ConnectorControlResolver, StatisticsMetric, StatisticsMetricRequest,
 };
 
+use crate::catalog_application::query_catalog::{
+    load_connector_table_alias_materialization_with_lease,
+    load_connector_table_materialization_with_lease,
+};
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
@@ -34,8 +38,6 @@ use crate::query_execution::planning::bindings::{
 };
 use crate::query_execution::planning::catalog_materializer::{
     QueryTableBindingLoader, connector_query_binding_from_materialization,
-    load_connector_table_alias_materialization_with_lease,
-    load_connector_table_materialization_with_lease,
 };
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
 use novarocks_sql::planning::dml::{

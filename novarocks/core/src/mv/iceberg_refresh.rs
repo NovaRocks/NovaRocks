@@ -434,14 +434,19 @@ fn prepare_managed_repartition_transition(
         current_catalog,
         current_database,
     );
-    let analysis = crate::mv::analysis_adapter::analyze_mv_select_with_ports(
+    let provider = crate::query_execution::compiler::build_catalog_service_provider(
         current_catalog,
         source.catalog_service().as_ref(),
-        source.catalog_application(),
         source.connector_control(),
+        connector_context.clone(),
+        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+        source.catalog_application(),
+    );
+    let analysis = crate::mv::analysis_adapter::analyze_mv_select_with_provider(
+        current_catalog,
+        &provider,
         current_database,
         &query,
-        connector_context,
     )?;
     validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;
     if derive_fragment_property(&analysis)?.is_composed_aggregate_schema_contract_fallback() {
@@ -2222,14 +2227,19 @@ fn prepare_iceberg_mv_create_with_ports(
     );
     let catalog_service =
         crate::catalog_application::query_catalog::catalog_service_snapshot(ports);
-    let analysis = crate::mv::analysis_adapter::analyze_mv_select_with_ports(
+    let provider = crate::query_execution::compiler::build_catalog_service_provider(
         Some(current_catalog),
         &catalog_service,
-        ports.catalog_application.as_deref(),
         ports.connector_control.as_ref(),
+        connector_context.clone(),
+        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+        ports.catalog_application.as_deref(),
+    );
+    let analysis = crate::mv::analysis_adapter::analyze_mv_select_with_provider(
+        Some(current_catalog),
+        &provider,
         current_database,
         &canonical_select_query,
-        connector_context,
     )?;
     let refresh_contract = derive_imv_refresh_contract(&analysis)?;
     let partition_fields = partition_fields_for_create(stmt.partition_by.as_ref());
@@ -6831,14 +6841,19 @@ fn build_aggregate_layout_for_refresh_select_sql(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let visible_query = parse_mv_select_query(select_sql)?;
-    let visible_analysis = crate::mv::analysis_adapter::analyze_mv_select_with_ports(
+    let provider = crate::query_execution::compiler::build_catalog_service_provider(
         current_catalog,
         source.catalog_service().as_ref(),
-        source.catalog_application(),
         source.connector_control(),
+        connector_context.clone(),
+        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+        source.catalog_application(),
+    );
+    let visible_analysis = crate::mv::analysis_adapter::analyze_mv_select_with_provider(
+        current_catalog,
+        &provider,
         current_database,
         &visible_query,
-        connector_context,
     )?;
     let facts = visible_analysis
         .refresh_input
@@ -7422,7 +7437,7 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
             &base.table,
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         )?;
-        let mut materialization = crate::query_execution::planning::catalog_materializer::connector_table_materialization_from_metadata(
+        let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
             metadata,
             planning_lease,
         )?;
@@ -7995,7 +8010,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
-) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
+) -> Result<crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly, String> {
     let (request, facts, mode, evidence, execution_artifact, publication_intent) =
         prepared.into_parts();
     if request.observed_binding != *exact_lease.binding_key() {

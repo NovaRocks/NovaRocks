@@ -16,12 +16,14 @@ use novarocks_spi::connector::{
 };
 
 use crate::mv::application::{
-    MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshPublicationIntent,
-    MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite, PreparedMvNativeWriteAssembly,
-    PreparedMvRefreshWrite,
+    MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
+    PreparedMvFirstRefreshWrite, PreparedMvRefreshWrite,
 };
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
+use crate::query_execution::mv_native_write::{
+    MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
+};
 use crate::query_execution::request_context::QueryExecutionContext;
 
 /// Core-side provider adapter installed into the frontend composition.

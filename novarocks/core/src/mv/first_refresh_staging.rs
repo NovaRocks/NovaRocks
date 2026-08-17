@@ -11,11 +11,11 @@ use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLeas
 use crate::catalog_application::query_catalog::catalog_service_snapshot;
 use crate::mv::application::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,
-    PreparedMvNativeWriteAssembly,
 };
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::compiler::prepare_sealed_iceberg_write_native_assembly;
 use crate::query_execution::kernels::QueryPreparationKernel;
+use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, dml_write_plan_input_for_admitted_target,

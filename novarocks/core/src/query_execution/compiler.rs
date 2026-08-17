@@ -25,6 +25,7 @@ use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
+use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 pub use crate::query_execution::post_compile::{
     NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
 };
@@ -38,9 +39,9 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 
 use crate::catalog_application::query_catalog::{QueryCatalogService, new_query_catalog_service};
 use crate::connector::UnifiedStatisticsResolver;
+use crate::mv::application::MvApplicationService;
 #[cfg(test)]
 use crate::mv::application::UnavailableMvApplicationService;
-use crate::mv::application::{MvApplicationService, MvRefreshProviderActivation};
 use crate::mv::repository::MvRepository;
 #[cfg(test)]
 use crate::mv::repository::UnavailableMvRepository;
@@ -2182,7 +2183,7 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     query_table_bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, String> {
     crate::connector::validate_request_context(connector_context)?;
     let scan_resolver =
         crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
@@ -2199,7 +2200,7 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     )?;
     let cohort_id = connector_write.cohort_id();
     let exact_lease = connector_write.lease();
-    Ok(crate::mv::application::PreparedMvNativeWriteAssembly::new(
+    Ok(PreparedMvNativeWriteAssembly::new(
         NativeFragmentEncodingInput::new(distributed_plan, prepared),
         None,
         crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
@@ -2217,13 +2218,13 @@ pub(crate) fn prepare_planned_iceberg_change_stream_write(
     encoding: NativeFragmentEncodingInput,
     query_opts: Option<QueryOptions>,
     connector_write: Option<DistributedConnectorWrite>,
-) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, String> {
     let Some(DistributedConnectorWrite::Begin(template)) = connector_write else {
         return Err("prepared connector write requires an unsealed write template".to_string());
     };
     let cohort_id = template.cohort_id();
     let exact_lease = template.lease();
-    Ok(crate::mv::application::PreparedMvNativeWriteAssembly::new(
+    Ok(PreparedMvNativeWriteAssembly::new(
         encoding,
         query_opts,
         crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),

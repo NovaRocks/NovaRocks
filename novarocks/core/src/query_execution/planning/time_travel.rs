@@ -427,7 +427,7 @@ pub(crate) fn external_schema_columns_for_statement(
     }
 
     let materialization =
-        crate::query_execution::planning::catalog_materializer::load_connector_table_materialization_with_lease(
+        crate::catalog_application::query_catalog::load_connector_table_materialization_with_lease(
             resolver.connector_control(),
             crate::connector::connector_request_context(
                 None,

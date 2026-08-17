@@ -592,7 +592,7 @@ impl MvRefreshProviderActivationPorts {
 /// and retains the admitted query execution service for native writes.
 pub fn mv_refresh_provider_activation(
     ports: MvRefreshProviderActivationPorts,
-) -> Arc<dyn novarocks::mv::application::MvRefreshProviderActivation> {
+) -> Arc<dyn novarocks::query_execution::mv_native_write::MvRefreshProviderActivation> {
     let query_kernel = domain::QueryPreparationKernel::new(
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
@@ -619,7 +619,7 @@ pub fn mv_refresh_provider_activation(
 
 /// Bind MV refresh activation before the Frontend performs startup restore.
 pub fn bind_mv_refresh_provider_activation(
-    sink: &dyn novarocks::mv::application::MvRefreshProviderActivationSink,
+    sink: &dyn novarocks::query_execution::mv_native_write::MvRefreshProviderActivationSink,
     ports: MvRefreshProviderActivationPorts,
 ) -> Result<(), String> {
     sink.bind_mv_refresh_provider_activation(mv_refresh_provider_activation(ports))

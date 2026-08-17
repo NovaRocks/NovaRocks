@@ -25,8 +25,7 @@ use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
 };
 use novarocks::mv::application::{
-    MvApplicationError, MvApplicationErrorKind, MvRefreshCommittedFacts,
-    MvRefreshProviderActivation, MvRefreshProviderActivationSink, MvRefreshPublishedFacts,
+    MvApplicationError, MvApplicationErrorKind, MvRefreshCommittedFacts, MvRefreshPublishedFacts,
     MvStatementResult, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use novarocks::mv::persistence::refresh::{
@@ -39,6 +38,9 @@ use novarocks::mv::repository::{
 };
 use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
+use novarocks::query_execution::mv_native_write::{
+    MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
+};
 use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use novarocks::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{
@@ -97,7 +99,7 @@ impl FrontendMvRefreshProviderActivationPort {
         planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         lease: &novarocks_spi::connector::ConnectorWriteLease,
         execution: &novarocks::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<novarocks::mv::application::PreparedMvNativeWriteAssembly, MvApplicationError> {
+    ) -> Result<PreparedMvNativeWriteAssembly, MvApplicationError> {
         let activation = self
             .activation
             .read()
@@ -1098,14 +1100,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use novarocks::mv::application::PreparedMvNativeWriteAssembly;
     use novarocks::mv::application::{
-        MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshProviderActivationSink,
-        MvRefreshPublicationIntent, PreparedMvRefreshWrite,
+        MvRefreshCommittedFacts, MvRefreshPublicationIntent, PreparedMvRefreshWrite,
     };
     use novarocks::mv::persistence::refresh::{
         FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
         FrontendMvRefreshCommittedVersion,
+    };
+    use novarocks::query_execution::mv_native_write::{
+        MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
     };
     use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_spi::connector::{
