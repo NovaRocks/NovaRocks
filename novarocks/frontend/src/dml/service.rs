@@ -570,7 +570,10 @@ mod tests {
     fn local_statistics_observation_never_resolves_an_external_schema() {
         let catalog = Arc::new(new_query_catalog_service());
         {
-            let mut local = catalog.local().write().expect("frontend local catalog write lock");
+            let mut local = catalog
+                .local()
+                .write()
+                .expect("frontend local catalog write lock");
             local.create_database("analytics").expect("create database");
             novarocks_sql::planning::catalog::register_test_connector_read_table(
                 &mut local,
@@ -595,9 +598,11 @@ mod tests {
             .expect("local table has a schema");
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].name, "order_id");
-        assert!(service
-            .local_statistics_columns("analytics", "missing")
-            .expect("unknown local table is not an observation failure")
-            .is_none());
+        assert!(
+            service
+                .local_statistics_columns("analytics", "missing")
+                .expect("unknown local table is not an observation failure")
+                .is_none()
+        );
     }
 }
