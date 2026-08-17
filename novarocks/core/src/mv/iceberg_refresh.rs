@@ -103,7 +103,10 @@ use crate::mv::schema_validation::{validate_join_schema_contract, validate_schem
 use crate::mv::storage_observation::MvSchemaValidationObservation;
 use crate::mv::storage_observation::{MvStorageObservationPort, MvTargetCreationObservation};
 use crate::query_execution::StatementResult;
-use crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs;
+use crate::query_execution::mv_assembly::query_local_bindings::{
+    bind_imv_target_query_table_in_store_from_rewrite,
+    freeze_imv_base_query_local_overlays_from_captured_inputs,
+};
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact,
     MvIncrementalWritePreparer, MvIncrementalWriteRequest, MvRefreshPublicationBase,
@@ -7211,92 +7214,6 @@ fn sql_imv_planning_input_from_rewrite(
         rewrite.to_sql_rewrite_snapshot(target_binding)?,
         validation,
     ))
-}
-
-/// Freeze the IMV target exactly once for one compilation request.  The SQL
-/// planner receives only the returned scoped token; the provider table/files
-/// and retained control generation stay in the application binding store.
-pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
-    rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
-    store: &Arc<QueryTableBindingStore>,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
-    let target = &rewrite.target;
-    let target_table_uuid = rewrite.target_table_uuid.clone();
-    let frozen_snapshot_id = rewrite.target_snapshot_id;
-    let planning_lease = planning_lease.clone();
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &planning_lease,
-        connector_context.clone(),
-        &target.namespace,
-        &target.table,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?;
-    let selector = frozen_snapshot_id
-        .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
-        .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
-    let target_read = QueryScanMaterialization {
-        table: metadata.table.clone(),
-        schema: metadata.schema.clone(),
-        selector,
-        statistics_pin: None,
-        planning_lease: planning_lease.clone(),
-    };
-    let mv_target_read = MvTargetReadAdmission {
-        full: target_read.clone(),
-        affected_partitions: target_read,
-        target_table_uuid: target_table_uuid.clone(),
-        frozen_snapshot_id,
-    };
-    let key = QueryTableBindingKey::mv_target(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-        &target_table_uuid,
-        frozen_snapshot_id,
-    );
-    let token = store.resolve_or_insert_with_id(key, |binding| {
-        let resolved = novarocks_sql::planning::catalog::materialize_mv_target_locator_table(
-            novarocks_sql::planning::catalog::SqlMvTargetLocatorTableFacts::try_new(
-                target.catalog.clone(),
-                target.namespace.clone(),
-                target.table.clone(),
-                target_table_uuid.clone(),
-                frozen_snapshot_id,
-                rewrite
-                    .schema_contract
-                    .target
-                    .hidden_apply_key
-                    .column_name
-                    .clone(),
-                rewrite
-                    .schema_contract
-                    .branch
-                    .as_ref()
-                    .map(|branch| branch.branch_id_column.column_name.clone()),
-                binding,
-            )?,
-        )
-        .into_resolved_table();
-        Ok(QueryTableBinding {
-            resolved,
-            // IMV target scans use their frozen file materialization; no
-            // optimizer statistics are resolved for this target as a side
-            // channel during refresh preparation.
-            statistics_pin: None,
-            admission:
-                crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact(
-                    planning_lease,
-                ),
-            scan_materialization: Some(mv_target_read.full.clone()),
-            mv_target_read: Some(mv_target_read),
-            write_target_admission: None,
-            frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
-        })
-    })?;
-    Ok(token)
 }
 
 #[cfg(test)]

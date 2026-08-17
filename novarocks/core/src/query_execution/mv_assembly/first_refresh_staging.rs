@@ -173,7 +173,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             )?;
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
             let target_binding =
-                crate::mv::iceberg_refresh::bind_imv_target_query_table_in_store_from_rewrite(
+                crate::query_execution::mv_assembly::query_local_bindings::bind_imv_target_query_table_in_store_from_rewrite(
                     &refresh_rewrite,
                     &bindings,
                     planning_lease,

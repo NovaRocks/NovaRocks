@@ -16,17 +16,103 @@
 //! Request-local IMV table bindings assembled from already captured facts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
 use crate::mv::refresh::pin::RefreshSnapshotPin;
-use crate::query_execution::planning::bindings::QueryScanMaterialization;
-use crate::query_execution::planning::bindings::QueryTableBindingKey;
+use crate::mv::rewrite::context::IcebergMvRewriteContext;
+use crate::query_execution::planning::bindings::{
+    MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
+    QueryTableBindingStore,
+};
 use crate::query_execution::planning::catalog_materializer::{
     QueryLocalTableOverlay, admit_connector_change_window,
     connector_query_binding_from_materialization,
 };
+
+/// Freeze the IMV target exactly once for one compilation request. The SQL
+/// planner receives only the returned scoped token; provider table/files and
+/// retained control generation stay in the request-local binding store.
+pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
+    rewrite: &IcebergMvRewriteContext,
+    store: &Arc<QueryTableBindingStore>,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    connector_context: &ConnectorRequestContext,
+) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
+    let target = &rewrite.target;
+    let target_table_uuid = rewrite.target_table_uuid.clone();
+    let frozen_snapshot_id = rewrite.target_snapshot_id;
+    let planning_lease = planning_lease.clone();
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &planning_lease,
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let selector = frozen_snapshot_id
+        .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
+        .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
+    let target_read = QueryScanMaterialization {
+        table: metadata.table.clone(),
+        schema: metadata.schema.clone(),
+        selector,
+        statistics_pin: None,
+        planning_lease: planning_lease.clone(),
+    };
+    let mv_target_read = MvTargetReadAdmission {
+        full: target_read.clone(),
+        affected_partitions: target_read,
+        target_table_uuid: target_table_uuid.clone(),
+        frozen_snapshot_id,
+    };
+    let key = QueryTableBindingKey::mv_target(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        &target_table_uuid,
+        frozen_snapshot_id,
+    );
+    store.resolve_or_insert_with_id(key, |binding| {
+        let resolved = novarocks_sql::planning::catalog::materialize_mv_target_locator_table(
+            novarocks_sql::planning::catalog::SqlMvTargetLocatorTableFacts::try_new(
+                target.catalog.clone(),
+                target.namespace.clone(),
+                target.table.clone(),
+                target_table_uuid.clone(),
+                frozen_snapshot_id,
+                rewrite
+                    .schema_contract
+                    .target
+                    .hidden_apply_key
+                    .column_name
+                    .clone(),
+                rewrite
+                    .schema_contract
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.branch_id_column.column_name.clone()),
+                binding,
+            )?,
+        )
+        .into_resolved_table();
+        Ok(QueryTableBinding {
+            resolved,
+            statistics_pin: None,
+            admission:
+                crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact(
+                    planning_lease,
+                ),
+            scan_materialization: Some(mv_target_read.full.clone()),
+            mv_target_read: Some(mv_target_read),
+            write_target_admission: None,
+            frozen_snapshot_materializations: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
+        })
+    })
+}
 
 /// Materialize every pinned IMV base immediately after capture. The returned
 /// overlays retain the exact connector lease, table handle, selected files and
