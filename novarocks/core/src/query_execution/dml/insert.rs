@@ -35,7 +35,6 @@ use crate::query_execution::dml::external_write_fence::{
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
-use crate::statistics::StatisticsEngine;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::planning::dml::parse_raw_statement;
 use novarocks_sql::syntax::{Literal, ObjectName};
@@ -198,7 +197,7 @@ pub enum IcebergWriteReport {
 
 /// Iceberg write port used by frontend-owned native INSERT orchestration.
 // Design: ADR-0021 (docs/adr/ADR-0021-native-frontend-insert-is-iceberg-only.md)
-pub trait InsertEngine: StatisticsEngine + Send + Sync {
+pub trait InsertEngine: Send + Sync {
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String>;
 
     fn prepare_iceberg_write(

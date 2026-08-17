@@ -36,6 +36,7 @@ use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Statement};
 use sqlparser::parser::Parser;
 use tokio::runtime::Handle;
 
+pub(crate) mod command;
 mod iceberg;
 pub mod repository;
 mod rewrite;

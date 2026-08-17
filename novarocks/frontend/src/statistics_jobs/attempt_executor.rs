@@ -26,20 +26,20 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
-use novarocks::query_execution::backend::BackendTopologyService;
-use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::statistics::application::{
+use crate::statistics_jobs::application::{
     StatisticsApplicationError, StatisticsAttemptExecutor, StatisticsAttemptRequest,
     StatisticsCollectedAttempt,
 };
+use bytes::Bytes;
+use novarocks::query_execution::backend::BackendTopologyService;
+use novarocks::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorMutationOperationId, ConnectorRequestContext,
-    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorTableHandle,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    StatisticsCollectionRequest, StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReconcileRequest,
+    ConnectorStatisticsLease, ConnectorTableHandle, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsCollectionRequest, StatisticsDataVersion,
+    StatisticsMetric, StatisticsMetricRequest, StatisticsPublishPreparationRequest,
+    StatisticsPublishRequest, StatisticsReconcileRequest,
 };
 
 /// Exact Frontend composition leaves retained by the durable ANALYZE worker.

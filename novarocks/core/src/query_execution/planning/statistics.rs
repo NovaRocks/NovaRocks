@@ -18,15 +18,16 @@
 
 use std::sync::Arc;
 
+use crate::catalog_application::query_bindings::{QueryTableBinding, QueryTableBindingStore};
+#[cfg(test)]
 use crate::catalog_application::query_bindings::{
-    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingStore,
-    parse_time_travel_overlay_identity,
+    QueryTableBindingAdmission, parse_time_travel_overlay_identity,
 };
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
 use crate::query_execution::kernels::{
-    DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel, StatisticsExecutionKernel,
+    DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
 use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
@@ -103,7 +104,6 @@ macro_rules! impl_kernel_statistics_resolver {
 impl_kernel_statistics_resolver!(QueryPreparationKernel);
 impl_kernel_statistics_resolver!(DmlExecutionKernel);
 impl_kernel_statistics_resolver!(MvExecutionKernel);
-impl_kernel_statistics_resolver!(StatisticsExecutionKernel);
 
 /// Project every admission-frozen connector observation into SQL values before
 /// optimization begins.  This is the one application boundary that may touch

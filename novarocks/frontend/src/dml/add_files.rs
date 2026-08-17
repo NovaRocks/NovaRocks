@@ -1577,7 +1577,7 @@ mod tests {
         (
             DmlService::compose_with_coordination(
                 Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-                Arc::new(novarocks::statistics::EmptyStatisticsService),
+                Arc::new(crate::statistics::FrontendStatisticsService::new()),
                 coordination(),
                 shared_runtime().handle().clone(),
             ),

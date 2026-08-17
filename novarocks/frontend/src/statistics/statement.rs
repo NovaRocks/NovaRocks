@@ -15,21 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::statistics::{
-    StatisticsEngine, StatisticsRequestContext, StatisticsStatementResult, StatisticsTableTarget,
-};
+use novarocks::catalog_application::query_catalog::QueryCatalogService;
 
-use super::FrontendStatisticsService;
-use super::model::ColumnStatRow;
 use super::model::{HistogramStatRow, MultiColumnStatRow, TableKey};
-use super::observation::{
-    add_analyze_status, drop_all_table_stats, observe_update, replace_column_stats,
-};
+use super::observation::{add_analyze_status, drop_all_table_stats, observe_update};
 use super::query::{normalize_name, ok_result};
+use super::{
+    FrontendStatisticsService, StatisticsColumn, StatisticsRequestContext,
+    StatisticsStatementResult,
+};
 
 pub(super) fn try_handle_statement(
     service: &FrontendStatisticsService,
-    engine: &dyn StatisticsEngine,
+    catalog_service: &QueryCatalogService,
     sql: &str,
     context: StatisticsRequestContext<'_>,
 ) -> Result<Option<StatisticsStatementResult>, String> {
@@ -82,7 +80,7 @@ pub(super) fn try_handle_statement(
         return Ok(Some(StatisticsStatementResult::Ok));
     }
     if lower.starts_with("analyze ") {
-        handle_analyze_statement(service, engine, trimmed, context)?;
+        handle_analyze_statement(service, catalog_service, trimmed, context)?;
         return Ok(Some(StatisticsStatementResult::Query(ok_result()?)));
     }
     Ok(None)
@@ -90,7 +88,7 @@ pub(super) fn try_handle_statement(
 
 fn handle_analyze_statement(
     service: &FrontendStatisticsService,
-    engine: &dyn StatisticsEngine,
+    catalog_service: &QueryCatalogService,
     sql: &str,
     context: StatisticsRequestContext<'_>,
 ) -> Result<(), String> {
@@ -113,12 +111,7 @@ fn handle_analyze_statement(
         return Ok(());
     }
 
-    let target = StatisticsTableTarget {
-        current_catalog: context.current_catalog.map(str::to_owned),
-        current_database: context.current_database.to_string(),
-        name_parts: table_parts(&table)?,
-    };
-    let available = engine.resolve_table_columns(&target)?;
+    let available = local_table_columns(catalog_service, context.current_database, &table)?;
     if lower.contains(" update histogram on ") {
         let columns = if lower.contains(" on all columns") {
             available
@@ -215,33 +208,33 @@ fn handle_analyze_statement(
     } else {
         columns.join(",")
     };
-    let collected = engine.collect_table_statistics(&target, &columns)?;
-    publish_collected_statistics(service, &key, collected, &status_columns)
+    let _ = (columns, status_columns);
+    Err("legacy in-memory statistics collection is unavailable; use the frontend ANALYZE command route".to_string())
 }
 
-fn publish_collected_statistics(
-    service: &FrontendStatisticsService,
-    key: &TableKey,
-    collected: Vec<novarocks::statistics::CollectedColumnStatistics>,
-    status_columns: &str,
-) -> Result<(), String> {
-    let rows = collected
-        .into_iter()
-        .map(|row| {
-            Ok(ColumnStatRow {
-                key: key.clone(),
-                column_name: normalize_name(&row.column_name)?,
-                partition_name: key.table.clone(),
-                row_count: row.row_count,
-                max: row.max,
-                min: row.min,
-                ndv: row.ndv,
-            })
+/// Legacy statistics observation is restricted to the frontend's local
+/// catalog schema. It must not re-open connector metadata or borrow a query
+/// execution kernel after a DML command has completed.
+fn local_table_columns(
+    catalog_service: &QueryCatalogService,
+    current_database: &str,
+    name: &str,
+) -> Result<Vec<StatisticsColumn>, String> {
+    let key = table_key(name, current_database)?;
+    let catalog = catalog_service
+        .local()
+        .read()
+        .expect("frontend local catalog read lock");
+    let table =
+        novarocks_sql::planning::catalog::local_catalog_table(&catalog, &key.db, &key.table)?;
+    Ok(table
+        .columns
+        .iter()
+        .map(|column| StatisticsColumn {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    replace_column_stats(service, key, rows);
-    add_analyze_status(service, key, status_columns, "FULL", false);
-    Ok(())
+        .collect())
 }
 
 fn table_token_after(sql: &str, prefix: &str) -> Result<String, String> {

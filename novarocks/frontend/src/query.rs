@@ -54,8 +54,6 @@ use novarocks::server::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
-use novarocks::statistics::command::StatisticsCommandExecutor;
-use novarocks::view::view_command::ViewCommandExecutor;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 use novarocks_protocol::lifecycle::QueryOptions;
@@ -64,6 +62,8 @@ use tokio::task;
 
 use crate::dml::DmlService;
 use crate::query::compiler::FrontendQueryCompiler;
+use crate::statistics::command::StatisticsCommandExecutor;
+use crate::view::command::ViewCommandExecutor;
 
 pub(crate) mod compiler;
 
@@ -1391,10 +1391,6 @@ mod tests {
         PrepareMutationRequest, PreparedMutation,
     };
     use novarocks::query_execution::request_context::QueryExecutionContext;
-    use novarocks::statistics::{
-        CollectedColumnStatistics, EmptyStatisticsService, StatisticsColumn, StatisticsEngine,
-        StatisticsTableTarget,
-    };
     use novarocks_catalog::schema::ColumnDef;
 
     fn default_query_options() -> QueryOptions {
@@ -1495,31 +1491,6 @@ mod tests {
         resolve_contexts: Mutex<Vec<QueryExecutionContext>>,
     }
 
-    impl StatisticsEngine for RecordingInsertEngine {
-        fn resolve_table_columns(
-            &self,
-            _target: &StatisticsTableTarget,
-        ) -> Result<Vec<StatisticsColumn>, String> {
-            Ok(Vec::new())
-        }
-
-        fn resolve_local_table_columns(
-            &self,
-            _database: &str,
-            _table: &str,
-        ) -> Result<Option<Vec<StatisticsColumn>>, String> {
-            Ok(None)
-        }
-
-        fn collect_table_statistics(
-            &self,
-            _target: &StatisticsTableTarget,
-            _columns: &[String],
-        ) -> Result<Vec<CollectedColumnStatistics>, String> {
-            Ok(Vec::new())
-        }
-    }
-
     impl InsertEngine for RecordingInsertEngine {
         fn resolve_target(
             &self,
@@ -1616,7 +1587,10 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(41, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1646,7 +1620,10 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(73, deadline, &cancellation);
@@ -1720,7 +1697,10 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(91, deadline, &cancellation);
@@ -1752,7 +1732,10 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(92, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1790,7 +1773,10 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(93, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1835,7 +1821,10 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(94, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1920,7 +1909,10 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(94, Instant::now() + Duration::from_secs(30), &cancellation);

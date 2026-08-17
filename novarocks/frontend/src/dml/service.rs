@@ -17,8 +17,8 @@
 
 use std::sync::{Arc, RwLock};
 
+use novarocks::catalog_application::query_catalog::QueryCatalogService;
 use novarocks::query_execution::dml::ctas::CtasEngine;
-use novarocks::statistics::{EmptyStatisticsService, StatisticsService};
 use tokio::runtime::Handle;
 
 use crate::coordination::FrontendCoordinationRuntime;
@@ -39,13 +39,15 @@ use crate::dml::statement_recovery::{
     direct_mutation_kind, is_authority_loss,
 };
 use crate::dml::write_recovery::HistoricalWriteRecoveryResolver;
+use crate::statistics::{FrontendStatisticsService, StatisticsColumn};
 
 /// The frontend DML application owner. Composes the narrow ports (journal +
 /// admission) and drives write transactions. Constructed from narrow handles —
 /// never from the host or a service locator.
 pub struct DmlService {
     journal: Option<Arc<dyn OperationJournal>>,
-    statistics: Arc<dyn StatisticsService>,
+    statistics: Arc<FrontendStatisticsService>,
+    local_catalog: RwLock<Option<Arc<QueryCatalogService>>>,
     admission: Arc<dyn WriteAdmission>,
     coordinator: Option<DmlCoordinator>,
     allow_unfenced_focused_test_support: bool,
@@ -65,13 +67,13 @@ pub(crate) enum DmlRecoveryProgress {
 }
 
 impl DmlService {
-    /// Build a journal-backed service with no-op statistics.
+    /// Build a journal-backed service with frontend-local statistics observation.
     ///
     /// Production composition uses [`Self::compose`]; this constructor keeps
     /// the statement-agnostic DML-1 runner usable in focused tests.
     #[doc(hidden)]
     pub fn new(journal: Arc<dyn OperationJournal>) -> Self {
-        Self::compose(Some(journal), Arc::new(EmptyStatisticsService))
+        Self::compose(Some(journal), Arc::new(FrontendStatisticsService::new()))
     }
 
     /// Compose the production DML owner from optional StateStore capability
@@ -79,11 +81,12 @@ impl DmlService {
     #[doc(hidden)]
     pub fn compose(
         journal: Option<Arc<dyn OperationJournal>>,
-        statistics: Arc<dyn StatisticsService>,
+        statistics: Arc<FrontendStatisticsService>,
     ) -> Self {
         Self {
             journal,
             statistics,
+            local_catalog: RwLock::new(None),
             admission: Arc::new(AlwaysAdmit),
             coordinator: None,
             allow_unfenced_focused_test_support: true,
@@ -101,13 +104,14 @@ impl DmlService {
     #[doc(hidden)]
     pub fn compose_with_coordination(
         journal: Option<Arc<dyn OperationJournal>>,
-        statistics: Arc<dyn StatisticsService>,
+        statistics: Arc<FrontendStatisticsService>,
         frontend: Arc<FrontendCoordinationRuntime>,
         runtime: Handle,
     ) -> Self {
         Self {
             journal,
             statistics,
+            local_catalog: RwLock::new(None),
             admission: Arc::new(AlwaysAdmit),
             coordinator: Some(DmlCoordinator::new(frontend, runtime)),
             allow_unfenced_focused_test_support: false,
@@ -152,12 +156,13 @@ impl DmlService {
     /// Build a service with a custom admission gate (CP-3 fencing).
     pub(crate) fn with_admission(
         journal: Option<Arc<dyn OperationJournal>>,
-        statistics: Arc<dyn StatisticsService>,
+        statistics: Arc<FrontendStatisticsService>,
         admission: Arc<dyn WriteAdmission>,
     ) -> Self {
         Self {
             journal,
             statistics,
+            local_catalog: RwLock::new(None),
             admission,
             coordinator: None,
             allow_unfenced_focused_test_support: true,
@@ -390,8 +395,44 @@ impl DmlService {
         })
     }
 
-    pub(crate) fn statistics(&self) -> &dyn StatisticsService {
+    pub(crate) fn statistics(&self) -> &FrontendStatisticsService {
         self.statistics.as_ref()
+    }
+
+    /// Install the frontend-local catalog used solely to update legacy
+    /// in-memory statistics observation after a successful local DML command.
+    /// This is not a connector metadata path and cannot resolve an external
+    /// schema after the command's admitted target has been released.
+    pub(crate) fn install_local_catalog(&self, catalog: Arc<QueryCatalogService>) {
+        *self
+            .local_catalog
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(catalog);
+    }
+
+    pub(crate) fn local_statistics_columns(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<Vec<StatisticsColumn>>, DmlError> {
+        let catalog = self
+            .local_catalog
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(catalog) = catalog else {
+            return Ok(None);
+        };
+        match local_table_columns(catalog.as_ref(), database, table) {
+            Ok(columns) => Ok(Some(columns)),
+            Err(error)
+                if error.starts_with("unknown database:")
+                    || error.starts_with("unknown table:") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(DmlError::executor(error)),
+        }
     }
 
     /// Load a stored operation by id.
@@ -413,6 +454,26 @@ impl DmlService {
     }
 }
 
+fn local_table_columns(
+    catalog_service: &QueryCatalogService,
+    database: &str,
+    table: &str,
+) -> Result<Vec<StatisticsColumn>, String> {
+    let catalog = catalog_service
+        .local()
+        .read()
+        .expect("frontend local catalog read lock");
+    let table = novarocks_sql::planning::catalog::local_catalog_table(&catalog, database, table)?;
+    Ok(table
+        .columns
+        .iter()
+        .map(|column| StatisticsColumn {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -422,6 +483,8 @@ mod tests {
     use crate::dml::journal::testing::InMemoryOperationJournal;
     use crate::dml::model::{OperationKind, OperationState, OperationTarget, WriteTransactionSpec};
     use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
+    use novarocks::catalog_application::query_catalog::new_query_catalog_service;
+    use novarocks_catalog::schema::ColumnDef;
 
     struct OkExecutor;
 
@@ -501,5 +564,40 @@ mod tests {
         assert_eq!(operations[0].operation_id, id);
         assert_eq!(operations[0].state, OperationState::Finalized);
         assert!(service.list_unfinished_operations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_statistics_observation_never_resolves_an_external_schema() {
+        let catalog = Arc::new(new_query_catalog_service());
+        {
+            let mut local = catalog.local().write().expect("frontend local catalog write lock");
+            local.create_database("analytics").expect("create database");
+            novarocks_sql::planning::catalog::register_test_connector_read_table(
+                &mut local,
+                "analytics",
+                "orders",
+                vec![ColumnDef {
+                    name: "order_id".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+            )
+            .expect("register local table schema");
+        }
+        let service = DmlService::new(Arc::new(InMemoryOperationJournal::default()));
+        service.install_local_catalog(catalog);
+
+        let columns = service
+            .local_statistics_columns("analytics", "orders")
+            .expect("load local schema")
+            .expect("local table has a schema");
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "order_id");
+        assert!(service
+            .local_statistics_columns("analytics", "missing")
+            .expect("unknown local table is not an observation failure")
+            .is_none());
     }
 }

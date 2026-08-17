@@ -1,8 +1,6 @@
-use novarocks::statistics::{CatalogColumnStatistics, CatalogTableStatistics};
-
-use super::FrontendStatisticsService;
 use super::model::TableKey;
 use super::query::normalize_name;
+use super::{CatalogColumnStatistics, CatalogTableStatistics, FrontendStatisticsService};
 
 pub(super) fn catalog_table_statistics(
     service: &FrontendStatisticsService,

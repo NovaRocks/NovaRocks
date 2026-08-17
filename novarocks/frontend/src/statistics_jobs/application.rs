@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Typed Core-to-Frontend application port for unified statistics commands.
+//! Typed frontend application contract for unified statistics commands.
 //!
-//! This module deliberately contains no parser AST or SQL string. Core turns
-//! its parser variants into these commands exactly once; the frontend owns
-//! durable job state and implements this port without raw-SQL interception.
+//! This module deliberately contains no parser AST or raw-SQL interception.
+//! The frontend owns target resolution, durable job state, and worker composition.
 
 use std::any::Any;
 use std::fmt;
@@ -27,8 +26,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
-    ConnectorStatisticsResolver, ConnectorTableResolution, ExternalMutationEvidence,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorCancellation, ConnectorControlRegistry,
+    ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableRequest, ConnectorTableResolution, ExternalMutationEvidence,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsBasisRelation, StatisticsDataVersion,
     StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState,
@@ -58,7 +58,7 @@ pub struct StatisticsTablePin {
     pub columns: Vec<String>,
 }
 
-/// Core resolves a logical ANALYZE target exactly once. The frontend invokes
+/// The frontend resolves a logical ANALYZE target exactly once. The frontend invokes
 /// this before creating a job and persists the returned pin; background work
 /// has no latest-name resolution capability.
 pub trait StatisticsTargetResolver: Send + Sync {
@@ -68,7 +68,7 @@ pub trait StatisticsTargetResolver: Send + Sync {
     ) -> Result<StatisticsTablePin, StatisticsApplicationError>;
 }
 
-/// Frontend composition sink installed before engine open. Core calls it once
+/// Frontend composition sink installed before engine open. Frontend composition calls it once
 /// after connector control is ready, so ANALYZE submission can resolve and
 /// persist a pin without giving the durable worker a resolver.
 pub trait StatisticsTargetResolverSink: Send + Sync {
@@ -78,7 +78,7 @@ pub trait StatisticsTargetResolverSink: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Read-only Core table-statistics surface. Unlike ANALYZE submission, it is
+/// Read-only frontend table-statistics surface. Unlike ANALYZE submission, it is
 /// intentionally available without a StateStore and resolves its latest table
 /// metadata only for this one short-lived read.
 pub trait StatisticsTableReader: Send + Sync {
@@ -99,7 +99,7 @@ pub trait StatisticsTableReaderSink: Send + Sync {
 }
 
 /// Durable worker input expressed without any frontend repository type.  The
-/// table/version pin was fixed at ANALYZE submission; Core must not turn this
+/// table/version pin was fixed at ANALYZE submission; the worker must not turn this
 /// back into a name lookup when an attempt eventually runs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsAttemptRequest {
@@ -116,7 +116,7 @@ pub trait StatisticsCollectedAttempt: Send + Sync {
 }
 
 /// Frontend-owned implementation of provider-native collection and
-/// publication. Core retains only this durable-worker port and the immutable
+/// publication. The frontend retains this durable-worker port and the immutable
 /// request types; the frontend owns connector leases, native mapping, the
 /// distributed request, and `ExternalMutationOutcome` handling.
 pub trait StatisticsAttemptExecutor: Send + Sync {
@@ -144,7 +144,7 @@ pub trait StatisticsAttemptExecutor: Send + Sync {
     ) -> Result<(), StatisticsApplicationError>;
 }
 
-/// Composition sink used after Core has installed connector control and the
+/// Composition sink used after the frontend has installed connector control and the
 /// native coordinator.  A frontend with no StateStore may bind the read-only
 /// surfaces above but must decline this executor rather than construct an
 /// in-memory job table.
@@ -177,7 +177,7 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let (resolved, _) = crate::connector::metadata_load_table(
+        let metadata = load_statistics_table_metadata(
             self.controls.as_ref(),
             context,
             &target.catalog,
@@ -186,19 +186,26 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             ConnectorTableResolution::StrictBaseTable,
         )
         .map_err(StatisticsApplicationError::new)?;
-        let pin = resolved.statistics_pin.ok_or_else(|| {
+        let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
             StatisticsApplicationError::new(
                 "connector metadata did not provide a statistics data-version pin",
             )
         })?;
         Ok(StatisticsTablePin {
-            connector_instance_id: pin.table.owner().as_str().to_string(),
-            table_handle: pin.table.payload().to_vec(),
-            data_version: pin.data_version.as_bytes().to_vec(),
-            columns: resolved
-                .columns
-                .into_iter()
-                .map(|column| column.name)
+            connector_instance_id: metadata.table.owner().as_str().to_string(),
+            table_handle: metadata.table.payload().to_vec(),
+            data_version: data_version.as_bytes().to_vec(),
+            columns: metadata
+                .schema
+                .fields()
+                .iter()
+                .filter(|field| {
+                    field
+                        .metadata()
+                        .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                        .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
+                })
+                .map(|field| field.name().to_string())
                 .collect(),
         })
     }
@@ -220,7 +227,7 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
         target: &StatisticsTableTarget,
     ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError> {
         let context = statistics_request_context()?;
-        let (resolved, _) = crate::connector::metadata_load_table(
+        let metadata = load_statistics_table_metadata(
             self.controls.as_ref(),
             context.clone(),
             &target.catalog,
@@ -229,13 +236,25 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
             ConnectorTableResolution::StrictBaseTable,
         )
         .map_err(StatisticsApplicationError::new)?;
-        let pin = resolved.statistics_pin.ok_or_else(|| {
+        let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
             StatisticsApplicationError::new(
                 "connector metadata did not provide a statistics data-version pin",
             )
         })?;
-        let requested_metric_count =
-            1usize.saturating_add(resolved.columns.len().saturating_mul(5));
+        let requested_metric_count = 1usize.saturating_add(
+            metadata
+                .schema
+                .fields()
+                .iter()
+                .filter(|field| {
+                    field
+                        .metadata()
+                        .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                        .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
+                })
+                .count()
+                .saturating_mul(5),
+        );
         if requested_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
             return Err(StatisticsApplicationError::new(format!(
                 "SHOW TABLE STATS requires {requested_metric_count} metrics, exceeding the connector statistics limit of {MAX_CONNECTOR_STATISTICS_METRICS}",
@@ -243,8 +262,13 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
         }
         let mut metrics = Vec::with_capacity(requested_metric_count);
         metrics.push(StatisticsMetric::RowCount);
-        for column in &resolved.columns {
-            let name: Arc<str> = Arc::from(column.name.as_str());
+        for field in metadata.schema.fields().iter().filter(|field| {
+            field
+                .metadata()
+                .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
+        }) {
+            let name: Arc<str> = Arc::from(field.name().as_str());
             metrics.extend([
                 StatisticsMetric::NullCount {
                     column: Arc::clone(&name),
@@ -265,12 +289,12 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let lease = self
             .controls
-            .acquire_current_statistics(pin.table.owner())
+            .acquire_current_statistics(metadata.table.owner())
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let evidence = lease
             .read(StatisticsReadRequest {
-                table: pin.table,
-                data_version: pin.data_version,
+                table: metadata.table,
+                data_version,
                 metrics,
                 context,
             })
@@ -282,6 +306,36 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
             .map(|(metric, state)| statistics_table_stat_view(metric, state, &queried_version))
             .collect())
     }
+}
+
+/// Load one short-lived statistics observation directly through the
+/// frontend-owned connector-control registry.  This preserves the exact
+/// generation lease for the load and does not expose a Core metadata bridge.
+fn load_statistics_table_metadata(
+    controls: &dyn ConnectorControlRegistry,
+    context: ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    resolution: ConnectorTableResolution,
+) -> Result<ConnectorTableMetadata, String> {
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let binding = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    binding
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution,
+            context,
+        })
+        .map_err(|error| error.to_string())
 }
 
 fn statistics_request_context() -> Result<ConnectorRequestContext, StatisticsApplicationError> {
@@ -452,8 +506,7 @@ pub trait StatisticsApplicationPort: Send + Sync {
     ) -> Result<StatisticsApplicationResult, StatisticsApplicationError>;
 }
 
-/// Non-frontend composition must not gain an in-memory statistics authority.
-/// It fails closed until a frontend explicitly installs the durable port.
+/// A frontend composition with no durable statistics authority fails closed.
 pub struct UnavailableStatisticsApplicationPort;
 
 impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {

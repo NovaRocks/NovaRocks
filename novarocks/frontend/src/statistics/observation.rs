@@ -1,15 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::datatypes::DataType;
-use novarocks::statistics::{
-    StatisticsColumn, StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral,
-    StatisticsOverwriteMode,
-};
 use sqlparser::ast as sqlast;
 
-use super::FrontendStatisticsService;
 use super::model::{AnalyzeStatusRow, ColumnStatRow, TableKey};
 use super::query::normalize_name;
+use super::{
+    FrontendStatisticsService, StatisticsColumn, StatisticsInsertObservation,
+    StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode,
+};
 
 pub(super) fn observe_query(
     service: &FrontendStatisticsService,

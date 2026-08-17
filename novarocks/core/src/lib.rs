@@ -27,7 +27,6 @@ pub mod query_execution;
 pub mod runtime;
 pub mod server;
 pub mod service;
-pub mod statistics;
 pub mod view;
 pub use novarocks_version as version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.

@@ -15,26 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Closed typed executor for external-view statements.
+//! Frontend-owned command executor for external-view statements.
 
+use novarocks::query_execution::StatementResult;
+use novarocks::query_execution::kernels::ViewExecutionKernel;
+use novarocks::view::{ViewRequestContext, ViewService, ViewStatementResult};
 use novarocks_spi::connector::ConnectorRequestContext;
 
-use crate::query_execution::StatementResult;
-use crate::query_execution::kernels::ViewExecutionKernel;
-use crate::view::{ViewRequestContext, ViewService, ViewStatementResult};
-
 #[derive(Clone)]
-pub struct ViewCommandExecutor {
+pub(crate) struct ViewCommandExecutor {
     kernel: ViewExecutionKernel,
 }
 
 impl ViewCommandExecutor {
-    pub fn new(kernel: ViewExecutionKernel) -> Self {
+    pub(crate) fn new(kernel: ViewExecutionKernel) -> Self {
         Self { kernel }
     }
 
     /// Execute only statements recognized by the installed view service.
-    pub fn try_execute(
+    pub(crate) fn try_execute(
         &self,
         sql: &str,
         current_catalog: Option<&str>,

@@ -27,8 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
-use novarocks::statistics::application as core_application;
-
+use super::application;
 use super::model::{
     StatisticsJob, StatisticsJobCreate, StatisticsJobTablePin, StatisticsJobTarget,
 };
@@ -113,25 +112,25 @@ impl StatisticsJobTargetResolver for UnavailableStatisticsJobTargetResolver {
         &self,
         _target: &StatisticsJobTarget,
     ) -> Result<StatisticsJobTablePin, String> {
-        Err("ANALYZE is unavailable until the Core statistics target resolver is bound".into())
+        Err("ANALYZE is unavailable until the frontend statistics target resolver is bound".into())
     }
 }
 
-struct CoreStatisticsTargetResolverAdapter {
-    inner: std::sync::Arc<dyn core_application::StatisticsTargetResolver>,
+struct StatisticsTargetResolverAdapter {
+    inner: std::sync::Arc<dyn application::StatisticsTargetResolver>,
 }
 
-struct CoreStatisticsTableReaderAdapter {
-    inner: std::sync::Arc<dyn core_application::StatisticsTableReader>,
+struct StatisticsTableReaderAdapter {
+    inner: std::sync::Arc<dyn application::StatisticsTableReader>,
 }
 
-impl TableStatisticsReader for CoreStatisticsTableReaderAdapter {
+impl TableStatisticsReader for StatisticsTableReaderAdapter {
     fn show_table_stats(
         &self,
         target: &StatisticsJobTarget,
     ) -> Result<Vec<StatisticsTableStatRow>, String> {
         self.inner
-            .show_table_stats(&core_application::StatisticsTableTarget {
+            .show_table_stats(&application::StatisticsTableTarget {
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
@@ -153,14 +152,14 @@ impl TableStatisticsReader for CoreStatisticsTableReaderAdapter {
     }
 }
 
-impl StatisticsJobTargetResolver for CoreStatisticsTargetResolverAdapter {
+impl StatisticsJobTargetResolver for StatisticsTargetResolverAdapter {
     fn resolve_table_pin(
         &self,
         target: &StatisticsJobTarget,
     ) -> Result<StatisticsJobTablePin, String> {
         let pin = self
             .inner
-            .resolve_table_pin(&core_application::StatisticsTableTarget {
+            .resolve_table_pin(&application::StatisticsTableTarget {
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
@@ -391,9 +390,8 @@ impl fmt::Display for StatisticsApplicationError {
 
 impl std::error::Error for StatisticsApplicationError {}
 
-/// Adapter installed by the frontend composition root.  Core owns command
-/// parsing while this service owns durable StateStore access; no SQL text is
-/// accepted across this boundary.
+/// Frontend application owner for parsed statistics commands and durable
+/// StateStore access. It accepts no SQL text across this boundary.
 pub struct FrontendStatisticsApplicationPort {
     service: StatisticsApplicationService,
     table_statistics: std::sync::RwLock<Option<std::sync::Arc<dyn TableStatisticsReader>>>,
@@ -433,7 +431,7 @@ impl FrontendStatisticsApplicationPort {
         })
     }
 
-    /// Called only after Core has opened its pin-aware statistics reader.
+    /// Called only after frontend composition has opened its pin-aware statistics reader.
     /// Rebinding would permit a stale engine to replace the active reader, so
     /// reject it rather than silently changing a live application boundary.
     pub fn bind_table_statistics_reader(
@@ -451,21 +449,22 @@ impl FrontendStatisticsApplicationPort {
         Ok(())
     }
 
-    /// Called after Core has opened its connector-control registry. Rebinding
+    /// Called after frontend composition has opened its connector-control registry. Rebinding
     /// would permit a different engine generation to change ANALYZE target
     /// resolution while jobs are live, so fail rather than silently replace it.
-    pub fn bind_core_statistics_target_resolver(
+    pub fn bind_statistics_target_resolver(
         &self,
-        resolver: std::sync::Arc<dyn core_application::StatisticsTargetResolver>,
+        resolver: std::sync::Arc<dyn application::StatisticsTargetResolver>,
     ) -> Result<(), String> {
-        self.service.bind_target_resolver(std::sync::Arc::new(
-            CoreStatisticsTargetResolverAdapter { inner: resolver },
-        ))
+        self.service
+            .bind_target_resolver(std::sync::Arc::new(StatisticsTargetResolverAdapter {
+                inner: resolver,
+            }))
     }
 
-    fn bind_core_statistics_attempt_executor(
+    fn bind_statistics_attempt_executor(
         &self,
-        executor: Arc<dyn core_application::StatisticsAttemptExecutor>,
+        executor: Arc<dyn application::StatisticsAttemptExecutor>,
     ) -> Result<(), String> {
         let Some(repository) = self.service.worker_repository() else {
             // SHOW TABLE STATS remains available without StateStore, but a
@@ -473,7 +472,7 @@ impl FrontendStatisticsApplicationPort {
             return Ok(());
         };
         let adapter: Arc<dyn StatisticsAttemptExecutor> =
-            Arc::new(CoreStatisticsAttemptAdapter { inner: executor });
+            Arc::new(StatisticsAttemptAdapter { inner: executor });
         let mut executor_slot = self
             .attempt_executor
             .lock()
@@ -526,28 +525,26 @@ impl FrontendStatisticsApplicationPort {
     }
 }
 
-impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicationPort {
+impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPort {
     fn execute(
         &self,
-        command: core_application::StatisticsApplicationCommand,
-    ) -> Result<
-        core_application::StatisticsApplicationResult,
-        core_application::StatisticsApplicationError,
-    > {
+        command: application::StatisticsApplicationCommand,
+    ) -> Result<application::StatisticsApplicationResult, application::StatisticsApplicationError>
+    {
         let statement = match command {
-            core_application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
+            application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
                 StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
                     target: target.into(),
                     metric_names: columns,
                 })
             }
-            core_application::StatisticsApplicationCommand::ShowAnalyzeJobs => {
+            application::StatisticsApplicationCommand::ShowAnalyzeJobs => {
                 StatisticsStatement::ShowAnalyzeJobs(ShowAnalyzeJobsStatement { target: None })
             }
-            core_application::StatisticsApplicationCommand::CancelAnalyze { job_id } => {
+            application::StatisticsApplicationCommand::CancelAnalyze { job_id } => {
                 StatisticsStatement::CancelAnalyze(CancelAnalyzeStatement { job_id })
             }
-            core_application::StatisticsApplicationCommand::ShowTableStats { target } => {
+            application::StatisticsApplicationCommand::ShowTableStats { target } => {
                 StatisticsStatement::ShowTableStats(ShowTableStatsStatement {
                     target: target.into(),
                 })
@@ -555,11 +552,11 @@ impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicati
         };
         let submitted_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| core_application::StatisticsApplicationError::new(error.to_string()))?
+            .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))?
             .as_millis()
             .try_into()
             .map_err(|_| {
-                core_application::StatisticsApplicationError::new(
+                application::StatisticsApplicationError::new(
                     "statistics submission timestamp overflow",
                 )
             })?;
@@ -567,7 +564,7 @@ impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicati
             .table_statistics
             .read()
             .map_err(|_| {
-                core_application::StatisticsApplicationError::new(
+                application::StatisticsApplicationError::new(
                     "statistics table reader lock poisoned",
                 )
             })?
@@ -580,7 +577,7 @@ impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicati
                     .execute(statement, submitted_at_ms, reader.as_ref()),
             )
         })
-        .map_err(|error| core_application::StatisticsApplicationError::new(error.to_string()))?;
+        .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))?;
         if matches!(result, StatisticsStatementResult::JobSubmitted(_)) {
             if let Ok(worker) = self.worker.lock() {
                 if let Some(worker) = worker.as_ref() {
@@ -588,58 +585,58 @@ impl core_application::StatisticsApplicationPort for FrontendStatisticsApplicati
                 }
             }
         }
-        Ok(map_core_result(result))
+        Ok(map_application_result(result))
     }
 }
 
-impl core_application::StatisticsTargetResolverSink for FrontendStatisticsApplicationPort {
+impl application::StatisticsTargetResolverSink for FrontendStatisticsApplicationPort {
     fn bind_statistics_target_resolver(
         &self,
-        resolver: std::sync::Arc<dyn core_application::StatisticsTargetResolver>,
+        resolver: std::sync::Arc<dyn application::StatisticsTargetResolver>,
     ) -> Result<(), String> {
-        self.bind_core_statistics_target_resolver(resolver)
+        self.bind_statistics_target_resolver(resolver)
     }
 }
 
-impl core_application::StatisticsTableReaderSink for FrontendStatisticsApplicationPort {
+impl application::StatisticsTableReaderSink for FrontendStatisticsApplicationPort {
     fn bind_statistics_table_reader(
         &self,
-        reader: std::sync::Arc<dyn core_application::StatisticsTableReader>,
+        reader: std::sync::Arc<dyn application::StatisticsTableReader>,
     ) -> Result<(), String> {
-        self.bind_table_statistics_reader(std::sync::Arc::new(CoreStatisticsTableReaderAdapter {
+        self.bind_table_statistics_reader(std::sync::Arc::new(StatisticsTableReaderAdapter {
             inner: reader,
         }))
     }
 }
 
-impl core_application::StatisticsAttemptExecutorSink for FrontendStatisticsApplicationPort {
+impl application::StatisticsAttemptExecutorSink for FrontendStatisticsApplicationPort {
     fn bind_statistics_attempt_executor(
         &self,
-        executor: Arc<dyn core_application::StatisticsAttemptExecutor>,
+        executor: Arc<dyn application::StatisticsAttemptExecutor>,
     ) -> Result<(), String> {
-        self.bind_core_statistics_attempt_executor(executor)
+        self.bind_statistics_attempt_executor(executor)
     }
 }
 
-struct CoreCollectedAttempt {
-    inner: Box<dyn core_application::StatisticsCollectedAttempt>,
+struct StatisticsCollectedAttemptAdapter {
+    inner: Box<dyn application::StatisticsCollectedAttempt>,
 }
 
-impl StatisticsCollectedAttempt for CoreCollectedAttempt {
+impl StatisticsCollectedAttempt for StatisticsCollectedAttemptAdapter {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
 
-struct CoreStatisticsAttemptAdapter {
-    inner: Arc<dyn core_application::StatisticsAttemptExecutor>,
+struct StatisticsAttemptAdapter {
+    inner: Arc<dyn application::StatisticsAttemptExecutor>,
 }
 
-impl CoreStatisticsAttemptAdapter {
-    fn request(job: &StatisticsJob) -> core_application::StatisticsAttemptRequest {
-        core_application::StatisticsAttemptRequest {
+impl StatisticsAttemptAdapter {
+    fn request(job: &StatisticsJob) -> application::StatisticsAttemptRequest {
+        application::StatisticsAttemptRequest {
             operation_id: job.operation_id,
-            table_pin: core_application::StatisticsTablePin {
+            table_pin: application::StatisticsTablePin {
                 connector_instance_id: job.table_pin.connector_instance_id.clone(),
                 table_handle: job.table_pin.table_handle.clone(),
                 data_version: job.table_pin.data_version.clone(),
@@ -651,10 +648,10 @@ impl CoreStatisticsAttemptAdapter {
 
     fn collected<'a>(
         collected: &'a dyn StatisticsCollectedAttempt,
-    ) -> Result<&'a dyn core_application::StatisticsCollectedAttempt, StatisticsAttemptError> {
+    ) -> Result<&'a dyn application::StatisticsCollectedAttempt, StatisticsAttemptError> {
         collected
             .as_any()
-            .downcast_ref::<CoreCollectedAttempt>()
+            .downcast_ref::<StatisticsCollectedAttemptAdapter>()
             .map(|collected| collected.inner.as_ref())
             .ok_or_else(|| {
                 StatisticsAttemptError::permanent(
@@ -664,7 +661,7 @@ impl CoreStatisticsAttemptAdapter {
             })
     }
 
-    fn map_error(error: core_application::StatisticsApplicationError) -> StatisticsAttemptError {
+    fn map_error(error: application::StatisticsApplicationError) -> StatisticsAttemptError {
         if error.requires_reconcile() {
             StatisticsAttemptError::reconcile(
                 super::model::StatisticsJobErrorKind::Publish,
@@ -684,7 +681,7 @@ impl CoreStatisticsAttemptAdapter {
     }
 }
 
-impl StatisticsAttemptExecutor for CoreStatisticsAttemptAdapter {
+impl StatisticsAttemptExecutor for StatisticsAttemptAdapter {
     fn collect(
         &self,
         job: &StatisticsJob,
@@ -692,7 +689,8 @@ impl StatisticsAttemptExecutor for CoreStatisticsAttemptAdapter {
         self.inner
             .collect(&Self::request(job))
             .map(|inner| {
-                Box::new(CoreCollectedAttempt { inner }) as Box<dyn StatisticsCollectedAttempt>
+                Box::new(StatisticsCollectedAttemptAdapter { inner })
+                    as Box<dyn StatisticsCollectedAttempt>
             })
             .map_err(Self::map_error)
     }
@@ -735,12 +733,12 @@ impl TableStatisticsReader for UnboundTableStatisticsReader {
         &self,
         _target: &StatisticsJobTarget,
     ) -> Result<Vec<StatisticsTableStatRow>, String> {
-        Err("SHOW TABLE STATS is unavailable until the Core statistics reader is bound".into())
+        Err("SHOW TABLE STATS is unavailable until the frontend statistics reader is bound".into())
     }
 }
 
-impl From<core_application::StatisticsTableTarget> for StatisticsJobTarget {
-    fn from(value: core_application::StatisticsTableTarget) -> Self {
+impl From<application::StatisticsTableTarget> for StatisticsJobTarget {
+    fn from(value: application::StatisticsTableTarget) -> Self {
         Self {
             catalog: value.catalog,
             namespace: value.namespace,
@@ -749,25 +747,25 @@ impl From<core_application::StatisticsTableTarget> for StatisticsJobTarget {
     }
 }
 
-fn map_core_result(
+fn map_application_result(
     result: StatisticsStatementResult,
-) -> core_application::StatisticsApplicationResult {
+) -> application::StatisticsApplicationResult {
     match result {
         StatisticsStatementResult::JobSubmitted(job) => {
-            core_application::StatisticsApplicationResult::JobSubmitted(job_view(job))
+            application::StatisticsApplicationResult::JobSubmitted(job_view(job))
         }
         StatisticsStatementResult::JobCancellationRequested(job) => {
-            core_application::StatisticsApplicationResult::JobCancellationRequested(job_view(job))
+            application::StatisticsApplicationResult::JobCancellationRequested(job_view(job))
         }
         StatisticsStatementResult::AnalyzeJobs(jobs) => {
-            core_application::StatisticsApplicationResult::AnalyzeJobs(
+            application::StatisticsApplicationResult::AnalyzeJobs(
                 jobs.into_iter().map(job_view).collect(),
             )
         }
         StatisticsStatementResult::TableStats(rows) => {
-            core_application::StatisticsApplicationResult::TableStats(
+            application::StatisticsApplicationResult::TableStats(
                 rows.into_iter()
-                    .map(|row| core_application::StatisticsTableStatView {
+                    .map(|row| application::StatisticsTableStatView {
                         metric: row.metric_name,
                         value: row.value,
                         status: row.status,
@@ -782,13 +780,13 @@ fn map_core_result(
     }
 }
 
-fn job_view(job: StatisticsJob) -> core_application::StatisticsJobView {
-    core_application::StatisticsJobView {
+fn job_view(job: StatisticsJob) -> application::StatisticsJobView {
+    application::StatisticsJobView {
         job_id: job.job_id,
         operation_id: job.operation_id,
         state: format!("{:?}", job.state).to_ascii_uppercase(),
         attempt: job.attempt,
-        target: core_application::StatisticsTableTarget {
+        target: application::StatisticsTableTarget {
             catalog: job.target.catalog,
             namespace: job.target.namespace,
             table: job.target.table,

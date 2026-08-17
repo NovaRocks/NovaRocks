@@ -21,6 +21,7 @@
 //! `statistics` service. A later worker supplies a StateStore lease-fence
 //! validator to every mutating call before the job record is changed.
 
+pub mod application;
 pub(crate) mod attempt_executor;
 pub mod model;
 pub mod repository;

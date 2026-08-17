@@ -704,7 +704,7 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn statistics_service(&self) -> Arc<dyn novarocks::statistics::StatisticsService> {
+    pub fn statistics_service(&self) -> Arc<FrontendStatisticsService> {
         self.statistics_service
             .as_ref()
             .expect("frontend statistics service is installed before host open returns")

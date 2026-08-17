@@ -34,8 +34,6 @@ use crate::mv::repository::MvRepository;
 use crate::mv::storage_observation::MvStorageObservationPort;
 use crate::query_execution::backend::BackendTopologyService;
 use crate::query_execution::service::QueryExecutionService;
-use crate::statistics::StatisticsService;
-use crate::statistics::application::StatisticsApplicationPort;
 use crate::view::ViewService;
 use novarocks_spi::connector::ConnectorControlRegistry;
 
@@ -345,62 +343,6 @@ impl MvExecutionKernel {
 
     pub(crate) fn storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {
         &self.storage_observation
-    }
-
-    pub(crate) fn query_execution(&self) -> &QueryExecutionService {
-        &self.query_execution
-    }
-}
-
-/// Typed statistics command and collection dependencies.
-#[derive(Clone)]
-pub struct StatisticsExecutionKernel {
-    catalog_service: Arc<QueryCatalogService>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-    unified_statistics: Arc<UnifiedStatisticsResolver>,
-    statistics_service: Arc<dyn StatisticsService>,
-    statistics_application: Arc<dyn StatisticsApplicationPort>,
-    query_execution: QueryExecutionService,
-}
-
-impl StatisticsExecutionKernel {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        catalog_service: Arc<QueryCatalogService>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        unified_statistics: Arc<UnifiedStatisticsResolver>,
-        statistics_service: Arc<dyn StatisticsService>,
-        statistics_application: Arc<dyn StatisticsApplicationPort>,
-        query_execution: QueryExecutionService,
-    ) -> Self {
-        Self {
-            catalog_service,
-            connector_control,
-            unified_statistics,
-            statistics_service,
-            statistics_application,
-            query_execution,
-        }
-    }
-
-    pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
-        &self.catalog_service
-    }
-
-    pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
-        &self.connector_control
-    }
-
-    pub(crate) fn unified_statistics(&self) -> &Arc<UnifiedStatisticsResolver> {
-        &self.unified_statistics
-    }
-
-    pub(crate) fn statistics_service(&self) -> &Arc<dyn StatisticsService> {
-        &self.statistics_service
-    }
-
-    pub(crate) fn statistics_application(&self) -> &Arc<dyn StatisticsApplicationPort> {
-        &self.statistics_application
     }
 
     pub(crate) fn query_execution(&self) -> &QueryExecutionService {

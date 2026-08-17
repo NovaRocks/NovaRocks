@@ -41,13 +41,16 @@ use novarocks::query_execution::backend_command;
 use novarocks::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
 use novarocks::query_execution::kernels as domain;
 use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::statistics::StatisticsService;
-use novarocks::statistics::application::StatisticsApplicationPort;
-use novarocks::statistics::command as statistics_command;
 use novarocks::view::ViewService;
-use novarocks::view::view_command;
 
 use crate::mv::{FrontendMvService, command as mv_command};
+use crate::statistics::command::StatisticsCommandExecutor;
+use crate::statistics_jobs::application::{
+    ConnectorStatisticsTableReader, ConnectorStatisticsTargetResolver, StatisticsApplicationPort,
+    StatisticsAttemptExecutor, StatisticsAttemptExecutorSink, StatisticsTableReaderSink,
+    StatisticsTargetResolverSink,
+};
+use crate::view::command::ViewCommandExecutor;
 
 use crate::query::compiler::FrontendQueryCompiler;
 
@@ -246,49 +249,13 @@ pub fn catalog_command_executor(
     )
 }
 
-/// Leaf ports for durable statistics command submission and observation.
-#[derive(Clone)]
-pub struct StatisticsCommandPorts {
-    catalog_service: Arc<QueryCatalogService>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-    unified_statistics: Arc<UnifiedStatisticsResolver>,
-    statistics_service: Arc<dyn StatisticsService>,
-    statistics_application: Arc<dyn StatisticsApplicationPort>,
-    query_execution: QueryExecutionService,
-}
-
-impl StatisticsCommandPorts {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        catalog_service: Arc<QueryCatalogService>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        unified_statistics: Arc<UnifiedStatisticsResolver>,
-        statistics_service: Arc<dyn StatisticsService>,
-        statistics_application: Arc<dyn StatisticsApplicationPort>,
-        query_execution: QueryExecutionService,
-    ) -> Self {
-        Self {
-            catalog_service,
-            connector_control,
-            unified_statistics,
-            statistics_service,
-            statistics_application,
-            query_execution,
-        }
-    }
-}
-
-pub fn statistics_command_executor(
-    ports: StatisticsCommandPorts,
-) -> statistics_command::StatisticsCommandExecutor {
-    statistics_command::StatisticsCommandExecutor::new(domain::StatisticsExecutionKernel::new(
-        ports.catalog_service,
-        ports.connector_control,
-        ports.unified_statistics,
-        ports.statistics_service,
-        ports.statistics_application,
-        ports.query_execution,
-    ))
+/// Statistics SQL commands terminate at the frontend durable application
+/// owner. They do not receive a query-execution kernel or Core composition
+/// bundle.
+pub(crate) fn statistics_command_executor(
+    application: Arc<dyn StatisticsApplicationPort>,
+) -> StatisticsCommandExecutor {
+    StatisticsCommandExecutor::new(application)
 }
 
 /// Leaf port for FE-owned backend membership commands.
@@ -487,8 +454,8 @@ impl ViewCommandPorts {
     }
 }
 
-pub fn view_command_executor(ports: ViewCommandPorts) -> view_command::ViewCommandExecutor {
-    view_command::ViewCommandExecutor::new(domain::ViewExecutionKernel::new(
+pub(crate) fn view_command_executor(ports: ViewCommandPorts) -> ViewCommandExecutor {
+    ViewCommandExecutor::new(domain::ViewExecutionKernel::new(
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
@@ -630,24 +597,22 @@ pub fn bind_mv_refresh_provider_activation(
 
 /// Bind the short-lived, generation-fenced statistics target resolver.
 pub fn bind_statistics_target_resolver(
-    sink: &dyn novarocks::statistics::application::StatisticsTargetResolverSink,
+    sink: &dyn StatisticsTargetResolverSink,
     connector_control: Arc<dyn ConnectorControlRegistry>,
 ) -> Result<(), String> {
-    sink.bind_statistics_target_resolver(Arc::new(
-        novarocks::statistics::application::ConnectorStatisticsTargetResolver::new(
-            connector_control,
-        ),
-    ))
+    sink.bind_statistics_target_resolver(Arc::new(ConnectorStatisticsTargetResolver::new(
+        connector_control,
+    )))
 }
 
 /// Bind the short-lived, generation-fenced statistics reader.
 pub fn bind_statistics_table_reader(
-    sink: &dyn novarocks::statistics::application::StatisticsTableReaderSink,
+    sink: &dyn StatisticsTableReaderSink,
     connector_control: Arc<dyn ConnectorControlRegistry>,
 ) -> Result<(), String> {
-    sink.bind_statistics_table_reader(Arc::new(
-        novarocks::statistics::application::ConnectorStatisticsTableReader::new(connector_control),
-    ))
+    sink.bind_statistics_table_reader(Arc::new(ConnectorStatisticsTableReader::new(
+        connector_control,
+    )))
 }
 
 /// Exact leaves retained by the Frontend-owned durable ANALYZE worker.
@@ -682,7 +647,7 @@ impl StatisticsAttemptExecutorPorts {
 /// Build the native statistics attempt executor from Frontend-owned leaves.
 pub fn statistics_attempt_executor(
     ports: StatisticsAttemptExecutorPorts,
-) -> Arc<dyn novarocks::statistics::application::StatisticsAttemptExecutor> {
+) -> Arc<dyn StatisticsAttemptExecutor> {
     Arc::new(
         crate::statistics_jobs::attempt_executor::FrontendStatisticsAttemptExecutor::new(
             crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutionPorts::new(
@@ -699,7 +664,7 @@ pub fn statistics_attempt_executor(
 /// coordinator leaves are ready.  A missing sink remains a Frontend decision;
 /// this helper never supplies an in-memory job fallback.
 pub fn bind_statistics_attempt_executor(
-    sink: &dyn novarocks::statistics::application::StatisticsAttemptExecutorSink,
+    sink: &dyn StatisticsAttemptExecutorSink,
     ports: StatisticsAttemptExecutorPorts,
 ) -> Result<(), String> {
     sink.bind_statistics_attempt_executor(statistics_attempt_executor(ports))

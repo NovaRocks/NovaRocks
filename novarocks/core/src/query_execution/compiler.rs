@@ -16,15 +16,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
-use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 pub use crate::query_execution::post_compile::{
     NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
@@ -32,16 +27,12 @@ pub use crate::query_execution::post_compile::{
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::runtime::query_result::{
-    QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
-};
+use crate::runtime::query_result::{QueryResult, build_string_query_result};
 use novarocks_protocol::lifecycle::QueryOptions;
 
-use crate::catalog_application::query_catalog::{QueryCatalogService, new_query_catalog_service};
+use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
-use crate::connector::UnifiedStatisticsResolver;
-use crate::mv::application::MvApplicationService;
 #[cfg(test)]
 use crate::mv::application::UnavailableMvApplicationService;
 use crate::mv::repository::MvRepository;
@@ -52,23 +43,12 @@ use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 pub use novarocks_sql::planning::catalog::TableLookupMode;
 
-use crate::catalog_application::resolver as backend_resolver;
-use crate::catalog_application::statement::{
-    execute_create_database_statement, execute_create_table_statement,
-    execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
-    looks_like_add_equality_delete, looks_like_alter_iceberg_properties,
-    looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
-    looks_like_show_create_table, parse_alter_iceberg_properties_sql,
-    parse_alter_partition_column_sql, parse_show_create_table,
-};
 use crate::query_execution::kernels as domain;
 use crate::query_execution::planning::time_travel::{
     has_time_travel_refs, rewrite_time_travel_refs,
 };
 #[cfg(test)]
 use novarocks_sql::syntax::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
-
-use novarocks_catalog::partition::LegacyRangePartition;
 
 use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 
@@ -86,7 +66,6 @@ impl_kernel_catalog_service_source!(domain::QueryPreparationKernel);
 impl_kernel_catalog_service_source!(domain::DmlExecutionKernel);
 impl_kernel_catalog_service_source!(domain::CatalogCommandKernel);
 impl_kernel_catalog_service_source!(domain::MvExecutionKernel);
-impl_kernel_catalog_service_source!(domain::StatisticsExecutionKernel);
 impl_kernel_catalog_service_source!(domain::ViewExecutionKernel);
 impl_kernel_catalog_service_source!(domain::MaintenanceExecutionKernel);
 
@@ -1334,132 +1313,6 @@ fn rewrite_named_partition_insert_overwrite(sql: &str) -> Result<String, String>
     let table = captures.name("table").expect("table capture").as_str();
     let rest = captures.name("rest").expect("rest capture").as_str();
     Ok(format!("INSERT OVERWRITE PARTITIONS {table} {rest}"))
-}
-
-// ---------------------------------------------------------------------------
-// Custom statement dispatch
-// ---------------------------------------------------------------------------
-
-pub(crate) fn statistics_application_target(
-    name: &novarocks_sql::syntax::ObjectName,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<crate::statistics::application::StatisticsTableTarget, String> {
-    let default_catalog = current_catalog.unwrap_or("default_catalog");
-    let (catalog, namespace, table) = match name.parts.as_slice() {
-        [table] => (default_catalog, current_database, table.as_str()),
-        [namespace, table] => (default_catalog, namespace.as_str(), table.as_str()),
-        [catalog, namespace, table] => (catalog.as_str(), namespace.as_str(), table.as_str()),
-        _ => {
-            return Err(format!(
-                "statistics table name must be table, db.table, or catalog.db.table: {}",
-                name.parts.join(".")
-            ));
-        }
-    };
-    Ok(crate::statistics::application::StatisticsTableTarget {
-        catalog: normalize_identifier(catalog)?,
-        namespace: normalize_identifier(namespace)?,
-        table: normalize_identifier(table)?,
-    })
-}
-
-pub(crate) fn statistics_application_result(
-    result: crate::statistics::application::StatisticsApplicationResult,
-) -> Result<StatementResult, String> {
-    use crate::statistics::application::StatisticsApplicationResult;
-
-    match result {
-        StatisticsApplicationResult::JobSubmitted(_)
-        | StatisticsApplicationResult::JobCancellationRequested(_) => Ok(StatementResult::Ok),
-        StatisticsApplicationResult::AnalyzeJobs(jobs) => statistics_string_result(
-            &[
-                "job_id",
-                "operation_id",
-                "state",
-                "attempt",
-                "catalog",
-                "namespace",
-                "table",
-            ],
-            jobs.into_iter()
-                .map(|job| {
-                    vec![
-                        Some(job.job_id.to_string()),
-                        Some(job.operation_id.to_string()),
-                        Some(job.state),
-                        Some(job.attempt.to_string()),
-                        Some(job.target.catalog),
-                        Some(job.target.namespace),
-                        Some(job.target.table),
-                    ]
-                })
-                .collect(),
-        ),
-        StatisticsApplicationResult::TableStats(rows) => statistics_string_result(
-            &[
-                "metric",
-                "value",
-                "status",
-                "basis_version",
-                "source",
-                "numeric_nature",
-                "basis_relation",
-            ],
-            rows.into_iter()
-                .map(|row| {
-                    vec![
-                        Some(row.metric),
-                        row.value,
-                        Some(row.status),
-                        Some(row.basis_version),
-                        Some(row.source),
-                        Some(row.numeric_nature),
-                        Some(row.basis_relation),
-                    ]
-                })
-                .collect(),
-        ),
-    }
-}
-
-fn statistics_string_result(
-    names: &[&str],
-    rows: Vec<Vec<Option<String>>>,
-) -> Result<StatementResult, String> {
-    if rows.iter().any(|row| row.len() != names.len()) {
-        return Err("statistics application returned malformed tabular result".to_string());
-    }
-    let columns = names
-        .iter()
-        .map(|name| QueryResultColumn {
-            name: (*name).to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        })
-        .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(
-        names
-            .iter()
-            .map(|name| Field::new(*name, DataType::Utf8, true))
-            .collect::<Vec<_>>(),
-    ));
-    let arrays = (0..names.len())
-        .map(|column| {
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row[column].clone())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef
-        })
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|error| format!("build statistics application result failed: {error}"))?;
-    Ok(StatementResult::Query(QueryResult {
-        columns,
-        chunks: vec![record_batch_to_chunk(batch)?],
-    }))
 }
 
 fn require_backend_management_role(
@@ -2803,67 +2656,7 @@ fn parse_explain_refresh_materialized_view(
 
 #[cfg(test)]
 mod tests {
-    use super::QueryResult;
-    use crate::statistics::application::{
-        StatisticsApplicationCommand, StatisticsApplicationError, StatisticsApplicationPort,
-        StatisticsApplicationResult, StatisticsJobView, StatisticsTableStatView,
-        StatisticsTableTarget,
-    };
-    use arrow::array::{Array, StringArray};
     use novarocks_protocol::{lifecycle::QueryOptions, novarocks};
-    use std::sync::{Arc, Mutex};
-    use uuid::Uuid;
-
-    #[derive(Default)]
-    struct RecordingStatisticsApplicationPort {
-        commands: Mutex<Vec<StatisticsApplicationCommand>>,
-    }
-
-    impl RecordingStatisticsApplicationPort {
-        fn commands(&self) -> Vec<StatisticsApplicationCommand> {
-            self.commands.lock().expect("statistics commands").clone()
-        }
-    }
-
-    impl StatisticsApplicationPort for RecordingStatisticsApplicationPort {
-        fn execute(
-            &self,
-            command: StatisticsApplicationCommand,
-        ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
-            self.commands
-                .lock()
-                .expect("statistics commands")
-                .push(command.clone());
-            match command {
-                StatisticsApplicationCommand::AnalyzeTable { target, .. } => Ok(
-                    StatisticsApplicationResult::JobSubmitted(StatisticsJobView {
-                        job_id: Uuid::nil(),
-                        operation_id: Uuid::nil(),
-                        state: "SUBMITTED".into(),
-                        attempt: 0,
-                        target,
-                    }),
-                ),
-                StatisticsApplicationCommand::ShowAnalyzeJobs
-                | StatisticsApplicationCommand::CancelAnalyze { .. } => {
-                    Ok(StatisticsApplicationResult::AnalyzeJobs(Vec::new()))
-                }
-                StatisticsApplicationCommand::ShowTableStats { .. } => {
-                    Ok(StatisticsApplicationResult::TableStats(vec![
-                        StatisticsTableStatView {
-                            metric: "row_count".into(),
-                            value: Some("42".into()),
-                            status: "AVAILABLE".into(),
-                            basis_version: "SAME".into(),
-                            source: "PROVIDER_ARTIFACT".into(),
-                            numeric_nature: "EXACT".into(),
-                            basis_relation: "IDENTICAL".into(),
-                        },
-                    ]))
-                }
-            }
-        }
-    }
 
     #[test]
     fn explain_analyze_query_options_only_enable_profile() {
@@ -2955,73 +2748,5 @@ mod tests {
                 .expect("recognized");
         assert_eq!(rewritten, "EXPLAIN SELECT k FROM t");
         assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Normal);
-    }
-
-    fn string_cell(result: &QueryResult, row: usize, col: usize) -> String {
-        let batch = &result.chunks[0].batch;
-        let array = batch
-            .column(col)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray column");
-        array.value(row).to_string()
-    }
-
-    #[test]
-    fn typed_statistics_statements_use_the_injected_application_port() {
-        let port = Arc::new(RecordingStatisticsApplicationPort::default());
-        let executor = crate::statistics::command::StatisticsCommandExecutor::new(
-            crate::query_execution::kernels::StatisticsExecutionKernel::new(
-                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
-                Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
-                Arc::new(crate::connector::UnifiedStatisticsResolver::default()),
-                Arc::new(crate::statistics::EmptyStatisticsService),
-                Arc::clone(&port) as Arc<dyn StatisticsApplicationPort>,
-                crate::query_execution::compiler::test_query_execution_service(),
-            ),
-        );
-
-        assert!(
-            executor
-                .try_execute(
-                    "ANALYZE TABLE ice.analytics.orders (order_id)",
-                    None,
-                    "default",
-                )
-                .expect("submit typed analyze")
-                .is_some()
-        );
-        let show_stats = executor
-            .try_execute("SHOW TABLE STATS ice.analytics.orders", None, "default")
-            .expect("show typed table stats")
-            .expect("statistics command result");
-        let crate::query_execution::StatementResult::Query(show_stats) = show_stats else {
-            panic!("SHOW TABLE STATS must return a query result");
-        };
-        assert_eq!(show_stats.columns[0].name, "metric");
-        assert_eq!(show_stats.columns[1].name, "value");
-        assert_eq!(string_cell(&show_stats, 0, 0), "row_count");
-        assert_eq!(string_cell(&show_stats, 0, 1), "42");
-
-        assert_eq!(
-            port.commands(),
-            vec![
-                StatisticsApplicationCommand::AnalyzeTable {
-                    target: StatisticsTableTarget {
-                        catalog: "ice".into(),
-                        namespace: "analytics".into(),
-                        table: "orders".into(),
-                    },
-                    columns: vec!["order_id".into()],
-                },
-                StatisticsApplicationCommand::ShowTableStats {
-                    target: StatisticsTableTarget {
-                        catalog: "ice".into(),
-                        namespace: "analytics".into(),
-                        table: "orders".into(),
-                    },
-                },
-            ]
-        );
     }
 }

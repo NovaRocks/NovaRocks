@@ -105,7 +105,6 @@ pub fn build_frontend_query_session_factory(
     let mv_application = host.mv_application_service();
     let mv_service = host.mv_service();
     let view_service = host.view_service();
-    let statistics_service = host.statistics_service();
     let statistics_application = host.statistics_application_port();
     let maintenance_service = host.table_maintenance_service();
 
@@ -252,16 +251,8 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&mv_storage_observation),
             view_service,
         ));
-    let statistics_command_executor = core_capabilities::statistics_command_executor(
-        core_capabilities::StatisticsCommandPorts::new(
-            Arc::clone(&catalog_service),
-            Arc::clone(&connector_control),
-            Arc::clone(&unified_statistics),
-            statistics_service,
-            statistics_application,
-            query_execution.clone(),
-        ),
-    );
+    let statistics_command_executor =
+        core_capabilities::statistics_command_executor(statistics_application);
     let backend_command_executor = core_capabilities::backend_command_executor(
         core_capabilities::BackendCommandPorts::new(topology.clone()),
     );
@@ -301,6 +292,8 @@ pub fn build_frontend_query_session_factory(
         mv_storage_observation,
         query_execution.clone(),
     ));
+    host.dml_service()
+        .install_local_catalog(Arc::clone(&catalog_service));
     host.ctas_recovery_binding()
         .install_ctas_engine(Arc::clone(&dml_engines.ctas))
         .map_err(|error| {
