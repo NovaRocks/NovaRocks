@@ -143,6 +143,11 @@ mysql_port_start="${NOVA_ENV_MYSQL_PORT_START:-9030}"
 mysql_port_range="${NOVA_ENV_MYSQL_PORT_RANGE:-200}"
 grpc_port_start="${NOVA_ENV_GRPC_PORT_START:-9080}"
 grpc_port_range="${NOVA_ENV_GRPC_PORT_RANGE:-200}"
+# The metrics listener defaults to a fixed 8040 in the server, so a worktree
+# that leaves it unset makes every other worktree's server fail to bind. Range
+# chosen clear of the REST fixture (8181) and of that default.
+http_port_start="${NOVA_ENV_HTTP_PORT_START:-8240}"
+http_port_range="${NOVA_ENV_HTTP_PORT_RANGE:-200}"
 configured_compose_project="${NOVA_ENV_SHARED_COMPOSE_PROJECT:-nr-iceberg-rest}"
 configured_minio_port="${NOVA_ENV_MINIO_PORT:-9000}"
 configured_minio_console_port="${NOVA_ENV_MINIO_CONSOLE_PORT:-9001}"
@@ -169,6 +174,7 @@ if [[ -f "$exports_file" ]]; then
   fi
   mysql_port="${NOVA_ENV_MYSQL_PORT}"
   grpc_port="${NOVA_ENV_GRPC_PORT:-$(choose_port_in_range "$grpc_port_start" "$grpc_port_range" "$offset")}"
+  http_port="${NOVA_ENV_HTTP_PORT:-$(choose_port_in_range "$http_port_start" "$http_port_range" "$offset")}"
 else
   if [[ "$shared_docker" == "true" ]]; then
     minio_port="$configured_minio_port"
@@ -177,6 +183,7 @@ else
     spark_ui_port="$configured_spark_ui_port"
     mysql_port="$(choose_port_in_range "$mysql_port_start" "$mysql_port_range" "$offset")"
     grpc_port="$(choose_port_in_range "$grpc_port_start" "$grpc_port_range" "$offset")"
+    http_port="$(choose_port_in_range "$http_port_start" "$http_port_range" "$offset")"
   else
     minio_port="$(choose_port $((19000 + offset)))"
     minio_console_port="$(choose_port $((20000 + offset)))"
@@ -184,6 +191,7 @@ else
     spark_ui_port="$(choose_port $((22000 + offset)))"
     mysql_port="$(choose_port $((23000 + offset)))"
     grpc_port="$(choose_port $((24000 + offset)))"
+    http_port="$(choose_port $((25000 + offset)))"
   fi
 fi
 shared_docker="${NOVA_ENV_SHARED_DOCKER:-$shared_docker}"
@@ -357,6 +365,7 @@ EOF
 cat > "$runtime_dir/standalone.toml" <<EOF
 [server]
 host = "127.0.0.1"
+http_port = $http_port
 grpc_port = $grpc_port
 
 [runtime]
@@ -387,6 +396,7 @@ EOF
 cat > "$runtime_dir/standalone-scheduler.toml" <<EOF
 [server]
 host = "127.0.0.1"
+http_port = $http_port
 grpc_port = $grpc_port
 
 [runtime]
@@ -528,6 +538,7 @@ export NOVA_ENV_REST_PORT="$rest_port"
 export NOVA_ENV_SPARK_UI_PORT="$spark_ui_port"
 export NOVA_ENV_MYSQL_PORT="$mysql_port"
 export NOVA_ENV_GRPC_PORT="$grpc_port"
+export NOVA_ENV_HTTP_PORT="$http_port"
 export AWS_S3_ENDPOINT="$minio_endpoint"
 export AWS_S3_ACCESS_KEY_ID="$minio_user"
 export AWS_S3_SECRET_ACCESS_KEY="$minio_password"
