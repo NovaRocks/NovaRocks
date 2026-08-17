@@ -66,7 +66,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
                 )
             }
             PreparedMvRefreshWriteArtifact::Incremental(prepared) => {
-                crate::mv::iceberg_refresh::bind_prepared_mv_incremental_staging(
+                super::incremental_staging::bind_prepared_mv_incremental_staging(
                     &self.query_kernel,
                     &self.ports,
                     prepared,
