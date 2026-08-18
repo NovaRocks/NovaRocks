@@ -36,6 +36,7 @@ mod metadata_maintenance;
 mod mutation;
 mod mv_attempt_discovery;
 mod mv_publication_fencing;
+mod mv_storage_observation;
 mod predicate;
 mod read;
 mod read_session;
@@ -254,6 +255,17 @@ pub use mv_publication_fencing::{
     ConnectorMvRefreshPublicationReceipt, ConnectorMvRefreshPublicationRequest,
     ConnectorMvRefreshResourceIdentity, ESTABLISH_MV_PUBLICATION_FENCE_KIND,
     PUBLISH_MV_REFRESH_KIND,
+};
+pub use mv_storage_observation::{
+    MAX_MV_LAKE_BASES, MAX_MV_LAKE_DESCRIPTOR_BYTES, MAX_MV_OBSERVATION_FIELDS,
+    MAX_MV_OBSERVATION_PARTITION_FIELDS, MAX_MV_OBSERVATION_REFS, MAX_MV_OBSERVATION_SNAPSHOTS,
+    MvCreatedTargetObservation, MvLakeDescriptorProjection, MvLakePackageObservation,
+    MvLakePublicationObservation, MvMaintenanceMetadataObservation, MvObservedField,
+    MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
+    MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
+    MvPublishedBaseObservation, MvPublishedRefreshObservation, MvPublishedRefreshTechnique,
+    MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
+    MvStorageObservationPort, UnavailableMvStorageObservationPort,
 };
 pub use predicate::{
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp,

@@ -26,6 +26,7 @@ pub mod field_render_schema;
 pub mod identity;
 pub mod largeint;
 pub mod logical;
+pub mod mv_aggregate_layout;
 mod predicate;
 pub mod primitive;
 pub mod slot_id;
