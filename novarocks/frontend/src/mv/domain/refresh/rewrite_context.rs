@@ -11,10 +11,9 @@ use std::sync::Arc;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, load_iceberg_mv_target_binding};
-use crate::mv::domain::storage_observation::{
-    MvSchemaValidationObservation, MvStorageObservationPort,
-};
+use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorChangeWindow, ConnectorChangeWindowAdmission, ConnectorControlRegistry,
     ConnectorRequestContext, ConnectorScanAdmission, ConnectorTableResolution,
@@ -114,7 +113,7 @@ pub fn build_neutral_refresh_rewrite_context(
     .map(Arc::new)
 }
 
-pub fn observe_and_admit_change_window_for_table(
+pub(crate) fn observe_and_admit_change_window_for_table(
     connector_control: &dyn ConnectorControlRegistry,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
@@ -148,13 +147,17 @@ pub fn observe_and_admit_change_window_for_table(
     let ConnectorScanAdmission::ChangeWindow(admission) = scan.admission() else {
         return Err("connector returned a snapshot admission for a change-window scan".to_string());
     };
-    let observation = storage_observation
-        .observe_schema_validation(&exact_lease, &metadata, connector_context.clone())
-        .map_err(|error| {
-            format!(
-                "observe MV schema validation facts for {}: {error}",
-                table.fqn()
-            )
-        })?;
+    let observation = crate::mv::domain::storage_observation::observe_schema_validation(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        connector_context.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "observe MV schema validation facts for {}: {error}",
+            table.fqn()
+        )
+    })?;
     Ok((admission.clone(), observation))
 }

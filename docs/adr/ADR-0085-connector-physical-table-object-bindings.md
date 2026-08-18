@@ -1,5 +1,5 @@
 ---
-id: ADR-0075
+id: ADR-0085
 title: "Connector physical table object bindings"
 domain: [provider-spi]
 status: active
@@ -24,7 +24,7 @@ code-anchors:
 
 现有 `ConnectorControlPlanningLease` 已经固定 metadata 的 instance 与 incarnation。`ConnectorMetadata` 是该 exact lease 暴露的 metadata owner；统计 capability 则是可选的、FE-only 的独立能力（ADR-0022），不能成为 generic table rebinding 的依赖。
 
-ADR-0060 已为 MV refresh 裁决：从同一份 exact metadata 投影 UUID 与 current snapshot 的 consumer-owned observation 不能为这个单一 use case 新建 Connector capability。现在出现了跨 durable caller 的「只确认当前物理对象仍相同」需求，触发了该 ADR 列出的通用化重评估条件；本 ADR 只承接 object-ID capture/rebind，既不推翻 MV-local observation，也不把其 snapshot、schema 或 target-publication 事实扩大到通用契约。
+ADR-0060 曾为 MV refresh 裁决：从同一份 exact metadata 投影 UUID 与 current snapshot 的 consumer-owned observation 不应为这个单一 use case 新建 Connector capability。现在出现了跨 durable caller 的「只确认当前物理对象仍相同」需求，触发了该 ADR 列出的通用化重评估条件；本 ADR 只承接 object-ID capture/rebind，既不推翻 MV-local observation，也不把其 snapshot、schema 或 target-publication 事实扩大到通用契约。MV observation 的 SPI relocation 及其 Frontend durable conversion 由 ADR-0086 单独裁决。
 
 ## 考虑过的选项
 
@@ -44,7 +44,7 @@ ADR-0060 已为 MV refresh 裁决：从同一份 exact metadata 投影 UUID 与 
 
 Iceberg 在一次 metadata load 中从封存 payload 的 table UUID 生成 ID。rebind 的目标缺失必须返回 `Missing`，UUID 不同必须返回 `Replaced`；两者都不可在进度前 retry，且不得向 caller 返回 replacement 的 handle。StarRocks 不实现该可选能力，保持 `Unsupported`。
 
-ADR-0060 的 `MvStorageObservationPort::observe_refresh_base` 继续是 MV 的同版本 UUID/snapshot 投影入口；它的 consumer-owned owner 与无额外 runtime IO 前提保持不变。这里的通用 metadata contract 只给未来 durable caller 一个 opaque identity gate，不能反向替代或扩展该 MV port。
+ADR-0086 的 `MvStorageObservationPort::observe_refresh_base` 继续是 MV 的同版本 UUID/snapshot 投影入口；其 durable consumer owner 与无额外 runtime IO 前提保持不变。这里的通用 metadata contract 只给未来 durable caller 一个 opaque identity gate，不能反向替代或扩展该 MV port。
 
 ## 接受的妥协（诚实记录）
 

@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use crate::mv::domain::repository::MvRepository;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
     MvRewriteDefinitionIndex, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
 };
@@ -103,9 +103,13 @@ fn freeze_base_table_state(
         &table_ref.table,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
-    let schema_observation = storage_observation
-        .observe_schema_validation(&exact_lease, &metadata, connector_context.clone())
-        .map_err(|error| format!("observe MV rewrite storage facts for {fqn}: {error}"))?;
+    let schema_observation = crate::mv::domain::storage_observation::observe_schema_validation(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        connector_context.clone(),
+    )
+    .map_err(|error| format!("observe MV rewrite storage facts for {fqn}: {error}"))?;
     let reference_facts = novarocks::connector::metadata_read_reference_facts_with_planning_lease(
         exact_lease,
         connector_context,

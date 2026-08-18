@@ -17,19 +17,21 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::mv::dependency::model::MvDependencyObjectRef;
-use novarocks::mv::persistence::definition::{StoredMvDefinition, UpdateMvRefreshMetadataRequest};
-use novarocks::mv::persistence::dependency::StoredMvDependency;
-use novarocks::mv::persistence::partition::{
+use novarocks_frontend::mv::domain::dependency::model::MvDependencyObjectRef;
+use novarocks_frontend::mv::domain::persistence::definition::{
+    StoredMvDefinition, UpdateMvRefreshMetadataRequest,
+};
+use novarocks_frontend::mv::domain::persistence::dependency::StoredMvDependency;
+use novarocks_frontend::mv::domain::persistence::partition::{
     RecordFailedMvPartitionStatesRequest, ReplaceMvPartitionStatesRequest, StoredMvPartitionState,
     UpdateMvPartitionContractRequest,
 };
-use novarocks::mv::persistence::refresh::{
+use novarocks_frontend::mv::domain::persistence::refresh::{
     BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, RecordPublishCommitRequest,
     RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvRefresh,
     UpdateStarRocksMvRefreshSummaryRequest,
 };
-use novarocks::mv::repository::{
+use novarocks_frontend::mv::domain::repository::{
     CreateMvDependencyRequest, CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest,
     FinalizeMvRefreshWithPartitionsRequest, MvRepository, MvRepositoryAvailability,
     MvRepositoryError, MvRepositoryErrorKind, MvTarget, RebuildMvRepositoryRequest,

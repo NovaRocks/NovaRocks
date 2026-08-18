@@ -72,7 +72,7 @@ pub(crate) struct StandaloneMvBackgroundEngine {
     ports: IcebergMvCorePorts,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
-    storage_observation: Arc<dyn crate::mv::domain::storage_observation::MvStorageObservationPort>,
+    storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
 }
 
 impl StandaloneMvBackgroundEngine {
@@ -80,9 +80,7 @@ impl StandaloneMvBackgroundEngine {
         ports: IcebergMvCorePorts,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
-        storage_observation: Arc<
-            dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
-        >,
+        storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
     ) -> Self {
         Self {
             ports,

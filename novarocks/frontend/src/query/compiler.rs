@@ -24,7 +24,6 @@ use crate::catalog_application::query_materializer::build_catalog_service_provid
 use crate::catalog_application::virtual_table;
 use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use crate::mv::domain::repository::MvRepository;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::PreparedQueryOperation;
 use crate::query_execution::compiler::{
@@ -42,6 +41,7 @@ use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_d
 use crate::view::ViewRequestContext;
 use novarocks::connector::connector_request_context_for_query;
 use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
     ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
     SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,

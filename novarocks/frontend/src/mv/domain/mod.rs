@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod aggregate_state;
 pub mod analysis;
 pub mod analysis_adapter;
 pub mod application;

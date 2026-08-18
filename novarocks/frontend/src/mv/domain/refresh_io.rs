@@ -34,7 +34,7 @@ use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution
 /// table again.
 pub(crate) fn observe_current_refresh_base_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     table_ref: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<crate::mv::domain::storage_observation::MvRefreshBaseObservation, String> {
@@ -49,14 +49,18 @@ pub(crate) fn observe_current_refresh_base_with_ports(
         &table_ref.table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let observation = storage_observation
-        .observe_refresh_base(&exact_lease, &metadata, connector_context.clone())
-        .map_err(|error| {
-            format!(
-                "observe MV refresh base facts for {}: {error}",
-                table_ref.fqn()
-            )
-        })?;
+    let observation = crate::mv::domain::storage_observation::observe_refresh_base(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        connector_context.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "observe MV refresh base facts for {}: {error}",
+            table_ref.fqn()
+        )
+    })?;
     if observation.table() != &metadata.identity {
         return Err(format!(
             "MV refresh base observation identity does not match loaded metadata for {}",

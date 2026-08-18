@@ -17,17 +17,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use novarocks::mv::dependency::model::{
+use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks::mv::persistence::definition::CreateMvDefinitionRequest;
-use novarocks::mv::persistence::partition::ReplaceMvPartitionStatesRequest;
-use novarocks::mv::persistence::refresh::MvRefreshFinalizeRequest;
-use novarocks::mv::repository::{
+use novarocks_frontend::mv::domain::persistence::definition::CreateMvDefinitionRequest;
+use novarocks_frontend::mv::domain::persistence::partition::ReplaceMvPartitionStatesRequest;
+use novarocks_frontend::mv::domain::persistence::refresh::MvRefreshFinalizeRequest;
+use novarocks_frontend::mv::domain::repository::{
     CreateMvDependencyRequest, CreateMvRepositoryRequest, InitialMvRefreshConfiguration,
     MvRepository, MvTarget,
 };
-use novarocks::mv::test_repository::InMemoryMvRepository;
+use novarocks_frontend::mv::domain::test_repository::InMemoryMvRepository;
 use uuid::Uuid;
 
 fn target() -> MvTarget {
@@ -93,7 +93,7 @@ fn provider_neutral_repository_preserves_create_refresh_partition_and_dependency
         .expect("begin refresh through port");
     repository
         .finalize_refresh_with_partitions(
-            novarocks::mv::repository::FinalizeMvRefreshWithPartitionsRequest {
+            novarocks_frontend::mv::domain::repository::FinalizeMvRefreshWithPartitionsRequest {
                 refresh: MvRefreshFinalizeRequest {
                     refresh_id: refresh.refresh_id,
                     rows: 3,

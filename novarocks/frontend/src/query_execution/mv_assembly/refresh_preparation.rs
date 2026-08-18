@@ -122,7 +122,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
     current_database: &str,
     select_sql: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<crate::mv::domain::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
+) -> Result<novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout, String> {
     let visible_query = parse_mv_select_query(select_sql)?;
     let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
         current_catalog,
@@ -141,9 +141,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
     let facts = visible_analysis
         .refresh_input
         .aggregate_layout_facts(&visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
-    crate::mv::domain::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(
-        &facts,
-    )
+    novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
 }
 
 impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
@@ -314,19 +312,18 @@ fn retain_exact_repartition_target(
         connector_context,
     )?;
     validate_retained_target_identity(&target, binding.identity())?;
-    let schema_validation = source
-        .storage_observation()
-        .observe_schema_validation(
-            binding.lease(),
-            binding.metadata(),
-            connector_context.clone(),
+    let schema_validation = crate::mv::domain::storage_observation::observe_schema_validation(
+        source.storage_observation(),
+        binding.lease(),
+        binding.metadata(),
+        connector_context.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "observe exact MV repartition target schema for {}.{}.{}: {error}",
+            target.catalog, target.namespace, target.table
         )
-        .map_err(|error| {
-            format!(
-                "observe exact MV repartition target schema for {}.{}.{}: {error}",
-                target.catalog, target.namespace, target.table
-            )
-        })?;
+    })?;
     Ok(RetainedRepartitionTarget {
         binding,
         schema_validation,
@@ -793,12 +790,18 @@ fn prepare_frontend_first_refresh_write(
         } else if !schema_contract.bases.is_empty() {
             novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::FanInAggregate {
                 calls,
-                aggregate_input_types: aggregate_layout.aggregate_input_types,
+                aggregate_input_types: aggregate_layout
+                    .runtime_layout()
+                    .aggregate_input_types()
+                    .to_vec(),
             }
         } else {
             novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::Aggregate {
                 calls,
-                aggregate_input_types: aggregate_layout.aggregate_input_types,
+                aggregate_input_types: aggregate_layout
+                    .runtime_layout()
+                    .aggregate_input_types()
+                    .to_vec(),
             }
         }
     } else if let Some(branch) = &schema_contract.branch {

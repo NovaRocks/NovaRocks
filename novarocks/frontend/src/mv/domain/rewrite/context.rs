@@ -45,8 +45,10 @@ use novarocks_sql::compiler::{
     SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
 };
 use novarocks_sql::planning::mv::{
-    SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
+    SqlMvAggregateCalls as AggregateSqlCalls, SqlMvAggregateLayoutFacts,
+    extract_aggregate_sql_calls,
 };
+use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
 
 /// Read-only metadata that drives Iceberg MV refresh rewrite.
 ///
@@ -317,7 +319,7 @@ impl IcebergMvRewriteContext {
     ) -> Result<
         (
             AggregateSqlCalls,
-            crate::mv::domain::aggregate_state::mv_agg_state::AggregateMvLayout,
+            novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
         ),
         String,
     > {
@@ -365,12 +367,12 @@ impl IcebergMvRewriteContext {
 
         let aggregate_input_types =
             aggregate_input_types_from_schema_contract(&aggregate_calls, &self.schema_contract)?;
-        let layout =
-            crate::mv::domain::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-                &aggregate_calls,
-                &output_columns,
-                &aggregate_input_types,
-            )?;
+        let aggregate_layout_facts = SqlMvAggregateLayoutFacts::from_aggregate_calls_and_outputs(
+            &aggregate_calls,
+            &output_columns,
+            &aggregate_input_types,
+        )?;
+        let layout = build_sql_mv_aggregate_physical_layout(&aggregate_layout_facts)?;
         Ok((aggregate_calls, layout))
     }
 
@@ -425,48 +427,50 @@ impl IcebergMvRewriteContext {
             Some(SqlImvAggregateExecutionFacts::try_new(
                 calls.group_keys.len(),
                 calls.visible_outputs,
-                layout.row_id_column.column.name.clone(),
+                layout.row_id_column().column().name.clone(),
                 layout
-                    .visible_columns
-                    .into_iter()
+                    .runtime_layout()
+                    .visible_columns()
+                    .iter()
                     .map(|column| {
                         SqlImvAggregateVisibleColumnFacts::try_new(
-                            column.name,
-                            column.data_type,
-                            column.nullable,
+                            column.name().to_string(),
+                            column.data_type().clone(),
+                            column.nullable(),
                         )
                     })
                     .collect::<Result<Vec<_>, String>>()?,
                 layout
-                    .state_columns
-                    .into_iter()
+                    .runtime_layout()
+                    .state_columns()
+                    .iter()
                     .map(|column| {
                         SqlImvAggregateExecutionStateColumnFacts::try_new(
-                            column.name,
-                            column.data_type,
-                            column.nullable,
-                            column.visible_source_index,
-                            column.aggregate_index,
-                            column.function,
-                            match column.state_role {
-                                crate::mv::domain::model::AggregateStateRole::Single => {
+                            column.name().to_string(),
+                            column.data_type().clone(),
+                            column.nullable(),
+                            column.visible_source_index(),
+                            column.aggregate_index(),
+                            aggregate_function_kind(column.aggregate_kind()),
+                            match column.state_role() {
+                                novarocks_types::mv_aggregate_layout::MvAggregateStateRole::Single => {
                                     SqlImvAggregateStateRoleFacts::Single
                                 }
-                                crate::mv::domain::model::AggregateStateRole::RetractionCount => {
+                                novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount => {
                                     SqlImvAggregateStateRoleFacts::RetractionCount
                                 }
                             },
-                            column.count_star,
+                            column.count_star(),
                         )
                     })
                     .collect::<Result<Vec<_>, String>>()?,
-                layout.group_key_source_indexes,
+                layout.runtime_layout().group_key_source_indexes().to_vec(),
                 layout
-                    .physical_columns
-                    .into_iter()
-                    .map(|column| column.column.name)
+                    .physical_columns()
+                    .iter()
+                    .map(|column| column.column().name.clone())
                     .collect(),
-                layout.aggregate_input_types,
+                layout.runtime_layout().aggregate_input_types().to_vec(),
             )?)
         } else {
             None
@@ -475,6 +479,25 @@ impl IcebergMvRewriteContext {
             builder.set_aggregate_execution(aggregate_execution)?;
         }
         builder.build()
+    }
+}
+
+fn aggregate_function_kind(
+    kind: novarocks_types::mv_aggregate_layout::MvAggregateRuntimeKind,
+) -> novarocks_sql::planning::mv::AggregateFunctionKind {
+    use novarocks_sql::planning::mv::AggregateFunctionKind;
+    use novarocks_types::mv_aggregate_layout::MvAggregateRuntimeKind;
+
+    match kind {
+        MvAggregateRuntimeKind::Count => AggregateFunctionKind::Count,
+        MvAggregateRuntimeKind::Sum => AggregateFunctionKind::Sum,
+        MvAggregateRuntimeKind::Avg => AggregateFunctionKind::Avg,
+        MvAggregateRuntimeKind::Min => AggregateFunctionKind::Min,
+        MvAggregateRuntimeKind::Max => AggregateFunctionKind::Max,
+        MvAggregateRuntimeKind::BoolOr => AggregateFunctionKind::BoolOr,
+        MvAggregateRuntimeKind::BoolAnd => AggregateFunctionKind::BoolAnd,
+        MvAggregateRuntimeKind::CountDistinct => AggregateFunctionKind::CountDistinct,
+        MvAggregateRuntimeKind::ApproxCountDistinct => AggregateFunctionKind::ApproxCountDistinct,
     }
 }
 

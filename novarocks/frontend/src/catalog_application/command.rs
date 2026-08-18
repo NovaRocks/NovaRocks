@@ -37,9 +37,9 @@ use crate::catalog_application::statement::{
 };
 use crate::catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
 use crate::mv::domain::repository::MvRepository;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use novarocks::runtime::query_result::QueryResultColumn;
 use novarocks::runtime::statement_result::StatementResult;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
     looks_like_create_table, looks_like_drop_statement,

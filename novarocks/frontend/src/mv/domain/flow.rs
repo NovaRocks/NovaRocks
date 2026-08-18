@@ -389,7 +389,7 @@ pub fn list_mvs_with_backend(
 ///
 /// Runs the semantic analyzer on the ORIGINAL (un-rewritten) SQL and returns
 /// the visible output columns. This is used by the aggregate MV refresh path
-/// to obtain visible-shaped types for `build_aggregate_mv_layout`, which expects
+/// to obtain visible-shaped types for SQL's aggregate physical-layout builder, which expects
 /// types matching `shape.visible_outputs` — not the state-shaped columns that
 /// the rewritten SELECT (AVG → SUM + COUNT) produces.
 fn normalize_incremental_mv_base_ref(

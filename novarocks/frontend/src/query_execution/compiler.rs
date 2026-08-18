@@ -84,7 +84,7 @@ pub fn query_catalog_service_snapshot(
 pub fn freeze_query_mv_rewrite_definition_index(
     query_kernel: &domain::QueryPreparationKernel,
     repository: &dyn MvRepository,
-    storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
 ) -> Result<novarocks_sql::compiler::MvRewriteDefinitionIndex, String> {
     crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
         repository,
@@ -955,8 +955,7 @@ pub struct TestQueryCompiler {
     view: domain::ViewExecutionKernel,
     system_tables: domain::SystemTableQueryKernel,
     mv_repository: Arc<dyn MvRepository>,
-    mv_storage_observation:
-        Arc<dyn crate::mv::domain::storage_observation::MvStorageObservationPort>,
+    mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
 }
 
 #[cfg(test)]
@@ -966,9 +965,7 @@ impl TestQueryCompiler {
         view: domain::ViewExecutionKernel,
         system_tables: domain::SystemTableQueryKernel,
         mv_repository: Arc<dyn MvRepository>,
-        mv_storage_observation: Arc<
-            dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
-        >,
+        mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
     ) -> Self {
         Self {
             query,
@@ -2124,7 +2121,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
     mv_repository: &dyn crate::mv::domain::repository::MvRepository,
-    mv_storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     query_opts: Option<QueryOptions>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
@@ -2237,7 +2234,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
     mv_repository: &dyn crate::mv::domain::repository::MvRepository,
-    mv_storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     level: novarocks_sql::compiler::ExplainLevel,

@@ -83,7 +83,7 @@ pub(crate) fn reject_if_iceberg_mv_properties(
 /// the retired connector registry.
 pub fn reject_if_iceberg_mv_table_with_ports(
     connector_control: &dyn ConnectorControlResolver,
-    storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
 ) -> Result<(), String> {
@@ -114,10 +114,14 @@ pub fn reject_if_iceberg_mv_table_with_ports(
             "connector loaded a different table while checking the MV mutation guard".to_string(),
         );
     }
-    if storage_observation
-        .observe_lake_package(&exact_lease, &metadata, context)
-        .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
-        .is_some()
+    if crate::mv::domain::storage_observation::observe_lake_package(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        context,
+    )
+    .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
+    .is_some()
     {
         return Err(format!(
             "table {}.{}.{} is a materialized view; {}",

@@ -629,6 +629,15 @@ impl MvRefreshTargetObservation {
     pub fn snapshot_marker(&self, snapshot_id: i64) -> Option<&MvObservedRefreshMarker> {
         self.snapshot_markers.get(&snapshot_id)
     }
+
+    /// All refresh markers carried by this bounded observation.
+    ///
+    /// The frontend converts these provider-neutral facts into its durable
+    /// refresh application representation; it does not resolve any additional
+    /// metadata while doing so.
+    pub fn snapshot_markers(&self) -> &BTreeMap<i64, MvObservedRefreshMarker> {
+        &self.snapshot_markers
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -730,6 +739,7 @@ impl MvMaintenanceMetadataObservation {
 
 /// Consumer-owned port physically published by SPI. An implementation must
 /// answer from the supplied exact lease and sealed metadata only.
+// Design: ADR-0086 (docs/adr/ADR-0086-frontend-mv-storage-observation-spi-relocation.md)
 pub trait MvStorageObservationPort: Send + Sync {
     fn observe_created_target(
         &self,

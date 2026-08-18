@@ -177,7 +177,7 @@ impl IcebergControlProvider {
             resolution,
             context,
         })?;
-        // Design: ADR-0075 (docs/adr/ADR-0075-connector-physical-table-object-bindings.md)
+        // Design: ADR-0085 (docs/adr/ADR-0085-connector-physical-table-object-bindings.md)
         // Reuse the UUID frozen into this exact metadata observation instead of
         // issuing a second catalog lookup or deriving identity from a name.
         let table_payload = self.table_payload(&metadata.table)?;

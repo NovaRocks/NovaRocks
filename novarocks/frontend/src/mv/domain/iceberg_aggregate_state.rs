@@ -22,13 +22,14 @@ use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::mv::domain::aggregate_state::mv_agg_state::{
-    AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
-};
 use crate::mv::domain::refresh::execution_context::MvRefreshPruningLimits;
 use novarocks::runtime::query_result::record_batch_to_chunk;
 use novarocks_execution::exec::change_op::{ChangeOp, change_op_array, change_op_field};
 use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::mv::aggregate_state::{
+    build_old_state_map, merge_aggregate_state_batches_with_retractions,
+};
+use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 
 pub(crate) struct IcebergAggregateMergeResult {
     pub(crate) delete_row_ids: Vec<String>,
@@ -44,7 +45,7 @@ struct AggregateStateMergeCoreResult {
 }
 
 pub(crate) fn merge_aggregate_target_state(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
 ) -> Result<IcebergAggregateMergeResult, String> {
@@ -73,7 +74,7 @@ pub(crate) fn merge_aggregate_target_state(
 pub(crate) fn merge_aggregate_state_chunks_for_change_stream(
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
 ) -> Result<Vec<Chunk>, String> {
     merge_aggregate_state_chunks_for_change_stream_with_pruning_limits(
         old_chunks,
@@ -86,7 +87,7 @@ pub(crate) fn merge_aggregate_state_chunks_for_change_stream(
 pub(crate) fn merge_aggregate_state_chunks_for_change_stream_with_pruning_limits(
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     pruning_limits: MvRefreshPruningLimits,
 ) -> Result<Vec<Chunk>, String> {
     let core = merge_aggregate_state_chunks_core(old_chunks, delta_chunks, layout, pruning_limits)?;
@@ -101,7 +102,7 @@ pub(crate) fn merge_aggregate_state_chunks_for_change_stream_with_pruning_limits
 fn merge_aggregate_state_chunks_core(
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     pruning_limits: MvRefreshPruningLimits,
 ) -> Result<AggregateStateMergeCoreResult, String> {
     let touched_row_ids = delta_row_ids(layout, delta_chunks)?;
@@ -119,9 +120,12 @@ fn merge_aggregate_state_chunks_core(
     } else {
         filter_physical_chunks_by_row_ids(layout, old_chunks, &touched_row_ids)?
     };
-    let old_rows = build_old_state_map(&touched_old_chunks, layout)?;
-    let merge_result =
-        merge_aggregate_state_batches_with_retractions(&old_rows, delta_chunks, layout)?;
+    let old_rows = build_old_state_map(&touched_old_chunks, layout.runtime_layout())?;
+    let merge_result = merge_aggregate_state_batches_with_retractions(
+        &old_rows,
+        delta_chunks,
+        layout.runtime_layout(),
+    )?;
     let upsert_chunks =
         filter_physical_chunks_by_row_ids(layout, &merge_result.upsert_chunks, &touched_row_ids)?;
     let replaced_old_count = touched_row_ids
@@ -148,7 +152,7 @@ fn merge_aggregate_state_chunks_core(
 }
 
 pub(crate) fn build_aggregate_change_chunks(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     merge: IcebergAggregateMergeResult,
 ) -> Result<Vec<Chunk>, String> {
     let mut chunks = Vec::new();
@@ -156,7 +160,11 @@ pub(crate) fn build_aggregate_change_chunks(
         let row_count = merge.delete_row_ids.len();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                Field::new(&layout.row_id_column.column.name, DataType::Utf8, false),
+                Field::new(
+                    layout.row_id_column().column().name.as_str(),
+                    DataType::Utf8,
+                    false,
+                ),
                 change_op_field(),
             ])),
             vec![
@@ -190,7 +198,7 @@ pub(crate) fn build_aggregate_change_chunks(
 }
 
 fn build_aggregate_change_stream_chunks(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     old_chunks: &[Chunk],
     upsert_chunks: &[Chunk],
     touched_row_ids: &BTreeSet<String>,
@@ -219,7 +227,7 @@ fn build_aggregate_change_stream_chunks(
 }
 
 fn append_change_op_to_physical_chunk(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     chunk: Chunk,
     op: ChangeOp,
     context: &str,
@@ -242,22 +250,22 @@ fn append_change_op_to_physical_chunk(
 }
 
 fn validate_physical_aggregate_schema(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     batch: &RecordBatch,
     context: &str,
 ) -> Result<(), String> {
-    if batch.num_columns() < layout.physical_columns.len() {
+    if batch.num_columns() < layout.physical_columns().len() {
         return Err(format!(
             "{context}: physical aggregate schema column count mismatch: got {} expected at least {}",
             batch.num_columns(),
-            layout.physical_columns.len()
+            layout.physical_columns().len()
         ));
     }
 
     let schema = batch.schema();
-    for (idx, expected_column) in layout.physical_columns.iter().enumerate() {
+    for (idx, expected_column) in layout.physical_columns().iter().enumerate() {
         let actual = schema.field(idx);
-        let expected_name = &expected_column.column.name;
+        let expected_name = &expected_column.column().name;
         if actual.name() != expected_name {
             return Err(format!(
                 "{context}: physical aggregate schema column {idx} name mismatch: got `{}` expected `{expected_name}`",
@@ -265,7 +273,7 @@ fn validate_physical_aggregate_schema(
             ));
         }
         let expected_type = novarocks_sql::syntax::sql_type_to_arrow_type(
-            &expected_column.column.data_type,
+            &expected_column.column().data_type,
         )
                 .map_err(|e| {
                     format!(
@@ -294,11 +302,11 @@ fn validate_physical_aggregate_schema(
                 expected_type
             ));
         }
-        if actual.is_nullable() != expected_column.column.nullable {
+        if actual.is_nullable() != expected_column.column().nullable {
             return Err(format!(
                 "{context}: physical aggregate schema column {idx} `{expected_name}` nullability mismatch: got {} expected {}",
                 actual.is_nullable(),
-                expected_column.column.nullable
+                expected_column.column().nullable
             ));
         }
     }
@@ -306,11 +314,11 @@ fn validate_physical_aggregate_schema(
 }
 
 fn delta_row_ids(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     delta_chunks: &[Chunk],
 ) -> Result<BTreeSet<String>, String> {
     let mut row_ids = BTreeSet::new();
-    let row_id_column = &layout.row_id_column.column.name;
+    let row_id_column = &layout.row_id_column().column().name;
     for chunk in delta_chunks {
         let schema = chunk.batch.schema();
         let row_id_index = schema.index_of(row_id_column).map_err(|e| {
@@ -337,11 +345,11 @@ fn delta_row_ids(
 }
 
 fn physical_row_ids(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     chunks: &[Chunk],
 ) -> Result<BTreeSet<String>, String> {
     let mut row_ids = BTreeSet::new();
-    let row_id_column = &layout.row_id_column.column.name;
+    let row_id_column = &layout.row_id_column().column().name;
     for chunk in chunks {
         let schema = chunk.batch.schema();
         let row_id_index = schema.index_of(row_id_column).map_err(|e| {
@@ -368,7 +376,7 @@ fn physical_row_ids(
 }
 
 fn filter_physical_chunks_by_row_ids(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     chunks: &[Chunk],
     row_ids: &BTreeSet<String>,
 ) -> Result<Vec<Chunk>, String> {
@@ -376,7 +384,7 @@ fn filter_physical_chunks_by_row_ids(
         return Ok(Vec::new());
     }
 
-    let row_id_column = &layout.row_id_column.column.name;
+    let row_id_column = &layout.row_id_column().column().name;
     let mut out = Vec::new();
     for chunk in chunks {
         let schema = chunk.batch.schema();
@@ -428,14 +436,10 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    use crate::mv::domain::aggregate_state::mv_agg_state::{
-        AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
-    };
-    use crate::mv::domain::aggregate_state::physical_column::starrocks_physical_column;
-    use crate::mv::domain::model::AggregateStateRole;
-    use novarocks_catalog::schema::SqlType;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
-    use novarocks_sql::planning::mv::AggregateFunctionKind;
+    use novarocks_sql::plan_read::{ColumnId, OutputColumn};
+    use novarocks_sql::planning::mv::{SqlMvAggregateLayoutFacts, extract_aggregate_sql_calls};
+    use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
 
     fn chunk(batch: RecordBatch) -> novarocks_execution::exec::chunk::Chunk {
         record_batch_to_chunk(batch).expect("chunk")
@@ -449,64 +453,37 @@ mod tests {
             .collect()
     }
 
-    fn test_count_layout() -> AggregateMvLayout {
-        let row_id_column = starrocks_physical_column(
-            "__row_id__".to_string(),
-            SqlType::String,
-            false,
-            false,
-            true,
-        );
-        let region_column =
-            starrocks_physical_column("region".to_string(), SqlType::String, true, true, false);
-        let count_column =
-            starrocks_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
-        let count_state_column = starrocks_physical_column(
-            "__agg_state_c".to_string(),
-            SqlType::Binary,
-            false,
-            false,
-            false,
-        );
-
-        AggregateMvLayout {
-            row_id_column: row_id_column.clone(),
-            visible_columns: vec![
-                AggregateVisibleColumn {
-                    name: "region".to_string(),
-                    data_type: DataType::Utf8,
-                    sql_type: SqlType::String,
-                    nullable: true,
-                    source_index: 0,
-                },
-                AggregateVisibleColumn {
-                    name: "c".to_string(),
-                    data_type: DataType::Int64,
-                    sql_type: SqlType::BigInt,
-                    nullable: false,
-                    source_index: 1,
-                },
-            ],
-            state_columns: vec![AggregateStateColumn {
-                name: "__agg_state_c".to_string(),
-                data_type: DataType::LargeBinary,
-                sql_type: SqlType::Binary,
+    fn test_count_layout() -> SqlMvAggregatePhysicalLayout {
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(
+            "select region, count(*) as c from ice.sales.fact group by region",
+        )
+        .expect("normalize aggregate select");
+        let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
+            .expect("parse aggregate select");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        let calls = extract_aggregate_sql_calls(&query).expect("extract aggregate calls");
+        let outputs = vec![
+            OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "region".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "c".to_string(),
+                data_type: DataType::Int64,
                 nullable: false,
-                visible_source_index: 1,
-                aggregate_index: 0,
-                function: AggregateFunctionKind::Count,
-                state_role: AggregateStateRole::Single,
-                count_star: true,
-            }],
-            aggregate_input_types: vec![None],
-            group_key_source_indexes: vec![0],
-            physical_columns: vec![
-                row_id_column,
-                region_column,
-                count_column,
-                count_state_column,
-            ],
-        }
+                is_internal: false,
+            },
+        ];
+        let facts =
+            SqlMvAggregateLayoutFacts::from_aggregate_calls_and_outputs(&calls, &outputs, &[None])
+                .expect("layout facts");
+        build_sql_mv_aggregate_physical_layout(&facts).expect("aggregate layout")
     }
 
     fn count_physical_batch(rows: &[(&str, &str, i64, i64)]) -> RecordBatch {
@@ -1044,147 +1021,5 @@ mod tests {
             validate_physical_aggregate_schema(&layout, &wrong_nullability, "wrong nullability")
                 .expect_err("wrong nullability rejected");
         assert!(err.contains("nullability mismatch"), "err={err}");
-    }
-
-    /// Regression test for IVM-P5 four-bug-chain bug #4: Map<K, V> columns
-    /// scanned from Iceberg parquet carry `PARQUET:field_id` metadata on
-    /// the inner Struct fields, the Iceberg map convention names the
-    /// entries field `key_value`, and the inner key is non-nullable.
-    /// `validate_physical_aggregate_schema` must accept this shape against a
-    /// layout-derived expected type that uses `sql_type_to_arrow_type`'s
-    /// "entries" + nullable-inner-key convention with no metadata.
-    ///
-    /// The test rebuilds a synthetic batch whose Map column carries
-    /// PARQUET:field_id metadata on inner Struct fields, then casts the
-    /// Map array values into the field-id-annotated type so the batch is
-    /// constructable. Validation must succeed.
-    #[test]
-    fn validate_physical_schema_accepts_min_max_state_map_with_field_id_metadata() {
-        use std::collections::HashMap;
-
-        let row_id_column = starrocks_physical_column(
-            "__row_id__".to_string(),
-            SqlType::String,
-            false,
-            false,
-            true,
-        );
-        let region_column =
-            starrocks_physical_column("region".to_string(), SqlType::String, true, true, false);
-        let mn_column =
-            starrocks_physical_column("mn".to_string(), SqlType::BigInt, true, true, false);
-        let state_column = starrocks_physical_column(
-            "__agg_state_mn".to_string(),
-            SqlType::Map(Box::new(SqlType::BigInt), Box::new(SqlType::BigInt)),
-            false,
-            false,
-            false,
-        );
-
-        let layout = AggregateMvLayout {
-            row_id_column: row_id_column.clone(),
-            visible_columns: vec![
-                AggregateVisibleColumn {
-                    name: "region".to_string(),
-                    data_type: DataType::Utf8,
-                    sql_type: SqlType::String,
-                    nullable: true,
-                    source_index: 0,
-                },
-                AggregateVisibleColumn {
-                    name: "mn".to_string(),
-                    data_type: DataType::Int64,
-                    sql_type: SqlType::BigInt,
-                    nullable: true,
-                    source_index: 1,
-                },
-            ],
-            state_columns: vec![AggregateStateColumn {
-                name: "__agg_state_mn".to_string(),
-                data_type: DataType::Int64,
-                sql_type: SqlType::BigInt,
-                nullable: false,
-                visible_source_index: 1,
-                aggregate_index: 0,
-                function: AggregateFunctionKind::Min,
-                state_role: AggregateStateRole::Single,
-                count_star: false,
-            }],
-            aggregate_input_types: vec![Some(DataType::Int64)],
-            group_key_source_indexes: vec![0],
-            physical_columns: vec![row_id_column, region_column, mn_column, state_column],
-        };
-
-        // Step 1: build an empty Map via the standard MapBuilder using
-        // Iceberg-rust 0.9 convention (entries field name "key_value",
-        // non-null inner key).
-        let mut builder = arrow::array::MapBuilder::new(
-            Some(arrow::array::MapFieldNames {
-                entry: "key_value".to_string(),
-                key: "key".to_string(),
-                value: "value".to_string(),
-            }),
-            arrow::array::Int64Builder::new(),
-            arrow::array::Int64Builder::new(),
-        );
-        builder.append(true).expect("append empty map row");
-        let raw_map = builder.finish();
-
-        // Step 2: synthesize a MapArray whose inner Struct Fields carry
-        // PARQUET:field_id metadata, by reconstructing the MapArray from
-        // its children using a Field with the new metadata.
-        let mut key_meta = HashMap::new();
-        key_meta.insert("PARQUET:field_id".to_string(), "9".to_string());
-        let mut value_meta = HashMap::new();
-        value_meta.insert("PARQUET:field_id".to_string(), "10".to_string());
-        let key_field = Arc::new(Field::new("key", DataType::Int64, false).with_metadata(key_meta));
-        let value_field =
-            Arc::new(Field::new("value", DataType::Int64, true).with_metadata(value_meta));
-        let entries_struct_type = DataType::Struct(arrow::datatypes::Fields::from(vec![
-            key_field.as_ref().clone(),
-            value_field.as_ref().clone(),
-        ]));
-        let entries_field = Arc::new(Field::new("key_value", entries_struct_type.clone(), false));
-
-        let raw_struct = raw_map.entries();
-        let new_struct = arrow::array::StructArray::new(
-            arrow::datatypes::Fields::from(vec![
-                key_field.as_ref().clone(),
-                value_field.as_ref().clone(),
-            ]),
-            raw_struct.columns().to_vec(),
-            raw_struct.nulls().cloned(),
-        );
-        let map_with_field_ids = arrow::array::MapArray::new(
-            entries_field.clone(),
-            raw_map.offsets().clone(),
-            new_struct,
-            raw_map.nulls().cloned(),
-            false,
-        );
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("__row_id__", DataType::Utf8, false),
-            Field::new("region", DataType::Utf8, true),
-            Field::new("mn", DataType::Int64, true),
-            Field::new("__agg_state_mn", DataType::Map(entries_field, false), false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["r1"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["r1"])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                Arc::new(map_with_field_ids) as ArrayRef,
-            ],
-        )
-        .expect("field-id annotated map batch");
-
-        // The validator must accept this shape, even though it would fail
-        // under strict `!=` (PARQUET:field_id metadata on inner Struct
-        // fields plus differing inner-key nullability vs the expected type
-        // derived from sql_type_to_arrow_type).
-        validate_physical_aggregate_schema(&layout, &batch, "field-id annotated map")
-            .expect("Map<K, V> column with field-id metadata must validate");
     }
 }

@@ -2254,7 +2254,7 @@ mod tests {
             Arc::new(
                 novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
-            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )
     }

@@ -31,7 +31,7 @@
 //! write preparation, reached through the derived write lease.
 //!
 //! This is the write-path sibling of the MV refresh binding in
-//! `crate::mv::refresh::target_binding`. The two are deliberately separate
+//! Frontend MV refresh target binding. The two are deliberately separate
 //! types: the MV one additionally carries MV refresh-ledger identity
 //! (refresh markers, bootstrap state, main-ancestor lineage) that has no
 //! meaning for an INSERT or a row mutation.

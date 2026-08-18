@@ -856,12 +856,14 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
                     .to_string(),
             );
         }
-        if self
-            .kernel
-            .mv_storage_observation()
-            .observe_lake_package(&exact_lease, &metadata, self.connector_context.clone())
-            .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
-            .is_some()
+        if crate::mv::domain::storage_observation::observe_lake_package(
+            self.kernel.mv_storage_observation().as_ref(),
+            &exact_lease,
+            &metadata,
+            self.connector_context.clone(),
+        )
+        .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
+        .is_some()
         {
             return Err(format!(
                 "table {}.{}.{} is a materialized view; use ALTER MATERIALIZED VIEW or DROP MATERIALIZED VIEW",

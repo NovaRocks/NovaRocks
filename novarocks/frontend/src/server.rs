@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use crate::capabilities as core_capabilities;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use novarocks::server::ResolvedMysqlListenerSettings;
 use novarocks::server::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlFactory;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_state_store::StateStoreHostConfig;
 
 use crate::native::report_server::FrontendReportServerHandle;
@@ -601,18 +601,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use novarocks_spi::connector::UnavailableMvStorageObservationPort;
+
     use super::{
         FrontendServerConfig, build_frontend_query_session_factory, run_frontend_server,
         run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
         run_frontend_server_with_signal_and_ports,
     };
+    use crate::catalog_application::CatalogAdmission;
     use crate::{
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig,
     };
     use novarocks::{
-        catalog_application::CatalogAdmission, server::ResolvedMysqlListenerSettings,
-        server::session::QuerySessionOpenRequest,
+        server::ResolvedMysqlListenerSettings, server::session::QuerySessionOpenRequest,
     };
     use novarocks_state_store::{
         FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
@@ -653,9 +655,7 @@ mod tests {
                 "root",
             ),
             connector_control_factories: Vec::new(),
-            mv_storage_observation: Arc::new(
-                crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort,
-            ),
+            mv_storage_observation: Arc::new(UnavailableMvStorageObservationPort),
             state_store_host_config: None,
         }
     }
@@ -746,7 +746,7 @@ mod tests {
             &host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
-            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(UnavailableMvStorageObservationPort),
         )
         .expect("build ready frontend session factory");
         let session = session_factory
@@ -861,7 +861,7 @@ mod tests {
             &host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
-            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(UnavailableMvStorageObservationPort),
         )
         .expect("build ready frontend session factory");
         let session = session_factory

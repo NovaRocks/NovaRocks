@@ -32,7 +32,6 @@ use crate::catalog_application::query_bindings::{
     QueryTableBindingStore,
 };
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::mv::domain::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
 use crate::mv::domain::analysis::rebind::rewrite_select_sql_for_rebind;
 use crate::mv::domain::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
@@ -129,13 +128,12 @@ use crate::mv::domain::schema_validation::{
     validate_join_schema_contract, validate_schema_contract,
 };
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
-use crate::mv::domain::storage_observation::{
-    MvStorageObservationPort, MvTargetCreationObservation,
-};
+use crate::mv::domain::storage_observation::MvTargetCreationObservation;
 use mv_schema::MvPartitionContract;
 use novarocks::common::engine_error::EngineError;
 use novarocks::runtime::statement_result::StatementResult;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_spi::connector::MvStorageObservationPort;
 #[cfg(test)]
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorExecutionBindingKey, ConnectorTableIdentity,
@@ -517,7 +515,8 @@ impl MvEngine for StandaloneMvEngine {
                     )));
                 }
             };
-        let observation = match self.ports.storage_observation.observe_created_target(
+        let observation = match crate::mv::domain::storage_observation::observe_created_target(
+            self.ports.storage_observation.as_ref(),
             &planning_lease,
             &loaded_target,
             self.connector_context.clone(),
@@ -1560,9 +1559,10 @@ fn aggregate_state_hidden_columns_from_property(
         return Ok(Vec::new());
     };
     Ok(layout
-        .state_columns
+        .runtime_layout()
+        .state_columns()
         .iter()
-        .map(|column| column.name.clone())
+        .map(|column| column.name().to_string())
         .collect())
 }
 
@@ -1580,7 +1580,10 @@ fn representative_aggregate_layout(
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
     analysis: &MvAnalysis,
-) -> Result<Option<crate::mv::domain::aggregate_state::mv_agg_state::AggregateMvLayout>, String> {
+) -> Result<
+    Option<novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout>,
+    String,
+> {
     match inner_row_identity(&property.identity) {
         TargetIdentity::BaseRowId | TargetIdentity::JoinRowKey(_, _) => Ok(None),
         TargetIdentity::GroupRowId(_) => {
@@ -1592,7 +1595,7 @@ fn representative_aggregate_layout(
             let facts = analysis
                 .refresh_input
                 .aggregate_layout_facts(canonical_query, scope)?;
-            crate::mv::domain::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(
+            novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(
                 &facts,
             )
             .map(Some)
@@ -1763,9 +1766,12 @@ pub fn sync_iceberg_mv_descriptor_with_ports(
         target_table_name,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
-    let package = ports
-        .storage_observation
-        .observe_lake_package(&exact_lease, &metadata, connector_context.clone())
+    let package = crate::mv::domain::storage_observation::observe_lake_package(
+        ports.storage_observation.as_ref(),
+        &exact_lease,
+        &metadata,
+        connector_context.clone(),
+    )
         .map_err(|error| format!("observe MV descriptor storage facts failed: {error}"))?
         .ok_or_else(|| {
             format!(
@@ -1872,13 +1878,15 @@ fn base_snapshot_status_for_refresh(
 }
 
 fn iceberg_aggregate_target_columns_from_layout(
-    layout: &crate::mv::domain::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
 ) -> Result<Vec<TableColumnDef>, String> {
-    validate_unique_aggregate_physical_column_names(&layout.physical_columns)?;
+    novarocks_sql::planning::mv_aggregate_layout::validate_unique_aggregate_physical_column_names(
+        layout.physical_columns(),
+    )?;
     Ok(layout
-        .physical_columns
+        .physical_columns()
         .iter()
-        .map(|column| column.column.clone())
+        .map(|column| column.column().clone())
         .collect())
 }
 
@@ -2252,7 +2260,7 @@ fn build_aggregate_contract_core(
         .refresh_input
         .aggregate_layout_facts(query, aggregate_layout_scope)?;
     let layout =
-        crate::mv::domain::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(
+        novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(
             &aggregate_layout_facts,
         )?;
 
@@ -2968,47 +2976,48 @@ fn target_contract(
 }
 
 fn aggregate_contract(
-    layout: &crate::mv::domain::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
     target_observation: &MvTargetCreationObservation,
 ) -> Result<mv_schema::AggregateStateContract, String> {
     let state_columns = layout
-        .state_columns
+        .runtime_layout()
+        .state_columns()
         .iter()
         .map(|column| {
             let target_field = target_observation
                 .fields
                 .iter()
-                .find(|field| field.name.eq_ignore_ascii_case(&column.name))
+                .find(|field| field.name.eq_ignore_ascii_case(column.name()))
                 .ok_or_else(|| {
                     format!(
                         "Iceberg MV target aggregate state column {} is missing from target schema",
-                        column.name
+                        column.name()
                     )
                 })?;
             Ok(mv_schema::AggregateStateColumnContract {
-                column_name: column.name.clone(),
+                column_name: column.name().to_string(),
                 target_field_id: target_field.field_id,
                 type_signature: target_field.type_signature.clone(),
                 nullable: target_field.nullable,
-                role: aggregate_state_role_contract(column.state_role),
+                role: aggregate_state_role_contract(column.state_role()),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(mv_schema::AggregateStateContract {
         state_layout_version: 1,
-        row_id_column_name: layout.row_id_column.column.name.clone(),
+        row_id_column_name: layout.row_id_column().column().name.clone(),
         state_columns,
     })
 }
 
 fn aggregate_state_role_contract(
-    role: crate::mv::domain::model::AggregateStateRole,
+    role: novarocks_types::mv_aggregate_layout::MvAggregateStateRole,
 ) -> mv_schema::AggregateStateRoleContract {
     match role {
-        crate::mv::domain::model::AggregateStateRole::Single => {
+        novarocks_types::mv_aggregate_layout::MvAggregateStateRole::Single => {
             mv_schema::AggregateStateRoleContract::Single
         }
-        crate::mv::domain::model::AggregateStateRole::RetractionCount => {
+        novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount => {
             mv_schema::AggregateStateRoleContract::RetractionCount
         }
     }

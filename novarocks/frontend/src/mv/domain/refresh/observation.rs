@@ -24,15 +24,16 @@ use crate::mv::domain::schema_validation::{
     ContractDecision, JoinContractDecision, validate_join_schema_contract, validate_schema_contract,
 };
 use crate::mv::domain::storage_observation::{
-    MvRefreshBaseObservation, MvSchemaValidationObservation, MvStorageObservationPort,
+    MvRefreshBaseObservation, MvSchemaValidationObservation,
 };
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorRequestContext, ConnectorTableResolution,
 };
 
 /// Loads the current schema facts used to validate a persisted MV contract.
-pub fn observe_schema_validation_for_table(
+pub(crate) fn observe_schema_validation_for_table(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
@@ -47,19 +48,23 @@ pub fn observe_schema_validation_for_table(
         &table.table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    storage_observation
-        .observe_schema_validation(&exact_lease, &metadata, connector_context.clone())
-        .map_err(|error| {
-            format!(
-                "observe MV schema validation facts for {}: {error}",
-                table.fqn()
-            )
-        })
+    crate::mv::domain::storage_observation::observe_schema_validation(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        connector_context.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "observe MV schema validation facts for {}: {error}",
+            table.fqn()
+        )
+    })
 }
 
 /// Loads the current base-table refresh facts without admitting query assembly
 /// dependencies into refresh-domain planning.
-pub fn observe_current_refresh_base(
+pub(crate) fn observe_current_refresh_base(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
@@ -77,7 +82,7 @@ pub fn observe_current_refresh_base(
 /// needed by refresh planning. This is MV-domain schema work; it deliberately
 /// receives the individual observation ports rather than a query-assembly
 /// source object.
-pub fn rebind_mv_definition_before_refresh_derivation(
+pub(crate) fn rebind_mv_definition_before_refresh_derivation(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     mv_definition: &StoredMvDefinition,

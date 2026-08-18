@@ -101,7 +101,7 @@ impl MvTargetBinding {
         )
     }
 
-    pub const fn observation(&self) -> &MvRefreshTargetObservation {
+    pub(crate) const fn observation(&self) -> &MvRefreshTargetObservation {
         &self.observation
     }
 
@@ -134,7 +134,7 @@ impl MvTargetBinding {
 /// catalog's latest connector generation again.
 pub(crate) fn load_mv_target_binding_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     table: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvTargetBinding, String> {
@@ -153,7 +153,7 @@ pub(crate) fn load_mv_target_binding_with_ports(
 /// This preserves atomicity when the caller already acquired the lease while
 /// resolving related target facts.
 pub fn load_mv_target_binding_with_lease_and_ports(
-    storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     table: &TableIdentity,
     exact_lease: ConnectorControlPlanningLease,
     connector_context: &ConnectorRequestContext,
@@ -173,14 +173,18 @@ pub fn load_mv_target_binding_with_lease_and_ports(
         &table.table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let observation = storage_observation
-        .observe_refresh_target(&exact_lease, &metadata, connector_context.clone())
-        .map_err(|error| {
-            format!(
-                "observe MV refresh target facts for {}: {error}",
-                table.fqn()
-            )
-        })?;
+    let observation = crate::mv::domain::storage_observation::observe_refresh_target(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        connector_context.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "observe MV refresh target facts for {}: {error}",
+            table.fqn()
+        )
+    })?;
     Ok(MvTargetBinding::new(metadata, exact_lease, observation))
 }
 

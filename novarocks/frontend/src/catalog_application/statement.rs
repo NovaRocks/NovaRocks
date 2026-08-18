@@ -57,9 +57,7 @@ pub trait CatalogDropContext:
 {
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
     fn mv_repository(&self) -> &dyn crate::mv::domain::repository::MvRepository;
-    fn mv_storage_observation(
-        &self,
-    ) -> &dyn crate::mv::domain::storage_observation::MvStorageObservationPort;
+    fn mv_storage_observation(&self) -> &dyn novarocks_spi::connector::MvStorageObservationPort;
 }
 
 /// Convert a sqlparser DELETE AST to our custom DeleteStmt.

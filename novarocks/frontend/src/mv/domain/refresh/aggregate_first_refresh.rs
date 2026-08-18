@@ -27,21 +27,20 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
-use crate::mv::domain::aggregate_state::mv_agg_state::{
-    AggregateMvLayout, materialize_aggregate_result_chunks,
-};
-use crate::mv::domain::model::AggregateStateRole;
 use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use novarocks::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::mv::aggregate_state::materialize_aggregate_result_chunks;
 use novarocks_sql::planning::mv::VisibleAggregateOutput;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME, SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
 };
+use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
+use novarocks_types::mv_aggregate_layout::MvAggregateStateRole;
 
 pub(crate) struct AggregateStateRead {
     pub(crate) result: QueryResult,
-    pub(crate) source_layout: AggregateMvLayout,
+    pub(crate) source_layout: SqlMvAggregatePhysicalLayout,
 }
 
 pub(crate) fn prepare_aggregate_first_refresh_chunks<F>(
@@ -316,7 +315,7 @@ fn parse_stored_select_query(sql: &str) -> Result<sqlparser::ast::Query, String>
 fn normalize_and_materialize_aggregate_read(
     mut read: AggregateStateRead,
     source_calls: &AggregateSqlCalls,
-    target_layout: &AggregateMvLayout,
+    target_layout: &SqlMvAggregatePhysicalLayout,
     target_calls: &AggregateSqlCalls,
 ) -> Result<Vec<Chunk>, String> {
     validate_aggregate_layout_compatibility(
@@ -378,11 +377,11 @@ fn normalize_and_materialize_aggregate_read(
             reorder_and_rename_chunk_columns(chunk, &target_names, &permutation)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    materialize_aggregate_result_chunks(read.result, target_layout)
+    materialize_aggregate_result_chunks(read.result.chunks, target_layout.runtime_layout())
 }
 
 fn aggregate_state_source_result_column_names(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     calls: &AggregateSqlCalls,
 ) -> Result<Vec<String>, String> {
     let mut names = aggregate_state_result_column_names(layout, calls)?;
@@ -400,9 +399,9 @@ fn aggregate_state_source_result_column_names(
 fn validate_aggregate_layout_compatibility(
     branch_index: usize,
     source_calls: &AggregateSqlCalls,
-    source_layout: &AggregateMvLayout,
+    source_layout: &SqlMvAggregatePhysicalLayout,
     target_calls: &AggregateSqlCalls,
-    target_layout: &AggregateMvLayout,
+    target_layout: &SqlMvAggregatePhysicalLayout,
 ) -> Result<(), String> {
     let mismatch = |dimension: &str| {
         Err(format!(
@@ -441,103 +440,139 @@ fn validate_aggregate_layout_compatibility(
             return mismatch(&format!("aggregate {aggregate_index} input kind"));
         }
     }
-    if source_layout.visible_columns.len() != target_layout.visible_columns.len() {
+    let source_runtime = source_layout.runtime_layout();
+    let target_runtime = target_layout.runtime_layout();
+    if source_runtime.visible_columns().len() != target_runtime.visible_columns().len() {
         return mismatch("visible column count");
     }
-    for (column_index, (source, target)) in source_layout
-        .visible_columns
+    for (column_index, (source, target)) in source_runtime
+        .visible_columns()
         .iter()
-        .zip(target_layout.visible_columns.iter())
+        .zip(target_runtime.visible_columns().iter())
         .enumerate()
     {
-        if source.data_type != target.data_type {
+        if source.data_type() != target.data_type() {
             return mismatch(&format!("visible column {column_index} Arrow type"));
         }
-        if source.sql_type != target.sql_type {
+        let source_physical = source_layout
+            .physical_columns()
+            .get(column_index + 1)
+            .ok_or_else(|| {
+                format!(
+                    "aggregate MV source physical layout is missing visible column {column_index}"
+                )
+            })?;
+        let target_physical = target_layout
+            .physical_columns()
+            .get(column_index + 1)
+            .ok_or_else(|| {
+                format!(
+                    "aggregate MV target physical layout is missing visible column {column_index}"
+                )
+            })?;
+        if source_physical.column().data_type != target_physical.column().data_type {
             return mismatch(&format!("visible column {column_index} SQL type"));
         }
-        if source.nullable != target.nullable {
+        if source.nullable() != target.nullable() {
             return mismatch(&format!("visible column {column_index} nullability"));
         }
-        if source.source_index != target.source_index {
+        if source.source_index() != target.source_index() {
             return mismatch(&format!("visible column {column_index} source index"));
         }
     }
-    if source_layout.state_columns.len() != target_layout.state_columns.len() {
+    if source_runtime.state_columns().len() != target_runtime.state_columns().len() {
         return mismatch("state column count");
     }
-    for (column_index, (source, target)) in source_layout
-        .state_columns
+    for (column_index, (source, target)) in source_runtime
+        .state_columns()
         .iter()
-        .zip(target_layout.state_columns.iter())
+        .zip(target_runtime.state_columns().iter())
         .enumerate()
     {
-        if source.data_type != target.data_type {
+        if source.data_type() != target.data_type() {
             return mismatch(&format!("state column {column_index} Arrow type"));
         }
-        if source.sql_type != target.sql_type {
+        let physical_index = 1 + source_runtime.visible_columns().len() + column_index;
+        let source_physical = source_layout
+            .physical_columns()
+            .get(physical_index)
+            .ok_or_else(|| {
+                format!(
+                    "aggregate MV source physical layout is missing state column {column_index}"
+                )
+            })?;
+        let target_physical = target_layout
+            .physical_columns()
+            .get(physical_index)
+            .ok_or_else(|| {
+                format!(
+                    "aggregate MV target physical layout is missing state column {column_index}"
+                )
+            })?;
+        if source_physical.column().data_type != target_physical.column().data_type {
             return mismatch(&format!("state column {column_index} SQL type"));
         }
-        if source.nullable != target.nullable {
+        if source.nullable() != target.nullable() {
             return mismatch(&format!("state column {column_index} nullability"));
         }
-        if source.visible_source_index != target.visible_source_index {
+        if source.visible_source_index() != target.visible_source_index() {
             return mismatch(&format!("state column {column_index} visible source index"));
         }
-        if source.aggregate_index != target.aggregate_index {
+        if source.aggregate_index() != target.aggregate_index() {
             return mismatch(&format!("state column {column_index} aggregate index"));
         }
-        if source.function != target.function {
+        if source.aggregate_kind() != target.aggregate_kind() {
             return mismatch(&format!("state column {column_index} function"));
         }
-        if source.state_role != target.state_role {
+        if source.state_role() != target.state_role() {
             return mismatch(&format!("state column {column_index} role"));
         }
-        if source.count_star != target.count_star {
+        if source.count_star() != target.count_star() {
             return mismatch(&format!("state column {column_index} count-star flag"));
         }
     }
-    if source_layout.aggregate_input_types.len() != target_layout.aggregate_input_types.len() {
+    if source_runtime.aggregate_input_types().len() != target_runtime.aggregate_input_types().len()
+    {
         return mismatch("aggregate input type count");
     }
-    for (aggregate_index, (source, target)) in source_layout
-        .aggregate_input_types
+    for (aggregate_index, (source, target)) in source_runtime
+        .aggregate_input_types()
         .iter()
-        .zip(target_layout.aggregate_input_types.iter())
+        .zip(target_runtime.aggregate_input_types().iter())
         .enumerate()
     {
         if source != target {
             return mismatch(&format!("aggregate {aggregate_index} input type"));
         }
     }
-    if source_layout.group_key_source_indexes != target_layout.group_key_source_indexes {
+    if source_runtime.group_key_source_indexes() != target_runtime.group_key_source_indexes() {
         return mismatch("group-key source indexes");
     }
-    if source_layout.physical_columns.len() != target_layout.physical_columns.len() {
+    if source_layout.physical_columns().len() != target_layout.physical_columns().len() {
         return mismatch("physical column count");
     }
     for (column_index, (source, target)) in source_layout
-        .physical_columns
+        .physical_columns()
         .iter()
-        .zip(target_layout.physical_columns.iter())
+        .zip(target_layout.physical_columns().iter())
         .enumerate()
     {
-        if source.column.data_type != target.column.data_type {
+        if source.column().data_type != target.column().data_type {
             return mismatch(&format!("physical column {column_index} SQL type"));
         }
-        if source.column.nullable != target.column.nullable {
+        if source.column().nullable != target.column().nullable {
             return mismatch(&format!("physical column {column_index} nullability"));
         }
-        if source.column.aggregation != target.column.aggregation {
+        if source.column().aggregation != target.column().aggregation {
             return mismatch(&format!("physical column {column_index} aggregation role"));
         }
-        if source.column.default != target.column.default {
+        if source.column().default != target.column().default {
             return mismatch(&format!("physical column {column_index} default"));
         }
-        if source.visible != target.visible {
+        if source.visible() != target.visible() {
             return mismatch(&format!("physical column {column_index} visibility role"));
         }
-        if source.is_key != target.is_key {
+        if source.is_key() != target.is_key() {
             return mismatch(&format!("physical column {column_index} key role"));
         }
     }
@@ -581,54 +616,55 @@ fn exact_name_permutation(
 }
 
 fn aggregate_state_result_column_names(
-    layout: &AggregateMvLayout,
+    layout: &SqlMvAggregatePhysicalLayout,
     calls: &AggregateSqlCalls,
 ) -> Result<Vec<String>, String> {
-    let mut names = Vec::with_capacity(calls.visible_outputs.len() + layout.state_columns.len());
+    let runtime = layout.runtime_layout();
+    let mut names = Vec::with_capacity(calls.visible_outputs.len() + runtime.state_columns().len());
     for output in &calls.visible_outputs {
         match output {
             VisibleAggregateOutput::GroupKey(group_key_index) => {
-                let visible_source_index = layout
-                    .group_key_source_indexes
+                let visible_source_index = runtime
+                    .group_key_source_indexes()
                     .get(*group_key_index)
                     .ok_or_else(|| {
                         format!(
                             "aggregate MV state result group key index {group_key_index} out of range"
                         )
                     })?;
-                let visible = layout
-                    .visible_columns
+                let visible = runtime
+                    .visible_columns()
                     .get(*visible_source_index)
                     .ok_or_else(|| {
                         format!(
                             "aggregate MV state result visible source index {visible_source_index} out of range"
                         )
                     })?;
-                names.push(visible.name.clone());
+                names.push(visible.name().to_string());
             }
             VisibleAggregateOutput::Aggregate(aggregate_index) => {
-                let state_column = layout
-                    .state_columns
+                let state_column = runtime
+                    .state_columns()
                     .iter()
                     .find(|column| {
-                        column.state_role == AggregateStateRole::Single
-                            && column.aggregate_index == *aggregate_index
+                        column.state_role() == MvAggregateStateRole::Single
+                            && column.aggregate_index() == *aggregate_index
                     })
                     .ok_or_else(|| {
                         format!(
                             "aggregate MV state result missing state column for aggregate index {aggregate_index}"
                         )
                     })?;
-                names.push(state_column.name.clone());
+                names.push(state_column.name().to_string());
             }
         }
     }
     names.extend(
-        layout
-            .state_columns
+        runtime
+            .state_columns()
             .iter()
-            .filter(|column| column.state_role == AggregateStateRole::RetractionCount)
-            .map(|column| column.name.clone()),
+            .filter(|column| column.state_role() == MvAggregateStateRole::RetractionCount)
+            .map(|column| column.name().to_string()),
     );
     Ok(names)
 }
@@ -686,15 +722,12 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::mv::domain::aggregate_state::mv_agg_state::{
-        AggregateStateColumn, AggregateVisibleColumn,
-    };
-    use crate::mv::domain::aggregate_state::physical_column::starrocks_physical_column;
-    use crate::mv::domain::model::AggregateStateRole;
     use novarocks::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
     use novarocks_catalog::schema::SqlType;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
-    use novarocks_sql::planning::mv::AggregateFunctionKind;
+    use novarocks_sql::plan_read::{ColumnId, OutputColumn};
+    use novarocks_sql::planning::mv::SqlMvAggregateLayoutFacts;
+    use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {
         let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
@@ -707,58 +740,37 @@ mod tests {
         extract_aggregate_sql_calls(&query).expect("extract aggregate calls")
     }
 
-    fn count_layout(group_key: &str) -> AggregateMvLayout {
-        let row_id = starrocks_physical_column(
-            "__row_id__".to_string(),
-            SqlType::String,
-            false,
-            false,
-            true,
-        );
-        let group =
-            starrocks_physical_column(group_key.to_string(), SqlType::String, true, true, false);
-        let counter =
-            starrocks_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
-        let state = starrocks_physical_column(
-            "__agg_state_c".to_string(),
-            SqlType::Binary,
-            false,
-            false,
-            false,
-        );
-        AggregateMvLayout {
-            row_id_column: row_id.clone(),
-            visible_columns: vec![
-                AggregateVisibleColumn {
-                    name: group_key.to_string(),
-                    data_type: DataType::Utf8,
-                    sql_type: SqlType::String,
-                    nullable: true,
-                    source_index: 0,
-                },
-                AggregateVisibleColumn {
-                    name: "c".to_string(),
-                    data_type: DataType::Int64,
-                    sql_type: SqlType::BigInt,
-                    nullable: false,
-                    source_index: 1,
-                },
-            ],
-            state_columns: vec![AggregateStateColumn {
-                name: "__agg_state_c".to_string(),
-                data_type: DataType::Binary,
-                sql_type: SqlType::Binary,
+    fn count_layout(group_key: &str) -> SqlMvAggregatePhysicalLayout {
+        count_layout_with_nullable(group_key, true)
+    }
+
+    fn count_layout_with_nullable(
+        group_key: &str,
+        group_key_nullable: bool,
+    ) -> SqlMvAggregatePhysicalLayout {
+        let calls = parse_calls(&format!(
+            "select {group_key}, count(*) as c from ice.sales.fact group by {group_key}"
+        ));
+        let outputs = vec![
+            OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: group_key.to_string(),
+                data_type: DataType::Utf8,
+                nullable: group_key_nullable,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId::UNSET,
+                name: "c".to_string(),
+                data_type: DataType::Int64,
                 nullable: false,
-                visible_source_index: 1,
-                aggregate_index: 0,
-                function: AggregateFunctionKind::Count,
-                state_role: AggregateStateRole::Single,
-                count_star: true,
-            }],
-            aggregate_input_types: vec![None],
-            group_key_source_indexes: vec![0],
-            physical_columns: vec![row_id, group, counter, state],
-        }
+                is_internal: false,
+            },
+        ];
+        let facts =
+            SqlMvAggregateLayoutFacts::from_aggregate_calls_and_outputs(&calls, &outputs, &[None])
+                .expect("aggregate layout facts");
+        build_sql_mv_aggregate_physical_layout(&facts).expect("aggregate layout")
     }
 
     fn reordered_count_result() -> QueryResult {
@@ -1099,9 +1111,9 @@ mod tests {
 
     fn assert_branch_layout_mismatch(
         source_calls: &AggregateSqlCalls,
-        source_layout: &AggregateMvLayout,
+        source_layout: &SqlMvAggregatePhysicalLayout,
         target_calls: &AggregateSqlCalls,
-        target_layout: &AggregateMvLayout,
+        target_layout: &SqlMvAggregatePhysicalLayout,
         dimension: &str,
     ) {
         let error = validate_aggregate_layout_compatibility(
@@ -1155,64 +1167,13 @@ mod tests {
             "aggregate 0 input kind",
         );
 
-        let mut source_layout = target_layout.clone();
-        source_layout.visible_columns[0].data_type = DataType::Int64;
-        assert_branch_layout_mismatch(
-            &target_calls,
-            &source_layout,
-            &target_calls,
-            &target_layout,
-            "visible column 0 Arrow type",
-        );
-
-        let mut source_layout = target_layout.clone();
-        source_layout.visible_columns[0].sql_type = SqlType::BigInt;
-        assert_branch_layout_mismatch(
-            &target_calls,
-            &source_layout,
-            &target_calls,
-            &target_layout,
-            "visible column 0 SQL type",
-        );
-
-        let mut source_layout = target_layout.clone();
-        source_layout.visible_columns[0].nullable = false;
+        let source_layout = count_layout_with_nullable("region", false);
         assert_branch_layout_mismatch(
             &target_calls,
             &source_layout,
             &target_calls,
             &target_layout,
             "visible column 0 nullability",
-        );
-
-        let mut source_layout = target_layout.clone();
-        source_layout.state_columns[0].state_role = AggregateStateRole::RetractionCount;
-        assert_branch_layout_mismatch(
-            &target_calls,
-            &source_layout,
-            &target_calls,
-            &target_layout,
-            "state column 0 role",
-        );
-
-        let mut source_layout = target_layout.clone();
-        source_layout.aggregate_input_types[0] = Some(DataType::Int64);
-        assert_branch_layout_mismatch(
-            &target_calls,
-            &source_layout,
-            &target_calls,
-            &target_layout,
-            "aggregate 0 input type",
-        );
-
-        let mut source_layout = target_layout.clone();
-        source_layout.physical_columns[1].visible = false;
-        assert_branch_layout_mismatch(
-            &target_calls,
-            &source_layout,
-            &target_calls,
-            &target_layout,
-            "physical column 1 visibility role",
         );
     }
 
@@ -1234,10 +1195,7 @@ mod tests {
                 let branch = reads;
                 reads += 1;
                 let source_name = if branch == 0 { "region" } else { "area" };
-                let mut layout = count_layout(source_name);
-                if branch == 1 {
-                    layout.visible_columns[0].nullable = false;
-                }
+                let layout = count_layout_with_nullable(source_name, branch != 1);
                 Ok(AggregateStateRead {
                     result: count_result(source_name, branch as i64 + 1),
                     source_layout: layout,

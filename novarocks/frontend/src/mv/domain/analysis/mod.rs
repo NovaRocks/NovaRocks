@@ -21,7 +21,6 @@ pub mod rebind;
 pub mod refresh_property;
 use std::collections::HashSet;
 
-use crate::mv::domain::aggregate_state::sql_type::arrow_data_type_to_sql_type;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_sql::planning::mv::{
     SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
@@ -689,7 +688,7 @@ pub(crate) fn output_column_to_table_column(
 ) -> Result<TableColumnDef, String> {
     Ok(TableColumnDef {
         name: column.name.clone(),
-        data_type: arrow_data_type_to_sql_type(&column.data_type)?,
+        data_type: novarocks_sql::syntax::arrow_data_type_to_sql_type(&column.data_type)?,
         nullable: column.nullable,
         aggregation: None,
         default: None,

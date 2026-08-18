@@ -105,13 +105,12 @@ code-anchors:
 - ADR-0053 — MV snapshot change window 为何复用 exact-generation scan planning 并返回 sealed neutral admission（active）
 - ADR-0055 — row-DML 调用方为何只读 Provider 签发的 strategy，而 SQL 谓词合法性为何留在 Core（active）
 - ADR-0056 — 摘除 Core 对 provider 的测试依赖时，无法用冻结 SPI facts 表达的断言为何归位到实现旁而非复刻或删除（active）
-- ADR-0060 — MV refresh base pin 为何必须从同一 exact metadata 投影 UUID 与 current snapshot（active）
 - ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
 - ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（active）
 - ADR-0077 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
 - ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（active）
-- ADR-0075 — durable caller 为何通过既有 exact metadata lease capture/rebind 物理表对象，而不依赖统计能力或新增平行 authority（active）
+- ADR-0085 — durable caller 为何通过既有 exact metadata lease capture/rebind 物理表对象，而不依赖统计能力或新增平行 authority（active）
 - ADR-0080 — 统计证据为何拆成 collection 级覆盖度与 per-metric 基准版本/来源/数值性质/集合关系四个独立维度（active）
 - ADR-0081 — 统计为何是带版本、允许陈旧、由读侧逐 metric 决定可用性的估计事实（active）
 - ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（active）
@@ -121,6 +120,7 @@ code-anchors:
 
 - ADR-0048 — distributed write为何以 Provider-signed preparation、exact lease 与中立 durable terminal fact 收敛 caller authority（superseded → ADR-0051）
 - ADR-0062 — Copy-on-Write row mutation 的读源为何由 Provider 按 cohort 冻结并以中立 recipe 签发（superseded → ADR-0063）
+- ADR-0060 — MV refresh base pin 为何必须从同一 exact metadata 投影 UUID 与 current snapshot（superseded → ADR-0086）
 
 ### distributed-query-lifecycle
 
@@ -225,6 +225,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（active）
 - ADR-0074 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
 - ADR-0075 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（active）
+- ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
 
 #### 历史
 

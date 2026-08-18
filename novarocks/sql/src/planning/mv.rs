@@ -633,7 +633,7 @@ impl SqlResolvedMvRefreshInput {
         let calls = extract_aggregate_sql_calls(&query)?;
         let aggregate_input_types = aggregate_input_types_from_resolved_query(&calls, resolved)?;
         let group_key_source_indexes = group_key_source_indexes(&calls)?;
-        let calls = calls
+        let aggregate_call_facts = calls
             .aggregates
             .iter()
             .enumerate()
@@ -647,7 +647,7 @@ impl SqlResolvedMvRefreshInput {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(SqlMvAggregateLayoutFacts {
-            calls,
+            calls: aggregate_call_facts,
             output_columns: output_column_facts(resolved),
             aggregate_input_types,
             group_key_source_indexes,
@@ -774,6 +774,49 @@ pub struct SqlMvAggregateLayoutFacts {
 }
 
 impl SqlMvAggregateLayoutFacts {
+    /// Build aggregate-layout facts from an already-admitted aggregate shape
+    /// and application-owned output schema values.
+    ///
+    /// This is intentionally the value-only counterpart of
+    /// [`SqlResolvedMvRefreshInput::aggregate_layout_facts`].  Refresh
+    /// application code can retain its persisted schema interpretation while
+    /// SQL remains the sole owner of aggregate-output classification and the
+    /// visible-source-index validation order.
+    pub fn from_aggregate_calls_and_outputs(
+        calls: &SqlMvAggregateCalls,
+        output_columns: &[crate::plan_read::OutputColumn],
+        aggregate_input_types: &[Option<arrow::datatypes::DataType>],
+    ) -> Result<Self, String> {
+        let output_columns = output_columns
+            .iter()
+            .map(|column| SqlMvOutputColumnFacts {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            })
+            .collect();
+        let aggregate_call_facts = calls
+            .aggregates
+            .iter()
+            .enumerate()
+            .map(|(aggregate_index, aggregate)| {
+                Ok(SqlMvAggregateCallFacts {
+                    output_name: aggregate.output_name.clone(),
+                    function: aggregate.function,
+                    count_star: matches!(aggregate.input, AggregateInput::Star),
+                    visible_source_index: aggregate_visible_source_index(calls, aggregate_index)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let group_key_source_indexes = group_key_source_indexes(calls)?;
+        Ok(Self {
+            calls: aggregate_call_facts,
+            output_columns,
+            aggregate_input_types: aggregate_input_types.to_vec(),
+            group_key_source_indexes,
+        })
+    }
+
     pub fn calls(&self) -> &[SqlMvAggregateCallFacts] {
         &self.calls
     }

@@ -66,9 +66,7 @@ impl CatalogDropContext for CatalogCommandKernel {
         self.mv_repository().as_ref()
     }
 
-    fn mv_storage_observation(
-        &self,
-    ) -> &dyn crate::mv::domain::storage_observation::MvStorageObservationPort {
+    fn mv_storage_observation(&self) -> &dyn novarocks_spi::connector::MvStorageObservationPort {
         self.mv_storage_observation().as_ref()
     }
 }

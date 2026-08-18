@@ -31,8 +31,8 @@ use std::sync::Arc;
 use crate::catalog_application::{CatalogApplicationPort, CatalogRuntimeProjection};
 use crate::mv::domain::repository::MvRepository;
 use crate::mv::domain::startup_restore::MvStartupRestore;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
+use novarocks_spi::connector::MvStorageObservationPort;
 
 /// The frontend's implementation of the ordered startup restore steps.
 pub(crate) struct FrontendMvStartupRestore {

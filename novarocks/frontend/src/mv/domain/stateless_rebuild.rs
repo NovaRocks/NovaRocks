@@ -55,11 +55,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::mv::domain::repository::MvRepository;
-use crate::mv::domain::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, MvStorageObservationPort,
-};
+use crate::mv::domain::storage_observation::{MvLakePackageObservation, MvLakePublication};
 use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks::runtime::statement_result::StatementResult;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
 };
@@ -220,15 +219,19 @@ fn execute_request_with_context(
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )
     .map_err(|error| format!("load stateless rebuild table metadata: {error}"))?;
-    let package = mv_storage_observation
-        .observe_lake_package(&exact_lease, &loaded_table, connector_context)
-        .map_err(|error| format!("observe stateless rebuild lake package: {error}"))?
-        .ok_or_else(|| {
-            format!(
-                "MV '{}.{}' not found among lake-native Iceberg MV packages in catalog '{}'",
-                req.namespace, req.mv, req.catalog
-            )
-        })?;
+    let package = crate::mv::domain::storage_observation::observe_lake_package(
+        mv_storage_observation,
+        &exact_lease,
+        &loaded_table,
+        connector_context,
+    )
+    .map_err(|error| format!("observe stateless rebuild lake package: {error}"))?
+    .ok_or_else(|| {
+        format!(
+            "MV '{}.{}' not found among lake-native Iceberg MV packages in catalog '{}'",
+            req.namespace, req.mv, req.catalog
+        )
+    })?;
 
     let descriptor_hash = package.descriptor.content_hash()?;
     let (provenance_hash, waterline_hash, available) = publication_level(&package.publication);

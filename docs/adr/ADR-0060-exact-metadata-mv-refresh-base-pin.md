@@ -2,15 +2,15 @@
 id: ADR-0060
 title: "Exact metadata projection for MV refresh base pins"
 domain: [provider-spi, frontend-mv]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0086
 date: 2026-08-12
 provenance:
   - "PR: MV production owner-cut readiness consumer migration (PR number pending merge)"
   - "discussion: 2026-08-12 exact-generation MV base UUID and snapshot pinning"
 code-anchors:
-  - "novarocks/core/src/mv/storage_observation.rs (MvStorageObservationPort::observe_refresh_base)"
+  - "novarocks/spi/src/connector/mv_storage_observation.rs (MvStorageObservationPort::observe_refresh_base)"
   - "novarocks/connector/iceberg/src/storage_inspector.rs (IcebergStorageInspector::observe_refresh_base)"
 ---
 

@@ -108,7 +108,7 @@ pub(crate) fn downstream_floor(
 /// leaves, never the aggregate standalone engine state.
 pub fn collect_table_stats_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
-    storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     catalog: &str,
     namespace: &str,
     table: &str,
@@ -147,11 +147,15 @@ pub fn collect_table_stats_with_ports(
         table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let observed = storage_observation
-        .observe_maintenance_metadata(&exact_lease, &metadata, context)
-        .map_err(|error| {
-            format!("observe {catalog}.{namespace}.{table} maintenance metadata: {error}")
-        })?;
+    let observed = crate::mv::domain::storage_observation::observe_maintenance_metadata(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        context,
+    )
+    .map_err(|error| {
+        format!("observe {catalog}.{namespace}.{table} maintenance metadata: {error}")
+    })?;
 
     let snapshots: Vec<SnapshotInfo> = observed
         .snapshots()

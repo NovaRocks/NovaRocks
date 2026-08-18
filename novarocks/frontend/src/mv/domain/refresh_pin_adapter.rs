@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 
 /// Capture refresh pins from the exact connector-control and storage-observation

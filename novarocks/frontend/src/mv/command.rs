@@ -22,8 +22,8 @@ use crate::mv::domain::application::{MvApplicationService, MvStatementResult};
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::repository::MvRepository;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use crate::runtime::statement_result::StatementResult;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
     RefreshMaterializedViewStmt, parse_call_procedure_sql, parse_mv_admitted_statement,

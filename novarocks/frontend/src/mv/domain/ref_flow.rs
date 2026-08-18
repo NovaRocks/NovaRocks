@@ -36,7 +36,7 @@ use novarocks_sql::syntax::{
 /// and MV storage-observation ports required for MV-target admission.
 pub(crate) fn execute_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     _current_database: &str,
     stmt: &AlterIcebergRefStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -62,15 +62,19 @@ pub(crate) fn execute_with_ports(
         namespace: namespace.clone(),
         table: table_name.clone(),
     };
-    if storage_observation
-        .observe_lake_package(&exact_lease, &metadata, connector_context.clone())
-        .map_err(|error| {
-            format!(
-                "observe materialized-view storage facts for {}.{}.{}: {error}",
-                target.catalog, target.namespace, target.table
-            )
-        })?
-        .is_some()
+    if crate::mv::domain::storage_observation::observe_lake_package(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        connector_context.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "observe materialized-view storage facts for {}.{}.{}: {error}",
+            target.catalog, target.namespace, target.table
+        )
+    })?
+    .is_some()
     {
         return Err(format!(
             "table {}.{}.{} is a materialized view; use ALTER MATERIALIZED VIEW for MV metadata changes",

@@ -30,12 +30,12 @@ use crate::common::backend_topology::BackendTopologyService;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::repository::MvRepository;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
 use novarocks::connector::unified_statistics::UnifiedStatisticsResolver;
 use novarocks_spi::connector::ConnectorControlRegistry;
+use novarocks_spi::connector::MvStorageObservationPort;
 
 /// Query compilation and distributed-query preparation dependencies.
 ///

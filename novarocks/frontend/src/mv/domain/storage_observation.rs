@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Consumer-owned observation boundary for MV storage facts.
+//! Frontend-owned conversion and discovery for MV storage observations.
 //!
-//! This is an application-owned public port. Consumers retain an exact
-//! connector planning lease while an adapter reads provider-specific storage,
-//! then receive only validated neutral values.  It is not a Connector SPI
-//! capability and must not expose concrete table handles or catalog entries.
+//! SPI owns the provider-facing observation port and its neutral values. This
+//! module converts those sealed values into Frontend durable contracts and
+//! performs application-owned lake-package discovery. No conversion resolves a
+//! current generation or performs provider runtime IO.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
@@ -30,6 +30,16 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
     ConnectorTableResolution, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    MvCreatedTargetObservation as SpiCreatedTargetObservation,
+    MvLakePackageObservation as SpiLakePackageObservation,
+    MvLakePublicationObservation as SpiLakePublicationObservation,
+    MvMaintenanceMetadataObservation as SpiMaintenanceMetadataObservation,
+    MvObservedField as SpiObservedField, MvObservedPartitionSpec as SpiObservedPartitionSpec,
+    MvObservedPartitionTransform as SpiObservedPartitionTransform,
+    MvPublishedRefreshTechnique as SpiPublishedRefreshTechnique,
+    MvRefreshBaseObservation as SpiRefreshBaseObservation,
+    MvRefreshTargetObservation as SpiRefreshTargetObservation,
+    MvSchemaValidationObservation as SpiSchemaValidationObservation, MvStorageObservationPort,
 };
 
 use crate::mv::domain::persistence::{descriptor::MvDescriptorV1, schema::MvPartitionContract};
@@ -41,7 +51,7 @@ const MV_SCHEMA_VALIDATION_PARTITION_FIELD_BYTES: usize = 48;
 
 /// Exact target-schema facts observed immediately after CREATE/bootstrap.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvTargetCreationObservation {
+pub(crate) struct MvTargetCreationObservation {
     pub table: ConnectorTableIdentity,
     pub table_uuid: String,
     pub schema_id: i32,
@@ -99,7 +109,7 @@ impl MvTargetCreationObservation {
 /// the exact connector generation that loaded the source metadata. Core never
 /// interprets the opaque table handle or provider schema values.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvSchemaValidationObservation {
+pub(crate) struct MvSchemaValidationObservation {
     table_uuid: String,
     schema_id: i32,
     format_v3: bool,
@@ -253,7 +263,7 @@ impl MvSchemaValidationObservation {
 
 /// One field in an observed target schema.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvObservedTargetField {
+pub(crate) struct MvObservedTargetField {
     pub field_id: i32,
     pub name: String,
     pub type_signature: String,
@@ -289,7 +299,7 @@ impl MvObservedTargetField {
 
 /// Provider-neutral current default partition specification.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvSchemaValidationPartitionContract {
+pub(crate) struct MvSchemaValidationPartitionContract {
     spec_id: i32,
     fields: Vec<MvSchemaValidationPartitionField>,
 }
@@ -309,7 +319,7 @@ impl MvSchemaValidationPartitionContract {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvSchemaValidationPartitionField {
+pub(crate) struct MvSchemaValidationPartitionField {
     partition_field_id: i32,
     partition_field_name: String,
     source_target_field_id: i32,
@@ -356,7 +366,7 @@ impl MvSchemaValidationPartitionField {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MvSchemaValidationPartitionTransform {
+pub(crate) enum MvSchemaValidationPartitionTransform {
     Identity,
     Year,
     Month,
@@ -370,7 +380,7 @@ pub enum MvSchemaValidationPartitionTransform {
 
 /// A discovered MV lake package, including its current publication state.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvLakePackageObservation {
+pub(crate) struct MvLakePackageObservation {
     pub table: ConnectorTableIdentity,
     pub descriptor: MvDescriptorV1,
     pub publication: MvLakePublication,
@@ -397,14 +407,14 @@ impl MvLakePackageObservation {
 
 /// The only publication states meaningful to lake recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MvLakePublication {
+pub(crate) enum MvLakePublication {
     NeverPublished,
     Published(MvPublishedLakeFacts),
 }
 
 /// Persisted refresh facts observed together with the lake package.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvPublishedLakeFacts {
+pub(crate) struct MvPublishedLakeFacts {
     pub target_snapshot_id: i64,
     pub refresh_id: i64,
     pub mv_id: i64,
@@ -493,7 +503,7 @@ impl MvPublishedLakeFacts {
 
 /// One base-table identity and refresh watermark from MV provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvPublishedBaseFact {
+pub(crate) struct MvPublishedBaseFact {
     pub table_fqn: String,
     pub table_uuid: String,
     pub from_snapshot: Option<i64>,
@@ -502,7 +512,7 @@ pub struct MvPublishedBaseFact {
 
 /// The published refresh technique, detached from provider provenance types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MvPublishedRefreshTechnique {
+pub(crate) enum MvPublishedRefreshTechnique {
     Incremental,
     Full,
     MetadataOnly,
@@ -515,7 +525,7 @@ pub enum MvPublishedRefreshTechnique {
 /// observation narrow prevents base pinning from becoming a general-purpose
 /// provider metadata surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvRefreshBaseObservation {
+pub(crate) struct MvRefreshBaseObservation {
     table: ConnectorTableIdentity,
     table_uuid: String,
     current_snapshot_id: Option<i64>,
@@ -577,7 +587,7 @@ const MAX_MV_REFRESH_TARGET_REFS: usize = 1_024;
 /// objects — are deliberately absent: they belong to the Provider's own write
 /// preparation, not to a Core-visible observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvRefreshTargetObservation {
+pub(crate) struct MvRefreshTargetObservation {
     table: ConnectorTableIdentity,
     table_uuid: String,
     schema_id: i32,
@@ -595,7 +605,7 @@ pub struct MvRefreshTargetObservation {
 /// The Provider decodes it from its own provenance encoding; Core only ever
 /// compares it against the identity in its own refresh ledger.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvObservedRefreshMarker {
+pub(crate) struct MvObservedRefreshMarker {
     pub refresh_id: i64,
     pub mv_id: i64,
     pub token: String,
@@ -747,7 +757,7 @@ const MV_MAINTENANCE_SNAPSHOT_BYTES: usize = 16;
 /// neutral facts. Provider-specific naming is not: the observation reports how
 /// many references are not the provider's default one, never which ref that is.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvMaintenanceMetadataObservation {
+pub(crate) struct MvMaintenanceMetadataObservation {
     current_snapshot_id: Option<i64>,
     snapshots: Vec<MvObservedSnapshot>,
     non_default_reference_count: usize,
@@ -759,7 +769,7 @@ pub struct MvMaintenanceMetadataObservation {
 
 /// One retained snapshot and the instant it was committed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MvObservedSnapshot {
+pub(crate) struct MvObservedSnapshot {
     pub snapshot_id: i64,
     pub timestamp_ms: i64,
 }
@@ -770,7 +780,7 @@ pub struct MvObservedSnapshot {
 /// clamping belong to the policy owner, never to the observation: an absent
 /// value and a declared value must stay distinguishable across the boundary.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MvObservedMaintenancePolicy {
+pub(crate) struct MvObservedMaintenancePolicy {
     pub maintenance_enabled: Option<bool>,
     pub expire_max_snapshot_age_ms: Option<i64>,
     pub expire_min_snapshots_to_keep: Option<u32>,
@@ -871,146 +881,331 @@ impl MvMaintenanceMetadataObservation {
     }
 }
 
-/// Observation port implemented by a composition-injected storage inspector.
-///
-/// The Core application loads metadata through the retained exact lease, then
-/// gives the inspector that sealed metadata value.  The port deliberately has
-/// no catalog entry, table handle downcast, or "current generation" lookup:
-/// only the provider implementation may interpret its opaque table handle.
-pub trait MvStorageObservationPort: Send + Sync {
-    fn observe_created_target(
-        &self,
-        exact_lease: &ConnectorControlPlanningLease,
-        metadata: &ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<MvTargetCreationObservation, ConnectorError>;
-
-    fn observe_schema_validation(
-        &self,
-        exact_lease: &ConnectorControlPlanningLease,
-        metadata: &ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<MvSchemaValidationObservation, ConnectorError>;
-
-    fn observe_lake_package(
-        &self,
-        exact_lease: &ConnectorControlPlanningLease,
-        metadata: &ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<Option<MvLakePackageObservation>, ConnectorError>;
-
-    /// Observe a base table's UUID and current snapshot from one exact sealed
-    /// metadata value.
-    // Design: ADR-0060 (docs/adr/ADR-0060-exact-metadata-mv-refresh-base-pin.md)
-    fn observe_refresh_base(
-        &self,
-        exact_lease: &ConnectorControlPlanningLease,
-        metadata: &ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<MvRefreshBaseObservation, ConnectorError>;
-
-    /// Observe the refresh-time facts of an MV target.
-    ///
-    /// Called on the same exact generation that loaded `metadata`, so the
-    /// returned snapshot and ref identity are consistent with the Arrow schema
-    /// and opaque handle the caller already holds.
-    fn observe_refresh_target(
-        &self,
-        exact_lease: &ConnectorControlPlanningLease,
-        metadata: &ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<MvRefreshTargetObservation, ConnectorError>;
-
-    /// Observe the maintenance facts a provider can project from `metadata`
-    /// alone.
-    ///
-    /// Scoped to pure metadata on purpose: it never triggers provider runtime
-    /// IO, so a maintenance pass can gather these facts for every table at the
-    /// cost of the metadata load it already performed.
-    fn observe_maintenance_metadata(
-        &self,
-        exact_lease: &ConnectorControlPlanningLease,
-        metadata: &ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<MvMaintenanceMetadataObservation, ConnectorError>;
+pub(crate) fn observe_created_target(
+    observer: &dyn MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+) -> Result<MvTargetCreationObservation, ConnectorError> {
+    created_target_from_spi(observer.observe_created_target(exact_lease, metadata, context)?)
 }
 
-/// Fail-closed default used until the Server composition root installs the
-/// provider-specific storage inspector adapter.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnavailableMvStorageObservationPort;
+pub(crate) fn observe_schema_validation(
+    observer: &dyn MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+) -> Result<MvSchemaValidationObservation, ConnectorError> {
+    schema_validation_from_spi(
+        observer.observe_schema_validation(exact_lease, metadata, context.clone())?,
+        &context,
+    )
+}
 
-impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
-    fn observe_created_target(
-        &self,
-        _exact_lease: &ConnectorControlPlanningLease,
-        _metadata: &ConnectorTableMetadata,
-        _context: ConnectorRequestContext,
-    ) -> Result<MvTargetCreationObservation, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "MV storage observation port is not installed",
-        ))
+pub(crate) fn observe_lake_package(
+    observer: &dyn MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
+    observer
+        .observe_lake_package(exact_lease, metadata, context)
+        .and_then(|observation| observation.map(lake_package_from_spi).transpose())
+}
+
+pub(crate) fn observe_refresh_base(
+    observer: &dyn MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+) -> Result<MvRefreshBaseObservation, ConnectorError> {
+    refresh_base_from_spi(
+        observer.observe_refresh_base(exact_lease, metadata, context.clone())?,
+        &context,
+    )
+}
+
+pub(crate) fn observe_refresh_target(
+    observer: &dyn MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+) -> Result<MvRefreshTargetObservation, ConnectorError> {
+    refresh_target_from_spi(
+        observer.observe_refresh_target(exact_lease, metadata, context.clone())?,
+        &context,
+    )
+}
+
+pub(crate) fn observe_maintenance_metadata(
+    observer: &dyn MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {
+    maintenance_metadata_from_spi(
+        observer.observe_maintenance_metadata(exact_lease, metadata, context.clone())?,
+        &context,
+    )
+}
+
+fn created_target_from_spi(
+    observation: SpiCreatedTargetObservation,
+) -> Result<MvTargetCreationObservation, ConnectorError> {
+    MvTargetCreationObservation::try_new(
+        observation.table().clone(),
+        observation.table_uuid().to_string(),
+        observation.schema_id(),
+        observed_fields_from_spi(observation.fields()),
+        durable_partition_from_spi(observation.partition())?,
+    )
+}
+
+fn schema_validation_from_spi(
+    observation: SpiSchemaValidationObservation,
+    context: &ConnectorRequestContext,
+) -> Result<MvSchemaValidationObservation, ConnectorError> {
+    MvSchemaValidationObservation::try_new(
+        observation.table_uuid().to_string(),
+        observation.schema_id(),
+        observation.is_format_v3(),
+        observation.stored_row_lineage_enabled(),
+        observed_fields_from_spi(observation.fields()),
+        schema_validation_partition_from_spi(observation.partition()),
+        context,
+    )
+}
+
+fn lake_package_from_spi(
+    observation: SpiLakePackageObservation,
+) -> Result<MvLakePackageObservation, ConnectorError> {
+    let descriptor_projection = observation.descriptor();
+    let mut properties = HashMap::from([(
+        crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP.to_string(),
+        descriptor_projection.inline_descriptor().to_string(),
+    )]);
+    if let Some(content_hash) = descriptor_projection.content_hash() {
+        properties.insert(
+            crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP.to_string(),
+            content_hash.to_string(),
+        );
     }
+    let descriptor = MvDescriptorV1::from_storage_properties(&properties).map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode MV storage descriptor: {error}"),
+        )
+    })?;
+    let publication = match observation.publication() {
+        SpiLakePublicationObservation::NeverPublished => MvLakePublication::NeverPublished,
+        SpiLakePublicationObservation::Published(facts) => {
+            let technique = match facts.technique {
+                SpiPublishedRefreshTechnique::Incremental => {
+                    MvPublishedRefreshTechnique::Incremental
+                }
+                SpiPublishedRefreshTechnique::Full => MvPublishedRefreshTechnique::Full,
+                SpiPublishedRefreshTechnique::MetadataOnly => {
+                    MvPublishedRefreshTechnique::MetadataOnly
+                }
+            };
+            MvLakePublication::Published(MvPublishedLakeFacts::try_new(
+                facts.target_snapshot_id,
+                facts.refresh_id,
+                facts.mv_id,
+                facts.token.clone(),
+                technique,
+                facts
+                    .bases
+                    .iter()
+                    .map(|base| MvPublishedBaseFact {
+                        table_fqn: base.table_fqn.clone(),
+                        table_uuid: base.table_uuid.clone(),
+                        from_snapshot: base.from_snapshot,
+                        to_snapshot: base.to_snapshot,
+                    })
+                    .collect(),
+                facts.definition_fingerprint.clone(),
+                facts.rows,
+                facts.provenance_hash.clone(),
+                facts.waterline_hash.clone(),
+            )?)
+        }
+    };
+    MvLakePackageObservation::try_new(observation.table().clone(), descriptor, publication)
+}
 
-    fn observe_schema_validation(
-        &self,
-        _exact_lease: &ConnectorControlPlanningLease,
-        _metadata: &ConnectorTableMetadata,
-        _context: ConnectorRequestContext,
-    ) -> Result<MvSchemaValidationObservation, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "MV schema validation observation port is not installed",
-        ))
-    }
+fn refresh_base_from_spi(
+    observation: SpiRefreshBaseObservation,
+    context: &ConnectorRequestContext,
+) -> Result<MvRefreshBaseObservation, ConnectorError> {
+    MvRefreshBaseObservation::try_new(
+        observation.table().clone(),
+        observation.table_uuid().to_string(),
+        observation.current_snapshot_id(),
+        context,
+    )
+}
 
-    fn observe_lake_package(
-        &self,
-        _exact_lease: &ConnectorControlPlanningLease,
-        _metadata: &ConnectorTableMetadata,
-        _context: ConnectorRequestContext,
-    ) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "MV storage observation port is not installed",
-        ))
-    }
+fn refresh_target_from_spi(
+    observation: SpiRefreshTargetObservation,
+    context: &ConnectorRequestContext,
+) -> Result<MvRefreshTargetObservation, ConnectorError> {
+    MvRefreshTargetObservation::try_new(
+        observation.table().clone(),
+        observation.table_uuid().to_string(),
+        observation.schema_id(),
+        durable_partition_from_spi(observation.partition())?,
+        observation.current_snapshot_id(),
+        observation.ref_snapshot_ids().clone(),
+        observation.field_ids().to_vec(),
+        observation.main_ancestor_snapshot_ids().to_vec(),
+        observation.current_snapshot_is_empty_bootstrap(),
+        observation
+            .snapshot_markers()
+            .iter()
+            .map(|(snapshot_id, marker)| {
+                (
+                    *snapshot_id,
+                    MvObservedRefreshMarker {
+                        refresh_id: marker.refresh_id,
+                        mv_id: marker.mv_id,
+                        token: marker.token.clone(),
+                    },
+                )
+            })
+            .collect(),
+        context,
+    )
+}
 
-    fn observe_refresh_base(
-        &self,
-        _exact_lease: &ConnectorControlPlanningLease,
-        _metadata: &ConnectorTableMetadata,
-        _context: ConnectorRequestContext,
-    ) -> Result<MvRefreshBaseObservation, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "MV refresh base observation port is not installed",
-        ))
-    }
+fn maintenance_metadata_from_spi(
+    observation: SpiMaintenanceMetadataObservation,
+    context: &ConnectorRequestContext,
+) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {
+    MvMaintenanceMetadataObservation::try_new(
+        observation.current_snapshot_id(),
+        observation
+            .snapshots()
+            .iter()
+            .map(|snapshot| MvObservedSnapshot {
+                snapshot_id: snapshot.snapshot_id,
+                timestamp_ms: snapshot.timestamp_ms,
+            })
+            .collect(),
+        observation.non_default_reference_count(),
+        observation.total_data_files(),
+        observation.total_delete_files(),
+        observation.total_files_size_bytes(),
+        MvObservedMaintenancePolicy {
+            maintenance_enabled: observation.policy().maintenance_enabled,
+            expire_max_snapshot_age_ms: observation.policy().expire_max_snapshot_age_ms,
+            expire_min_snapshots_to_keep: observation.policy().expire_min_snapshots_to_keep,
+            target_file_size_bytes: observation.policy().target_file_size_bytes,
+        },
+        context,
+    )
+}
 
-    fn observe_refresh_target(
-        &self,
-        _exact_lease: &ConnectorControlPlanningLease,
-        _metadata: &ConnectorTableMetadata,
-        _context: ConnectorRequestContext,
-    ) -> Result<MvRefreshTargetObservation, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "MV refresh target observation port is not installed",
-        ))
-    }
+fn observed_fields_from_spi(fields: &[SpiObservedField]) -> Vec<MvObservedTargetField> {
+    fields
+        .iter()
+        .map(|field| {
+            MvObservedTargetField::new(
+                field.field_id(),
+                field.name().to_string(),
+                field.type_signature().to_string(),
+                field.nullable(),
+            )
+        })
+        .collect()
+}
 
-    fn observe_maintenance_metadata(
-        &self,
-        _exact_lease: &ConnectorControlPlanningLease,
-        _metadata: &ConnectorTableMetadata,
-        _context: ConnectorRequestContext,
-    ) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "MV maintenance metadata observation port is not installed",
-        ))
+fn durable_partition_from_spi(
+    partition: &SpiObservedPartitionSpec,
+) -> Result<MvPartitionContract, ConnectorError> {
+    Ok(MvPartitionContract {
+        target_spec_id: partition.spec_id(),
+        fields: partition
+            .fields()
+            .iter()
+            .map(|field| {
+                Ok(
+                    crate::mv::domain::persistence::schema::MvPartitionFieldContract {
+                        partition_field_id: field.partition_field_id(),
+                        partition_field_name: field.partition_field_name().to_string(),
+                        source_target_field_id: field.source_target_field_id(),
+                        source_column_name: field.source_column_name().to_string(),
+                        transform: durable_partition_transform_from_spi(field.transform())?,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, ConnectorError>>()?,
+    })
+}
+
+fn schema_validation_partition_from_spi(
+    partition: &SpiObservedPartitionSpec,
+) -> MvSchemaValidationPartitionContract {
+    MvSchemaValidationPartitionContract::new(
+        partition.spec_id(),
+        partition
+            .fields()
+            .iter()
+            .map(|field| {
+                MvSchemaValidationPartitionField::new(
+                    field.partition_field_id(),
+                    field.partition_field_name().to_string(),
+                    field.source_target_field_id(),
+                    field.source_column_name().to_string(),
+                    schema_validation_partition_transform_from_spi(field.transform()),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn durable_partition_transform_from_spi(
+    transform: &SpiObservedPartitionTransform,
+) -> Result<crate::mv::domain::persistence::schema::MvPartitionTransformContract, ConnectorError> {
+    use crate::mv::domain::persistence::schema::MvPartitionTransformContract as Durable;
+    Ok(match transform {
+        SpiObservedPartitionTransform::Identity => Durable::Identity,
+        SpiObservedPartitionTransform::Year => Durable::Year,
+        SpiObservedPartitionTransform::Month => Durable::Month,
+        SpiObservedPartitionTransform::Day => Durable::Day,
+        SpiObservedPartitionTransform::Hour => Durable::Hour,
+        SpiObservedPartitionTransform::Bucket { num_buckets } => Durable::Bucket {
+            num_buckets: *num_buckets,
+        },
+        SpiObservedPartitionTransform::Truncate { width } => Durable::Truncate { width: *width },
+        SpiObservedPartitionTransform::Void => Durable::Void,
+        SpiObservedPartitionTransform::Unsupported(name) => {
+            return corrupt(format!("unsupported MV partition transform `{name}`"));
+        }
+    })
+}
+
+fn schema_validation_partition_transform_from_spi(
+    transform: &SpiObservedPartitionTransform,
+) -> MvSchemaValidationPartitionTransform {
+    match transform {
+        SpiObservedPartitionTransform::Identity => MvSchemaValidationPartitionTransform::Identity,
+        SpiObservedPartitionTransform::Year => MvSchemaValidationPartitionTransform::Year,
+        SpiObservedPartitionTransform::Month => MvSchemaValidationPartitionTransform::Month,
+        SpiObservedPartitionTransform::Day => MvSchemaValidationPartitionTransform::Day,
+        SpiObservedPartitionTransform::Hour => MvSchemaValidationPartitionTransform::Hour,
+        SpiObservedPartitionTransform::Bucket { num_buckets } => {
+            MvSchemaValidationPartitionTransform::Bucket {
+                num_buckets: *num_buckets,
+            }
+        }
+        SpiObservedPartitionTransform::Truncate { width } => {
+            MvSchemaValidationPartitionTransform::Truncate { width: *width }
+        }
+        SpiObservedPartitionTransform::Void => MvSchemaValidationPartitionTransform::Void,
+        SpiObservedPartitionTransform::Unsupported(name) => {
+            MvSchemaValidationPartitionTransform::Unsupported(name.clone())
+        }
     }
 }
 
@@ -1020,7 +1215,7 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
 /// retains one exact generation while enumerating and loading every table,
 /// then passes only the lease-loaded metadata to the injected observation
 /// port. It never interprets an opaque provider handle.
-pub fn discover_mv_lake_packages(
+pub(crate) fn discover_mv_lake_packages(
     controls: &dyn ConnectorControlResolver,
     instance_ids: impl IntoIterator<Item = ConnectorInstanceId>,
     observer: &dyn MvStorageObservationPort,
@@ -1101,7 +1296,7 @@ pub fn discover_mv_lake_packages(
                     );
                 }
                 if let Some(package) =
-                    observer.observe_lake_package(&exact_lease, &loaded, context.clone())?
+                    observe_lake_package(observer, &exact_lease, &loaded, context.clone())?
                 {
                     if package.table != table {
                         return corrupt(format!(
@@ -1369,7 +1564,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableIdentity, MvCreatedTargetObservation as SpiCreatedTargetObservation,
+        MvLakeDescriptorProjection as SpiLakeDescriptorProjection,
+        MvLakePackageObservation as SpiLakePackageObservation,
+        MvLakePublicationObservation as SpiLakePublicationObservation,
+        MvObservedField as SpiObservedField, MvObservedPartitionField as SpiObservedPartitionField,
+        MvObservedPartitionSpec as SpiObservedPartitionSpec,
+        MvObservedPartitionTransform as SpiObservedPartitionTransform,
     };
 
     use super::{
@@ -1654,6 +1856,81 @@ mod tests {
                 .unwrap_err();
         assert_eq!(
             err.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn frontend_converts_the_spi_lake_projection_before_durable_decode() {
+        let descriptor = descriptor();
+        let properties = descriptor.to_storage_properties().unwrap();
+        let inline = properties
+            .iter()
+            .find(|(key, _)| {
+                key == crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP
+            })
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        let hash = properties
+            .iter()
+            .find(|(key, _)| {
+                key == crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP
+            })
+            .map(|(_, value)| value.clone());
+        let projection = SpiLakeDescriptorProjection::try_new(
+            descriptor.package_id.clone(),
+            inline,
+            hash,
+            &context(4096),
+        )
+        .unwrap();
+        let observed = SpiLakePackageObservation::try_new(
+            table(),
+            projection,
+            SpiLakePublicationObservation::NeverPublished,
+        )
+        .unwrap();
+
+        let converted = super::lake_package_from_spi(observed).unwrap();
+
+        assert_eq!(converted.descriptor, descriptor);
+        assert!(matches!(
+            converted.publication,
+            MvLakePublication::NeverPublished
+        ));
+    }
+
+    #[test]
+    fn frontend_rejects_an_unsupported_spi_partition_before_durable_conversion() {
+        let partition = SpiObservedPartitionSpec::new(
+            0,
+            vec![SpiObservedPartitionField::new(
+                10,
+                "unknown_c1".to_string(),
+                1,
+                "c1".to_string(),
+                SpiObservedPartitionTransform::Unsupported("unknown".to_string()),
+            )],
+        );
+        let observed = SpiCreatedTargetObservation::try_new(
+            table(),
+            "uuid-1".to_string(),
+            1,
+            vec![SpiObservedField::new(
+                1,
+                "c1".to_string(),
+                "int".to_string(),
+                false,
+            )],
+            partition,
+            &context(4096),
+        )
+        .unwrap();
+
+        let error = super::created_target_from_spi(observed).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
             novarocks_spi::connector::ConnectorErrorKind::CorruptData
         );
     }

@@ -12,10 +12,9 @@ use crate::mv::domain::refresh::target::IcebergMvTarget;
 use crate::mv::domain::schema_validation::{
     ContractDecision, JoinContractDecision, validate_join_schema_contract, validate_schema_contract,
 };
-use crate::mv::domain::storage_observation::{
-    MvSchemaValidationObservation, MvStorageObservationPort,
-};
+use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 
 /// Validates the persisted aggregate metadata before any refresh planning or
@@ -84,7 +83,7 @@ pub(crate) fn validate_aggregate_schema_contract_for_base(
     }
 }
 
-pub fn validate_repartition_schema_contract(
+pub(crate) fn validate_repartition_schema_contract(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     schema_contract: &MvSchemaContract,

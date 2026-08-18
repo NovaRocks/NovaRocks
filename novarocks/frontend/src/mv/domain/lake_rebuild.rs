@@ -132,8 +132,7 @@ pub struct LakeRebuildContext<'a> {
         Option<&'a Arc<crate::catalog_application::CatalogRuntimeProjection>>,
     pub catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
     pub connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
-    pub mv_storage_observation:
-        &'a dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+    pub mv_storage_observation: &'a dyn novarocks_spi::connector::MvStorageObservationPort,
     pub mv_repository: &'a dyn crate::mv::domain::repository::MvRepository,
 }
 

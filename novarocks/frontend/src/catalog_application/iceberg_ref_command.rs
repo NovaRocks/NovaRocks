@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
 
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use novarocks::runtime::statement_result::StatementResult;
+use novarocks_spi::connector::MvStorageObservationPort;
 
 #[derive(Clone)]
 pub struct IcebergRefCommandExecutor {

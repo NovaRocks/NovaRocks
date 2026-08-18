@@ -725,6 +725,8 @@ fn mv_repository_error(error: CatalogApplicationError) -> MvRepositoryError {
 mod tests {
     use std::collections::BTreeSet;
 
+    use crate::catalog_application::CatalogRuntimeProjection;
+
     use super::*;
 
     #[test]

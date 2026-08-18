@@ -21,8 +21,8 @@ use crate::mv::domain::refresh::target_binding::{
     MvTargetBinding, load_mv_target_binding_with_ports,
 };
 use crate::mv::domain::repository::MvTarget;
-use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 use novarocks_sql::syntax::ObjectName;
 
