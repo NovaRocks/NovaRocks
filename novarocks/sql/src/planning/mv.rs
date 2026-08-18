@@ -468,6 +468,47 @@ mod refresh_property_facade_tests {
     }
 
     #[test]
+    fn aggregate_layout_builder_keeps_sql_ddl_and_runtime_facts_together() {
+        let sql = "SELECT region, sum(amount) AS total, avg(amount) AS average \
+                   FROM fact_east GROUP BY region";
+        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        let facts = analyzed_refresh_input(sql)
+            .aggregate_layout_facts(&query, SqlMvAggregateLayoutScope::WholeQuery)
+            .expect("aggregate layout facts");
+
+        let layout =
+            crate::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
+                .expect("aggregate physical layout");
+
+        assert_eq!(
+            layout
+                .physical_columns()
+                .iter()
+                .map(|column| column.column().name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "__row_id__",
+                "region",
+                "total",
+                "average",
+                "__agg_state_total",
+                "__agg_state_average",
+                "__agg_state___ivm_row_count",
+            ]
+        );
+        assert!(layout.row_id_column().is_key());
+        assert_eq!(layout.runtime_layout().row_id_column_name(), "__row_id__");
+        assert_eq!(layout.runtime_layout().state_columns().len(), 3);
+        assert_eq!(
+            layout.runtime_layout().state_columns()[2].state_role(),
+            novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount
+        );
+    }
+
+    #[test]
     fn opaque_refresh_input_selects_first_union_branch_for_aggregate_layout() {
         let sql = "SELECT region, sum(amount) AS total FROM fact_east GROUP BY region \
                    UNION ALL \

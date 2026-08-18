@@ -24,4 +24,5 @@
 pub mod catalog;
 pub mod dml;
 pub mod mv;
+pub mod mv_aggregate_layout;
 pub mod query_execution;
