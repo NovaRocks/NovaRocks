@@ -22,12 +22,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::catalog_application::system_catalog::{
+    SystemCatalog, SystemCatalogInputs, SystemTableData,
+};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::catalog_application::system_catalog::{
-    SystemCatalog, SystemCatalogInputs, SystemTableData,
-};
 use novarocks_catalog::schema::ColumnDef;
 
 const INFORMATION_SCHEMA_DB: &str = "information_schema";

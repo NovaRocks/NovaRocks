@@ -226,23 +226,6 @@ static FRONTEND_QUERY_LIFECYCLE_LATENCY: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("register novarocks_frontend_query_lifecycle_latency_micros")
 });
 
-static FRONTEND_CATALOG_PROJECTION_CATALOGS: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!(
-        "novarocks_frontend_catalog_projection_catalogs",
-        "Number of catalog attachments currently projected into this Frontend runtime."
-    )
-    .expect("register novarocks_frontend_catalog_projection_catalogs")
-});
-
-static FRONTEND_CATALOG_PROJECTION_EVENTS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_frontend_catalog_projection_events_total",
-        "Cumulative Frontend catalog projection controller events.",
-        &["outcome"]
-    )
-    .expect("register novarocks_frontend_catalog_projection_events_total")
-});
-
 pub(crate) fn observe_fragments_scheduled(count: usize) {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc_by(count as u64);
 }
@@ -448,22 +431,6 @@ pub fn publish_frontend_query_lifecycle_metrics(
     }
 }
 
-pub(crate) fn publish_catalog_projection_metrics(
-    snapshot: crate::catalog_application::CatalogProjectionMetricsSnapshot,
-) {
-    Lazy::force(&FRONTEND_CATALOG_PROJECTION_CATALOGS).set(snapshot.projected_catalogs as i64);
-    for (outcome, count) in [
-        ("poll_success", snapshot.successful_polls),
-        ("poll_failure", snapshot.failed_polls),
-        ("resync", snapshot.resyncs),
-        ("freshness_expiry", snapshot.freshness_expiries),
-    ] {
-        FRONTEND_CATALOG_PROJECTION_EVENTS
-            .with_label_values(&[outcome])
-            .set(count as i64);
-    }
-}
-
 /// Shared metrics HTTP handler for role-owned native listeners.
 pub async fn handle_metrics(Query(params): Query<HashMap<String, String>>) -> Response {
     if params
@@ -567,8 +534,6 @@ fn refresh_backend_gauges() {
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_LATENCY);
-    Lazy::force(&FRONTEND_CATALOG_PROJECTION_CATALOGS);
-    Lazy::force(&FRONTEND_CATALOG_PROJECTION_EVENTS);
 }
 
 #[cfg(test)]

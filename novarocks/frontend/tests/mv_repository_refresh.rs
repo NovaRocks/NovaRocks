@@ -4,13 +4,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::mv::dependency::model::{
+use novarocks_frontend::mv::coordination::{
+    MvRefreshOwnershipContext, OwnershipRefusal, acquire_refresh_ownership,
+};
+use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks::mv::persistence::definition::UpdateMvRefreshMetadataRequest;
-use novarocks::mv::persistence::dependency::CreateMvDependencyRequest;
-use novarocks::mv::persistence::partition::ReplaceMvPartitionStatesRequest;
-use novarocks::mv::persistence::refresh::{
+use novarocks_frontend::mv::domain::persistence::definition::UpdateMvRefreshMetadataRequest;
+use novarocks_frontend::mv::domain::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_frontend::mv::domain::persistence::partition::ReplaceMvPartitionStatesRequest;
+use novarocks_frontend::mv::domain::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
     FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
     FrontendMvRefreshRecoveryBaseFact, FrontendMvRefreshRecoveryDisposition,
@@ -18,13 +21,10 @@ use novarocks::mv::persistence::refresh::{
     MvRefreshFinalizeRequest, MvRefreshLifecycleOwner, MvRefreshState, RecordPublishCommitRequest,
     RecordStagingCommitRequest,
 };
-use novarocks::mv::repository::{
+use novarocks_frontend::mv::domain::repository::{
     BeginFrontendMvRecoveryCycleRequest, FinalizeMvRefreshWithPartitionsRequest,
     FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
     RecordFrontendMvRecoveryCleanupOutcomeRequest, RecordFrontendMvRecoveryObservationRequest,
-};
-use novarocks_frontend::mv::coordination::{
-    MvRefreshOwnershipContext, OwnershipRefusal, acquire_refresh_ownership,
 };
 use novarocks_frontend::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, FenceValidator, MvRefreshFenceSource,

@@ -29,7 +29,6 @@ pub mod stats;
 pub mod unified_statistics;
 pub mod write_target;
 
-pub use backend::MvBackend;
 use novarocks_protocol::lifecycle::QueryOptions;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use std::collections::BTreeMap;
@@ -818,7 +817,6 @@ mod tests {
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
-    mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
     #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     fixture_controls: Arc<
         Mutex<
@@ -830,7 +828,6 @@ pub struct ConnectorRegistry {
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
-            mv_backends: HashMap::new(),
             #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             fixture_controls: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -873,40 +870,6 @@ impl ConnectorRegistry {
                 )
             })?;
         Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
-    }
-
-    pub(crate) fn register_mv_backend(&mut self, backend: Arc<dyn MvBackend>) {
-        self.mv_backends.insert(backend.name(), backend);
-    }
-
-    /// Install the Iceberg MV capability into this explicit registry leaf.
-    ///
-    /// The caller supplies the complete Core port set captured by Frontend
-    /// composition. This method intentionally does not accept application
-    /// state or synthesize provider/default dependencies.
-    pub fn register_iceberg_mv_backend(
-        &mut self,
-        ports: crate::mv::iceberg_refresh::IcebergMvCorePorts,
-    ) {
-        self.register_mv_backend(Arc::new(
-            crate::mv::iceberg_backend::IcebergMvBackend::new_with_ports(ports),
-        ));
-    }
-
-    pub(crate) fn mv_backend(&self, name: &str) -> Result<Arc<dyn MvBackend>, String> {
-        self.mv_backends
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("unknown MV backend: {name}"))
-    }
-
-    pub(crate) fn mv_backends(&self) -> Vec<Arc<dyn MvBackend>> {
-        let mut entries: Vec<_> = self.mv_backends.iter().collect();
-        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-        entries
-            .into_iter()
-            .map(|(_, backend)| Arc::clone(backend))
-            .collect()
     }
 }
 
@@ -975,10 +938,6 @@ impl Default for ConnectorRegistry {
 
 impl std::fmt::Debug for ConnectorRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut mv_backends: Vec<_> = self.mv_backends.keys().copied().collect();
-        mv_backends.sort();
-        f.debug_struct("ConnectorRegistry")
-            .field("mv_backends", &mv_backends)
-            .finish()
+        f.debug_struct("ConnectorRegistry").finish()
     }
 }

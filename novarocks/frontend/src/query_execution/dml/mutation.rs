@@ -309,7 +309,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         let (kernel, target, base_snapshot_id) = match request.kind {
             MutationStatementKind::Update => {
                 let stmt =
-                    novarocks::catalog_application::statement::convert_sqlparser_update_to_custom(
+                    crate::catalog_application::statement::convert_sqlparser_update_to_custom(
                         &raw,
                     )?;
                 let prepared = crate::query_execution::dml::mutation_flow::prepare_update_mutation(
@@ -332,9 +332,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             }
             MutationStatementKind::Merge => {
                 let stmt =
-                    novarocks::catalog_application::statement::convert_sqlparser_merge_to_custom(
-                        &raw,
-                    )?;
+                    crate::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)?;
                 let prepared = crate::query_execution::dml::mutation_flow::prepare_merge_mutation(
                     self,
                     &stmt,
@@ -569,13 +567,13 @@ mod tests {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         crate::query_execution::kernels::DmlExecutionKernel::new(
-            Arc::new(novarocks::catalog_application::query_catalog::new_query_catalog_service()),
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             Arc::new(
                 novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
-            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )
     }

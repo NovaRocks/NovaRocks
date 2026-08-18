@@ -28,10 +28,10 @@
 
 use std::sync::Arc;
 
-use novarocks::catalog_application::{CatalogApplicationPort, CatalogRuntimeProjection};
-use novarocks::mv::repository::MvRepository;
-use novarocks::mv::startup_restore::MvStartupRestore;
-use novarocks::mv::storage_observation::MvStorageObservationPort;
+use crate::catalog_application::{CatalogApplicationPort, CatalogRuntimeProjection};
+use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::startup_restore::MvStartupRestore;
+use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
 
 /// The frontend's implementation of the ordered startup restore steps.
@@ -72,8 +72,8 @@ impl MvStartupRestore for FrontendMvStartupRestore {
         // Always enter the bounded discovery sweep. The admitted catalog
         // projection and provider observations naturally determine whether any
         // lake package is eligible for rebuild.
-        novarocks::mv_startup::rebuild_imv_cache_from_lake(
-            &novarocks::mv_startup::LakeRebuildContext {
+        crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_lake(
+            &crate::mv::domain::lake_rebuild::LakeRebuildContext {
                 catalog_runtime_projection: Some(&self.catalog_runtime_projection),
                 catalog_application: Some(self.catalog_application.as_ref()),
                 connector_control: self.connector_control.as_ref(),
@@ -84,8 +84,8 @@ impl MvStartupRestore for FrontendMvStartupRestore {
     }
 
     fn restore_targets(&self) -> Result<(), String> {
-        novarocks::mv_startup::restore_iceberg_mv_targets(
-            &novarocks::mv_startup::MvTargetRestoreContext {
+        crate::mv::domain::iceberg_refresh::restore_iceberg_mv_targets(
+            &crate::mv::domain::iceberg_refresh::MvTargetRestoreContext {
                 connector_control: self.connector_control.as_ref(),
                 mv_repository: self.mv_repository.as_ref(),
             },
@@ -131,13 +131,14 @@ mod tests {
                 Ok(())
             }),
         };
-        novarocks::mv::startup_restore::run_mv_startup_restore(&restore).expect("restore succeeds");
+        crate::mv::domain::startup_restore::run_mv_startup_restore(&restore)
+            .expect("restore succeeds");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let failing = OnlyRecovery {
             recover: Box::new(|| Err("recovery failed".to_string())),
         };
-        let error = novarocks::mv::startup_restore::run_mv_startup_restore(&failing)
+        let error = crate::mv::domain::startup_restore::run_mv_startup_restore(&failing)
             .expect_err("a failing recovery must not be swallowed");
         assert!(error.contains("recovery failed"), "{error}");
     }

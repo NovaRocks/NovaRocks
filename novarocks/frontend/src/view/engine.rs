@@ -25,9 +25,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::runtime::query_result::QueryResult;
-use novarocks::catalog_application::query_catalog::CatalogServiceSource;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
@@ -194,7 +194,7 @@ trait ViewExecutionContext: CatalogServiceSource + Send + Sync {
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry;
     fn catalog_application(
         &self,
-    ) -> Option<&dyn novarocks::catalog_application::CatalogApplicationPort>;
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
 }
 
 impl ViewExecutionContext for ViewExecutionKernel {
@@ -204,7 +204,7 @@ impl ViewExecutionContext for ViewExecutionKernel {
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn novarocks::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 }
@@ -280,7 +280,7 @@ where
                     aggregation: None,
                     default: None,
                 };
-                novarocks::catalog_application::statement::connector_column(&column)
+                crate::catalog_application::statement::connector_column(&column)
             })
             .collect::<Result<Vec<_>, String>>()?;
         let instance_id = ConnectorInstanceId::parse(&request.target.catalog)
@@ -430,9 +430,9 @@ where
         context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String> {
         let catalog_service_snapshot =
-            novarocks::catalog_application::query_catalog::catalog_service_snapshot(self);
+            crate::catalog_application::query_catalog::catalog_service_snapshot(self);
         let provider =
-            novarocks::catalog_application::query_materializer::build_catalog_service_provider(
+            crate::catalog_application::query_materializer::build_catalog_service_provider(
                 Some(catalog),
                 &catalog_service_snapshot,
                 self.connector_control(),

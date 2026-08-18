@@ -1,14 +1,16 @@
 use bytes::Bytes;
-use novarocks::mv::dependency::model::{
+use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
-use novarocks::mv::persistence::refresh::{
+use novarocks_frontend::mv::domain::persistence::definition::{
+    StoredMvDefinition, StoredMvRefreshPolicy,
+};
+use novarocks_frontend::mv::domain::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
     FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
     FrontendMvRefreshRecoveryLedger, MvRefreshLifecycleOwner, MvRefreshState, StoredMvRefresh,
 };
-use novarocks::mv::repository::MvTargetLookup;
+use novarocks_frontend::mv::domain::repository::MvTargetLookup;
 use novarocks_frontend::mv::repository::catalog::schema_catalog;
 use novarocks_frontend::mv::repository::codec::{
     DecodedMvRecord, MvRecordKind, MvSequence, decode_definition, decode_record, encode_definition,

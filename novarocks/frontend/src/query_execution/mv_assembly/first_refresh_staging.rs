@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
+use crate::catalog_application::query_catalog::catalog_service_snapshot;
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::compiler::prepare_sealed_iceberg_write_native_assembly;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
@@ -18,9 +21,6 @@ use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-use novarocks::catalog_application::query_bindings::QueryTableBindingStore;
-use novarocks::catalog_application::query_catalog::catalog_service_snapshot;
-use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
 use novarocks_sql::planning::mv::first_refresh::{
     SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext,
     analyze_join_first_refresh_connector_write, analyze_mv_first_refresh_connector_write,
@@ -28,10 +28,10 @@ use novarocks_sql::planning::mv::first_refresh::{
 };
 
 pub(crate) fn frozen_logical_context_from_rewrite(
-    rewrite: &novarocks::mv::rewrite::context::IcebergMvRewriteContext,
-    affected_partitions: novarocks::mv::model::AffectedTargetPartitions,
+    rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
+    affected_partitions: crate::mv::domain::model::AffectedTargetPartitions,
     frozen_base_overlays: Option<
-        Vec<novarocks::catalog_application::query_materializer::QueryLocalTableOverlay>,
+        Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
     >,
 ) -> Result<MvFirstRefreshLogicalContext, String> {
     Ok(MvFirstRefreshLogicalContext {
@@ -105,11 +105,11 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             )?;
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
             let materializer =
-                novarocks::catalog_application::query_materializer::CatalogServiceMaterializer::new(
+                crate::catalog_application::query_materializer::CatalogServiceMaterializer::new(
                     None,
                     &catalog_service_snapshot,
                     Arc::clone(&bindings),
-                    novarocks::catalog_application::query_materializer::iceberg_table_binding_loader(
+                    crate::catalog_application::query_materializer::iceberg_table_binding_loader(
                         query_kernel.connector_control().as_ref(),
                         connector_context.clone(),
                     ),
@@ -197,11 +197,11 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
-            let materializer = novarocks::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+            let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
                 &catalog_service_snapshot,
                 Arc::clone(&bindings),
-                novarocks::catalog_application::query_materializer::iceberg_table_binding_loader(
+                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
                     query_kernel.connector_control().as_ref(),
                     connector_context.clone(),
                 ),
@@ -269,7 +269,7 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
     facts: &MvFirstRefreshLogicalContext,
     planning_lease: &ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Arc<novarocks::mv::rewrite::context::IcebergMvRewriteContext>, String> {
+) -> Result<Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>, String> {
     let target_identity =
         novarocks_catalog::identifier::TableIdentity {
             catalog: facts.mv_definition.target_catalog.clone().ok_or_else(|| {
@@ -297,7 +297,7 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
     }
     validate_frozen_join_base_facts(facts)?;
     let target_binding =
-        novarocks::mv::refresh::target_binding::load_mv_target_binding_with_lease_and_ports(
+        crate::mv::domain::refresh::target_binding::load_mv_target_binding_with_lease_and_ports(
             ports.storage_observation(),
             &target_identity,
             planning_lease.clone(),
@@ -313,29 +313,30 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
             "MV refresh logical artifact target snapshot drifted after preparation".to_string(),
         );
     }
-    let application_pin = novarocks::mv::refresh::pin::RefreshSnapshotPin::from_captured_entries(
-        facts
-            .base_refs
-            .iter()
-            .map(|base| {
-                let snapshot_id = facts.pin.get(base).ok_or_else(|| {
-                    format!(
-                        "MV first-refresh logical artifact has no snapshot pin for {}",
-                        base.fqn()
-                    )
-                })?;
-                let table_uuid = facts.pin.uuid(base).ok_or_else(|| {
-                    format!(
-                        "MV first-refresh logical artifact has no UUID pin for {}",
-                        base.fqn()
-                    )
-                })?;
-                Ok((base.clone(), snapshot_id, table_uuid.to_string()))
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-    );
+    let application_pin =
+        crate::mv::domain::refresh::pin::RefreshSnapshotPin::from_captured_entries(
+            facts
+                .base_refs
+                .iter()
+                .map(|base| {
+                    let snapshot_id = facts.pin.get(base).ok_or_else(|| {
+                        format!(
+                            "MV first-refresh logical artifact has no snapshot pin for {}",
+                            base.fqn()
+                        )
+                    })?;
+                    let table_uuid = facts.pin.uuid(base).ok_or_else(|| {
+                        format!(
+                            "MV first-refresh logical artifact has no UUID pin for {}",
+                            base.fqn()
+                        )
+                    })?;
+                    Ok((base.clone(), snapshot_id, table_uuid.to_string()))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        );
     let schema_contract = facts.mv_definition.schema_contract.clone().map(Arc::new);
-    novarocks::mv::rewrite::context::IcebergMvRewriteContext::from_parts(
+    crate::mv::domain::rewrite::context::IcebergMvRewriteContext::from_parts(
         target_identity,
         facts.mv_definition.mv_id,
         current_catalog.map(str::to_string),

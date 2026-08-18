@@ -36,6 +36,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
 use sqlparser::ast as sqlast;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
+use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
@@ -45,8 +47,6 @@ use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-use novarocks::catalog_application::query_bindings::QueryTableBindingStore;
-use novarocks::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
@@ -109,11 +109,11 @@ pub(crate) fn prepare_delete_statement(
     // drives its own writes through that same admission, so at that level a
     // user statement is indistinguishable from the MV machinery maintaining its
     // own target.
-    novarocks::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         state.connector_control().as_ref(),
         state.mv_storage_observation().as_ref(),
         &target,
-        novarocks::mv::iceberg_guard::IcebergMvUserMutation::Delete,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
     )?;
 
     // 3. Reject an unsupported WHERE clause before any external side effect.
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn delete_position_sink_query_projects_row_identity_and_partition_sources() {
-        let target = novarocks::catalog_application::resolver::TargetBackend {
+        let target = crate::catalog_application::resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
@@ -897,7 +897,7 @@ mod tests {
 
     #[test]
     fn delete_position_sink_query_pins_branch_read_snapshot() {
-        let target = novarocks::catalog_application::resolver::TargetBackend {
+        let target = crate::catalog_application::resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: "ice".to_string(),
             namespace: "db".to_string(),

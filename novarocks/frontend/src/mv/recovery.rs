@@ -25,17 +25,17 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use novarocks::mv::persistence::refresh::{
+use crate::mv::domain::persistence::refresh::{
     FrontendMvRefreshActionPhase, FrontendMvRefreshActionState, FrontendMvRefreshCommittedVersion,
     FrontendMvRefreshEvidence, FrontendMvRefreshRecoveryBaseFact,
     FrontendMvRefreshRecoveryDisposition, FrontendMvRefreshRecoveryObservation,
     MvRefreshFinalizeRequest, MvRefreshLifecycleOwner, StoredMvRefresh,
 };
-use novarocks::mv::repository::{
+use crate::mv::domain::repository::{
     BeginFrontendMvRecoveryCycleRequest, FinalizeRecoveredMvRefreshRequest, MvRepository,
     RecordFrontendMvRecoveryCleanupOutcomeRequest, RecordFrontendMvRecoveryObservationRequest,
 };
+use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorCommittedVersion, ConnectorControlRegistry,
     ConnectorHistoricalPublicationAction, ConnectorInstanceId, ConnectorMutationOperationId,
@@ -428,16 +428,17 @@ fn finalize_legacy_published(
         target_snapshot_id: Some(snapshot),
         partition_spec: None,
     };
-    use novarocks::mv::persistence::refresh::MvRefreshState;
+    use crate::mv::domain::persistence::refresh::MvRefreshState;
     match refresh.state {
         MvRefreshState::IntentCreated => repository
             .record_external_commit_and_finalize(
-                novarocks::mv::repository::RecordExternalCommitAndFinalizeRequest {
+                crate::mv::domain::repository::RecordExternalCommitAndFinalizeRequest {
                     refresh_id: refresh.refresh_id,
-                    external_outcome: novarocks::mv::persistence::refresh::RefreshExternalOutcome {
-                        target_snapshot_id: Some(snapshot),
-                        commit_id: format!("recovered-iceberg-snapshot-{snapshot}"),
-                    },
+                    external_outcome:
+                        crate::mv::domain::persistence::refresh::RefreshExternalOutcome {
+                            target_snapshot_id: Some(snapshot),
+                            commit_id: format!("recovered-iceberg-snapshot-{snapshot}"),
+                        },
                     finalize,
                 },
             )
@@ -445,7 +446,7 @@ fn finalize_legacy_published(
         MvRefreshState::StagingCommitted => {
             repository
                 .record_publish_commit(
-                    novarocks::mv::persistence::refresh::RecordPublishCommitRequest {
+                    crate::mv::domain::persistence::refresh::RecordPublishCommitRequest {
                         refresh_id: refresh.refresh_id,
                         published_snapshot_id: snapshot,
                     },
@@ -956,24 +957,24 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks::mv::dependency::model::{
+    use crate::mv::domain::dependency::model::{
         MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
     };
-    use novarocks::mv::persistence::definition::{
+    use crate::mv::domain::persistence::definition::{
         CreateMvDefinitionRequest, StoredMvRefreshPolicy,
     };
-    use novarocks::mv::persistence::dependency::CreateMvDependencyRequest;
-    use novarocks::mv::persistence::refresh::{
+    use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
+    use crate::mv::domain::persistence::refresh::{
         FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
         FrontendMvRefreshLedger, FrontendMvRefreshRecoveryStatus, MvRefreshState,
     };
-    use novarocks::mv::persistence::schema::{
+    use crate::mv::domain::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
-    use novarocks::mv::repository::{
+    use crate::mv::domain::repository::{
         BeginFrontendMvRefreshIntentRequest, CreateMvRepositoryRequest,
         InitialMvRefreshConfiguration, MvRepository,
     };
@@ -1944,7 +1945,7 @@ mod tests {
         let second_observation = ledger.observation.expect("second observation");
         assert_eq!(
             second_observation.disposition,
-            novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Superseded
+            crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Superseded
         );
         assert!(!second_observation.cleanup_required);
         assert_ne!(second_observation.digest, first_observation.digest);

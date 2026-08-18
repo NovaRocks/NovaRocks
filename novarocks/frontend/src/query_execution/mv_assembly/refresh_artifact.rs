@@ -22,7 +22,7 @@ use novarocks_spi::connector::{
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
 use novarocks_sql::planning::mv::first_refresh::{SqlMvFirstRefreshArtifact, SqlMvSnapshotPin};
 
-use novarocks::mv::application::{
+use crate::mv::domain::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
 };
 
@@ -285,21 +285,21 @@ impl MvRefreshPublishedFacts {
 /// artifact contains its logical plan only; persistence and refresh-context
 /// reconstruction stay at this application boundary.
 pub(crate) struct MvFirstRefreshLogicalContext {
-    pub(crate) mv_definition: novarocks::mv::persistence::definition::StoredMvDefinition,
+    pub(crate) mv_definition: crate::mv::domain::persistence::definition::StoredMvDefinition,
     pub(crate) canonical_select_query: sqlparser::ast::Query,
     pub(crate) base_refs: Vec<novarocks_catalog::identifier::TableIdentity>,
     pub(crate) pin: SqlMvSnapshotPin,
     pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,
     pub(crate) previous_table_uuids: BTreeMap<String, String>,
     pub(crate) target_table_uuid: String,
-    pub(crate) affected_partitions: novarocks::mv::model::AffectedTargetPartitions,
+    pub(crate) affected_partitions: crate::mv::domain::model::AffectedTargetPartitions,
     /// Base-table materializations admitted while the first-refresh artifact
     /// was prepared.  The overlays retain their exact control leases, files,
     /// and snapshot facts until activation creates the request-local binding
     /// store. `None` identifies artifact modes that have not admitted a
     /// logical join input and therefore cannot use this handoff.
     pub(crate) frozen_base_overlays:
-        Option<Vec<novarocks::catalog_application::query_materializer::QueryLocalTableOverlay>>,
+        Option<Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>>,
 }
 
 /// Application envelope for a join first-refresh artifact.

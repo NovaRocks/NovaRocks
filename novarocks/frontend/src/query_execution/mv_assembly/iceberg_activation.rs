@@ -16,6 +16,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
@@ -27,7 +28,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
 };
-use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
 
 /// Core-side provider adapter installed into the frontend composition.
 ///
@@ -91,7 +91,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
     fn sync_repartition_descriptor(
         &self,
         mv_id: i64,
-        partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+        partition_spec: crate::mv::domain::persistence::schema::MvPartitionContract,
         committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
         connector_context: &ConnectorRequestContext,
     ) -> Result<(), String> {
@@ -108,7 +108,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         })?;
         schema.target.partition = Some(partition_spec.clone());
         definition.partition_spec = Some(partition_spec);
-        novarocks::mv::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
+        crate::mv::domain::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
             &self.ports,
             &definition,
             &definition.refresh_policy,
@@ -137,7 +137,7 @@ pub(crate) fn activate_first_refresh_connector_write(
         );
     }
     let operation_id: ConnectorWriteOperationId = prepared.operation_id();
-    let target = novarocks::catalog_application::resolver::TargetBackend {
+    let target = crate::catalog_application::resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: prepared.target_catalog().to_string(),
         namespace: prepared.target_namespace().to_string(),

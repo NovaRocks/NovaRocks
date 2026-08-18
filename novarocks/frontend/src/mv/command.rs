@@ -18,24 +18,24 @@
 //! Closed typed executor for Iceberg MV statements.
 
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::mv::domain::application::{MvApplicationService, MvStatementResult};
+use crate::mv::domain::iceberg_backend::IcebergMvBackend;
+use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use crate::runtime::statement_result::StatementResult;
-use novarocks::connector::MvBackend;
-use novarocks::mv::application::{MvApplicationService, MvStatementResult};
-use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
-use novarocks::mv::repository::MvRepository;
-use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
     RefreshMaterializedViewStmt, parse_call_procedure_sql, parse_mv_admitted_statement,
 };
 
 use super::FrontendMvService;
-use crate::runtime::query_result::build_string_query_result;
-use novarocks::mv::refresh::resolve_refresh_mv_target;
-use novarocks::mv::{
+use crate::mv::domain::refresh::resolve_refresh_mv_target;
+use crate::mv::domain::{
     PROCEDURE_NAME, alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
     execute_novarocks_imv_stateless_rebuild, list_mvs_with_backend,
 };
+use crate::runtime::query_result::build_string_query_result;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -45,7 +45,7 @@ pub struct MvCommandExecutor {
     refresh_service: Arc<FrontendMvService>,
     repository: Arc<dyn MvRepository>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
-    mv_backend: Arc<dyn MvBackend>,
+    mv_backend: Arc<IcebergMvBackend>,
 }
 
 impl MvCommandExecutor {
@@ -55,7 +55,7 @@ impl MvCommandExecutor {
         refresh_service: Arc<FrontendMvService>,
         repository: Arc<dyn MvRepository>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
-        mv_backend: Arc<dyn MvBackend>,
+        mv_backend: Arc<IcebergMvBackend>,
     ) -> Self {
         Self {
             ports,
@@ -228,13 +228,13 @@ impl MvCommandExecutor {
             "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
                 .to_string()
         })?;
-        let requested_object = novarocks::mv::dependency::model::iceberg_mv_dependency_ref(
+        let requested_object = crate::mv::domain::dependency::model::iceberg_mv_dependency_ref(
             target_catalog,
             &target.database,
             &target.name,
         );
         let steps =
-            novarocks::mv::dependency::refresh::build_upstream_refresh_steps_with_repository(
+            crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_repository(
                 self.repository.as_ref(),
                 &requested_object,
             )?;

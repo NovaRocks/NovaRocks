@@ -34,12 +34,12 @@ use novarocks_spi::connector::{
     ConnectorTableHandle,
 };
 
-use crate::common::backend_topology::BackendTopologySnapshot;
-use crate::query_execution::preparation::scan::PlannedConnectorRead;
-use novarocks::catalog_application::query_bindings::{
+use crate::catalog_application::query_bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
 };
-use novarocks::catalog_application::query_materializer::QueryLocalTableOverlay;
+use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
+use crate::common::backend_topology::BackendTopologySnapshot;
+use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_frozen_connector_scan_plan,

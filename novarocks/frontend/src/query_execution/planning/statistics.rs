@@ -18,13 +18,13 @@
 
 use std::sync::Arc;
 
+use crate::catalog_application::query_bindings::{QueryTableBinding, QueryTableBindingStore};
+#[cfg(test)]
+use crate::catalog_application::query_bindings::{
+    QueryTableBindingAdmission, parse_time_travel_overlay_identity,
+};
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
-};
-use novarocks::catalog_application::query_bindings::{QueryTableBinding, QueryTableBindingStore};
-#[cfg(test)]
-use novarocks::catalog_application::query_bindings::{
-    QueryTableBindingAdmission, parse_time_travel_overlay_identity,
 };
 use novarocks::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,

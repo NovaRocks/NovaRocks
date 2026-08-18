@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::catalog_application::command::CatalogCommandExecutor;
+use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use crate::common::admitted_query_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
@@ -50,8 +52,6 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use novarocks::catalog_application::command::CatalogCommandExecutor;
-use novarocks::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use novarocks::server::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
@@ -909,7 +909,7 @@ fn resolve_catalog_name(
         .require_external_catalog_ready(&normalized)
         .map_err(|error| {
             let kind = match error.kind() {
-                novarocks::catalog_application::CatalogApplicationErrorKind::Unavailable => {
+                crate::catalog_application::CatalogApplicationErrorKind::Unavailable => {
                     QueryServiceErrorKind::Unavailable
                 }
                 _ => QueryServiceErrorKind::BadDatabase,

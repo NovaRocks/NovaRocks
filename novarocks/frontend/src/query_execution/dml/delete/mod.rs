@@ -52,10 +52,10 @@ pub fn parse_delete_statement(sql: &str) -> Result<Option<sqlparser::ast::Delete
 
 /// Recognize the NovaRocks equality-delete ALTER TABLE extension.
 pub fn parse_equality_delete_statement(sql: &str) -> Result<Option<()>, String> {
-    if !novarocks::catalog_application::statement::looks_like_add_equality_delete(sql) {
+    if !crate::catalog_application::statement::looks_like_add_equality_delete(sql) {
         return Ok(None);
     }
-    novarocks::catalog_application::statement::parse_add_equality_delete_sql(sql)?;
+    crate::catalog_application::statement::parse_add_equality_delete_sql(sql)?;
     Ok(Some(()))
 }
 
@@ -274,7 +274,7 @@ impl DeleteEngine for DmlExecutionKernel {
                     "DELETE request did not contain a DELETE statement".to_string()
                 })?;
                 let statement =
-                    novarocks::catalog_application::statement::convert_sqlparser_delete_to_custom(
+                    crate::catalog_application::statement::convert_sqlparser_delete_to_custom(
                         &delete,
                     )?;
                 standard::prepare_delete_statement(
@@ -288,7 +288,7 @@ impl DeleteEngine for DmlExecutionKernel {
             }
             DeleteStatementKind::Equality => {
                 let statement =
-                    novarocks::catalog_application::statement::parse_add_equality_delete_sql(
+                    crate::catalog_application::statement::parse_add_equality_delete_sql(
                         request.sql,
                     )?;
                 equality::prepare_equality_delete_statement(

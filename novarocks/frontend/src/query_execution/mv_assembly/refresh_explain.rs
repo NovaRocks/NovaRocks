@@ -2,26 +2,26 @@
 
 use std::sync::Arc;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
+use crate::mv::domain::analysis::canonicalize_iceberg_mv_select_query;
+use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
+use crate::mv::domain::refresh::definition::parse_iceberg_table_refs;
+use crate::mv::domain::refresh::definition::{
+    load_iceberg_mv_definition_by_target, parse_mv_select_query,
+};
+use crate::mv::domain::refresh::execution_policy::explain_refresh_full_guard;
+use crate::mv::domain::refresh::pin::validate_refresh_pin_table_uuids;
+use crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context;
+use crate::mv::domain::refresh::schema_contract::validate_aggregate_schema_contract_metadata;
+use crate::mv::domain::refresh::target::{
+    load_iceberg_mv_target_binding, resolve_refresh_target, validate_target_snapshot,
+};
+use crate::mv::domain::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
 use crate::query_execution::mv_assembly::query_local_bindings::{
     bind_imv_target_query_table_in_store_from_rewrite,
     freeze_imv_base_query_local_overlays_from_captured_inputs,
 };
-use novarocks::catalog_application::query_bindings::QueryTableBindingStore;
-use novarocks::mv::analysis::canonicalize_iceberg_mv_select_query;
-use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
-use novarocks::mv::refresh::capabilities::RefreshCapabilities;
-use novarocks::mv::refresh::definition::parse_iceberg_table_refs;
-use novarocks::mv::refresh::definition::{
-    load_iceberg_mv_definition_by_target, parse_mv_select_query,
-};
-use novarocks::mv::refresh::execution_policy::explain_refresh_full_guard;
-use novarocks::mv::refresh::pin::validate_refresh_pin_table_uuids;
-use novarocks::mv::refresh::rewrite_context::build_neutral_refresh_rewrite_context;
-use novarocks::mv::refresh::schema_contract::validate_aggregate_schema_contract_metadata;
-use novarocks::mv::refresh::target::{
-    load_iceberg_mv_target_binding, resolve_refresh_target, validate_target_snapshot,
-};
-use novarocks::mv::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
 use novarocks_sql::syntax::RefreshMaterializedViewStmt;
 
 /// Compiles an EXPLAIN refresh plan from the exact frozen MV ports and
@@ -95,7 +95,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         connector_context,
     )?;
     let catalog_service_snapshot =
-        novarocks::catalog_application::query_catalog::catalog_service_snapshot(ports);
+        crate::catalog_application::query_catalog::catalog_service_snapshot(ports);
     let overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
         ports.connector_control(),
         connector_context,
@@ -103,11 +103,11 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         &rewrite.pin,
         &rewrite.previous_snapshot_ids,
     )?;
-    let materializer = novarocks::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+    let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
         None,
         &catalog_service_snapshot,
         Arc::clone(&bindings),
-        novarocks::catalog_application::query_materializer::iceberg_table_binding_loader(
+        crate::catalog_application::query_materializer::iceberg_table_binding_loader(
             ports.connector_control(),
             connector_context.clone(),
         ),

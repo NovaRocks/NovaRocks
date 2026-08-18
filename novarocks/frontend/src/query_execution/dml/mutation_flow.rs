@@ -26,6 +26,7 @@ use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
@@ -33,7 +34,6 @@ use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::runtime::query_result::QueryResult;
-use novarocks::catalog_application::query_bindings::QueryTableBindingStore;
 use novarocks_sql::planning::dml::{
     DmlChangeStreamCompileRequest, DmlChangeStreamKind, DmlChangeStreamRoute,
     DmlChangeStreamRouteField, DmlPreExpandKeyedAssert, DmlWriteSinkMode, IcebergRefSuffix,
@@ -337,7 +337,7 @@ impl DmlRowMutationEffectSet {
 #[allow(clippy::too_many_arguments)]
 fn compile_dml_change_stream_write(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     query: sqlparser::ast::Query,
     kind: DmlChangeStreamKind,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
@@ -349,9 +349,9 @@ fn compile_dml_change_stream_write(
     use novarocks_spi::connector::ConnectorWriteInputShape;
 
     let catalog_service_snapshot =
-        novarocks::catalog_application::query_catalog::catalog_service_snapshot(state);
+        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
     let analyzer_provider =
-        novarocks::catalog_application::query_materializer::build_catalog_service_provider(
+        crate::catalog_application::query_materializer::build_catalog_service_provider(
             Some(&target.catalog),
             &catalog_service_snapshot,
             state.connector_control().as_ref(),
@@ -502,7 +502,7 @@ pub(crate) enum MutationStagedWrite {
 pub(crate) struct PreparedUpdateMutation {
     pub(crate) stmt: UpdateStmt,
     pub(crate) current_catalog: Option<String>,
-    pub(crate) target: novarocks::catalog_application::resolver::TargetBackend,
+    pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) target_ref: String,
     /// Exact Provider schema that belongs to the opaque preparation table.
@@ -549,7 +549,7 @@ pub(crate) struct PreparedMorUpdateWriteTarget {
 pub(crate) struct PreparedMergeMutation {
     pub(crate) stmt: MergeStmt,
     pub(crate) current_catalog: Option<String>,
-    pub(crate) target: novarocks::catalog_application::resolver::TargetBackend,
+    pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) target_ref: String,
     /// See [`PreparedUpdateMutation::match_target_schema`].
@@ -754,7 +754,7 @@ pub(crate) fn prepare_update_mutation(
         _ => "main".to_string(),
     };
 
-    let target = novarocks::catalog_application::resolver::resolve_existing_table_target(
+    let target = crate::catalog_application::resolver::resolve_existing_table_target(
         state,
         table_name,
         current_catalog,
@@ -772,11 +772,11 @@ pub(crate) fn prepare_update_mutation(
     // refresh drives its own writes through that same admission, so at that
     // level a user statement is indistinguishable from the MV machinery
     // maintaining its own target.
-    novarocks::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         state.connector_control().as_ref(),
         state.mv_storage_observation().as_ref(),
         &target,
-        novarocks::mv::iceberg_guard::IcebergMvUserMutation::Update,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Update,
     )?;
 
     let target_binding = novarocks::connector::write_target::load_write_target_binding(
@@ -913,7 +913,7 @@ pub(crate) fn prepare_merge_mutation(
         Some(IcebergRefSuffix::Branch(branch)) => branch.clone(),
         _ => "main".to_string(),
     };
-    let target = novarocks::catalog_application::resolver::resolve_existing_table_target(
+    let target = crate::catalog_application::resolver::resolve_existing_table_target(
         state,
         table_name,
         current_catalog,
@@ -927,11 +927,11 @@ pub(crate) fn prepare_merge_mutation(
     }
     // See the UPDATE path for why this rejection cannot live in row-mutation
     // admission.
-    novarocks::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         state.connector_control().as_ref(),
         state.mv_storage_observation().as_ref(),
         &target,
-        novarocks::mv::iceberg_guard::IcebergMvUserMutation::Merge,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Merge,
     )?;
     let target_binding = novarocks::connector::write_target::load_write_target_binding(
         state.connector_control().as_ref(),
@@ -1344,7 +1344,7 @@ pub(crate) fn stage_prepared_update_mutation(
 #[cfg(test)]
 fn materialize_update_matches(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
     execution: &QueryExecutionContext,
@@ -1389,7 +1389,7 @@ fn mutation_source_to_sql(
     state: &DmlExecutionKernel,
     source: &Option<novarocks_sql::syntax::MutationSource>,
     current_catalog: Option<&str>,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<Option<String>, String> {
     match source {
         None => Ok(None),
@@ -1403,7 +1403,7 @@ fn mutation_source_relation_to_sql(
     state: &DmlExecutionKernel,
     source: &novarocks_sql::syntax::MutationSource,
     current_catalog: Option<&str>,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<String, String> {
     use novarocks_sql::syntax::MutationSource;
     match source {
@@ -1415,7 +1415,7 @@ fn mutation_source_relation_to_sql(
             // target's namespace+catalog (lets refresh follow the
             // current-catalog path), and a 2-part `<namespace>.<table>` name
             // otherwise so the standalone analyzer can find it directly.
-            let resolved = novarocks::catalog_application::resolver::resolve_existing_table_target(
+            let resolved = crate::catalog_application::resolver::resolve_existing_table_target(
                 state,
                 name,
                 current_catalog,
@@ -1445,7 +1445,7 @@ fn mutation_source_relation_to_sql(
 #[allow(clippy::too_many_arguments)]
 fn build_update_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -1531,7 +1531,7 @@ fn update_assignment_projection_sql(
 }
 
 fn update_change_stream_target_sql(
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     target_alias: &str,
     target_ref: &str,
 ) -> String {
@@ -1555,9 +1555,7 @@ fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Que
     }
 }
 
-fn qualify_iceberg_table(
-    target: &novarocks::catalog_application::resolver::TargetBackend,
-) -> String {
+fn qualify_iceberg_table(target: &crate::catalog_application::resolver::TargetBackend) -> String {
     format!(
         "{}.{}.{}",
         sql_identifier(&target.catalog),
@@ -1580,7 +1578,7 @@ fn sql_string_literal(value: &str) -> String {
 
 struct MorUpdateChangeStreamExecutor {
     state: DmlExecutionKernel,
-    target: novarocks::catalog_application::resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
     write_registration:
         Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
@@ -1598,7 +1596,7 @@ struct MorUpdateChangeStreamExecutor {
 
 struct MorMergeChangeStreamExecutor {
     state: DmlExecutionKernel,
-    target: novarocks::catalog_application::resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
     write_registration:
         Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
@@ -1739,10 +1737,7 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
     }
 
     fn finalize(&self) -> Result<(), String> {
-        novarocks::catalog_application::resolver::invalidate_iceberg_caches(
-            &self.state,
-            &self.target,
-        )
+        crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
 
@@ -1872,10 +1867,7 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
     }
 
     fn finalize(&self) -> Result<(), String> {
-        novarocks::catalog_application::resolver::invalidate_iceberg_caches(
-            &self.state,
-            &self.target,
-        )
+        crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
 struct CowFrozenRead {
@@ -1899,7 +1891,7 @@ struct CowUpdateDistributedWrite {
 }
 
 fn build_cow_update_distributed_write(
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     provider_plan: novarocks_spi::connector::ConnectorRowMutationExecutionPlan,
@@ -2311,7 +2303,7 @@ fn build_cow_rewrite_query(
 
 struct DistributedCowUpdateExecutor {
     state: DmlExecutionKernel,
-    target: novarocks::catalog_application::resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     write: Mutex<Option<CowUpdateDistributedWrite>>,
     operation_session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
     execution: QueryExecutionContext,
@@ -2371,7 +2363,7 @@ impl MutationExecution for DistributedCowUpdateExecutor {
 
 fn run_cow_cohort_writes(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     write: CowUpdateDistributedWrite,
     operation_session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
     execution: &QueryExecutionContext,
@@ -2407,7 +2399,7 @@ fn run_cow_cohort_writes(
 
 fn run_one_cow_cohort(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     plan: CowCohortWritePlan,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
@@ -2507,7 +2499,7 @@ fn run_one_cow_cohort(
 
 fn build_cow_update_distributed_execution(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     write: CowUpdateDistributedWrite,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -2832,7 +2824,7 @@ fn execute_update_match_query(
 #[allow(clippy::too_many_arguments)]
 fn execute_exact_cow_match_query(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     query: &sqlparser::ast::Query,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -2871,9 +2863,9 @@ fn execute_exact_cow_match_query(
         binding, identity, read,
     );
     let catalog_service_snapshot =
-        novarocks::catalog_application::query_catalog::catalog_service_snapshot(state);
+        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
     let analyzer_catalog =
-        novarocks::catalog_application::query_materializer::build_catalog_service_provider_with_bindings_and_query_local_overlays(
+        crate::catalog_application::query_materializer::build_catalog_service_provider_with_bindings_and_query_local_overlays(
             Some(&target.catalog),
             &catalog_service_snapshot,
             state.connector_control().as_ref(),
@@ -3196,7 +3188,7 @@ fn build_update_match_query_sql(
 }
 
 fn build_exact_cow_update_selection_query(
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &UpdateStmt,
     source_sql: Option<&str>,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
@@ -3678,7 +3670,7 @@ impl MergeMatchRows {
 #[cfg(test)]
 fn materialize_merge_match(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -3810,7 +3802,7 @@ fn materialize_merge_match(
 
 fn build_exact_cow_merge_selection_query(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     insert_columns: Option<&[MergeInsertColumn]>,
@@ -3955,7 +3947,7 @@ fn build_exact_cow_merge_selection_query(
 #[allow(clippy::too_many_arguments)]
 fn build_merge_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -4235,7 +4227,7 @@ fn build_merge_match_query_sql(
 
 fn build_merge_unmatched_insert_query(
     state: &DmlExecutionKernel,
-    target: &novarocks::catalog_application::resolver::TargetBackend,
+    target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &MergeStmt,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -4318,13 +4310,13 @@ mod tests {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         DmlExecutionKernel::new(
-            Arc::new(novarocks::catalog_application::query_catalog::new_query_catalog_service()),
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             Arc::new(
                 novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
-            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )
     }
@@ -4390,8 +4382,8 @@ mod tests {
         }
     }
 
-    fn iceberg_target() -> novarocks::catalog_application::resolver::TargetBackend {
-        novarocks::catalog_application::resolver::TargetBackend {
+    fn iceberg_target() -> crate::catalog_application::resolver::TargetBackend {
+        crate::catalog_application::resolver::TargetBackend {
             backend_name: "iceberg",
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
@@ -5230,9 +5222,8 @@ mod tests {
              WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id) VALUES (s.id)",
         )
         .expect("parse MERGE");
-        let stmt =
-            novarocks::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)
-                .expect("convert MERGE");
+        let stmt = crate::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)
+            .expect("convert MERGE");
         let target_columns = vec![col("id"), col("v")];
         let insert_columns = resolve_merge_insert_columns(
             &stmt.not_matched.as_ref().expect("not matched").action,

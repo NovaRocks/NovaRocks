@@ -26,10 +26,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
-use novarocks::mv::persistence::definition::{
+use crate::mv::domain::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
-use novarocks::mv::repository::{MvRepository, MvRepositoryError, MvTarget};
+use crate::mv::domain::repository::{MvRepository, MvRepositoryError, MvTarget};
 
 /// Existing standalone scheduler settings, now interpreted by the frontend.
 #[derive(Clone, Debug, PartialEq, Eq)]

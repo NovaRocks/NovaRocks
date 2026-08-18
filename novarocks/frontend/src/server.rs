@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use crate::capabilities as core_capabilities;
-use novarocks::mv::storage_observation::MvStorageObservationPort;
+use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use novarocks::server::ResolvedMysqlListenerSettings;
 use novarocks::server::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlFactory;
@@ -88,12 +88,12 @@ pub async fn open_frontend_application_for_server(
 /// request resolve services from the lifecycle host.
 pub fn build_frontend_query_session_factory(
     host: &FrontendApplicationHost,
-    system_catalog: Arc<dyn novarocks::catalog_application::system_catalog::SystemCatalog>,
+    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 ) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
     let catalog_service =
-        Arc::new(novarocks::catalog_application::query_catalog::new_query_catalog_service());
+        Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
     let unified_statistics = Arc::new(novarocks::connector::UnifiedStatisticsResolver::default());
     let catalog_application = host.catalog_application_port();
     let catalog_projection = host.catalog_runtime_projection();
@@ -148,7 +148,7 @@ pub fn build_frontend_query_session_factory(
             })
         },
     );
-    novarocks::mv::startup_restore::run_mv_startup_restore(&startup_restore)
+    crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
         .map_err(FrontendApplicationError::server)?;
 
     core_capabilities::bind_statistics_target_resolver(
@@ -399,7 +399,7 @@ where
     let exchange_port = report_server.bound_addr().port();
     host.coordinator_report_endpoint_sink()
         .set_bound_port(exchange_port);
-    let system_catalog: Arc<dyn novarocks::catalog_application::system_catalog::SystemCatalog> =
+    let system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     let session_factory = match build_frontend_query_session_factory(
         host,
@@ -654,7 +654,7 @@ mod tests {
             ),
             connector_control_factories: Vec::new(),
             mv_storage_observation: Arc::new(
-                novarocks::mv::storage_observation::UnavailableMvStorageObservationPort,
+                crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort,
             ),
             state_store_host_config: None,
         }
@@ -746,7 +746,7 @@ mod tests {
             &host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
-            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
         )
         .expect("build ready frontend session factory");
         let session = session_factory
@@ -861,7 +861,7 @@ mod tests {
             &host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
-            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
         )
         .expect("build ready frontend session factory");
         let session = session_factory

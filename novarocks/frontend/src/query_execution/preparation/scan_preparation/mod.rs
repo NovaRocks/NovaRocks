@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::catalog_application::query_bindings::{
+    QueryScanMaterialization, QueryTableBindingStore,
+};
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
-};
-use novarocks::catalog_application::query_bindings::{
-    QueryScanMaterialization, QueryTableBindingStore,
 };
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};

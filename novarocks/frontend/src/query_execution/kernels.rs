@@ -23,18 +23,18 @@
 
 use std::sync::Arc;
 
+use crate::catalog_application::CatalogApplicationPort;
+use crate::catalog_application::query_catalog::QueryCatalogService;
+use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::common::backend_topology::BackendTopologyService;
+use crate::mv::domain::application::MvApplicationService;
+use crate::mv::domain::iceberg_backend::IcebergMvBackend;
+use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
-use novarocks::catalog_application::CatalogApplicationPort;
-use novarocks::catalog_application::query_catalog::QueryCatalogService;
-use novarocks::catalog_application::system_catalog::SystemCatalog;
-use novarocks::connector::MvBackend;
 use novarocks::connector::unified_statistics::UnifiedStatisticsResolver;
-use novarocks::mv::application::MvApplicationService;
-use novarocks::mv::repository::MvRepository;
-use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
 
 /// Query compilation and distributed-query preparation dependencies.
@@ -280,7 +280,7 @@ pub struct MvExecutionKernel {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
-    mv_backend: Arc<dyn MvBackend>,
+    mv_backend: Arc<IcebergMvBackend>,
     repository: Arc<dyn MvRepository>,
     application: Arc<dyn MvApplicationService>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -294,7 +294,7 @@ impl MvExecutionKernel {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
-        mv_backend: Arc<dyn MvBackend>,
+        mv_backend: Arc<IcebergMvBackend>,
         repository: Arc<dyn MvRepository>,
         application: Arc<dyn MvApplicationService>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -329,7 +329,7 @@ impl MvExecutionKernel {
         &self.unified_statistics
     }
 
-    pub(crate) fn mv_backend(&self) -> &Arc<dyn MvBackend> {
+    pub(crate) fn mv_backend(&self) -> &Arc<IcebergMvBackend> {
         &self.mv_backend
     }
 
@@ -451,7 +451,7 @@ impl MaintenanceExecutionKernel {
 // live beside the kernels and move to Frontend together with them.
 macro_rules! impl_kernel_catalog_admission {
     ($kernel:ty) => {
-        impl novarocks::catalog_application::resolver::CatalogAdmission for $kernel {
+        impl crate::catalog_application::resolver::CatalogAdmission for $kernel {
             fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
                 self.catalog_application().map(Arc::as_ref)
             }
@@ -517,17 +517,17 @@ impl SessionCatalogResolver {
     pub fn require_external_catalog_ready(
         &self,
         catalog_name: &str,
-    ) -> Result<(), novarocks::catalog_application::CatalogApplicationError> {
+    ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
         let application = self.catalog_application.as_ref().ok_or_else(|| {
-            novarocks::catalog_application::CatalogApplicationError::new(
-                novarocks::catalog_application::CatalogApplicationErrorKind::Unavailable,
+            crate::catalog_application::CatalogApplicationError::new(
+                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
                 "external catalogs require a configured frontend catalog application",
             )
         })?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
             .map_err(|error| {
-                novarocks::catalog_application::CatalogApplicationError::new(
-                    novarocks::catalog_application::CatalogApplicationErrorKind::InvalidRequest,
+                crate::catalog_application::CatalogApplicationError::new(
+                    crate::catalog_application::CatalogApplicationErrorKind::InvalidRequest,
                     format!("invalid catalog connector instance ID: {error}"),
                 )
             })?;

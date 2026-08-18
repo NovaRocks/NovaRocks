@@ -179,9 +179,8 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
     let selected = store
         .frozen_snapshot_materialization(facts.binding(), 11)
         .expect("select admitted snapshot files");
-    let novarocks::catalog_application::query_bindings::QueryScanMaterialization {
-        selector, ..
-    } = selected;
+    let crate::catalog_application::query_bindings::QueryScanMaterialization { selector, .. } =
+        selected;
 
     assert_eq!(
         selector,

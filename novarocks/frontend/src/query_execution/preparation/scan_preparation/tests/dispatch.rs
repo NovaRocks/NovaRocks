@@ -234,9 +234,8 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
 fn sqlx1_preparation_rejects_unbound_binding_instead_of_reacquiring_current() {
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = novarocks::connector::FixtureControlResolver::new(registry);
-    let bindings =
-        novarocks::catalog_application::query_bindings::QueryTableBindingStore::try_new()
-            .expect("binding store");
+    let bindings = crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
+        .expect("binding store");
     let error = match super::super::prepare_scan_bindings(
         &native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
             .expect("sealed ordinary fixture"),

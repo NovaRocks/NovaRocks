@@ -26,7 +26,14 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
 
+use crate::catalog_application::CatalogApplicationPort;
+use crate::catalog_application::query_catalog::QueryCatalogService;
+use crate::catalog_application::system_catalog::SystemCatalog;
+use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
 use crate::common::backend_topology::BackendTopologyService;
+use crate::mv::domain::application::MvApplicationService;
+use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::storage_observation::MvStorageObservationPort;
 use crate::query_execution::backend_command;
 use crate::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
 use crate::query_execution::kernels as domain;
@@ -37,14 +44,7 @@ use crate::query_execution::maintenance::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
-use novarocks::catalog_application::CatalogApplicationPort;
-use novarocks::catalog_application::query_catalog::QueryCatalogService;
-use novarocks::catalog_application::system_catalog::SystemCatalog;
-use novarocks::catalog_application::{command as catalog_command, iceberg_ref_command};
 use novarocks::connector::UnifiedStatisticsResolver;
-use novarocks::mv::application::MvApplicationService;
-use novarocks::mv::repository::MvRepository;
-use novarocks::mv::storage_observation::MvStorageObservationPort;
 
 use crate::mv::{FrontendMvService, command as mv_command};
 use crate::statistics::command::StatisticsCommandExecutor;
@@ -412,7 +412,7 @@ impl MvCommandPorts {
 }
 
 pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecutor {
-    let iceberg_ports = novarocks::mv::iceberg_refresh::IcebergMvCorePorts::new(
+    let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
         Arc::clone(&ports.connector_control),
@@ -420,7 +420,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
         Arc::clone(&ports.storage_observation),
     );
     let backend = Arc::new(
-        novarocks::mv::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports.clone()),
+        crate::mv::domain::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports.clone()),
     );
     mv_command::MvCommandExecutor::new(
         iceberg_ports,
@@ -505,7 +505,7 @@ pub fn session_catalog_resolver(
 /// helper deliberately neither publishes a runtime nor creates a catalog
 /// controller.
 pub fn bind_catalog_runtime_projection(
-    projection: &novarocks::catalog_application::CatalogRuntimeProjection,
+    projection: &crate::catalog_application::CatalogRuntimeProjection,
     catalog_service: Arc<QueryCatalogService>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
 ) -> Result<(), String> {
@@ -575,7 +575,7 @@ pub fn mv_refresh_provider_activation(
         ports.backend_topology,
         ports.exchange_port,
     );
-    let mv_ports = novarocks::mv::iceberg_refresh::IcebergMvCorePorts::new(
+    let mv_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
@@ -744,7 +744,7 @@ pub(crate) fn mv_background_bindings(
     ports: MvBackgroundPorts,
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
 ) -> crate::mv::background::MvBackgroundBindings {
-    let iceberg_ports = novarocks::mv::iceberg_refresh::IcebergMvCorePorts::new(
+    let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
         ports.catalog_service,
         ports.catalog_application,
         Arc::clone(&ports.connector_control),

@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::mv::application::{
+use crate::mv::domain::application::{
     MvApplicationError, MvApplicationErrorKind, MvCreateStatement, MvEngine, MvEngineError,
     MvRequestContext, MvStatementResult, PrepareMvCreateRequest,
 };
-use novarocks::mv::repository::{
+use crate::mv::domain::repository::{
     MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
 };
 use uuid::Uuid;
@@ -102,7 +102,7 @@ fn known_committed_finalize_error(error: MvEngineError) -> MvApplicationError {
 
 fn cleanup_known_uncommitted(
     engine: &dyn MvEngine,
-    target: &novarocks::mv::application::CreatedMvTarget,
+    target: &crate::mv::domain::application::CreatedMvTarget,
     primary: MvApplicationError,
 ) -> MvApplicationError {
     match engine.drop_created_target(target) {

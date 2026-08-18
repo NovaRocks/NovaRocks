@@ -21,16 +21,16 @@ use std::sync::Arc;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
-use novarocks::catalog_application::query_bindings::{
+use crate::catalog_application::query_bindings::{
     MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
     QueryTableBindingStore,
 };
-use novarocks::catalog_application::query_materializer::{
+use crate::catalog_application::query_materializer::{
     QueryLocalTableOverlay, connector_query_binding_from_materialization,
 };
+use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
+use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
 use novarocks::connector::scan_admission::admit_connector_change_window;
-use novarocks::mv::refresh::pin::RefreshSnapshotPin;
-use novarocks::mv::rewrite::context::IcebergMvRewriteContext;
 
 /// Freeze the IMV target exactly once for one compilation request. The SQL
 /// planner receives only the returned scoped token; provider table/files and
@@ -102,7 +102,7 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
             resolved,
             statistics_pin: None,
             admission:
-                novarocks::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
+                crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
                     planning_lease,
                 ),
             scan_materialization: Some(mv_target_read.full.clone()),
@@ -158,7 +158,7 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
             &base.table,
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         )?;
-        let mut materialization = novarocks::catalog_application::query_catalog::connector_table_materialization_from_metadata(
+        let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
             metadata,
             planning_lease,
         )?;

@@ -1,34 +1,36 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use novarocks::mv::application::{
+use novarocks_frontend::mv::FrontendMvService;
+use novarocks_frontend::mv::domain::application::{
     CreatedMvTarget, MvApplicationErrorKind, MvApplicationService, MvApplicationStatement,
     MvCreateRefreshPolicy, MvCreateStatement, MvEngine, MvEngineError, MvEngineErrorKind,
     MvRequestContext, MvStatementResult, PrepareMvCreateRequest, PreparedMvCreate,
     PreparedMvDefinition,
 };
-use novarocks::mv::dependency::model::MvDependencyObjectRef;
-use novarocks::mv::persistence::definition::{
+use novarocks_frontend::mv::domain::dependency::model::MvDependencyObjectRef;
+use novarocks_frontend::mv::domain::persistence::definition::{
     CreateMvDefinitionRequest, StoredMvDefinition, StoredMvRefreshPolicy,
     UpdateMvRefreshMetadataRequest,
 };
-use novarocks::mv::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
-use novarocks::mv::persistence::partition::{
+use novarocks_frontend::mv::domain::persistence::dependency::{
+    CreateMvDependencyRequest, StoredMvDependency,
+};
+use novarocks_frontend::mv::domain::persistence::partition::{
     RecordFailedMvPartitionStatesRequest, ReplaceMvPartitionStatesRequest, StoredMvPartitionState,
     UpdateMvPartitionContractRequest,
 };
-use novarocks::mv::persistence::refresh::{
+use novarocks_frontend::mv::domain::persistence::refresh::{
     BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, RecordPublishCommitRequest,
     RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvRefresh,
     UpdateStarRocksMvRefreshSummaryRequest,
 };
-use novarocks::mv::repository::{
+use novarocks_frontend::mv::domain::repository::{
     CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest,
     FinalizeMvRefreshWithPartitionsRequest, InitialMvRefreshConfiguration, MvRepository,
     MvRepositoryAvailability, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
     RebuildMvRepositoryRequest, RecordExternalCommitAndFinalizeRequest, UnavailableMvRepository,
 };
-use novarocks_frontend::mv::FrontendMvService;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use uuid::Uuid;
@@ -450,7 +452,10 @@ fn statement() -> MvApplicationStatement {
 fn execute(
     failures: &[FailurePoint],
 ) -> (
-    Result<Option<MvStatementResult>, novarocks::mv::application::MvApplicationError>,
+    Result<
+        Option<MvStatementResult>,
+        novarocks_frontend::mv::domain::application::MvApplicationError,
+    >,
     Arc<FakeEngine>,
     Arc<FakeRepository>,
 ) {

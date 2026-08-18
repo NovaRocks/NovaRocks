@@ -12,6 +12,47 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::catalog_application::query_catalog::CatalogServiceSource;
+use crate::mv::domain::analysis::refresh_property::derive_fragment_property;
+use crate::mv::domain::analysis::{
+    canonicalize_iceberg_mv_select_query, validate_mv_partition_columns,
+};
+use crate::mv::domain::application::{
+    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
+};
+use crate::mv::domain::iceberg_refresh::{
+    IcebergMvCorePorts, join_base_refs_for_schema_contract,
+    plan_iceberg_mv_refresh_with_connector_context,
+};
+use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
+use crate::mv::domain::refresh::definition::{
+    load_iceberg_mv_definition_by_target, mv_definition_fingerprint, parse_mv_select_query,
+};
+#[cfg(test)]
+use crate::mv::domain::refresh::execution_policy::should_use_join_delta_append_only_fast_path;
+use crate::mv::domain::refresh::execution_policy::{
+    non_join_incremental_write_mode, select_join_incremental_execution_mode,
+};
+use crate::mv::domain::refresh::non_join_incremental::{
+    NonJoinBaseChange, NonJoinIncrementalChangePlan, plan_non_join_incremental_changes,
+};
+use crate::mv::domain::refresh::observation::{
+    observe_current_refresh_base, observe_schema_validation_for_table,
+    rebind_mv_definition_before_refresh_derivation,
+};
+use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
+use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
+#[cfg(test)]
+use crate::mv::domain::refresh::repartition::RepartitionShape;
+use crate::mv::domain::refresh::repartition::select_repartition_shape;
+use crate::mv::domain::refresh::rewrite_context::{
+    admitted_change_facts, build_neutral_refresh_rewrite_context,
+    observe_and_admit_change_window_for_table,
+};
+use crate::mv::domain::refresh::schema_contract::validate_repartition_schema_contract;
+use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
+use crate::mv::domain::refresh::target::{IcebergMvTarget, load_iceberg_mv_target_binding};
+use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact,
@@ -23,47 +64,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
-use novarocks::catalog_application::query_catalog::CatalogServiceSource;
-use novarocks::mv::analysis::refresh_property::derive_fragment_property;
-use novarocks::mv::analysis::{
-    canonicalize_iceberg_mv_select_query, validate_mv_partition_columns,
-};
-use novarocks::mv::application::{
-    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-};
-use novarocks::mv::iceberg_refresh::{
-    IcebergMvCorePorts, join_base_refs_for_schema_contract,
-    plan_iceberg_mv_refresh_with_connector_context,
-};
-use novarocks::mv::refresh::capabilities::RefreshCapabilities;
-use novarocks::mv::refresh::definition::{
-    load_iceberg_mv_definition_by_target, mv_definition_fingerprint, parse_mv_select_query,
-};
-#[cfg(test)]
-use novarocks::mv::refresh::execution_policy::should_use_join_delta_append_only_fast_path;
-use novarocks::mv::refresh::execution_policy::{
-    non_join_incremental_write_mode, select_join_incremental_execution_mode,
-};
-use novarocks::mv::refresh::non_join_incremental::{
-    NonJoinBaseChange, NonJoinIncrementalChangePlan, plan_non_join_incremental_changes,
-};
-use novarocks::mv::refresh::observation::{
-    observe_current_refresh_base, observe_schema_validation_for_table,
-    rebind_mv_definition_before_refresh_derivation,
-};
-use novarocks::mv::refresh::pin::RefreshSnapshotPin;
-use novarocks::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
-#[cfg(test)]
-use novarocks::mv::refresh::repartition::RepartitionShape;
-use novarocks::mv::refresh::repartition::select_repartition_shape;
-use novarocks::mv::refresh::rewrite_context::{
-    admitted_change_facts, build_neutral_refresh_rewrite_context,
-    observe_and_admit_change_window_for_table,
-};
-use novarocks::mv::refresh::schema_contract::validate_repartition_schema_contract;
-use novarocks::mv::refresh::snapshot::ExecutableRefreshDecision;
-use novarocks::mv::refresh::target::{IcebergMvTarget, load_iceberg_mv_target_binding};
-use novarocks::mv::storage_observation::MvSchemaValidationObservation;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorTableIdentity,
 };
@@ -122,18 +122,17 @@ fn build_aggregate_layout_for_refresh_select_sql(
     current_database: &str,
     select_sql: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<novarocks::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
+) -> Result<crate::mv::domain::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let visible_query = parse_mv_select_query(select_sql)?;
-    let provider =
-        novarocks::catalog_application::query_materializer::build_catalog_service_provider(
-            current_catalog,
-            ports.catalog_service().as_ref(),
-            ports.connector_control(),
-            connector_context.clone(),
-            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-            ports.catalog_application(),
-        );
-    let visible_analysis = novarocks::mv::analysis_adapter::analyze_mv_select_with_provider(
+    let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
+        current_catalog,
+        ports.catalog_service().as_ref(),
+        ports.connector_control(),
+        connector_context.clone(),
+        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+        ports.catalog_application(),
+    );
+    let visible_analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
         current_catalog,
         &provider,
         current_database,
@@ -142,7 +141,9 @@ fn build_aggregate_layout_for_refresh_select_sql(
     let facts = visible_analysis
         .refresh_input
         .aggregate_layout_facts(&visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
-    novarocks::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(&facts)
+    crate::mv::domain::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(
+        &facts,
+    )
 }
 
 impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
@@ -288,7 +289,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
 /// preparation. Both payloads were produced from the same exact lease and
 /// metadata value; no downstream repartition step may resolve `latest` again.
 struct RetainedRepartitionTarget {
-    binding: novarocks::mv::refresh::target_binding::MvTargetBinding,
+    binding: crate::mv::domain::refresh::target_binding::MvTargetBinding,
     schema_validation: MvSchemaValidationObservation,
 }
 
@@ -406,16 +407,15 @@ fn prepare_managed_repartition_transition(
         current_catalog,
         current_database,
     );
-    let provider =
-        novarocks::catalog_application::query_materializer::build_catalog_service_provider(
-            current_catalog,
-            source.catalog_service().as_ref(),
-            source.connector_control(),
-            connector_context.clone(),
-            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-            source.catalog_application(),
-        );
-    let analysis = novarocks::mv::analysis_adapter::analyze_mv_select_with_provider(
+    let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
+        current_catalog,
+        source.catalog_service().as_ref(),
+        source.connector_control(),
+        connector_context.clone(),
+        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+        source.catalog_application(),
+    );
+    let analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_provider(
         current_catalog,
         &provider,
         current_database,
@@ -509,9 +509,9 @@ fn managed_repartition_field(
 }
 
 fn managed_partition_transform(
-    transform: &novarocks::mv::storage_observation::MvSchemaValidationPartitionTransform,
+    transform: &crate::mv::domain::storage_observation::MvSchemaValidationPartitionTransform,
 ) -> Result<novarocks_spi::connector::ConnectorManagedPartitionTransform, String> {
-    use novarocks::mv::storage_observation::MvSchemaValidationPartitionTransform as Observed;
+    use crate::mv::domain::storage_observation::MvSchemaValidationPartitionTransform as Observed;
     use novarocks_spi::connector::ConnectorManagedPartitionTransform as Managed;
     match transform {
         Observed::Identity => Ok(Managed::Identity),
@@ -765,7 +765,7 @@ fn prepare_frontend_first_refresh_write(
         // layout is defined by the first branch and CREATE-time validation
         // guarantees the remaining branches share that layout.
         let aggregate_query = if schema_contract.branch.is_some() {
-            novarocks::mv::rewrite::context::first_union_branch_query(&query)?
+            crate::mv::domain::rewrite::context::first_union_branch_query(&query)?
         } else {
             query.clone()
         };
@@ -852,9 +852,9 @@ fn first_refresh_target_handle(
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<novarocks_spi::connector::ConnectorTableHandle, String> {
     select_retained_target_handle(retained, || {
-        novarocks::catalog_application::resolver::iceberg_connector_table_handle(
+        crate::catalog_application::resolver::iceberg_connector_table_handle(
             write_lease,
-            &novarocks::catalog_application::resolver::TargetBackend {
+            &crate::catalog_application::resolver::TargetBackend {
                 backend_name: "iceberg",
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
@@ -1153,14 +1153,14 @@ fn prepare_frontend_incremental_write(
         }
         let left_facts = left_facts.expect("full-rebuild admission returned above");
         let right_facts = right_facts.expect("full-rebuild admission returned above");
-        let branches = novarocks::mv::iceberg_join_branch::plan_join_delta_branches(
+        let branches = crate::mv::domain::iceberg_join_branch::plan_join_delta_branches(
             &left_ref,
             &right_ref,
-            novarocks::mv::iceberg_join_branch::SnapshotWindow {
+            crate::mv::domain::iceberg_join_branch::SnapshotWindow {
                 from: left_from,
                 to: left_to,
             },
-            novarocks::mv::iceberg_join_branch::SnapshotWindow {
+            crate::mv::domain::iceberg_join_branch::SnapshotWindow {
                 from: right_from,
                 to: right_to,
             },

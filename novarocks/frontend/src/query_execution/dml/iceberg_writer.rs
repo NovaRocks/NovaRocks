@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Field;
 
+use crate::catalog_application::resolver::TargetBackend;
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
@@ -35,7 +36,6 @@ use crate::query_execution::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
     IcebergWriteValidationPolicy,
 };
-use novarocks::catalog_application::resolver::TargetBackend;
 use novarocks::connector::backend::ResolvedTable;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
@@ -247,9 +247,8 @@ fn prepare_iceberg_distributed_write(
         ConnectorWriteAdmissionPurpose::OrdinaryDml,
         connector_context.clone(),
     )?;
-    let table_bindings = Arc::new(
-        novarocks::catalog_application::query_bindings::QueryTableBindingStore::try_new()?,
-    );
+    let table_bindings =
+        Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
     let target_binding = admit_prepared_frozen_connector_write_target(
         table_bindings.as_ref(),
         FrozenConnectorScanIdentity::new(
@@ -339,7 +338,7 @@ pub(crate) fn prepare_iceberg_connector_write(
     purpose: ConnectorWriteAdmissionPurpose,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ConnectorWritePreparation, String> {
-    let table = novarocks::catalog_application::resolver::iceberg_connector_table_handle(
+    let table = crate::catalog_application::resolver::iceberg_connector_table_handle(
         exact_lease,
         target,
         context.clone(),
@@ -570,7 +569,7 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
-        novarocks::catalog_application::resolver::invalidate_iceberg_caches(
+        crate::catalog_application::resolver::invalidate_iceberg_caches(
             &self.executor.state,
             &self.executor.target,
         )
@@ -586,7 +585,7 @@ struct PreparedIcebergWriteExecutor {
     target: TargetBackend,
     query: sqlparser::ast::Query,
     sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<novarocks::catalog_application::query_bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,

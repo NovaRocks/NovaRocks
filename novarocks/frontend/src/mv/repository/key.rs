@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
-use novarocks::mv::dependency::model::{
+use crate::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
+use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_spi::state_store::Key;

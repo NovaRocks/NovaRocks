@@ -382,7 +382,7 @@ pub fn prepare_statistics_collection_request(
         context.clone(),
     )?;
     let table_bindings = Arc::new(
-        novarocks::catalog_application::query_bindings::QueryTableBindingStore::try_new()
+        crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
             .map_err(contract_violation)?,
     );
     let source_binding = admit_statistics_scan_binding(table_bindings.as_ref(), &program)?;
@@ -439,7 +439,7 @@ pub fn prepare_statistics_collection_request(
 /// statistics lease; the binding store keeps the synthetic compiler source
 /// scoped to this one submission and prevents a fallback catalog acquire.
 fn admit_statistics_scan_binding(
-    bindings: &novarocks::catalog_application::query_bindings::QueryTableBindingStore,
+    bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     program: &StatisticsCollectionProgram,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, DistributedQueryError> {
     let input_schema = Arc::new(arrow::datatypes::Schema::new(

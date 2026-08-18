@@ -25,8 +25,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use novarocks::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
-use novarocks::mv::persistence::schema::{MvPartitionContract, MvSchemaContract};
+use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
 
 use super::catalog::schema_catalog;
 use super::key::{MvKeyKind, expected_record_kind};

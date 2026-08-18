@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::catalog_application::query_catalog::QueryCatalogService;
+use crate::catalog_application::query_catalog::QueryCatalogService;
 
 use super::model::{HistogramStatRow, MultiColumnStatRow, TableKey};
 use super::observation::{add_analyze_status, drop_all_table_stats, observe_update};

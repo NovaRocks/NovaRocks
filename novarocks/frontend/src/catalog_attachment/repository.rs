@@ -669,10 +669,10 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
-    use bytes::Bytes;
-    use novarocks::mv::dependency::model::{
+    use crate::mv::domain::dependency::model::{
         MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
     };
+    use bytes::Bytes;
     use novarocks_spi::state_store::{
         CommitOutcome, FeDeploymentView, Precondition, StateStore, TransactionId,
         conformance::{FaultGate, FaultInjectingStateStore},

@@ -27,13 +27,13 @@ use std::sync::Arc;
 
 use novarocks_catalog::schema::ColumnDef;
 
+use crate::catalog_application::resolver::TargetBackend;
 use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use crate::query_execution::dml::external_write_fence::{
     ExternalWriteFenceProposal, external_fence_authority_unavailable, invalid_fence_request,
 };
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use novarocks::catalog_application::resolver::TargetBackend;
 use novarocks::connector::backend::ResolvedTable;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::planning::dml::parse_raw_statement;
@@ -301,7 +301,7 @@ impl InsertEngine for DmlExecutionKernel {
         )?;
         novarocks::connector::validate_request_context(&connector_context)?;
 
-        let target = novarocks::catalog_application::resolver::resolve_existing_table_target(
+        let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
             &name,
             request.current_catalog.as_deref(),
@@ -318,11 +318,11 @@ impl InsertEngine for DmlExecutionKernel {
             &target.table,
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         )?;
-        novarocks::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
             self.connector_control().as_ref(),
             self.mv_storage_observation().as_ref(),
             &target,
-            novarocks::mv::iceberg_guard::IcebergMvUserMutation::Insert,
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
         )?;
         let columns = insert_columns_from_connector_metadata(&metadata);
         Ok(ResolvedInsertTarget {
@@ -609,13 +609,13 @@ mod tests {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         DmlExecutionKernel::new(
-            Arc::new(novarocks::catalog_application::query_catalog::new_query_catalog_service()),
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             Arc::new(
                 novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
-            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )
     }

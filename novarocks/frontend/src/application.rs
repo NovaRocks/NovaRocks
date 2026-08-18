@@ -117,7 +117,7 @@ impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
-    catalog_runtime_projection: Arc<novarocks::catalog_application::CatalogRuntimeProjection>,
+    catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
     ctas_recovery_binding: Option<CtasRecoveryBinding>,
@@ -127,8 +127,8 @@ pub struct FrontendApplicationHost {
     catalog_controller: Option<Arc<FrontendCatalogController>>,
     view_service: Option<Arc<dyn crate::view::ViewService>>,
     table_maintenance_service: Option<Arc<dyn TableMaintenanceService>>,
-    mv_repository: Option<Arc<dyn novarocks::mv::repository::MvRepository>>,
-    mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
+    mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
+    mv_application_service: Option<Arc<dyn crate::mv::domain::application::MvApplicationService>>,
     mv_service: Option<Arc<FrontendMvService>>,
     mv_refresh_provider_activation: Option<Arc<FrontendMvRefreshProviderActivationPort>>,
     mv_background_engine_sink: Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
@@ -320,7 +320,7 @@ impl FrontendApplicationHost {
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
     ) -> Result<Self, FrontendApplicationError> {
         let catalog_runtime_projection =
-            novarocks::catalog_application::CatalogRuntimeProjection::new();
+            crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
             connector_control: Arc::new(
                 ConnectorControlHost::with_factories(connector_factories).map_err(|error| {
@@ -600,7 +600,7 @@ impl FrontendApplicationHost {
                 .await
                 {
                     Ok(repository) => {
-                        let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
+                        let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
                             repository;
                         let provider_activation =
                             Arc::new(FrontendMvRefreshProviderActivationPort::new());
@@ -621,9 +621,9 @@ impl FrontendApplicationHost {
                             FrontendMvService::background_engine_sink(Arc::clone(&service)),
                         );
                         let application_service: Arc<
-                            dyn novarocks::mv::application::MvApplicationService,
+                            dyn crate::mv::domain::application::MvApplicationService,
                         > = Arc::clone(&service)
-                            as Arc<dyn novarocks::mv::application::MvApplicationService>;
+                            as Arc<dyn crate::mv::domain::application::MvApplicationService>;
                         host.mv_application_service = Some(application_service);
                         host.mv_service = Some(service);
                         host.mv_repository = Some(repository);
@@ -640,12 +640,13 @@ impl FrontendApplicationHost {
                 }
             }
             None => {
-                let repository: Arc<dyn novarocks::mv::repository::MvRepository> =
-                    Arc::new(novarocks::mv::repository::UnavailableMvRepository);
+                let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
+                    Arc::new(crate::mv::domain::repository::UnavailableMvRepository);
                 let service = Arc::new(FrontendMvService::new(Arc::clone(&repository)));
-                let application_service: Arc<dyn novarocks::mv::application::MvApplicationService> =
-                    Arc::clone(&service)
-                        as Arc<dyn novarocks::mv::application::MvApplicationService>;
+                let application_service: Arc<
+                    dyn crate::mv::domain::application::MvApplicationService,
+                > = Arc::clone(&service)
+                    as Arc<dyn crate::mv::domain::application::MvApplicationService>;
                 host.mv_repository = Some(repository);
                 host.mv_application_service = Some(application_service);
                 host.mv_service = Some(service);
@@ -747,13 +748,12 @@ impl FrontendApplicationHost {
 
     pub fn catalog_application_port(
         &self,
-    ) -> Arc<dyn novarocks::catalog_application::CatalogApplicationPort> {
+    ) -> Arc<dyn crate::catalog_application::CatalogApplicationPort> {
         let application = Arc::clone(
             self.catalog_application_port
                 .as_ref()
                 .expect("catalog application port is installed before host open returns"),
-        )
-            as Arc<dyn novarocks::catalog_application::CatalogApplicationPort>;
+        ) as Arc<dyn crate::catalog_application::CatalogApplicationPort>;
         self.catalog_runtime_projection
             .bind_application(application)
     }
@@ -765,7 +765,7 @@ impl FrontendApplicationHost {
     /// published its exact local runtime generation.
     pub fn catalog_runtime_projection(
         &self,
-    ) -> Arc<novarocks::catalog_application::CatalogRuntimeProjection> {
+    ) -> Arc<crate::catalog_application::CatalogRuntimeProjection> {
         Arc::clone(&self.catalog_runtime_projection)
     }
 
@@ -777,7 +777,7 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn mv_repository(&self) -> Arc<dyn novarocks::mv::repository::MvRepository> {
+    pub fn mv_repository(&self) -> Arc<dyn crate::mv::domain::repository::MvRepository> {
         Arc::clone(
             self.mv_repository
                 .as_ref()
@@ -787,7 +787,7 @@ impl FrontendApplicationHost {
 
     pub fn mv_application_service(
         &self,
-    ) -> Arc<dyn novarocks::mv::application::MvApplicationService> {
+    ) -> Arc<dyn crate::mv::domain::application::MvApplicationService> {
         Arc::clone(
             self.mv_application_service
                 .as_ref()
@@ -1281,11 +1281,11 @@ mod tests {
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance id");
         assert!(matches!(
-            novarocks::catalog_application::CatalogApplicationPort::admit_catalog(
+            crate::catalog_application::CatalogApplicationPort::admit_catalog(
                 host.catalog_application_port().as_ref(),
                 &instance_id,
             ),
-            novarocks::catalog_application::CatalogAdmission::Absent
+            crate::catalog_application::CatalogAdmission::Absent
         ));
         host.shutdown().await.expect("host shutdown");
     }

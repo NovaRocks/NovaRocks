@@ -8,15 +8,15 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::mv::domain::application::{
+    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
+};
+use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::PreparedMvIncrementalWrite;
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
-use novarocks::catalog_application::query_bindings::QueryTableBindingStore;
-use novarocks::mv::application::{
-    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-};
-use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RewriteMergeRefreshEvidence {
@@ -27,7 +27,7 @@ enum RewriteMergeRefreshEvidence {
 }
 
 fn sql_imv_planning_input_from_rewrite(
-    rewrite: &novarocks::mv::rewrite::context::IcebergMvRewriteContext,
+    rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
     target_binding: novarocks_sql::binding::SqlTableBindingId,
     evidence: RewriteMergeRefreshEvidence,
 ) -> Result<novarocks_sql::compiler::SqlImvPlanningInput, String> {
@@ -78,7 +78,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         planning_lease,
         &connector_context,
     )?;
-    let target = novarocks::catalog_application::resolver::TargetBackend {
+    let target = crate::catalog_application::resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: request.target_catalog,
         namespace: request.target_namespace,
@@ -244,7 +244,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 rewrite_evidence,
             )?;
             let catalog_service_snapshot =
-                novarocks::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
+                crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
             let base_overlays = crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs(
                 ports.connector_control(),
                 &connector_context,
@@ -252,11 +252,11 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 &refresh_rewrite.pin,
                 &refresh_rewrite.previous_snapshot_ids,
             )?;
-            let analyzer_catalog = novarocks::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+            let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
                 &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
-                novarocks::catalog_application::query_materializer::iceberg_table_binding_loader(
+                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
                     query_kernel.connector_control().as_ref(),
                     connector_context.clone(),
                 ),
@@ -358,12 +358,12 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 &refresh_rewrite.previous_snapshot_ids,
             )?;
             let catalog_service_snapshot =
-                novarocks::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
-            let analyzer_catalog = novarocks::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
+                crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);
+            let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
                 &catalog_service_snapshot,
                 Arc::clone(&target_bindings),
-                novarocks::catalog_application::query_materializer::iceberg_table_binding_loader(
+                crate::catalog_application::query_materializer::iceberg_table_binding_loader(
                     query_kernel.connector_control().as_ref(),
                     connector_context.clone(),
                 ),

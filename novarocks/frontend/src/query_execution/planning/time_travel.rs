@@ -19,11 +19,11 @@
 //! statement schema lookup, and catalog-service table invalidation.
 //! Ordinary SELECT external tables resolve through the query catalog materializer.
 
+use crate::catalog_application::query_catalog::CatalogServiceSource;
+use crate::catalog_application::resolver::{CatalogAdmission, resolve_table_target};
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
-use novarocks::catalog_application::query_catalog::CatalogServiceSource;
-use novarocks::catalog_application::resolver::{CatalogAdmission, resolve_table_target};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
 #[cfg(test)]
@@ -427,7 +427,7 @@ pub(crate) fn external_schema_columns_for_statement(
     }
 
     let materialization =
-        novarocks::catalog_application::query_catalog::load_connector_table_materialization_with_lease(
+        crate::catalog_application::query_catalog::load_connector_table_materialization_with_lease(
             resolver.connector_control(),
             novarocks::connector::connector_request_context(
                 None,

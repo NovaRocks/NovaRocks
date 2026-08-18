@@ -24,23 +24,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 
-use novarocks::mv::dependency::model::MvDependencyObjectRef;
-use novarocks::mv::persistence::definition::{
+use crate::mv::domain::dependency::model::MvDependencyObjectRef;
+use crate::mv::domain::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
-use novarocks::mv::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
-use novarocks::mv::persistence::partition::{
+use crate::mv::domain::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
+use crate::mv::domain::persistence::partition::{
     MvPartitionRefreshStatus, RecordFailedMvPartitionStatesRequest,
     ReplaceMvPartitionStatesRequest, StoredMvPartitionState, UpdateMvPartitionContractRequest,
 };
-use novarocks::mv::persistence::refresh::{
+use crate::mv::domain::persistence::refresh::{
     BeginIcebergMvRefreshRequest, FrontendMvRefreshAction, FrontendMvRefreshActionPhase,
     FrontendMvRefreshActionState, FrontendMvRefreshLedger, FrontendMvRefreshRecoveryLedger,
     FrontendMvRefreshRecoveryStatus, MvRefreshFinalizeRequest, MvRefreshLifecycleOwner,
     MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
     RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
 };
-use novarocks::mv::repository::{
+use crate::mv::domain::repository::{
     BeginFrontendMvRecoveryCycleRequest, CreateMvRepositoryRequest,
     CreateMvRepositoryWithIdRequest, FinalizeMvRefreshWithPartitionsRequest,
     FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryAvailability, MvRepositoryError,
@@ -113,7 +113,7 @@ pub trait CatalogAttachmentObservationSource: Send + Sync {
     ) -> Result<Vec<CatalogAttachmentVersioned>, MvRepositoryError>;
 }
 
-pub use novarocks::mv::repository::BeginFrontendMvRefreshIntentRequest;
+pub use crate::mv::domain::repository::BeginFrontendMvRefreshIntentRequest;
 
 impl StateStoreMvRepository {
     pub async fn open(
@@ -2400,9 +2400,9 @@ impl StateStoreMvRepository {
                     })?;
                     if !matches!(
                         observation.disposition,
-                        novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Published
-                            | novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Superseded
-                            | novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::CleanupPending
+                        crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Published
+                            | crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Superseded
+                            | crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::CleanupPending
                     ) {
                         return Err(conflict_state_store("recovery observation does not prove publication"));
                     }
@@ -2494,8 +2494,8 @@ impl StateStoreMvRepository {
                     let disposition = recovery.observation.as_ref().map(|value| &value.disposition);
                     if !matches!(
                         disposition,
-                        Some(novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::KnownUncommitted)
-                            | Some(novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Staged)
+                        Some(crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::KnownUncommitted)
+                            | Some(crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Staged)
                     ) {
                         return Err(conflict_state_store("recovery observation does not prove an uncommitted refresh"));
                     }
@@ -3944,7 +3944,7 @@ fn frontend_prepared_actions(ledger: &FrontendMvRefreshLedger) -> Vec<FrontendMv
 
 fn converge_recovered_repartition_actions(
     refresh: &mut StoredMvRefresh,
-    observation: &novarocks::mv::persistence::refresh::FrontendMvRefreshRecoveryObservation,
+    observation: &crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryObservation,
 ) -> Result<(), novarocks_spi::state_store::StateStoreError> {
     let ledger = refresh.frontend_ledger.as_mut().ok_or_else(|| {
         invalid_state_store("recovered repartition refresh has no frontend action ledger")
@@ -4067,8 +4067,8 @@ fn dependency_sort_key(
     &Option<String>,
     &String,
     &String,
-    &novarocks::mv::dependency::model::MvDependencyObjectType,
-    &novarocks::mv::dependency::model::MvDependencyStorageEngine,
+    &crate::mv::domain::dependency::model::MvDependencyObjectType,
+    &crate::mv::domain::dependency::model::MvDependencyStorageEngine,
 ) {
     (
         &dependency.upstream.catalog,

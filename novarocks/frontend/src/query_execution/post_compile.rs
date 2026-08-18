@@ -168,7 +168,7 @@ impl PreparedDistributedQueryAssembly {
 pub fn prepare_compiled_distributed_query(
     distributed_plan: DistributedPlan,
     query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
-    analyzer_catalog: &novarocks::catalog_application::query_materializer::CatalogServiceMaterializer<
+    analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
         '_,
     >,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,

@@ -17,8 +17,8 @@
 
 use std::sync::{Arc, RwLock};
 
+use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::query_execution::dml::ctas::CtasEngine;
-use novarocks::catalog_application::query_catalog::QueryCatalogService;
 use tokio::runtime::Handle;
 
 use crate::coordination::FrontendCoordinationRuntime;
@@ -480,10 +480,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::DmlService;
+    use crate::catalog_application::query_catalog::new_query_catalog_service;
     use crate::dml::journal::testing::InMemoryOperationJournal;
     use crate::dml::model::{OperationKind, OperationState, OperationTarget, WriteTransactionSpec};
     use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
-    use novarocks::catalog_application::query_catalog::new_query_catalog_service;
     use novarocks_catalog::schema::ColumnDef;
 
     struct OkExecutor;

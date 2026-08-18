@@ -29,6 +29,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::mv::domain::persistence::schema::MvPartitionContract;
 use crate::query_execution::contract::ConnectorWriteOperationRegistration;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent,
@@ -37,7 +38,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::post_compile::NativeFragmentEncodingInput;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
-use novarocks::mv::persistence::schema::MvPartitionContract;
 
 /// Exact Core-retained inputs for one Frontend-owned MV native assembly.
 ///

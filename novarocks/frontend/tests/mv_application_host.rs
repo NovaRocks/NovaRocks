@@ -16,7 +16,7 @@
 // under the License.
 
 use bytes::Bytes;
-use novarocks::mv::repository::MvRepositoryErrorKind;
+use novarocks_frontend::mv::domain::repository::MvRepositoryErrorKind;
 use novarocks_frontend::mv::repository::key::definition_by_id_key;
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationErrorKind, FrontendApplicationHost,

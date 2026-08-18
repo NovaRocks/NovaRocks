@@ -175,10 +175,8 @@ impl FrontendCatalogController {
         Ok(())
     }
 
-    pub fn metrics_snapshot(
-        &self,
-    ) -> novarocks::catalog_application::CatalogProjectionMetricsSnapshot {
-        novarocks::catalog_application::CatalogProjectionMetricsSnapshot {
+    pub fn metrics_snapshot(&self) -> crate::catalog_application::CatalogProjectionMetricsSnapshot {
+        crate::catalog_application::CatalogProjectionMetricsSnapshot {
             projected_catalogs: self.projection.projection_count(),
             successful_polls: self.metrics.successful_polls.load(Ordering::Relaxed),
             failed_polls: self.metrics.failed_polls.load(Ordering::Relaxed),
@@ -188,7 +186,7 @@ impl FrontendCatalogController {
     }
 
     fn publish_metrics(&self) {
-        novarocks::catalog_application::publish_catalog_projection_metrics(self.metrics_snapshot());
+        crate::catalog_application::publish_catalog_projection_metrics(self.metrics_snapshot());
     }
 
     async fn run(&self) {
@@ -293,12 +291,12 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-    use bytes::Bytes;
-    use novarocks::catalog_application::{
+    use crate::catalog_application::{
         CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind,
         CatalogApplicationPort, CatalogCreateCommand, CatalogDropCommand,
         CatalogRuntimeObservation, CatalogRuntimePublisherSink,
     };
+    use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
         ConnectorControlResolver, ConnectorError, ConnectorProviderId,
@@ -755,7 +753,7 @@ mod tests {
         let port = Arc::new(FrontendCatalogApplicationPort::new(
             repository,
             Arc::clone(&control),
-            novarocks::catalog_application::CatalogRuntimeProjection::new().publisher(),
+            crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
             tokio::runtime::Handle::current(),
         ));
         (control, port)
@@ -875,7 +873,7 @@ mod tests {
         let port = Arc::new(FrontendCatalogApplicationPort::new(
             repository.clone(),
             control,
-            novarocks::catalog_application::CatalogRuntimeProjection::new().publisher(),
+            crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
             tokio::runtime::Handle::current(),
         ));
 

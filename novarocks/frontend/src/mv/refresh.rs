@@ -20,6 +20,17 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use crate::mv::domain::application::{
+    MvApplicationError, MvApplicationErrorKind, MvStatementResult,
+};
+use crate::mv::domain::persistence::refresh::{
+    FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
+    FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
+    MvRefreshFinalizeRequest,
+};
+use crate::mv::domain::repository::{
+    BeginFrontendMvRefreshIntentRequest, MvRepository, MvRepositoryError,
+};
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
@@ -36,15 +47,6 @@ use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::service::QueryExecutionService;
 use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
-};
-use novarocks::mv::application::{MvApplicationError, MvApplicationErrorKind, MvStatementResult};
-use novarocks::mv::persistence::refresh::{
-    FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
-    FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
-    MvRefreshFinalizeRequest,
-};
-use novarocks::mv::repository::{
-    BeginFrontendMvRefreshIntentRequest, MvRepository, MvRepositoryError,
 };
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt, ConnectorControlRegistry,
@@ -133,7 +135,7 @@ impl FrontendMvRefreshProviderActivationPort {
     pub(super) fn sync_repartition_descriptor(
         &self,
         mv_id: i64,
-        partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+        partition_spec: crate::mv::domain::persistence::schema::MvPartitionContract,
         committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
         connector_context: &ConnectorRequestContext,
     ) -> Result<(), MvApplicationError> {
@@ -958,8 +960,8 @@ fn proof_only_action(
 
 pub(super) fn mv_partition_contract(
     committed: &novarocks_spi::connector::ConnectorCommittedPartitioning,
-) -> Result<novarocks::mv::persistence::schema::MvPartitionContract, MvApplicationError> {
-    use novarocks::mv::persistence::schema::{
+) -> Result<crate::mv::domain::persistence::schema::MvPartitionContract, MvApplicationError> {
+    use crate::mv::domain::persistence::schema::{
         MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
     };
     use novarocks_spi::connector::ConnectorManagedPartitionTransform as Transform;
@@ -1075,22 +1077,22 @@ fn unavailable(message: impl Into<String>) -> MvApplicationError {
 
 fn repository_error(error: MvRepositoryError) -> MvApplicationError {
     let kind = match error.kind() {
-        novarocks::mv::repository::MvRepositoryErrorKind::Conflict => {
+        crate::mv::domain::repository::MvRepositoryErrorKind::Conflict => {
             MvApplicationErrorKind::AlreadyActive
         }
-        novarocks::mv::repository::MvRepositoryErrorKind::NotFound => {
+        crate::mv::domain::repository::MvRepositoryErrorKind::NotFound => {
             MvApplicationErrorKind::TargetGone
         }
-        novarocks::mv::repository::MvRepositoryErrorKind::Corruption => {
+        crate::mv::domain::repository::MvRepositoryErrorKind::Corruption => {
             MvApplicationErrorKind::Corruption
         }
-        novarocks::mv::repository::MvRepositoryErrorKind::CommitUnknown => {
+        crate::mv::domain::repository::MvRepositoryErrorKind::CommitUnknown => {
             MvApplicationErrorKind::RecoveryRequired
         }
-        novarocks::mv::repository::MvRepositoryErrorKind::KnownCommittedFinalizeFailed => {
+        crate::mv::domain::repository::MvRepositoryErrorKind::KnownCommittedFinalizeFailed => {
             MvApplicationErrorKind::RecoveryRequired
         }
-        novarocks::mv::repository::MvRepositoryErrorKind::Unavailable => {
+        crate::mv::domain::repository::MvRepositoryErrorKind::Unavailable => {
             MvApplicationErrorKind::Unavailable
         }
         _ => MvApplicationErrorKind::Repository,
@@ -1104,16 +1106,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::common::admitted_query_context::QueryExecutionContext;
+    use crate::mv::domain::persistence::refresh::{
+        FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
+        FrontendMvRefreshCommittedVersion,
+    };
     use crate::query_execution::mv_assembly::refresh_artifact::{
         MvRefreshCommittedFacts, MvRefreshPublicationIntent,
     };
     use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite;
     use crate::query_execution::mv_native_write::{
         MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
-    };
-    use novarocks::mv::persistence::refresh::{
-        FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
-        FrontendMvRefreshCommittedVersion,
     };
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
@@ -1129,7 +1131,7 @@ mod tests {
         descriptor_projection: Mutex<
             Option<(
                 i64,
-                novarocks::mv::persistence::schema::MvPartitionContract,
+                crate::mv::domain::persistence::schema::MvPartitionContract,
                 ConnectorCommittedPartitioning,
             )>,
         >,
@@ -1158,7 +1160,7 @@ mod tests {
         fn sync_repartition_descriptor(
             &self,
             mv_id: i64,
-            partition_spec: novarocks::mv::persistence::schema::MvPartitionContract,
+            partition_spec: crate::mv::domain::persistence::schema::MvPartitionContract,
             committed_partitioning: ConnectorCommittedPartitioning,
             _connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<(), String> {
@@ -1275,7 +1277,7 @@ mod tests {
 
         assert_eq!(
             error.kind(),
-            novarocks::mv::application::MvApplicationErrorKind::KnownCommittedFinalizeFailed
+            crate::mv::domain::application::MvApplicationErrorKind::KnownCommittedFinalizeFailed
         );
     }
 

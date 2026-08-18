@@ -1,10 +1,10 @@
 mod mv_repository_definition;
 
-use novarocks::mv::dependency::model::{
+use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks::mv::persistence::dependency::CreateMvDependencyRequest;
-use novarocks::mv::repository::MvRepository;
+use novarocks_frontend::mv::domain::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_frontend::mv::domain::repository::MvRepository;
 
 #[test]
 fn dependency_replace_delete_guard_and_ordering_are_provider_backed() {

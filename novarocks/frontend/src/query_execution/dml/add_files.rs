@@ -266,7 +266,7 @@ impl AddFilesEngine for DmlExecutionKernel {
         &self,
         request: PlanAddFilesRequest,
     ) -> Result<PreparedAddFiles, AddFilesPlanError> {
-        let target = novarocks::catalog_application::resolver::resolve_existing_table_target(
+        let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
             &ObjectName {
                 parts: request.command.table_parts,
@@ -281,11 +281,11 @@ impl AddFilesEngine for DmlExecutionKernel {
                 target.namespace, target.table
             )));
         }
-        novarocks::mv::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
             self.connector_control().as_ref(),
             self.mv_storage_observation().as_ref(),
             &target,
-            novarocks::mv::iceberg_guard::IcebergMvUserMutation::Insert,
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
         )
         .map_err(plan_string_failure)?;
         let connector_context = novarocks::connector::connector_request_context_for_execution(

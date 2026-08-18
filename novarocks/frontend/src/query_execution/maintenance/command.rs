@@ -85,7 +85,7 @@ impl MaintenanceReadCommandExecutor {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<Option<StatementResult>, String> {
-        if !novarocks::catalog_application::statement::looks_like_show_alter_table_optimize(sql) {
+        if !crate::catalog_application::statement::looks_like_show_alter_table_optimize(sql) {
             return Ok(None);
         }
         self.service

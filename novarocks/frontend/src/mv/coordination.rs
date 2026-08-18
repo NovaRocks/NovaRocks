@@ -55,8 +55,8 @@ use novarocks_state_store::coordination::{
 use uuid::Uuid;
 
 use crate::coordination::{CurrentLeaseFence, FenceValidator, FrontendCoordinationRuntime};
+use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use crate::mv::repository::MvRefreshFenceSource;
-use novarocks::mv::repository::{MvRepositoryError, MvRepositoryErrorKind};
 
 /// Prefix that scopes MV refresh leases away from every other coordinated
 /// resource in the same StateStore.

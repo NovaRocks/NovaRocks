@@ -5,12 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::mv::dependency::model::{
+use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks::mv::persistence::definition::{CreateMvDefinitionRequest, StoredMvRefreshPolicy};
-use novarocks::mv::persistence::dependency::CreateMvDependencyRequest;
-use novarocks::mv::repository::{
+use novarocks_frontend::mv::domain::persistence::definition::{
+    CreateMvDefinitionRequest, StoredMvRefreshPolicy,
+};
+use novarocks_frontend::mv::domain::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_frontend::mv::domain::repository::{
     CreateMvRepositoryRequest, InitialMvRefreshConfiguration, MvRepository, MvTarget,
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
@@ -338,7 +340,7 @@ fn concurrent_allocation_has_no_duplicates_and_explicit_bounds_are_checked() {
                     Ok(definition) => return definition.mv_id,
                     Err(error)
                         if error.kind()
-                            == novarocks::mv::repository::MvRepositoryErrorKind::Conflict =>
+                            == novarocks_frontend::mv::domain::repository::MvRepositoryErrorKind::Conflict =>
                     {
                         continue;
                     }
@@ -359,7 +361,7 @@ fn concurrent_allocation_has_no_duplicates_and_explicit_bounds_are_checked() {
         repository
             .create_with_id(
                 uuid::Uuid::now_v7(),
-                novarocks::mv::repository::CreateMvRepositoryWithIdRequest {
+                novarocks_frontend::mv::domain::repository::CreateMvRepositoryWithIdRequest {
                     mv_id: 0,
                     create: create_request("invalid"),
                 },
@@ -369,7 +371,7 @@ fn concurrent_allocation_has_no_duplicates_and_explicit_bounds_are_checked() {
     repository
         .create_with_id(
             uuid::Uuid::now_v7(),
-            novarocks::mv::repository::CreateMvRepositoryWithIdRequest {
+            novarocks_frontend::mv::domain::repository::CreateMvRepositoryWithIdRequest {
                 mv_id: i64::MAX,
                 create: create_request("maximum"),
             },
@@ -422,7 +424,7 @@ fn commit_resolution_fault_matrix_terminalizes_real_transactions_and_preserves_s
             let error = result.expect_err("unresolved abort must not be recovered as committed");
             assert_eq!(
                 error.kind(),
-                novarocks::mv::repository::MvRepositoryErrorKind::CommitUnknown,
+                novarocks_frontend::mv::domain::repository::MvRepositoryErrorKind::CommitUnknown,
                 "mode={mode:?}"
             );
             assert!(

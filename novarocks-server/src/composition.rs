@@ -23,18 +23,6 @@ use crate::app_config::NovaRocksConfig;
 use anyhow::Context;
 use novarocks::common::backend_topology::BackendTopologyPort;
 use novarocks::common::network;
-use novarocks::mv::persistence::descriptor::MvDescriptorV1;
-use novarocks::mv::persistence::schema::{
-    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
-};
-use novarocks::mv::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, MvMaintenanceMetadataObservation,
-    MvObservedMaintenancePolicy, MvObservedRefreshMarker, MvObservedSnapshot,
-    MvObservedTargetField, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
-    MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
-    MvSchemaValidationPartitionContract, MvSchemaValidationPartitionField,
-    MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
-};
 use novarocks_backend::{
     BackendApplicationHost, BackendServerConfig, BackendStoreSettings, QueryLifecycleRegistryConfig,
 };
@@ -49,6 +37,18 @@ use novarocks_connector_iceberg::storage_inspector::{
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+};
+use novarocks_frontend::mv::domain::persistence::descriptor::MvDescriptorV1;
+use novarocks_frontend::mv::domain::persistence::schema::{
+    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+};
+use novarocks_frontend::mv::domain::storage_observation::{
+    MvLakePackageObservation, MvLakePublication, MvMaintenanceMetadataObservation,
+    MvObservedMaintenancePolicy, MvObservedRefreshMarker, MvObservedSnapshot,
+    MvObservedTargetField, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
+    MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
+    MvSchemaValidationPartitionContract, MvSchemaValidationPartitionField,
+    MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,

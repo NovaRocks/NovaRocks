@@ -361,7 +361,7 @@ pub(crate) struct CtasSourceExecutionGate {
 /// second SQL compilation or a current-generation metadata lookup.
 pub(crate) struct PlannedCtasSourceQuery {
     source: novarocks_sql::planning::dml::DmlCtasSourcePlan,
-    table_bindings: Arc<novarocks::catalog_application::query_bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
     connector_target_parallelism: std::num::NonZeroUsize,
 }
@@ -386,9 +386,9 @@ fn plan_query_for_ctas_source(
         )?;
     }
     let catalog_service_snapshot =
-        novarocks::catalog_application::query_catalog::catalog_service_snapshot(state);
+        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
     let analyzer_provider =
-        novarocks::catalog_application::query_materializer::build_catalog_service_provider(
+        crate::catalog_application::query_materializer::build_catalog_service_provider(
             current_catalog,
             &catalog_service_snapshot,
             state.connector_control().as_ref(),
@@ -494,7 +494,7 @@ fn prepare_planned_ctas_connector_write(
 
 #[derive(Clone)]
 struct CoreCtasTargetPreflight {
-    target: novarocks::catalog_application::resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     lease: ConnectorCtasStagedPublicationLease,
     write_lease: ConnectorWriteLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
@@ -971,7 +971,7 @@ struct CorePreparedCtasSource {
     gate: Arc<CtasSourceExecutionGate>,
     preflight: CoreCtasTargetPreflight,
     command: CtasCommand,
-    target: novarocks::catalog_application::resolver::TargetBackend,
+    target: crate::catalog_application::resolver::TargetBackend,
     current_catalog: Option<String>,
     current_database: String,
     query_options: Option<QueryOptions>,
@@ -1352,7 +1352,7 @@ impl CtasEngine for DmlExecutionKernel {
             source_sql: source.to_string(),
             partitioning: partition_fields
                 .iter()
-                .map(novarocks::catalog_application::statement::connector_partition_transform)
+                .map(crate::catalog_application::statement::connector_partition_transform)
                 .collect(),
             properties: normalized_properties,
         }))
@@ -1364,7 +1364,7 @@ impl CtasEngine for DmlExecutionKernel {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
-        let target = novarocks::catalog_application::resolver::resolve_table_target(
+        let target = crate::catalog_application::resolver::resolve_table_target(
             self,
             &novarocks_sql::syntax::ObjectName {
                 parts: command.target_parts.clone(),
@@ -1431,7 +1431,7 @@ impl CtasEngine for DmlExecutionKernel {
         request: PrepareCtasSourceRequest,
     ) -> Result<PreparedCtasSource, CtasFailure> {
         let preflight = downcast_preflight(preflight)?;
-        let target = novarocks::catalog_application::resolver::resolve_table_target(
+        let target = crate::catalog_application::resolver::resolve_table_target(
             self,
             &novarocks_sql::syntax::ObjectName {
                 parts: request.command.target_parts.clone(),
@@ -1493,7 +1493,7 @@ impl CtasEngine for DmlExecutionKernel {
             .map_err(internal_failure)?;
         let output_columns = table_columns
             .iter()
-            .map(novarocks::catalog_application::statement::connector_column)
+            .map(crate::catalog_application::statement::connector_column)
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_failure)?;
         let schema_text = format!("{output_schema:?}");
@@ -2248,13 +2248,13 @@ mod tests {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         DmlExecutionKernel::new(
-            Arc::new(novarocks::catalog_application::query_catalog::new_query_catalog_service()),
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             Arc::new(
                 novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
-            Arc::new(novarocks::mv::storage_observation::UnavailableMvStorageObservationPort),
+            Arc::new(crate::mv::domain::storage_observation::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )
     }
@@ -2652,7 +2652,7 @@ mod tests {
         capability: Arc<dyn ConnectorCtasStagedPublication>,
     ) -> CoreCtasTargetPreflight {
         CoreCtasTargetPreflight {
-            target: novarocks::catalog_application::resolver::TargetBackend {
+            target: crate::catalog_application::resolver::TargetBackend {
                 backend_name: "iceberg",
                 catalog: owner.instance_id.as_str().to_string(),
                 namespace: "db".to_string(),

@@ -17,7 +17,6 @@
 
 //! Connector-agnostic metadata and materialized-view backend traits.
 
-use crate::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{ConnectorTableHandle, StatisticsDataVersion};
 
@@ -50,16 +49,4 @@ pub struct ResolvedTable {
     /// This pin is distinct from the schema version and must travel with any
     /// scan that later consumes connector statistics.
     pub statistics_pin: Option<ResolvedTableStatisticsPin>,
-}
-
-/// Materialized-view backend: CREATE / DROP / SHOW.
-///
-/// Backends implement external storage-specific ownership behind this boundary;
-/// the trait does not define a native internal-table storage engine.
-pub trait MvBackend: Send + Sync {
-    fn name(&self) -> &'static str;
-
-    fn create_mv(&self, req: CreateMvRequest) -> Result<(), String>;
-    fn drop_mv(&self, req: DropMvRequest) -> Result<(), String>;
-    fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String>;
 }

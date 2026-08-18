@@ -29,17 +29,17 @@ use crate::common::admitted_query_context::{
 };
 use crate::common::backend_topology::BackendTopologyService;
 use crate::common::query_cancellation::QueryCancellationSource;
+use crate::mv::domain::application::{
+    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
+    MvStatementResult,
+};
+use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh, PreparedMvRefreshWork,
 };
 use crate::query_execution::service::QueryExecutionService;
-use novarocks::mv::application::{
-    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
-    MvStatementResult,
-};
-use novarocks::mv::repository::MvRepository;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
 use super::{
@@ -261,7 +261,7 @@ impl FrontendMvService {
     ) -> Result<MvStatementResult, MvApplicationError> {
         let dependencies = self.refresh.as_ref().ok_or_else(|| {
             MvApplicationError::new(
-                novarocks::mv::application::MvApplicationErrorKind::Unavailable,
+                crate::mv::domain::application::MvApplicationErrorKind::Unavailable,
                 "frontend MV refresh dependencies are not installed",
             )
         })?;
@@ -278,7 +278,7 @@ impl FrontendMvService {
         &self,
         preparation: &dyn MvRefreshPreparationService,
         statement: novarocks_sql::planning::mv::MvRefreshStatement,
-        target: novarocks::mv::repository::MvTarget,
+        target: crate::mv::domain::repository::MvTarget,
         connector_context: ConnectorRequestContext,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
@@ -290,14 +290,14 @@ impl FrontendMvService {
             )
             .map_err(|_| {
                 MvApplicationError::new(
-                    novarocks::mv::application::MvApplicationErrorKind::ShutdownCancelled,
+                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
                     "frontend MV activity admission is closed",
                 )
             })?;
         let _gate_lease = loop {
             if execution.cancellation().is_cancelled() {
                 return Err(MvApplicationError::new(
-                    novarocks::mv::application::MvApplicationErrorKind::ShutdownCancelled,
+                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
                     "manual MV refresh was cancelled while waiting for activity gate",
                 ));
             }
@@ -306,7 +306,7 @@ impl FrontendMvService {
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                 Err(_) => {
                     return Err(MvApplicationError::new(
-                        novarocks::mv::application::MvApplicationErrorKind::ShutdownCancelled,
+                        crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
                         "frontend MV activity admission is closed",
                     ));
                 }
@@ -321,13 +321,13 @@ impl FrontendMvService {
             })
             .map_err(|error| {
                 MvApplicationError::new(
-                    novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
+                    crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
                     error,
                 )
             })?;
         if prepared.attempt != attempt {
             return Err(MvApplicationError::new(
-                novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
+                crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
                 "MV refresh preparation changed the frontend-reserved attempt identity",
             ));
         }
@@ -351,7 +351,7 @@ impl FrontendMvService {
             .reserve_frontend_refresh_id()
             .map_err(|error| {
                 MvApplicationError::new(
-                    novarocks::mv::application::MvApplicationErrorKind::Repository,
+                    crate::mv::domain::application::MvApplicationErrorKind::Repository,
                     error.to_string(),
                 )
             })?;
@@ -676,7 +676,7 @@ fn execute_scheduled_refresh(
 /// production builds do not inspect this environment variable.
 #[cfg(debug_assertions)]
 fn scheduled_refresh_test_barrier(
-    target: &novarocks::mv::repository::MvTarget,
+    target: &crate::mv::domain::repository::MvTarget,
     cancellation: &crate::common::query_cancellation::QueryCancellationView,
 ) -> bool {
     let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
@@ -697,7 +697,7 @@ fn scheduled_refresh_test_barrier(
 
 #[cfg(not(debug_assertions))]
 fn scheduled_refresh_test_barrier(
-    _target: &novarocks::mv::repository::MvTarget,
+    _target: &crate::mv::domain::repository::MvTarget,
     _cancellation: &crate::common::query_cancellation::QueryCancellationView,
 ) -> bool {
     false
@@ -705,7 +705,7 @@ fn scheduled_refresh_test_barrier(
 
 fn reserve_refresh_attempt(
     repository: &dyn MvRepository,
-) -> Result<MvRefreshAttemptIdentity, novarocks::mv::repository::MvRepositoryError> {
+) -> Result<MvRefreshAttemptIdentity, crate::mv::domain::repository::MvRepositoryError> {
     let refresh_id = repository.reserve_frontend_refresh_id()?;
     Ok(MvRefreshAttemptIdentity {
         refresh_id,
@@ -722,9 +722,9 @@ fn reserve_refresh_attempt(
 }
 
 fn repository_disposition(
-    error: novarocks::mv::repository::MvRepositoryError,
+    error: crate::mv::domain::repository::MvRepositoryError,
 ) -> ScheduledRefreshDisposition {
-    use novarocks::mv::repository::MvRepositoryErrorKind;
+    use crate::mv::domain::repository::MvRepositoryErrorKind;
     match error.kind() {
         MvRepositoryErrorKind::Conflict => ScheduledRefreshDisposition::AlreadyActive,
         MvRepositoryErrorKind::NotFound => ScheduledRefreshDisposition::TargetGone,
@@ -745,7 +745,7 @@ fn repository_disposition(
 }
 
 fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposition {
-    use novarocks::mv::application::MvApplicationErrorKind;
+    use crate::mv::domain::application::MvApplicationErrorKind;
     match error.kind() {
         MvApplicationErrorKind::AlreadyActive => ScheduledRefreshDisposition::AlreadyActive,
         MvApplicationErrorKind::TargetGone => ScheduledRefreshDisposition::TargetGone,

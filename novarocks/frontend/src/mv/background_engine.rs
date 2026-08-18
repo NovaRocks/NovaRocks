@@ -22,18 +22,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
+use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_repository;
+use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::domain::refresh::{
+    definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
+};
+use crate::mv::domain::repository::MvTarget;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh,
 };
 use novarocks::maintenance::MaintenanceTarget;
-use novarocks::mv::dependency::model::iceberg_mv_dependency_ref;
-use novarocks::mv::dependency::refresh::build_upstream_refresh_steps_with_repository;
-use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
-use novarocks::mv::refresh::{
-    definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
-};
-use novarocks::mv::repository::MvTarget;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -71,16 +71,18 @@ fn background_connector_request_context() -> Result<ConnectorRequestContext, Str
 pub(crate) struct StandaloneMvBackgroundEngine {
     ports: IcebergMvCorePorts,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    repository: Arc<dyn novarocks::mv::repository::MvRepository>,
-    storage_observation: Arc<dyn novarocks::mv::storage_observation::MvStorageObservationPort>,
+    repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
+    storage_observation: Arc<dyn crate::mv::domain::storage_observation::MvStorageObservationPort>,
 }
 
 impl StandaloneMvBackgroundEngine {
     pub(crate) fn new_with_ports(
         ports: IcebergMvCorePorts,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        repository: Arc<dyn novarocks::mv::repository::MvRepository>,
-        storage_observation: Arc<dyn novarocks::mv::storage_observation::MvStorageObservationPort>,
+        repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
+        storage_observation: Arc<
+            dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
+        >,
     ) -> Self {
         Self {
             ports,
@@ -93,8 +95,10 @@ impl StandaloneMvBackgroundEngine {
     fn definition_for_target(
         &self,
         target: &MvTarget,
-    ) -> Result<novarocks::mv::persistence::definition::StoredMvDefinition, MvBackgroundEngineError>
-    {
+    ) -> Result<
+        crate::mv::domain::persistence::definition::StoredMvDefinition,
+        MvBackgroundEngineError,
+    > {
         let definition = self
             .repository
             .find_by_target(target)
@@ -227,7 +231,7 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             .repository
             .list_definitions()
             .map_err(repository_error)?;
-        let stats = novarocks::mv::maintenance::stats::collect_table_stats_with_ports(
+        let stats = crate::mv::domain::maintenance::stats::collect_table_stats_with_ports(
             self.connector_control.as_ref(),
             self.storage_observation.as_ref(),
             &target.catalog,
@@ -262,9 +266,9 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
 }
 
 fn repository_error(
-    error: novarocks::mv::repository::MvRepositoryError,
+    error: crate::mv::domain::repository::MvRepositoryError,
 ) -> MvBackgroundEngineError {
-    use novarocks::mv::repository::MvRepositoryErrorKind;
+    use crate::mv::domain::repository::MvRepositoryErrorKind;
 
     let kind = match error.kind() {
         MvRepositoryErrorKind::NotFound => MvBackgroundEngineErrorKind::TargetGone,

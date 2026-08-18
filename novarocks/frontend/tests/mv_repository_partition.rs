@@ -4,17 +4,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::mv::persistence::partition::{
+use novarocks_frontend::mv::domain::persistence::partition::{
     MvPartitionRefreshStatus, RecordFailedMvPartitionStatesRequest,
     ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
 };
-use novarocks::mv::persistence::schema::{
+use novarocks_frontend::mv::domain::persistence::schema::{
     BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
     HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
     MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
     TargetContract, TargetVisibleColumn,
 };
-use novarocks::mv::repository::MvRepository;
+use novarocks_frontend::mv::domain::repository::MvRepository;
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_sql::planning::mv::ApplyKeySource;

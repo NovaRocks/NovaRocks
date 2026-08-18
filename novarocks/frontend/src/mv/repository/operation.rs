@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::mv::repository::{MvRepositoryError, MvRepositoryErrorKind};
+use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use novarocks_spi::state_store::{
     CommitOutcome, CommitResolution, StateStore, StateStoreError, StateStoreErrorKind,
     TransactionId,

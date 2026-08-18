@@ -15,755 +15,531 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend implementation of Core's catalog application boundary.
+//! Consumer-owned catalog control and admission contracts.
 //!
-//! The StateStore attachment is committed before a local control generation is
-//! registered. A registration failure therefore leaves durable truth intact
-//! and is reported as `Unavailable`; reconciliation can retry installation.
+//! Core consumes these facts but never owns the durable attachment record,
+//! provider factory, or a provider-concrete catalog handle. Frontend owns
+//! those control-plane concerns and projects Ready observations into this
+//! boundary.
 
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use novarocks::catalog_application::{
-    CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
-    CatalogCreateCommand, CatalogDropCommand, CatalogRuntimeObservation,
-    CatalogRuntimePublisherSink,
-};
-use novarocks::mv::repository::{MvRepositoryError, MvRepositoryErrorKind};
-use novarocks_spi::connector::{
-    ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlResolver,
-    ConnectorInstanceId, ConnectorProviderId,
-};
-use tokio::runtime::{Handle, RuntimeFlavor};
+use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
 use uuid::Uuid;
 
-use crate::catalog_attachment::{
-    CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
-    CatalogAttachmentRepository,
-};
-use crate::connector::ConnectorControlHost;
-use crate::mv::repository::CatalogAttachmentObservationSource;
+pub mod command;
+pub mod create_table_ddl;
+pub mod iceberg_ref_command;
+pub mod information_schema;
+pub mod query_bindings;
+pub mod query_catalog;
+pub mod query_materializer;
+pub mod resolver;
+pub mod statement;
+pub mod system_catalog;
+pub mod virtual_table;
+
+pub mod frontend_port;
+pub use frontend_port::FrontendCatalogApplicationPort;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum LocalProjection {
-    Unavailable {
-        attachment_id: Uuid,
-        provider_id: ConnectorProviderId,
-        reason: String,
-    },
-    Ready {
-        attachment_id: Uuid,
-        provider_id: ConnectorProviderId,
-        generation: u64,
-    },
+pub struct CatalogCreateCommand {
+    pub instance_id: ConnectorInstanceId,
+    pub display_name: String,
+    pub properties: Vec<(String, String)>,
+    pub if_not_exists: bool,
 }
 
-impl LocalProjection {
-    fn attachment_id(&self) -> Uuid {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogDropCommand {
+    pub instance_id: ConnectorInstanceId,
+    pub if_exists: bool,
+}
+
+/// The exact identity that Core may admit into a query/runtime path.
+///
+/// `attachment_id` distinguishes a catalog recreated under the same SQL
+/// name; `generation` distinguishes locally retired and republished runtime
+/// projections of that durable attachment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogRuntimeObservation {
+    pub attachment_id: Uuid,
+    pub instance_id: ConnectorInstanceId,
+    pub provider_id: ConnectorProviderId,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogAdmission {
+    Absent,
+    Unavailable { reason: String },
+    Ready(CatalogRuntimeObservation),
+}
+
+impl CatalogAdmission {
+    /// Resolves the admission, naming the catalog in both failure messages.
+    ///
+    /// Operators and tests match on the catalog name, so an absent attachment
+    /// must not surface as an anonymous "not found".
+    pub fn require_ready(
+        self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
         match self {
-            Self::Unavailable { attachment_id, .. } | Self::Ready { attachment_id, .. } => {
-                *attachment_id
-            }
-        }
-    }
-
-    fn ready_generation(&self) -> Option<u64> {
-        match self {
-            Self::Ready { generation, .. } => Some(*generation),
-            Self::Unavailable { .. } => None,
-        }
-    }
-}
-
-/// Owns durable attachment mutation and the local Connector control projection.
-// Design: ADR-0066 (docs/adr/ADR-0066-state-store-catalog-attachment-authority.md)
-pub struct FrontendCatalogApplicationPort {
-    repository: Option<CatalogAttachmentRepository>,
-    control: Arc<ConnectorControlHost>,
-    runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
-    runtime: Handle,
-    projections: Mutex<BTreeMap<ConnectorInstanceId, LocalProjection>>,
-    next_generation: AtomicU64,
-}
-
-impl FrontendCatalogApplicationPort {
-    pub fn unavailable(
-        control: Arc<ConnectorControlHost>,
-        runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
-        runtime: Handle,
-    ) -> Self {
-        Self {
-            repository: None,
-            control,
-            runtime_publisher,
-            runtime,
-            projections: Mutex::new(BTreeMap::new()),
-            next_generation: AtomicU64::new(1),
-        }
-    }
-
-    pub fn new(
-        repository: CatalogAttachmentRepository,
-        control: Arc<ConnectorControlHost>,
-        runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
-        runtime: Handle,
-    ) -> Self {
-        Self {
-            repository: Some(repository),
-            control,
-            runtime_publisher,
-            runtime,
-            projections: Mutex::new(BTreeMap::new()),
-            next_generation: AtomicU64::new(1),
-        }
-    }
-
-    fn repository(&self) -> Result<&CatalogAttachmentRepository, CatalogApplicationError> {
-        self.repository.as_ref().ok_or_else(|| {
-            CatalogApplicationError::new(
+            Self::Ready(observation) => Ok(observation),
+            Self::Absent => Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::NotFound,
+                format!("unknown catalog `{}`", instance_id.as_str()),
+            )),
+            Self::Unavailable { reason } => Err(CatalogApplicationError::new(
                 CatalogApplicationErrorKind::Unavailable,
-                "catalog attachments require a configured Frontend StateStore",
-            )
+                format!(
+                    "catalog `{}` is unavailable on this frontend: {reason}",
+                    instance_id.as_str()
+                ),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogApplicationErrorKind {
+    InvalidRequest,
+    NotFound,
+    AlreadyExists,
+    Conflict,
+    Unavailable,
+    Internal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogApplicationError {
+    kind: CatalogApplicationErrorKind,
+    message: String,
+}
+
+impl CatalogApplicationError {
+    pub fn new(kind: CatalogApplicationErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> CatalogApplicationErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for CatalogApplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CatalogApplicationError {}
+
+/// Frontend's catalog command and admission dependency.
+///
+/// Implemented by Frontend. Core must not downcast this port to access an
+/// attachment repository, control host, registry, or provider handle.
+// Design: ADR-0066 (docs/adr/ADR-0066-state-store-catalog-attachment-authority.md)
+pub trait CatalogApplicationPort: Send + Sync {
+    fn create_catalog(
+        &self,
+        command: CatalogCreateCommand,
+    ) -> Result<CatalogRuntimeObservation, CatalogApplicationError>;
+
+    fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError>;
+
+    fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission;
+}
+
+/// The provider-neutral sink Frontend uses to project a Ready catalog runtime
+/// into Core. It deliberately exposes only exact observations and retirement,
+/// never a concrete registry or provider handle.
+pub trait CatalogRuntimePublisherSink: Send + Sync {
+    fn publish_catalog_runtime(
+        &self,
+        observation: CatalogRuntimeObservation,
+    ) -> Result<(), CatalogApplicationError>;
+
+    fn unpublish_catalog_runtime(
+        &self,
+        instance_id: &ConnectorInstanceId,
+        generation: u64,
+    ) -> Result<(), CatalogApplicationError>;
+}
+
+/// The query catalog registry this projection publishes admitted runtimes into.
+///
+/// Frontend opens its catalog controller before the engine exists, so the
+/// registry arrives later and any observation published in the meantime is
+/// replayed under the same lock that guards the publication set.
+struct QueryCatalogBinding {
+    service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
+    controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+}
+
+impl QueryCatalogBinding {
+    fn register(&self, observation: &CatalogRuntimeObservation) {
+        self.service.register_catalog(
+            crate::catalog_application::query_catalog::build_connector_catalog(
+                observation.instance_id.as_str(),
+                Arc::clone(&self.controls),
+            ),
+        );
+    }
+
+    fn unregister(&self, instance_id: &ConnectorInstanceId) {
+        self.service.unregister_catalog(instance_id.as_str());
+    }
+}
+
+/// Frontend-owned exact runtime publication set.
+///
+/// Frontend publishes only after a local Connector control generation is
+/// installed and unpublishes before retiring it. Core wraps the Frontend
+/// application port with this set so a stale or partially installed local
+/// projection can never be admitted into query materialization.
+// Design: ADR-0066 (docs/adr/ADR-0066-state-store-catalog-attachment-authority.md)
+pub struct CatalogRuntimeProjection {
+    published: Mutex<BTreeMap<ConnectorInstanceId, CatalogRuntimeObservation>>,
+    query_catalog: Mutex<Option<QueryCatalogBinding>>,
+}
+
+impl CatalogRuntimeProjection {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            published: Mutex::new(BTreeMap::new()),
+            query_catalog: Mutex::new(None),
         })
     }
 
-    fn block_on<T>(
+    /// Binds the engine's query catalog registry and replays every runtime the
+    /// Frontend controller already published. Engine open calls this once; a
+    /// second bind is rejected so two engines cannot share one publication set.
+    pub fn bind_query_catalog(
         &self,
-        future: impl Future<Output = Result<T, CatalogAttachmentError>>,
-    ) -> Result<T, CatalogApplicationError> {
-        let result = match Handle::try_current() {
-            Ok(_) if self.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread => {
-                return Err(CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::Unavailable,
-                    "catalog attachment StateStore access is unavailable on a current-thread Tokio runtime",
-                ));
-            }
-            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
-            Err(_) => self.runtime.block_on(future),
-        };
-        result.map_err(repository_error)
-    }
-
-    fn next_projection_generation(&self) -> u64 {
-        self.next_generation.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn observation(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission {
-        let projection = match self.projections.lock() {
-            Ok(projections) => projections.get(instance_id).cloned(),
-            Err(_) => {
-                return CatalogAdmission::Unavailable {
-                    reason: "catalog projection lock is poisoned".to_string(),
-                };
-            }
-        };
-        let Some(projection) = projection else {
-            return CatalogAdmission::Absent;
-        };
-        match projection {
-            LocalProjection::Unavailable { reason, .. } => CatalogAdmission::Unavailable { reason },
-            LocalProjection::Ready {
-                attachment_id,
-                provider_id,
-                generation,
-            } => match self.control.observe_current_binding(instance_id) {
-                Ok(_) => CatalogAdmission::Ready(CatalogRuntimeObservation {
-                    attachment_id,
-                    instance_id: instance_id.clone(),
-                    provider_id,
-                    generation,
-                }),
-                Err(error) => CatalogAdmission::Unavailable {
-                    reason: error.to_string(),
-                },
-            },
-        }
-    }
-
-    fn mark_unavailable(
-        &self,
-        instance_id: &ConnectorInstanceId,
-        attachment_id: Uuid,
-        provider_id: &ConnectorProviderId,
-        reason: impl Into<String>,
-    ) {
-        let previous = self.projections.lock().ok().and_then(|mut projections| {
-            projections.insert(
-                instance_id.clone(),
-                LocalProjection::Unavailable {
-                    attachment_id,
-                    provider_id: provider_id.clone(),
-                    reason: reason.into(),
-                },
-            )
-        });
-        if let Some(generation) = previous
-            .as_ref()
-            .and_then(LocalProjection::ready_generation)
-            && let Err(error) = self
-                .runtime_publisher
-                .unpublish_catalog_runtime(instance_id, generation)
-        {
-            tracing::warn!(%error, catalog = instance_id.as_str(), "catalog runtime unpublish failed while marking projection unavailable");
-        }
-        if previous.is_some()
-            && let Err(error) = self.control.retire_current(instance_id)
-        {
-            tracing::debug!(%error, catalog = instance_id.as_str(), "catalog runtime was not locally active while marking projection unavailable");
-        }
-    }
-
-    fn install_created(
-        &self,
-        attachment: &CatalogAttachment,
-        binding: novarocks_spi::connector::ConnectorControlBinding,
-    ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
-        self.control.register(binding).map_err(connector_error)?;
-        let generation = self.next_projection_generation();
-        let observation = CatalogRuntimeObservation {
-            attachment_id: attachment.attachment_id,
-            instance_id: attachment.instance_id.clone(),
-            provider_id: attachment.provider_id.clone(),
-            generation,
-        };
-        if let Err(error) = self
-            .runtime_publisher
-            .publish_catalog_runtime(observation.clone())
-        {
-            let _ = self.control.retire_current(&attachment.instance_id);
-            return Err(error);
-        }
-        let projection = LocalProjection::Ready {
-            attachment_id: attachment.attachment_id,
-            provider_id: attachment.provider_id.clone(),
-            generation,
-        };
-        let publish_result = self
-            .projections
-            .lock()
-            .map_err(|_| {
-                CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::Internal,
-                    "catalog projection lock is poisoned",
-                )
-            })
-            .and_then(
-                |mut projections| match projections.get(&attachment.instance_id) {
-                    Some(LocalProjection::Unavailable {
-                        attachment_id,
-                        provider_id,
-                        ..
-                    }) if *attachment_id == attachment.attachment_id
-                        && *provider_id == attachment.provider_id =>
-                    {
-                        projections.insert(attachment.instance_id.clone(), projection);
-                        Ok(())
-                    }
-                    _ => Err(CatalogApplicationError::new(
-                        CatalogApplicationErrorKind::Conflict,
-                        "catalog projection changed before its runtime became ready",
-                    )),
-                },
-            );
-        if let Err(error) = publish_result {
-            let _ = self
-                .runtime_publisher
-                .unpublish_catalog_runtime(&attachment.instance_id, generation);
-            let _ = self.control.retire_current(&attachment.instance_id);
-            if let Ok(mut projections) = self.projections.lock()
-                && projections
-                    .get(&attachment.instance_id)
-                    .is_some_and(|projection| {
-                        projection.attachment_id() == attachment.attachment_id
-                    })
-            {
-                projections.insert(
-                    attachment.instance_id.clone(),
-                    LocalProjection::Unavailable {
-                        attachment_id: attachment.attachment_id,
-                        provider_id: attachment.provider_id.clone(),
-                        reason: error.to_string(),
-                    },
-                );
-            }
-            return Err(error);
-        }
-        Ok(observation)
-    }
-
-    /// Rebuild this process's control projection from the authoritative
-    /// attachment scan. A change hint never carries attachment state; callers
-    /// always invoke this method after rereading StateStore. Factory and
-    /// registration work is bounded because provider materialization can
-    /// synchronously perform remote validation.
-    pub(crate) async fn reconcile_with_page_size(
-        self: &Arc<Self>,
-        page_size: usize,
-        worker_count: usize,
+        service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
+        controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
     ) -> Result<(), CatalogApplicationError> {
-        if worker_count == 0 {
+        let published = self.published.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog runtime publication lock is poisoned",
+            )
+        })?;
+        let mut binding = self.query_catalog.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog runtime query catalog lock is poisoned",
+            )
+        })?;
+        if binding.is_some() {
             return Err(CatalogApplicationError::new(
-                CatalogApplicationErrorKind::InvalidRequest,
-                "catalog projection worker count must be positive",
+                CatalogApplicationErrorKind::Conflict,
+                "catalog runtime projection is already bound to a query catalog",
             ));
         }
-        let repository = self.repository()?;
-        let attachments = repository
-            .list_with_page_size(page_size)
-            .await
-            .map_err(repository_error)?;
-        let desired = attachments
-            .iter()
-            .map(|versioned| {
-                (
-                    versioned.attachment.instance_id.clone(),
-                    versioned.attachment.clone(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        let stale = self
-            .projections
-            .lock()
-            .map_err(|_| {
-                CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::Internal,
-                    "catalog projection lock is poisoned",
-                )
-            })?
-            .iter()
-            .filter(|(instance_id, _)| !desired.contains_key(*instance_id))
-            .map(|(instance_id, projection)| (instance_id.clone(), projection.attachment_id()))
-            .collect::<Vec<_>>();
-        // A projection missing from the scan is not proof that its attachment is
-        // gone: `create_catalog` commits the attachment and only then installs
-        // the projection, so a catalog created after `list` began is present
-        // locally and absent from `desired`. Retiring on that alone made the
-        // statement right after CREATE EXTERNAL CATALOG fail with
-        // "unknown catalog" whenever a reconcile cycle straddled it.
-        //
-        // Re-reading each candidate closes the window rather than narrowing it:
-        // the projection can only exist because the attachment was already
-        // committed, so a read issued after observing the projection sees it.
-        for (instance_id, attachment_id) in stale {
-            match repository.get(&instance_id).await {
-                Ok(Some(versioned)) if versioned.attachment.attachment_id == attachment_id => {}
-                Ok(_) => self.retire_projection(&instance_id),
-                // Keep serving and retry next cycle: the read failed, so nothing
-                // was proven about the attachment either way.
-                Err(error) => tracing::warn!(
-                    %error,
-                    catalog = instance_id.as_str(),
-                    "catalog attachment re-read failed while retiring a projection absent from the scan",
-                ),
-            }
+        let bound = QueryCatalogBinding { service, controls };
+        for observation in published.values() {
+            bound.register(observation);
         }
-
-        let mut workers = tokio::task::JoinSet::new();
-        for attachment in desired.into_values() {
-            if workers.len() >= worker_count {
-                let completed = workers.join_next().await.ok_or_else(|| {
-                    CatalogApplicationError::new(
-                        CatalogApplicationErrorKind::Internal,
-                        "catalog projection worker exited unexpectedly",
-                    )
-                })?;
-                completed.map_err(|error| {
-                    CatalogApplicationError::new(
-                        CatalogApplicationErrorKind::Internal,
-                        format!("catalog projection worker failed: {error}"),
-                    )
-                })?;
-            }
-            let projection = Arc::clone(self);
-            workers.spawn_blocking(move || projection.reconcile_attachment(attachment));
-        }
-        while let Some(completed) = workers.join_next().await {
-            completed.map_err(|error| {
-                CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::Internal,
-                    format!("catalog projection worker failed: {error}"),
-                )
-            })?;
-        }
+        *binding = Some(bound);
         Ok(())
     }
 
-    fn reconcile_attachment(&self, attachment: CatalogAttachment) {
-        let installed = self
-            .projections
-            .lock()
-            .map(|projections| {
-                projections
-                    .get(&attachment.instance_id)
-                    .is_some_and(|projection| {
-                        matches!(
-                            projection,
-                            LocalProjection::Ready { attachment_id, .. }
-                                if *attachment_id == attachment.attachment_id
-                        )
-                    })
-            })
-            .unwrap_or(false)
-            && self
-                .control
-                .observe_current_binding(&attachment.instance_id)
-                .is_ok();
-        if installed {
-            return;
-        }
+    pub fn publisher(self: &Arc<Self>) -> Arc<dyn CatalogRuntimePublisherSink> {
+        Arc::clone(self) as Arc<dyn CatalogRuntimePublisherSink>
+    }
 
-        self.mark_unavailable(
-            &attachment.instance_id,
-            attachment.attachment_id,
-            &attachment.provider_id,
-            "catalog attachment runtime is being materialized",
-        );
-        let installed = (|| {
-            let request = ConnectorControlFactoryRequest::try_new(
-                attachment.provider_id.clone(),
-                attachment.instance_id.clone(),
-                attachment.durable_properties.clone(),
+    pub fn bind_application(
+        self: &Arc<Self>,
+        application: Arc<dyn CatalogApplicationPort>,
+    ) -> Arc<dyn CatalogApplicationPort> {
+        Arc::new(PublishedCatalogApplicationPort {
+            application,
+            projection: Arc::clone(self),
+        })
+    }
+
+    /// Every catalog runtime this process currently admits.
+    ///
+    /// Startup rediscovery consumes this instead of a durable scan: the
+    /// attachment record lives in StateStore and only the Frontend controller
+    /// may read it.
+    pub(crate) fn published_observations(
+        &self,
+    ) -> Result<Vec<CatalogRuntimeObservation>, CatalogApplicationError> {
+        let published = self.published.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog runtime publication lock is poisoned",
             )
-            .map_err(connector_error)?;
-            let creation = self
-                .control
-                .create_control(request)
-                .map_err(connector_error)?;
-            let (binding, _) = creation.into_parts();
-            self.install_created(&attachment, binding).map(|_| ())
-        })();
-        if let Err(error) = installed {
-            self.mark_unavailable(
-                &attachment.instance_id,
-                attachment.attachment_id,
-                &attachment.provider_id,
-                error.to_string(),
-            );
-            // A single provider failure must not make durable truth disappear
-            // or prevent unrelated catalog projections. Its admission remains
-            // Unavailable until a later resync works.
-            tracing::warn!(%error, catalog = attachment.instance_id.as_str(), "catalog attachment remains unavailable after projection attempt");
-        }
+        })?;
+        Ok(published.values().cloned().collect())
     }
 
-    /// Stops all local admission before retiring existing leases. Durable
-    /// attachments remain unchanged, so a later authoritative reconcile can
-    /// construct fresh generations after a freshness outage.
-    pub(crate) fn unpublish_all(&self) {
-        let attachments = self
-            .projections
-            .lock()
-            .map(|projections| {
-                projections
-                    .iter()
-                    .map(|(instance_id, projection)| match projection {
-                        LocalProjection::Unavailable {
-                            attachment_id,
-                            provider_id,
-                            ..
-                        }
-                        | LocalProjection::Ready {
-                            attachment_id,
-                            provider_id,
-                            ..
-                        } => (instance_id.clone(), *attachment_id, provider_id.clone()),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for (instance_id, attachment_id, provider_id) in attachments {
-            self.mark_unavailable(
-                &instance_id,
-                attachment_id,
-                &provider_id,
-                "catalog attachment projection freshness expired",
-            );
-        }
-    }
-
-    pub(crate) fn projection_count(&self) -> usize {
-        self.projections
-            .lock()
-            .map(|projections| {
-                projections
-                    .values()
-                    .filter(|projection| matches!(projection, LocalProjection::Ready { .. }))
-                    .count()
-            })
-            .unwrap_or_default()
-    }
-
-    fn retire_projection(&self, instance_id: &ConnectorInstanceId) {
-        let projection = self
-            .projections
-            .lock()
-            .ok()
-            .and_then(|mut projections| projections.remove(instance_id));
-        if let Some(generation) = projection
-            .as_ref()
-            .and_then(LocalProjection::ready_generation)
-            && let Err(error) = self
-                .runtime_publisher
-                .unpublish_catalog_runtime(instance_id, generation)
-        {
-            tracing::warn!(%error, catalog = instance_id.as_str(), "catalog runtime unpublish failed during retirement");
-        }
-        if let Err(error) = self.control.retire_current(instance_id) {
-            tracing::debug!(%error, catalog = instance_id.as_str(), "catalog runtime was not locally active during retirement");
+    fn require_exact(
+        &self,
+        observation: &CatalogRuntimeObservation,
+    ) -> Result<(), CatalogApplicationError> {
+        let published = self.published.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "catalog runtime publication lock is poisoned",
+            )
+        })?;
+        match published.get(&observation.instance_id) {
+            Some(current) if current == observation => Ok(()),
+            Some(_) => Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "catalog runtime publication does not match the admitted attachment generation",
+            )),
+            None => Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "catalog runtime is not published into Frontend",
+            )),
         }
     }
 }
 
-impl CatalogApplicationPort for FrontendCatalogApplicationPort {
+impl CatalogRuntimePublisherSink for CatalogRuntimeProjection {
+    fn publish_catalog_runtime(
+        &self,
+        observation: CatalogRuntimeObservation,
+    ) -> Result<(), CatalogApplicationError> {
+        let mut published = self.published.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog runtime publication lock is poisoned",
+            )
+        })?;
+        match published.get(&observation.instance_id) {
+            Some(current) if current == &observation => Ok(()),
+            Some(_) => Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Conflict,
+                "catalog runtime must be unpublished before publishing another generation",
+            )),
+            None => {
+                // The SQL name only becomes resolvable after the local control
+                // generation is registered, so query admission can never see a
+                // catalog without a binding.
+                if let Some(binding) = self
+                    .query_catalog
+                    .lock()
+                    .map_err(|_| {
+                        CatalogApplicationError::new(
+                            CatalogApplicationErrorKind::Internal,
+                            "catalog runtime query catalog lock is poisoned",
+                        )
+                    })?
+                    .as_ref()
+                {
+                    binding.register(&observation);
+                }
+                published.insert(observation.instance_id.clone(), observation);
+                Ok(())
+            }
+        }
+    }
+
+    fn unpublish_catalog_runtime(
+        &self,
+        instance_id: &ConnectorInstanceId,
+        generation: u64,
+    ) -> Result<(), CatalogApplicationError> {
+        let mut published = self.published.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog runtime publication lock is poisoned",
+            )
+        })?;
+        if published
+            .get(instance_id)
+            .is_some_and(|current| current.generation == generation)
+        {
+            published.remove(instance_id);
+            // Revoking the SQL name before the caller retires its local
+            // generation is what stops new admission for a dropped catalog.
+            if let Some(binding) = self
+                .query_catalog
+                .lock()
+                .map_err(|_| {
+                    CatalogApplicationError::new(
+                        CatalogApplicationErrorKind::Internal,
+                        "catalog runtime query catalog lock is poisoned",
+                    )
+                })?
+                .as_ref()
+            {
+                binding.unregister(instance_id);
+            }
+        }
+        Ok(())
+    }
+}
+
+struct PublishedCatalogApplicationPort {
+    application: Arc<dyn CatalogApplicationPort>,
+    projection: Arc<CatalogRuntimeProjection>,
+}
+
+impl CatalogApplicationPort for PublishedCatalogApplicationPort {
     fn create_catalog(
         &self,
         command: CatalogCreateCommand,
     ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
-        let repository = self.repository()?;
-        if self
-            .block_on(repository.get(&command.instance_id))?
-            .is_some()
-        {
-            if !command.if_not_exists {
-                return Err(CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::AlreadyExists,
-                    "catalog attachment already exists",
-                ));
-            }
-            return self
-                .admit_catalog(&command.instance_id)
-                .require_ready(&command.instance_id);
-        }
-
-        let provider_id = provider_id_from_properties(&command.properties)?;
-        let request = ConnectorControlFactoryRequest::try_new(
-            provider_id.clone(),
-            command.instance_id.clone(),
-            command.properties,
-        )
-        .map_err(connector_error)?;
-        // The factory may validate provider configuration, but it does not
-        // become live until after the attachment CAS succeeds below.
-        let creation = self
-            .control
-            .create_control(request)
-            .map_err(connector_error)?;
-        let (binding, mut durable_properties) = creation.into_parts();
-        durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
-        let attachment = CatalogAttachment {
-            attachment_id: Uuid::now_v7(),
-            instance_id: command.instance_id,
-            provider_id,
-            display_name: command.display_name,
-            durable_properties,
-            created_at_ms: chrono::Utc::now().timestamp_millis(),
-        };
-        let created = self.block_on(repository.create(attachment))?;
-        self.mark_unavailable(
-            &created.attachment.instance_id,
-            created.attachment.attachment_id,
-            &created.attachment.provider_id,
-            "catalog attachment runtime is being installed",
-        );
-        self.install_created(&created.attachment, binding)
+        let observation = self.application.create_catalog(command)?;
+        self.projection.require_exact(&observation)?;
+        Ok(observation)
     }
 
     fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError> {
-        let repository = self.repository()?;
-        let Some(existing) = self.block_on(repository.get(&command.instance_id))? else {
-            return if command.if_exists {
-                Ok(())
-            } else {
-                Err(CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::NotFound,
-                    "catalog attachment was not found",
-                ))
-            };
-        };
-        self.block_on(repository.drop_exact_fenced_by_materialized_views(existing, 256))?;
-        self.retire_projection(&command.instance_id);
-        // Durable deletion is authoritative. A local generation can be absent
-        // or already retiring; either case converges through reconciliation.
-        Ok(())
+        self.application.drop_catalog(command)
     }
 
     fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission {
-        if self.repository.is_none() {
-            return CatalogAdmission::Unavailable {
-                reason: "catalog attachments require a configured Frontend StateStore".to_string(),
-            };
-        }
-        self.observation(instance_id)
-    }
-}
-
-impl CatalogAttachmentObservationSource for FrontendCatalogApplicationPort {
-    fn capture(
-        &self,
-        catalogs: &std::collections::BTreeSet<String>,
-    ) -> Result<Vec<crate::catalog_attachment::CatalogAttachmentVersioned>, MvRepositoryError> {
-        let repository = self.repository().map_err(mv_repository_error)?;
-        let mut observations = Vec::with_capacity(catalogs.len());
-        for catalog in catalogs {
-            let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| {
-                MvRepositoryError::new(MvRepositoryErrorKind::InvalidRequest, error.to_string())
-            })?;
-            match self.admit_catalog(&instance_id) {
-                CatalogAdmission::Ready(observation) => {
-                    let versioned = self
-                        .block_on(repository.get(&instance_id))
-                        .map_err(mv_repository_error)?
-                        .ok_or_else(|| {
-                            MvRepositoryError::new(
-                                MvRepositoryErrorKind::Conflict,
-                                "catalog attachment disappeared during MV admission",
-                            )
-                        })?;
-                    if versioned.attachment.attachment_id != observation.attachment_id
-                        || versioned.attachment.provider_id != observation.provider_id
-                    {
-                        return Err(MvRepositoryError::new(
-                            MvRepositoryErrorKind::Conflict,
-                            "catalog attachment changed during MV admission",
-                        ));
-                    }
-                    observations.push(versioned);
-                }
-                CatalogAdmission::Absent => {
-                    return Err(MvRepositoryError::new(
-                        MvRepositoryErrorKind::Conflict,
-                        "materialized view references a catalog attachment that is absent",
-                    ));
-                }
-                CatalogAdmission::Unavailable { reason } => {
-                    return Err(MvRepositoryError::new(
-                        MvRepositoryErrorKind::Unavailable,
-                        format!("materialized view catalog admission is unavailable: {reason}"),
-                    ));
+        match self.application.admit_catalog(instance_id) {
+            CatalogAdmission::Ready(observation) => {
+                match self.projection.require_exact(&observation) {
+                    Ok(()) => CatalogAdmission::Ready(observation),
+                    Err(error) => CatalogAdmission::Unavailable {
+                        reason: error.to_string(),
+                    },
                 }
             }
+            admission => admission,
         }
-        Ok(observations)
     }
 }
 
-fn provider_id_from_properties(
-    properties: &[(String, String)],
-) -> Result<ConnectorProviderId, CatalogApplicationError> {
-    let mut providers = properties
-        .iter()
-        .filter(|(key, _)| key.eq_ignore_ascii_case("type"))
-        .map(|(_, value)| value.as_str());
-    let Some(provider) = providers.next() else {
-        return Err(CatalogApplicationError::new(
-            CatalogApplicationErrorKind::InvalidRequest,
-            "CREATE CATALOG requires exactly one type property",
-        ));
-    };
-    if providers.next().is_some() {
-        return Err(CatalogApplicationError::new(
-            CatalogApplicationErrorKind::InvalidRequest,
-            "CREATE CATALOG requires exactly one type property",
-        ));
-    }
-    ConnectorProviderId::parse(provider).map_err(|error| {
-        CatalogApplicationError::new(
-            CatalogApplicationErrorKind::InvalidRequest,
-            error.to_string(),
-        )
-    })
+/// Process-local health facts for the Frontend-owned catalog projection.
+///
+/// The durable attachment remains in StateStore; these fields only describe
+/// the local controller that projects it into a runtime generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CatalogProjectionMetricsSnapshot {
+    pub projected_catalogs: usize,
+    pub successful_polls: u64,
+    pub failed_polls: u64,
+    pub resyncs: u64,
+    pub freshness_expiries: u64,
 }
 
-fn repository_error(error: CatalogAttachmentError) -> CatalogApplicationError {
-    let kind = match error.kind() {
-        CatalogAttachmentErrorKind::InvalidRequest => CatalogApplicationErrorKind::InvalidRequest,
-        CatalogAttachmentErrorKind::NotFound => CatalogApplicationErrorKind::NotFound,
-        CatalogAttachmentErrorKind::AlreadyExists => CatalogApplicationErrorKind::AlreadyExists,
-        CatalogAttachmentErrorKind::Conflict => CatalogApplicationErrorKind::Conflict,
-        CatalogAttachmentErrorKind::Unavailable | CatalogAttachmentErrorKind::CommitUnknown => {
-            CatalogApplicationErrorKind::Unavailable
-        }
-        CatalogAttachmentErrorKind::Corruption => CatalogApplicationErrorKind::Internal,
-    };
-    CatalogApplicationError::new(kind, error.to_string())
-}
-
-fn connector_error(error: novarocks_spi::connector::ConnectorError) -> CatalogApplicationError {
-    use novarocks_spi::connector::ConnectorErrorKind;
-
-    let kind = match error.kind() {
-        ConnectorErrorKind::InvalidRequest => CatalogApplicationErrorKind::InvalidRequest,
-        ConnectorErrorKind::NotFound => CatalogApplicationErrorKind::Unavailable,
-        ConnectorErrorKind::Unavailable
-        | ConnectorErrorKind::ResourceExhausted
-        | ConnectorErrorKind::DeadlineExceeded
-        | ConnectorErrorKind::Cancelled => CatalogApplicationErrorKind::Unavailable,
-        ConnectorErrorKind::PermissionDenied
-        | ConnectorErrorKind::Unsupported
-        | ConnectorErrorKind::CorruptData
-        | ConnectorErrorKind::Internal => CatalogApplicationErrorKind::Internal,
-    };
-    CatalogApplicationError::new(kind, error.to_string())
-}
-
-fn mv_repository_error(error: CatalogApplicationError) -> MvRepositoryError {
-    let kind = match error.kind() {
-        CatalogApplicationErrorKind::InvalidRequest => MvRepositoryErrorKind::InvalidRequest,
-        CatalogApplicationErrorKind::NotFound
-        | CatalogApplicationErrorKind::AlreadyExists
-        | CatalogApplicationErrorKind::Conflict => MvRepositoryErrorKind::Conflict,
-        CatalogApplicationErrorKind::Unavailable => MvRepositoryErrorKind::Unavailable,
-        CatalogApplicationErrorKind::Internal => MvRepositoryErrorKind::Corruption,
-    };
-    MvRepositoryError::new(kind, error.to_string())
+/// Publishes Frontend-owned projection health to the process metrics endpoint.
+pub fn publish_catalog_projection_metrics(snapshot: CatalogProjectionMetricsSnapshot) {
+    crate::catalog_projection_metrics::publish(snapshot);
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::sync::Mutex;
 
     use super::*;
 
+    fn observation() -> CatalogRuntimeObservation {
+        CatalogRuntimeObservation {
+            attachment_id: Uuid::now_v7(),
+            instance_id: ConnectorInstanceId::parse("warehouse").expect("instance"),
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+            generation: 7,
+        }
+    }
+
     #[test]
-    fn create_catalog_requires_one_type_property() {
-        assert_eq!(
-            provider_id_from_properties(&[])
-                .expect_err("missing type must fail")
-                .kind(),
-            CatalogApplicationErrorKind::InvalidRequest
+    fn admission_preserves_not_found_and_unavailable_as_distinct_outcomes() {
+        let instance_id = ConnectorInstanceId::parse("warehouse").expect("instance");
+        let absent = CatalogAdmission::Absent
+            .require_ready(&instance_id)
+            .expect_err("absent catalog");
+        assert_eq!(absent.kind(), CatalogApplicationErrorKind::NotFound);
+        assert_eq!(absent.to_string(), "unknown catalog `warehouse`");
+        let unavailable = CatalogAdmission::Unavailable {
+            reason: "projection is stale".to_string(),
+        }
+        .require_ready(&instance_id)
+        .expect_err("unavailable catalog");
+        assert_eq!(unavailable.kind(), CatalogApplicationErrorKind::Unavailable);
+        assert!(
+            unavailable.to_string().contains("warehouse")
+                && unavailable.to_string().contains("projection is stale"),
+            "an unavailable catalog must name itself and keep the reason: {unavailable}"
         );
         assert_eq!(
-            provider_id_from_properties(&[
-                ("type".to_string(), "iceberg".to_string()),
-                ("TYPE".to_string(), "starrocks".to_string()),
-            ])
-            .expect_err("duplicate type must fail")
-            .kind(),
-            CatalogApplicationErrorKind::InvalidRequest
-        );
-        assert_eq!(
-            provider_id_from_properties(&[("type".to_string(), "iceberg".to_string())])
-                .expect("one type")
-                .as_str(),
-            "iceberg"
+            CatalogAdmission::Ready(observation())
+                .require_ready(&instance_id)
+                .expect("ready catalog")
+                .generation,
+            7
         );
     }
 
-    #[tokio::test]
-    async fn mv_observation_source_rejects_catalogs_without_a_durable_frontend_attachment() {
-        let port = FrontendCatalogApplicationPort::unavailable(
-            Arc::new(ConnectorControlHost::new()),
-            novarocks::catalog_application::CatalogRuntimeProjection::new().publisher(),
-            tokio::runtime::Handle::current(),
+    struct FixedApplication {
+        admission: Mutex<CatalogAdmission>,
+    }
+
+    impl CatalogApplicationPort for FixedApplication {
+        fn create_catalog(
+            &self,
+            _command: CatalogCreateCommand,
+        ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+            self.admission
+                .lock()
+                .expect("admission lock")
+                .clone()
+                .require_ready(&_command.instance_id)
+        }
+
+        fn drop_catalog(
+            &self,
+            _command: CatalogDropCommand,
+        ) -> Result<(), CatalogApplicationError> {
+            Ok(())
+        }
+
+        fn admit_catalog(&self, _instance_id: &ConnectorInstanceId) -> CatalogAdmission {
+            self.admission.lock().expect("admission lock").clone()
+        }
+    }
+
+    #[test]
+    fn runtime_projection_requires_exact_publish_and_unpublishes_exact_generation() {
+        let projection = CatalogRuntimeProjection::new();
+        let current = observation();
+        let application: Arc<dyn CatalogApplicationPort> = Arc::new(FixedApplication {
+            admission: Mutex::new(CatalogAdmission::Ready(current.clone())),
+        });
+        let bound = projection.bind_application(application);
+
+        assert!(matches!(
+            bound.admit_catalog(&current.instance_id),
+            CatalogAdmission::Unavailable { .. }
+        ));
+        projection
+            .publish_catalog_runtime(current.clone())
+            .expect("publish current runtime");
+        assert_eq!(
+            bound.admit_catalog(&current.instance_id),
+            CatalogAdmission::Ready(current.clone())
         );
-        let error = CatalogAttachmentObservationSource::capture(
-            &port,
-            &BTreeSet::from(["catalog.analytics".to_string()]),
-        )
-        .expect_err("an unavailable attachment repository cannot freeze an MV dependency");
-        assert_eq!(error.kind(), MvRepositoryErrorKind::Unavailable);
+
+        projection
+            .unpublish_catalog_runtime(&current.instance_id, current.generation + 1)
+            .expect("ignore stale unpublish");
+        assert_eq!(
+            bound.admit_catalog(&current.instance_id),
+            CatalogAdmission::Ready(current.clone())
+        );
+        projection
+            .unpublish_catalog_runtime(&current.instance_id, current.generation)
+            .expect("unpublish current runtime");
+        assert!(matches!(
+            bound.admit_catalog(&current.instance_id),
+            CatalogAdmission::Unavailable { .. }
+        ));
     }
 }

@@ -30,14 +30,14 @@ use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_result::{QueryResult, build_string_query_result};
 use novarocks_protocol::lifecycle::QueryOptions;
 
-use novarocks::catalog_application::query_catalog::QueryCatalogService;
+use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
-use novarocks::catalog_application::query_materializer::build_catalog_service_provider;
+use crate::catalog_application::query_materializer::build_catalog_service_provider;
 #[cfg(test)]
-use novarocks::mv::application::UnavailableMvApplicationService;
-use novarocks::mv::repository::MvRepository;
+use crate::mv::domain::application::UnavailableMvApplicationService;
+use crate::mv::domain::repository::MvRepository;
 #[cfg(test)]
-use novarocks::mv::repository::UnavailableMvRepository;
+use crate::mv::domain::repository::UnavailableMvRepository;
 use novarocks_catalog::identifier::normalize_identifier;
 #[cfg(test)]
 use novarocks_catalog::memory::DEFAULT_DATABASE;
@@ -50,9 +50,7 @@ use crate::query_execution::planning::time_travel::{
 #[cfg(test)]
 use novarocks_sql::syntax::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
 
-use novarocks::catalog_application::query_catalog::{
-    CatalogServiceSource, catalog_service_snapshot,
-};
+use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 
 macro_rules! impl_kernel_catalog_service_source {
     ($kernel:ty) => {
@@ -86,9 +84,9 @@ pub fn query_catalog_service_snapshot(
 pub fn freeze_query_mv_rewrite_definition_index(
     query_kernel: &domain::QueryPreparationKernel,
     repository: &dyn MvRepository,
-    storage_observation: &dyn novarocks::mv::storage_observation::MvStorageObservationPort,
+    storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
 ) -> Result<novarocks_sql::compiler::MvRewriteDefinitionIndex, String> {
-    novarocks::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
+    crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
         repository,
         query_kernel.connector_control().as_ref(),
         storage_observation,
@@ -99,7 +97,7 @@ pub fn freeze_query_mv_rewrite_definition_index(
 /// store used by SQL analysis.  It never resolves a newer connector state.
 pub fn query_statistics_snapshot(
     query_kernel: &domain::QueryPreparationKernel,
-    analyzer_catalog: &novarocks::catalog_application::query_materializer::CatalogServiceMaterializer<
+    analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
         '_,
     >,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -124,7 +122,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     fn catalog_application(
         &self,
-    ) -> Option<&dyn novarocks::catalog_application::CatalogApplicationPort>;
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
     fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService;
     fn capture_dml_fallback_execution(
         &self,
@@ -138,7 +136,7 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn novarocks::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 
@@ -163,7 +161,7 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn novarocks::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 
@@ -934,7 +932,7 @@ pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
 
 #[cfg(test)]
 pub(crate) fn test_mv_repository() -> Arc<dyn MvRepository> {
-    Arc::new(novarocks::mv::test_repository::InMemoryMvRepository::default())
+    Arc::new(crate::mv::domain::test_repository::InMemoryMvRepository::default())
 }
 
 #[cfg(test)]
@@ -957,7 +955,8 @@ pub struct TestQueryCompiler {
     view: domain::ViewExecutionKernel,
     system_tables: domain::SystemTableQueryKernel,
     mv_repository: Arc<dyn MvRepository>,
-    mv_storage_observation: Arc<dyn novarocks::mv::storage_observation::MvStorageObservationPort>,
+    mv_storage_observation:
+        Arc<dyn crate::mv::domain::storage_observation::MvStorageObservationPort>,
 }
 
 #[cfg(test)]
@@ -968,7 +967,7 @@ impl TestQueryCompiler {
         system_tables: domain::SystemTableQueryKernel,
         mv_repository: Arc<dyn MvRepository>,
         mv_storage_observation: Arc<
-            dyn novarocks::mv::storage_observation::MvStorageObservationPort,
+            dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
         >,
     ) -> Self {
         Self {
@@ -1087,7 +1086,7 @@ impl TestQueryCompiler {
             }
             sqlast::Statement::Query(ref query) => {
                 if let Some(result) =
-                    novarocks::catalog_application::information_schema::try_query_materialized_views(
+                    crate::catalog_application::information_schema::try_query_materialized_views(
                         self.system_tables.mv_repository().as_ref(),
                         query,
                     )?
@@ -1106,7 +1105,7 @@ impl TestQueryCompiler {
                         connector_context: Some(&connector_context),
                     },
                 )?;
-                novarocks::catalog_application::virtual_table::rewrite_query(
+                crate::catalog_application::virtual_table::rewrite_query(
                     self.system_tables.catalog_service(),
                     self.system_tables.connector_control().as_ref(),
                     self.system_tables.system_catalog().as_ref(),
@@ -1490,7 +1489,7 @@ pub(crate) fn prepare_query_as_iceberg_write(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<novarocks::catalog_application::query_bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
@@ -1523,7 +1522,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<novarocks::catalog_application::query_bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
@@ -1554,7 +1553,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_connector_context
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<novarocks::catalog_application::query_bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
@@ -1589,14 +1588,14 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overl
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<novarocks::catalog_application::query_bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
-    overlays: &[novarocks::catalog_application::query_materializer::QueryLocalTableOverlay],
+    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
 ) -> Result<PreparedDmlWriteAssembly, String> {
     prepare_query_as_iceberg_write_with_connector_binding(
         state,
@@ -1682,14 +1681,14 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<novarocks::catalog_application::query_bindings::QueryTableBindingStore>,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<DistributedConnectorWrite>,
     scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
-    query_local_overlays: &[novarocks::catalog_application::query_materializer::QueryLocalTableOverlay],
+    query_local_overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
 ) -> Result<PreparedDmlWriteAssembly, String> {
     let maintenance_execution;
     let execution = match execution {
@@ -1720,7 +1719,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     }
 
     let catalog_service_snapshot = catalog_service_snapshot(state);
-    let analyzer_provider = novarocks::catalog_application::query_materializer::build_catalog_service_provider_with_bindings_and_query_local_overlays(
+    let analyzer_provider = crate::catalog_application::query_materializer::build_catalog_service_provider_with_bindings_and_query_local_overlays(
         current_catalog,
         &catalog_service_snapshot,
         DmlQueryExecutionKernel::connector_control(state),
@@ -1916,7 +1915,7 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
-    query_table_bindings: &novarocks::catalog_application::query_bindings::QueryTableBindingStore,
+    query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
     novarocks::connector::validate_request_context(connector_context)?;
@@ -1947,7 +1946,7 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
-    query_table_bindings: &novarocks::catalog_application::query_bindings::QueryTableBindingStore,
+    query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
@@ -2118,14 +2117,14 @@ fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionO
 #[cfg(test)]
 fn prepare_query_with_sql_compiler_kernel_with_ports(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &novarocks::catalog_application::query_materializer::CatalogServiceMaterializer<
+    analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
         '_,
     >,
     current_catalog: Option<&str>,
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
-    mv_repository: &dyn novarocks::mv::repository::MvRepository,
-    mv_storage_observation: &dyn novarocks::mv::storage_observation::MvStorageObservationPort,
+    mv_repository: &dyn crate::mv::domain::repository::MvRepository,
+    mv_storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     query_opts: Option<QueryOptions>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
@@ -2151,7 +2150,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     let mv_definitions =
         if allow_mv_rewrite_candidates && mv_repository.availability().is_available() {
             Some(
-                novarocks::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
+                crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
                     mv_repository,
                     query_kernel.connector_control().as_ref(),
                     mv_storage_observation,
@@ -2231,14 +2230,14 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
 #[cfg(test)]
 fn explain_query_with_sql_compiler_kernel_with_ports(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &novarocks::catalog_application::query_materializer::CatalogServiceMaterializer<
+    analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
         '_,
     >,
     current_catalog: Option<&str>,
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
-    mv_repository: &dyn novarocks::mv::repository::MvRepository,
-    mv_storage_observation: &dyn novarocks::mv::storage_observation::MvStorageObservationPort,
+    mv_repository: &dyn crate::mv::domain::repository::MvRepository,
+    mv_storage_observation: &dyn crate::mv::domain::storage_observation::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     level: novarocks_sql::compiler::ExplainLevel,
@@ -2251,7 +2250,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     let table_bindings = analyzer_catalog.query_table_bindings();
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let mv_definitions =
-        novarocks::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
+        crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
             mv_repository,
             query_kernel.connector_control().as_ref(),
             mv_storage_observation,

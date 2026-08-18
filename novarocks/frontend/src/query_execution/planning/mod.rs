@@ -54,7 +54,7 @@ pub fn sql_cancellation_observation(
 
 pub(crate) struct PostCompilePlanningContext<'a> {
     pub(crate) table_bindings:
-        Arc<novarocks::catalog_application::query_bindings::QueryTableBindingStore>,
+        Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     pub(crate) connector_controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     pub(crate) connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
 }
