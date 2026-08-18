@@ -162,6 +162,7 @@ pub enum MvAggregateVisibleOutput {
 /// Immutable Arrow/runtime facts for aggregate materialized-view state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvAggregateRuntimeLayout {
+    row_id_column_name: String,
     visible_columns: Vec<MvAggregateVisibleColumn>,
     state_columns: Vec<MvAggregateStateColumn>,
     aggregate_input_types: Vec<Option<DataType>>,
@@ -171,11 +172,15 @@ pub struct MvAggregateRuntimeLayout {
 
 impl MvAggregateRuntimeLayout {
     pub fn try_new(
+        row_id_column_name: String,
         visible_columns: Vec<MvAggregateVisibleColumn>,
         state_columns: Vec<MvAggregateStateColumn>,
         aggregate_input_types: Vec<Option<DataType>>,
         group_key_source_indexes: Vec<usize>,
     ) -> Result<Self, String> {
+        if row_id_column_name.is_empty() {
+            return Err("aggregate MV row ID column name must not be empty".to_string());
+        }
         for (index, column) in visible_columns.iter().enumerate() {
             if column.source_index != index {
                 return Err(format!(
@@ -303,12 +308,17 @@ impl MvAggregateRuntimeLayout {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
+            row_id_column_name,
             visible_columns,
             state_columns,
             aggregate_input_types,
             group_key_source_indexes,
             visible_output_order,
         })
+    }
+
+    pub fn row_id_column_name(&self) -> &str {
+        &self.row_id_column_name
     }
 
     pub fn visible_columns(&self) -> &[MvAggregateVisibleColumn] {
@@ -360,6 +370,7 @@ mod tests {
     #[test]
     fn layout_derives_neutral_visible_output_order() {
         let layout = MvAggregateRuntimeLayout::try_new(
+            "__row_id__".to_string(),
             vec![
                 visible("sum_v", 0),
                 visible("region", 1),
@@ -384,6 +395,7 @@ mod tests {
     #[test]
     fn layout_rejects_duplicate_visible_output() {
         let error = MvAggregateRuntimeLayout::try_new(
+            "__row_id__".to_string(),
             vec![visible("region", 0), visible("sum_v", 1)],
             vec![state(0, 0)],
             vec![Some(DataType::Int64)],
@@ -410,6 +422,7 @@ mod tests {
             true,
         );
         let error = MvAggregateRuntimeLayout::try_new(
+            "__row_id__".to_string(),
             vec![visible("count_v", 0)],
             vec![state(0, 0), invalid_retraction],
             vec![None],
