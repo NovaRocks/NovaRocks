@@ -21,15 +21,16 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use novarocks::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_cleanup_fault};
+use crate::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_cleanup_fault};
+use crate::query_execution::maintenance::{
+    HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
+    MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
+    OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
+};
 use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
-use novarocks::maintenance::{
-    HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
-    MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
-    MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
-};
+use novarocks::maintenance::MaintenanceTarget;
 use novarocks_spi::connector::{
     BatchReceipt, ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
@@ -118,7 +119,7 @@ enum ResolvedRewriteCreate {
 const COORDINATION_REQUIRED: &str =
     "durable table maintenance requires frontend coordination authority";
 
-// Design: ADR-0009 (docs/adr/ADR-0009-frontend-table-maintenance-owner.md)
+// Design: ADR-0083 (docs/adr/ADR-0083-frontend-owns-table-maintenance-execution-port.md)
 pub struct FrontendTableMaintenanceService {
     repository: Option<Arc<OptimizeJobRepository>>,
     metadata_repository: Option<Arc<MetadataMaintenanceOperationRepository>>,
@@ -922,7 +923,7 @@ impl FrontendTableMaintenanceService {
         engine: &dyn TableMaintenanceEngine,
         repository: &DistributedRewriteOperationRepository,
         operation_id: uuid::Uuid,
-        session: &novarocks::connector::distributed_rewrite_application::DistributedRewriteMaintenanceSession,
+        session: &crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession,
         error: String,
         authority: &MaintenanceAuthorityV1,
         validator: &MaintenanceFenceValidator,
@@ -1391,7 +1392,7 @@ impl FrontendTableMaintenanceService {
         repository: &Arc<MetadataMaintenanceOperationRepository>,
         engine: &dyn TableMaintenanceEngine,
         operation: &model::MetadataMaintenanceOperation,
-        attempt_context: &novarocks::maintenance::MaintenanceAttemptContext,
+        attempt_context: &crate::query_execution::maintenance::MaintenanceAttemptContext,
         attempt: &MaintenanceAttemptGuard,
         authority: &MaintenanceAuthorityV1,
         validator: &MaintenanceFenceValidator,
@@ -1764,7 +1765,7 @@ impl FrontendTableMaintenanceService {
         repository: &Arc<CleanupOperationRepository>,
         engine: &dyn TableMaintenanceEngine,
         operation: &model::CleanupOperation,
-        attempt_context: &novarocks::maintenance::MaintenanceAttemptContext,
+        attempt_context: &crate::query_execution::maintenance::MaintenanceAttemptContext,
         attempt: &MaintenanceAttemptGuard,
         authority: &MaintenanceAuthorityV1,
         validator: &MaintenanceFenceValidator,

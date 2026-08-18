@@ -17,9 +17,9 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks::query_execution::lifecycle::QueryExecutionId;
-use novarocks::query_execution::lifecycle_plan::QueryInitPlan;
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::lifecycle_plan::QueryInitPlan;
+use crate::query_lifecycle::QueryExecutionId;
 use novarocks_protocol::lifecycle::{ParticipantManifestDigest, ParticipantRole, QueryInitRequest};
 use novarocks_protocol::novarocks as protocol_wire;
 
@@ -111,9 +111,8 @@ pub(super) fn materialize(
 fn core_execution_id(
     execution_id: novarocks_protocol::lifecycle::QueryExecutionId,
 ) -> Result<QueryExecutionId, DistributedQueryError> {
-    let attempt =
-        novarocks::query_execution::lifecycle::AttemptId::new(execution_id.attempt_id().get())
-            .map_err(|error| contract_error(error.to_string()))?;
+    let attempt = crate::query_lifecycle::AttemptId::new(execution_id.attempt_id().get())
+        .map_err(|error| contract_error(error.to_string()))?;
     QueryExecutionId::new(execution_id.query_id(), attempt)
         .map_err(|error| contract_error(error.to_string()))
 }

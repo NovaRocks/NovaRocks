@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use crate::capabilities as core_capabilities;
-use novarocks::maintenance::BackgroundMaintenanceAttemptFactory;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks::server::ResolvedMysqlListenerSettings;
 use novarocks::server::session::QuerySessionFactory;
@@ -29,6 +28,9 @@ use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
 
 use crate::native::report_server::FrontendReportServerHandle;
+use crate::query_execution::maintenance::{
+    BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
+};
 use crate::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
     FrontendApplicationHost, FrontendExecutionConfig, FrontendQueryControlTimeouts,
@@ -39,13 +41,11 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
-    topology: novarocks::query_execution::backend::BackendTopologyService,
+    topology: crate::common::backend_topology::BackendTopologyService,
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
-    fn begin_automatic_maintenance_attempt(
-        &self,
-    ) -> Result<novarocks::maintenance::BackgroundMaintenanceAttempt, String> {
+    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String> {
         core_capabilities::background_maintenance_attempt(self.role, self.topology.clone())
     }
 }
@@ -333,7 +333,7 @@ pub fn build_frontend_query_session_factory(
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|error| {
             FrontendApplicationError::server(format!(

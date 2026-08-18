@@ -127,24 +127,7 @@ use crate::mv::schema_validation::{
 use crate::mv::schema_validation::{validate_join_schema_contract, validate_schema_contract};
 use crate::mv::storage_observation::MvSchemaValidationObservation;
 use crate::mv::storage_observation::{MvStorageObservationPort, MvTargetCreationObservation};
-use crate::query_execution::StatementResult;
-#[cfg(test)]
-use crate::query_execution::mv_assembly::query_local_bindings::{
-    bind_imv_target_query_table_in_store_from_rewrite,
-    freeze_imv_base_query_local_overlays_from_captured_inputs,
-};
-#[cfg(test)]
-use crate::query_execution::mv_assembly::refresh_artifact::{
-    MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact,
-    MvIncrementalWritePreparer, MvIncrementalWriteRequest, MvRefreshPublicationBase,
-    MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite,
-    PreparedMvIncrementalWrite,
-};
-#[cfg(test)]
-use crate::query_execution::mv_assembly::refresh_handoff::{
-    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
-    PreparedMvRefreshWork, PreparedMvRefreshWrite,
-};
+use crate::runtime::statement_result::StatementResult;
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 #[cfg(test)]
@@ -226,7 +209,7 @@ impl IcebergMvCorePorts {
         }
     }
 
-    pub(crate) fn repository(&self) -> &Arc<dyn MvRepository> {
+    pub fn repository(&self) -> &Arc<dyn MvRepository> {
         &self.repository
     }
 
@@ -234,7 +217,7 @@ impl IcebergMvCorePorts {
         self.connector_control.as_ref()
     }
 
-    pub(crate) fn storage_observation(&self) -> &dyn MvStorageObservationPort {
+    pub fn storage_observation(&self) -> &dyn MvStorageObservationPort {
         self.storage_observation.as_ref()
     }
 
@@ -1734,7 +1717,7 @@ fn stored_refresh_policy_descriptor_json(
 /// back through a mutation lease derived from the same generation. Repartition
 /// projection supplies the raw provider-committed partitioning as an atomic
 /// property-mutation guard; ordinary CREATE/ALTER policy sync passes `None`.
-pub(crate) fn sync_iceberg_mv_descriptor_with_ports(
+pub fn sync_iceberg_mv_descriptor_with_ports(
     ports: &IcebergMvCorePorts,
     definition: &StoredMvDefinition,
     refresh_policy: &StoredMvRefreshPolicy,
@@ -3088,60 +3071,6 @@ mod tests {
     use crate::mv::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::refresh::capabilities::PartitionPruningPolicy;
     use arrow::datatypes::DataType;
-    use std::cell::Cell;
-
-    #[test]
-    fn retained_repartition_target_identity_matches_exact_target() {
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_sales".to_string(),
-        };
-        let identity = ConnectorTableIdentity {
-            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-            namespace: Arc::from("analytics"),
-            table: Arc::from("mv_sales"),
-        };
-
-        crate::query_execution::mv_assembly::refresh_preparation::validate_retained_target_identity(&target, &identity).expect("matching identity");
-    }
-
-    #[test]
-    fn retained_repartition_target_identity_rejects_drift() {
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_sales".to_string(),
-        };
-        let identity = ConnectorTableIdentity {
-            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-            namespace: Arc::from("analytics"),
-            table: Arc::from("mv_sales_recreated"),
-        };
-
-        let error = crate::query_execution::mv_assembly::refresh_preparation::validate_retained_target_identity(&target, &identity)
-            .expect_err("drifted identity must fail closed");
-        assert!(error.contains("does not match ice.analytics.mv_sales"));
-    }
-
-    #[test]
-    fn retained_repartition_target_handle_skips_latest_reload() {
-        let handle = novarocks_spi::connector::ConnectorTableHandle::try_new(
-            ConnectorInstanceId::parse("ice").expect("instance"),
-            bytes::Bytes::from_static(b"retained-table-metadata"),
-        )
-        .expect("retained table handle");
-        let reload_called = Cell::new(false);
-
-        let selected = crate::query_execution::mv_assembly::refresh_preparation::select_retained_target_handle(Some(&handle), || {
-            reload_called.set(true);
-            Err("latest metadata reload must not run".to_string())
-        })
-        .expect("select retained target handle");
-
-        assert_eq!(selected, handle);
-        assert!(!reload_called.get());
-    }
 
     #[test]
     fn aggregate_incremental_inserts_use_row_delta() {
@@ -3885,7 +3814,7 @@ fn build_refresh_state_baseline(
     })
 }
 
-pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
+pub fn plan_iceberg_mv_refresh_with_connector_context(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -5234,7 +5163,7 @@ fn join_base_refs_for_aliases<'a>(
     Ok((left, right))
 }
 
-pub(crate) fn join_base_refs_for_schema_contract<'a>(
+pub fn join_base_refs_for_schema_contract<'a>(
     schema_contract: &mv_schema::MvSchemaContract,
     base_refs: &'a [TableIdentity],
 ) -> Result<(&'a TableIdentity, &'a TableIdentity), String> {

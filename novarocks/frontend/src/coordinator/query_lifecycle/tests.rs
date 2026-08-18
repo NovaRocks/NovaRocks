@@ -20,15 +20,15 @@ use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::common::backend_topology::LiveBackendTarget;
+use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::native::transport::new_query_lifecycle_transport;
-use novarocks::query_execution::backend::LiveBackendTarget;
-use novarocks::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
-use novarocks::query_execution::contract::DistributedQueryIntent;
-use novarocks::query_execution::fragment_transport::{
+use crate::protocol::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
-use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
-use novarocks::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
+use crate::query_execution::contract::DistributedQueryIntent;
+use crate::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
+use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle as protocol_lifecycle;
 use novarocks_protocol::lifecycle::{
     AttemptId, FragmentLiveObservation, ParticipantBackendIdentity, ParticipantManifest,

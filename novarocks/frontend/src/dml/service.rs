@@ -17,8 +17,8 @@
 
 use std::sync::{Arc, RwLock};
 
+use crate::query_execution::dml::ctas::CtasEngine;
 use novarocks::catalog_application::query_catalog::QueryCatalogService;
-use novarocks::query_execution::dml::ctas::CtasEngine;
 use tokio::runtime::Handle;
 
 use crate::coordination::FrontendCoordinationRuntime;

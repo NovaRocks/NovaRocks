@@ -21,35 +21,37 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::common::admitted_query_context::{
+    RequestAdmission, RequestContext, SessionOptimizerSettings,
+};
+use crate::common::backend_topology::BackendTopologyService;
+use crate::common::engine_error::{EngineError, EngineErrorCode};
+use crate::common::query_cancellation::QueryCancellationReason;
 use crate::mv::command::MvCommandExecutor;
+use crate::query_execution::backend_command::BackendCommandExecutor;
+use crate::query_execution::control::{
+    QueryCancelOutcome, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
+    StatementFinishOutcome,
+};
+use crate::query_execution::dml::add_files::AddFilesEngine;
+use crate::query_execution::dml::ctas::CtasEngine;
+use crate::query_execution::dml::delete::DeleteEngine;
+use crate::query_execution::dml::insert::InsertEngine;
+use crate::query_execution::dml::mutation::MutationEngine;
+use crate::query_execution::dml::truncate::TruncateEngine;
+use crate::query_execution::kernels::SessionCatalogResolver;
+use crate::query_execution::maintenance::command::{
+    MaintenanceCommandExecutor, MaintenanceReadCommandExecutor,
+};
+use crate::query_execution::service::QueryExecutionService;
+use crate::query_execution::{PreparedQueryOperation, StatementResult};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks::catalog_application::command::CatalogCommandExecutor;
 use novarocks::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
-use novarocks::common::engine_error::{EngineError, EngineErrorCode};
-use novarocks::maintenance::command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor};
-use novarocks::query_execution::backend::BackendTopologyService;
-use novarocks::query_execution::backend_command::BackendCommandExecutor;
-use novarocks::query_execution::cancellation::QueryCancellationReason;
-use novarocks::query_execution::control::{
-    QueryCancelOutcome, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
-    StatementFinishOutcome,
-};
-use novarocks::query_execution::dml::add_files::AddFilesEngine;
-use novarocks::query_execution::dml::ctas::CtasEngine;
-use novarocks::query_execution::dml::delete::DeleteEngine;
-use novarocks::query_execution::dml::insert::InsertEngine;
-use novarocks::query_execution::dml::mutation::MutationEngine;
-use novarocks::query_execution::dml::truncate::TruncateEngine;
-use novarocks::query_execution::kernels::SessionCatalogResolver;
-use novarocks::query_execution::request_context::{
-    RequestAdmission, RequestContext, SessionOptimizerSettings,
-};
-use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::query_execution::{PreparedQueryOperation, StatementResult};
-use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks::server::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
@@ -511,7 +513,7 @@ impl FrontendQuerySession {
             let value = if let Some(inner_query) = parenthesized_query(raw_value) {
                 match self.execute_admitted(inner_query.to_string()).await? {
                     StatementResult::Query(result) => {
-                        novarocks::runtime::user_variable::query_result_to_user_variable_literal(
+                        crate::runtime::user_variable::query_result_to_user_variable_literal(
                             &result,
                         )
                         .map_err(|message| {
@@ -1376,21 +1378,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks::query_execution::backend::BackendTopologySnapshot;
-    use novarocks::query_execution::cancellation::QueryCancellationSource;
-    use novarocks::query_execution::dml::delete::{
+    use crate::common::admitted_query_context::QueryExecutionContext;
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::query_cancellation::QueryCancellationSource;
+    use crate::query_execution::dml::delete::{
         DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport,
         PrepareDeleteRequest, PreparedDelete,
     };
-    use novarocks::query_execution::dml::insert::{
+    use crate::query_execution::dml::insert::{
         IcebergInsertCommit, IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert,
         PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
     };
-    use novarocks::query_execution::dml::mutation::{
+    use crate::query_execution::dml::mutation::{
         MutationAbort, MutationCommit, MutationEngine, MutationPrepared, MutationStageOutcome,
         PrepareMutationRequest, PreparedMutation,
     };
-    use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_catalog::schema::ColumnDef;
 
     fn default_query_options() -> QueryOptions {

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use novarocks::common::network::AdvertiseEndpoint;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryTerminalIngress};
+use novarocks::query_lifecycle::{QueryLifecycleError, QueryTerminalIngress};
 use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_protocol::lifecycle::{

@@ -8,8 +8,8 @@ mod statement;
 
 use std::sync::RwLock;
 
+use crate::runtime::query_result::QueryResult;
 use novarocks::catalog_application::query_catalog::QueryCatalogService;
-use novarocks::runtime::query_result::QueryResult;
 
 pub use legacy::{
     CatalogColumnStatistics, CatalogTableStatistics, StatisticsColumn, StatisticsInsertObservation,

@@ -172,7 +172,7 @@ impl std::fmt::Display for TargetPartitionFilter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AffectedTargetPartitions {
+pub enum AffectedTargetPartitions {
     Unpartitioned,
     Known {
         partitions: BTreeSet<MvPartitionKey>,

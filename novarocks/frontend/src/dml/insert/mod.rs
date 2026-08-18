@@ -21,11 +21,11 @@ mod command;
 mod iceberg;
 mod shaping;
 
-use novarocks::query_execution::dml::insert::{
+use crate::common::admitted_query_context::RequestContext;
+use crate::query_execution::dml::insert::{
     IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, InsertValue,
     PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
-use novarocks::query_execution::request_context::RequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::error::DmlError;
@@ -59,7 +59,7 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<Option<()>, DmlError> {
-        let Some(statement) = novarocks::query_execution::dml::insert::parse_insert_statement(sql)
+        let Some(statement) = crate::query_execution::dml::insert::parse_insert_statement(sql)
             .map_err(DmlError::executor)?
         else {
             return Ok(None);

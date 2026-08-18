@@ -17,24 +17,24 @@
 
 pub(crate) mod aggregate_first_refresh;
 pub(crate) mod apply_key;
-pub(crate) mod capabilities;
+pub mod capabilities;
 pub(crate) mod contract;
 pub mod definition;
 pub(crate) mod execution;
 pub(crate) mod execution_context;
-pub(crate) mod execution_policy;
-pub(crate) mod non_join_incremental;
+pub mod execution_policy;
+pub mod non_join_incremental;
 pub mod observation;
-pub(crate) mod pin;
-pub(crate) mod planning;
+pub mod pin;
+pub mod planning;
 pub(crate) mod projection_first_refresh;
-pub(crate) mod repartition;
-pub(crate) mod rewrite_context;
+pub mod repartition;
+pub mod rewrite_context;
 pub(crate) mod scan_binding;
-pub(crate) mod schema_contract;
-pub(crate) mod snapshot;
-pub(crate) mod target;
+pub mod schema_contract;
+pub mod snapshot;
+pub mod target;
 pub(crate) mod target_apply;
-pub(crate) mod target_binding;
+pub mod target_binding;
 
 pub use target::resolve_refresh_mv_target;

@@ -15,6 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod mv_agg_state;
+pub mod mv_agg_state;
 pub(crate) mod physical_column;
 pub(crate) mod sql_type;

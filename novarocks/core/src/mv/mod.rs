@@ -15,31 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod aggregate_state;
-pub(crate) mod analysis;
-pub(crate) mod analysis_adapter;
+pub mod aggregate_state;
+pub mod analysis;
+pub mod analysis_adapter;
 pub mod application;
 pub mod dependency;
 pub(crate) mod dependency_resolver;
 pub(crate) mod flow;
 pub(crate) mod iceberg_aggregate_state;
 pub mod iceberg_backend;
-pub(crate) mod iceberg_guard;
-pub(crate) mod iceberg_join_branch;
+pub mod iceberg_guard;
+pub mod iceberg_join_branch;
 pub mod iceberg_refresh;
 pub(crate) mod lake_rebuild;
 pub(crate) mod lifecycle;
 pub mod maintenance;
 pub(crate) mod metadata_consistency;
-pub(crate) mod model;
+pub mod model;
 pub(crate) mod partition;
 pub mod persistence;
 pub(crate) mod ref_flow;
 pub mod refresh;
-pub(crate) mod refresh_io;
-pub(crate) mod refresh_pin_adapter;
+pub mod refresh_io;
+pub mod refresh_pin_adapter;
 pub mod repository;
-pub(crate) mod rewrite;
+pub mod rewrite;
 pub mod rewrite_prep;
 pub(crate) mod schema_validation;
 pub mod startup_restore;

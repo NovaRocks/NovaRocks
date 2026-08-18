@@ -18,14 +18,14 @@
 use crate::mv::application::{MvIncrementalJoinMode, MvIncrementalWriteMode};
 use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
 
-pub(crate) fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
+pub fn explain_refresh_full_guard(full: bool) -> Result<(), String> {
     if full {
         return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string());
     }
     Ok(())
 }
 
-pub(crate) fn non_join_incremental_write_mode(
+pub fn non_join_incremental_write_mode(
     is_aggregate: bool,
     has_delete_changes: bool,
 ) -> MvIncrementalWriteMode {
@@ -36,7 +36,7 @@ pub(crate) fn non_join_incremental_write_mode(
     }
 }
 
-pub(crate) fn select_join_incremental_execution_mode(
+pub fn select_join_incremental_execution_mode(
     left_has_delete_changes: bool,
     right_has_delete_changes: bool,
 ) -> MvIncrementalJoinMode {
@@ -47,8 +47,8 @@ pub(crate) fn select_join_incremental_execution_mode(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn should_use_join_delta_append_only_fast_path(
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub fn should_use_join_delta_append_only_fast_path(
     query: &sqlparser::ast::Query,
     left_has_delete_changes: bool,
     right_has_delete_changes: bool,

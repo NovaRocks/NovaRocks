@@ -66,11 +66,11 @@ pub(crate) const AGG_STATE_PREFIX: &str = "__agg_state_";
 pub(crate) const AGG_RETRACTION_COUNT_STATE_COLUMN: &str = "__agg_state___ivm_row_count";
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AggregateMvLayout {
+pub struct AggregateMvLayout {
     pub(crate) row_id_column: StarRocksPhysicalColumn,
     pub(crate) visible_columns: Vec<AggregateVisibleColumn>,
     pub(crate) state_columns: Vec<AggregateStateColumn>,
-    pub(crate) aggregate_input_types: Vec<Option<DataType>>,
+    pub aggregate_input_types: Vec<Option<DataType>>,
     pub(crate) group_key_source_indexes: Vec<usize>,
     pub(crate) physical_columns: Vec<StarRocksPhysicalColumn>,
 }
@@ -185,7 +185,7 @@ struct AggregateLayoutCallFacts {
 /// Map SQL's one-shot immutable aggregate facts into the execution-owned
 /// aggregate-state layout. No analyzer query, output-column ID, or expression
 /// graph crosses this boundary.
-pub(crate) fn build_aggregate_mv_layout_from_sql_facts(
+pub fn build_aggregate_mv_layout_from_sql_facts(
     facts: &SqlMvAggregateLayoutFacts,
 ) -> Result<AggregateMvLayout, String> {
     let output_columns = facts

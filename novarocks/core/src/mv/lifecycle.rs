@@ -29,7 +29,7 @@ use novarocks_sql::syntax::{
 };
 
 #[derive(Clone)]
-pub(crate) struct CreateMvRequest {
+pub struct CreateMvRequest {
     pub stmt: CreateMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
@@ -37,7 +37,7 @@ pub(crate) struct CreateMvRequest {
 }
 
 #[derive(Clone)]
-pub(crate) struct DropMvRequest {
+pub struct DropMvRequest {
     pub stmt: DropMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
@@ -45,13 +45,13 @@ pub(crate) struct DropMvRequest {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ListMvsRequest {
+pub struct ListMvsRequest {
     pub stmt: ShowMaterializedViewsStmt,
     pub current_catalog: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RefreshRequest {
+pub struct RefreshRequest {
     pub target: MvTarget,
     pub current_catalog: Option<String>,
     pub current_database: String,
@@ -59,33 +59,33 @@ pub(crate) struct RefreshRequest {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RefreshPlan {
-    pub(crate) contract: RefreshPlanContract,
-    pub(crate) backend_plan: BackendRefreshPlan,
+pub struct RefreshPlan {
+    pub contract: RefreshPlanContract,
+    pub backend_plan: BackendRefreshPlan,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum BackendRefreshPlan {
+pub enum BackendRefreshPlan {
     StarRocks(StarRocksTableRefreshPlan),
     Iceberg(IcebergRefreshPlan),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct StarRocksTableRefreshPlan {
+pub struct StarRocksTableRefreshPlan {
     pub stmt: RefreshMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergRefreshPlan {
+pub struct IcebergRefreshPlan {
     pub stmt: RefreshMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RefreshOutcome {
+pub struct RefreshOutcome {
     pub mv_id: Option<i64>,
     pub target: MvTarget,
     pub rows: Option<i64>,
@@ -96,23 +96,23 @@ pub(crate) struct RefreshOutcome {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum BackendRefreshOutcome {
+pub enum BackendRefreshOutcome {
     StarRocks(StarRocksTableRefreshOutcome),
     Iceberg(IcebergRefreshOutcome),
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct StarRocksTableRefreshOutcome {
+pub struct StarRocksTableRefreshOutcome {
     pub completed_inside_execute: bool,
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct IcebergRefreshOutcome {
+pub struct IcebergRefreshOutcome {
     pub completed_inside_execute: bool,
 }
 
 #[derive(Clone)]
-pub(crate) struct RefreshCtx {
+pub struct RefreshCtx {
     pub refresh_id: Option<i64>,
     pub expected_target_snapshot_id: Option<i64>,
     pub recovery_required: bool,
@@ -120,9 +120,7 @@ pub(crate) struct RefreshCtx {
 }
 
 impl RefreshCtx {
-    pub(crate) fn new(
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Self {
+    pub fn new(connector_context: novarocks_spi::connector::ConnectorRequestContext) -> Self {
         Self {
             refresh_id: None,
             expected_target_snapshot_id: None,
@@ -133,7 +131,7 @@ impl RefreshCtx {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvListRow {
+pub struct MvListRow {
     pub name: String,
     pub database: String,
     pub storage_engine: String,
@@ -152,7 +150,7 @@ pub(crate) struct MvListRow {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RefreshErrorKind {
+pub enum RefreshErrorKind {
     UserError,
     PreCommitFailed,
     CommitFailedKnownUncommitted,
@@ -162,7 +160,7 @@ pub(crate) enum RefreshErrorKind {
 }
 
 impl RefreshErrorKind {
-    pub(crate) fn should_rollback_after_commit(self) -> bool {
+    pub fn should_rollback_after_commit(self) -> bool {
         matches!(
             self,
             Self::UserError | Self::PreCommitFailed | Self::CommitFailedKnownUncommitted
@@ -171,40 +169,40 @@ impl RefreshErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RefreshError {
+pub struct RefreshError {
     pub kind: RefreshErrorKind,
     pub message: String,
 }
 
 impl RefreshError {
-    pub(crate) fn new(kind: RefreshErrorKind, message: impl Into<String>) -> Self {
+    pub fn new(kind: RefreshErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
         }
     }
 
-    pub(crate) fn user(message: impl Into<String>) -> Self {
+    pub fn user(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::UserError, message)
     }
 
-    pub(crate) fn pre_commit(message: impl Into<String>) -> Self {
+    pub fn pre_commit(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::PreCommitFailed, message)
     }
 
-    pub(crate) fn commit_known_uncommitted(message: impl Into<String>) -> Self {
+    pub fn commit_known_uncommitted(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::CommitFailedKnownUncommitted, message)
     }
 
-    pub(crate) fn commit_known_committed_finalize_failed(message: impl Into<String>) -> Self {
+    pub fn commit_known_committed_finalize_failed(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::CommitFailedKnownCommitted, message)
     }
 
-    pub(crate) fn commit_unknown(message: impl Into<String>) -> Self {
+    pub fn commit_unknown(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::CommitUnknown, message)
     }
 
-    pub(crate) fn metadata_finalize(message: impl Into<String>) -> Self {
+    pub fn metadata_finalize(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::MetadataFinalizeFailed, message)
     }
 }

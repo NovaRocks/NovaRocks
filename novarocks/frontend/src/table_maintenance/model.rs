@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::query_execution::maintenance::OptimizeJobState;
 use bytes::Bytes;
-use novarocks::maintenance::{MaintenanceTarget, OptimizeJobState};
+use novarocks::maintenance::MaintenanceTarget;
 use novarocks_spi::connector::ConnectorWriteExecutionId;
 use novarocks_state_store::coordination::FencingToken;
 use serde::ser::Error as _;

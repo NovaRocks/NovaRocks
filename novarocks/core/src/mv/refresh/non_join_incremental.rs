@@ -23,7 +23,7 @@ use novarocks_spi::connector::{
     ConnectorChangeWindowReplaceFailure,
 };
 
-pub(crate) struct NonJoinBaseChange<'a> {
+pub struct NonJoinBaseChange<'a> {
     pub base_ref: &'a TableIdentity,
     pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
@@ -32,7 +32,7 @@ pub(crate) struct NonJoinBaseChange<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NonJoinIncrementalChangePlan {
+pub enum NonJoinIncrementalChangePlan {
     MetadataOnly(NonJoinLineage),
     FullRebuild {
         lineage: NonJoinLineage,
@@ -45,7 +45,7 @@ pub(crate) enum NonJoinIncrementalChangePlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NonJoinLineage {
+pub struct NonJoinLineage {
     pub snapshots: BTreeMap<String, i64>,
     pub table_uuids: BTreeMap<String, String>,
 }
@@ -58,7 +58,7 @@ struct PlannedFact {
     admission: ConnectorChangeWindowAdmission,
 }
 
-pub(crate) fn plan_non_join_incremental_changes(
+pub fn plan_non_join_incremental_changes(
     changes: &[NonJoinBaseChange<'_>],
 ) -> Result<NonJoinIncrementalChangePlan, String> {
     if changes.is_empty() {

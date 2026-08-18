@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
 use bytes::Bytes;
-use novarocks::view::{
+use novarocks_frontend::FrontendViewService;
+use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
 };
-use novarocks_frontend::FrontendViewService;
 use novarocks_spi::{
     connector::{ConnectorCancellation, ConnectorRequestContext},
     state_store::{FeDeploymentView, StateStore},

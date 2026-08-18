@@ -19,8 +19,8 @@
 
 use std::collections::HashMap;
 
-use novarocks::query_execution::FragmentInstancePlacement;
-use novarocks::runtime::scan_range;
+use crate::query_execution::FragmentInstancePlacement;
+use crate::runtime::scan_range;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::query_options::QueryOptions;

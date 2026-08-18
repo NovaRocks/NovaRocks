@@ -32,11 +32,11 @@ use novarocks_spi::connector::{
 use novarocks_sql::syntax::ObjectName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TargetBackend {
-    pub(crate) backend_name: &'static str,
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) table: String,
+pub struct TargetBackend {
+    pub backend_name: &'static str,
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
 }
 
 // Ownership: this drops the local catalog snapshot for an already-resolved
@@ -44,7 +44,7 @@ pub(crate) struct TargetBackend {
 // catalog_application, and the operation is pure catalog cache maintenance with
 // no plan, fragment, or write-transaction state, so it belongs beside the
 // resolution that produced the target rather than in a DML writer.
-pub(crate) fn invalidate_iceberg_caches(
+pub fn invalidate_iceberg_caches(
     state: &impl crate::catalog_application::query_catalog::CatalogServiceSource,
     target: &TargetBackend,
 ) -> Result<(), String> {
@@ -95,7 +95,7 @@ pub trait CatalogAdmission {
     fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort>;
 }
 
-pub(crate) fn resolve_table_target(
+pub fn resolve_table_target(
     admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
@@ -117,7 +117,7 @@ pub(crate) fn resolve_table_target(
     })
 }
 
-pub(crate) fn resolve_existing_table_target(
+pub fn resolve_existing_table_target(
     admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
@@ -139,7 +139,7 @@ pub(crate) fn resolve_existing_table_target(
     })
 }
 
-pub(crate) fn resolve_namespace_target(
+pub fn resolve_namespace_target(
     admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,

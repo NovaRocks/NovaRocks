@@ -602,25 +602,4 @@ mod tests {
                 .expect("missing application is decidable"),
         );
     }
-
-    /// Startup always enters the rebuild step. With no ready catalog projection,
-    /// the bounded sweep has no admitted instance IDs and completes without
-    /// touching the repository or provider observation ports.
-    #[test]
-    fn sweep_is_empty_without_a_ready_catalog_projection() {
-        let connector_control =
-            crate::query_execution::compiler::TestConnectorControlRegistry::default();
-        let storage_observation =
-            crate::mv::storage_observation::UnavailableMvStorageObservationPort;
-        let repository = crate::mv::repository::UnavailableMvRepository;
-        let context = LakeRebuildContext {
-            catalog_runtime_projection: None,
-            catalog_application: None,
-            connector_control: &connector_control,
-            mv_storage_observation: &storage_observation,
-            mv_repository: &repository,
-        };
-
-        rebuild_imv_cache_from_lake(&context).expect("empty sweep succeeds");
-    }
 }

@@ -36,19 +36,19 @@ use crate::common::engine_error::EngineError;
 /// The statement-level operation before its provider-owned table handle is
 /// loaded through the exact-generation metadata capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DataMutationIntent {
+pub enum DataMutationIntent {
     RegisterExistingFiles { source_location: Arc<str> },
     Truncate { target_ref: Arc<str> },
 }
 
 impl DataMutationIntent {
-    pub(crate) fn register_existing_files(source_location: impl Into<Arc<str>>) -> Self {
+    pub fn register_existing_files(source_location: impl Into<Arc<str>>) -> Self {
         Self::RegisterExistingFiles {
             source_location: source_location.into(),
         }
     }
 
-    pub(crate) fn truncate(target_ref: impl Into<Arc<str>>) -> Self {
+    pub fn truncate(target_ref: impl Into<Arc<str>>) -> Self {
         Self::Truncate {
             target_ref: target_ref.into(),
         }
@@ -75,45 +75,26 @@ impl DataMutationIntent {
 /// `ExternalMutationFinalization`. Calling this port only after that outcome is
 /// received fixes the provider-before-generic ordering without exposing a
 /// concrete provider registry to core.
-pub(crate) trait DataMutationCacheFinalizer {
+pub trait DataMutationCacheFinalizer {
     fn invalidate_generic_table(
         &self,
         table: &ConnectorTableIdentity,
     ) -> Result<(), ConnectorError>;
 }
 
-// CLS-R2 boundary: the port above is a connector fact and stays with the
-// aggregate package. This binding is the only part that names the query
-// assembly owner, so it moves to the frontend with `DmlExecutionKernel` in
-// CLS-R2 T15.
-impl DataMutationCacheFinalizer for crate::query_execution::kernels::DmlExecutionKernel {
-    fn invalidate_generic_table(
-        &self,
-        table: &ConnectorTableIdentity,
-    ) -> Result<(), ConnectorError> {
-        self.catalog_service()
-            .invalidate_table(
-                table.instance_id.as_str(),
-                table.namespace.as_ref(),
-                table.table.as_ref(),
-            )
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
-    }
-}
-
 #[derive(Clone, Debug)]
-pub(crate) struct CompletedDataMutation {
+pub struct CompletedDataMutation {
     #[allow(dead_code)]
-    pub(crate) effect: ExternalMutationEffect,
-    pub(crate) receipt: ConnectorDataMutationReceipt,
-    pub(crate) finalization: ExternalMutationFinalization,
+    pub effect: ExternalMutationEffect,
+    pub receipt: ConnectorDataMutationReceipt,
+    pub finalization: ExternalMutationFinalization,
 }
 
 /// A known-uncommitted result can originate either from read-only planning or
 /// from an explicit provider outcome. Keeping those sources distinct avoids
 /// pretending that a planning `ConnectorError` crossed the dispatch boundary.
 #[derive(Clone, Debug)]
-pub(crate) enum KnownUncommittedDataMutation {
+pub enum KnownUncommittedDataMutation {
     Planning(ConnectorError),
     Provider(ConnectorMutationFailure),
 }
@@ -128,14 +109,14 @@ impl fmt::Display for KnownUncommittedDataMutation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DataMutationDispatchState {
+pub enum DataMutationDispatchState {
     ConfirmedNotDispatched,
     PossiblyDispatched,
 }
 
 /// Application view after one execute or one explicit reconciliation.
 #[derive(Clone, Debug)]
-pub(crate) enum ResolvedDataMutation {
+pub enum ResolvedDataMutation {
     KnownCommitted(CompletedDataMutation),
     KnownUncommitted {
         failure: KnownUncommittedDataMutation,
@@ -155,7 +136,7 @@ pub(crate) enum ResolvedDataMutation {
 /// Execute a data mutation and project its typed truth state to the existing
 /// user-facing engine error vocabulary.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_data_mutation(
+pub fn execute_data_mutation(
     resolver: &dyn ConnectorDataMutationResolver,
     cache_finalizer: &dyn DataMutationCacheFinalizer,
     instance_id: &ConnectorInstanceId,
@@ -200,7 +181,7 @@ pub(crate) fn execute_data_mutation(
 /// outer SPI error is conservatively possibly dispatched. A provider unknown
 /// is reconciled once through the retained lease and is never re-executed.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_data_mutation(
+pub fn resolve_data_mutation(
     resolver: &dyn ConnectorDataMutationResolver,
     cache_finalizer: &dyn DataMutationCacheFinalizer,
     instance_id: &ConnectorInstanceId,
@@ -227,7 +208,7 @@ pub(crate) fn resolve_data_mutation(
     session.reconcile_once(evidence.clone(), cache_finalizer)
 }
 
-pub(crate) struct DataMutationSession {
+pub struct DataMutationSession {
     lease: ConnectorDataMutationLease,
     table: ConnectorTableIdentity,
     plan: novarocks_spi::connector::ConnectorDataMutationPlan,
@@ -243,7 +224,7 @@ enum DataMutationSessionPhase {
 
 impl DataMutationSession {
     #[allow(clippy::result_large_err)]
-    pub(crate) fn plan(
+    pub fn plan(
         resolver: &dyn ConnectorDataMutationResolver,
         instance_id: &ConnectorInstanceId,
         operation_id: ConnectorMutationOperationId,
@@ -331,11 +312,11 @@ impl DataMutationSession {
             .establish_external_fence(fence, self.context.clone())
     }
 
-    pub(crate) fn plan_ref(&self) -> &novarocks_spi::connector::ConnectorDataMutationPlan {
+    pub fn plan_ref(&self) -> &novarocks_spi::connector::ConnectorDataMutationPlan {
         &self.plan
     }
 
-    pub(crate) fn descriptor_ref(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+    pub fn descriptor_ref(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
         self.lease.descriptor()
     }
 
@@ -344,7 +325,7 @@ impl DataMutationSession {
     /// A commit-unknown outcome is deliberately returned without reconciling.
     /// The caller must first durably persist the evidence and then explicitly
     /// pass that same evidence to [`Self::reconcile_once`].
-    pub(crate) fn execute_once(
+    pub fn execute_once(
         &mut self,
         cache_finalizer: &dyn DataMutationCacheFinalizer,
     ) -> ResolvedDataMutation {
@@ -400,7 +381,7 @@ impl DataMutationSession {
     /// Reconcile one previously returned unknown outcome on the retained exact
     /// lease. Passing the evidence back explicitly is the durable-barrier seam:
     /// core cannot silently reconcile before the frontend records it.
-    pub(crate) fn reconcile_once(
+    pub fn reconcile_once(
         &mut self,
         evidence: ExternalMutationEvidence,
         cache_finalizer: &dyn DataMutationCacheFinalizer,

@@ -26,13 +26,13 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::common::backend_topology::BackendTopologyService;
+use crate::query_execution::service::QueryExecutionService;
 use crate::statistics_jobs::application::{
     StatisticsApplicationError, StatisticsAttemptExecutor, StatisticsAttemptRequest,
     StatisticsCollectedAttempt,
 };
 use bytes::Bytes;
-use novarocks::query_execution::backend::BackendTopologyService;
-use novarocks::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorMutationOperationId, ConnectorRequestContext,
     ConnectorStatisticsLease, ConnectorTableHandle, ExternalMutationEvidence,
@@ -82,8 +82,7 @@ impl FrontendStatisticsAttemptExecutor {
 
     fn collection_context() -> Result<ConnectorRequestContext, StatisticsApplicationError> {
         ConnectorRequestContext::try_new(
-            Instant::now()
-                + novarocks::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
+            Instant::now() + crate::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
             Arc::new(NeverCancelled),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -217,11 +216,11 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
                 context: context.clone(),
             })
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let program = novarocks::query_execution::statistics::StatisticsCollectionProgram::try_new(
+        let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
             plan,
-            novarocks::query_execution::statistics::StatisticsExecutionPolicy::try_new(
-                novarocks::query_execution::statistics::StatisticsExecutionMode::DurableJobAttempt,
-                novarocks::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
+            crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
+                crate::query_execution::statistics::StatisticsExecutionMode::DurableJobAttempt,
+                crate::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
             )
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
         )
@@ -231,8 +230,8 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             .backend_topology
             .snapshot()
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
-        let cancellation = novarocks::query_execution::cancellation::QueryCancellationSource::new();
-        let execution = novarocks::query_execution::request_context::QueryExecutionContext::new(
+        let cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
+        let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
             self.ports.execution_role,
             topology,
             Some(Instant::now() + program.policy().attempt_timeout()),
@@ -242,15 +241,14 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
 
         // The sequence is intentional: Core prepares immutable provider facts;
         // Frontend maps the sealed view; Core consumes the exact attachment.
-        let prepared =
-            novarocks::query_execution::statistics::prepare_statistics_collection_request(
-                self.ports.connector_control.as_ref(),
-                &execution,
-                context.clone(),
-                program,
-                planning_lease,
-            )
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        let prepared = crate::query_execution::statistics::prepare_statistics_collection_request(
+            self.ports.connector_control.as_ref(),
+            &execution,
+            context.clone(),
+            program,
+            planning_lease,
+        )
+        .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
         let native_attachment = crate::native::fragment_encoder::encode_native_fragment_bundle(
             prepared.encoding_view(),
         )
@@ -262,9 +260,7 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             .ports
             .query_execution
             .execute(distributed)
-            .and_then(
-                novarocks::query_execution::contract::DistributedQueryOutcome::into_statistics,
-            )
+            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_statistics)
             .map(|outcome| outcome.into_collection_result())
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
         Ok(Box::new(FrontendStatisticsCollectedAttempt {

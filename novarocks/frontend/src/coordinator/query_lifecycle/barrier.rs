@@ -19,13 +19,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use novarocks::query_execution::cancellation::QueryCancellationView;
-use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks::query_execution::launch::{QueryLaunchBarrier, StageBatch};
-use novarocks::query_execution::lifecycle::{AttemptId as CoreAttemptId, QueryExecutionId};
-use novarocks::query_execution::lifecycle_plan::{
+use crate::common::query_cancellation::QueryCancellationView;
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch};
+use crate::query_execution::lifecycle_plan::{
     QueryInitBarrier, QueryInitPlan, QueryLifecycleLease,
 };
+use crate::query_lifecycle::{AttemptId as CoreAttemptId, QueryExecutionId};
 use novarocks_protocol::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryControlAttach, QueryInitOutcome, QueryStageAck,
     QueryStageRequest, QueryStartAck, QueryStartRequest,
@@ -608,7 +608,7 @@ pub(super) fn record_lifecycle_phase_marker_for_execution(
     phase: &str,
     execution_id: QueryExecutionId,
 ) -> Result<(), DistributedQueryError> {
-    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = crate::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     for (kind, action) in [("kill-query", "kill_query"), ("fe-crash", "kill_fe")] {
@@ -673,7 +673,7 @@ fn record_stage_barrier_marker(batches: &[StageBatch]) -> Result<(), Distributed
     let Some(execution_id) = batches.first().map(|batch| batch.request().execution_id()) else {
         return Ok(());
     };
-    if novarocks::common::query_lifecycle_fault::configured_root().is_some() {
+    if crate::common::query_lifecycle_fault::configured_root().is_some() {
         eprintln!(
             "NOVAROCKS_QUERY_STAGE_BARRIER execution_id={}:{}:{} participants={}",
             execution_id.query_id().high(),
@@ -999,7 +999,7 @@ fn attach_one(
 
 #[cfg(debug_assertions)]
 fn record_control_ready_marker(participant: &MaterializedParticipant) -> Result<(), String> {
-    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = crate::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     let execution_id = participant_execution_id(participant);

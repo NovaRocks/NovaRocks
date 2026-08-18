@@ -16,7 +16,7 @@
 // under the License.
 
 pub mod application;
-pub(crate) use novarocks::{common, protocol, query_execution, runtime};
+pub(crate) use novarocks::{common, protocol, query_lifecycle, runtime};
 pub mod capabilities;
 pub mod catalog_application;
 pub mod catalog_attachment;
@@ -32,6 +32,7 @@ pub mod mv;
 mod native;
 pub mod query;
 pub mod query_control;
+pub mod query_execution;
 pub mod runtime_filter;
 mod server;
 pub mod statistics;

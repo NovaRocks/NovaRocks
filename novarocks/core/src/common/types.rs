@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::result_batch::ResultBatch;
-pub(crate) use novarocks_types::{UniqueId, format_uuid};
+pub use novarocks_types::{UniqueId, format_uuid};
 
 #[derive(Clone, Debug)]
 pub struct FetchResult {

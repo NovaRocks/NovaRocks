@@ -22,7 +22,7 @@ use std::sync::Arc;
 use novarocks_spi::connector::ConnectorControlRegistry;
 
 use crate::mv::storage_observation::MvStorageObservationPort;
-use crate::query_execution::StatementResult;
+use crate::runtime::statement_result::StatementResult;
 
 #[derive(Clone)]
 pub struct IcebergRefCommandExecutor {

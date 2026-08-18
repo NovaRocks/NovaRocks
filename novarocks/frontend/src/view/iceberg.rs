@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::view::{
+use crate::view::{
     CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewSqlDialect, ViewStatementResult,
     ViewTarget,
 };

@@ -6,11 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use novarocks::query_execution::artifact::RuntimeFilterScheduledView;
-use novarocks::query_execution::contract::{
+use crate::query_execution::artifact::RuntimeFilterScheduledView;
+use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, RuntimeFilterLifecycleView,
 };
-use novarocks::query_execution::{
+use crate::query_execution::{
     RuntimeFilterArtifactCapability, RuntimeFilterCompletionRequirement,
     RuntimeFilterConsumerActivation, RuntimeFilterContributionKind, RuntimeFilterCoverageFacts,
     RuntimeFilterDeploymentBindingRoleFacts, RuntimeFilterDeploymentFactsView,
@@ -216,7 +216,7 @@ impl DeploymentInput {
         let join_progress = facts
             .join_progress()
             .filter_map(|progress| match progress {
-                novarocks::query_execution::RuntimeFilterJoinProgressFacts::Proven {
+                crate::query_execution::RuntimeFilterJoinProgressFacts::Proven {
                     channel_id,
                     producer_binding_id,
                     producer_fragment_id,
@@ -237,7 +237,7 @@ impl DeploymentInput {
                         .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
                         .collect(),
                 }),
-                novarocks::query_execution::RuntimeFilterJoinProgressFacts::Skipped { .. } => None,
+                crate::query_execution::RuntimeFilterJoinProgressFacts::Skipped { .. } => None,
             })
             .map(|proof| {
                 (

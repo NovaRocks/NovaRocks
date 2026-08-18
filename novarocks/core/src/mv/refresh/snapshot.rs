@@ -55,7 +55,7 @@ pub(crate) enum RefreshDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExecutableRefreshDecision {
+pub enum ExecutableRefreshDecision {
     SkipEmpty,
     FirstRefresh,
     MetadataOnly,

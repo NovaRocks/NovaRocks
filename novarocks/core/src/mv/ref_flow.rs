@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use crate::query_execution::StatementResult;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
     ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,

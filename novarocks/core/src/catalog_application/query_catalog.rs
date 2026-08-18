@@ -43,19 +43,19 @@ use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 /// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
 /// never decodes a provider table handle or metadata payload.
 #[derive(Clone)]
-pub(crate) struct ConnectorQueryTableMaterialization {
-    pub(crate) schema_version: Option<Vec<u8>>,
-    pub(crate) columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub(crate) row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub(crate) read_table: novarocks_spi::connector::ConnectorTableHandle,
-    pub(crate) read_schema: arrow::datatypes::SchemaRef,
-    pub(crate) read_selector: novarocks_spi::connector::ConnectorReadSelector,
-    pub(crate) sql_planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
-    pub(crate) statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
-    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+pub struct ConnectorQueryTableMaterialization {
+    pub schema_version: Option<Vec<u8>>,
+    pub columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub read_table: novarocks_spi::connector::ConnectorTableHandle,
+    pub read_schema: arrow::datatypes::SchemaRef,
+    pub read_selector: novarocks_spi::connector::ConnectorReadSelector,
+    pub sql_planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
+    pub statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
+    pub planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
-pub(crate) fn load_connector_table_materialization_with_lease(
+pub fn load_connector_table_materialization_with_lease(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
@@ -75,7 +75,7 @@ pub(crate) fn load_connector_table_materialization_with_lease(
 /// Load one provider-defined read alias through the same opaque metadata
 /// contract used for base tables. The alias syntax is application-owned, but
 /// Core neither decodes the returned table handle nor names a provider type.
-pub(crate) fn load_connector_table_alias_materialization_with_lease(
+pub fn load_connector_table_alias_materialization_with_lease(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
@@ -132,7 +132,7 @@ fn load_connector_table_materialization_with_resolution(
     connector_table_materialization_from_metadata(metadata, planning_lease)
 }
 
-pub(crate) fn connector_table_materialization_from_metadata(
+pub fn connector_table_materialization_from_metadata(
     metadata: novarocks_spi::connector::ConnectorTableMetadata,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<ConnectorQueryTableMaterialization, String> {
@@ -338,7 +338,7 @@ pub fn new_query_catalog_service() -> QueryCatalogService {
     service
 }
 
-pub(crate) fn build_connector_catalog(
+pub fn build_connector_catalog(
     name: &str,
     controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
 ) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {

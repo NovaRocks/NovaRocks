@@ -44,7 +44,7 @@ static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
 /// Canonical request-local lookup identity.  Names are normalized before the
 /// binding is inserted, so a resolve failure is memoized just like success.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct QueryTableBindingKey {
+pub struct QueryTableBindingKey {
     catalog: String,
     namespace: String,
     table: String,
@@ -52,7 +52,7 @@ pub(crate) struct QueryTableBindingKey {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum QueryTableBindingSelector {
+pub enum QueryTableBindingSelector {
     StrictBaseTable,
     /// A terminal writer target. This remains separate from a read binding
     /// for the same physical table because the writer's frozen physical
@@ -80,13 +80,13 @@ impl QueryTableBindingKey {
     /// physical table and snapshot selector before it reaches the request
     /// local memo.  This overlay is intentionally local to the binding
     /// store; it must never register a synthetic table in the global catalog.
-    pub(crate) fn analysis_lookup(catalog: &str, namespace: &str, table: &str) -> Self {
+    pub fn analysis_lookup(catalog: &str, namespace: &str, table: &str) -> Self {
         if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
             return Self::snapshot(catalog, namespace, base_table, snapshot_id);
         }
         Self::strict_base(catalog, namespace, table)
     }
-    pub(crate) fn strict_base(catalog: &str, namespace: &str, table: &str) -> Self {
+    pub fn strict_base(catalog: &str, namespace: &str, table: &str) -> Self {
         Self::new(
             catalog,
             namespace,
@@ -98,7 +98,7 @@ impl QueryTableBindingKey {
     /// Reserve an exact terminal writer target.  A write must never reuse a
     /// same-name read binding: those bindings carry different SQL facts while
     /// both remain valid for their independently frozen application roles.
-    pub(crate) fn write_target(
+    pub fn write_target(
         catalog: &str,
         namespace: &str,
         table: &str,
@@ -112,7 +112,7 @@ impl QueryTableBindingKey {
         )
     }
 
-    pub(crate) fn snapshot(catalog: &str, namespace: &str, table: &str, snapshot_id: i64) -> Self {
+    pub fn snapshot(catalog: &str, namespace: &str, table: &str, snapshot_id: i64) -> Self {
         Self::new(
             catalog,
             namespace,
@@ -121,7 +121,7 @@ impl QueryTableBindingKey {
         )
     }
 
-    pub(crate) fn timestamp_millis(
+    pub fn timestamp_millis(
         catalog: &str,
         namespace: &str,
         table: &str,
@@ -135,7 +135,7 @@ impl QueryTableBindingKey {
         )
     }
 
-    pub(crate) fn metadata(
+    pub fn metadata(
         catalog: &str,
         namespace: &str,
         table: &str,
@@ -153,7 +153,7 @@ impl QueryTableBindingKey {
     /// admission.  This is deliberately distinct from a normal base-table or
     /// time-travel key: both target-state and target-locator scans must reuse
     /// this same frozen materialization, never a later target generation.
-    pub(crate) fn mv_target(
+    pub fn mv_target(
         catalog: &str,
         namespace: &str,
         table: &str,
@@ -186,7 +186,7 @@ impl QueryTableBindingKey {
     }
 }
 
-pub(crate) fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
+pub fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
     let encoded = table.strip_prefix("__sqlx1_tt_")?;
     let (base_table, snapshot_id) = encoded.rsplit_once('_')?;
     (!base_table.is_empty())
@@ -199,7 +199,7 @@ pub(crate) fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i
 /// stays here; neither the SQL scan vocabulary nor SQL catalog facts contain
 /// a provider table, files, cloud properties, or serialized metadata.
 #[derive(Clone)]
-pub(crate) enum QueryTableBindingAdmission {
+pub enum QueryTableBindingAdmission {
     /// Local SQL tables do not own a connector generation and cannot be used
     /// as a connector read or write admission source.
     Local,
@@ -209,7 +209,7 @@ pub(crate) enum QueryTableBindingAdmission {
 }
 
 impl QueryTableBindingAdmission {
-    pub(crate) fn exact_planning_lease(&self) -> Result<ConnectorControlPlanningLease, String> {
+    pub fn exact_planning_lease(&self) -> Result<ConnectorControlPlanningLease, String> {
         match self {
             Self::Exact(lease) => Ok(lease.clone()),
             Self::Local => Err("query binding has no connector planning lease".to_string()),
@@ -218,23 +218,23 @@ impl QueryTableBindingAdmission {
 }
 
 #[derive(Clone)]
-pub(crate) struct QueryTableBinding {
-    pub(crate) resolved: ResolvedAnalyzerTable,
-    pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
-    pub(crate) admission: QueryTableBindingAdmission,
+pub struct QueryTableBinding {
+    pub resolved: ResolvedAnalyzerTable,
+    pub statistics_pin: Option<ResolvedTableStatisticsPin>,
+    pub admission: QueryTableBindingAdmission,
     /// Provider facts required by scan preparation.  This is deliberately
     /// application-owned and paired with the same token as `resolved`; it is
     /// never embedded in a SQL logical or distributed plan.
-    pub(crate) scan_materialization: Option<QueryScanMaterialization>,
+    pub scan_materialization: Option<QueryScanMaterialization>,
     /// MV target SQL facts plus the two admitted opaque read authorities. A
     /// target-state scan may choose the pre-filtered read, while its locator
     /// always uses the full read; neither lane receives provider file facts.
-    pub(crate) mv_target_read: Option<MvTargetReadAdmission>,
+    pub mv_target_read: Option<MvTargetReadAdmission>,
     /// SQL-owned write facts projected at connector admission.  The opaque
     /// handle is retained solely for the provider to rehydrate its execution
     /// carrier after SQL planning; Core never parses it or serializes provider
     /// metadata while preparing a terminal write.
-    pub(crate) write_target_admission: Option<QueryWriteTargetAdmission>,
+    pub write_target_admission: Option<QueryWriteTargetAdmission>,
     /// Exact file sets captured for the snapshot selectors emitted by one
     /// admitted logical plan.  A binding can serve both sides of an IMV
     /// from/to comparison, so the primary materialization alone is not
@@ -242,12 +242,12 @@ pub(crate) struct QueryTableBinding {
     ///
     /// The map is query-local and shares the binding's planning lease; it is
     /// never populated by a later catalog lookup.
-    pub(crate) frozen_snapshot_materializations: BTreeMap<i64, QueryScanMaterialization>,
+    pub frozen_snapshot_materializations: BTreeMap<i64, QueryScanMaterialization>,
     /// Provider-sealed snapshot-window admissions retained for SQL delta
     /// scans. Core never decodes their handles or reconstructs provider
     /// physical facts; preparation reuses the exact sealed scan through this
     /// binding's request-local token.
-    pub(crate) admitted_change_scans: BTreeMap<(i64, i64), novarocks_spi::connector::ConnectorScan>,
+    pub admitted_change_scans: BTreeMap<(i64, i64), novarocks_spi::connector::ConnectorScan>,
 }
 
 /// One Provider-signed terminal write preparation retained beside the SQL
@@ -255,8 +255,8 @@ pub(crate) struct QueryTableBinding {
 /// all sealed by the provider; SQL may project its Arrow layout and field
 /// tokens but must not reconstruct table-format metadata.
 #[derive(Clone)]
-pub(crate) struct QueryWriteTargetAdmission {
-    pub(crate) preparation: ConnectorWritePreparation,
+pub struct QueryWriteTargetAdmission {
+    pub preparation: ConnectorWritePreparation,
 }
 
 /// Exact provider scan facts retained after admission.  The concrete Iceberg
@@ -264,23 +264,23 @@ pub(crate) struct QueryWriteTargetAdmission {
 /// callers are migrated to `SqlScanSource`; preparation must obtain it by the
 /// request-local binding token rather than from a planner table.
 #[derive(Clone)]
-pub(crate) struct QueryScanMaterialization {
+pub struct QueryScanMaterialization {
     /// Provider-neutral scan authority.  The handle is opaque to Core; the
     /// schema is the single projection-ordinal authority and the lease keeps
     /// the exact control generation alive until native preparation finishes.
-    pub(crate) table: ConnectorTableHandle,
-    pub(crate) schema: SchemaRef,
-    pub(crate) selector: ConnectorReadSelector,
-    pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
-    pub(crate) planning_lease: ConnectorControlPlanningLease,
+    pub table: ConnectorTableHandle,
+    pub schema: SchemaRef,
+    pub selector: ConnectorReadSelector,
+    pub statistics_pin: Option<ResolvedTableStatisticsPin>,
+    pub planning_lease: ConnectorControlPlanningLease,
 }
 
 #[derive(Clone)]
-pub(crate) struct MvTargetReadAdmission {
-    pub(crate) full: QueryScanMaterialization,
-    pub(crate) affected_partitions: QueryScanMaterialization,
-    pub(crate) target_table_uuid: String,
-    pub(crate) frozen_snapshot_id: Option<i64>,
+pub struct MvTargetReadAdmission {
+    pub full: QueryScanMaterialization,
+    pub affected_partitions: QueryScanMaterialization,
+    pub target_table_uuid: String,
+    pub frozen_snapshot_id: Option<i64>,
 }
 
 impl std::fmt::Debug for QueryScanMaterialization {
@@ -294,7 +294,7 @@ impl std::fmt::Debug for QueryScanMaterialization {
 }
 
 impl QueryTableBinding {
-    pub(crate) fn local(resolved: ResolvedAnalyzerTable, binding: SqlTableBindingId) -> Self {
+    pub fn local(resolved: ResolvedAnalyzerTable, binding: SqlTableBindingId) -> Self {
         Self {
             resolved: catalog::attach_binding_to_local_materialization(resolved, binding),
             statistics_pin: None,
@@ -311,10 +311,7 @@ impl QueryTableBinding {
     /// token it reserved.  Concrete provider scans are never accepted here:
     /// they must already live in `scan_materialization` before SQL receives
     /// the table facts.
-    pub(crate) fn validate_sql_scan_binding(
-        &self,
-        binding: SqlTableBindingId,
-    ) -> Result<(), String> {
+    pub fn validate_sql_scan_binding(&self, binding: SqlTableBindingId) -> Result<(), String> {
         catalog::validate_materialization_binding(&self.resolved, binding)
     }
 }
@@ -323,8 +320,8 @@ impl QueryTableBinding {
 /// tests. The SQL scan itself comes from a sealed SQL fixture; this helper
 /// only pairs its opaque request-local token with one provider-sealed change
 /// window and never exposes a planner table constructor.
-#[cfg(test)]
-pub(crate) fn admitted_change_window_binding_for_test(
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub fn admitted_change_window_binding_for_test(
     binding: SqlTableBindingId,
     from_snapshot_id: i64,
     to_snapshot_id: i64,
@@ -362,7 +359,7 @@ struct StoredBinding {
 }
 
 /// Exact application authority paired with one compiler request.
-pub(crate) struct QueryTableBindingStore {
+pub struct QueryTableBindingStore {
     allocator: Mutex<SqlTableBindingAllocator>,
     entries: Mutex<HashMap<QueryTableBindingKey, Result<StoredBinding, String>>>,
     by_id: Mutex<HashMap<SqlTableBindingId, Arc<QueryTableBinding>>>,
@@ -371,7 +368,7 @@ pub(crate) struct QueryTableBindingStore {
 impl QueryTableBindingStore {
     /// Allocate one fresh process-local scope.  Scope exhaustion is explicit
     /// rather than silently reusing a token from another query.
-    pub(crate) fn try_new() -> Result<Self, String> {
+    pub fn try_new() -> Result<Self, String> {
         let raw_scope = NEXT_BINDING_SCOPE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -390,8 +387,8 @@ impl QueryTableBindingStore {
     /// fixtures.  Production admission must always use `try_new`, which
     /// allocates a process-unique scope.  Tests use this only alongside
     /// `test_sql_scan_source`, whose token has the same fixed scope.
-    #[cfg(test)]
-    pub(crate) fn try_new_with_scope_for_test(scope: NonZeroU64) -> Self {
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+    pub fn try_new_with_scope_for_test(scope: NonZeroU64) -> Self {
         Self {
             allocator: Mutex::new(
                 SqlTableBindingAllocator::try_new(scope)
@@ -408,7 +405,7 @@ impl QueryTableBindingStore {
     /// CTAS) to the exact catalog/statistics/control generation used during
     /// compilation. Opaque provider bytes are hashed rather than embedded so
     /// the digest cannot become a provider payload carrier.
-    pub(crate) fn stable_digest_material(&self) -> Vec<u8> {
+    pub fn stable_digest_material(&self) -> Vec<u8> {
         use sha2::{Digest, Sha256};
 
         let mut material = Vec::new();
@@ -437,7 +434,7 @@ impl QueryTableBindingStore {
         material
     }
 
-    pub(crate) fn scope(&self) -> SqlTableBindingScopeId {
+    pub fn scope(&self) -> SqlTableBindingScopeId {
         self.allocator
             .lock()
             .expect("query table binding allocator lock")
@@ -446,7 +443,7 @@ impl QueryTableBindingStore {
 
     /// Memoize both success and failure.  The supplied load closure executes
     /// at most once for a canonical key in this request.
-    pub(crate) fn resolve_or_insert(
+    pub fn resolve_or_insert(
         &self,
         key: QueryTableBindingKey,
         load: impl FnOnce() -> Result<QueryTableBinding, String>,
@@ -462,7 +459,7 @@ impl QueryTableBindingStore {
     /// application loader receives the exact token that the resulting SQL
     /// table will carry, while the concrete scan authority remains in this
     /// store. Failed loads remain memoized and never publish their token.
-    pub(crate) fn resolve_or_insert_with_id(
+    pub fn resolve_or_insert_with_id(
         &self,
         key: QueryTableBindingKey,
         load: impl FnOnce(SqlTableBindingId) -> Result<QueryTableBinding, String>,
@@ -490,7 +487,7 @@ impl QueryTableBindingStore {
         response
     }
 
-    pub(crate) fn binding(&self, id: SqlTableBindingId) -> Result<Arc<QueryTableBinding>, String> {
+    pub fn binding(&self, id: SqlTableBindingId) -> Result<Arc<QueryTableBinding>, String> {
         if !id.belongs_to(self.scope()) {
             return Err("SQL table binding token belongs to a different request".to_string());
         }
@@ -502,14 +499,14 @@ impl QueryTableBindingStore {
             .ok_or_else(|| "SQL table binding token is missing from this request".to_string())
     }
 
-    pub(crate) fn statistics_pin(
+    pub fn statistics_pin(
         &self,
         id: SqlTableBindingId,
     ) -> Result<Option<ResolvedTableStatisticsPin>, String> {
         Ok(self.binding(id)?.statistics_pin.clone())
     }
 
-    pub(crate) fn exact_planning_lease(
+    pub fn exact_planning_lease(
         &self,
         id: SqlTableBindingId,
     ) -> Result<ConnectorControlPlanningLease, String> {
@@ -519,7 +516,7 @@ impl QueryTableBindingStore {
     /// Recover provider scan facts only through the exact request-local token.
     /// A missing materialization is a submission-time contract failure, not a
     /// reason to resolve a current table or connector generation.
-    pub(crate) fn scan_materialization(
+    pub fn scan_materialization(
         &self,
         id: SqlTableBindingId,
     ) -> Result<Option<QueryScanMaterialization>, String> {
@@ -530,7 +527,7 @@ impl QueryTableBindingStore {
     /// A selector without an admitted entry is a hard submission failure: a
     /// preparation-time fallback to the current materialization would silently
     /// turn an IMV `From` scan into a `To` scan.
-    pub(crate) fn frozen_snapshot_materialization(
+    pub fn frozen_snapshot_materialization(
         &self,
         id: SqlTableBindingId,
         snapshot_id: i64,
@@ -550,7 +547,7 @@ impl QueryTableBindingStore {
     /// Return the immutable bindings captured during admission.  The caller
     /// may project them into compiler input, but must not use this view to
     /// acquire a newer connector generation.
-    pub(crate) fn captured_bindings(&self) -> Vec<(SqlTableBindingId, Arc<QueryTableBinding>)> {
+    pub fn captured_bindings(&self) -> Vec<(SqlTableBindingId, Arc<QueryTableBinding>)> {
         let mut bindings: Vec<_> = self
             .by_id
             .lock()
@@ -566,7 +563,7 @@ impl QueryTableBindingStore {
     /// while production callers are moved to `SqlScanSource`.  The result is
     /// still retrieved from this one token store; this helper never acquires a
     /// current connector generation.
-    pub(crate) fn strict_base_binding(
+    pub fn strict_base_binding(
         &self,
         catalog: &str,
         namespace: &str,
@@ -581,7 +578,7 @@ impl QueryTableBindingStore {
     /// Read and write bindings for the same physical table are intentionally
     /// distinct: the writer token owns its physical output schema and exact
     /// lease, while scans retain their own selector and materialization.
-    pub(crate) fn admitted_iceberg_write_binding_id(
+    pub fn admitted_iceberg_write_binding_id(
         &self,
         catalog: &str,
         namespace: &str,
@@ -608,7 +605,7 @@ impl QueryTableBindingStore {
     /// Return the unique Provider-signed preparation admitted for a terminal
     /// write target.  Callers that need more than one shape must use their
     /// explicit preparation instead of allowing target lookup to choose one.
-    pub(crate) fn admitted_iceberg_write_preparation(
+    pub fn admitted_iceberg_write_preparation(
         &self,
         catalog: &str,
         namespace: &str,
@@ -642,7 +639,7 @@ impl QueryTableBindingStore {
     /// Return one explicitly admitted writer binding for its sealed
     /// preparation. This is required when a single terminal operation has
     /// multiple writer shapes for the same physical target.
-    pub(crate) fn admitted_iceberg_write_binding_id_for_preparation(
+    pub fn admitted_iceberg_write_binding_id_for_preparation(
         &self,
         catalog: &str,
         namespace: &str,
@@ -667,7 +664,7 @@ impl QueryTableBindingStore {
     /// Return the one admission-frozen MV target binding.  The UUID and
     /// snapshot are part of the lookup key so a recreated target or a later
     /// refresh baseline can never reuse an earlier request's authority.
-    pub(crate) fn mv_target_binding_id(
+    pub fn mv_target_binding_id(
         &self,
         catalog: &str,
         namespace: &str,
@@ -699,8 +696,8 @@ impl QueryTableBindingStore {
         self.binding(id).ok()
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_strict_base_binding_for_test(
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+    pub fn insert_strict_base_binding_for_test(
         &self,
         catalog: &str,
         namespace: &str,

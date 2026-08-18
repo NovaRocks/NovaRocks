@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "query-execution-contract-test-support"))]
 
 //! Provider-neutral, test-only read fixture connector.
 //!
@@ -93,25 +93,25 @@ const FIXTURE_HIDDEN_KEY_COLUMN: &str = "__fixture_connector_key";
 /// into its opaque split payload and never interprets any field. Tests use
 /// [`planned_split_file_for_test`] to prove Core returned it unchanged.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct FixtureScanFile {
-    pub(crate) path: String,
-    pub(crate) size: i64,
-    pub(crate) row_count: Option<i64>,
+pub struct FixtureScanFile {
+    pub path: String,
+    pub size: i64,
+    pub row_count: Option<i64>,
     /// Per-column statistics keyed by column name. The fixture never decodes
     /// the bounds, because it never prunes.
-    pub(crate) column_stats: BTreeMap<String, FixtureColumnStats>,
-    pub(crate) partition_spec_id: Option<i32>,
-    pub(crate) partition_values: Vec<FixturePartitionValue>,
-    pub(crate) sequence_number: Option<i64>,
-    pub(crate) deletes: Vec<FixtureDeleteFile>,
+    pub column_stats: BTreeMap<String, FixtureColumnStats>,
+    pub partition_spec_id: Option<i32>,
+    pub partition_values: Vec<FixturePartitionValue>,
+    pub sequence_number: Option<i64>,
+    pub deletes: Vec<FixtureDeleteFile>,
     /// Arbitrary provider-private bytes. Core must round-trip them untouched.
-    pub(crate) opaque_payload: Vec<u8>,
+    pub opaque_payload: Vec<u8>,
 }
 
 impl FixtureScanFile {
     /// A unit identified only by its path, with a plausible size and row count
     /// so byte-estimate assertions have something to read.
-    pub(crate) fn new(path: &str) -> Self {
+    pub fn new(path: &str) -> Self {
         Self {
             path: path.to_string(),
             size: 128,
@@ -124,44 +124,44 @@ impl FixtureScanFile {
 /// Opaque per-column statistics. Bounds stay encoded: decoding them is a
 /// provider concern and this fixture has no pruning path that would need them.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct FixtureColumnStats {
-    pub(crate) null_count: Option<i64>,
-    pub(crate) value_count: Option<i64>,
-    pub(crate) lower_bound: Option<Vec<u8>>,
-    pub(crate) upper_bound: Option<Vec<u8>>,
+pub struct FixtureColumnStats {
+    pub null_count: Option<i64>,
+    pub value_count: Option<i64>,
+    pub lower_bound: Option<Vec<u8>>,
+    pub upper_bound: Option<Vec<u8>>,
 }
 
 /// One partition field value attached to a read unit. `value` is already
 /// rendered by the test; the fixture never parses it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct FixturePartitionValue {
-    pub(crate) field_name: String,
-    pub(crate) transform: String,
-    pub(crate) value: Option<String>,
+pub struct FixturePartitionValue {
+    pub field_name: String,
+    pub transform: String,
+    pub value: Option<String>,
 }
 
 /// Whether an associated delete descriptor addresses rows by position or by
 /// the value of an equality key.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) enum FixtureDeleteKind {
+pub enum FixtureDeleteKind {
     Position,
     Equality,
 }
 
 /// One delete descriptor associated with a read unit.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct FixtureDeleteFile {
-    pub(crate) path: String,
-    pub(crate) kind: FixtureDeleteKind,
-    pub(crate) sequence_number: Option<i64>,
+pub struct FixtureDeleteFile {
+    pub path: String,
+    pub kind: FixtureDeleteKind,
+    pub sequence_number: Option<i64>,
     /// Equality key columns by name. Empty for a position delete.
-    pub(crate) equality_column_names: Vec<String>,
+    pub equality_column_names: Vec<String>,
     /// Equality key columns by field ID. Empty for a position delete.
-    pub(crate) equality_field_ids: Vec<i32>,
+    pub equality_field_ids: Vec<i32>,
 }
 
 impl FixtureDeleteFile {
-    pub(crate) fn position(path: &str) -> Self {
+    pub fn position(path: &str) -> Self {
         Self {
             path: path.to_string(),
             kind: FixtureDeleteKind::Position,
@@ -171,7 +171,7 @@ impl FixtureDeleteFile {
         }
     }
 
-    pub(crate) fn equality(
+    pub fn equality(
         path: &str,
         equality_column_names: &[&str],
         equality_field_ids: &[i32],
@@ -759,7 +759,7 @@ impl ConnectorExecutionDistribution for FixtureDistribution {
 // This fixture deliberately does not implement provider semantics such as
 // predicate pruning. A test that needs those belongs beside the implementation
 // that owns them, not here.
-pub(crate) fn planned_files_fixture_binding(
+pub fn planned_files_fixture_binding(
     catalog: &str,
     files_by_table: HashMap<String, Vec<FixtureScanFile>>,
     seen_projections: Option<Arc<Mutex<Vec<Vec<usize>>>>>,
@@ -773,8 +773,8 @@ pub(crate) fn planned_files_fixture_binding(
 }
 
 /// Build the same opaque read fixture under an explicitly selected provider ID.
-#[cfg(test)]
-pub(crate) fn planned_files_fixture_binding_for_provider(
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub fn planned_files_fixture_binding_for_provider(
     provider_id: ConnectorProviderId,
     catalog: &str,
     files_by_table: HashMap<String, Vec<FixtureScanFile>>,
@@ -807,7 +807,7 @@ pub(crate) fn planned_files_fixture_binding_for_provider(
 }
 
 /// Register a fixture that answers for every table name with the same units.
-pub(crate) fn register_planned_files_fixture(
+pub fn register_planned_files_fixture(
     registry: &crate::connector::ConnectorRegistry,
     catalog: &str,
     files: Vec<FixtureScanFile>,
@@ -822,7 +822,7 @@ pub(crate) fn register_planned_files_fixture(
 }
 
 /// Register a fixture with per-table prepared units.
-pub(crate) fn register_planned_table_files_fixture(
+pub fn register_planned_table_files_fixture(
     registry: &crate::connector::ConnectorRegistry,
     catalog: &str,
     files_by_table: HashMap<String, Vec<FixtureScanFile>>,
@@ -856,16 +856,14 @@ pub(crate) fn freeze_explicit_files(
 /// Read the neutral fact back out of a planned split, byte-for-byte.
 ///
 /// Tests use this to assert Core never reinterpreted a provider fact.
-pub(crate) fn planned_split_file_for_test(
-    split: &ConnectorSplit,
-) -> Result<FixtureScanFile, String> {
+pub fn planned_split_file_for_test(split: &ConnectorSplit) -> Result<FixtureScanFile, String> {
     decode_payload::<SplitPayload>(split.payload(), "split")
         .map(|payload| payload.file)
         .map_err(|error| error.to_string())
 }
 
 /// Read back the physical columns a planned split declared it must read.
-pub(crate) fn planned_split_required_physical_columns_for_test(
+pub fn planned_split_required_physical_columns_for_test(
     split: &ConnectorSplit,
 ) -> Result<Vec<String>, String> {
     decode_payload::<SplitPayload>(split.payload(), "split")

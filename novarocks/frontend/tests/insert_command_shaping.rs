@@ -18,11 +18,11 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
-use novarocks::query_execution::dml::insert::{
-    InsertOverwriteMode, InsertValue, parse_insert_statement,
-};
 use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
 use novarocks_frontend::dml::{InsertCommandSource, convert_insert_command, reorder_insert_rows};
+use novarocks_frontend::query_execution::dml::insert::{
+    InsertOverwriteMode, InsertValue, parse_insert_statement,
+};
 
 fn parse_insert(sql: &str) -> sqlparser::ast::Insert {
     parse_insert_statement(sql)
@@ -114,7 +114,7 @@ fn parse_json_values_fold_to_packed_variant_literal() {
     );
     let unpacked = packed.chars().map(|ch| ch as u8).collect::<Vec<_>>();
     let expected =
-        novarocks::query_execution::dml::insert::encode_insert_variant_json(r#"{"a":1}"#)
+        novarocks_frontend::query_execution::dml::insert::encode_insert_variant_json(r#"{"a":1}"#)
             .expect("encode expected variant");
     assert_eq!(unpacked, expected);
 }

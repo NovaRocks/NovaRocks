@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifest,
     ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent, QueryInitOutcome,

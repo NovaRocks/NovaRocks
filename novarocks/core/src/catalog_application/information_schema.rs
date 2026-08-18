@@ -23,8 +23,8 @@ use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
 use crate::mv::repository::MvRepository;
-use crate::query_execution::StatementResult;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use crate::runtime::statement_result::StatementResult;
 
 #[derive(Clone, Debug)]
 struct MaterializedViewInfoRow {

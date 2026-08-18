@@ -96,7 +96,7 @@ impl QueryResult {
 
     /// Empty schema, empty chunks. Used as the no-op output when an
     /// IVM branch (insert or delete) has zero input files / rows.
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             columns: Vec::new(),
             chunks: Vec::new(),

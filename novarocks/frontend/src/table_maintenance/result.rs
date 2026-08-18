@@ -17,11 +17,11 @@
 
 use std::sync::Arc;
 
+use crate::query_execution::maintenance::{MaintenanceActionOutcome, MaintenanceStatementResult};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::maintenance::{MaintenanceActionOutcome, MaintenanceStatementResult};
-use novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_types::SlotId;
 

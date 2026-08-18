@@ -20,8 +20,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use novarocks::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
-use novarocks::query_execution::control::{
+use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
+use crate::query_execution::control::{
     QueryCancelOutcome, QueryControlError, QueryControlPort, QueryControlService, SessionIdentity,
     SessionToken, StatementFinishOutcome, StatementRegistration, StatementToken,
 };
@@ -167,12 +167,12 @@ impl QueryControlPort for FrontendQueryControl {
             return QueryCancelOutcome::NoActiveStatement;
         };
         match active.cancellation.request(reason) {
-            novarocks::query_execution::cancellation::QueryCancellationRequestResult::Requested => {
+            crate::common::query_cancellation::QueryCancellationRequestResult::Requested => {
                 QueryCancelOutcome::Requested
             }
-            novarocks::query_execution::cancellation::QueryCancellationRequestResult::AlreadyRequested(reason) => {
-                QueryCancelOutcome::AlreadyRequested(reason)
-            }
+            crate::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
+                reason,
+            ) => QueryCancelOutcome::AlreadyRequested(reason),
         }
     }
 
@@ -198,14 +198,13 @@ impl QueryControlPort for FrontendQueryControl {
             .cancellation
             .request(QueryCancellationReason::ExplicitKill {
                 requester_connection_id: requester.connection_id(),
-            })
-        {
-            novarocks::query_execution::cancellation::QueryCancellationRequestResult::Requested => {
+            }) {
+            crate::common::query_cancellation::QueryCancellationRequestResult::Requested => {
                 QueryCancelOutcome::Requested
             }
-            novarocks::query_execution::cancellation::QueryCancellationRequestResult::AlreadyRequested(reason) => {
-                QueryCancelOutcome::AlreadyRequested(reason)
-            }
+            crate::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
+                reason,
+            ) => QueryCancelOutcome::AlreadyRequested(reason),
         }
     }
 
@@ -222,7 +221,7 @@ impl QueryControlPort for FrontendQueryControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks::query_execution::control::QueryControlPort;
+    use crate::query_execution::control::QueryControlPort;
 
     fn register(control: &FrontendQueryControl, id: u32, principal: &str) -> SessionToken {
         control

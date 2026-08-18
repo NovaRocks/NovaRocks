@@ -32,7 +32,7 @@ use novarocks_spi::connector::{
 };
 
 /// Loads the current schema facts used to validate a persisted MV contract.
-pub(crate) fn observe_schema_validation_for_table(
+pub fn observe_schema_validation_for_table(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
@@ -77,7 +77,7 @@ pub fn observe_current_refresh_base(
 /// needed by refresh planning. This is MV-domain schema work; it deliberately
 /// receives the individual observation ports rather than a query-assembly
 /// source object.
-pub(crate) fn rebind_mv_definition_before_refresh_derivation(
+pub fn rebind_mv_definition_before_refresh_derivation(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     mv_definition: &StoredMvDefinition,

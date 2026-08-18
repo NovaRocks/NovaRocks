@@ -11,14 +11,14 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::transport::Channel;
 
-use novarocks::common::network::format_host_for_url;
-use novarocks::query_execution::artifact::ConnectorBindingDispatcher;
-use novarocks::query_execution::backend::{BeId, HeartbeatOutcome, LiveBackendTarget};
-use novarocks::query_execution::fragment_transport::{
+use crate::common::backend_topology::{BeId, HeartbeatOutcome, LiveBackendTarget};
+use crate::common::network::format_host_for_url;
+use crate::protocol::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
 };
-use novarocks::query_execution::lifecycle_plan::QueryLifecycleTarget;
-use novarocks::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
+use crate::query_execution::artifact::ConnectorBindingDispatcher;
+use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
+use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use novarocks::service::observe_backend_heartbeat_rtt;
 use novarocks_protocol::common::UniqueId as ProtoUniqueId;
 use novarocks_protocol::lifecycle::{
@@ -237,7 +237,7 @@ impl ConnectorBindingControl {
 impl ConnectorBindingDispatcher for ConnectorBindingControl {
     fn install(
         &self,
-        execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+        execution_id: crate::query_lifecycle::QueryExecutionId,
         backend_idx: usize,
         endpoint: SocketAddr,
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,

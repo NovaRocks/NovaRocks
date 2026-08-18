@@ -25,10 +25,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 
-use novarocks::mv::repository::MvTarget;
-use novarocks::query_execution::cancellation::{
+use crate::common::query_cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
+use novarocks::mv::repository::MvTarget;
 
 /// A stable, provider-neutral identity for the MV whose activity is being
 /// serialized.  Inputs must already have passed SQL/catalog canonicalization;

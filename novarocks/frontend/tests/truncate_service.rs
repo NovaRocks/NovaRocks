@@ -22,16 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::query_execution::backend::BackendTopologySnapshot;
-use novarocks::query_execution::cancellation::QueryCancellationSource;
-use novarocks::query_execution::dml::truncate::{
-    PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateDispatchState, TruncateEffect,
-    TruncateEngine, TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization,
-    TruncateOutcome, TruncatePlanError, TruncatePlanFacts, TruncatePlanSummary, TruncatePrepared,
-    TruncateReceipt, parse_truncate_command,
-};
-use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
-use novarocks::statistics::EmptyStatisticsService;
+use novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
+use novarocks::common::backend_topology::BackendTopologySnapshot;
+use novarocks::common::query_cancellation::QueryCancellationSource;
+use novarocks_frontend::FrontendStatisticsService;
 use novarocks_frontend::dml::model::{
     DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_OPERATION_SCHEMA_VERSION,
     DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
@@ -44,6 +38,12 @@ use novarocks_frontend::dml::{
     CreatePreparingRequest, CreateStatementOperationRequest, DmlError, DmlErrorKind,
     DmlOperationId, DmlService, OperationFact, OperationJournal, OperationMutationRequest,
     OperationPayload, OperationState, StatementNextAction, StoredOperation, TruncateLifecyclePhase,
+};
+use novarocks_frontend::query_execution::dml::truncate::{
+    PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateDispatchState, TruncateEffect,
+    TruncateEngine, TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization,
+    TruncateOutcome, TruncatePlanError, TruncatePlanFacts, TruncatePlanSummary, TruncatePrepared,
+    TruncateReceipt, parse_truncate_command,
 };
 use novarocks_spi::connector::{
     ConnectorDataMutationPlanSummary, ConnectorDataMutationReceipt, ConnectorInstanceDescriptor,
@@ -142,7 +142,7 @@ impl TruncateEngine for FakeTruncateEngine {
     /// provider's marker publication itself.
     fn establish_truncate_external_fence(
         &self,
-        _prepared: &dyn novarocks::query_execution::dml::truncate::TruncatePrepared,
+        _prepared: &dyn novarocks_frontend::query_execution::dml::truncate::TruncatePrepared,
         fence: novarocks_spi::connector::ConnectorExternalOperationFence,
     ) -> Result<
         novarocks_spi::connector::ConnectorExternalFenceReceipt,
@@ -431,7 +431,7 @@ impl FakeJournal {
     }
 
     fn fail_mutation_at(&self, call: usize) {
-        let error = DmlService::compose(None, Arc::new(EmptyStatisticsService))
+        let error = DmlService::compose(None, Arc::new(FrontendStatisticsService::new()))
             .list_operations()
             .unwrap_err();
         *self.fail_mutation_at.lock().unwrap() = Some(call);
@@ -444,7 +444,7 @@ impl FakeJournal {
     }
 
     fn journal_limit_error() -> DmlError {
-        DmlService::compose(None, Arc::new(EmptyStatisticsService))
+        DmlService::compose(None, Arc::new(FrontendStatisticsService::new()))
             .list_operations()
             .unwrap_err()
     }
@@ -678,7 +678,7 @@ fn harness(engine: &mut FakeTruncateEngine) -> (TestService, Arc<FakeJournal>) {
     let coordination = common::coordination_fixture::open_blocking("truncate-service-test");
     let dml = DmlService::compose_with_coordination(
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::new(EmptyStatisticsService),
+        Arc::new(FrontendStatisticsService::new()),
         Arc::clone(&coordination.coordination),
         coordination.handle(),
     );
@@ -775,7 +775,7 @@ fn truncate_requires_journal_before_plan_and_reports_stable_operation_id() {
             finalization_failure: None,
         },
     );
-    let service = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+    let service = DmlService::compose(None, Arc::new(FrontendStatisticsService::new()));
     let (context, _, _) = admitted_context();
     let error = service
         .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)

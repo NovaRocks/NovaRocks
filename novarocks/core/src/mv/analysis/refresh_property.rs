@@ -19,7 +19,7 @@ pub(crate) fn derive_imv_refresh_contract(
     ))
 }
 
-pub(crate) fn derive_fragment_property(
+pub fn derive_fragment_property(
     analysis: &crate::mv::analysis::MvAnalysis,
 ) -> Result<RefreshFragmentProperty, String> {
     analysis.refresh_input.refresh_property()

@@ -54,13 +54,13 @@ use novarocks_spi::connector::{
 /// [`ConnectorControlPlanningLease`] is `Debug`, precisely so an opaque
 /// provider handle and a live generation cannot end up in a log line.
 #[derive(Clone)]
-pub(crate) struct ConnectorWriteTargetBinding {
+pub struct ConnectorWriteTargetBinding {
     metadata: ConnectorTableMetadata,
     lease: ConnectorControlPlanningLease,
 }
 
 impl ConnectorWriteTargetBinding {
-    pub(crate) const fn new(
+    pub const fn new(
         metadata: ConnectorTableMetadata,
         lease: ConnectorControlPlanningLease,
     ) -> Self {
@@ -72,20 +72,20 @@ impl ConnectorWriteTargetBinding {
     /// Write preparation must derive its lease from this one rather than
     /// re-resolving `latest`, otherwise a concurrent commit could split one
     /// statement across two generations.
-    pub(crate) const fn lease(&self) -> &ConnectorControlPlanningLease {
+    pub const fn lease(&self) -> &ConnectorControlPlanningLease {
         &self.lease
     }
 
-    pub(crate) const fn metadata(&self) -> &ConnectorTableMetadata {
+    pub const fn metadata(&self) -> &ConnectorTableMetadata {
         &self.metadata
     }
 
     /// Opaque provider handle. Core passes it through and never decodes it.
-    pub(crate) const fn handle(&self) -> &ConnectorTableHandle {
+    pub const fn handle(&self) -> &ConnectorTableHandle {
         &self.metadata.table
     }
 
-    pub(crate) const fn identity(&self) -> &ConnectorTableIdentity {
+    pub const fn identity(&self) -> &ConnectorTableIdentity {
         &self.metadata.identity
     }
 
@@ -93,7 +93,7 @@ impl ConnectorWriteTargetBinding {
     ///
     /// This replaces reading `current_schema()` off a concrete provider table:
     /// column shaping, projection and default filling all work from here.
-    pub(crate) fn arrow_schema(&self) -> &arrow::datatypes::SchemaRef {
+    pub fn arrow_schema(&self) -> &arrow::datatypes::SchemaRef {
         &self.metadata.schema
     }
 
@@ -103,7 +103,7 @@ impl ConnectorWriteTargetBinding {
     /// overrides are all bounded neutral planning facts. Keeping this
     /// projection here avoids loading or decoding a concrete provider table in
     /// statement planning.
-    pub(crate) fn dml_target_columns(&self) -> Vec<novarocks_catalog::schema::ColumnDef> {
+    pub fn dml_target_columns(&self) -> Vec<novarocks_catalog::schema::ColumnDef> {
         self.metadata
             .schema
             .fields()
@@ -135,7 +135,7 @@ impl ConnectorWriteTargetBinding {
     }
 
     /// Derive the write lease for this statement from the same generation.
-    pub(crate) fn derive_write_lease(&self) -> Result<ConnectorWriteLease, String> {
+    pub fn derive_write_lease(&self) -> Result<ConnectorWriteLease, String> {
         self.lease
             .derive_write_lease()
             .map_err(|error| error.to_string())
@@ -143,7 +143,7 @@ impl ConnectorWriteTargetBinding {
 
     /// Ask the exact generation that resolved this target to sign one row
     /// mutation. The opaque table handle is passed through unchanged.
-    pub(crate) fn prepare_row_mutation(
+    pub fn prepare_row_mutation(
         &self,
         target_ref: &str,
         operation_id: ConnectorWriteOperationId,
@@ -179,7 +179,7 @@ impl ConnectorWriteTargetBinding {
     /// than claiming it is the opaque base sealed into a write preparation.
     /// Those two facts can differ if the external ref moves; harmonizing them
     /// is a separate lifecycle change.
-    pub(crate) fn journal_ref_head_snapshot_id(
+    pub fn journal_ref_head_snapshot_id(
         &self,
         target_ref: &str,
         context: ConnectorRequestContext,
@@ -209,7 +209,7 @@ impl ConnectorWriteTargetBinding {
 /// Mirrors `load_mv_target_binding`: acquire one planning lease, then load the
 /// table metadata through that same lease, so the schema, planning facts and
 /// opaque handle cannot drift apart.
-pub(crate) fn load_write_target_binding(
+pub fn load_write_target_binding(
     controls: &dyn ConnectorControlResolver,
     catalog: &str,
     namespace: &str,

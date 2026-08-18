@@ -25,8 +25,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::query_execution::dml::ctas::CtasEngine;
 use bytes::Bytes;
-use novarocks::query_execution::dml::ctas::CtasEngine;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorCtasActionId, ConnectorCtasAdvanceFenceRequest,
     ConnectorCtasFailure, ConnectorCtasOperationId, ConnectorCtasProofPurpose,
@@ -1639,8 +1639,8 @@ mod tests {
     use std::sync::{Barrier, Mutex};
 
     use super::*;
+    use crate::query_execution::dml::ctas::*;
     use async_trait::async_trait;
-    use novarocks::query_execution::dml::ctas::*;
     use novarocks_spi::connector::{
         ConnectorClusterIdentity, ConnectorCtasAbortResult, ConnectorCtasPublishResult,
         ConnectorCtasStagedLocator, ConnectorError, ConnectorErrorKind,
@@ -1982,8 +1982,8 @@ mod tests {
 
         fn bind_ctas_write_native_bundle(
             &self,
-            _prepared: &dyn novarocks::query_execution::dml::ctas::CtasPreparedWrite,
-            _native_bundle: novarocks::query_execution::native_fragment::NativeFragmentAttachment,
+            _prepared: &dyn crate::query_execution::dml::ctas::CtasPreparedWrite,
+            _native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
         ) -> Result<(), CtasFailure> {
             unreachable!("recovery never assembles native writers")
         }

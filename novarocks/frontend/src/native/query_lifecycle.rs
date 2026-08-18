@@ -1,5 +1,5 @@
 //! Frontend-local lifecycle transport ports.
-use novarocks::query_execution::lifecycle_plan::QueryLifecycleTarget;
+use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use novarocks_protocol::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,

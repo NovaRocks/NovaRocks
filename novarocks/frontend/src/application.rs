@@ -20,8 +20,8 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks::query_execution::dml::ctas::CtasEngine;
-use novarocks::query_execution::service::QueryExecutionService;
+use crate::query_execution::dml::ctas::CtasEngine;
+use crate::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 use novarocks_state_store::{
@@ -45,6 +45,7 @@ use crate::mv::{
     FrontendMvRefreshProviderActivationPort, FrontendMvService, repository::StateStoreMvRepository,
 };
 use crate::query_control::FrontendQueryControl;
+use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::statistics::FrontendStatisticsService;
 use crate::statistics_jobs::repository::StatisticsJobRepository;
 use crate::statistics_jobs::service::{
@@ -124,8 +125,8 @@ pub struct FrontendApplicationHost {
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
     catalog_controller: Option<Arc<FrontendCatalogController>>,
-    view_service: Option<Arc<dyn novarocks::view::ViewService>>,
-    table_maintenance_service: Option<Arc<dyn novarocks::maintenance::TableMaintenanceService>>,
+    view_service: Option<Arc<dyn crate::view::ViewService>>,
+    table_maintenance_service: Option<Arc<dyn TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn novarocks::mv::repository::MvRepository>>,
     mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
     mv_service: Option<Arc<FrontendMvService>>,
@@ -134,7 +135,7 @@ pub struct FrontendApplicationHost {
     state_store_host: Option<StateStoreHost>,
     coordination: Option<Arc<FrontendCoordinationRuntime>>,
     query_execution: Option<QueryExecutionService>,
-    query_control: novarocks::query_execution::control::QueryControlService,
+    query_control: crate::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     execution_role: novarocks_types::ClusterRole,
     topology: Option<Arc<ClusterBackendService>>,
@@ -696,7 +697,7 @@ impl FrontendApplicationHost {
         Ok(host)
     }
 
-    pub fn view_service(&self) -> Arc<dyn novarocks::view::ViewService> {
+    pub fn view_service(&self) -> Arc<dyn crate::view::ViewService> {
         Arc::clone(
             self.view_service
                 .as_ref()
@@ -768,9 +769,7 @@ impl FrontendApplicationHost {
         Arc::clone(&self.catalog_runtime_projection)
     }
 
-    pub fn table_maintenance_service(
-        &self,
-    ) -> Arc<dyn novarocks::maintenance::TableMaintenanceService> {
+    pub fn table_maintenance_service(&self) -> Arc<dyn TableMaintenanceService> {
         Arc::clone(
             self.table_maintenance_service
                 .as_ref()
@@ -806,10 +805,10 @@ impl FrontendApplicationHost {
 
     pub fn mv_refresh_provider_activation_sink(
         &self,
-    ) -> Option<Arc<dyn novarocks::query_execution::mv_native_write::MvRefreshProviderActivationSink>>
+    ) -> Option<Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivationSink>>
     {
         self.mv_refresh_provider_activation.as_ref().map(|port| {
-            Arc::clone(port) as Arc<dyn novarocks::query_execution::mv_native_write::MvRefreshProviderActivationSink>
+            Arc::clone(port) as Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivationSink>
         })
     }
 
@@ -865,15 +864,11 @@ impl FrontendApplicationHost {
             .clone()
     }
 
-    pub fn query_control_service(
-        &self,
-    ) -> novarocks::query_execution::control::QueryControlService {
+    pub fn query_control_service(&self) -> crate::query_execution::control::QueryControlService {
         self.query_control.clone()
     }
 
-    pub fn terminal_ingress(
-        &self,
-    ) -> Arc<dyn novarocks::query_execution::lifecycle::QueryTerminalIngress> {
+    pub fn terminal_ingress(&self) -> Arc<dyn crate::query_lifecycle::QueryTerminalIngress> {
         Arc::new(
             self.coordinator
                 .as_ref()
@@ -892,12 +887,12 @@ impl FrontendApplicationHost {
     #[cfg(test)]
     pub(crate) fn execute_distributed_query_for_test(
         &self,
-        request: novarocks::query_execution::contract::DistributedQueryRequest,
+        request: crate::query_execution::contract::DistributedQueryRequest,
     ) -> Result<
-        novarocks::query_execution::contract::DistributedQueryOutcome,
-        novarocks::query_execution::contract::DistributedQueryError,
+        crate::query_execution::contract::DistributedQueryOutcome,
+        crate::query_execution::contract::DistributedQueryError,
     > {
-        novarocks::query_execution::contract::DistributedQueryCoordinator::execute(
+        crate::query_execution::contract::DistributedQueryCoordinator::execute(
             self.coordinator
                 .as_ref()
                 .expect("frontend coordinator is installed before host open returns")
@@ -915,13 +910,13 @@ impl FrontendApplicationHost {
 
     pub fn backend_query_event_sink(
         &self,
-    ) -> Arc<dyn novarocks::query_execution::backend::BackendQueryEventSink> {
+    ) -> Arc<dyn crate::common::backend_topology::BackendQueryEventSink> {
         Arc::new(self.backend_query_activity())
     }
 
     pub fn coordinator_report_endpoint_sink(
         &self,
-    ) -> Arc<dyn novarocks::query_execution::backend::CoordinatorReportEndpointSink> {
+    ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
         self.coordinator
             .as_ref()
             .expect("frontend coordinator is installed before host open returns")
@@ -931,10 +926,8 @@ impl FrontendApplicationHost {
     /// Frontend composition-time topology leaf.  The all-in-one server uses it
     /// only to register its separately owned backend endpoint before it builds
     /// the same ready SQL session factory as role=fe.
-    pub fn backend_topology_port(
-        &self,
-    ) -> novarocks::query_execution::backend::BackendTopologyService {
-        Arc::clone(self.topology()) as novarocks::query_execution::backend::BackendTopologyService
+    pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
+        Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
     }
 
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {

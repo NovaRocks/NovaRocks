@@ -23,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
     ContractError, ContractErrorCode, QueryAbortRequest, QueryControlAttach,
     QueryControlCommand as ProtocolQueryControlCommand, QueryControlEvent, QueryExecutionId,

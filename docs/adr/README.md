@@ -231,16 +231,20 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 ### table-maintenance
 
-领域哲学：表维护的 application/lifecycle 由 frontend host 统一拥有，core 只提供一对一、consumer-owned 的 typed
-engine port，connector 保留 catalog、snapshot、file 与 commit 等 external-system truth。Optimize job 以 StateStore
-为唯一 durable truth；单 FE 恢复与未来多 FE lease/fence/takeover 分阶段决策，不以 SPI、service locator、双写或
-内存 fallback 模糊 owner 和故障语义。
+领域哲学：表维护的 application/lifecycle 与 execution port 都由 frontend host 统一拥有；connector 保留 catalog、
+snapshot、file 与 commit 等 external-system truth，聚合 core 仅保留中立 DTO。Optimize job 以 StateStore 为唯一
+durable truth；单 FE 恢复与未来多 FE lease/fence/takeover 分阶段决策，不以 SPI、service locator、双写或内存
+fallback 模糊 owner 和故障语义。
 
-- ADR-0009 — 表维护为何由 frontend 拥有 application/lifecycle，并通过 core domain port 调用 connector truth（active）
+- ADR-0083 — 表维护 execution port 为何必须随 query assembly 归 Frontend，不能以 Core cohort bridge 留存（active）
 - ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（active）
 - ADR-0057 — MV 维护事实为何按「是否需要 provider runtime IO」切成观测口投影与 SPI capability 两条通道（active）
 - ADR-0065 — 同一张表的维护为何以单个 per-table lease attempt 为唯一派发权威、并在同事务内校验 fence（active）
 - ADR-0067 — 收敛已死 generation 的维护为何是独立 provider capability，而不是放宽 exact-generation reconcile（active）
+
+#### 历史
+
+- ADR-0009 — 表维护为何由 frontend 拥有 application/lifecycle，并通过 core domain port 调用 connector truth（superseded → ADR-0083）
 
 ### crate-boundary
 

@@ -21,13 +21,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
-use novarocks::view::{
-    ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult,
-};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_spi::state_store::StateStore;
@@ -37,9 +34,16 @@ use sqlparser::parser::Parser;
 use tokio::runtime::Handle;
 
 pub(crate) mod command;
+pub mod engine;
 mod iceberg;
 pub mod repository;
 mod rewrite;
+
+pub use engine::{
+    CreateExternalViewRequest, EmptyViewService, ExternalViewResolution, ResolvedExternalView,
+    ViewColumnDefinition, ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect,
+    ViewStatementResult, ViewTarget,
+};
 
 use repository::{DatabaseMutation, StoredDatabaseViewsV1, ViewRepository};
 

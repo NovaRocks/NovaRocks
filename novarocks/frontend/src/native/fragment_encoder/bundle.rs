@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use novarocks::query_execution::native_fragment::{
+pub use crate::query_execution::native_fragment::{
     NativeFragmentAttachment, NativeFragmentEncodingView,
 };
 

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 pub(crate) use self::type_mapping::encode_type;
 use super::expr::encode_expr;
-use novarocks::query_execution::preparation::NativeScanFactsView;
+use crate::query_execution::preparation::NativeScanFactsView;
 use novarocks_protocol::{common, plan};
 use novarocks_sql::plan_read::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,

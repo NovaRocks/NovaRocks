@@ -18,9 +18,9 @@
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotWindow {
-    pub(crate) from: i64,
-    pub(crate) to: i64,
+pub struct SnapshotWindow {
+    pub from: i64,
+    pub to: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub(crate) const JOIN_RIGHT_ROW_ID_COLUMN: &str = "__nova_right_row_id";
 pub(crate) const JOIN_DELTA_TARGET_LOCATOR_TABLE: &str = "__nr_join_delta_target_locator";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct JoinDeltaBranchPlan {
+pub struct JoinDeltaBranchPlan {
     pub(crate) left_base: novarocks_catalog::identifier::TableIdentity,
     pub(crate) right_base: novarocks_catalog::identifier::TableIdentity,
     pub(crate) left: BranchSide,
@@ -57,7 +57,7 @@ impl JoinDeltaBranchPlan {
     }
 }
 
-pub(crate) fn plan_join_delta_branches(
+pub fn plan_join_delta_branches(
     left_base: &novarocks_catalog::identifier::TableIdentity,
     right_base: &novarocks_catalog::identifier::TableIdentity,
     left_window: SnapshotWindow,

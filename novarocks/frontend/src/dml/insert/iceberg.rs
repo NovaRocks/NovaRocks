@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use novarocks::query_execution::dml::insert::{
+use crate::query_execution::dml::insert::{
     IcebergInsertCommit, IcebergWriteReport, InsertEngine, PreparedIcebergInsert,
 };
 

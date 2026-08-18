@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::query_execution::dml::insert::{InsertOverwriteMode, InsertTargetName, InsertValue};
+use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertTargetName, InsertValue};
 use sqlparser::ast as sqlast;
 
 const DYNAMIC_OVERWRITE_MARKER: &str = "__nr_op_dyn";
@@ -335,9 +335,8 @@ fn function_to_insert_value(function: &sqlast::Function) -> Result<InsertValue, 
             let InsertValue::String(json_text) = expr_to_insert_value(args[0])? else {
                 return Err("parse_json expects VARCHAR argument".to_string());
             };
-            let bytes =
-                novarocks::query_execution::dml::insert::encode_insert_variant_json(&json_text)
-                    .map_err(|error| format!("parse_json failed: {error}"))?;
+            let bytes = crate::query_execution::dml::insert::encode_insert_variant_json(&json_text)
+                .map_err(|error| format!("parse_json failed: {error}"))?;
             Ok(InsertValue::String(
                 bytes.into_iter().map(char::from).collect(),
             ))

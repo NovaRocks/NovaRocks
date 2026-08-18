@@ -17,9 +17,9 @@
 
 //! Frontend-owned command executor for external-view statements.
 
-use novarocks::query_execution::StatementResult;
-use novarocks::query_execution::kernels::ViewExecutionKernel;
-use novarocks::view::{ViewRequestContext, ViewService, ViewStatementResult};
+use crate::query_execution::kernels::ViewExecutionKernel;
+use crate::runtime::statement_result::StatementResult;
+use crate::view::{ViewRequestContext, ViewService, ViewStatementResult};
 use novarocks_spi::connector::ConnectorRequestContext;
 
 #[derive(Clone)]

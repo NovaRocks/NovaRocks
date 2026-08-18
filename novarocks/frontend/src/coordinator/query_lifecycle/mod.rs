@@ -28,4 +28,4 @@ pub(super) use crate::native::query_lifecycle::{
     QueryControlSession, QueryLifecycleTransport, QueryLifecycleTransportError,
     QueryLifecycleTransportErrorKind,
 };
-pub(super) use novarocks::query_execution::lifecycle_plan::QueryLifecycleTarget;
+pub(super) use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;

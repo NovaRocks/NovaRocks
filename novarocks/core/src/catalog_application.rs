@@ -30,14 +30,14 @@ use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
 use uuid::Uuid;
 
 pub mod command;
-pub(crate) mod create_table_ddl;
+pub mod create_table_ddl;
 pub mod iceberg_ref_command;
 pub mod information_schema;
-pub(crate) mod query_bindings;
+pub mod query_bindings;
 pub mod query_catalog;
 pub mod query_materializer;
 pub mod resolver;
-pub(crate) mod statement;
+pub mod statement;
 pub mod system_catalog;
 pub mod virtual_table;
 
@@ -538,68 +538,5 @@ mod tests {
             bound.admit_catalog(&current.instance_id),
             CatalogAdmission::Unavailable { .. }
         ));
-    }
-
-    fn test_controls() -> Arc<dyn novarocks_spi::connector::ConnectorControlResolver> {
-        Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default())
-            as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>
-    }
-
-    #[test]
-    fn binding_a_query_catalog_replays_publications_and_revokes_on_unpublish() {
-        let projection = CatalogRuntimeProjection::new();
-        let replayed = observation();
-        projection
-            .publish_catalog_runtime(replayed.clone())
-            .expect("publish before the engine exists");
-
-        let service =
-            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
-        projection
-            .bind_query_catalog(Arc::clone(&service), test_controls())
-            .expect("bind the engine query catalog");
-        // A catalog published before engine open must still resolve afterwards.
-        service
-            .invalidate_table(replayed.instance_id.as_str(), "ns", "orders")
-            .expect("replayed catalog is registered");
-
-        let later = CatalogRuntimeObservation {
-            attachment_id: Uuid::now_v7(),
-            instance_id: ConnectorInstanceId::parse("later").expect("instance"),
-            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
-            generation: 1,
-        };
-        projection
-            .publish_catalog_runtime(later.clone())
-            .expect("publish after bind");
-        service
-            .invalidate_table(later.instance_id.as_str(), "ns", "orders")
-            .expect("later catalog is registered");
-
-        // A stale generation must not revoke the live SQL name.
-        projection
-            .unpublish_catalog_runtime(&later.instance_id, later.generation + 1)
-            .expect("ignore stale unpublish");
-        service
-            .invalidate_table(later.instance_id.as_str(), "ns", "orders")
-            .expect("live catalog survives a stale unpublish");
-
-        projection
-            .unpublish_catalog_runtime(&later.instance_id, later.generation)
-            .expect("unpublish the live generation");
-        assert!(
-            service
-                .invalidate_table(later.instance_id.as_str(), "ns", "orders")
-                .is_err(),
-            "unpublishing must revoke the SQL catalog name"
-        );
-
-        assert_eq!(
-            projection
-                .bind_query_catalog(service, test_controls())
-                .expect_err("one publication set serves exactly one engine")
-                .kind(),
-            CatalogApplicationErrorKind::Conflict
-        );
     }
 }

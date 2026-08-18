@@ -294,7 +294,8 @@ mod tests {
             .try_execute("SHOW TABLE STATS ice.analytics.orders", None, "default")
             .expect("show typed table stats")
             .expect("statistics command result");
-        let novarocks::query_execution::StatementResult::Query(show_stats) = show_stats else {
+        let crate::runtime::statement_result::StatementResult::Query(show_stats) = show_stats
+        else {
             panic!("SHOW TABLE STATS must return a query result");
         };
         assert_eq!(show_stats.columns[0].name, "metric");

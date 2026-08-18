@@ -25,16 +25,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use arrow::array::StringArray;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
-use novarocks::query_execution::backend::{
+use crate::common::backend_topology::{
     BackendQueryEvent, BackendQueryEventSink, BackendTopologyError, BackendTopologyMetricsSnapshot,
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome,
     LiveBackendTarget, publish_backend_topology_metrics,
 };
-use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use arrow::array::StringArray;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use novarocks_spi::state_store::{
     CommitResolution, Key, Precondition, StateRecord, StateStore, Value,
 };
@@ -582,7 +582,7 @@ impl ClusterBackendService {
         )
         .expect("valid test topology configuration");
         let runtime = Handle::try_current().unwrap_or_else(|_| {
-            novarocks::runtime::global_async_runtime::data_runtime_handle()
+            crate::runtime::global_async_runtime::data_runtime_handle()
                 .expect("initialize data runtime for topology test")
         });
         Self::new(
@@ -1536,7 +1536,7 @@ fn invalid_state_store_request(
 mod tests {
     use std::net::SocketAddr;
 
-    use novarocks::query_execution::backend::{BackendTopologyPort, LiveBackendTarget};
+    use crate::common::backend_topology::{BackendTopologyPort, LiveBackendTarget};
 
     use super::{
         ClusterBackendOpenConfig, ClusterBackendService, DesiredBackendState,

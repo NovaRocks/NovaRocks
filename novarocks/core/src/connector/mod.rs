@@ -16,26 +16,26 @@
 // under the License.
 pub mod backend;
 pub mod cleanup_maintenance;
-pub(crate) mod data_mutation;
+pub mod data_mutation;
 pub mod distributed_rewrite_application;
 pub mod file_execution;
 pub mod metadata_maintenance;
 pub mod mutation;
 pub mod runtime;
-pub(crate) mod scan_admission;
-pub(crate) mod scan_model;
+pub mod scan_admission;
+pub mod scan_model;
 pub mod schema;
-pub(crate) mod stats;
-pub(crate) mod unified_statistics;
-pub(crate) mod write_target;
+pub mod stats;
+pub mod unified_statistics;
+pub mod write_target;
 
 pub use backend::MvBackend;
 use novarocks_protocol::lifecycle::QueryOptions;
-#[cfg(test)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -59,7 +59,7 @@ impl ConnectorCancellation for RequestConnectorCancellation {
 }
 
 struct QueryConnectorCancellation {
-    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
 }
 
 impl ConnectorCancellation for QueryConnectorCancellation {
@@ -82,7 +82,7 @@ fn build_connector_request_context(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn connector_request_context(
+pub fn connector_request_context(
     query_options: Option<&QueryOptions>,
     cancellation_signal: Arc<AtomicBool>,
 ) -> Result<ConnectorRequestContext, String> {
@@ -100,7 +100,7 @@ pub(crate) fn connector_request_context(
 /// provider requests share the statement cancellation identity and options.
 pub fn connector_request_context_for_query(
     query_options: Option<&QueryOptions>,
-    cancellation: crate::query_execution::cancellation::QueryCancellationView,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
     build_connector_request_context(
         query_options,
@@ -113,7 +113,7 @@ pub fn connector_request_context_for_query(
 /// admission deadline use the bounded connector fallback.
 pub fn connector_request_context_for_execution(
     query_options: Option<&QueryOptions>,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<ConnectorRequestContext, String> {
     let cancellation: Arc<dyn ConnectorCancellation> = Arc::new(QueryConnectorCancellation {
         cancellation: execution.cancellation().clone(),
@@ -141,7 +141,7 @@ fn query_expire_duration(query_options: Option<&QueryOptions>) -> Duration {
     Duration::from_secs(query_timeout as u64)
 }
 
-pub(crate) fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), String> {
+pub fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), String> {
     if context.cancellation().is_cancelled() {
         return Err("connector request was cancelled".to_string());
     }
@@ -151,8 +151,8 @@ pub(crate) fn validate_request_context(context: &ConnectorRequestContext) -> Res
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn test_request_context() -> ConnectorRequestContext {
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub fn test_request_context() -> ConnectorRequestContext {
     connector_request_context(None, Arc::new(AtomicBool::new(false)))
         .expect("test connector request context")
 }
@@ -162,9 +162,9 @@ mod request_context_tests {
     use std::time::{Duration, Instant};
 
     use super::{connector_request_context_for_execution, query_expire_duration};
-    use crate::query_execution::backend::BackendTopologySnapshot;
-    use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
-    use crate::query_execution::request_context::{RequestAdmission, RequestContext};
+    use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 
@@ -243,7 +243,7 @@ fn metadata_binding(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn metadata_namespace_exists(
+pub fn metadata_namespace_exists(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: ConnectorRequestContext,
     catalog: &str,
@@ -264,7 +264,7 @@ pub(crate) fn metadata_namespace_exists(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn metadata_table_exists(
+pub fn metadata_table_exists(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: ConnectorRequestContext,
     catalog: &str,
@@ -278,7 +278,7 @@ pub(crate) fn metadata_table_exists(
 /// Resolve table existence through an admission-frozen planning lease.  A
 /// caller that performs a table-or-view decision must retain this lease for
 /// every metadata lookup in that decision.
-pub(crate) fn metadata_table_exists_with_planning_lease(
+pub fn metadata_table_exists_with_planning_lease(
     binding: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
     namespace: &str,
@@ -303,7 +303,7 @@ pub(crate) fn metadata_table_exists_with_planning_lease(
 /// Enumerate namespaces through an admission-frozen connector control lease.
 /// Ordering and duplicate handling stay application-owned so providers only
 /// expose their authoritative catalog facts.
-pub(crate) fn metadata_list_namespaces_with_planning_lease(
+pub fn metadata_list_namespaces_with_planning_lease(
     binding: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
 ) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
@@ -320,7 +320,7 @@ pub(crate) fn metadata_list_namespaces_with_planning_lease(
 
 /// Read immutable branch/tag/snapshot facts through the same exact lease that
 /// admitted the table.  SQL owns the projection of these neutral facts.
-pub(crate) fn metadata_read_reference_facts_with_planning_lease(
+pub fn metadata_read_reference_facts_with_planning_lease(
     binding: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
     namespace: &str,
@@ -341,7 +341,7 @@ pub(crate) fn metadata_read_reference_facts_with_planning_lease(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn metadata_load_table(
+pub fn metadata_load_table(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: ConnectorRequestContext,
     catalog: &str,
@@ -356,7 +356,7 @@ pub(crate) fn metadata_load_table(
 /// Resolve metadata through an admission-frozen planning lease.  Write
 /// callers use this instead of reopening `acquire_current` after target
 /// admission.
-pub(crate) fn metadata_load_table_with_planning_lease(
+pub fn metadata_load_table_with_planning_lease(
     binding: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
     namespace: &str,
@@ -406,7 +406,7 @@ pub(crate) fn metadata_load_table_with_planning_lease(
 /// Consumers that need provider-owned interpretation must pass this value to
 /// a composition-injected application port.  They must not decode the opaque
 /// table handle or reopen the current connector generation themselves.
-pub(crate) fn metadata_load_connector_table_with_planning_lease(
+pub fn metadata_load_connector_table_with_planning_lease(
     binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
     namespace: &str,
@@ -461,7 +461,7 @@ fn sql_columns_from_connector_schema(
 /// Facts are optional by contract: a provider with no column defaults returns
 /// empty facts, and the column then behaves exactly as it did before defaults
 /// were expressible.
-pub(crate) fn connector_write_default_at(
+pub fn connector_write_default_at(
     planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
     ordinal: usize,
 ) -> Option<novarocks_catalog::schema::ColumnDefault> {
@@ -477,7 +477,7 @@ pub(crate) fn connector_write_default_at(
 /// The two vocabularies are variant-for-variant identical; they are separate
 /// types only because the SPI dependency ceiling admits no application value
 /// crate.
-pub(crate) fn connector_default_to_column_default(
+pub fn connector_default_to_column_default(
     value: &novarocks_spi::connector::ConnectorColumnDefault,
 ) -> novarocks_catalog::schema::ColumnDefault {
     use novarocks_catalog::schema::ColumnDefault;
@@ -557,7 +557,7 @@ pub(crate) fn connector_default_to_column_default(
     }
 }
 
-pub(crate) fn acquire_metadata_planning_lease(
+pub fn acquire_metadata_planning_lease(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     catalog: &str,
 ) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
@@ -819,7 +819,7 @@ mod tests {
 #[derive(Clone)]
 pub struct ConnectorRegistry {
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     fixture_controls: Arc<
         Mutex<
             BTreeMap<ConnectorInstanceId, Arc<novarocks_spi::connector::ConnectorControlBinding>>,
@@ -831,13 +831,13 @@ impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
             mv_backends: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             fixture_controls: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn register_fixture_control(
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+    pub fn register_fixture_control(
         &self,
         binding: novarocks_spi::connector::ConnectorControlBinding,
     ) {
@@ -847,7 +847,7 @@ impl ConnectorRegistry {
             .insert(binding.descriptor().instance_id.clone(), Arc::new(binding));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     fn acquire_fixture_control(
         &self,
         instance_id: &ConnectorInstanceId,
@@ -911,19 +911,19 @@ impl ConnectorRegistry {
 }
 
 /// Test-only resolver for fixtures that explicitly register a control binding.
-#[cfg(test)]
-pub(crate) struct FixtureControlResolver {
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub struct FixtureControlResolver {
     registry: ConnectorRegistry,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 impl FixtureControlResolver {
-    pub(crate) fn new(registry: ConnectorRegistry) -> Self {
+    pub fn new(registry: ConnectorRegistry) -> Self {
         Self { registry }
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 impl novarocks_spi::connector::ConnectorControlResolver for FixtureControlResolver {
     fn observe_current_binding(
         &self,

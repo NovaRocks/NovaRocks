@@ -9,7 +9,7 @@ use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RepartitionShape {
+pub enum RepartitionShape {
     ProjectionFilterSingleBase,
     AggregateSingleBase,
     JoinProjectionFilter,
@@ -31,7 +31,7 @@ impl RepartitionShape {
     }
 }
 
-pub(crate) fn select_repartition_shape(
+pub fn select_repartition_shape(
     capabilities: &RefreshCapabilities,
 ) -> Result<RepartitionShape, String> {
     match (

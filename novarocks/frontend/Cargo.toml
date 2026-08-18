@@ -15,6 +15,7 @@ arrow-buffer = "58.2.0"
 axum = "0.7"
 bytes = "1"
 chrono = "0.4"
+datasketches = "0.2.0"
 futures = "0.3"
 hex = "0.4"
 novarocks = { path = "../core" }
@@ -27,6 +28,7 @@ novarocks-sql = { path = "../sql" }
 novarocks-state-store = { path = "../state-store" }
 novarocks-types = { path = "../types" }
 prost = "0.13"
+regex = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

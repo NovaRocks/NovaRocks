@@ -53,7 +53,7 @@ use novarocks_sql::planning::mv::{
 /// Optimizer rewrite rules consume `Arc<IcebergMvRewriteContext>` without
 /// depending on concrete execution handles owned by the engine adapter.
 #[derive(Debug)]
-pub(crate) struct IcebergMvRewriteContext {
+pub struct IcebergMvRewriteContext {
     // ---- Identity ----
     pub target: TableIdentity,
     pub mv_id: i64,
@@ -118,7 +118,7 @@ impl IcebergMvRewriteContext {
     /// `target_table.metadata()`. Unit tests construct the rewrite layer
     /// directly via this helper without concrete execution handles.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         target: TableIdentity,
         mv_id: i64,
         current_catalog: Option<String>,
@@ -378,7 +378,7 @@ impl IcebergMvRewriteContext {
     /// input vocabulary. This is intentionally an application-side adapter:
     /// all connector schema access and persisted-contract interpretation end
     /// before the SQL compiler receives the resulting snapshot.
-    pub(crate) fn to_sql_rewrite_snapshot(
+    pub fn to_sql_rewrite_snapshot(
         &self,
         target_binding: SqlTableBindingId,
     ) -> Result<SqlImvRewriteSnapshotHandle, String> {
@@ -693,7 +693,7 @@ fn is_union_all_query(query: &sqlparser::ast::Query) -> bool {
 /// The first UNION ALL branch as a standalone `Query` (keeps the branch's own
 /// FROM — a scan, a join, or a fan-in union). Works off the AST so a composed
 /// branch is not classified.
-pub(crate) fn first_union_branch_query(
+pub fn first_union_branch_query(
     query: &sqlparser::ast::Query,
 ) -> Result<sqlparser::ast::Query, String> {
     fn first_branch_body(

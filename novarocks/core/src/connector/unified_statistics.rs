@@ -44,7 +44,7 @@ use novarocks_spi::connector::{
 /// these values into its own typed fatal vocabulary without importing a
 /// connector error or capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum StatisticsResolutionFailure {
+pub enum StatisticsResolutionFailure {
     OwnerMismatch,
     IncarnationMismatch,
     DataVersionMismatch,
@@ -53,7 +53,7 @@ pub(crate) enum StatisticsResolutionFailure {
 }
 
 #[derive(Clone)]
-pub(crate) struct ResolvedStatisticsTable {
+pub struct ResolvedStatisticsTable {
     pub table: ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
     pub incarnation: ConnectorInstanceIncarnation,
@@ -89,7 +89,7 @@ pub struct UnifiedStatisticsResolver {
 }
 
 impl UnifiedStatisticsResolver {
-    pub(crate) fn resolve(
+    pub fn resolve(
         &self,
         table: &ResolvedStatisticsTable,
         statistics: &dyn ConnectorStatistics,

@@ -4,12 +4,12 @@
 //! native runtime-filter canonical schema and digest construction used by both
 //! fragment bindings and participant deployment/install contributions.
 
-use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
-use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks::query_execution::{
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::{
     RuntimeFilterLogicalDomainFacts, RuntimeFilterNullOrder, RuntimeFilterNullSemantics,
     RuntimeFilterReductionFacts, RuntimeFilterSortDirection,
 };
+use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
 use novarocks_protocol::{common, plan};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
@@ -326,7 +326,7 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks::query_execution::RuntimeFilterOrderKeyFacts;
+    use crate::query_execution::RuntimeFilterOrderKeyFacts;
 
     fn digest(hex: &str) -> [u8; 32] {
         hex::decode(hex)

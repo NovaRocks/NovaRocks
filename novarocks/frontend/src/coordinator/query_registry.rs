@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks::query_execution::backend::LiveBackendTarget;
-use novarocks::query_execution::contract::{
+use crate::common::backend_topology::LiveBackendTarget;
+use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot;
@@ -170,7 +170,7 @@ impl FrontendQueryRegistry {
         self: &Arc<Self>,
         query_id: QueryId,
         _intent: DistributedQueryIntent,
-        _dispatcher: Arc<dyn novarocks::query_execution::fragment_transport::FragmentDispatcher>,
+        _dispatcher: Arc<dyn crate::protocol::native::fragment_transport::FragmentDispatcher>,
     ) -> Result<ActiveQueryGuard, DistributedQueryError> {
         let key = query_key(query_id);
         let mut active = self.active.lock().expect("frontend query registry lock");

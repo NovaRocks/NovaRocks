@@ -44,7 +44,7 @@ use crate::mv::storage_observation::MvRefreshTargetObservation;
 /// `ConnectorControlPlanningLease` are not `Debug` precisely so an opaque
 /// handle and a live generation cannot end up in a log line.
 #[derive(Clone)]
-pub(crate) struct MvTargetBinding {
+pub struct MvTargetBinding {
     metadata: ConnectorTableMetadata,
     lease: ConnectorControlPlanningLease,
     observation: MvRefreshTargetObservation,
@@ -68,20 +68,20 @@ impl MvTargetBinding {
     /// Downstream mutation and write preparation must reuse this lease rather
     /// than re-resolving `latest`, otherwise a concurrent commit could split
     /// one refresh attempt across two generations.
-    pub(crate) const fn lease(&self) -> &ConnectorControlPlanningLease {
+    pub const fn lease(&self) -> &ConnectorControlPlanningLease {
         &self.lease
     }
 
-    pub(crate) const fn metadata(&self) -> &ConnectorTableMetadata {
+    pub const fn metadata(&self) -> &ConnectorTableMetadata {
         &self.metadata
     }
 
     /// Opaque provider handle. Core passes it through and never decodes it.
-    pub(crate) const fn handle(&self) -> &ConnectorTableHandle {
+    pub const fn handle(&self) -> &ConnectorTableHandle {
         &self.metadata.table
     }
 
-    pub(crate) const fn identity(&self) -> &ConnectorTableIdentity {
+    pub const fn identity(&self) -> &ConnectorTableIdentity {
         &self.metadata.identity
     }
 
@@ -93,7 +93,7 @@ impl MvTargetBinding {
     /// provider field IDs. The planning facts identify them without exposing
     /// provider vocabulary. Hidden ordinary fields remain because MV apply
     /// keys and aggregate state are declared physical target fields.
-    pub(crate) fn physical_write_schema(&self) -> Result<SchemaRef, String> {
+    pub fn physical_write_schema(&self) -> Result<SchemaRef, String> {
         mv_target_physical_write_schema(
             &self.metadata.schema,
             &self.metadata.planning_facts,
@@ -101,27 +101,27 @@ impl MvTargetBinding {
         )
     }
 
-    pub(crate) const fn observation(&self) -> &MvRefreshTargetObservation {
+    pub const fn observation(&self) -> &MvRefreshTargetObservation {
         &self.observation
     }
 
-    pub(crate) fn table_uuid(&self) -> &str {
+    pub fn table_uuid(&self) -> &str {
         self.observation.table_uuid()
     }
 
-    pub(crate) const fn schema_id(&self) -> i32 {
+    pub const fn schema_id(&self) -> i32 {
         self.observation.schema_id()
     }
 
-    pub(crate) const fn partition(&self) -> &MvPartitionContract {
+    pub const fn partition(&self) -> &MvPartitionContract {
         self.observation.partition()
     }
 
-    pub(crate) const fn current_snapshot_id(&self) -> Option<i64> {
+    pub const fn current_snapshot_id(&self) -> Option<i64> {
         self.observation.current_snapshot_id()
     }
 
-    pub(crate) fn snapshot_id_for_ref(&self, ref_name: &str) -> Option<i64> {
+    pub fn snapshot_id_for_ref(&self, ref_name: &str) -> Option<i64> {
         self.observation.snapshot_id_for_ref(ref_name)
     }
 }
@@ -152,7 +152,7 @@ pub(crate) fn load_mv_target_binding_with_ports(
 ///
 /// This preserves atomicity when the caller already acquired the lease while
 /// resolving related target facts.
-pub(crate) fn load_mv_target_binding_with_lease_and_ports(
+pub fn load_mv_target_binding_with_lease_and_ports(
     storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     table: &TableIdentity,
     exact_lease: ConnectorControlPlanningLease,

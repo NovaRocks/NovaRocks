@@ -1,0 +1,824 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::common::backend_topology::BackendTopologySnapshot;
+use crate::common::query_cancellation::{
+    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
+};
+use crate::query_execution::artifact::{
+    BackendPlacement, ConnectorBindingInstallBarrier, ConnectorBindingInstallLease,
+    FragmentScheduleDraft, ValidatedFragmentSchedule, ValidatedNativeSubmission,
+    WriterRegistrationSet,
+};
+use crate::query_execution::contract::{
+    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
+    DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
+    build_distributed_query_request_with_execution,
+};
+use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch};
+use crate::query_execution::lifecycle_plan::{
+    QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLifecycleAbortOutcome,
+    QueryLifecycleLease, QueryLifecycleLeaseGuard,
+};
+use crate::query_execution::outcome::QueryOutcomeFactory;
+use crate::query_execution::service::QueryExecutionService;
+use crate::query_execution::statistics::{
+    StatisticsExecutionMode, StatisticsExecutionPolicy, ThetaSketchPartial,
+};
+use crate::query_execution::terminal_set::QueryTerminalSet;
+use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
+use crate::query_lifecycle::{AttemptId, QueryExecutionId};
+use bytes::Bytes;
+use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext {
+    QueryExecutionContext::new(
+        novarocks_types::ClusterRole::AllInOne,
+        BackendTopologySnapshot::empty(0),
+        None,
+        cancellation,
+        novarocks_sql::compiler::SessionOptimizerSettings::default(),
+    )
+}
+
+struct RecordingQueryLifecycleGuard {
+    finalizes: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+impl QueryLifecycleLeaseGuard for RecordingQueryLifecycleGuard {
+    fn finalize(mut self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError> {
+        self.armed = false;
+        self.finalizes.fetch_add(1, Ordering::SeqCst);
+        Ok(QueryTerminalSet::new(Vec::new()).expect("an empty test terminal set is valid"))
+    }
+
+    fn abort_preserving(mut self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome {
+        self.armed = false;
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        QueryLifecycleAbortOutcome::new(
+            format!("{primary_error}; query lifecycle rollback completed"),
+            None,
+        )
+    }
+}
+
+struct NoopConnectorBindingBarrier;
+
+impl ConnectorBindingInstallBarrier for NoopConnectorBindingBarrier {
+    fn install_all(
+        &self,
+        _execution_id: crate::query_lifecycle::QueryExecutionId,
+        _plan: crate::query_execution::artifact::ConnectorBindingInstallPlan,
+    ) -> Result<ConnectorBindingInstallLease, DistributedQueryError> {
+        Ok(ConnectorBindingInstallLease)
+    }
+}
+
+impl Drop for RecordingQueryLifecycleGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+struct RecordingQueryInitBarrier {
+    calls: Arc<AtomicUsize>,
+    participants: Arc<AtomicUsize>,
+    finalizes: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+}
+
+struct CapturingQueryInitBarrier {
+    plan: Arc<Mutex<Option<QueryInitPlan>>>,
+    finalizes: Arc<AtomicUsize>,
+    aborts: Arc<AtomicUsize>,
+}
+
+impl QueryInitBarrier for CapturingQueryInitBarrier {
+    fn initialize_all(
+        &self,
+        plan: QueryInitPlan,
+    ) -> Result<QueryLifecycleLease, DistributedQueryError> {
+        *self.plan.lock().expect("capture plan") = Some(plan);
+        Ok(QueryLifecycleLease::new(Box::new(
+            RecordingQueryLifecycleGuard {
+                finalizes: self.finalizes.clone(),
+                aborts: self.aborts.clone(),
+                armed: true,
+            },
+        )))
+    }
+}
+
+impl QueryInitBarrier for RecordingQueryInitBarrier {
+    fn initialize_all(
+        &self,
+        plan: QueryInitPlan,
+    ) -> Result<QueryLifecycleLease, DistributedQueryError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.participants
+            .store(plan.participant_count(), Ordering::SeqCst);
+        Ok(QueryLifecycleLease::new(Box::new(
+            RecordingQueryLifecycleGuard {
+                finalizes: self.finalizes.clone(),
+                aborts: self.aborts.clone(),
+                armed: true,
+            },
+        )))
+    }
+}
+
+struct RecordingQueryLaunchBarrier;
+
+impl QueryLaunchBarrier for RecordingQueryLaunchBarrier {
+    fn stage_all(&self, _batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
+        Ok(())
+    }
+
+    fn start_all(&self, _batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
+        Ok(())
+    }
+}
+
+fn real_execution_artifacts() -> (
+    crate::query_execution::preparation::PreparedFragmentSet,
+    crate::query_execution::native_fragment::NativeFragmentAttachment,
+) {
+    let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
+        .expect("sealed result execution fixture");
+    let registry = novarocks::connector::ConnectorRegistry::new();
+    let controls = novarocks::connector::FixtureControlResolver::new(registry.clone());
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &plan,
+        &controls,
+        &novarocks::connector::test_request_context(),
+        None,
+        None,
+        crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
+    )
+    .expect("prepare production execution artifact");
+    let native_bundle =
+        crate::query_execution::native_fragment::native_fragment_attachment_for_test(
+            [novarocks_protocol::plan::PlanFragment {
+                fragment_id: 7,
+                ..Default::default()
+            }],
+            &std::collections::BTreeSet::from([7]),
+            None,
+        )
+        .expect("seal production execution artifact");
+    (prepared, native_bundle)
+}
+
+fn execution_id(query_id: crate::query_execution::contract::QueryId) -> QueryExecutionId {
+    QueryExecutionId::new(query_id, AttemptId::new(9).expect("nonzero attempt"))
+        .expect("valid execution id")
+}
+
+#[test]
+fn request_owns_prepared_and_native_artifacts() {
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let request = build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        Some(
+            QueryOptions::parse(novarocks_protocol::novarocks::QueryOptions {
+                pipeline_dop: 3,
+                ..Default::default()
+            })
+            .expect("valid protocol query options"),
+        ),
+        DistributedQueryIntent::Result,
+        &test_execution(QueryCancellationSource::new().view()),
+    )
+    .expect("valid production artifacts form an owned request");
+
+    assert_eq!(
+        request
+            .artifacts()
+            .scheduling_view()
+            .fragment_ids()
+            .collect::<Vec<_>>(),
+        [7]
+    );
+    assert_eq!(
+        request.options().native_submission_options().pipeline_dop(),
+        3
+    );
+    let parts = request.into_parts();
+    let cancellation = parts.cancellation;
+    let completion = parts.completion;
+    assert!(!cancellation.is_cancelled());
+    assert_eq!(completion.intent(), DistributedQueryIntent::Result);
+}
+
+#[test]
+fn query_control_typestate_initializes_before_native_assembly() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let participants = Arc::new(AtomicUsize::new(0));
+    let finalizes = Arc::new(AtomicUsize::new(0));
+    let aborts = Arc::new(AtomicUsize::new(0));
+    let barrier = RecordingQueryInitBarrier {
+        calls: calls.clone(),
+        participants: participants.clone(),
+        finalizes: finalizes.clone(),
+        aborts: aborts.clone(),
+    };
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let request = build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Result,
+        &test_execution(QueryCancellationSource::new().view()),
+    )
+    .expect("build request");
+    let parts = request.into_parts();
+    let query_id = crate::query_execution::contract::QueryId::new(41, 73);
+    let execution_id = execution_id(query_id);
+    let protocol_execution_id = novarocks_protocol::lifecycle::QueryExecutionId::new(
+        query_id,
+        novarocks_protocol::lifecycle::AttemptId::new(9).expect("nonzero protocol attempt"),
+    )
+    .expect("valid protocol execution id");
+    let wire_query_options = novarocks_protocol::lifecycle::QueryOptions::parse(
+        novarocks_protocol::novarocks::QueryOptions::default(),
+    )
+    .expect("valid protocol query options");
+    let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
+    let mut draft = FragmentScheduleDraft::new();
+    draft
+        .freeze_live_backends(vec![
+            crate::common::backend_topology::LiveBackendTarget::new(3, endpoint, 11),
+        ])
+        .expect("freeze live topology");
+    draft
+        .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
+        .expect("assign fragment");
+    let schedule =
+        ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), execution_id, draft)
+            .expect("validate schedule");
+    let options = QueryInitOptions::new(
+        protocol_execution_id,
+        vec![crate::common::backend_topology::LiveBackendTarget::new(
+            3, endpoint, 11,
+        )],
+        &parts.options,
+        wire_query_options,
+        1_000,
+        std::time::Duration::from_secs(30),
+        crate::common::backend_topology::CoordinatorReportEndpoint::from_socket_addr(
+            "127.0.0.1:19030".parse().expect("valid report endpoint"),
+        ),
+    )
+    .expect("valid init options");
+
+    let attachment = parts
+        .artifacts
+        .runtime_filter_binding_view()
+        .seal_empty()
+        .expect("seal explicit empty runtime-filter bindings");
+    let scheduled = parts
+        .artifacts
+        .attach_runtime_filter_bindings(attachment)
+        .expect("bind explicit empty runtime-filter tables")
+        .bind_schedule(schedule)
+        .expect("bind schedule");
+    let deployment = scheduled
+        .seal_runtime_filter_deployment(std::iter::empty())
+        .expect("seal explicit empty runtime-filter deployment");
+    let ready = scheduled
+        .attach_runtime_filter_deployment(deployment)
+        .expect("attach empty runtime-filter deployment")
+        .initialize_query(options, &barrier)
+        .expect("initialize query")
+        .prepare_connector_bindings(&NoopConnectorBindingBarrier)
+        .expect("install empty connector bindings");
+    let submission_view = ready
+        .native_submission_view()
+        .expect("obtain sealed native submission view");
+    let key = submission_view.root_key();
+    let template = submission_view
+        .native_fragments_in_id_order()
+        .find_map(|(fragment_id, fragment)| {
+            (fragment_id == key.fragment_id()).then(|| fragment.clone())
+        })
+        .expect("sealed root template");
+    let instance_params = novarocks_protocol::novarocks::InstanceParams {
+        fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
+            hi: key.fragment_instance_id().high(),
+            lo: key.fragment_instance_id().low(),
+        }),
+        ..Default::default()
+    };
+    let attachment = submission_view
+        .seal(
+            vec![ValidatedNativeSubmission::new(
+                key.backend_idx(),
+                key.fragment_instance_id(),
+                submission_view.execution_id(),
+                template,
+                instance_params,
+            )],
+            WriterRegistrationSet::new(std::iter::empty()),
+        )
+        .expect("seal explicit test submission attachment");
+    let execution = ready
+        .finish_stage(attachment)
+        .expect("prepare exact stage batches")
+        .stage(&RecordingQueryLaunchBarrier)
+        .expect("stage after control ready")
+        .start(&RecordingQueryLaunchBarrier)
+        .expect("start after all participants stage")
+        .into_parts();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(participants.load(Ordering::SeqCst), 1);
+    assert_eq!(execution.root_fetch.fragment_id(), 7);
+    assert_eq!(aborts.load(Ordering::SeqCst), 0);
+    execution
+        .query_lifecycle_lease
+        .finalize()
+        .expect("finalize lifecycle");
+    execution.connector_binding_lease.release();
+    assert_eq!(finalizes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancellation_view_observes_injected_flag() {
+    let cancelled = QueryCancellationSource::new();
+    let view = cancelled.view();
+
+    assert!(!view.is_cancelled());
+    let _ = cancelled.request(QueryCancellationReason::ClientDisconnected);
+    assert!(view.is_cancelled());
+}
+
+#[test]
+fn outcome_factory_rejects_intent_mismatch() {
+    let result = QueryOutcomeFactory::new(DistributedQueryIntent::Result).write(
+        crate::runtime::query_result::QueryResult::empty(),
+        None,
+        None,
+    );
+
+    let Err(error) = result else {
+        panic!("Result intent must reject a Write outcome");
+    };
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert_eq!(
+        error.message(),
+        "distributed query outcome intent mismatch: expected Result, received Write"
+    );
+}
+
+fn statistics_program() -> crate::query_execution::statistics::StatisticsCollectionProgram {
+    let table = novarocks_spi::connector::ConnectorTableHandle::try_new(
+        novarocks_spi::connector::ConnectorInstanceId::parse("statistics-test")
+            .expect("instance ID"),
+        Bytes::from_static(b"pinned-table"),
+    )
+    .expect("table handle");
+    let data_version = novarocks_spi::connector::StatisticsDataVersion::try_new(
+        Bytes::from_static(b"snapshot-42"),
+    )
+    .expect("data version");
+    let evidence_revision = novarocks_spi::connector::StatisticsEvidenceRevision::try_new(
+        Bytes::from_static(b"collection-42"),
+    )
+    .expect("evidence revision");
+    let metrics = novarocks_spi::connector::StatisticsMetricRequest::try_new(vec![
+        novarocks_spi::connector::StatisticsMetric::RowCount,
+    ])
+    .expect("metrics");
+    let plan = novarocks_spi::connector::StatisticsCollectionPlan::try_new(
+        table,
+        data_version,
+        evidence_revision,
+        metrics,
+        Vec::new(),
+        Bytes::from_static(b"provider-plan"),
+    )
+    .expect("plan");
+    crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
+        plan,
+        StatisticsExecutionPolicy::try_new(
+            StatisticsExecutionMode::DurableJobAttempt,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("policy"),
+    )
+    .expect("program")
+}
+
+fn statistics_result(
+    program: &crate::query_execution::statistics::StatisticsCollectionProgram,
+    data_version: novarocks_spi::connector::StatisticsDataVersion,
+    metrics: std::collections::BTreeMap<
+        novarocks_spi::connector::StatisticsMetric,
+        novarocks_spi::connector::StatisticsMetricState,
+    >,
+) -> novarocks_spi::connector::StatisticsCollectionResult {
+    novarocks_spi::connector::StatisticsCollectionResult::try_new(
+        novarocks_spi::connector::StatisticsEvidence::try_new(
+            data_version,
+            novarocks_spi::connector::StatisticsEvidenceRevision::try_new(Bytes::from_static(
+                b"evidence-1",
+            ))
+            .expect("revision"),
+            novarocks_spi::connector::StatisticsRowCoverage::AllVisibleRows,
+            metrics,
+        )
+        .expect("evidence"),
+        program.plan().provider_payload().clone(),
+    )
+    .expect("result")
+}
+
+/// One value produced by a visible-row scan of `data_version` itself. A Theta
+/// sketch stays approximate; anything else a full scan counts is exact.
+fn scanned(
+    data_version: &novarocks_spi::connector::StatisticsDataVersion,
+    metric: &novarocks_spi::connector::StatisticsMetric,
+    value: novarocks_spi::connector::StatisticsMetricValue,
+) -> novarocks_spi::connector::StatisticsMetricState {
+    let nature = match metric {
+        novarocks_spi::connector::StatisticsMetric::ThetaNdv { .. } => {
+            novarocks_spi::connector::StatisticsNumericNature::TwoSidedApproximate
+        }
+        _ => novarocks_spi::connector::StatisticsNumericNature::Exact,
+    };
+    novarocks_spi::connector::StatisticsMetricState::Available(
+        novarocks_spi::connector::StatisticsMetricObservation::new(
+            value,
+            data_version.clone(),
+            novarocks_spi::connector::StatisticsMetricSource::VisibleRowScan,
+            nature,
+            novarocks_spi::connector::StatisticsBasisRelation::Identical,
+        ),
+    )
+}
+
+#[test]
+fn statistics_outcome_is_typed_and_never_carries_query_rows() {
+    let program = statistics_program();
+    let metric = novarocks_spi::connector::StatisticsMetric::RowCount;
+    let result = statistics_result(
+        &program,
+        program.plan().data_version.clone(),
+        std::collections::BTreeMap::from([(
+            metric.clone(),
+            scanned(
+                &program.plan().data_version,
+                &metric,
+                novarocks_spi::connector::StatisticsMetricValue::U64(7),
+            ),
+        )]),
+    );
+
+    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Statistics)
+        .statistics(&program, result)
+        .expect("statistics completion");
+    let collection = outcome
+        .into_statistics()
+        .expect("statistics outcome variant")
+        .into_collection_result();
+    let observation = match collection.evidence.metrics().get(&metric) {
+        Some(novarocks_spi::connector::StatisticsMetricState::Available(observation)) => {
+            observation
+        }
+        other => panic!("expected an available row count, got {other:?}"),
+    };
+    assert_eq!(
+        observation.value(),
+        &novarocks_spi::connector::StatisticsMetricValue::U64(7)
+    );
+}
+
+#[test]
+fn statistics_sink_rejects_version_drift_and_metric_expansion() {
+    let program = statistics_program();
+    let mut sink = program.result_sink();
+    let drifted_version = novarocks_spi::connector::StatisticsDataVersion::try_new(
+        Bytes::from_static(b"snapshot-43"),
+    )
+    .expect("drifted data version");
+    let drifted_basis = drifted_version.clone();
+    let drifted = statistics_result(
+        &program,
+        drifted_version,
+        std::collections::BTreeMap::from([(
+            novarocks_spi::connector::StatisticsMetric::RowCount,
+            scanned(
+                &drifted_basis,
+                &novarocks_spi::connector::StatisticsMetric::RowCount,
+                novarocks_spi::connector::StatisticsMetricValue::U64(7),
+            ),
+        )]),
+    );
+    assert_eq!(
+        sink.accept(drifted)
+            .expect_err("version drift must fail")
+            .kind(),
+        DistributedQueryErrorKind::ContractViolation
+    );
+
+    let expanded = statistics_result(
+        &program,
+        program.plan().data_version.clone(),
+        std::collections::BTreeMap::from([
+            (
+                novarocks_spi::connector::StatisticsMetric::RowCount,
+                scanned(
+                    &program.plan().data_version,
+                    &novarocks_spi::connector::StatisticsMetric::RowCount,
+                    novarocks_spi::connector::StatisticsMetricValue::U64(7),
+                ),
+            ),
+            (
+                novarocks_spi::connector::StatisticsMetric::ThetaNdv {
+                    column: Arc::from("id"),
+                },
+                scanned(
+                    &program.plan().data_version,
+                    &novarocks_spi::connector::StatisticsMetric::ThetaNdv {
+                        column: Arc::from("id"),
+                    },
+                    novarocks_spi::connector::StatisticsMetricValue::U64(7),
+                ),
+            ),
+        ]),
+    );
+    assert_eq!(
+        sink.accept(expanded)
+            .expect_err("metric expansion must fail")
+            .kind(),
+        DistributedQueryErrorKind::ContractViolation
+    );
+}
+
+#[test]
+fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
+    let policy = StatisticsExecutionPolicy::try_new(
+        StatisticsExecutionMode::DurableJobAttempt,
+        std::time::Duration::from_secs(30 * 60),
+    )
+    .expect("maximum durable policy");
+    assert!(!policy.mode().statement_cancellation_terminates_execution());
+    assert_eq!(
+        policy.attempt_timeout(),
+        std::time::Duration::from_secs(30 * 60)
+    );
+    assert!(
+        StatisticsExecutionPolicy::try_new(
+            StatisticsExecutionMode::DurableJobAttempt,
+            std::time::Duration::from_secs(30 * 60 + 1),
+        )
+        .is_err()
+    );
+    assert!(StatisticsExecutionMode::SynchronousWait.statement_cancellation_terminates_execution());
+}
+
+#[test]
+fn statistics_theta_partials_union_without_exposing_a_sql_aggregate() {
+    let left = ThetaSketchPartial::try_from_i64_values(12, [1, 2]).expect("left partial");
+    let right = ThetaSketchPartial::try_from_i64_values(12, [2, 3]).expect("right partial");
+    let merged = ThetaSketchPartial::try_union([left, right]).expect("two-phase union");
+    assert_eq!(merged.finalize().estimate(), 3.0);
+}
+
+#[test]
+fn write_outcome_preserves_commit_or_abort() {
+    let write_id = novarocks_types::UniqueId::new(41, 73);
+    let commit = WriteCommitInput {
+        write_id,
+        writers: Vec::new(),
+    };
+    let commit_outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
+        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
+            query_result: crate::runtime::query_result::build_string_query_result(
+                "status",
+                vec!["committed".to_string()],
+            )
+            .expect("commit result"),
+            write_commit: Some(commit.clone()),
+            write_abort: None,
+            connector_completion: None,
+            fragment_profiles: Vec::new(),
+        })
+        .expect("Write intent accepts a commit payload");
+    let (result, actual_commit, actual_abort) = commit_outcome
+        .into_write()
+        .expect("write outcome variant")
+        .into_parts();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(actual_commit, Some(commit));
+    assert_eq!(actual_abort, None);
+
+    let abort = WriteAbortInput {
+        write_id,
+        reason: "writer failed".to_string(),
+        completed_writer_outputs: Vec::new(),
+        incomplete_writers: Vec::new(),
+    };
+    let abort_outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
+        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
+            query_result: crate::runtime::query_result::QueryResult::empty(),
+            write_commit: None,
+            write_abort: Some(abort.clone()),
+            connector_completion: None,
+            fragment_profiles: Vec::new(),
+        })
+        .expect("Write intent accepts an abort payload");
+    let (_, actual_commit, actual_abort) = abort_outcome
+        .into_write()
+        .expect("write outcome variant")
+        .into_parts();
+    assert_eq!(actual_commit, None);
+    assert_eq!(actual_abort, Some(abort));
+}
+
+#[test]
+fn connector_staging_rejects_a_legacy_direct_commit_payload() {
+    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
+        .write(
+            crate::runtime::query_result::QueryResult::empty(),
+            Some(WriteCommitInput {
+                write_id: novarocks_types::UniqueId::new(43, 79),
+                writers: Vec::new(),
+            }),
+            None,
+        )
+        .expect("legacy write terminal remains valid outside connector staging");
+
+    let result = outcome
+        .into_write()
+        .expect("write outcome variant")
+        .into_connector_staging();
+    let Err(error) = result else {
+        panic!("connector staging must not consume a legacy direct commit");
+    };
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert_eq!(
+        error.message(),
+        "connector staging terminal returned a legacy direct commit payload"
+    );
+}
+
+#[test]
+fn profile_outcome_preserves_fragment_profiles() {
+    let profile =
+        novarocks_execution::runtime::profile::Profiler::new("fragment-7").to_native_tree();
+    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
+        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
+            query_result: crate::runtime::query_result::build_string_query_result(
+                "status",
+                vec!["profiled".to_string()],
+            )
+            .expect("profile result"),
+            write_commit: None,
+            write_abort: None,
+            connector_completion: None,
+            fragment_profiles: vec![profile.clone()],
+        })
+        .expect("Profile intent accepts fragment profiles");
+
+    let (result, profiles) = outcome
+        .into_profile()
+        .expect("profile outcome variant")
+        .into_parts();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(profiles.into_profiles(), vec![profile]);
+}
+
+#[test]
+fn result_outcome_preserves_query_result() {
+    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Result)
+        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
+            query_result: crate::runtime::query_result::build_string_query_result(
+                "value",
+                vec!["kept".to_string()],
+            )
+            .expect("result payload"),
+            write_commit: None,
+            write_abort: None,
+            connector_completion: None,
+            fragment_profiles: Vec::new(),
+        })
+        .expect("Result intent accepts a plain query result");
+
+    assert_eq!(
+        outcome
+            .into_result()
+            .expect("result outcome variant")
+            .into_query_result()
+            .row_count(),
+        1
+    );
+}
+
+#[test]
+fn write_outcome_rejects_commit_and_abort_together() {
+    let write_id = novarocks_types::UniqueId::new(8, 13);
+    let result = QueryOutcomeFactory::new(DistributedQueryIntent::Write).write(
+        crate::runtime::query_result::QueryResult::empty(),
+        Some(WriteCommitInput {
+            write_id,
+            writers: Vec::new(),
+        }),
+        Some(WriteAbortInput {
+            write_id,
+            reason: "ambiguous".to_string(),
+            completed_writer_outputs: Vec::new(),
+            incomplete_writers: Vec::new(),
+        }),
+    );
+
+    let Err(error) = result else {
+        panic!("Write outcome must reject simultaneous commit and abort payloads");
+    };
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert_eq!(
+        error.message(),
+        "Write outcome cannot contain both commit and abort payloads"
+    );
+}
+
+struct RecordingCoordinator {
+    calls: Arc<AtomicUsize>,
+}
+
+impl DistributedQueryCoordinator for RecordingCoordinator {
+    fn execute(
+        &self,
+        request: DistributedQueryRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        request
+            .into_parts()
+            .completion
+            .result(crate::runtime::query_result::QueryResult::empty())
+    }
+}
+
+#[test]
+fn query_execution_service_uses_explicitly_injected_coordinator() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = QueryExecutionService::new(Arc::new(RecordingCoordinator {
+        calls: calls.clone(),
+    }));
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let request = build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Result,
+        &test_execution(QueryCancellationSource::new().view()),
+    )
+    .expect("build service request");
+
+    let outcome = service
+        .execute(request)
+        .expect("injected coordinator result");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.intent(), DistributedQueryIntent::Result);
+}
+
+#[test]
+fn generic_request_builder_rejects_statistics_without_a_typed_program() {
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let result = build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Statistics,
+        &test_execution(QueryCancellationSource::new().view()),
+    );
+    let Err(error) = result else {
+        panic!("statistics must use the typed request builder");
+    };
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert!(error.message().contains("StatisticsCollectionProgram"));
+}

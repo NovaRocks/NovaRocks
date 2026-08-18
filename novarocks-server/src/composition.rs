@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
 use anyhow::Context;
+use novarocks::common::backend_topology::BackendTopologyPort;
 use novarocks::common::network;
 use novarocks::mv::persistence::descriptor::MvDescriptorV1;
 use novarocks::mv::persistence::schema::{
@@ -34,7 +35,6 @@ use novarocks::mv::storage_observation::{
     MvSchemaValidationPartitionContract, MvSchemaValidationPartitionField,
     MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
 };
-use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{
     BackendApplicationHost, BackendServerConfig, BackendStoreSettings, QueryLifecycleRegistryConfig,
 };

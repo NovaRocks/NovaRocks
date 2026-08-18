@@ -23,7 +23,7 @@ use novarocks_spi::connector::{ConnectorTableHandle, StatisticsDataVersion};
 
 /// Immutable table/version pair from one connector metadata resolution.
 #[derive(Clone)]
-pub(crate) struct ResolvedTableStatisticsPin {
+pub struct ResolvedTableStatisticsPin {
     pub table: ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
 }
@@ -42,7 +42,7 @@ impl std::fmt::Debug for ResolvedTableStatisticsPin {
 /// the subset of table shape the engine layer needs in order to plan INSERTs
 /// and to register the table with the in-memory logical catalog.
 #[derive(Clone, Debug)]
-pub(crate) struct ResolvedTable {
+pub struct ResolvedTable {
     pub catalog: String,
     pub namespace: String,
     pub table: String,

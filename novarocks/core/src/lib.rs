@@ -23,11 +23,10 @@ pub mod connector;
 pub mod maintenance;
 pub mod mv;
 pub mod protocol;
-pub mod query_execution;
+pub mod query_lifecycle;
 pub mod runtime;
 pub mod server;
 pub mod service;
-pub mod view;
 pub use novarocks_version as version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
 pub use common::logging as novarocks_logging;

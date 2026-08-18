@@ -39,17 +39,17 @@ pub(crate) enum RefreshIdentity {
 
 /// Refresh-time capabilities reconstructed from a persisted MV schema contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RefreshCapabilities {
-    pub(crate) snapshot_policy: BaseSnapshotPolicy,
-    pub(crate) has_agg_state: bool,
-    pub(crate) identity: RefreshIdentity,
-    pub(crate) apply_key_column: String,
-    pub(crate) apply_key_value_type: ApplyKeyValueType,
-    pub(crate) partition_pruning: PartitionPruningPolicy,
+pub struct RefreshCapabilities {
+    pub snapshot_policy: BaseSnapshotPolicy,
+    pub has_agg_state: bool,
+    pub identity: RefreshIdentity,
+    pub apply_key_column: String,
+    pub apply_key_value_type: ApplyKeyValueType,
+    pub partition_pruning: PartitionPruningPolicy,
 }
 
 impl RefreshCapabilities {
-    pub(crate) fn from_schema_contract(
+    pub fn from_schema_contract(
         contract: &MvSchemaContract,
     ) -> Result<RefreshCapabilities, String> {
         let has_join = contract.join.is_some();

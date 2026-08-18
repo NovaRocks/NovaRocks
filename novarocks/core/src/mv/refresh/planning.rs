@@ -52,7 +52,7 @@ pub(crate) fn decide_refresh_plan(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RefreshStateBaseline {
+pub enum RefreshStateBaseline {
     Pinless,
     SnapshotBacked {
         previous_snapshot_ids: BTreeMap<String, i64>,
@@ -64,15 +64,15 @@ pub(crate) enum RefreshStateBaseline {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RefreshPlanContract {
-    pub(crate) mv_id: Option<i64>,
-    pub(crate) target: MvTarget,
-    pub(crate) storage_engine: MvStorageEngine,
-    pub(crate) decision: ExecutableRefreshDecision,
-    pub(crate) state_baseline: RefreshStateBaseline,
-    pub(crate) base_refs: Vec<TableIdentity>,
-    pub(crate) snapshot_pins: BTreeMap<String, Option<i64>>,
-    pub(crate) affected_partitions: AffectedTargetPartitions,
+pub struct RefreshPlanContract {
+    pub mv_id: Option<i64>,
+    pub target: MvTarget,
+    pub storage_engine: MvStorageEngine,
+    pub decision: ExecutableRefreshDecision,
+    pub state_baseline: RefreshStateBaseline,
+    pub base_refs: Vec<TableIdentity>,
+    pub snapshot_pins: BTreeMap<String, Option<i64>>,
+    pub affected_partitions: AffectedTargetPartitions,
 }
 
 impl RefreshPlanContract {

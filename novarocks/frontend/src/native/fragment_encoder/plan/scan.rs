@@ -25,7 +25,7 @@ use super::output::{encode_output_column, encode_output_columns};
 use super::type_mapping::encode_type;
 use super::type_mapping::{encode_edge_partition_type, encode_sql_type};
 use super::{NativePlanEncodeContext, encode_exprs};
-use novarocks::query_execution::preparation::{
+use crate::query_execution::preparation::{
     NativeScanBindingView, NativeScanColumnKind, NativeScanColumnView, NativeScanExecutionKind,
 };
 use novarocks_protocol::{common, plan};

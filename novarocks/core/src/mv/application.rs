@@ -32,19 +32,19 @@ use novarocks_sql::syntax::{
 /// Join refresh shape retained until query assembly admits exact connector
 /// bindings for the corresponding write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvIncrementalJoinMode {
+pub enum MvIncrementalJoinMode {
     AppendOnly,
     Coalesce,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvIncrementalWriteMode {
+pub enum MvIncrementalWriteMode {
     FastAppend,
     RowDelta,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvIncrementalRewriteEvidence {
+pub enum MvIncrementalRewriteEvidence {
     None,
     Aggregate,
     JoinAggregate,

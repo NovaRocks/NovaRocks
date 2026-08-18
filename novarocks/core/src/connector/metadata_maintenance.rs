@@ -96,27 +96,6 @@ pub trait MetadataMaintenanceCacheFinalizer {
     ) -> Result<(), ConnectorError>;
 }
 
-// CLS-R2 boundary: the port above is a connector fact and stays with the
-// aggregate package. This binding is the only part that names the query
-// assembly owner, so it moves to the frontend with `MaintenanceExecutionKernel`
-// in CLS-R2 T15.
-impl MetadataMaintenanceCacheFinalizer
-    for crate::query_execution::kernels::MaintenanceExecutionKernel
-{
-    fn invalidate_generic_table(
-        &self,
-        table: &ConnectorTableIdentity,
-    ) -> Result<(), ConnectorError> {
-        self.catalog_service()
-            .invalidate_table(
-                table.instance_id.as_str(),
-                table.namespace.as_ref(),
-                table.table.as_ref(),
-            )
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct CompletedMetadataMaintenance {
     #[allow(dead_code)]
@@ -128,7 +107,7 @@ pub struct CompletedMetadataMaintenance {
 /// Planning never crosses the dispatch boundary, whereas an explicit provider
 /// outcome did. Preserve this distinction for the durable operation owner.
 #[derive(Clone, Debug)]
-pub(crate) enum KnownUncommittedMetadataMaintenance {
+pub enum KnownUncommittedMetadataMaintenance {
     Planning(ConnectorError),
     Provider(ConnectorMutationFailure),
 }
@@ -143,7 +122,7 @@ impl fmt::Display for KnownUncommittedMetadataMaintenance {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MetadataMaintenanceDispatchState {
+pub enum MetadataMaintenanceDispatchState {
     ConfirmedNotDispatched,
     PossiblyDispatched,
 }
@@ -152,7 +131,7 @@ pub(crate) enum MetadataMaintenanceDispatchState {
 /// reconcile. `CommitUnknown` remains durable-operation work; it is not an
 /// invitation to dispatch the maintenance action again.
 #[derive(Clone, Debug)]
-pub(crate) enum ResolvedMetadataMaintenance {
+pub enum ResolvedMetadataMaintenance {
     KnownCommitted(CompletedMetadataMaintenance),
     KnownUncommitted {
         failure: KnownUncommittedMetadataMaintenance,
@@ -169,7 +148,7 @@ pub(crate) enum ResolvedMetadataMaintenance {
 
 /// Compatibility projection for a synchronous statement caller.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_metadata_maintenance(
+pub fn execute_metadata_maintenance(
     resolver: &dyn ConnectorMetadataMaintenanceResolver,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     instance_id: &ConnectorInstanceId,
@@ -329,7 +308,7 @@ pub fn read_max_compactable_data_files(
 
 /// Plan and execute one operation using a newly acquired current lease.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_metadata_maintenance(
+pub fn resolve_metadata_maintenance(
     resolver: &dyn ConnectorMetadataMaintenanceResolver,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     instance_id: &ConnectorInstanceId,

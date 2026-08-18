@@ -25,24 +25,24 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use novarocks::query_execution::ConnectorWriteCompletion;
-use novarocks::query_execution::artifact::{
+use crate::common::backend_topology::LiveBackendTarget;
+use crate::protocol::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
+use crate::query_execution::ConnectorWriteCompletion;
+use crate::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
     DispatchingConnectorBindingBarrier, RunningNativeExecutionParts,
 };
-use novarocks::query_execution::backend::LiveBackendTarget;
-use novarocks::query_execution::contract::{
+use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
     DistributedQueryRequest, ProfileTerminalBuilder,
 };
-use novarocks::query_execution::fragment_transport::{FetchOutcome, FragmentDispatcher};
-use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
-use novarocks::query_execution::lifecycle_plan::{
+use crate::query_execution::lifecycle_plan::{
     QueryInitOptions, QueryLifecycleLease, QueryLifecycleTarget,
 };
-use novarocks::query_execution::write::WriteTerminalBuilder;
-use novarocks::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::query_execution::write::WriteTerminalBuilder;
+use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::query_lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_protocol::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
     QueryOptions as ProtocolQueryOptions,
@@ -269,7 +269,7 @@ impl FrontendReportEndpointBinding {
 
     fn resolve(
         &self,
-    ) -> Result<novarocks::query_execution::backend::CoordinatorReportEndpoint, DistributedQueryError>
+    ) -> Result<crate::common::backend_topology::CoordinatorReportEndpoint, DistributedQueryError>
     {
         let port = if self.configured_port == 0 {
             let bound = self.bound_port.load(Ordering::Acquire);
@@ -282,7 +282,7 @@ impl FrontendReportEndpointBinding {
         } else {
             self.configured_port
         };
-        novarocks::query_execution::backend::CoordinatorReportEndpoint::new(
+        crate::common::backend_topology::CoordinatorReportEndpoint::new(
             self.advertised_host.clone(),
             port,
         )
@@ -290,7 +290,7 @@ impl FrontendReportEndpointBinding {
     }
 }
 
-impl novarocks::query_execution::backend::CoordinatorReportEndpointSink
+impl crate::common::backend_topology::CoordinatorReportEndpointSink
     for FrontendReportEndpointBinding
 {
     fn set_bound_port(&self, port: u16) {
@@ -557,7 +557,7 @@ fn production_backend_services(
 
 pub struct FrontendDistributedQueryCoordinator {
     report_endpoint: Arc<FrontendReportEndpointBinding>,
-    backend_topology: novarocks::query_execution::backend::BackendTopologyService,
+    backend_topology: crate::common::backend_topology::BackendTopologyService,
     #[cfg(test)]
     backend_services: Option<BackendServicesSource>,
     runtime_filter_worker_count: NonZeroUsize,
@@ -595,7 +595,7 @@ impl FrontendDistributedQueryCoordinator {
         configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
         query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
-        backend_topology: novarocks::query_execution::backend::BackendTopologyService,
+        backend_topology: crate::common::backend_topology::BackendTopologyService,
         connector_control: Arc<ConnectorControlHost>,
     ) -> Result<Self, DistributedQueryError> {
         // Reject an unusable `[runtime]` query-control section at startup rather
@@ -653,7 +653,7 @@ impl FrontendDistributedQueryCoordinator {
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
-        backend_topology: novarocks::query_execution::backend::BackendTopologyService,
+        backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
         let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
@@ -729,7 +729,7 @@ impl FrontendDistributedQueryCoordinator {
 
     pub fn report_endpoint_sink(
         &self,
-    ) -> Arc<dyn novarocks::query_execution::backend::CoordinatorReportEndpointSink> {
+    ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
         self.report_endpoint.clone()
     }
 
@@ -1219,7 +1219,7 @@ fn abort_query_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::FrontendReportEndpointBinding;
-    use novarocks::query_execution::backend::CoordinatorReportEndpointSink;
+    use crate::common::backend_topology::CoordinatorReportEndpointSink;
 
     #[test]
     fn ephemeral_report_endpoint_is_unavailable_until_the_bound_port_is_published() {

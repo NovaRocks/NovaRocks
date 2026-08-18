@@ -2,14 +2,13 @@
 id: ADR-0009
 title: "Frontend owns table maintenance application lifecycle"
 domain: [table-maintenance]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0083
 date: 2026-07-28
 provenance:
   - "discussion: 2026-07-28 table maintenance ownership extraction"
 code-anchors:
-  - "novarocks/core/src/engine/table_maintenance.rs (TableMaintenanceEngine, TableMaintenanceService)"
   - "novarocks/frontend/src/table_maintenance/mod.rs (FrontendTableMaintenanceService)"
 ---
 

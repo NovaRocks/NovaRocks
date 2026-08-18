@@ -272,7 +272,7 @@ fn dependency_display_for_mv_with_repository(
 /// lease, and the catalog-application admission gate are all frozen into it
 /// before analysis starts. This adapter contributes MV SELECT preparation and
 /// analysis only; it never acquires catalog or connector authority itself.
-pub(crate) fn analyze_mv_select_with_provider(
+pub fn analyze_mv_select_with_provider(
     current_catalog: Option<&str>,
     provider: &dyn novarocks_sql::planning::catalog::PlannerTableProvider,
     current_database: &str,

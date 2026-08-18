@@ -24,12 +24,12 @@
 
 pub(crate) mod recovery;
 
-use novarocks::query_execution::dml::ctas::{
+use crate::common::admitted_query_context::RequestContext;
+use crate::query_execution::dml::ctas::{
     CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetFacts,
     CtasTargetPreflightOutcome, CtasWriteOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
     PreparedCtasTarget, PreparedCtasWrite,
 };
-use novarocks::query_execution::request_context::RequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorCtasAbortDisposition, ConnectorCtasActionId, ConnectorCtasConflictKind,
@@ -1202,7 +1202,7 @@ fn abort_foreground(
 }
 
 fn new_recovery_record(
-    facts: &novarocks::query_execution::dml::ctas::CtasTargetPreflightFacts,
+    facts: &crate::query_execution::dml::ctas::CtasTargetPreflightFacts,
     attempt_id: Uuid,
     generation: crate::dml::model::DmlExternalFenceGeneration,
     action_id: ConnectorCtasActionId,
@@ -1505,7 +1505,7 @@ fn connector_action_id(uuid: Uuid) -> Result<ConnectorCtasActionId, DmlError> {
 
 fn validate_preflight_facts(
     stored: &StoredOperation,
-    facts: &novarocks::query_execution::dml::ctas::CtasTargetPreflightFacts,
+    facts: &crate::query_execution::dml::ctas::CtasTargetPreflightFacts,
 ) -> Result<(), DmlError> {
     if facts.capability_version == 1
         && facts.instance_id == stored.target.catalog
@@ -1526,7 +1526,7 @@ fn validate_preflight_facts(
 
 fn validate_target_facts_v2(
     stored: &StoredOperation,
-    preflight: &novarocks::query_execution::dml::ctas::CtasTargetPreflightFacts,
+    preflight: &crate::query_execution::dml::ctas::CtasTargetPreflightFacts,
     fence: &ConnectorCtasPublicationFence,
     facts: &CtasTargetFacts,
     locator: &ConnectorCtasStagedLocator,
@@ -1877,7 +1877,7 @@ mod tests {
     use crate::dml::model::{
         DmlExternalFenceGeneration, validate_ctas_recovery, validate_ctas_recovery_transition,
     };
-    use novarocks::query_execution::dml::ctas::CtasTargetPreflightFacts;
+    use crate::query_execution::dml::ctas::CtasTargetPreflightFacts;
     use novarocks_spi::connector::ConnectorMutationFailureKind;
 
     fn confirmed_recovery() -> DmlCtasRecoveryRecord {

@@ -1100,28 +1100,26 @@ mod tests {
         failure: Option<&'static str>,
     }
 
-    impl novarocks::query_execution::mv_native_write::MvRefreshProviderActivation
+    impl crate::query_execution::mv_native_write::MvRefreshProviderActivation
         for TestDescriptorProjection
     {
         fn activate_write(
             &self,
-            _prepared: novarocks::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite,
+            _prepared: crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite,
             _planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
             _exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
-            _execution: &novarocks::query_execution::request_context::QueryExecutionContext,
-        ) -> Result<
-            novarocks::query_execution::mv_native_write::PreparedMvNativeWriteAssembly,
-            String,
-        > {
+            _execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        ) -> Result<crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly, String>
+        {
             unreachable!("recovery never activates a writer")
         }
 
         fn interpret_write_commit(
             &self,
-            _intent: novarocks::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
+            _intent: crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
             _receipt: &novarocks_spi::connector::ConnectorWriteReceipt,
         ) -> Result<
-            novarocks::query_execution::mv_assembly::refresh_artifact::MvRefreshCommittedFacts,
+            crate::query_execution::mv_assembly::refresh_artifact::MvRefreshCommittedFacts,
             String,
         > {
             unreachable!("recovery never interprets a live write receipt")
@@ -1271,7 +1269,7 @@ mod tests {
         host.register(binding).expect("register control binding");
         let provider_activation =
             Arc::new(super::super::refresh::FrontendMvRefreshProviderActivationPort::new());
-        novarocks::query_execution::mv_native_write::MvRefreshProviderActivationSink::bind_mv_refresh_provider_activation(
+        crate::query_execution::mv_native_write::MvRefreshProviderActivationSink::bind_mv_refresh_provider_activation(
             provider_activation.as_ref(),
             projection,
         )

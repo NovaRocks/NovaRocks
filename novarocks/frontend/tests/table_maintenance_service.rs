@@ -22,9 +22,10 @@ use std::time::{Duration, Instant};
 
 use arrow::array::StringArray;
 use bytes::Bytes;
-use novarocks::maintenance::{
+use novarocks::maintenance::MaintenanceTarget;
+use novarocks_frontend::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-    MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine,
+    MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
     TableMaintenanceService,
 };
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;

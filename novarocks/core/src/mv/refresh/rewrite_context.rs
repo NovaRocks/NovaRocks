@@ -19,12 +19,12 @@ use novarocks_spi::connector::{
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AdmittedChangeFacts {
-    pub(crate) has_inserts: bool,
-    pub(crate) has_deletes: bool,
+pub struct AdmittedChangeFacts {
+    pub has_inserts: bool,
+    pub has_deletes: bool,
 }
 
-pub(crate) fn admitted_change_facts(
+pub fn admitted_change_facts(
     admission: &ConnectorChangeWindowAdmission,
 ) -> Result<AdmittedChangeFacts, String> {
     match admission {
@@ -44,7 +44,7 @@ pub(crate) fn admitted_change_facts(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_neutral_refresh_rewrite_context(
+pub fn build_neutral_refresh_rewrite_context(
     connector_control: &dyn ConnectorControlRegistry,
     storage_observation: &dyn MvStorageObservationPort,
     target: &IcebergMvTarget,
@@ -112,7 +112,7 @@ pub(crate) fn build_neutral_refresh_rewrite_context(
     .map(Arc::new)
 }
 
-pub(crate) fn observe_and_admit_change_window_for_table(
+pub fn observe_and_admit_change_window_for_table(
     connector_control: &dyn ConnectorControlRegistry,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,

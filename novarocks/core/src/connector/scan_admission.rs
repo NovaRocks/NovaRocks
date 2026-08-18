@@ -5,7 +5,7 @@
 
 //! Provider scan-admission leaves over an exact planning lease.
 
-pub(crate) fn admit_connector_change_window(
+pub fn admit_connector_change_window(
     table: &novarocks_spi::connector::ConnectorTableHandle,
     schema: &arrow::datatypes::SchemaRef,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,

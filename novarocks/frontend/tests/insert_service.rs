@@ -17,32 +17,26 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use common::coordination_fixture::JournalInspect;
-use novarocks::query_execution::backend::BackendTopologySnapshot;
-use novarocks::query_execution::cancellation::QueryCancellationSource;
-use novarocks::query_execution::dml::insert::{
-    IcebergInsertCommit, IcebergInsertOperation, IcebergInsertSource, IcebergPreparedInsert,
-    IcebergWriteReport, InsertEngine, InsertOverwriteMode, InsertValue, PrepareIcebergInsert,
-    PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
-};
-use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
-use novarocks::runtime::query_result::QueryResult;
-use novarocks::statistics::{
-    CatalogTableStatistics, CollectedColumnStatistics, StatisticsColumn, StatisticsEngine,
-    StatisticsInsertObservation, StatisticsRequestContext, StatisticsService,
-    StatisticsStatementResult, StatisticsTableTarget,
-};
+use novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
+use novarocks::common::backend_topology::BackendTopologySnapshot;
+use novarocks::common::query_cancellation::QueryCancellationSource;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_frontend::FrontendStatisticsService;
 use novarocks_frontend::dml::model::DML_OPERATION_SCHEMA_VERSION;
 use novarocks_frontend::dml::{
     CreatePreparingRequest, DmlError, DmlErrorKind, DmlOperationId, DmlService, OperationFact,
     OperationJournal, OperationState, StoredOperation,
+};
+use novarocks_frontend::query_execution::dml::insert::{
+    IcebergInsertCommit, IcebergInsertOperation, IcebergInsertSource, IcebergPreparedInsert,
+    IcebergWriteReport, InsertEngine, InsertOverwriteMode, InsertValue, PrepareIcebergInsert,
+    PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlPlanningLease,
@@ -146,38 +140,13 @@ impl FakeInsertEngine {
     }
 }
 
-impl StatisticsEngine for FakeInsertEngine {
-    fn resolve_table_columns(
-        &self,
-        _target: &StatisticsTableTarget,
-    ) -> Result<Vec<StatisticsColumn>, String> {
-        Ok(Vec::new())
-    }
-
-    fn resolve_local_table_columns(
-        &self,
-        _database: &str,
-        _table: &str,
-    ) -> Result<Option<Vec<StatisticsColumn>>, String> {
-        Ok(None)
-    }
-
-    fn collect_table_statistics(
-        &self,
-        _target: &StatisticsTableTarget,
-        _columns: &[String],
-    ) -> Result<Vec<CollectedColumnStatistics>, String> {
-        Ok(Vec::new())
-    }
-}
-
 impl InsertEngine for FakeInsertEngine {
     /// Distributed write fails closed until a fence is established, so the fake
     /// engine must expose a real write authority to fence against.
     fn establish_iceberg_write_external_fence(
         &self,
-        _prepared: &dyn novarocks::query_execution::dml::insert::IcebergPreparedInsert,
-        proposal: &dyn novarocks::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
+        _prepared: &dyn novarocks_frontend::query_execution::dml::insert::IcebergPreparedInsert,
+        proposal: &dyn novarocks_frontend::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
     ) -> Result<
         novarocks_spi::connector::ConnectorEstablishedWriteFence,
         novarocks_spi::connector::ConnectorError,
@@ -254,16 +223,16 @@ impl InsertEngine for FakeInsertEngine {
         &self,
         _prepared: &'a dyn IcebergPreparedInsert,
     ) -> Result<
-        novarocks::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding<'a>,
+        novarocks_frontend::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding<'a>,
         String,
     > {
-        novarocks::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding::test_fixture()
+        novarocks_frontend::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding::test_fixture()
     }
 
     fn run_iceberg_write_with_native_bundle(
         &self,
         prepared: &dyn IcebergPreparedInsert,
-        _native_bundle: novarocks::query_execution::native_fragment::NativeFragmentAttachment,
+        _native_bundle: novarocks_frontend::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<IcebergWriteReport, String> {
         self.run_iceberg_write(prepared)
     }
@@ -293,81 +262,6 @@ impl InsertEngine for FakeInsertEngine {
     fn finalize_iceberg_write(&self, _prepared: &dyn IcebergPreparedInsert) -> Result<(), String> {
         self.calls.lock().unwrap().push(Call::Finalize);
         Ok(())
-    }
-}
-
-struct RecordingStatistics {
-    insert_count: AtomicUsize,
-    fail_insert: AtomicBool,
-}
-
-impl RecordingStatistics {
-    fn new() -> Self {
-        Self {
-            insert_count: AtomicUsize::new(0),
-            fail_insert: AtomicBool::new(false),
-        }
-    }
-
-    fn fail_insert(&self) {
-        self.fail_insert.store(true, Ordering::SeqCst);
-    }
-}
-
-impl StatisticsService for RecordingStatistics {
-    fn try_handle_statement(
-        &self,
-        _engine: &dyn StatisticsEngine,
-        _sql: &str,
-        _context: StatisticsRequestContext<'_>,
-    ) -> Result<Option<StatisticsStatementResult>, String> {
-        Ok(None)
-    }
-
-    fn try_query(
-        &self,
-        _sql: &str,
-        _query: &sqlparser::ast::Query,
-        _context: StatisticsRequestContext<'_>,
-    ) -> Result<Option<QueryResult>, String> {
-        Ok(None)
-    }
-
-    fn observe_query(
-        &self,
-        _query: &sqlparser::ast::Query,
-        _current_database: &str,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn observe_insert(
-        &self,
-        _engine: &dyn StatisticsEngine,
-        _observation: StatisticsInsertObservation<'_>,
-    ) -> Result<(), String> {
-        self.insert_count.fetch_add(1, Ordering::SeqCst);
-        if self.fail_insert.load(Ordering::SeqCst) {
-            Err("statistics observation failed".to_string())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn observe_update(&self, _sql: &str, _current_database: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn drop_table(&self, _database: &str, _table: &str) {}
-
-    fn drop_database(&self, _database: &str) {}
-
-    fn catalog_table_statistics(
-        &self,
-        _database: &str,
-        _table: &str,
-    ) -> Result<Option<CatalogTableStatistics>, String> {
-        Ok(None)
     }
 }
 
@@ -659,11 +553,10 @@ impl std::ops::Deref for TestService {
 fn service_over(
     coordination: common::coordination_fixture::BlockingCoordination,
     journal: Option<Arc<dyn OperationJournal>>,
-    statistics: Arc<RecordingStatistics>,
 ) -> TestService {
     let dml = DmlService::compose_with_coordination(
         journal,
-        statistics,
+        Arc::new(FrontendStatisticsService::new()),
         Arc::clone(&coordination.coordination),
         coordination.handle(),
     );
@@ -673,19 +566,18 @@ fn service_over(
     }
 }
 
-fn service(journal: Option<Arc<FakeJournal>>, statistics: Arc<RecordingStatistics>) -> TestService {
+fn service(journal: Option<Arc<FakeJournal>>) -> TestService {
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
     let journal = journal.map(|_| Arc::clone(&coordination.journal) as Arc<dyn OperationJournal>);
-    service_over(coordination, journal, statistics)
+    service_over(coordination, journal)
 }
 
 #[test]
 fn non_insert_returns_none_without_engine_calls() {
     let engine = FakeInsertEngine::new(target());
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     assert_eq!(
-        service(None, statistics)
+        service(None)
             .try_execute_insert(&engine, "DELETE FROM t WHERE a = 1", &context, None)
             .unwrap(),
         None
@@ -700,12 +592,10 @@ fn union_all_commits_once_in_source_order() {
     let engine = FakeInsertEngine::new(resolved);
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
     let journal = Arc::clone(&coordination.journal);
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     service_over(
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        statistics,
     )
     .try_execute_insert(
         &engine,
@@ -740,9 +630,8 @@ fn union_all_commits_once_in_source_order() {
 #[test]
 fn tag_target_is_read_only() {
     let engine = FakeInsertEngine::new(target());
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    let error = service(Some(Arc::new(FakeJournal::default())), statistics)
+    let error = service(Some(Arc::new(FakeJournal::default())))
         .try_execute_insert(
             &engine,
             "INSERT INTO t.tag_v1 VALUES (1, 2)",
@@ -761,9 +650,8 @@ fn tag_target_is_read_only() {
 fn branch_insert_requires_iceberg_v3() {
     let engine = FakeInsertEngine::new(target());
     engine.set_prepare_error("iceberg ref: branch writes require Iceberg v3 tables");
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    let error = service(Some(Arc::new(FakeJournal::default())), statistics)
+    let error = service(Some(Arc::new(FakeJournal::default())))
         .try_execute_insert(
             &engine,
             "INSERT INTO t.branch_dev VALUES (1, 2)",
@@ -783,13 +671,11 @@ fn branch_insert_journals_the_prepared_branch_base_snapshot() {
     let engine = FakeInsertEngine::new(target());
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
     let journal = Arc::clone(&coordination.journal);
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
 
     service_over(
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        statistics,
     )
     .try_execute_insert(
         &engine,
@@ -820,9 +706,8 @@ fn branch_insert_journals_the_prepared_branch_base_snapshot() {
 #[test]
 fn iceberg_without_journal_fails_before_prepare() {
     let engine = FakeInsertEngine::new(target());
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
-    let error = service(None, Arc::clone(&statistics))
+    let error = service(None)
         .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
@@ -831,7 +716,6 @@ fn iceberg_without_journal_fails_before_prepare() {
         engine.calls().as_slice(),
         [Call::Resolve { target, .. }] if target == &vec!["t".to_string()]
     ));
-    assert_eq!(statistics.insert_count.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -840,12 +724,10 @@ fn iceberg_append_empty_records_known_empty_terminal_fact() {
     engine.set_write_behavior(WriteBehavior::FilelessOutput);
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
     let journal = Arc::clone(&coordination.journal);
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     service_over(
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        statistics,
     )
     .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
     .unwrap();
@@ -860,12 +742,10 @@ fn iceberg_overwrite_empty_commits_and_finalizes() {
     engine.set_write_behavior(WriteBehavior::FilelessOutput);
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
     let journal = Arc::clone(&coordination.journal);
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     service_over(
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        statistics,
     )
     .try_execute_insert(&engine, "INSERT OVERWRITE t VALUES (1, 2)", &context, None)
     .unwrap();
@@ -880,12 +760,10 @@ fn iceberg_commit_unknown_is_persisted_without_retry() {
     engine.set_commit_behavior(CommitBehavior::Unknown);
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
     let journal = Arc::clone(&coordination.journal);
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     let error = service_over(
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        statistics,
     )
     .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
     .unwrap_err();
@@ -907,19 +785,15 @@ fn admitted_context_reaches_insert_select_and_iceberg_write() {
     let mut resolved = target();
     resolved.columns = vec![column("a", false)];
     let iceberg = FakeInsertEngine::new(resolved);
-    let statistics = Arc::new(RecordingStatistics::new());
     let (write_context, _, write_deadline) = context();
-    service(
-        Some(Arc::new(FakeJournal::default())),
-        Arc::clone(&statistics),
-    )
-    .try_execute_insert(
-        &iceberg,
-        "INSERT INTO t SELECT a FROM src",
-        &write_context,
-        None,
-    )
-    .unwrap();
+    service(Some(Arc::new(FakeJournal::default())))
+        .try_execute_insert(
+            &iceberg,
+            "INSERT INTO t SELECT a FROM src",
+            &write_context,
+            None,
+        )
+        .unwrap();
     assert!(iceberg.calls().iter().any(|call| matches!(
         call,
         Call::Prepare {
@@ -935,67 +809,15 @@ fn admitted_context_reaches_insert_select_and_iceberg_write() {
 }
 
 #[test]
-fn statistics_runs_once_after_success() {
-    let engine = FakeInsertEngine::new(target());
-    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
-    let journal = Arc::clone(&coordination.journal);
-    let statistics = Arc::new(RecordingStatistics::new());
-    let (context, _, _) = context();
-    service_over(
-        coordination,
-        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::clone(&statistics),
-    )
-    .try_execute_insert(
-        &engine,
-        "INSERT INTO t VALUES (1, 2), (3, 4)",
-        &context,
-        None,
-    )
-    .unwrap();
-    assert_eq!(statistics.insert_count.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn statistics_error_does_not_change_finalized_operation() {
-    let engine = FakeInsertEngine::new(target());
-    let coordination = common::coordination_fixture::open_blocking("insert-service-test");
-    let journal = Arc::clone(&coordination.journal);
-    let statistics = Arc::new(RecordingStatistics::new());
-    statistics.fail_insert();
-    let (context, _, _) = context();
-    let error = service_over(
-        coordination,
-        Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::clone(&statistics),
-    )
-    .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
-    .unwrap_err();
-    assert!(error.to_string().contains("statistics observation failed"));
-    assert_eq!(statistics.insert_count.load(Ordering::SeqCst), 1);
-    assert_eq!(journal.states(), vec![OperationState::Finalized]);
-    assert_eq!(
-        engine
-            .calls()
-            .iter()
-            .filter(|call| **call == Call::Commit)
-            .count(),
-        1
-    );
-}
-
-#[test]
 fn writer_abort_is_recorded_without_commit() {
     let engine = FakeInsertEngine::new(target());
     engine.set_write_behavior(WriteBehavior::Aborted);
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
     let journal = Arc::clone(&coordination.journal);
-    let statistics = Arc::new(RecordingStatistics::new());
     let (context, _, _) = context();
     let error = service_over(
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        statistics,
     )
     .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
     .unwrap_err();

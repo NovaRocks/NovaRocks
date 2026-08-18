@@ -27,9 +27,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::background::{MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts};
-use novarocks::maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
+use crate::query_execution::maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, OptimizeSubmission,
 };
+use novarocks::maintenance::MaintenanceTarget;
 
 const DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS: i64 = 432_000_000;
 const DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP: u32 = 1;

@@ -28,7 +28,7 @@ use crate::mv::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 use novarocks_catalog::identifier::normalize_identifier;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergMvUserMutation {
+pub enum IcebergMvUserMutation {
     Insert,
     Update,
     Delete,
@@ -81,7 +81,7 @@ pub(crate) fn reject_if_iceberg_mv_properties(
 /// and the storage-observation port. Command kernels use this entry directly;
 /// they must not reconstruct an application facade or obtain a provider through
 /// the retired connector registry.
-pub(crate) fn reject_if_iceberg_mv_table_with_ports(
+pub fn reject_if_iceberg_mv_table_with_ports(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     target: &TargetBackend,

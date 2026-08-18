@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use arrow::datatypes::DataType;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
-use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{
     ConsumerActivation, RuntimeFilterBindingId, RuntimeFilterChannelId,

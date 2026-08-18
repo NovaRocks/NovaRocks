@@ -42,14 +42,14 @@ use novarocks_catalog::identifier::TableIdentity;
 /// `current_snapshot_id` it had at refresh entry time.
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
-pub(crate) struct RefreshSnapshotPin {
+pub struct RefreshSnapshotPin {
     snapshots: BTreeMap<String, i64>,
     table_uuids: BTreeMap<String, String>,
 }
 
 #[allow(dead_code)]
 impl RefreshSnapshotPin {
-    pub(crate) fn from_captured_entries(
+    pub fn from_captured_entries(
         entries: impl IntoIterator<Item = (TableIdentity, i64, String)>,
     ) -> Self {
         let mut pin = RefreshSnapshotPin::default();
@@ -61,38 +61,38 @@ impl RefreshSnapshotPin {
         pin
     }
 
-    pub(crate) fn get(&self, base: &TableIdentity) -> Option<i64> {
+    pub fn get(&self, base: &TableIdentity) -> Option<i64> {
         self.snapshots.get(&base.fqn()).copied()
     }
 
-    pub(crate) fn uuid(&self, base: &TableIdentity) -> Option<&str> {
+    pub fn uuid(&self, base: &TableIdentity) -> Option<&str> {
         self.table_uuids.get(&base.fqn()).map(String::as_str)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.snapshots.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, i64)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&str, i64)> {
         self.snapshots.iter().map(|(k, v)| (k.as_str(), *v))
     }
 
-    pub(crate) fn to_snapshot_map(&self) -> BTreeMap<String, i64> {
+    pub fn to_snapshot_map(&self) -> BTreeMap<String, i64> {
         self.snapshots.clone()
     }
 
-    pub(crate) fn to_table_uuid_map(&self) -> BTreeMap<String, String> {
+    pub fn to_table_uuid_map(&self) -> BTreeMap<String, String> {
         self.table_uuids.clone()
     }
 }
 
 /// Rejects a refresh when a persisted base-table identity no longer matches
 /// the identity frozen in this attempt's pin.
-pub(crate) fn validate_refresh_pin_table_uuids(
+pub fn validate_refresh_pin_table_uuids(
     mv_definition: &StoredMvDefinition,
     pin: &RefreshSnapshotPin,
     base_refs: &[TableIdentity],

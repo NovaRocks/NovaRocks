@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::view::ViewSqlDialect;
 use bytes::Bytes;
-use novarocks::view::ViewSqlDialect;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,

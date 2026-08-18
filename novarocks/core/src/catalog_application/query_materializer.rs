@@ -47,7 +47,7 @@ use novarocks_sql::planning::catalog::{
 /// Project a provider-neutral SPI metadata materialization into the
 /// request-local SQL binding. Provider aliases retain their separately frozen
 /// provider-owned facts until their dedicated adapters run.
-pub(crate) fn connector_query_binding_from_materialization(
+pub fn connector_query_binding_from_materialization(
     materialization: ConnectorQueryTableMaterialization,
     catalog: &str,
     namespace: &str,
@@ -109,7 +109,7 @@ pub(crate) fn connector_query_binding_from_materialization(
 /// Application materializer for connector-controlled table metadata.  The
 /// interface is intentionally application-owned because it returns an exact
 /// lease alongside planner facts.  It is not part of SQL's vocabulary.
-pub(crate) trait QueryTableBindingLoader: Send + Sync {
+pub trait QueryTableBindingLoader: Send + Sync {
     fn load_strict_base_table(
         &self,
         catalog: &str,
@@ -154,7 +154,7 @@ pub struct CatalogServiceMaterializer<'a> {
 /// before SQL sees the resulting tokenized table.  Keeping the factory here
 /// prevents a synthetic relation from leaking into the shared catalog.
 #[derive(Clone)]
-pub(crate) struct QueryLocalTableOverlay {
+pub struct QueryLocalTableOverlay {
     namespace: String,
     table: String,
     key: QueryTableBindingKey,
@@ -163,7 +163,7 @@ pub(crate) struct QueryLocalTableOverlay {
 }
 
 impl QueryLocalTableOverlay {
-    pub(crate) fn new(
+    pub fn new(
         namespace: impl Into<String>,
         table: impl Into<String>,
         key: QueryTableBindingKey,
@@ -190,7 +190,7 @@ impl QueryLocalTableOverlay {
 }
 
 impl<'a> CatalogServiceMaterializer<'a> {
-    pub(crate) fn new(
+    pub fn new(
         current_catalog: Option<&'a str>,
         service: &'a crate::catalog_application::query_catalog::QueryCatalogService,
         bindings: Arc<QueryTableBindingStore>,
@@ -199,7 +199,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         Self::new_with_query_local_overlays(current_catalog, service, bindings, loader, Vec::new())
     }
 
-    pub(crate) fn new_with_query_local_overlays(
+    pub fn new_with_query_local_overlays(
         current_catalog: Option<&'a str>,
         service: &'a crate::catalog_application::query_catalog::QueryCatalogService,
         bindings: Arc<QueryTableBindingStore>,
@@ -219,11 +219,11 @@ impl<'a> CatalogServiceMaterializer<'a> {
         }
     }
 
-    pub(crate) fn query_table_bindings(&self) -> Arc<QueryTableBindingStore> {
+    pub fn query_table_bindings(&self) -> Arc<QueryTableBindingStore> {
         Arc::clone(&self.bindings)
     }
 
-    pub(crate) fn with_catalog_application(
+    pub fn with_catalog_application(
         mut self,
         catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
     ) -> Self {
@@ -479,7 +479,7 @@ pub fn build_catalog_service_provider<'a>(
 /// supplying generated relations that are scoped to that request. These
 /// overlays are projected into SQL binding tokens before analysis and never
 /// enter the shared local catalog.
-pub(crate) fn build_catalog_service_provider_with_query_local_overlays<'a>(
+pub fn build_catalog_service_provider_with_query_local_overlays<'a>(
     current_catalog: Option<&'a str>,
     catalog_service: &'a QueryCatalogService,
     controls: &'a dyn ConnectorControlResolver,
@@ -503,7 +503,7 @@ pub(crate) fn build_catalog_service_provider_with_query_local_overlays<'a>(
     )
 }
 
-pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overlays<'a>(
+pub fn build_catalog_service_provider_with_bindings_and_query_local_overlays<'a>(
     current_catalog: Option<&'a str>,
     catalog_service: &'a QueryCatalogService,
     controls: &'a dyn ConnectorControlResolver,
@@ -526,7 +526,7 @@ pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overl
 /// Application adapter for the SQL catalog's provider-neutral materialization
 /// seam. The resulting binding carries the exact planning lease acquired for
 /// metadata; SQL itself never names the Iceberg provider.
-pub(crate) fn iceberg_table_binding_loader<'a>(
+pub fn iceberg_table_binding_loader<'a>(
     controls: &'a dyn ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Box<dyn QueryTableBindingLoader + 'a> {

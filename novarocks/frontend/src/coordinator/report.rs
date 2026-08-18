@@ -17,10 +17,8 @@
 
 use std::sync::Arc;
 
-use novarocks::query_execution::contract::DistributedQueryErrorKind;
-use novarocks::query_execution::lifecycle::{
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress,
-};
+use crate::query_execution::contract::DistributedQueryErrorKind;
+use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
 use novarocks_protocol::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };

@@ -18,7 +18,7 @@ use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext
 
 /// Validates the persisted aggregate metadata before any refresh planning or
 /// query assembly derives an aggregate refresh path.
-pub(crate) fn validate_aggregate_schema_contract_metadata<'a>(
+pub fn validate_aggregate_schema_contract_metadata<'a>(
     target: &IcebergMvTarget,
     mv_definition: &'a StoredMvDefinition,
 ) -> Result<&'a MvSchemaContract, String> {
@@ -82,7 +82,7 @@ pub(crate) fn validate_aggregate_schema_contract_for_base(
     }
 }
 
-pub(crate) fn validate_repartition_schema_contract(
+pub fn validate_repartition_schema_contract(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     schema_contract: &MvSchemaContract,

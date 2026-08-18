@@ -58,8 +58,8 @@ use crate::mv::repository::MvRepository;
 use crate::mv::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvStorageObservationPort,
 };
-use crate::query_execution::StatementResult;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
 };

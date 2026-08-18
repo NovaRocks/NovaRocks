@@ -25,13 +25,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ::novarocks::query_execution::FragmentInstancePlacement;
-use ::novarocks::query_execution::artifact::{
+use crate::query_execution::FragmentInstancePlacement;
+use crate::query_execution::artifact::{
     NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionFragmentRole,
     ValidatedNativeSubmission, WriterRegistration, WriterRegistrationSet,
 };
-use ::novarocks::query_execution::assembly;
-use ::novarocks::query_execution::write_plan::ConnectorWritePlanAttachment;
+use crate::query_execution::assembly;
+use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_spi::connector::ConnectorWriteCohortId;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdgeKind, FragmentId};

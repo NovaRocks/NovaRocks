@@ -26,7 +26,7 @@ use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext
 /// capabilities selected by the caller.  This keeps an EXPLAIN or foreground
 /// refresh attempt from reconstructing application state just to re-observe
 /// a base table.
-pub(crate) fn capture_refresh_snapshot_pin_with_ports(
+pub fn capture_refresh_snapshot_pin_with_ports(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     base_refs: &[TableIdentity],

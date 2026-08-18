@@ -27,10 +27,10 @@ use novarocks_sql::syntax::ObjectName;
 /// A normalized Iceberg MV target identity.  Refresh planning and the domain
 /// persistence paths share this value without acquiring query assembly state.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct IcebergMvTarget {
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) table: String,
+pub struct IcebergMvTarget {
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
 }
 
 impl From<&TableIdentity> for IcebergMvTarget {
@@ -44,7 +44,7 @@ impl From<&TableIdentity> for IcebergMvTarget {
 }
 
 /// Resolves the SQL-level MV name to its normalized Iceberg target identity.
-pub(crate) fn resolve_refresh_target(
+pub fn resolve_refresh_target(
     current_catalog: Option<&str>,
     current_database: &str,
     name: &ObjectName,
@@ -82,7 +82,7 @@ pub fn resolve_refresh_mv_target(
 /// This capability deliberately receives only the two admitted ports, the
 /// normalized domain target, and the request context.  It does not depend on
 /// the aggregate refresh source or query assembly state.
-pub(crate) fn load_iceberg_mv_target_binding(
+pub fn load_iceberg_mv_target_binding(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     target: &IcebergMvTarget,
@@ -102,7 +102,7 @@ pub(crate) fn load_iceberg_mv_target_binding(
 
 /// Validates that the persisted MV definition still names the target snapshot
 /// that was observed for refresh planning.
-pub(crate) fn validate_target_snapshot(
+pub fn validate_target_snapshot(
     target: &IcebergMvTarget,
     mv_definition: &StoredMvDefinition,
     binding: &MvTargetBinding,

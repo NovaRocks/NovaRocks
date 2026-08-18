@@ -21,11 +21,11 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use novarocks::query_execution::dml::delete::{
+use crate::common::admitted_query_context::RequestContext;
+use crate::query_execution::dml::delete::{
     DeleteCommit, DeleteEngine, DeleteStatementKind, DeleteWriteReport, PrepareDeleteRequest,
     PreparedDelete, parse_delete_statement, parse_equality_delete_statement,
 };
-use novarocks::query_execution::request_context::RequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::coordination::DmlExternalFenceProposal;

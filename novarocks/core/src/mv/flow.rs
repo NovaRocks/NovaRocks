@@ -29,7 +29,7 @@ use crate::mv::persistence::definition::{
 };
 use crate::mv::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use crate::mv::repository::MvRepository;
-use crate::query_execution::StatementResult;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_sql::syntax::three_part_table_ref_occurrences;
 use novarocks_sql::syntax::{
@@ -811,20 +811,6 @@ mod tests {
             .expect_err("extra 3-part ref must fail");
 
         assert!(err.contains("exactly one 3-part Iceberg table, got 2"));
-    }
-
-    #[test]
-    fn delete_temp_delta_file_omits_row_lineage_metadata() {
-        let file =
-            crate::query_execution::planning::time_travel::delete_temp_iceberg_file_for_query(
-                "file:///tmp/delete.parquet".to_string(),
-                128,
-                Some(1),
-                None,
-            );
-
-        assert_eq!(file.first_row_id, None);
-        assert_eq!(file.data_sequence_number, None);
     }
 
     #[test]

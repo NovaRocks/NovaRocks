@@ -17,25 +17,25 @@
 
 //! Closed typed executor for Iceberg MV statements.
 
+use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::runtime::statement_result::StatementResult;
 use novarocks::connector::MvBackend;
 use novarocks::mv::application::{MvApplicationService, MvStatementResult};
 use novarocks::mv::iceberg_refresh::IcebergMvCorePorts;
 use novarocks::mv::repository::MvRepository;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
-use novarocks::query_execution::StatementResult;
-use novarocks::query_execution::request_context::QueryExecutionContext;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
     RefreshMaterializedViewStmt, parse_call_procedure_sql, parse_mv_admitted_statement,
 };
 
 use super::FrontendMvService;
+use crate::runtime::query_result::build_string_query_result;
 use novarocks::mv::refresh::resolve_refresh_mv_target;
 use novarocks::mv::{
     PROCEDURE_NAME, alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
     execute_novarocks_imv_stateless_rebuild, list_mvs_with_backend,
 };
-use novarocks::runtime::query_result::build_string_query_result;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -86,7 +86,7 @@ impl MvCommandExecutor {
                     "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW is not supported".to_string()
                 );
             }
-            let lines = novarocks::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
+            let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
                 &self.ports,
                 current_catalog,
                 current_database,
@@ -193,7 +193,7 @@ impl MvCommandExecutor {
             full: false,
         };
         let preparation =
-            novarocks::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_repartition_with_ports(
+            crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_repartition_with_ports(
                 &self.ports,
                 current_catalog,
                 current_database,
@@ -257,7 +257,7 @@ impl MvCommandExecutor {
                 full: false,
             };
             let preparation =
-                novarocks::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
+                crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
                     &self.ports,
                     target_catalog.as_deref(),
                     &target_database,

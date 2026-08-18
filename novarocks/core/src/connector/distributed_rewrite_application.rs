@@ -22,7 +22,7 @@ use novarocks_spi::connector::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::query_execution::request_context::QueryExecutionContext;
+use crate::common::admitted_query_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DistributedRewriteIntent {
@@ -99,15 +99,15 @@ impl<S: SealedDistributedRewrite> DistributedRewriteApplicationSession<S> {
         hash.finalize().into()
     }
 
-    pub(crate) fn session(&self) -> &S {
+    pub fn session(&self) -> &S {
         &self.session
     }
 
-    pub(crate) fn context(&self) -> &ConnectorRequestContext {
+    pub fn context(&self) -> &ConnectorRequestContext {
         &self.context
     }
 
-    pub(crate) fn execution(&self) -> &QueryExecutionContext {
+    pub fn execution(&self) -> &QueryExecutionContext {
         &self.execution
     }
 }
@@ -176,41 +176,4 @@ pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
         context,
         execution,
     })
-}
-
-// CLS-R2 boundary: everything below binds the neutral seam above to the query
-// assembly owner that still lives in this package.  `QueryExecutionService` and
-// `ConnectorDistributedRewriteSession` move to the frontend in CLS-R2 T15;
-// these bindings move with them and nothing above this line changes.
-use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
-use crate::query_execution::service::QueryExecutionService;
-
-/// The maintenance session shape produced by the in-package query assembly
-/// owner.  Callers keep naming this alias, so relocating the owner does not
-/// change any call site.
-pub type DistributedRewriteMaintenanceSession =
-    DistributedRewriteApplicationSession<ConnectorDistributedRewriteSession>;
-
-impl SealedDistributedRewrite for ConnectorDistributedRewriteSession {
-    fn plan(&self) -> &ConnectorDistributedRewritePlan {
-        ConnectorDistributedRewriteSession::plan(self)
-    }
-
-    fn is_noop(&self) -> bool {
-        ConnectorDistributedRewriteSession::is_noop(self)
-    }
-}
-
-impl DistributedRewriteSealing for QueryExecutionService {
-    type Sealed = ConnectorDistributedRewriteSession;
-
-    fn seal_distributed_rewrite(
-        &self,
-        plan: ConnectorDistributedRewritePlan,
-        lease: ConnectorDistributedRewriteLease,
-        context: ConnectorRequestContext,
-    ) -> Result<Self::Sealed, String> {
-        self.begin_distributed_rewrite_operation_with_lease(plan, lease, context)
-            .map_err(|error| error.to_string())
-    }
 }

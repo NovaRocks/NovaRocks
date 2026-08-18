@@ -32,7 +32,7 @@ use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use novarocks::query_execution::lifecycle::QueryTerminalIngress;
+use novarocks::query_lifecycle::QueryTerminalIngress;
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_protocol::{filter, lifecycle::ParticipantTerminalOutcome, novarocks as proto};

@@ -34,13 +34,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
-use novarocks::maintenance::{
+use crate::common::query_cancellation::QueryCancellationSource;
+use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, MaintenanceActionOutcome, MaintenanceActionRequest,
-    MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
+    OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
+use novarocks::maintenance::MaintenanceTarget;
 use novarocks::mv::persistence::definition::StoredMvDefinition;
 use novarocks::mv::repository::{MvRepository, MvRepositoryError};
-use novarocks::query_execution::cancellation::QueryCancellationSource;
 
 use super::activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner};
 use super::maintenance::{

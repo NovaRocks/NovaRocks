@@ -19,30 +19,28 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
+use crate::query_execution::PreparedQueryOperation;
+use crate::query_execution::compiler::{
+    TableLookupMode, freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
+    query_statistics_snapshot,
+};
+use crate::query_execution::kernels::{
+    QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
+};
+use crate::query_execution::planning::sql_cancellation_observation;
+use crate::query_execution::planning::time_travel::{
+    has_time_travel_refs, rewrite_time_travel_refs,
+};
+use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_distributed_query};
+use crate::view::ViewRequestContext;
 use novarocks::catalog_application::information_schema;
 use novarocks::catalog_application::query_materializer::build_catalog_service_provider;
 use novarocks::catalog_application::virtual_table;
 use novarocks::connector::connector_request_context_for_query;
 use novarocks::mv::repository::MvRepository;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
-use novarocks::query_execution::PreparedQueryOperation;
-use novarocks::query_execution::compiler::{
-    TableLookupMode, freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
-    query_statistics_snapshot,
-};
-use novarocks::query_execution::kernels::{
-    QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
-};
-use novarocks::query_execution::planning::sql_cancellation_observation;
-use novarocks::query_execution::planning::time_travel::{
-    has_time_travel_refs, rewrite_time_travel_refs,
-};
-use novarocks::query_execution::post_compile::{
-    PostCompileIntent, prepare_compiled_distributed_query,
-};
-use novarocks::query_execution::request_context::{QueryExecutionContext, RequestContext};
-use novarocks::view::ViewRequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::compiler::{
     ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,

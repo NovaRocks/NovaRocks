@@ -22,17 +22,18 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::coordination_fixture::JournalInspect;
-use novarocks::query_execution::backend::BackendTopologySnapshot;
-use novarocks::query_execution::cancellation::QueryCancellationSource;
-use novarocks::query_execution::dml::delete::{
-    DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteStatementKind,
-    DeleteWriteReport, PrepareDeleteRequest, PreparedDelete,
-};
-use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
+use novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
+use novarocks::common::backend_topology::BackendTopologySnapshot;
+use novarocks::common::query_cancellation::QueryCancellationSource;
+use novarocks_frontend::FrontendStatisticsService;
 use novarocks_frontend::dml::model::DML_OPERATION_SCHEMA_VERSION;
 use novarocks_frontend::dml::{
     CreatePreparingRequest, DmlError, DmlErrorKind, DmlOperationId, DmlService, OperationFact,
     OperationJournal, OperationKind, OperationState, StoredOperation,
+};
+use novarocks_frontend::query_execution::dml::delete::{
+    DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteStatementKind,
+    DeleteWriteReport, PrepareDeleteRequest, PreparedDelete,
 };
 use novarocks_spi::connector::{
     ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationFinalization,
@@ -93,8 +94,8 @@ impl DeleteEngine for FakeDeleteEngine {
     /// engine must expose a real write authority to fence against.
     fn establish_delete_external_fence(
         &self,
-        _prepared: &dyn novarocks::query_execution::dml::delete::DeletePrepared,
-        proposal: &dyn novarocks::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
+        _prepared: &dyn novarocks_frontend::query_execution::dml::delete::DeletePrepared,
+        proposal: &dyn novarocks_frontend::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
     ) -> Result<
         novarocks_spi::connector::ConnectorEstablishedWriteFence,
         novarocks_spi::connector::ConnectorError,
@@ -140,14 +141,15 @@ impl DeleteEngine for FakeDeleteEngine {
     fn delete_native_encoding<'a>(
         &self,
         _prepared: &'a dyn DeletePrepared,
-    ) -> Result<novarocks::query_execution::dml::delete::DeleteNativeEncoding<'a>, String> {
-        novarocks::query_execution::dml::delete::DeleteNativeEncoding::test_fixture()
+    ) -> Result<novarocks_frontend::query_execution::dml::delete::DeleteNativeEncoding<'a>, String>
+    {
+        novarocks_frontend::query_execution::dml::delete::DeleteNativeEncoding::test_fixture()
     }
 
     fn run_delete_with_native_bundle(
         &self,
         prepared: &dyn DeletePrepared,
-        _native_bundle: novarocks::query_execution::native_fragment::NativeFragmentAttachment,
+        _native_bundle: novarocks_frontend::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<DeleteWriteReport, String> {
         self.run_delete(prepared)
     }
@@ -298,12 +300,9 @@ fn non_delete_skips_engine_and_journal() {
     let engine = FakeDeleteEngine::new(WriteBehavior::NoOp);
     let (context, _, _) = context();
     assert_eq!(
-        DmlService::compose(
-            None,
-            Arc::new(novarocks::statistics::EmptyStatisticsService)
-        )
-        .try_execute_delete(&engine, "SELECT 1", &context, None)
-        .unwrap(),
+        DmlService::compose(None, Arc::new(FrontendStatisticsService::new()))
+            .try_execute_delete(&engine, "SELECT 1", &context, None)
+            .unwrap(),
         None,
     );
     assert!(engine.prepare_calls.lock().unwrap().is_empty());
@@ -313,12 +312,9 @@ fn non_delete_skips_engine_and_journal() {
 fn delete_requires_journal_before_prepare() {
     let engine = FakeDeleteEngine::new(WriteBehavior::NoOp);
     let (context, _, _) = context();
-    let error = DmlService::compose(
-        None,
-        Arc::new(novarocks::statistics::EmptyStatisticsService),
-    )
-    .try_execute_delete(&engine, "DELETE FROM orders WHERE id = 1", &context, None)
-    .unwrap_err();
+    let error = DmlService::compose(None, Arc::new(FrontendStatisticsService::new()))
+        .try_execute_delete(&engine, "DELETE FROM orders WHERE id = 1", &context, None)
+        .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(engine.prepare_calls.lock().unwrap().is_empty());
 }
@@ -330,7 +326,7 @@ fn delete_uses_admitted_context_and_records_noop_as_known_empty() {
     let journal = Arc::clone(&coordination.journal);
     let service = DmlService::compose_with_coordination(
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::new(novarocks::statistics::EmptyStatisticsService),
+        Arc::new(FrontendStatisticsService::new()),
         Arc::clone(&coordination.coordination),
         coordination.handle(),
     );
@@ -357,7 +353,7 @@ fn equality_delete_commits_and_finalizes_row_delta() {
     let journal = Arc::clone(&coordination.journal);
     let service = DmlService::compose_with_coordination(
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::new(novarocks::statistics::EmptyStatisticsService),
+        Arc::new(FrontendStatisticsService::new()),
         Arc::clone(&coordination.coordination),
         coordination.handle(),
     );
@@ -390,7 +386,7 @@ fn aborted_delete_does_not_commit() {
     let journal = Arc::clone(&coordination.journal);
     let service = DmlService::compose_with_coordination(
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-        Arc::new(novarocks::statistics::EmptyStatisticsService),
+        Arc::new(FrontendStatisticsService::new()),
         Arc::clone(&coordination.coordination),
         coordination.handle(),
     );

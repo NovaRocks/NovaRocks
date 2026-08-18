@@ -69,7 +69,7 @@ pub enum MutationDispatchState {
 /// only with evidence; this adapter reconciles that evidence on the same
 /// generation-fenced lease and deliberately never replays the mutation.
 // Design: ADR-0017 (docs/adr/ADR-0017-connector-catalog-mutation-outcomes.md)
-pub(crate) fn execute_catalog_mutation(
+pub fn execute_catalog_mutation(
     resolver: &dyn ConnectorCatalogMutationResolver,
     instance_id: &ConnectorInstanceId,
     operation: ConnectorCatalogMutationOperation,
@@ -99,7 +99,7 @@ pub(crate) fn execute_catalog_mutation(
 /// Executes once and, only for `CommitUnknown`, reconciles once through the
 /// same generation-fenced lease. Outer errors are SPI contract failures; every
 /// provider/network/store result stays in the typed state space.
-pub(crate) fn resolve_catalog_mutation(
+pub fn resolve_catalog_mutation(
     resolver: &dyn ConnectorCatalogMutationResolver,
     instance_id: &ConnectorInstanceId,
     operation: ConnectorCatalogMutationOperation,

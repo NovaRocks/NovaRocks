@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use novarocks::query_execution::artifact::RuntimeFilterArtifactId;
+use crate::query_execution::artifact::RuntimeFilterArtifactId;
 use novarocks_protocol::{common, filter};
 
 use super::deployment::RuntimeFilterWaitGraph;

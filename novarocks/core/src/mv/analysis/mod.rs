@@ -17,8 +17,8 @@
 
 //! Materialized-view query-analysis vocabulary and pure staged contract.
 
-pub(crate) mod rebind;
-pub(crate) mod refresh_property;
+pub mod rebind;
+pub mod refresh_property;
 use std::collections::HashSet;
 
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
@@ -42,7 +42,7 @@ pub(crate) enum ResolvedTableRef {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MvAnalysis {
+pub struct MvAnalysis {
     pub resolved_refs: Vec<ResolvedTableRef>,
     pub output_columns: Vec<SqlMvOutputColumnFacts>,
     /// Opaque SQL-owned carrier for refresh-property planning. Core retains it
@@ -331,7 +331,7 @@ fn unsupported_mv_from_clause(clause: &str) -> String {
     format!("materialized view SELECT does not support {clause} in FROM")
 }
 
-pub(crate) fn canonicalize_iceberg_mv_select_query(
+pub fn canonicalize_iceberg_mv_select_query(
     query: &sqlparser::ast::Query,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -481,7 +481,7 @@ pub(crate) fn resolve_mv_name(
     }
 }
 
-pub(crate) fn validate_mv_partition_columns(
+pub fn validate_mv_partition_columns(
     partition_by: Option<&[IcebergPartitionFieldExpr]>,
     output_columns: &[SqlMvOutputColumnFacts],
 ) -> Result<(), String> {

@@ -20,12 +20,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks::query_execution::dml::mutation::{
+use crate::common::admitted_query_context::RequestContext;
+use crate::query_execution::dml::mutation::{
     MutationAbort, MutationCommit, MutationEngine, MutationNativeFragmentEncoder,
     MutationStageOutcome, MutationStatementKind, PrepareMutationRequest, PreparedMutation,
     parse_merge_statement, parse_update_statement,
 };
-use novarocks::query_execution::request_context::RequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::coordination::DmlExternalFenceProposal;
@@ -49,8 +49,8 @@ struct FrontendMutationNativeFragmentEncoder;
 impl MutationNativeFragmentEncoder for FrontendMutationNativeFragmentEncoder {
     fn encode(
         &self,
-        input: &novarocks::query_execution::compiler::NativeFragmentEncodingInput,
-    ) -> Result<novarocks::query_execution::native_fragment::NativeFragmentAttachment, String> {
+        input: &crate::query_execution::compiler::NativeFragmentEncodingInput,
+    ) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, String> {
         crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view())
     }
 }
@@ -235,14 +235,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use novarocks::query_execution::backend::BackendTopologySnapshot;
-    use novarocks::query_execution::cancellation::QueryCancellationSource;
-    use novarocks::query_execution::dml::mutation::{
+    use crate::common::admitted_query_context::{
+        RequestAdmission, RequestContext, SessionOptimizerSettings,
+    };
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::query_cancellation::QueryCancellationSource;
+    use crate::query_execution::dml::mutation::{
         MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
         PreparedMutation,
-    };
-    use novarocks::query_execution::request_context::{
-        RequestAdmission, RequestContext, SessionOptimizerSettings,
     };
     use novarocks_types::ClusterRole;
 
@@ -271,7 +271,7 @@ mod tests {
         ) -> Result<PreparedMutation, String> {
             self.events.lock().expect("events").push("prepare");
             Ok(PreparedMutation {
-                operation: novarocks::query_execution::dml::mutation::MutationOperation {
+                operation: crate::query_execution::dml::mutation::MutationOperation {
                     kind: request.kind,
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),

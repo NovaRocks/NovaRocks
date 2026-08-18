@@ -24,7 +24,7 @@ use crate::mv::refresh::target::IcebergMvTarget;
 use crate::mv::repository::MvRepository;
 
 /// Loads the persisted definition for one normalized Iceberg MV target.
-pub(crate) fn load_iceberg_mv_definition_by_target(
+pub fn load_iceberg_mv_definition_by_target(
     repository: &dyn MvRepository,
     target: &IcebergMvTarget,
 ) -> Result<StoredMvDefinition, String> {
@@ -46,12 +46,12 @@ pub(crate) fn load_iceberg_mv_definition_by_target(
 }
 
 /// Computes the stable persisted-SQL fingerprint used by refresh artifacts.
-pub(crate) fn mv_definition_fingerprint(select_sql: &str) -> String {
+pub fn mv_definition_fingerprint(select_sql: &str) -> String {
     hex::encode(Sha256::digest(select_sql.as_bytes()))
 }
 
 /// Parses the raw stored MV SELECT SQL without invoking query compilation.
-pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
+pub fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
     let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
         .map_err(|e| format!("stored MV SELECT normalize error: {e}"))?;
     let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)

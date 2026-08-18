@@ -1,10 +1,10 @@
 //! Frontend-owned semantic mapping from sealed RF facts to native plan DTOs.
 
-use novarocks::query_execution::artifact::{
+use crate::query_execution::artifact::{
     RuntimeFilterBindingAttachment, RuntimeFilterBindingEncodingView,
 };
-use novarocks::query_execution::contract::DistributedQueryError;
-use novarocks::query_execution::{
+use crate::query_execution::contract::DistributedQueryError;
+use crate::query_execution::{
     RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
     RuntimeFilterBindingFragmentFactsView, RuntimeFilterBindingRoleFacts,
     RuntimeFilterCompletionRequirement, RuntimeFilterConsumerActivation,
@@ -16,8 +16,8 @@ use novarocks_protocol::plan;
 use super::semantic_encoder;
 
 fn encoding_error(message: impl Into<String>) -> DistributedQueryError {
-    novarocks::query_execution::contract::DistributedQueryError::new(
-        novarocks::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+    crate::query_execution::contract::DistributedQueryError::new(
+        crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
         message,
     )
 }
@@ -73,7 +73,7 @@ fn validate_binding_order(
 }
 
 fn encode_binding(
-    binding: novarocks::query_execution::RuntimeFilterBindingFacts<'_>,
+    binding: crate::query_execution::RuntimeFilterBindingFacts<'_>,
 ) -> Result<plan::RuntimeFilterBinding, DistributedQueryError> {
     let logical_domain = semantic_encoder::encode_logical_domain(binding.logical_domain())?;
     Ok(plan::RuntimeFilterBinding {
@@ -225,12 +225,12 @@ fn encode_role(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType;
-    use novarocks::query_execution::{
+    use crate::query_execution::{
         RuntimeFilterLogicalDomainFacts, RuntimeFilterNullOrder, RuntimeFilterNullSemantics,
         RuntimeFilterOrderKeyFacts, RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget,
         RuntimeFilterSortDirection,
     };
+    use arrow::datatypes::DataType;
     use plan::runtime_filter_binding::Role;
     use plan::runtime_filter_consumer_activation::Kind as ActivationKind;
     use plan::runtime_filter_reduction_contract::Kind as ReductionKind;

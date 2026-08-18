@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks_protocol::{filter, novarocks as service};
 use prost::Message;
 use sha2::{Digest, Sha256};
