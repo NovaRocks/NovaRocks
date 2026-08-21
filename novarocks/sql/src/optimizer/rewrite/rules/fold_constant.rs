@@ -1008,6 +1008,41 @@ mod tests {
     }
 
     #[test]
+    fn does_not_fold_side_effecting_sleep_from_catalog_volatility() {
+        // `sleep(10)` has every surface property of a foldable constant: an
+        // immutable literal argument and a `Boolean` output that encodes onto
+        // the wire. Its only observable behavior is the delay it imposes on
+        // whichever thread evaluates it, so folding it on the frontend blocked
+        // the planner for the sleep duration and then shipped a bare `true` to
+        // the backends -- the delay vanished from execution.
+        //
+        // The gate is the catalog's volatility classification, so read it from
+        // the catalog here instead of hardcoding `Volatile`: this fails if
+        // `sleep` ever drifts back to `Immutable`.
+        for name in ["sleep", "SLEEP"] {
+            let mut fixture = Fixture::with_mode(FakeMode::Fold);
+            let ten = fixture.int_literal(10);
+            let call = fixture.intern(
+                ScalarNode::FunctionCall {
+                    name: name.to_string(),
+                    args: vec![ten],
+                    distinct: false,
+                    volatility: crate::functions::builtin_function_volatility(name),
+                },
+                DataType::Boolean,
+                false,
+            );
+            let plan = project(call);
+
+            assert!(
+                matches!(fixture.apply(plan), RewriteResult::Unchanged),
+                "{name} must not be folded"
+            );
+            assert_eq!(fixture.calls(), 0, "{name} must not reach the port");
+        }
+    }
+
+    #[test]
     fn does_not_fold_distinct_function_call() {
         let mut fixture = Fixture::with_mode(FakeMode::Fold);
         let one = fixture.int_literal(1);

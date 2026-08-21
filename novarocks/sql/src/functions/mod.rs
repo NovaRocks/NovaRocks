@@ -95,11 +95,25 @@ pub fn builtin_sql_function_catalog() -> &'static dyn crate::compiler::SqlFuncti
 /// Canonical set of volatile builtins.  Keep this list here rather than in
 /// analyzer and optimizer copies.  The historical analyzer list was a strict
 /// subset; SQLX-1 deliberately adopts the optimizer's full safety set.
+///
+/// "Volatile" covers two kinds of non-constant builtin, and both have to be
+/// denied for the same reason: the optimizer must not evaluate them itself.
+///
+/// - Non-deterministic *value*: `rand`, `random`, `uuid` and the clock family
+///   return a different answer per evaluation.
+/// - Non-reproducible *side effect*: `sleep` returns a constant `true`, but its
+///   whole observable behavior is the delay it imposes on the evaluating
+///   thread. Classifying it `Immutable` let `FoldConstant` evaluate
+///   `sleep(10)` on the frontend during logical normalization, which blocked
+///   the planner for the sleep duration and then shipped a bare `true` to the
+///   backends — the delay disappeared from execution entirely. This matches
+///   the reference engine, which groups `sleep` with `rand`/`random`/`uuid`
+///   rather than with the clock functions.
 pub(crate) fn builtin_function_volatility(name: &str) -> FunctionVolatility {
     match name.to_ascii_lowercase().as_str() {
-        "rand" | "random" | "uuid" | "now" | "current_timestamp" | "current_date" | "curdate"
-        | "current_time" | "curtime" | "localtime" | "localtimestamp" | "utc_timestamp"
-        | "utc_time" => FunctionVolatility::Volatile,
+        "rand" | "random" | "uuid" | "sleep" | "now" | "current_timestamp" | "current_date"
+        | "curdate" | "current_time" | "curtime" | "localtime" | "localtimestamp"
+        | "utc_timestamp" | "utc_time" => FunctionVolatility::Volatile,
         _ => FunctionVolatility::Immutable,
     }
 }
@@ -115,6 +129,7 @@ mod tests {
             "rand",
             "random",
             "uuid",
+            "sleep",
             "now",
             "current_timestamp",
             "current_date",
