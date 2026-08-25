@@ -20,7 +20,7 @@ use std::collections::HashMap;
 pub(crate) use self::type_mapping::encode_type;
 use super::expr::encode_expr;
 use crate::query_execution::preparation::NativeScanFactsView;
-use novarocks_protocol::{common, plan};
+use novarocks_proto::{common, plan};
 use novarocks_sql::plan_read::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,
     FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentStreamKind, NodeExecutionColumn,
@@ -210,6 +210,6 @@ pub(super) fn encode_node_with_context(
     Ok(node)
 }
 
-fn encode_exprs(src: &[TypedExpr]) -> Result<Vec<novarocks_protocol::expr::Expr>, String> {
+fn encode_exprs(src: &[TypedExpr]) -> Result<Vec<novarocks_proto::expr::Expr>, String> {
     src.iter().map(encode_expr).collect()
 }

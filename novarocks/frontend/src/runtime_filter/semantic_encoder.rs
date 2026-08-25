@@ -10,7 +10,7 @@ use crate::query_execution::{
     RuntimeFilterReductionFacts, RuntimeFilterSortDirection,
 };
 use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
-use novarocks_protocol::{common, plan};
+use novarocks_proto::{common, plan};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
 

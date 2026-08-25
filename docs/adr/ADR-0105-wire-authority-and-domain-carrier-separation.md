@@ -9,7 +9,7 @@ date: 2026-08-25
 provenance:
   - "discussion: 2026-08-25 connector execution binding carrier ownership"
 code-anchors:
-  - "novarocks/protocol/src/provider/execution_binding.rs (connector_execution_binding_declaration_digest)"
+  - "novarocks/proto/src/provider/execution_binding.rs (connector_execution_binding_declaration_digest)"
   - "novarocks/spi/src/connector/execution_declaration.rs (ConnectorExecutionDeclaration)"
   - "novarocks/frontend/src/native/transport.rs (encode_connector_execution_declaration)"
   - "novarocks/backend/src/connector/binding_decode.rs (decode_connector_execution_declaration)"
@@ -21,7 +21,7 @@ code-anchors:
 
 ## 背景与执行事实
 
-ADR-0103 正确地把仓库级 IDL、generated DTO 与 canonical digest 集中到 `novarocks-protocol`，并把同构 native build admission 留在 Frontend topology。但是它允许第一个真实 carrier 把 Protocol declaration wrapper 直接暴露给 SPI；这会使 SPI、SQL、Execution 与 StateStore provider 经一条本不属于它们的依赖边获得 Protocol/prost/protoc，也会让 catalog admission 的 normalizing identity 与 wire ingress 的 strict canonical validation 混在同一 representation 内。
+ADR-0103 正确地把仓库级 IDL、generated DTO 与 canonical digest 集中到 `novarocks-proto`，并把同构 native build admission 留在 Frontend topology。但是它允许第一个真实 carrier 把 Protocol declaration wrapper 直接暴露给 SPI；这会使 SPI、SQL、Execution 与 StateStore provider 经一条本不属于它们的依赖边获得 Protocol/prost/protoc，也会让 catalog admission 的 normalizing identity 与 wire ingress 的 strict canonical validation 混在同一 representation 内。
 
 Connector execution binding 已有两个静态内建 variant（Iceberg 与 StarRocks）、一个真实 FE producer、一个真实 BE consumer，以及 Host 的 generation/digest 状态机。它不需要 runtime registry、opaque codec、第三个 adapter crate 或两份可变 authority。因而可以把“wire 的规范形式”与“进程内领域值”明确分开，同时保留单一 DTO digest 的跨进程身份。
 
@@ -34,7 +34,7 @@ Connector execution binding 已有两个静态内建 variant（Iceberg 与 StarR
 
 ## 裁决
 
-`novarocks-protocol` 仍是跨进程 wire 的唯一 authority：IDL/generated DTO、typed Ensure/Retire outcome validator 与从原始 generated declaration 计算的 domain-separated canonical digest 均留在 Protocol。它不保存 Connector execution declaration 的领域 wrapper、ProviderKind、BindingKey 或重复 domain validation。
+`novarocks-proto` 仍是跨进程 wire 的唯一 authority：IDL/generated DTO、typed Ensure/Retire outcome validator 与从原始 generated declaration 计算的 domain-separated canonical digest 均留在 Protocol。它不保存 Connector execution declaration 的领域 wrapper、ProviderKind、BindingKey 或重复 domain validation。
 
 `novarocks-spi` 拥有 `ConnectorExecutionDeclaration`、`ConnectorExecutionBindingKey`、instance-id grammar 和闭合 provider variant。declaration 只有 Iceberg access binding 或 StarRocks local binding，字段私有，只能经 fallible constructor 产生；provider identity 只从 variant 派生，并必须和 control/write/rewrite binding descriptor 的 provider ID 交叉验证。catalog admission 保留 `ConnectorInstanceId::parse` 的 lowercase normalization；wire ingress 只用共享 grammar 的 `try_from_canonical`，因此 uppercase wire identity 必须失败而 SQL/catalog 既有大小写行为不回退。
 

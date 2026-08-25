@@ -42,7 +42,7 @@ use novarocks_execution::runtime::fragment::io::{
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_protocol::lifecycle::QueryExecutionId;
+use novarocks_proto::lifecycle::QueryExecutionId;
 use novarocks_types::SlotId;
 use novarocks_types::UniqueId;
 

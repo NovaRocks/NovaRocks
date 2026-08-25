@@ -31,7 +31,7 @@ is the NIDL-0 baseline; later NIDL tasks add the staged packages below.
 - This repository-level directory is the long-term, language-neutral source of
   the NovaRocks-native wire contract. It is not a staging location to be moved
   into a Rust crate.
-- `novarocks-protocol` is the sole Rust owner of generated DTOs and the native
+- `novarocks-proto` is the sole Rust owner of generated DTOs and the native
   descriptor set.
 - Frontend owns semantic encoding from its private plan to these DTOs; Backend
   owns wire validation and semantic decoding to its private execution domain.

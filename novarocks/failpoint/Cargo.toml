@@ -6,8 +6,8 @@ publish = false
 
 [features]
 default = ["typed"]
-typed = ["dep:novarocks-protocol", "dep:novarocks-types"]
+typed = ["dep:novarocks-proto", "dep:novarocks-types"]
 
 [dependencies]
-novarocks-protocol = { path = "../protocol", optional = true }
+novarocks-proto = { path = "../proto", optional = true }
 novarocks-types = { path = "../types", optional = true }

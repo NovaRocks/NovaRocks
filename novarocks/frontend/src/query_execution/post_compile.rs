@@ -24,7 +24,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::preparation::PreparedFragmentSet;

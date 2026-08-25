@@ -9,7 +9,7 @@ date: 2026-08-24
 provenance:
   - "discussion: 2026-08-21 central provider wire authority and homogeneous native build admission"
 code-anchors:
-  - "novarocks/protocol/src/lib.rs (central IDL and generated DTO authority)"
+  - "novarocks/proto/src/lib.rs (central IDL and generated DTO authority)"
   - "novarocks/frontend/src/topology.rs (ClusterBackendService::record_heartbeat_success)"
 ---
 
@@ -22,7 +22,7 @@ Native binary？
 ## 背景与执行事实
 
 NovaRocks 的生产形态是独立的 FE 与多个 BE。当前 Iceberg 与 StarRocks 都是同仓、静态链接的内建 Provider；中央 IDL、
-generated DTO、Provider 构型和 FE/BE 程序随同一次正式发布原子变化。`novarocks-protocol` 已经集中编译仓库级 IDL、
+generated DTO、Provider 构型和 FE/BE 程序随同一次正式发布原子变化。`novarocks-proto` 已经集中编译仓库级 IDL、
 导出 descriptor artifact，并拥有 generated message 的结构校验与 canonical digest；它是跨进程事实的自然规范位置。
 
 一次 query 或 Provider 工作必须先冻结精确 Connector generation，再在所属 host 中经历 admission、纯 preparation、
@@ -40,7 +40,7 @@ registry。它不能再作为跨 FE/BE Provider contract 的长期表示裁决�
    不能由中央 Protocol 审计，且调用方容易重新引入私有 JSON、私有 protobuf 或 runtime registry。
 2. 由每个 Provider crate 自行生成 Native schema，并以注册表或 generic envelope 接入。Provider 看似更独立，但会产生
    多个协议 authority、版本组合和动态装配问题；这不符合当前同仓内建、原子发布的产品边界。
-3. 由仓库级 IDL 与 `novarocks-protocol` 集中定义 carrier root；每个 carrier 使用 scoped `oneof` 容纳 Provider-specific
+3. 由仓库级 IDL 与 `novarocks-proto` 集中定义 carrier root；每个 carrier 使用 scoped `oneof` 容纳 Provider-specific
    variant，Protocol 负责 typed structural validation 与 canonical digest，真实 consumer 再按本 ADR 的 owner 边界原子切换。
    同时以单一 immutable Native build identity 在 heartbeat/topology 层做 exact-match admission。选择此方案。
 4. 每个 Provider 单独上报 manifest、descriptor digest 或协商版本，再按部分能力接纳 Backend。它可服务将来的异构发布，
@@ -49,7 +49,7 @@ registry。它不能再作为跨 FE/BE Provider contract 的长期表示裁决�
 
 ## 裁决
 
-仓库级 IDL 与 `novarocks-protocol` 是所有内建 Provider 跨 FE/BE wire DTO、generated surface、descriptor artifact、
+仓库级 IDL 与 `novarocks-proto` 是所有内建 Provider 跨 FE/BE wire DTO、generated surface、descriptor artifact、
 typed structural validation 和 canonical digest 的唯一 authority。每个真实 carrier 在中央 root 下定义自身的 scoped `oneof`，
 其 Provider variant 可以表达该 carrier 所需的具名、有界结构化事实；不得以 `payload`、`opaque`、`other` 或 generic envelope
 重新包装 NovaRocks 自有语义。真正属于外部 authority 的 token、标准文档、Arrow IPC 或算法 artifact 仍可作为由具体字段

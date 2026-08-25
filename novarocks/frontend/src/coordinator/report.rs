@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::query_execution::contract::DistributedQueryErrorKind;
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
 

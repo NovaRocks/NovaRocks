@@ -40,18 +40,18 @@ fn main() {
         env::set_var("PROTOC", protoc);
     }
 
-    // Native protobuf DTOs are generated exactly once by novarocks-protocol.
+    // Native protobuf DTOs are generated exactly once by novarocks-proto.
     // The backend owns its ingress and outbound Tonic transport stubs
     // and refers to every request and response through canonical DTO modules.
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
         .codec_path("crate::rpc::codec::NativeProstCodec")
-        .extern_path(".novarocks.common", "::novarocks_protocol::common")
-        .extern_path(".novarocks.expr", "::novarocks_protocol::expr")
-        .extern_path(".novarocks.filter", "::novarocks_protocol::filter")
-        .extern_path(".novarocks.plan", "::novarocks_protocol::plan")
-        .extern_path(".novarocks", "::novarocks_protocol::novarocks")
+        .extern_path(".novarocks.common", "::novarocks_proto::common")
+        .extern_path(".novarocks.expr", "::novarocks_proto::expr")
+        .extern_path(".novarocks.filter", "::novarocks_proto::filter")
+        .extern_path(".novarocks.plan", "::novarocks_proto::plan")
+        .extern_path(".novarocks", "::novarocks_proto::novarocks")
         .compile_protos(
             &[PathBuf::from(IDL_DIR).join("service.proto")],
             &[PathBuf::from(IDL_DIR)],

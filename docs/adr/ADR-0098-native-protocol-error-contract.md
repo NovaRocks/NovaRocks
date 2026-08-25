@@ -9,7 +9,7 @@ date: 2026-08-18
 provenance:
   - "discussion: 2026-08-18 native role data-plane ownership"
 code-anchors:
-  - "novarocks/protocol/src/lib.rs (error)"
+  - "novarocks/proto/src/lib.rs (error)"
 ---
 
 ## 问题
@@ -24,11 +24,11 @@ FE/BE native wire 的字段路径和验证错误，应该由 Core 的通用模�
 
 1. 继续由 Core 拥有全部错误词表。优点是既有 import 不变；代价是 protocol semantic 仍依赖 execution kernel 的目录位置，且无效的多协议概念继续存活。
 2. 新建 lifecycle contract crate。优点是可以把错误与其他 lifecycle 值单独隔离；代价是为少量 native schema 验证值新增一条 crate 边和第二个契约入口。
-3. 由 `novarocks-protocol` 直接拥有 native error contract，并删除 family discriminator 与未使用 transport 词表。优点是 schema、validated value 与拒绝语义在同一 owner；代价是所有消费者必须直接依赖 Protocol。
+3. 由 `novarocks-proto` 直接拥有 native error contract，并删除 family discriminator 与未使用 transport 词表。优点是 schema、validated value 与拒绝语义在同一 owner；代价是所有消费者必须直接依赖 Protocol。
 
 ## 裁决
 
-选择选项 3。`novarocks-protocol` 公开 `FieldPath`、`FieldPathSegment`、`ProtocolErrorKind` 和 `ProtocolError`；`ProtocolError` 固定表示 native 协议错误，构造函数不再接受 family。Core 仅保留使用 Protocol 值的 query-options 解码，Backend/Frontend 直接 import Protocol，不设置 Core compatibility re-export。
+选择选项 3。`novarocks-proto` 公开 `FieldPath`、`FieldPathSegment`、`ProtocolErrorKind` 和 `ProtocolError`；`ProtocolError` 固定表示 native 协议错误，构造函数不再接受 family。Core 仅保留使用 Protocol 值的 query-options 解码，Backend/Frontend 直接 import Protocol，不设置 Core compatibility re-export。
 
 ## 接受的妥协（诚实记录）
 

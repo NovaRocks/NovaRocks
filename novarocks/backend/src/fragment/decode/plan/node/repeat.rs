@@ -28,8 +28,8 @@ use crate::fragment::decode::plan::layout::Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::node::repeat::RepeatNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::plan;
-use novarocks_protocol::{FieldPath, ProtocolErrorKind};
+use novarocks_proto::plan;
+use novarocks_proto::{FieldPath, ProtocolErrorKind};
 use novarocks_types::SlotId;
 
 pub(super) fn lower_repeat_node(
@@ -224,8 +224,8 @@ mod tests {
     use super::super::tests::{lower, physical_node, two_col_values_node};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_protocol::ProtocolErrorKind;
-    use novarocks_protocol::plan;
+    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto::plan;
 
     fn valid_repeat() -> plan::RepeatNode {
         plan::RepeatNode {

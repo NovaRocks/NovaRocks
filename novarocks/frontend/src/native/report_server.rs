@@ -15,11 +15,11 @@ use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle::{
     ContractError, ContractErrorCode, ParticipantTerminalOutcome, QueryTerminalReportAck,
     QueryTerminalReportOutcome,
 };
-use novarocks_protocol::{filter, novarocks as proto};
+use novarocks_proto::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tonic::body::boxed;
@@ -511,7 +511,7 @@ fn runtime_filter_participant_available_debug(
 }
 
 fn runtime_filter_unique_id_debug(
-    id: novarocks_protocol::common::UniqueId,
+    id: novarocks_proto::common::UniqueId,
 ) -> RuntimeFilterUniqueIdDebug {
     RuntimeFilterUniqueIdDebug {
         high: id.hi,
@@ -868,11 +868,11 @@ mod tests {
         RuntimeFilterTerminalRollup, RuntimeFilterTerminalTotals,
         RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
     };
-    use novarocks_protocol::lifecycle::{
+    use novarocks_proto::lifecycle::{
         AttemptId, NegativeAttestation, ParticipantBackendIdentity, ParticipantTerminalOutcome,
         QueryExecutionId, QueryTerminalReportAck, QueryTerminalReportOutcome,
     };
-    use novarocks_protocol::novarocks as proto;
+    use novarocks_proto::novarocks as proto;
     use novarocks_types::QueryId;
 
     struct FixedIngress {
@@ -981,7 +981,7 @@ mod tests {
                             channel_binding_id: 3,
                             channel_id: 5,
                             producer_fragment_instance_id: Some(
-                                novarocks_protocol::common::UniqueId { hi: 9, lo: 10 },
+                                novarocks_proto::common::UniqueId { hi: 9, lo: 10 },
                             ),
                             partition_id: 0,
                             latest_accepted_sequence: Some(0),
@@ -1008,7 +1008,7 @@ mod tests {
                             channel_binding_id: 3,
                             channel_id: 5,
                             consumer_binding_id: 8,
-                            fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
+                            fragment_instance_id: Some(novarocks_proto::common::UniqueId {
                                 hi: 12,
                                 lo: 14,
                             }),

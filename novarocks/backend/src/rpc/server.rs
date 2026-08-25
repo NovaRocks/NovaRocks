@@ -35,7 +35,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_protocol::{filter, novarocks as proto};
+use novarocks_proto::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;

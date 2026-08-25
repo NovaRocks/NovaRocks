@@ -133,8 +133,8 @@ where
     type Error = Status;
 
     fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        let is_stage_fragments = TypeId::of::<U>()
-            == TypeId::of::<novarocks_protocol::novarocks::StageFragmentsRequest>();
+        let is_stage_fragments =
+            TypeId::of::<U>() == TypeId::of::<novarocks_proto::novarocks::StageFragmentsRequest>();
         if is_stage_fragments {
             let bytes = source.chunk();
             if bytes.len() != source.remaining() {

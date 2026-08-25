@@ -26,7 +26,7 @@ use crate::query_execution::artifact::{
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 #[cfg(debug_assertions)]
 use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, configured_root};
-use novarocks_protocol::lifecycle::QueryExecutionId;
+use novarocks_proto::lifecycle::QueryExecutionId;
 
 #[derive(Clone)]
 pub struct FrontendBackendSnapshot {
@@ -359,10 +359,10 @@ fn bind_query_lifecycle_fault_scopes(
 #[cfg(debug_assertions)]
 fn protocol_execution_id(
     execution_id: QueryExecutionId,
-) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, DistributedQueryError> {
-    let attempt = novarocks_protocol::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+) -> Result<novarocks_proto::lifecycle::QueryExecutionId, DistributedQueryError> {
+    let attempt = novarocks_proto::lifecycle::AttemptId::new(execution_id.attempt_id().get())
         .map_err(|error| contract_error(error.to_string()))?;
-    novarocks_protocol::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+    novarocks_proto::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
         .map_err(|error| contract_error(error.to_string()))
 }
 
@@ -496,7 +496,7 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 mod tests {
     use super::FrontendBackendSnapshot;
     use crate::query_execution::contract::DistributedQueryErrorKind;
-    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::QueryId;
 
     #[allow(

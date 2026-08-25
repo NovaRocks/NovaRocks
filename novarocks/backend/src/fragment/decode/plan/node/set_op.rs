@@ -27,8 +27,8 @@ use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::set_op::{SetOpKind, SetOpNode};
 use novarocks_execution::exec::node::union_all::UnionAllNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::{common as proto_common, plan};
+use novarocks_proto::FieldPath;
+use novarocks_proto::{common as proto_common, plan};
 use novarocks_types::SlotId;
 
 #[expect(
@@ -213,7 +213,7 @@ mod tests {
 
     use super::super::tests::{lower, one_col_values_node_with, output_column, physical_node};
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_protocol::plan;
+    use novarocks_proto::plan;
     use novarocks_types::SlotId;
 
     #[test]

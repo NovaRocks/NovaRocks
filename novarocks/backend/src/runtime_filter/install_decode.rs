@@ -31,8 +31,8 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterLateApplyGranularity, RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     RuntimeFilterProducerContract, RuntimeFilterProducerKind, RuntimeFilterReduction, contribution,
 };
-use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
-use novarocks_protocol::{
+use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto::{
     common, filter,
     lifecycle::{QueryExecutionId, RuntimeFilterContribution},
     plan,
@@ -1771,7 +1771,7 @@ mod tests {
         },
         test_support::BackendRuntimeFilterFixture,
     };
-    use novarocks_protocol::{
+    use novarocks_proto::{
         common, filter,
         lifecycle::{AttemptId, QueryExecutionId, RuntimeFilterContribution},
         novarocks as proto_novarocks,

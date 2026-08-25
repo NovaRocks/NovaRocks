@@ -26,9 +26,9 @@ use novarocks_execution::runtime::fragment::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_protocol::lifecycle::ScanRangeParams;
-use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
-use novarocks_protocol::{common, novarocks as proto};
+use novarocks_proto::lifecycle::ScanRangeParams;
+use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto::{common, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
@@ -220,7 +220,7 @@ fn query_id_from_native(src: &common::UniqueId) -> QueryId {
 #[cfg(test)]
 mod tests {
     use super::decode_instance_params;
-    use novarocks_protocol::{common, novarocks};
+    use novarocks_proto::{common, novarocks};
 
     fn valid_params() -> novarocks::InstanceParams {
         novarocks::InstanceParams {

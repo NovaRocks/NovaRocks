@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-use novarocks_protocol::lifecycle::{QueryExecutionId, QueryTerminationReason};
+use novarocks_proto::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
 
 use crate::ConnectorExecutionHost;

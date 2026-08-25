@@ -20,9 +20,9 @@ use std::sync::Arc;
 use novarocks_execution::runtime_filter::{
     PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
 };
-use novarocks_protocol as proto;
+use novarocks_proto as proto;
 #[cfg(debug_assertions)]
-use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
 #[cfg(debug_assertions)]
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
@@ -778,7 +778,7 @@ mod tests {
     use novarocks_execution::runtime_filter::{
         PartitionId, RuntimeFilterBindingId as BindingId, RuntimeFilterChannelId as ChannelId,
     };
-    use novarocks_protocol as proto;
+    use novarocks_proto as proto;
     use novarocks_types::UniqueId;
 
     use crate::runtime_filter::domain::{

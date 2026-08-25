@@ -26,8 +26,8 @@ use crate::fragment::decode::plan::layout::Layout;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::{FieldPath, ProtocolErrorKind};
-use novarocks_protocol::{expr, plan};
+use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto::{expr, plan};
 
 #[expect(
     clippy::too_many_arguments,
@@ -239,7 +239,7 @@ mod tests {
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::sort::SortTopNType;
-    use novarocks_protocol::{common, expr, plan};
+    use novarocks_proto::{common, expr, plan};
     use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

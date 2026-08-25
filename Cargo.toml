@@ -21,7 +21,7 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks/backend", "novarocks/connector/iceberg", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/failpoint", "novarocks/frontend", "novarocks/fs", "novarocks/parser", "novarocks/protocol", "novarocks/spi", "novarocks/sql", "novarocks/state-store/sqlite", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks-server", "tests/cluster-harness", "tests/system-test-runner", "tests/test-support"]
+members = ["novarocks/backend", "novarocks/connector/iceberg", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/failpoint", "novarocks/frontend", "novarocks/fs", "novarocks/parser", "novarocks/proto", "novarocks/spi", "novarocks/sql", "novarocks/state-store/sqlite", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks-server", "tests/cluster-harness", "tests/system-test-runner", "tests/test-support"]
 # Native development defaults to the server package.
 default-members = ["novarocks-server"]
 # Existing standalone crates under the workspace tree are excluded rather than

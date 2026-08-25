@@ -96,9 +96,9 @@ fn local_lookup(request: LookupRequest) -> Result<LookupBatch, FragmentIoError> 
 
 fn remote_request(
     request: &LookupRequest,
-) -> Result<novarocks_protocol::filter::LookupRequest, FragmentIoError> {
-    let mut output = novarocks_protocol::filter::LookupRequest {
-        query_id: Some(novarocks_protocol::common::UniqueId {
+) -> Result<novarocks_proto::filter::LookupRequest, FragmentIoError> {
+    let mut output = novarocks_proto::filter::LookupRequest {
+        query_id: Some(novarocks_proto::common::UniqueId {
             hi: request.query_id().high(),
             lo: request.query_id().low(),
         }),
@@ -111,7 +111,7 @@ fn remote_request(
             .map_err(|error| lookup_error(FragmentIoErrorKind::Internal, error))?;
         output
             .request_columns
-            .push(novarocks_protocol::filter::Column {
+            .push(novarocks_proto::filter::Column {
                 slot_id: column.slot_id().as_u32() as i32,
                 data_size: data.len() as i64,
                 data,
@@ -121,7 +121,7 @@ fn remote_request(
 }
 
 fn decode_response(
-    response: novarocks_protocol::filter::LookupResponse,
+    response: novarocks_proto::filter::LookupResponse,
 ) -> Result<LookupBatch, FragmentIoError> {
     if let Some(status) = response.status.as_ref()
         && status.code != 0

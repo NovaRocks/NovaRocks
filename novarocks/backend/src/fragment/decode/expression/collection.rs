@@ -22,8 +22,8 @@ use arrow::datatypes::DataType;
 use super::{decode_expr_at, lower_expr_list};
 use novarocks_execution::exec::expr::function::FunctionKind;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::expr;
+use novarocks_proto::FieldPath;
+use novarocks_proto::expr;
 
 use super::NativeExpressionInputLayout;
 
@@ -159,7 +159,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Fields};
     use novarocks_execution::exec::expr::{ExprNode, LiteralValue, function::FunctionKind};
-    use novarocks_protocol::{common, expr};
+    use novarocks_proto::{common, expr};
     use std::sync::Arc;
 
     #[test]

@@ -42,7 +42,7 @@ use crate::query_execution::planning::time_travel::{
 use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_distributed_query};
 use crate::view::ViewRequestContext;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{

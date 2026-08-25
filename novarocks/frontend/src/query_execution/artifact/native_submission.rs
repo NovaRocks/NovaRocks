@@ -33,7 +33,7 @@ use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_protocol::lifecycle::QueryExecutionId;
+use novarocks_proto::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::ConnectorWriteCohortId;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentId as PlannerFragmentId};
 use novarocks_types::UniqueId;
@@ -147,7 +147,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
     /// construction capability.
     pub fn native_fragments_in_id_order(
         &self,
-    ) -> impl ExactSizeIterator<Item = (FragmentId, &novarocks_protocol::plan::PlanFragment)> + '_
+    ) -> impl ExactSizeIterator<Item = (FragmentId, &novarocks_proto::plan::PlanFragment)> + '_
     {
         self.native_fragments.fragments_in_id_order()
     }
@@ -365,7 +365,7 @@ impl NativeSubmissionAttachment {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use novarocks_protocol::lifecycle::AttemptId;
+    use novarocks_proto::lifecycle::AttemptId;
 
     #[allow(
         dead_code,

@@ -18,13 +18,13 @@
 //! Frontend-owned Stage/Start orchestration values.
 //!
 //! The participant-local Stage and Start contracts belong to
-//! `novarocks_protocol::lifecycle`. These values retain the frozen ownership
+//! `novarocks_proto::lifecycle`. These values retain the frozen ownership
 //! binding, exact-batch assembly, and the two-barrier launch port. They are
 //! deliberately separate from the lifecycle wire value family.
 
 use std::collections::BTreeSet;
 
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle::{
     ContractError, ContractErrorCode, ParticipantManifestDigest, ParticipantRole, QueryExecutionId,
     QueryStageRequest, QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
 };
@@ -35,7 +35,7 @@ use crate::query_execution::contract::DistributedQueryError;
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 
 pub const DEFAULT_STAGE_MAX_FRAGMENTS: usize =
-    novarocks_protocol::lifecycle::stage::DEFAULT_STAGE_MAX_FRAGMENTS;
+    novarocks_proto::lifecycle::stage::DEFAULT_STAGE_MAX_FRAGMENTS;
 
 /// Frozen Stage ownership for one Init participant. It is captured before the
 /// Init plan is consumed and never re-reads live backend topology.
@@ -169,9 +169,9 @@ pub trait QueryLaunchBarrier: Send + Sync + 'static {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use novarocks_protocol::common;
-    use novarocks_protocol::lifecycle::AttemptId;
-    use novarocks_protocol::{novarocks, plan};
+    use novarocks_proto::common;
+    use novarocks_proto::lifecycle::AttemptId;
+    use novarocks_proto::{novarocks, plan};
     use novarocks_types::QueryId;
 
     use super::*;

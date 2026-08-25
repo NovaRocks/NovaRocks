@@ -23,7 +23,7 @@
 //! sealed encoding carrier and its provider activation port travel with the
 //! rest of query assembly.
 
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorControlPlanningLease, ConnectorRequestContext,
     ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,

@@ -25,7 +25,7 @@ use super::type_mapping::{
     encode_sort_topn_type, encode_topn_phase, usize_to_u64,
 };
 use super::{NativePlanEncodeContext, encode_exprs};
-use novarocks_protocol::plan;
+use novarocks_proto::plan;
 use novarocks_sql::plan_read::{
     PhysicalPlanKind, PlanRowCountAssertion, SqlPhysicalPlanRead, physical_plan_read,
 };

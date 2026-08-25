@@ -19,7 +19,7 @@ use arrow::datatypes::DataType;
 use prost::Message;
 
 use super::super::expr::encode_expr;
-use novarocks_protocol::{common, expr};
+use novarocks_proto::{common, expr};
 use novarocks_sql::plan_read::{LiteralValue, TypedExpr};
 use novarocks_sql::test_support::{
     native_cast_expression, native_expression_variants, native_lambda_expression,

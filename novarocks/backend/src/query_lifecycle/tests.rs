@@ -22,7 +22,7 @@ use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
-use novarocks_protocol::{
+use novarocks_proto::{
     common, filter,
     lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
@@ -66,9 +66,7 @@ trait TestManifestResult {
     fn execution_id(&self) -> QueryExecutionId;
 }
 
-impl TestManifestResult
-    for Result<ParticipantManifest, novarocks_protocol::lifecycle::ContractError>
-{
+impl TestManifestResult for Result<ParticipantManifest, novarocks_proto::lifecycle::ContractError> {
     fn execution_id(&self) -> QueryExecutionId {
         self.as_ref()
             .expect("validated init request retains a manifest")
@@ -990,17 +988,15 @@ fn assert_control_ready(attachment: &mut QueryControlAttachment) {
 
 fn terminal_ack_from_outcome(
     outcome: proto_novarocks::ParticipantTerminalOutcome,
-) -> novarocks_protocol::lifecycle::QueryTerminalAck {
+) -> novarocks_proto::lifecycle::QueryTerminalAck {
     let outcome = ProtocolParticipantTerminalOutcome::parse(outcome)
         .expect("registry emitted a Protocol-valid terminal outcome");
-    novarocks_protocol::lifecycle::QueryTerminalAck::parse(
-        proto_novarocks::QueryControlTerminalAck {
-            execution_id: Some(outcome.execution_id().to_proto()),
-            init_digest: outcome.init_digest().as_bytes().to_vec(),
-            snapshot_version: 1,
-            snapshot_digest: outcome.digest().to_vec(),
-        },
-    )
+    novarocks_proto::lifecycle::QueryTerminalAck::parse(proto_novarocks::QueryControlTerminalAck {
+        execution_id: Some(outcome.execution_id().to_proto()),
+        init_digest: outcome.init_digest().as_bytes().to_vec(),
+        snapshot_version: 1,
+        snapshot_digest: outcome.digest().to_vec(),
+    })
     .expect("terminal outcome forms a valid acknowledgement")
 }
 
@@ -1069,8 +1065,8 @@ fn protocol_execution_id(execution_id: QueryExecutionId) -> QueryExecutionId {
 }
 
 fn protocol_manifest_digest(
-    digest: novarocks_protocol::lifecycle::ParticipantManifestDigest,
-) -> novarocks_protocol::lifecycle::ParticipantManifestDigest {
+    digest: novarocks_proto::lifecycle::ParticipantManifestDigest,
+) -> novarocks_proto::lifecycle::ParticipantManifestDigest {
     digest
 }
 
@@ -1161,11 +1157,11 @@ fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
 
     let mismatched_digest = QueryStageRequest::new(
         protocol_execution_id(request.manifest().execution_id()),
-        novarocks_protocol::lifecycle::ParticipantManifestDigest::new([7; 32]),
+        novarocks_proto::lifecycle::ParticipantManifestDigest::new([7; 32]),
         StageDigestVersion::V1,
         StageDigest::compute_v1(
             protocol_execution_id(request.manifest().execution_id()),
-            novarocks_protocol::lifecycle::ParticipantManifestDigest::new([7; 32]),
+            novarocks_proto::lifecycle::ParticipantManifestDigest::new([7; 32]),
             &expected
                 .iter()
                 .copied()

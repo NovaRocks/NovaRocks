@@ -24,7 +24,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::catalog_application::query_bindings::QueryScanMaterialization;
-use novarocks_protocol::lifecycle::ScanRangeParams;
+use novarocks_proto::lifecycle::ScanRangeParams;
 use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::FragmentId;
 use novarocks_sql::plan_read::OutputColumn;

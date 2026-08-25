@@ -35,17 +35,17 @@ fn main() {
     }
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc path");
     unsafe { env::set_var("PROTOC", protoc) };
-    // DTO ownership stays in novarocks-protocol.  This crate generates only
+    // DTO ownership stays in novarocks-proto.  This crate generates only
     // private FE transport traits and clients against those canonical types.
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
         .codec_path("crate::native::codec::NativeProstCodec")
-        .extern_path(".novarocks.common", "::novarocks_protocol::common")
-        .extern_path(".novarocks.expr", "::novarocks_protocol::expr")
-        .extern_path(".novarocks.filter", "::novarocks_protocol::filter")
-        .extern_path(".novarocks.plan", "::novarocks_protocol::plan")
-        .extern_path(".novarocks", "::novarocks_protocol::novarocks")
+        .extern_path(".novarocks.common", "::novarocks_proto::common")
+        .extern_path(".novarocks.expr", "::novarocks_proto::expr")
+        .extern_path(".novarocks.filter", "::novarocks_proto::filter")
+        .extern_path(".novarocks.plan", "::novarocks_proto::plan")
+        .extern_path(".novarocks", "::novarocks_proto::novarocks")
         .compile_protos(
             &[PathBuf::from(IDL_DIR).join("service.proto")],
             &[PathBuf::from(IDL_DIR)],

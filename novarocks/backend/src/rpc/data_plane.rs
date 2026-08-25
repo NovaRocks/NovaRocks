@@ -13,7 +13,7 @@ use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
-use novarocks_protocol as proto;
+use novarocks_proto as proto;
 use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);

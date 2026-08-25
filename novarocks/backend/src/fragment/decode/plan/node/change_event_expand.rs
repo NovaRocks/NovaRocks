@@ -29,8 +29,8 @@ use novarocks_execution::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::plan;
+use novarocks_proto::FieldPath;
+use novarocks_proto::plan;
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_types::SlotId;
 
@@ -178,7 +178,7 @@ mod tests {
     use super::super::tests::{one_col_values_node, output_column, physical_node};
     use super::super::{NativePlanDecodeContext, decode_node};
     use novarocks_execution::exec::expr::ExprArena;
-    use novarocks_protocol::plan;
+    use novarocks_proto::plan;
 
     #[test]
     fn change_event_rejects_invalid_effect_slot() {

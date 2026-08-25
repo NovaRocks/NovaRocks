@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 use novarocks_execution::exec::fragment::program::{
     FragmentNodeId, ScanAssignmentKind, ScanSourceContract,
 };
-use novarocks_protocol::plan;
-use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto::plan;
+use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 pub(crate) fn decode_scan_source_contracts(
     root: &plan::DistributedNode,
@@ -109,8 +109,8 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 mod tests {
     use super::decode_scan_source_contracts;
     use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-    use novarocks_protocol::FieldPath;
-    use novarocks_protocol::plan;
+    use novarocks_proto::FieldPath;
+    use novarocks_proto::plan;
 
     #[expect(
         clippy::needless_update,

@@ -22,7 +22,7 @@ mod tests {
         let generated = include_str!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
         assert!(generated.contains("nova_rocks_grpc_client"));
         assert!(generated.contains("nova_rocks_grpc_server"));
-        assert!(generated.contains("::novarocks_protocol::novarocks::HeartbeatRequest"));
-        assert!(generated.contains("::novarocks_protocol::filter::LookupRequest"));
+        assert!(generated.contains("::novarocks_proto::novarocks::HeartbeatRequest"));
+        assert!(generated.contains("::novarocks_proto::filter::LookupRequest"));
     }
 }

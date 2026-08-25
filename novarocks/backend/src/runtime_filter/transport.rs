@@ -29,7 +29,7 @@ use tokio::sync::{Notify, mpsc};
 
 use prost::Message;
 
-use novarocks_protocol::filter::RuntimeFilterEnvelopeResponse;
+use novarocks_proto::filter::RuntimeFilterEnvelopeResponse;
 
 use crate::BackendDataRuntime;
 use crate::rpc::client::BackendRpcClient;
@@ -576,7 +576,7 @@ mod tests {
     };
     use crate::rpc::runtime::test_backend_data_runtime;
     use crate::runtime_filter::domain::BackendAcceptStatus;
-    use novarocks_protocol::filter::{
+    use novarocks_proto::filter::{
         RuntimeFilterAcceptStatus, RuntimeFilterContributionRouteIdentity,
         RuntimeFilterEnvelopeResponse, RuntimeFilterRouteIdentity,
         runtime_filter_route_identity::Value,
@@ -587,7 +587,7 @@ mod tests {
             value: Some(Value::Contribution(
                 RuntimeFilterContributionRouteIdentity {
                     producer_binding_id: 17,
-                    fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
+                    fragment_instance_id: Some(novarocks_proto::common::UniqueId {
                         hi: 18,
                         lo: 19,
                     }),

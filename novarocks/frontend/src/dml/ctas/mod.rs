@@ -30,7 +30,7 @@ use crate::query_execution::dml::ctas::{
     CtasTargetPreflightOutcome, CtasWriteOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
     PreparedCtasTarget, PreparedCtasWrite,
 };
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorCtasAbortDisposition, ConnectorCtasActionId, ConnectorCtasConflictKind,
     ConnectorCtasFailure, ConnectorCtasOperationId, ConnectorCtasPublicationFence,

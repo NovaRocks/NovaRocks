@@ -248,7 +248,7 @@ static NEXT_CLAIM: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "typed")]
 mod typed {
     use super::*;
-    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
     use std::collections::BTreeMap;
     use std::io::Write;
 
@@ -586,7 +586,7 @@ mod tests {
     #[cfg(feature = "typed")]
     #[test]
     fn typed_scope_keeps_the_existing_token_text_and_identity_contract() {
-        use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+        use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
 
         let root = unique_temp_root("scope");
         std::fs::create_dir_all(&root).expect("create root");
@@ -617,7 +617,7 @@ mod tests {
     #[cfg(feature = "typed")]
     #[test]
     fn receiver_agnostic_contribution_fault_claims_once_for_the_exact_execution() {
-        use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+        use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
 
         let root = unique_temp_root("receiver-agnostic");
         std::fs::create_dir_all(&root).expect("create root");

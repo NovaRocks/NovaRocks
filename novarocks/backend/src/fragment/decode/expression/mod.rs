@@ -23,8 +23,8 @@ use self::error::NativeExpressionDecodeError;
 use super::type_decode::{decode_field_type, decode_type};
 use novarocks_execution::exec::chunk::ChunkFieldSchema;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::expr;
+use novarocks_proto::FieldPath;
+use novarocks_proto::expr;
 use novarocks_types::SlotId;
 
 mod binary;
@@ -62,14 +62,14 @@ impl NativeExpressionInputLayout {
         &self,
         column_id: u32,
         path: FieldPath,
-    ) -> Result<SlotId, novarocks_protocol::ProtocolError> {
+    ) -> Result<SlotId, novarocks_proto::ProtocolError> {
         let slot = SlotId::new(column_id);
         if self.slots.contains(&slot) {
             Ok(slot)
         } else {
-            Err(novarocks_protocol::ProtocolError::new(
+            Err(novarocks_proto::ProtocolError::new(
                 path.field("column_id"),
-                novarocks_protocol::ProtocolErrorKind::InvalidValue,
+                novarocks_proto::ProtocolErrorKind::InvalidValue,
                 format!("ColumnRef column_id={column_id} not found in input layout"),
             ))
         }
@@ -634,7 +634,7 @@ pub(crate) mod tests {
     use novarocks_execution::exec::expr::{
         ExprArena, ExprNode, LiteralValue, function::FunctionKind,
     };
-    use novarocks_protocol::{common, expr};
+    use novarocks_proto::{common, expr};
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 

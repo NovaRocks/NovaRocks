@@ -29,9 +29,9 @@ use novarocks_execution::exec::fragment::program::{
 use novarocks_execution::runtime::fragment::{
     FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
 };
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::lifecycle::ScanRangeParams;
-use novarocks_protocol::{novarocks as proto, plan};
+use novarocks_proto::FieldPath;
+use novarocks_proto::lifecycle::ScanRangeParams;
+use novarocks_proto::{novarocks as proto, plan};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 
 use crate::fragment::decode::envelope::{require_root, require_sink};
@@ -189,9 +189,9 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks_execution::exec::fragment::program::FragmentSinkKind;
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_protocol::ProtocolErrorKind;
-    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
-    use novarocks_protocol::{common, expr, novarocks as proto, plan};
+    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_proto::{common, expr, novarocks as proto, plan};
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
         ConnectorExecutionBindingKey, ConnectorExecutionResolver,

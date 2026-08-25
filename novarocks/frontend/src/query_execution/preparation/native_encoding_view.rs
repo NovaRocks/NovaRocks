@@ -32,7 +32,7 @@ use super::scan::{
     PlannedConnectorRead, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumnKind,
     ResolvedScanExecution, ScanExecutionBindings,
 };
-use novarocks_protocol::lifecycle::ScanRangeParams;
+use novarocks_proto::lifecycle::ScanRangeParams;
 
 /// Frozen scan facts attached to one prepared native-encoding input.
 #[derive(Clone, Copy)]

@@ -29,9 +29,9 @@ use super::error::NativeFragmentLeafDecodeError;
 use crate::fragment::decode::type_decode::decode_field_type;
 #[cfg(test)]
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks_protocol::ProtocolErrorKind;
+use novarocks_proto::ProtocolErrorKind;
 #[cfg(test)]
-use novarocks_protocol::common;
+use novarocks_proto::common;
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug, Default)]

@@ -24,8 +24,8 @@
 use std::collections::BTreeSet;
 
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
-use novarocks_protocol::lifecycle::QueryTerminalSnapshot;
-use novarocks_protocol::novarocks;
+use novarocks_proto::lifecycle::QueryTerminalSnapshot;
+use novarocks_proto::novarocks;
 
 use super::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
 

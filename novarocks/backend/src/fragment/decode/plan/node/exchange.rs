@@ -26,8 +26,8 @@ use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::sort::{SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::plan;
+use novarocks_proto::FieldPath;
+use novarocks_proto::plan;
 
 pub(super) fn lower_exchange_receiver(
     node: &plan::DistributedNode,
@@ -180,7 +180,7 @@ mod tests {
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::runtime::exchange::ExchangeKey;
-    use novarocks_protocol::{common, expr, plan};
+    use novarocks_proto::{common, expr, plan};
     use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

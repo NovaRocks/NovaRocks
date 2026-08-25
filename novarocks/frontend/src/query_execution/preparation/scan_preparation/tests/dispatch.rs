@@ -149,7 +149,7 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
         expected_ids
             .iter()
             .copied()
-            .map(|fragment_id| novarocks_protocol::plan::PlanFragment {
+            .map(|fragment_id| novarocks_proto::plan::PlanFragment {
                 fragment_id,
                 ..Default::default()
             }),

@@ -31,8 +31,8 @@ use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use novarocks_execution::exec::expr::{ExprArena, cast_array_to_target};
 use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::{common as proto_common, plan};
+use novarocks_proto::FieldPath;
+use novarocks_proto::{common as proto_common, plan};
 
 #[expect(
     clippy::too_many_arguments,
@@ -236,7 +236,7 @@ mod tests {
     use super::*;
     use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
-    use novarocks_protocol::{common, expr, plan};
+    use novarocks_proto::{common, expr, plan};
     use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

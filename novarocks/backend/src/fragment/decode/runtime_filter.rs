@@ -20,8 +20,8 @@
 use std::collections::BTreeSet;
 
 use novarocks_execution::exec::fragment::program::{RuntimeFilterContract, RuntimeFilterId};
-use novarocks_protocol::plan;
-use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto::plan;
+use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 pub(crate) fn decode_runtime_filter_contract(
     fragment: &plan::PlanFragment,
@@ -69,7 +69,7 @@ pub(crate) fn decode_runtime_filter_contract(
 #[cfg(test)]
 mod tests {
     use super::decode_runtime_filter_contract;
-    use novarocks_protocol::plan;
+    use novarocks_proto::plan;
 
     #[test]
     fn missing_runtime_filter_binding_table_preserves_error_text() {

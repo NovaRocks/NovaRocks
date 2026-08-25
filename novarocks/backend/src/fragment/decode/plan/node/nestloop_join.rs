@@ -28,8 +28,8 @@ use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::plan;
+use novarocks_proto::FieldPath;
+use novarocks_proto::plan;
 
 #[expect(
     clippy::too_many_arguments,
@@ -159,7 +159,7 @@ mod tests {
         output_column, output_column_with_nullable, physical_node,
     };
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_protocol::plan;
+    use novarocks_proto::plan;
     use novarocks_types::SlotId;
 
     #[test]

@@ -19,8 +19,8 @@
 
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
-use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
-use novarocks_protocol::{novarocks as proto, plan};
+use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto::{novarocks as proto, plan};
 use novarocks_types::UniqueId;
 
 pub(crate) fn decode_fragment_sink_assignment(
@@ -161,7 +161,7 @@ fn invalid_value(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::decode_fragment_sink_assignment;
-    use novarocks_protocol::{novarocks as proto, plan};
+    use novarocks_proto::{novarocks as proto, plan};
 
     #[test]
     fn stream_destination_missing_id_preserves_error_text() {

@@ -22,8 +22,8 @@ use super::common::parse_optional_nonnegative_i64;
 use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
 use novarocks_execution::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::plan;
-use novarocks_protocol::{FieldPath, ProtocolErrorKind};
+use novarocks_proto::plan;
+use novarocks_proto::{FieldPath, ProtocolErrorKind};
 
 pub(super) fn lower_assert_one_row_node(
     node: &plan::DistributedNode,
@@ -158,8 +158,8 @@ mod tests {
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::assert::AssertNumRowsMode;
-    use novarocks_protocol::ProtocolErrorKind;
-    use novarocks_protocol::plan;
+    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto::plan;
     use novarocks_types::SlotId;
 
     fn decode_error(

@@ -24,8 +24,8 @@ use std::sync::Arc;
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
-use novarocks_protocol::{FieldPath, ProtocolErrorKind};
-use novarocks_protocol::{expr, plan};
+use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto::{expr, plan};
 
 /// Backend-local producer attachment target decoded from the native fragment
 /// binding table. It is translated into the corresponding neutral execution
@@ -1207,14 +1207,14 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use novarocks_protocol::ProtocolErrorKind;
-    use novarocks_protocol::expr;
+    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto::expr;
 
-    fn int64_type() -> novarocks_protocol::common::TypeDesc {
-        novarocks_protocol::common::TypeDesc {
-            kind: Some(novarocks_protocol::common::type_desc::Kind::Scalar(
-                novarocks_protocol::common::ScalarType {
-                    r#type: novarocks_protocol::common::PrimitiveType::Bigint as i32,
+    fn int64_type() -> novarocks_proto::common::TypeDesc {
+        novarocks_proto::common::TypeDesc {
+            kind: Some(novarocks_proto::common::type_desc::Kind::Scalar(
+                novarocks_proto::common::ScalarType {
+                    r#type: novarocks_proto::common::PrimitiveType::Bigint as i32,
                     ..Default::default()
                 },
             )),

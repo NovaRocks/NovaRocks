@@ -36,7 +36,7 @@ use crate::query_execution::dml::external_write_fence::{
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_parser::ast::{Insert, Query};
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_sql::semantic::{Literal, ObjectName};
 
 pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
@@ -622,7 +622,7 @@ mod tests {
                 fragment_id: 0,
                 writer_key,
                 connector_staged_report_frames: vec![
-                    novarocks_protocol::novarocks::ConnectorStagedReportFrame::default(),
+                    novarocks_proto::novarocks::ConnectorStagedReportFrame::default(),
                 ],
                 load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
                 loaded_rows: 11,

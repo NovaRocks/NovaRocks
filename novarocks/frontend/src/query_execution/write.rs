@@ -31,8 +31,8 @@ use sha2::{Digest, Sha256};
 
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks_protocol::lifecycle::QueryExecutionId;
-use novarocks_protocol::novarocks;
+use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto::novarocks;
 use novarocks_types::UniqueId;
 
 // This is deliberately a wire-level value rather than an Iceberg enum.  The
@@ -599,7 +599,7 @@ pub(crate) fn decode_connector_staged_report_frame(
 }
 
 fn connector_writer_identity_from_native(
-    writer: &novarocks_protocol::plan::ConnectorWriterIdentity,
+    writer: &novarocks_proto::plan::ConnectorWriterIdentity,
 ) -> Result<ConnectorWriterIdentity, DistributedQueryError> {
     let operation_id = ConnectorWriteOperationId::from_bytes(connector_id_bytes(
         &writer.operation_id,
@@ -857,8 +857,8 @@ fn query_id_to_be_bytes(execution_id: QueryExecutionId) -> [u8; 16] {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use novarocks_protocol::lifecycle::{AttemptId, QueryTerminalSnapshot};
-    use novarocks_protocol::{common, plan};
+    use novarocks_proto::lifecycle::{AttemptId, QueryTerminalSnapshot};
+    use novarocks_proto::{common, plan};
     use prost::Message;
 
     fn query_id() -> UniqueId {

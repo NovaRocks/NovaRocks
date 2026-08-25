@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use prost::Message;
 
-use novarocks_protocol::{common, novarocks, plan};
+use novarocks_proto::{common, novarocks, plan};
 
 fn roundtrip_message<M>(value: &M) -> M
 where

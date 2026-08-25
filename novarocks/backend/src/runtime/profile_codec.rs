@@ -18,14 +18,14 @@
 //! Backend adapter from execution profiles to native terminal wire values.
 
 use novarocks_execution::runtime::profile::{ProfileNode, ProfileUnit, RuntimeProfileTree};
-use novarocks_protocol::novarocks::{
+use novarocks_proto::novarocks::{
     Counter, ProfileNode as WireProfileNode, ProfileUnit as WireUnit,
 };
 
 pub(crate) fn encode_runtime_profile_tree(
     tree: &RuntimeProfileTree,
-) -> novarocks_protocol::novarocks::RuntimeProfileTree {
-    novarocks_protocol::novarocks::RuntimeProfileTree {
+) -> novarocks_proto::novarocks::RuntimeProfileTree {
+    novarocks_proto::novarocks::RuntimeProfileTree {
         root: Some(encode_profile_node(&tree.root)),
     }
 }

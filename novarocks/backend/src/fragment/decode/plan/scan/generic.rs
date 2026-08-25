@@ -40,8 +40,8 @@ use novarocks_execution::exec::variant_read::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
 use novarocks_execution::runtime::query_options::query_expire_durations;
-use novarocks_protocol::ProtocolErrorKind;
-use novarocks_protocol::plan;
+use novarocks_proto::ProtocolErrorKind;
+use novarocks_proto::plan;
 use novarocks_types::SlotId;
 
 use super::super::context::NativePlanDecodeContext;

@@ -28,7 +28,7 @@ use crate::runtime::query_result::QueryResult;
 #[cfg(test)]
 use crate::runtime::query_result::build_string_query_result;
 use novarocks_parser::ast::Query;
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
@@ -2640,7 +2640,7 @@ fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_protocol::{lifecycle::QueryOptions, novarocks};
+    use novarocks_proto::{lifecycle::QueryOptions, novarocks};
 
     #[test]
     fn explain_analyze_query_options_only_enable_profile() {

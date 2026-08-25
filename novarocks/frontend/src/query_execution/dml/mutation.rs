@@ -30,7 +30,7 @@ use novarocks_parser::Span;
 use novarocks_parser::ast::{
     DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
 };
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_sql::semantic::ObjectName;
 
 const PREPARED: u8 = 0;

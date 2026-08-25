@@ -61,7 +61,7 @@ use novarocks_parser::{
     ast::{self, Fold, Statement as ParsedStatement},
     printer::{print_expr, print_statement},
 };
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
 use novarocks_types::{ClusterRole, EngineErrorCode};
 use novarocks_user_error::UserError;
@@ -1819,7 +1819,7 @@ mod tests {
     use novarocks_types::schema::ColumnDef;
 
     fn default_query_options() -> QueryOptions {
-        QueryOptions::parse(novarocks_protocol::novarocks::QueryOptions::default())
+        QueryOptions::parse(novarocks_proto::novarocks::QueryOptions::default())
             .expect("default wire query options are valid")
     }
 

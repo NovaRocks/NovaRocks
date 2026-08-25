@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use prost::Message;
 
-use novarocks_protocol::{common, expr, filter, novarocks, plan};
+use novarocks_proto::{common, expr, filter, novarocks, plan};
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";

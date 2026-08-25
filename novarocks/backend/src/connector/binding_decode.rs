@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_protocol::lifecycle::QueryExecutionId;
-use novarocks_protocol::novarocks::{
+use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto::novarocks::{
     EnsureConnectorExecutionBindingRequest, RetireConnectorExecutionBindingRequest,
 };
-use novarocks_protocol::provider::{
+use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingRejection, EnsureConnectorExecutionBindingRejectionReason,
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingOutcome,
     RetireConnectorExecutionBindingResult, connector_execution_binding_declaration_digest,
@@ -89,7 +89,7 @@ pub(crate) fn decode_ensure_request(
 /// pass the resulting admitted pair directly to the BE Host.
 #[doc(hidden)]
 pub fn decode_connector_execution_declaration(
-    raw: novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration,
+    raw: novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration,
 ) -> Result<AdmittedConnectorExecutionDeclaration, String> {
     let incarnation: [u8; 16] = raw
         .incarnation
@@ -98,7 +98,7 @@ pub fn decode_connector_execution_declaration(
         .map_err(|_| "connector execution declaration has invalid incarnation".to_string())?;
     let declaration = match raw.provider.as_ref() {
         Some(
-            novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
+            novarocks_proto::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
                 provider,
             ),
         ) => ConnectorExecutionDeclaration::iceberg(
@@ -107,7 +107,7 @@ pub fn decode_connector_execution_declaration(
             &provider.access_binding,
         ),
         Some(
-            novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Starrocks(
+            novarocks_proto::novarocks::connector_execution_binding_declaration::Provider::Starrocks(
                 provider,
             ),
         ) => ConnectorExecutionDeclaration::starrocks(
@@ -169,13 +169,13 @@ mod tests {
         instance_id: impl Into<String>,
         incarnation: Vec<u8>,
         access_binding: impl Into<String>,
-    ) -> novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
-        novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+    ) -> novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration {
+        novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration {
             instance_id: instance_id.into(),
             incarnation,
             provider: Some(
-                novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
-                    novarocks_protocol::novarocks::IcebergExecutionBindingDeclaration {
+                novarocks_proto::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
+                    novarocks_proto::novarocks::IcebergExecutionBindingDeclaration {
                         access_binding: access_binding.into(),
                     },
                 ),
@@ -186,8 +186,8 @@ mod tests {
     #[test]
     fn ensure_request_rejects_missing_typed_declaration() {
         let result = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
-            execution_id: Some(novarocks_protocol::novarocks::QueryExecutionId {
-                query_id: Some(novarocks_protocol::common::UniqueId { hi: 7, lo: 9 }),
+            execution_id: Some(novarocks_proto::novarocks::QueryExecutionId {
+                query_id: Some(novarocks_proto::common::UniqueId { hi: 7, lo: 9 }),
                 attempt_id: 1,
             }),
             declaration: None,
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn wire_declaration_rejects_missing_provider_oneof() {
         let result = decode_connector_execution_declaration(
-            novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+            novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration {
                 instance_id: "catalog".to_string(),
                 incarnation: vec![7; 16],
                 provider: None,
@@ -264,12 +264,12 @@ mod tests {
     #[test]
     fn ensure_request_preserves_safe_declaration_failure_detail() {
         let result = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
-            execution_id: Some(novarocks_protocol::novarocks::QueryExecutionId {
-                query_id: Some(novarocks_protocol::common::UniqueId { hi: 7, lo: 9 }),
+            execution_id: Some(novarocks_proto::novarocks::QueryExecutionId {
+                query_id: Some(novarocks_proto::common::UniqueId { hi: 7, lo: 9 }),
                 attempt_id: 1,
             }),
             declaration: Some(
-                novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+                novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration {
                     instance_id: "catalog".to_string(),
                     incarnation: vec![7; 16],
                     provider: None,
@@ -279,7 +279,7 @@ mod tests {
         .expect_err("missing provider must reject admission");
 
         match result.outcome() {
-            novarocks_protocol::provider::EnsureConnectorExecutionBindingOutcome::Rejected(
+            novarocks_proto::provider::EnsureConnectorExecutionBindingOutcome::Rejected(
                 rejection,
             ) => {
                 assert_eq!(
@@ -291,7 +291,7 @@ mod tests {
                     "connector execution declaration has no provider"
                 );
             }
-            novarocks_protocol::provider::EnsureConnectorExecutionBindingOutcome::Ensured => {
+            novarocks_proto::provider::EnsureConnectorExecutionBindingOutcome::Ensured => {
                 panic!("missing provider must not be ensured")
             }
         }

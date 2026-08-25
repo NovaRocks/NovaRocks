@@ -27,8 +27,8 @@ use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_execution::exec::node::join::JoinType;
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::{FieldPath, ProtocolErrorKind};
-use novarocks_protocol::{common as proto_common, plan};
+use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto::{common as proto_common, plan};
 
 #[allow(
     dead_code,

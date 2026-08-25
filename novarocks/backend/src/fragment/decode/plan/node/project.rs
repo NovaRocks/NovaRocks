@@ -29,8 +29,8 @@ use novarocks_execution::exec::chunk::{
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::{FieldPath, ProtocolErrorKind};
-use novarocks_protocol::{expr, plan};
+use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto::{expr, plan};
 use novarocks_types::SlotId;
 
 pub(super) fn lower_project_node(
@@ -320,8 +320,8 @@ mod tests {
     use super::*;
     use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
-    use novarocks_protocol::ProtocolErrorKind;
-    use novarocks_protocol::{common, expr, plan};
+    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

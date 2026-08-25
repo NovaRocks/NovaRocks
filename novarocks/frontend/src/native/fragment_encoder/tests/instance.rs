@@ -21,11 +21,11 @@ use super::super::instance;
 fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() {
     use std::collections::{BTreeMap, HashMap};
 
-    let scan_range = novarocks_protocol::lifecycle::ScanRangeParams::parse(
-        novarocks_protocol::novarocks::ScanRangeParams {
-            range: Some(novarocks_protocol::novarocks::ScanRange {
-                kind: Some(novarocks_protocol::novarocks::scan_range::Kind::File(
-                    novarocks_protocol::novarocks::FileScanRange {
+    let scan_range = novarocks_proto::lifecycle::ScanRangeParams::parse(
+        novarocks_proto::novarocks::ScanRangeParams {
+            range: Some(novarocks_proto::novarocks::ScanRange {
+                kind: Some(novarocks_proto::novarocks::scan_range::Kind::File(
+                    novarocks_proto::novarocks::FileScanRange {
                         file_format: "PARQUET".to_string(),
                         full_path: Some("s3://bucket/data.parquet".to_string()),
                         relative_path: Some("data.parquet".to_string()),
@@ -43,7 +43,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
                         )),
                         file_pruning_min_max_values: HashMap::from([(
                             0,
-                            novarocks_protocol::novarocks::FilePruningMinMaxValue {
+                            novarocks_proto::novarocks::FilePruningMinMaxValue {
                                 value_kind: 2,
                                 has_null: false,
                                 all_null: false,
@@ -138,7 +138,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(encoded_range.volume_id, Some(13));
     assert_eq!(encoded_range.empty, Some(true));
     assert_eq!(encoded_range.has_more, Some(false));
-    let novarocks_protocol::novarocks::scan_range::Kind::File(file) = encoded_range
+    let novarocks_proto::novarocks::scan_range::Kind::File(file) = encoded_range
         .range
         .as_ref()
         .and_then(|range| range.kind.as_ref())
@@ -162,7 +162,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(pruning.max_int_value, Some(20));
     let opts = encoded.query_options.as_ref().expect("query options");
     assert_eq!(opts, &instance::encode_query_options(&query_options));
-    novarocks_protocol::lifecycle::QueryOptions::parse(*opts)
+    novarocks_proto::lifecycle::QueryOptions::parse(*opts)
         .expect("frontend query-options projection satisfies the Protocol contract");
     assert_eq!(opts.batch_size, 4096);
     assert_eq!(opts.query_timeout, 60);

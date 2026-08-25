@@ -16,7 +16,7 @@ use crate::query_execution::{
     RuntimeFilterDeploymentBindingRoleFacts, RuntimeFilterDeploymentFactsView,
     RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterLateApplyGranularity,
 };
-use novarocks_protocol::{common, filter, plan};
+use novarocks_proto::{common, filter, plan};
 use novarocks_types::UniqueId;
 use sha2::{Digest, Sha256};
 

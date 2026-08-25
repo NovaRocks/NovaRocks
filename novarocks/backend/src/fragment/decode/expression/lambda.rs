@@ -20,8 +20,8 @@
 use super::{decode_type, lower_required_child};
 use arrow::datatypes::DataType;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::expr;
+use novarocks_proto::FieldPath;
+use novarocks_proto::expr;
 use novarocks_types::SlotId;
 
 use super::NativeExpressionInputLayout;
@@ -82,7 +82,7 @@ mod tests {
     use super::super::tests::{col, lower, lower_with_slots, scalar_expr, type_desc};
     use arrow::datatypes::{DataType, Field};
     use novarocks_execution::exec::expr::{ExprNode, function::FunctionKind};
-    use novarocks_protocol::expr;
+    use novarocks_proto::expr;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 

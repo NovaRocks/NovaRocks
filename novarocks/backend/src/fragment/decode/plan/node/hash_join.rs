@@ -30,8 +30,8 @@ use novarocks_execution::exec::node::join::{
     JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::plan;
+use novarocks_proto::FieldPath;
+use novarocks_proto::plan;
 use novarocks_types::SlotId;
 use novarocks_types::wider_type;
 
@@ -450,7 +450,7 @@ mod tests {
         output_column_with_nullable, physical_node,
     };
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_protocol::plan;
+    use novarocks_proto::plan;
     use novarocks_types::SlotId;
 
     #[test]

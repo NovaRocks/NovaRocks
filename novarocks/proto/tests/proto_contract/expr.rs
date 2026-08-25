@@ -17,7 +17,7 @@
 
 use prost::Message;
 
-use novarocks_protocol::{common, expr as expr_proto};
+use novarocks_proto::{common, expr as expr_proto};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IType {

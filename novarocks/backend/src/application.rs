@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
 };
@@ -627,17 +627,17 @@ mod tests {
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
-    use novarocks_protocol::lifecycle::{
+    use novarocks_proto::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
         ParticipantRole, QueryAbortRequest, QueryControlEndpoint, QueryExecutionId,
         QueryInitRequest, QueryOptions, QueryTerminationReason,
     };
-    use novarocks_protocol::novarocks::{
+    use novarocks_proto::novarocks::{
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
         InitQueryRequest as ProtoInitQueryRequest, QueryControlAttach as ProtoQueryControlAttach,
         QueryControlRequest as ProtoQueryControlRequest,
     };
-    use novarocks_protocol::{lifecycle as protocol_lifecycle, novarocks as protocol};
+    use novarocks_proto::{lifecycle as protocol_lifecycle, novarocks as protocol};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::AdvertiseEndpoint;
     use novarocks_types::QueryId;
@@ -745,7 +745,7 @@ mod tests {
                 )
                 .expect("valid backend identity"),
                 [ParticipantRole::FragmentExecutor],
-                [novarocks_protocol::common::UniqueId {
+                [novarocks_proto::common::UniqueId {
                     hi: query_low,
                     lo: 1,
                 }],
@@ -1038,7 +1038,7 @@ mod tests {
             .into_inner();
         assert_eq!(
             termination.accepted_reason,
-            novarocks_protocol::novarocks::QueryTerminationReason::
+            novarocks_proto::novarocks::QueryTerminationReason::
                 QueryTerminationCoordinatorHeartbeatTimeout as i32
         );
 

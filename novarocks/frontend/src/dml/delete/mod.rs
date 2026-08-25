@@ -26,7 +26,7 @@ use crate::query_execution::dml::delete::{
     DeleteCommit, DeleteEngine, DeleteStatement, DeleteWriteReport, PrepareDeleteRequest,
     PreparedDelete,
 };
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 
 use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::{AdmitError, DmlError};

@@ -29,7 +29,7 @@ use crate::query_execution::dml::truncate::{
     TruncateOutcome, TruncatePlanError, TruncatePlanFacts, TruncateReceipt,
 };
 use bytes::Bytes;
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorDataMutationPlanSummary, ConnectorDataMutationReceipt, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationOperationId,

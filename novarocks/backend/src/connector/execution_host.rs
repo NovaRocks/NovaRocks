@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use novarocks_protocol::lifecycle::QueryExecutionId;
-use novarocks_protocol::provider::{
+use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingRejection, EnsureConnectorExecutionBindingRejectionReason,
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingOutcome,
     RetireConnectorExecutionBindingResult,
@@ -705,8 +705,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
-    use novarocks_protocol::lifecycle::AttemptId;
-    use novarocks_protocol::provider::EnsureConnectorExecutionBindingOutcome;
+    use novarocks_proto::lifecycle::AttemptId;
+    use novarocks_proto::provider::EnsureConnectorExecutionBindingOutcome;
     use novarocks_spi::connector::{
         ConnectorExecutionBindingKey, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
         ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,

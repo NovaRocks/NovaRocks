@@ -21,13 +21,7 @@ use novarocks_sql::plan_read::OutputColumn;
 pub(super) fn encode_fragment_output_contract(
     src: &PlanFragment,
     ctx: &NativePlanEncodeContext<'_>,
-) -> Result<
-    (
-        Vec<novarocks_protocol::expr::Expr>,
-        Vec<common::OutputColumn>,
-    ),
-    String,
-> {
+) -> Result<(Vec<novarocks_proto::expr::Expr>, Vec<common::OutputColumn>), String> {
     if matches!(&src.sink, DataSink::ConnectorWrite(sink) if sink.has_output_contract()) {
         // The planner finalized the connector writer output expressions and target output
         // schema at seal (CGO-9C Task 3). The encoder maps them 1:1 instead of

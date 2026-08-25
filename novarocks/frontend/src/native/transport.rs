@@ -21,13 +21,13 @@ use crate::query_execution::connector_binding::{
     ConnectorBindingDispatchError, ConnectorBindingRetirementError,
 };
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
-use novarocks_protocol::common::UniqueId as ProtoUniqueId;
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::common::UniqueId as ProtoUniqueId;
+use novarocks_proto::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,
     QueryTerminationAck, QueryTerminationReason,
 };
-use novarocks_protocol::novarocks::{
+use novarocks_proto::novarocks::{
     ConnectorExecutionBindingDeclaration, EnsureConnectorExecutionBindingRequest,
     FetchResultRequest, IcebergExecutionBindingDeclaration,
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
@@ -35,7 +35,7 @@ use novarocks_protocol::novarocks::{
     connector_execution_binding_declaration::Provider as ConnectorExecutionBindingProvider,
     fetch_result_response::Status as FetchStatus,
 };
-use novarocks_protocol::provider::{
+use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingOutcome, EnsureConnectorExecutionBindingResult,
     RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
 };
@@ -291,7 +291,7 @@ impl ConnectorBindingControl {
 impl ConnectorBindingDispatcher for ConnectorBindingControl {
     fn install(
         &self,
-        execution_id: novarocks_protocol::lifecycle::QueryExecutionId,
+        execution_id: novarocks_proto::lifecycle::QueryExecutionId,
         backend_idx: usize,
         endpoint: SocketAddr,
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
@@ -379,12 +379,10 @@ pub(crate) fn heartbeat(
         let client = Client::new(endpoint, data_runtime.clone())?;
         data_runtime.block_on(async {
             let mut grpc = client.grpc().await?;
-            grpc.heartbeat(Request::new(
-                novarocks_protocol::novarocks::HeartbeatRequest {
-                    assigned_be_id: be_id,
-                    fe_epoch: 0,
-                },
-            ))
+            grpc.heartbeat(Request::new(novarocks_proto::novarocks::HeartbeatRequest {
+                assigned_be_id: be_id,
+                fe_epoch: 0,
+            }))
             .await
             .map(|value| value.into_inner())
             .map_err(|error| format!("heartbeat rpc failed: {error}"))
@@ -508,9 +506,9 @@ impl QueryLifecycleTransport for LifecycleTransport {
         timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         let (tx, rx) = mpsc::channel(QUERY_CONTROL_CHANNEL_CAPACITY);
-        tx.try_send(novarocks_protocol::novarocks::QueryControlRequest {
+        tx.try_send(novarocks_proto::novarocks::QueryControlRequest {
             command: Some(
-                novarocks_protocol::novarocks::query_control_request::Command::Attach(
+                novarocks_proto::novarocks::query_control_request::Command::Attach(
                     attach.as_proto().clone(),
                 ),
             ),
@@ -687,7 +685,7 @@ struct ControlSession {
     data_runtime: FrontendDataRuntime,
 }
 struct ControlCommands {
-    sender: Option<mpsc::Sender<novarocks_protocol::novarocks::QueryControlRequest>>,
+    sender: Option<mpsc::Sender<novarocks_proto::novarocks::QueryControlRequest>>,
     pending: VecDeque<Pending>,
     /// The single terminal reason already accepted on this stream.  A later
     /// coordinator Abort cannot change a completed Finalize, but the BE may
@@ -736,21 +734,19 @@ impl QueryControlSession for ControlSession {
                 }
             })?;
         match command.as_proto().command.as_ref() {
-            Some(novarocks_protocol::novarocks::query_control_request::Command::Heartbeat(
+            Some(novarocks_proto::novarocks::query_control_request::Command::Heartbeat(
                 heartbeat,
             )) => state
                 .pending
                 .push_back(Pending::Heartbeat(heartbeat.sequence)),
-            Some(novarocks_protocol::novarocks::query_control_request::Command::Abort(_)) => {
+            Some(novarocks_proto::novarocks::query_control_request::Command::Abort(_)) => {
                 state.pending.push_back(Pending::Abort)
             }
-            Some(novarocks_protocol::novarocks::query_control_request::Command::Finalize(_)) => {
+            Some(novarocks_proto::novarocks::query_control_request::Command::Finalize(_)) => {
                 state.pending.push_back(Pending::Finalize)
             }
-            Some(novarocks_protocol::novarocks::query_control_request::Command::TerminalAck(_)) => {
-            }
-            Some(novarocks_protocol::novarocks::query_control_request::Command::Attach(_))
-            | None => {
+            Some(novarocks_proto::novarocks::query_control_request::Command::TerminalAck(_)) => {}
+            Some(novarocks_proto::novarocks::query_control_request::Command::Attach(_)) | None => {
                 return Err(invalid(
                     "validated query control command has an invalid variant",
                 ));
@@ -789,7 +785,7 @@ impl Drop for ControlSession {
     }
 }
 async fn bridge(
-    mut stream: tonic::Streaming<novarocks_protocol::novarocks::QueryControlResponse>,
+    mut stream: tonic::Streaming<novarocks_proto::novarocks::QueryControlResponse>,
     events: mpsc::Sender<Result<QueryControlEvent, QueryLifecycleTransportError>>,
     commands: Arc<Mutex<ControlCommands>>,
 ) {
@@ -830,7 +826,7 @@ fn validate_control_event(
         .lock()
         .map_err(|_| unavailable("query control command lock poisoned"))?;
     match event.as_proto().event.as_ref() {
-        Some(novarocks_protocol::novarocks::query_control_response::Event::HeartbeatAck(ack)) => {
+        Some(novarocks_proto::novarocks::query_control_response::Event::HeartbeatAck(ack)) => {
             match commands.pending.front().copied() {
                 Some(Pending::Heartbeat(expected)) if expected == ack.sequence => {
                     commands.pending.pop_front();
@@ -846,11 +842,9 @@ fn validate_control_event(
                 ))),
             }
         }
-        Some(
-            novarocks_protocol::novarocks::query_control_response::Event::TerminationAccepted(
-                accepted,
-            ),
-        ) => {
+        Some(novarocks_proto::novarocks::query_control_response::Event::TerminationAccepted(
+            accepted,
+        )) => {
             let reason = QueryTerminationReason::try_from(accepted.reason).map_err(|_| {
                 invalid(format!(
                     "unknown query termination reason {}",
@@ -1013,7 +1007,7 @@ fn stream_status_error(status: tonic::Status) -> QueryLifecycleTransportError {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_protocol::novarocks::{
+    use novarocks_proto::novarocks::{
         IcebergExecutionBindingDeclaration, StarRocksExecutionBindingDeclaration,
         connector_execution_binding_declaration::Provider,
     };
@@ -1029,7 +1023,7 @@ mod tests {
 
         assert_eq!(
             encode_connector_execution_declaration(&declaration),
-            novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+            novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration {
                 instance_id: "catalog".to_string(),
                 incarnation: vec![7; 16],
                 provider: Some(Provider::Iceberg(IcebergExecutionBindingDeclaration {
@@ -1046,7 +1040,7 @@ mod tests {
 
         assert_eq!(
             encode_connector_execution_declaration(&declaration),
-            novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+            novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration {
                 instance_id: "catalog".to_string(),
                 incarnation: vec![9; 16],
                 provider: Some(Provider::Starrocks(StarRocksExecutionBindingDeclaration {

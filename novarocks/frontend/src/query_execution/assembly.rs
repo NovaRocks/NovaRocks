@@ -212,7 +212,7 @@ pub fn ensure_native_fragment_sink_supported(
 /// neither decodes its provider payload nor permits a fallback to an
 /// unplanned handle.
 pub fn patch_native_connector_write_sink(
-    fragment: &mut novarocks_protocol::plan::PlanFragment,
+    fragment: &mut novarocks_proto::plan::PlanFragment,
     fragment_id: FragmentId,
     fragment_instance_id: novarocks_types::UniqueId,
     backend_num: i32,
@@ -231,7 +231,7 @@ pub fn patch_native_connector_write_sink(
 }
 
 fn patch_native_connector_write_sink_in_place(
-    fragment: &mut novarocks_protocol::plan::PlanFragment,
+    fragment: &mut novarocks_proto::plan::PlanFragment,
     fragment_id: FragmentId,
     fragment_instance_id: novarocks_types::UniqueId,
     backend_num: i32,
@@ -255,7 +255,7 @@ fn patch_native_connector_write_sink_in_place(
         .as_mut()
         .ok_or_else(|| format!("terminal write fragment {fragment_id} has no native sink"))?;
     let template = match sink.kind.take() {
-        Some(novarocks_protocol::plan::data_sink::Kind::ConnectorWrite(template)) => template,
+        Some(novarocks_proto::plan::data_sink::Kind::ConnectorWrite(template)) => template,
         Some(other) => {
             sink.kind = Some(other);
             return Err(format!(
@@ -277,24 +277,20 @@ fn patch_native_connector_write_sink_in_place(
         format!("terminal connector write fragment {fragment_id} is missing input binding")
     })?;
     let input = match input.kind {
-        Some(
-            novarocks_protocol::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
-                value,
-            ),
-        ) => novarocks_protocol::plan::ConnectorWriteInputBinding {
+        Some(novarocks_proto::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
+            value,
+        )) => novarocks_proto::plan::ConnectorWriteInputBinding {
             kind: Some(
-                novarocks_protocol::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
+                novarocks_proto::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
                     value,
                 ),
             ),
         },
-        Some(novarocks_protocol::plan::connector_write_input_binding::Kind::OutputOrdinals(
+        Some(novarocks_proto::plan::connector_write_input_binding::Kind::OutputOrdinals(
             values,
-        )) => novarocks_protocol::plan::ConnectorWriteInputBinding {
+        )) => novarocks_proto::plan::ConnectorWriteInputBinding {
             kind: Some(
-                novarocks_protocol::plan::connector_write_input_binding::Kind::OutputOrdinals(
-                    values,
-                ),
+                novarocks_proto::plan::connector_write_input_binding::Kind::OutputOrdinals(values),
             ),
         },
         None => {
@@ -303,11 +299,11 @@ fn patch_native_connector_write_sink_in_place(
             ));
         }
     };
-    sink.kind = Some(novarocks_protocol::plan::data_sink::Kind::ConnectorWrite(
-        novarocks_protocol::plan::ConnectorWriteFragmentSink {
-            handle: Some(novarocks_protocol::plan::ConnectorWriterHandleEnvelope {
+    sink.kind = Some(novarocks_proto::plan::data_sink::Kind::ConnectorWrite(
+        novarocks_proto::plan::ConnectorWriteFragmentSink {
+            handle: Some(novarocks_proto::plan::ConnectorWriterHandleEnvelope {
                 contract_version: handle.version(),
-                writer: Some(novarocks_protocol::plan::ConnectorWriterIdentity {
+                writer: Some(novarocks_proto::plan::ConnectorWriterIdentity {
                     operation_id: writer.operation_id().to_bytes().to_vec(),
                     cohort_id: writer.cohort_id().to_bytes().to_vec(),
                     execution_query_id: writer.execution_id().query_id().to_vec(),
@@ -335,8 +331,8 @@ fn unique_id_bytes(value: novarocks_types::UniqueId) -> [u8; 16] {
     bytes
 }
 
-fn native_unique_id(value: [u8; 16]) -> novarocks_protocol::common::UniqueId {
-    novarocks_protocol::common::UniqueId {
+fn native_unique_id(value: [u8; 16]) -> novarocks_proto::common::UniqueId {
+    novarocks_proto::common::UniqueId {
         hi: i64::from_be_bytes(value[..8].try_into().expect("fixed writer identity prefix")),
         lo: i64::from_be_bytes(value[8..].try_into().expect("fixed writer identity suffix")),
     }
@@ -474,7 +470,7 @@ pub(crate) fn validate_scheduling_placements(plan: &SchedulingPlan) -> Result<()
 /// source. The traversal deliberately has no provider branch and never
 /// interprets a split payload.
 pub fn patch_native_connector_read_splits(
-    fragment: &mut novarocks_protocol::plan::PlanFragment,
+    fragment: &mut novarocks_proto::plan::PlanFragment,
     node_id: i32,
     splits: &[ConnectorSplit],
 ) -> Result<(), String> {
@@ -500,7 +496,7 @@ pub fn patch_native_connector_read_splits(
 }
 
 fn patch_connector_splits_in_node(
-    node: &mut novarocks_protocol::plan::DistributedNode,
+    node: &mut novarocks_proto::plan::DistributedNode,
     node_id: i32,
     splits: &[ConnectorSplit],
     matches: &mut usize,
@@ -510,26 +506,25 @@ fn patch_connector_splits_in_node(
             .payload
             .as_mut()
             .and_then(|payload| match payload {
-                novarocks_protocol::plan::distributed_node::Payload::Physical(physical) => {
+                novarocks_proto::plan::distributed_node::Payload::Physical(physical) => {
                     physical.kind.as_mut()
                 }
-                novarocks_protocol::plan::distributed_node::Payload::Exchange(_) => None,
+                novarocks_proto::plan::distributed_node::Payload::Exchange(_) => None,
             })
             .and_then(|kind| match kind {
-                novarocks_protocol::plan::plan_node::Kind::Scan(scan) => scan.table.as_mut(),
+                novarocks_proto::plan::plan_node::Kind::Scan(scan) => scan.table.as_mut(),
                 _ => None,
             })
             .and_then(|table| table.source.as_mut())
             .and_then(|source| source.kind.as_mut());
-        let Some(novarocks_protocol::plan::scan_source::Kind::ConnectorRead(source)) = source
-        else {
+        let Some(novarocks_proto::plan::scan_source::Kind::ConnectorRead(source)) = source else {
             return Err(format!(
                 "native connector split patch node {node_id} is not a ConnectorReadSource"
             ));
         };
         source.splits = splits
             .iter()
-            .map(|split| novarocks_protocol::plan::ConnectorReadSplit {
+            .map(|split| novarocks_proto::plan::ConnectorReadSplit {
                 split_id: split.split_id().to_string(),
                 split_payload: split.payload().to_vec(),
                 estimated_bytes: split.estimated_bytes(),
@@ -544,7 +539,7 @@ fn patch_connector_splits_in_node(
 }
 
 pub fn patch_native_change_stream_router_sink(
-    fragment: &mut novarocks_protocol::plan::PlanFragment,
+    fragment: &mut novarocks_proto::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
     branch_edges: &[&FragmentEdge],
@@ -563,7 +558,7 @@ pub fn patch_native_change_stream_router_sink(
 }
 
 fn patch_native_change_stream_router_sink_in_place(
-    fragment: &mut novarocks_protocol::plan::PlanFragment,
+    fragment: &mut novarocks_proto::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
     branch_edges: &[&FragmentEdge],
@@ -573,7 +568,7 @@ fn patch_native_change_stream_router_sink_in_place(
         return Err("native Iceberg change-stream router sink has no branch edges".to_string());
     }
     let router = match fragment.sink.as_mut().and_then(|sink| sink.kind.as_mut()) {
-        Some(novarocks_protocol::plan::data_sink::Kind::ChangeStreamRouter(router)) => router,
+        Some(novarocks_proto::plan::data_sink::Kind::ChangeStreamRouter(router)) => router,
         _ => {
             return Err(format!(
                 "fragment {fragment_id} is router source for group {router_group_id} but native \
@@ -681,7 +676,7 @@ fn patch_native_change_stream_router_sink_in_place(
                 fragment_id, router_group_id, edge.target_fragment_id
             )
         })?;
-        route.destinations = Some(novarocks_protocol::plan::StreamDestinationList {
+        route.destinations = Some(novarocks_proto::plan::StreamDestinationList {
             destinations: dests
                 .iter()
                 .map(|placement| {
@@ -708,13 +703,13 @@ fn patch_native_change_stream_router_sink_in_place(
 type CteMulticastConsumer = (
     FragmentId,
     i32,
-    novarocks_protocol::plan::DataPartition,
+    novarocks_proto::plan::DataPartition,
     Vec<i32>,
     Vec<ColumnId>,
 );
 
 pub fn patch_native_cte_multicast_sink(
-    fragment: &mut novarocks_protocol::plan::PlanFragment,
+    fragment: &mut novarocks_proto::plan::PlanFragment,
     fragment_id: FragmentId,
     cte_id: CteId,
     consumers: &[CteMulticastConsumer],
@@ -744,7 +739,7 @@ pub fn patch_native_cte_multicast_sink(
             output_slot_ids,
             receive_producer_column_ids,
         )?;
-        sinks.push(novarocks_protocol::plan::DataStreamSink {
+        sinks.push(novarocks_proto::plan::DataStreamSink {
             dest_node_id: *exchange_node_id,
             output_partition: Some(partition.clone()),
             output_columns: sink_output_columns,
@@ -753,19 +748,17 @@ pub fn patch_native_cte_multicast_sink(
         let dests = consumer_dests.get(consumer_fragment_id).ok_or_else(|| {
             format!("CTE consumer fragment {consumer_fragment_id} has no placements")
         })?;
-        destinations.push(novarocks_protocol::plan::StreamDestinationList {
+        destinations.push(novarocks_proto::plan::StreamDestinationList {
             destinations: dests.iter().map(native_stream_destination).collect(),
         });
     }
-    fragment.sink = Some(novarocks_protocol::plan::DataSink {
-        kind: Some(
-            novarocks_protocol::plan::data_sink::Kind::MultiCastDataStream(
-                novarocks_protocol::plan::MultiCastDataStreamSink {
-                    sinks,
-                    destinations,
-                },
-            ),
-        ),
+    fragment.sink = Some(novarocks_proto::plan::DataSink {
+        kind: Some(novarocks_proto::plan::data_sink::Kind::MultiCastDataStream(
+            novarocks_proto::plan::MultiCastDataStreamSink {
+                sinks,
+                destinations,
+            },
+        )),
     });
     debug!(
         "patched native CTE multicast sink: fragment={} cte_id={} sinks={}",
@@ -778,9 +771,9 @@ pub fn patch_native_cte_multicast_sink(
 
 fn native_stream_destination(
     src: &novarocks_execution::runtime::endpoint::FragmentDestination,
-) -> novarocks_protocol::plan::StreamDestination {
-    novarocks_protocol::plan::StreamDestination {
-        finst_id: Some(novarocks_protocol::common::UniqueId {
+) -> novarocks_proto::plan::StreamDestination {
+    novarocks_proto::plan::StreamDestination {
+        finst_id: Some(novarocks_proto::common::UniqueId {
             hi: src.finst_id().high(),
             lo: src.finst_id().low(),
         }),
@@ -789,7 +782,7 @@ fn native_stream_destination(
 }
 
 fn native_cte_multicast_sink_output_columns(
-    fragment: &novarocks_protocol::plan::PlanFragment,
+    fragment: &novarocks_proto::plan::PlanFragment,
     cte_id: CteId,
     consumer_fragment_id: FragmentId,
     exchange_node_id: i32,
@@ -854,8 +847,8 @@ fn native_cte_multicast_sink_output_columns(
 }
 
 fn native_cte_multicast_contract_slot_map(
-    fragment: &novarocks_protocol::plan::PlanFragment,
-    root_columns: &[novarocks_protocol::common::OutputColumn],
+    fragment: &novarocks_proto::plan::PlanFragment,
+    root_columns: &[novarocks_proto::common::OutputColumn],
     root_slot_id_set: &BTreeSet<i32>,
 ) -> BTreeMap<i32, i32> {
     let mut map = BTreeMap::new();
@@ -866,8 +859,7 @@ fn native_cte_multicast_contract_slot_map(
             .iter()
             .zip(fragment.output_exprs.iter())
         {
-            let Some(novarocks_protocol::expr::expr::Kind::ColumnRef(column_ref)) =
-                expr.kind.as_ref()
+            let Some(novarocks_proto::expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref()
             else {
                 continue;
             };
@@ -941,7 +933,7 @@ mod tests {
     use super::*;
     use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-    use novarocks_protocol::plan as native_plan;
+    use novarocks_proto::plan as native_plan;
     use novarocks_sql::plan_read::{DataPartition, FragmentStreamKind};
     use novarocks_types::SlotId;
     use novarocks_types::UniqueId;
@@ -1208,7 +1200,7 @@ mod tests {
     fn patches_cte_multicast_from_sealed_root_output_slots() {
         let mut fragment = native_plan::PlanFragment {
             fragment_id: 1,
-            output_columns: vec![novarocks_protocol::common::OutputColumn {
+            output_columns: vec![novarocks_proto::common::OutputColumn {
                 column_id: 10,
                 name: "total".to_string(),
                 r#type: None,

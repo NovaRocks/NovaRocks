@@ -63,7 +63,7 @@ pub(crate) fn encode_native_submission(
         Vec<(
             FragmentId,
             i32,
-            novarocks_protocol::plan::DataPartition,
+            novarocks_proto::plan::DataPartition,
             Vec<i32>,
             Vec<ColumnId>,
         )>,
@@ -94,8 +94,8 @@ pub(crate) fn encode_native_submission(
                 consumers.push((
                     fragment.fragment_id(),
                     *exchange_node_id,
-                    novarocks_protocol::plan::DataPartition {
-                        kind: novarocks_protocol::plan::PartitionKind::Unpartitioned as i32,
+                    novarocks_proto::plan::DataPartition {
+                        kind: novarocks_proto::plan::PartitionKind::Unpartitioned as i32,
                         exprs: Vec::new(),
                     },
                     Vec::new(),
@@ -307,7 +307,7 @@ fn validate_fragment_output_kind(
 }
 
 fn patch_connector_writer(
-    native_fragment: &mut novarocks_protocol::plan::PlanFragment,
+    native_fragment: &mut novarocks_proto::plan::PlanFragment,
     fragment_id: FragmentId,
     placement: &FragmentInstancePlacement,
     attachment: &ConnectorWritePlanAttachment,

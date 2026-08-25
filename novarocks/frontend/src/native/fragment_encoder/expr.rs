@@ -21,7 +21,7 @@ use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
 use super::plan::encode_type;
-use novarocks_protocol::{common, expr};
+use novarocks_proto::{common, expr};
 use novarocks_sql::plan_read::{
     BinOp, LiteralValue, SortItem, SqlExpressionRead, SqlExpressionReadKind, TypedExpr, UnOp,
     WindowBound, WindowFrame, WindowFrameType, expression_read,

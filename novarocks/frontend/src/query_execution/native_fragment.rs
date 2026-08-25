@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
-use novarocks_protocol::plan::PlanFragment as NativePlanFragment;
+use novarocks_proto::plan::PlanFragment as NativePlanFragment;
 use novarocks_sql::plan_read::{DistributedPlan, FragmentId};
 
 use crate::query_execution::preparation::{NativeScanFactsView, PreparedFragmentSet};
@@ -160,7 +160,7 @@ impl NativeFragmentAttachment {
     /// consuming so one artifact cannot receive two runtime-filter tables.
     pub(crate) fn bind_runtime_filter_tables(
         mut self,
-        tables: BTreeMap<FragmentId, novarocks_protocol::plan::RuntimeFilterBindingTable>,
+        tables: BTreeMap<FragmentId, novarocks_proto::plan::RuntimeFilterBindingTable>,
     ) -> Result<Self, String> {
         let expected = self.by_fragment.keys().copied().collect::<BTreeSet<_>>();
         let actual = tables.keys().copied().collect::<BTreeSet<_>>();

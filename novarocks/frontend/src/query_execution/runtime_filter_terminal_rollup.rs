@@ -23,7 +23,7 @@
 //! facts and computes diagnostic query totals without introducing another
 //! lifecycle owner.
 
-use novarocks_protocol::novarocks;
+use novarocks_proto::novarocks;
 
 use super::terminal_set::QueryTerminalSet;
 
@@ -218,7 +218,7 @@ pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
 
 fn add_contribution_totals(
     totals: &mut RuntimeFilterTerminalTotals,
-    contribution: &novarocks_protocol::lifecycle::QueryTerminalProfileContributionV1,
+    contribution: &novarocks_proto::lifecycle::QueryTerminalProfileContributionV1,
 ) -> Result<(), ()> {
     for channel in contribution.channels() {
         checked_add(&mut totals.channels.count, 1)?;
@@ -377,8 +377,8 @@ mod tests {
     };
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::terminal_set::QueryTerminalSet;
-    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
-    use novarocks_protocol::{common, novarocks};
+    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
+    use novarocks_proto::{common, novarocks};
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))

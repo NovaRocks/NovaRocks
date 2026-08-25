@@ -23,7 +23,7 @@ use crate::query_execution::FragmentInstancePlacement;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_protocol::{common, novarocks as wire};
+use novarocks_proto::{common, novarocks as wire};
 use novarocks_types::UniqueId;
 
 pub(crate) fn encode_instance_params(

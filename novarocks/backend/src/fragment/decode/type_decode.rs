@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
-use novarocks_protocol::common;
+use novarocks_proto::common;
 use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
 const TIME_UNIT_MICROS: i32 = 2;
@@ -360,7 +360,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::decode_type;
-    use novarocks_protocol::common;
+    use novarocks_proto::common;
 
     #[test]
     fn decodes_nested_and_decimal_types_without_core_codec() {

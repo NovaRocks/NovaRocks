@@ -36,7 +36,7 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterSessionRef, RuntimeFilterSnapshot, RuntimeFilterSubscriptionHandle,
     RuntimeFilterSubscriptionRequest,
 };
-use novarocks_protocol::lifecycle::{QueryExecutionId, QueryTerminationReason};
+use novarocks_proto::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -1723,7 +1723,7 @@ mod tests {
         RuntimeFilterProducerFailure, RuntimeFilterSubscriptionHandle,
         RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome, UnavailableReason, contribution,
     };
-    use novarocks_protocol::lifecycle::AttemptId;
+    use novarocks_proto::lifecycle::AttemptId;
     use novarocks_types::QueryId;
 
     use super::*;

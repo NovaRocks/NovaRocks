@@ -30,15 +30,15 @@ use crate::native::transport::new_query_lifecycle_transport;
 use crate::query_execution::contract::DistributedQueryIntent;
 use crate::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
-use novarocks_protocol::lifecycle as protocol_lifecycle;
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle as protocol_lifecycle;
+use novarocks_proto::lifecycle::{
     AttemptId, FragmentLiveObservation, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantRole, QueryControlCommand as ProtocolQueryControlCommand, QueryControlEndpoint,
     QueryControlEvent as ProtocolQueryControlEvent, QueryExecutionId, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryOptions, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution,
 };
-use novarocks_protocol::{common as proto_common, filter, novarocks as proto};
+use novarocks_proto::{common as proto_common, filter, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 use tokio_stream::wrappers::ReceiverStream;

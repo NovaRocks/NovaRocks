@@ -23,13 +23,13 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle::{
     ContractError, ContractErrorCode, QueryAbortRequest, QueryControlAttach,
     QueryControlCommand as ProtocolQueryControlCommand, QueryControlEvent, QueryExecutionId,
     QueryInitOutcome, QueryInitRequest, QueryStageRequest, QueryStartRequest, QueryTerminalAck,
     QueryTerminationReason,
 };
-use novarocks_protocol::novarocks as proto;
+use novarocks_proto::novarocks as proto;
 
 use crate::query_lifecycle::{
     BackendQueryControl, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
@@ -532,11 +532,11 @@ use novarocks_failpoint::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
 use novarocks_failpoint::{claim_matching_fault, trigger_path};
 
 #[cfg(debug_assertions)]
-fn staged_heartbeat_stops() -> &'static Mutex<
-    BTreeMap<novarocks_protocol::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
-> {
+fn staged_heartbeat_stops()
+-> &'static Mutex<BTreeMap<novarocks_proto::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>>
+{
     static STOPS: OnceLock<
-        Mutex<BTreeMap<novarocks_protocol::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>>,
+        Mutex<BTreeMap<novarocks_proto::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>>,
     > = OnceLock::new();
     STOPS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }

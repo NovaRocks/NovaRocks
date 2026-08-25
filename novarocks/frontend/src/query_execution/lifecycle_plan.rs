@@ -26,13 +26,13 @@ use crate::query_execution::contract::{
 use crate::query_execution::schedule::FragmentLifecycleProjection;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_protocol::common;
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::common;
+use novarocks_proto::lifecycle::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest, ParticipantRole,
     QueryControlEndpoint, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
     RuntimeFilterContribution,
 };
-use novarocks_protocol::novarocks;
+use novarocks_proto::novarocks;
 
 use crate::query_execution::launch::StageParticipantBinding;
 use crate::query_execution::terminal_set::QueryTerminalSet;
@@ -74,7 +74,7 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 }
 
 fn protocol_contract_error(
-    error: novarocks_protocol::lifecycle::ContractError,
+    error: novarocks_proto::lifecycle::ContractError,
 ) -> DistributedQueryError {
     contract_error(error.to_string())
 }
@@ -116,7 +116,7 @@ fn protocol_unique_id(id: novarocks_types::UniqueId) -> common::UniqueId {
 }
 
 fn protocol_exchange_route(
-    route: &novarocks_protocol::lifecycle::ExchangeRouteManifest,
+    route: &novarocks_proto::lifecycle::ExchangeRouteManifest,
 ) -> novarocks::ExchangeRouteManifest {
     *route.as_proto()
 }
@@ -629,10 +629,10 @@ mod tests {
     use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
     use crate::query_execution::schedule::FragmentLifecycleProjection;
-    use novarocks_protocol::lifecycle::{
+    use novarocks_proto::lifecycle::{
         AttemptId, ParticipantRole, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
     };
-    use novarocks_protocol::novarocks;
+    use novarocks_proto::novarocks;
     use novarocks_types::UniqueId;
 
     fn execution_id() -> QueryExecutionId {

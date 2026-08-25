@@ -10,13 +10,13 @@ provenance:
   - "discussion: 2026-08-15 native query lifecycle canonical contract and Protocol ownership"
 code-anchors:
   - "idl/novarocks/service.proto (FE/BE lifecycle messages)"
-  - "novarocks/protocol/src/lib.rs (schema artifact exports)"
-  - "novarocks/protocol/src/lifecycle/mod.rs (lifecycle contract module)"
+  - "novarocks/proto/src/lib.rs (schema artifact exports)"
+  - "novarocks/proto/src/lifecycle/mod.rs (lifecycle contract module)"
 ---
 
 ## 问题
 
-FE 与 BE 共享的 query lifecycle 事实应以哪一种形式作为唯一规范，以及 `novarocks-protocol` 应拥有到什么边界，才能避免 Rust value 与 protobuf message 并行演进而削弱跨进程围栏？
+FE 与 BE 共享的 query lifecycle 事实应以哪一种形式作为唯一规范，以及 `novarocks-proto` 应拥有到什么边界，才能避免 Rust value 与 protobuf message 并行演进而削弱跨进程围栏？
 
 ## 背景与执行事实
 
@@ -24,7 +24,7 @@ Native query lifecycle 的 Init、Stage、Start、Abort、control stream 与 ter
 
 这种并行表示的风险不是编译器能捕获的。proto3 message 增加字段时，生成 DTO 会更新；手写 digest 投影、decode、跨字段检查却可能遗漏该字段。尤其当 digest 被用作重复投递一致性与 participant manifest 围栏时，遗漏会使封存内容、wire 内容和 hash 覆盖面不再一致。
 
-`novarocks-protocol` 原先只导出 generated DTO、descriptor set 与 schema-ledger metadata。它可以在不依赖 Core、Frontend、Backend、Execution、SPI、SQL、Server 或 provider runtime 的条件下，拥有纯 schema、descriptor-driven canonicalization/digest、以及只执行 value/wire 校验的 validated value。FE 与 BE 各自的 registry、timer、transport、liveness 和状态机仍是角色本地实现，受 ADR-0007 的进程分离约束。
+`novarocks-proto` 原先只导出 generated DTO、descriptor set 与 schema-ledger metadata。它可以在不依赖 Core、Frontend、Backend、Execution、SPI、SQL、Server 或 provider runtime 的条件下，拥有纯 schema、descriptor-driven canonicalization/digest、以及只执行 value/wire 校验的 validated value。FE 与 BE 各自的 registry、timer、transport、liveness 和状态机仍是角色本地实现，受 ADR-0007 的进程分离约束。
 
 仓库当前没有独立 schema baseline、mixed-version negotiation 或 rolling-upgrade digest 兼容承诺。因此同一部署中 FE 与 BE 可在一次原子发布中共同切换 digest 算法；这不构成对不同版本进程互通的承诺。
 
@@ -39,7 +39,7 @@ Native query lifecycle 的 Init、Stage、Start、Abort、control stream 与 ter
 
 IDL/proto message 是所有 FE↔BE 中立 query lifecycle 事实的唯一规范形式。canonical bytes、digest 输入与字段演进均以 descriptor 所描述的 schema 为准；不再把手写 Rust value 当作可与 proto 并列的第二份 contract。
 
-`novarocks-protocol` 扩展为三层稳定 surface：source IDL、generated DTO 与 descriptor set 组成 schema artifact；descriptor-driven canonical projection 与 digest 是可复用的纯工具；validated newtype 和纯校验规则封装 schema 无法表达的 value 不变量。每个 validated newtype 的字段私有且只持有一个 generated message；它不缓存 digest、runtime handle、registry reference、callback 或可变能力。解码后是校验并包装，编码是取出同一 message，而不是 Rust/proto 的双向语义转换。
+`novarocks-proto` 扩展为三层稳定 surface：source IDL、generated DTO 与 descriptor set 组成 schema artifact；descriptor-driven canonical projection 与 digest 是可复用的纯工具；validated newtype 和纯校验规则封装 schema 无法表达的 value 不变量。每个 validated newtype 的字段私有且只持有一个 generated message；它不缓存 digest、runtime handle、registry reference、callback 或可变能力。解码后是校验并包装，编码是取出同一 message，而不是 Rust/proto 的双向语义转换。
 
 Protocol 校验 required message presence、已知 enum 值、非零/上界、集合唯一性、跨字段一致性、digest 与内容一致性以及重复请求的 typed conflict。它不判断 ControlReady 是否收齐、participant 当前相位、timeout 是否触发、registry 是否接纳消息、SQL terminal verdict 或 retry/recovery 策略；这些依旧是各角色状态机的责任。
 

@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle::{
     FragmentLiveObservation, ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach,
     QueryControlEndpoint, QueryControlEvent, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
@@ -89,8 +89,8 @@ impl std::fmt::Display for QueryLifecycleError {
 
 impl std::error::Error for QueryLifecycleError {}
 
-impl From<novarocks_protocol::lifecycle::ContractError> for QueryLifecycleError {
-    fn from(error: novarocks_protocol::lifecycle::ContractError) -> Self {
+impl From<novarocks_proto::lifecycle::ContractError> for QueryLifecycleError {
+    fn from(error: novarocks_proto::lifecycle::ContractError) -> Self {
         Self::invalid_manifest(error.detail())
     }
 }

@@ -16,7 +16,7 @@
 // under the License.
 
 use super::backend;
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -193,12 +193,12 @@ mod request_context_tests {
 
     #[test]
     fn protocol_query_timeout_preserves_connector_deadline_defaults() {
-        let unset = novarocks_protocol::lifecycle::QueryOptions::parse(
-            novarocks_protocol::novarocks::QueryOptions::default(),
+        let unset = novarocks_proto::lifecycle::QueryOptions::parse(
+            novarocks_proto::novarocks::QueryOptions::default(),
         )
         .expect("default protocol query options are valid");
-        let configured = novarocks_protocol::lifecycle::QueryOptions::parse(
-            novarocks_protocol::novarocks::QueryOptions {
+        let configured = novarocks_proto::lifecycle::QueryOptions::parse(
+            novarocks_proto::novarocks::QueryOptions {
                 query_timeout: 17,
                 ..Default::default()
             },

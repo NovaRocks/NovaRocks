@@ -34,8 +34,8 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
-use novarocks_protocol::lifecycle::QueryExecutionId;
-use novarocks_protocol::provider::{
+use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingRejection, RetireConnectorExecutionBindingOutcome,
 };
 
@@ -436,7 +436,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::query_execution::contract::QueryId;
-    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
 
     use super::*;
 
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn dispatch_barrier_preserves_the_typed_be_rejection_without_retrying() {
-        use novarocks_protocol::provider::{
+        use novarocks_proto::provider::{
             EnsureConnectorExecutionBindingRejection,
             EnsureConnectorExecutionBindingRejectionReason,
         };

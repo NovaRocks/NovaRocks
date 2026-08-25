@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use crate::connector::ConnectorRegistry;
 use novarocks_execution::runtime::fragment::FragmentSubmission;
-use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
-use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
-use novarocks_protocol::{novarocks as proto, plan};
+use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::QueryId as ExecutionQueryId;
 use novarocks_types::QueryId;
@@ -222,8 +222,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::connector::ConnectorRegistry;
-    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
-    use novarocks_protocol::{common, novarocks as proto, plan};
+    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_proto::{common, novarocks as proto, plan};
     use novarocks_types::QueryId;
 
     use super::{NativeFragmentRequest, decode_native_query_execution_id};

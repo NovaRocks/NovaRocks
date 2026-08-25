@@ -37,7 +37,7 @@ use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::profile::Profiler;
-use novarocks_protocol::lifecycle::{QueryExecutionId, StageFragment};
+use novarocks_proto::lifecycle::{QueryExecutionId, StageFragment};
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, WriteCommitEvidenceLimits};
 use tracing::error;
 
@@ -632,14 +632,14 @@ impl NativeFragmentIngress for NativeFragmentService {
         &self,
         execution_id: QueryExecutionId,
         declaration: AdmittedConnectorExecutionDeclaration,
-    ) -> novarocks_protocol::provider::EnsureConnectorExecutionBindingResult {
+    ) -> novarocks_proto::provider::EnsureConnectorExecutionBindingResult {
         self.execution_host.ensure(execution_id, &declaration)
     }
 
     fn retire_connector_execution_binding(
         &self,
         key: ConnectorExecutionBindingKey,
-    ) -> novarocks_protocol::provider::RetireConnectorExecutionBindingResult {
+    ) -> novarocks_proto::provider::RetireConnectorExecutionBindingResult {
         self.execution_host.retire(&key)
     }
 
@@ -805,9 +805,9 @@ mod tests {
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
-    use novarocks_protocol as proto;
-    use novarocks_protocol::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
-    use novarocks_protocol::lifecycle::{
+    use novarocks_proto as proto;
+    use novarocks_proto::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
+    use novarocks_proto::lifecycle::{
         ParticipantBackendIdentity, ParticipantManifest, ParticipantRole, QueryControlAttach,
         QueryControlEndpoint, QueryInitOutcome, QueryInitRequest, QueryOptions, StageFragment,
     };
@@ -1019,7 +1019,7 @@ mod tests {
                 .expect("ControlReady")
                 .as_proto()
                 .event,
-            Some(novarocks_protocol::novarocks::query_control_response::Event::ControlReady(_))
+            Some(novarocks_proto::novarocks::query_control_response::Event::ControlReady(_))
         ));
         attachment
     }

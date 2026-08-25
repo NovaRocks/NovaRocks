@@ -28,7 +28,7 @@ use super::{NativePlanEncodeContext, encode_exprs};
 use crate::query_execution::preparation::{
     NativeScanBindingView, NativeScanColumnKind, NativeScanColumnView, NativeScanExecutionKind,
 };
-use novarocks_protocol::{common, plan};
+use novarocks_proto::{common, plan};
 use novarocks_sql::plan_read::{
     ColumnId, ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn,
     ScanVariantColumn, SqlPlanScanNodeRead, SqlScanSourceRead, SqlTableDefRead,

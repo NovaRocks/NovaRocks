@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 
 /// One parser-owned DELETE variant admitted by the typed statement router.
 ///

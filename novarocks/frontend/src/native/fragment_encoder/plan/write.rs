@@ -17,7 +17,7 @@
 
 use super::type_mapping::{encode_data_partition, encode_row_mutation_effect, usize_to_u64};
 use super::{NativePlanEncodeContext, required_context_ref};
-use novarocks_protocol::{common, plan};
+use novarocks_proto::{common, plan};
 use novarocks_sql::plan_read::{
     ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding, FragmentId,
 };

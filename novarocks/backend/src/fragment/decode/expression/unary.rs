@@ -22,8 +22,8 @@ use arrow::datatypes::DataType;
 use super::{function_call, literal, lower_required_child};
 use novarocks_execution::exec::expr::function::lookup_function;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
-use novarocks_protocol::FieldPath;
-use novarocks_protocol::expr;
+use novarocks_proto::FieldPath;
+use novarocks_proto::expr;
 
 use super::NativeExpressionInputLayout;
 

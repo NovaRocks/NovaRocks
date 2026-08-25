@@ -42,7 +42,7 @@ use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle::{
     AttemptId, AttemptId as ProtocolAttemptId, QueryExecutionId,
     QueryExecutionId as ProtocolQueryExecutionId, QueryOptions as ProtocolQueryOptions,
 };
@@ -74,7 +74,7 @@ use crate::runtime_filter::compiler::{
 };
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 #[cfg(test)]
-use novarocks_protocol::{
+use novarocks_proto::{
     lifecycle::{
         QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent,
         QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome,
@@ -570,7 +570,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
 
 #[cfg(test)]
 fn protocol_contract_error(
-    error: novarocks_protocol::lifecycle::ContractError,
+    error: novarocks_proto::lifecycle::ContractError,
 ) -> QueryLifecycleTransportError {
     QueryLifecycleTransportError::new(
         QueryLifecycleTransportErrorKind::InvalidResponse,

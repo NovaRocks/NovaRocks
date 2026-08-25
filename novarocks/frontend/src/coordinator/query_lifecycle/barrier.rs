@@ -25,12 +25,12 @@ use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch};
 use crate::query_execution::lifecycle_plan::{
     QueryInitBarrier, QueryInitPlan, QueryLifecycleLease,
 };
-use novarocks_protocol::lifecycle::{
+use novarocks_proto::lifecycle::{
     AttemptId as CoreAttemptId, AttemptId as ProtocolAttemptId, QueryControlAttach,
     QueryExecutionId, QueryInitOutcome, QueryStageAck, QueryStageRequest, QueryStartAck,
     QueryStartRequest,
 };
-use novarocks_protocol::novarocks as protocol_wire;
+use novarocks_proto::novarocks as protocol_wire;
 
 use super::QueryLifecycleTransport;
 use super::lease::{
@@ -569,16 +569,16 @@ fn validate_start_ack(
 
 fn protocol_execution_id(
     execution_id: QueryExecutionId,
-) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, String> {
+) -> Result<novarocks_proto::lifecycle::QueryExecutionId, String> {
     let attempt = ProtocolAttemptId::new(execution_id.attempt_id().get())
         .map_err(|error| error.to_string())?;
-    novarocks_protocol::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+    novarocks_proto::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
         .map_err(|error| error.to_string())
 }
 
 fn participant_execution_id(
     participant: &MaterializedParticipant,
-) -> novarocks_protocol::lifecycle::QueryExecutionId {
+) -> novarocks_proto::lifecycle::QueryExecutionId {
     participant
         .request
         .manifest()

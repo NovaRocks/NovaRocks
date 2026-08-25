@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use crate::client_connection::ClientConnectionToken;
 use crate::common::query_cancellation::QueryCancellationReason;
 use crate::runtime::statement_result::StatementResult;
-use novarocks_protocol::{lifecycle::QueryOptions, novarocks};
+use novarocks_proto::{lifecycle::QueryOptions, novarocks};
 use novarocks_user_error::UserError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

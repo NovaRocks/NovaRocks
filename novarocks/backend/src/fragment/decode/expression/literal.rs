@@ -22,8 +22,8 @@ use arrow_buffer::i256;
 
 use super::error::NativeExpressionLeafDecodeError;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
-use novarocks_protocol::{FieldPath, ProtocolErrorKind};
-use novarocks_protocol::{common, expr};
+use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto::{common, expr};
 
 #[allow(
     dead_code,
@@ -331,8 +331,8 @@ mod tests {
     use arrow::datatypes::DataType;
     use arrow_buffer::i256;
     use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
-    use novarocks_protocol::ProtocolErrorKind;
-    use novarocks_protocol::{common, expr};
+    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto::{common, expr};
 
     fn literal_error(
         literal: expr::LiteralExpr,

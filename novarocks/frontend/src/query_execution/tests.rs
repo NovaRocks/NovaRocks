@@ -43,8 +43,8 @@ use crate::query_execution::statistics::{
 use crate::query_execution::terminal_set::QueryTerminalSet;
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use bytes::Bytes;
-use novarocks_protocol::lifecycle::QueryOptions;
-use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -87,7 +87,7 @@ struct NoopConnectorBindingBarrier;
 impl ConnectorBindingInstallBarrier for NoopConnectorBindingBarrier {
     fn install_all(
         &self,
-        _execution_id: novarocks_protocol::lifecycle::QueryExecutionId,
+        _execution_id: novarocks_proto::lifecycle::QueryExecutionId,
         _plan: crate::query_execution::artifact::ConnectorBindingInstallPlan,
     ) -> Result<ConnectorBindingInstallLease, DistributedQueryError> {
         Ok(ConnectorBindingInstallLease)
@@ -184,7 +184,7 @@ fn real_execution_artifacts() -> (
     .expect("prepare production execution artifact");
     let native_bundle =
         crate::query_execution::native_fragment::native_fragment_attachment_for_test(
-            [novarocks_protocol::plan::PlanFragment {
+            [novarocks_proto::plan::PlanFragment {
                 fragment_id: 7,
                 ..Default::default()
             }],
@@ -207,7 +207,7 @@ fn request_owns_prepared_and_native_artifacts() {
         prepared,
         native_bundle,
         Some(
-            QueryOptions::parse(novarocks_protocol::novarocks::QueryOptions {
+            QueryOptions::parse(novarocks_proto::novarocks::QueryOptions {
                 pipeline_dop: 3,
                 ..Default::default()
             })
@@ -261,13 +261,13 @@ fn query_control_typestate_initializes_before_native_assembly() {
     let parts = request.into_parts();
     let query_id = crate::query_execution::contract::QueryId::new(41, 73);
     let execution_id = execution_id(query_id);
-    let protocol_execution_id = novarocks_protocol::lifecycle::QueryExecutionId::new(
+    let protocol_execution_id = novarocks_proto::lifecycle::QueryExecutionId::new(
         query_id,
-        novarocks_protocol::lifecycle::AttemptId::new(9).expect("nonzero protocol attempt"),
+        novarocks_proto::lifecycle::AttemptId::new(9).expect("nonzero protocol attempt"),
     )
     .expect("valid protocol execution id");
-    let wire_query_options = novarocks_protocol::lifecycle::QueryOptions::parse(
-        novarocks_protocol::novarocks::QueryOptions::default(),
+    let wire_query_options = novarocks_proto::lifecycle::QueryOptions::parse(
+        novarocks_proto::novarocks::QueryOptions::default(),
     )
     .expect("valid protocol query options");
     let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
@@ -329,8 +329,8 @@ fn query_control_typestate_initializes_before_native_assembly() {
             (fragment_id == key.fragment_id()).then(|| fragment.clone())
         })
         .expect("sealed root template");
-    let instance_params = novarocks_protocol::novarocks::InstanceParams {
-        fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
+    let instance_params = novarocks_proto::novarocks::InstanceParams {
+        fragment_instance_id: Some(novarocks_proto::common::UniqueId {
             hi: key.fragment_instance_id().high(),
             lo: key.fragment_instance_id().low(),
         }),

@@ -19,8 +19,8 @@
 
 use std::fmt;
 
-use novarocks_protocol::lifecycle::QueryExecutionId;
-use novarocks_protocol::provider::{
+use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingResult,
 };
 use novarocks_spi::connector::ConnectorExecutionBindingKey;

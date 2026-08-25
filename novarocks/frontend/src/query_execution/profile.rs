@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::terminal_codec::decode_runtime_profile_tree;
-use novarocks_protocol::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
-use novarocks_protocol::novarocks;
+use novarocks_proto::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
+use novarocks_proto::novarocks;
 
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
@@ -1099,8 +1099,8 @@ mod tests {
     };
     use crate::query_execution::contract::QueryId;
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler};
-    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
-    use novarocks_protocol::{common, novarocks};
+    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
+    use novarocks_proto::{common, novarocks};
 
     fn runtime_filter_snapshot(
         backend_id: u64,

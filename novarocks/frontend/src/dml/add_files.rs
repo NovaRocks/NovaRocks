@@ -27,7 +27,7 @@ use crate::query_execution::dml::add_files::{
     AddFilesFailure, AddFilesFailureKind, AddFilesFinalization, AddFilesOutcome, AddFilesPlanError,
     AddFilesPlanFacts, AddFilesReceipt, PlanAddFilesRequest, PreparedAddFiles,
 };
-use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorDataMutationSourceScopeKind, ExternalMutationEvidence, REGISTER_EXISTING_FILES_KIND,
 };

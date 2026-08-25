@@ -18,7 +18,7 @@
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use super::super::expr::encode_expr;
-use novarocks_protocol::{common, plan};
+use novarocks_proto::{common, plan};
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_sql::plan_read::{
     AggMode, DataPartition, HashSource, JoinDistribution, JoinExecutionMode, JoinKind,

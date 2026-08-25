@@ -17,7 +17,7 @@
 
 use prost::Message;
 
-use novarocks_protocol::novarocks;
+use novarocks_proto::novarocks;
 
 fn encoded_field_numbers<M: Message>(message: &M) -> Vec<u32> {
     let bytes = message.encode_to_vec();

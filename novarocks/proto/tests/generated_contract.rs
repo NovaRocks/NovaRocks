@@ -1,7 +1,7 @@
 use prost::Message;
 use prost_reflect::DescriptorPool;
 
-use novarocks_protocol::{
+use novarocks_proto::{
     FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, common, expr, filter, novarocks, plan,
 };
 

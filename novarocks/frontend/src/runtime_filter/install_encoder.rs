@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks_protocol::{filter, novarocks as service};
+use novarocks_proto::{filter, novarocks as service};
 use prost::Message;
 use sha2::{Digest, Sha256};
 
@@ -86,7 +86,7 @@ fn encode_participant(
 
 #[cfg(test)]
 mod tests {
-    use novarocks_protocol::filter;
+    use novarocks_proto::filter;
     use prost::Message;
     use sha2::{Digest, Sha256};
 
@@ -109,7 +109,7 @@ mod tests {
         let mut expected = Sha256::new();
         expected.update(CONTRIBUTION_DIGEST_DOMAIN);
         let envelope = filter::InstallRuntimeFilterDeploymentRequest {
-            query_id: Some(novarocks_protocol::common::UniqueId { hi: 1, lo: 2 }),
+            query_id: Some(novarocks_proto::common::UniqueId { hi: 1, lo: 2 }),
             deployment_epoch: 3,
             participant_id: participant.participant_id(),
             lifecycle: Some(lifecycle.to_wire()),
@@ -125,7 +125,7 @@ mod tests {
     fn encode_for_test(
         lifecycle: FrontendRuntimeFilterLifecycle,
         participant: &FrontendRuntimeFilterParticipant,
-    ) -> novarocks_protocol::novarocks::RuntimeFilterContribution {
+    ) -> novarocks_proto::novarocks::RuntimeFilterContribution {
         // Keep this assertion focused on the owner-local contribution shape;
         // constructing a sealed artifact belongs to the schedule-view seam.
         let mut digest = Sha256::new();
@@ -135,14 +135,14 @@ mod tests {
             routing_channels: Vec::new(),
         };
         let envelope = filter::InstallRuntimeFilterDeploymentRequest {
-            query_id: Some(novarocks_protocol::common::UniqueId { hi: 1, lo: 2 }),
+            query_id: Some(novarocks_proto::common::UniqueId { hi: 1, lo: 2 }),
             deployment_epoch: 3,
             participant_id: participant.participant_id(),
             lifecycle: Some(lifecycle.to_wire()),
             install: Some(install.clone()),
         };
         digest.update(envelope.encode_to_vec());
-        novarocks_protocol::novarocks::RuntimeFilterContribution {
+        novarocks_proto::novarocks::RuntimeFilterContribution {
             participant_id: participant.participant_id(),
             lifecycle: Some(lifecycle.to_wire()),
             install: Some(install),

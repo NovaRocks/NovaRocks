@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use novarocks_protocol::{
+use novarocks_proto::{
     lifecycle::{
         AttemptId, ContractErrorCode, ParticipantBackendIdentity, ParticipantManifest,
         ParticipantRole, QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,

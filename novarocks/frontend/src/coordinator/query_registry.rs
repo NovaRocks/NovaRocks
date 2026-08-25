@@ -25,7 +25,7 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
-use novarocks_protocol::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
+use novarocks_proto::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::{QueryId, QueryProcessNamespace};
 
 type QueryKey = (i64, i64);
@@ -824,10 +824,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks_protocol::lifecycle::{
+    use novarocks_proto::lifecycle::{
         AttemptId, ParticipantTerminalOutcome, QueryTerminalSnapshot, TerminalizationProof,
     };
-    use novarocks_protocol::{common, novarocks as proto};
+    use novarocks_proto::{common, novarocks as proto};
 
     struct RetainedControl {
         execution_id: QueryExecutionId,

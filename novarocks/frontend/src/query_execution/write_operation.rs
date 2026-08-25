@@ -879,7 +879,7 @@ mod tests {
     use crate::query_execution::terminal_codec::encode_connector_staged_report_frame;
     use crate::query_execution::write::{WriteCommitInput, WriterCommitInput, WriterKey};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::UniqueId;
 
     struct NeverCancelled;

@@ -3086,7 +3086,7 @@ dependencies = [
  "hex",
  "novarocks-execution",
  "novarocks-failpoint",
- "novarocks-protocol",
+ "novarocks-proto",
  "novarocks-spi",
  "novarocks-types",
  "novarocks-version",
@@ -3225,7 +3225,7 @@ dependencies = [
 name = "novarocks-failpoint"
 version = "0.1.0"
 dependencies = [
- "novarocks-protocol",
+ "novarocks-proto",
  "novarocks-types",
 ]
 
@@ -3251,7 +3251,7 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-parser",
- "novarocks-protocol",
+ "novarocks-proto",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
@@ -3303,7 +3303,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-protocol"
+name = "novarocks-proto"
 version = "0.1.0"
 dependencies = [
  "novarocks-types",

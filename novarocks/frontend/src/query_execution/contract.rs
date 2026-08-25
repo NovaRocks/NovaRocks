@@ -38,8 +38,8 @@ use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
-use novarocks_protocol::lifecycle::QueryOptions;
-use novarocks_protocol::provider::EnsureConnectorExecutionBindingRejection;
+use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto::provider::EnsureConnectorExecutionBindingRejection;
 use novarocks_spi::connector::{
     ConnectorActivatedWriteCohort, ConnectorError, ConnectorExecutionBindingKey,
     ConnectorRequestContext, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
@@ -898,8 +898,8 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::reconstruct_runtime_query_options;
-    use novarocks_protocol::lifecycle::QueryOptions;
-    use novarocks_protocol::novarocks;
+    use novarocks_proto::lifecycle::QueryOptions;
+    use novarocks_proto::novarocks;
 
     #[test]
     fn reconstructed_runtime_options_preserve_protocol_scalars() {

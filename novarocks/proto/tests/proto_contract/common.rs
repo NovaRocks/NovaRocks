@@ -17,7 +17,7 @@
 
 use prost::Message;
 
-use novarocks_protocol::common;
+use novarocks_proto::common;
 
 #[derive(Clone, Debug, PartialEq)]
 enum InternalType {

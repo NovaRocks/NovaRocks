@@ -23,9 +23,9 @@
 use novarocks_execution::runtime::profile::{
     ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree, default_counter_strategy,
 };
-use novarocks_protocol::novarocks;
+use novarocks_proto::novarocks;
 #[cfg(test)]
-use novarocks_protocol::{common, plan};
+use novarocks_proto::{common, plan};
 #[cfg(test)]
 use novarocks_spi::connector::{ConnectorStagedReportFrame, ConnectorWriterTerminalState};
 

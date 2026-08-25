@@ -17,8 +17,8 @@
 
 //! Fragment-owned native wire envelope validation.
 
-use novarocks_protocol::plan;
-use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto::plan;
+use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 pub(crate) fn require_root(
     fragment: &plan::PlanFragment,
@@ -49,7 +49,7 @@ fn error(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::{require_root, require_sink};
-    use novarocks_protocol::plan;
+    use novarocks_proto::plan;
 
     #[test]
     fn preserves_missing_root_error() {

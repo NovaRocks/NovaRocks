@@ -20,7 +20,7 @@
 use std::error::Error;
 use std::fmt;
 
-use novarocks_protocol::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
+use novarocks_proto::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 
 /// Typed error used by nested native-protobuf leaf decoders before the owning
 /// DTO boundary attaches its exact [`FieldPath`].

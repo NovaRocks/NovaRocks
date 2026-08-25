@@ -25,7 +25,7 @@ use crate::runtime::query_context::QueryId;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
 };
-use novarocks_protocol as proto;
+use novarocks_proto as proto;
 use novarocks_types::SlotId;
 fn ok_common_status() -> proto::common::Status {
     proto::common::Status {
