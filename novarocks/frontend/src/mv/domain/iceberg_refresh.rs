@@ -53,14 +53,13 @@ use crate::mv::domain::model::{MvStorageEngine, MvTarget, RefreshMode};
 use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use crate::mv::domain::persistence::descriptor::{
-    DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV2,
-};
+use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
 use crate::mv::domain::persistence::schema as mv_schema;
 use crate::mv::domain::persistence::schema::{
     APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
     HIDDEN_COLUMNS_PROPERTY,
 };
+use crate::mv::domain::persistence::semantic::{MvDesiredSemantics, MvRefreshDesiredConfiguration};
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 use crate::mv::domain::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::domain::refresh::contract::ImvRefreshContract;
@@ -585,13 +584,51 @@ impl MvEngine for StandaloneMvEngine {
         let mut repository_request = plan.repository_request.clone();
         repository_request.definition.schema_contract = Some(schema_contract.clone());
         repository_request.definition.partition_spec = schema_contract.target.partition.clone();
-        Ok(PreparedMvDefinition { repository_request })
+        let descriptor = MvDescriptorV3::from_desired_semantics(
+            MvDesiredSemantics::new(
+                format!("{}.{}", prepared.target.namespace, prepared.target.table),
+                repository_request.definition.query_definition.clone(),
+                prepared
+                    .analysis
+                    .output_columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect(),
+                descriptor_hidden_columns_for_create(
+                    &prepared.property,
+                    &prepared.canonical_select_query,
+                    &prepared.analysis,
+                    &prepared.refresh_contract,
+                )
+                .map_err(engine_target_error)?,
+                prepared
+                    .dependencies
+                    .iter()
+                    .map(descriptor_dependency_from_request)
+                    .collect(),
+                repository_request.definition.primary_key_columns.clone(),
+                schema_contract,
+                MvRefreshDesiredConfiguration::new(
+                    repository_request.refresh.policy.clone(),
+                    repository_request.refresh.paused,
+                    repository_request.refresh.interval_ms,
+                    repository_request.refresh.max_staleness_ms,
+                )
+                .map_err(engine_target_error)?,
+                prepared.created_at_ms,
+            )
+            .map_err(engine_target_error)?,
+        );
+        Ok(PreparedMvDefinition {
+            repository_request,
+            descriptor,
+        })
     }
 
     fn sync_target_descriptor(
         &self,
-        _target: &CreatedMvTarget,
-        definition: &StoredMvDefinition,
+        target: &CreatedMvTarget,
+        descriptor: &MvDescriptorV3,
     ) -> Result<(), MvEngineError> {
         // Reached from the MV engine trait, which carries no request context.
         // Use the same bounded, non-cancellable context other context-free
@@ -601,13 +638,10 @@ impl MvEngine for StandaloneMvEngine {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))?;
-        sync_iceberg_mv_descriptor_with_ports(
+        persist_iceberg_mv_descriptor_with_ports(
             &self.ports,
-            definition,
-            &definition.refresh_policy,
-            definition.refresh_paused,
-            definition.refresh_interval_ms,
-            None,
+            target,
+            descriptor,
             &connector_context,
         )
         .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
@@ -755,24 +789,6 @@ fn initial_refresh_configuration_for_create(
         interval_ms,
         max_staleness_ms: None,
         next_refresh_after_ms: None,
-    }
-}
-
-fn refresh_policy_descriptor_json_for_create(
-    policy: &crate::mv::domain::application::MvCreateRefreshPolicy,
-) -> serde_json::Value {
-    match policy {
-        crate::mv::domain::application::MvCreateRefreshPolicy::Manual => serde_json::json!({
-            "policy": "DEFERRED_MANUAL", "interval_ms": null, "paused": false,
-        }),
-        crate::mv::domain::application::MvCreateRefreshPolicy::AsyncOnChange => serde_json::json!({
-            "policy": "ASYNC_ON_CHANGE", "interval_ms": null, "paused": false,
-        }),
-        crate::mv::domain::application::MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
-            serde_json::json!({
-                "policy": "ASYNC_INTERVAL", "interval_ms": interval_ms, "paused": false,
-            })
-        }
     }
 }
 
@@ -1005,40 +1021,6 @@ fn prepare_iceberg_mv_create_with_ports(
         &canonical_select_query,
         &analysis,
     )?;
-    let mut descriptor_hidden_columns = Vec::new();
-    if identity_needs_physical_apply_key_column(&property.identity) {
-        descriptor_hidden_columns.push(apply_key_column_name.to_string());
-    }
-    if identity_needs_branch_id_column(&property.identity) {
-        descriptor_hidden_columns.push(BRANCH_ID_COLUMN_NAME.to_string());
-    }
-    descriptor_hidden_columns.extend(aggregate_state_hidden_columns.iter().cloned());
-    let descriptor = MvDescriptorV2 {
-        descriptor_version: MV_DESCRIPTOR_VERSION,
-        package_id: format!("{}.{}", target.namespace, target.table),
-        query_definition: crate::common::persisted_query_definition::PersistedQueryDefinition::new(
-            stmt.select_sql.clone(),
-            crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
-            current_catalog,
-            current_database,
-        )?,
-        visible_columns: analysis
-            .output_columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect(),
-        hidden_columns: descriptor_hidden_columns,
-        base_dependencies: resolved_dependencies
-            .dependencies
-            .iter()
-            .map(descriptor_dependency_from_request)
-            .collect(),
-        schema_contract: None,
-        refresh_contract: Some(refresh_policy_descriptor_json_for_create(
-            &stmt.refresh_policy,
-        )),
-        created_at_ms,
-    };
     let mut target_properties = vec![
         ("format-version".to_string(), "3".to_string()),
         ("write.row-lineage".to_string(), "true".to_string()),
@@ -1061,7 +1043,6 @@ fn prepare_iceberg_mv_create_with_ports(
             aggregate_state_hidden_columns.join(","),
         ));
     }
-    target_properties.extend(descriptor.to_storage_properties()?);
     Ok(IcebergMvCreatePreparation {
         target,
         canonical_select_query,
@@ -1116,11 +1097,17 @@ pub(crate) fn create_iceberg_mv_with_ports(
             ));
         }
     };
-    let definition = match ports
+    if let Err(error) = engine.sync_target_descriptor(&target, &definition.descriptor) {
+        // Descriptor commit status is part of the external authority boundary.
+        // Do not purge the target after a mutation attempt: a commit-unknown
+        // descriptor must remain discoverable rather than being erased.
+        return Err(error.to_string());
+    }
+    match ports
         .repository
         .create(operation_id, definition.repository_request)
     {
-        Ok(definition) => definition,
+        Ok(_) => {}
         Err(error)
             if error.kind()
                 == crate::mv::domain::repository::MvRepositoryErrorKind::CommitUnknown =>
@@ -1128,19 +1115,12 @@ pub(crate) fn create_iceberg_mv_with_ports(
             return Err(error.to_string());
         }
         Err(error) => {
-            return Err(legacy_cleanup_created_target(
-                &engine,
-                &target,
-                format!("create iceberg MV repository metadata failed: {error}"),
+            return Err(known_committed_create_finalize_error(
+                "StateStore accelerator projection",
+                error,
             ));
         }
     };
-    if let Err(error) = engine.sync_target_descriptor(&target, &definition) {
-        return Err(known_committed_create_finalize_error(
-            "descriptor sync",
-            error,
-        ));
-    }
     if let Err(error) = engine.register_target(&target) {
         return Err(known_committed_create_finalize_error(
             "catalog registration",
@@ -1155,6 +1135,59 @@ fn known_committed_create_finalize_error(phase: &str, error: impl std::fmt::Disp
         "Iceberg MV repository create committed but {phase} failed: {error}"
     ))
     .to_bracketed_user_message()
+}
+
+fn persist_iceberg_mv_descriptor_with_ports(
+    ports: &IcebergMvCorePorts,
+    target: &CreatedMvTarget,
+    descriptor: &MvDescriptorV3,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    let catalog =
+        target.target.catalog.as_deref().ok_or_else(|| {
+            "Iceberg MV descriptor persistence requires a target catalog".to_string()
+        })?;
+    let namespace = target.target.database.as_str();
+    let table_name = target.target.name.as_str();
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        ports.connector_control.as_ref(),
+        catalog,
+    )?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        namespace,
+        table_name,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let mutation_lease = exact_lease
+        .derive_mutation_lease()
+        .map_err(|error| error.to_string())?;
+    require_known_committed_target_mutation(
+        crate::connector::mutation::resolve_catalog_mutation_with_lease(
+            &mutation_lease,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
+                table: metadata.identity,
+                changes: descriptor
+                    .to_storage_properties()?
+                    .into_iter()
+                    .map(
+                        |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
+                            key: Arc::from(key),
+                            value: Arc::from(value),
+                        },
+                    )
+                    .collect(),
+                authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
+                expected_committed_partitioning: None,
+            },
+            connector_context.clone(),
+        ),
+        "materialized view descriptor lake commit",
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn legacy_cleanup_created_target(
@@ -1554,6 +1587,27 @@ fn aggregate_state_hidden_columns_from_property(
         .collect())
 }
 
+fn descriptor_hidden_columns_for_create(
+    property: &RefreshFragmentProperty,
+    canonical_query: &ast::Query,
+    analysis: &MvAnalysis,
+    refresh_contract: &ImvRefreshContract,
+) -> Result<Vec<String>, String> {
+    let mut hidden_columns = Vec::new();
+    if identity_needs_physical_apply_key_column(&property.identity) {
+        hidden_columns.push(refresh_contract.apply_key.column_name.to_string());
+    }
+    if identity_needs_branch_id_column(&property.identity) {
+        hidden_columns.push(BRANCH_ID_COLUMN_NAME.to_string());
+    }
+    hidden_columns.extend(aggregate_state_hidden_columns_from_property(
+        property,
+        canonical_query,
+        analysis,
+    )?);
+    Ok(hidden_columns)
+}
+
 /// The aggregate physical layout used for target-schema generation, or `None`
 /// when the property's identity carries no aggregate state (projection/filter,
 /// join, or their UNION ALL).
@@ -1698,22 +1752,10 @@ fn refresh_policy_descriptor_json(
     }
 }
 
-fn stored_refresh_policy_descriptor_json(
-    policy: &StoredMvRefreshPolicy,
-    paused: bool,
-    interval_ms: Option<i64>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "policy": policy.as_sql_str(),
-        "interval_ms": interval_ms,
-        "paused": paused,
-    })
-}
-
 /// Read-modify-write the Iceberg MV target table's descriptor properties:
-/// observe the descriptor from one exact connector generation, overwrite `refresh_contract` from the given
-/// refresh-policy inputs, carry `definition.schema_contract` (if present)
-/// into the descriptor's `schema_contract` field, and write the descriptor
+/// observe the descriptor from one exact connector generation, replace its
+/// typed refresh desired configuration, require the persisted schema contract,
+/// and write the descriptor
 /// back through a mutation lease derived from the same generation. Repartition
 /// projection supplies the raw provider-committed partitioning as an atomic
 /// property-mutation guard; ordinary CREATE/ALTER policy sync passes `None`.
@@ -1767,16 +1809,15 @@ pub fn sync_iceberg_mv_descriptor_with_ports(
             )
         })?;
     let mut descriptor = package.descriptor;
-    descriptor.refresh_contract = Some(stored_refresh_policy_descriptor_json(
-        refresh_policy,
+    descriptor.refresh = MvRefreshDesiredConfiguration::new(
+        refresh_policy.clone(),
         refresh_paused,
         refresh_interval_ms,
-    ));
-    // W2: the descriptor is the authoritative home for the schema contract.
-    // Carry the definition's contract into the descriptor whenever we sync.
-    if let Some(contract) = &definition.schema_contract {
-        descriptor.set_schema_contract(contract)?;
-    }
+        definition.max_staleness_ms,
+    )?;
+    descriptor.schema_contract = definition.schema_contract.clone().ok_or_else(|| {
+        "Iceberg MV descriptor sync requires a persisted schema contract".to_string()
+    })?;
     let descriptor_properties = descriptor.to_storage_properties()?;
     // The MV descriptor lives in the target's engine-owned property namespace.
     // Writing it is a catalog property mutation, not a reason for the MV path to

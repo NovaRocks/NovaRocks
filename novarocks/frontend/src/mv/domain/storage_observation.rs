@@ -42,7 +42,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
-use crate::mv::domain::persistence::{descriptor::MvDescriptorV2, schema::MvPartitionContract};
+use crate::mv::domain::persistence::{descriptor::MvDescriptorV3, schema::MvPartitionContract};
 
 const MAX_MV_SCHEMA_VALIDATION_FIELDS: usize = 4_096;
 const MAX_MV_SCHEMA_VALIDATION_PARTITION_FIELDS: usize = 4_096;
@@ -400,26 +400,126 @@ pub(crate) enum MvSchemaValidationPartitionTransform {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvLakePackageObservation {
     pub table: ConnectorTableIdentity,
-    pub descriptor: MvDescriptorV2,
+    pub descriptor: MvDescriptorV3,
+    pub current_target_snapshot: Option<MvLakeTargetSnapshot>,
     pub publication: MvLakePublication,
+}
+
+/// Exact current target revision observed with the package descriptor and
+/// publication provenance. It is not itself a refresh watermark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MvLakeTargetSnapshot {
+    pub snapshot_id: i64,
+    pub timestamp_ms: i64,
+}
+
+/// Immutable identity of the observed lake authority used to reject a
+/// destructive equivalence comparison across two target revisions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MvLakeSourceRevision {
+    pub table: ConnectorTableIdentity,
+    pub descriptor_content_hash: String,
+    pub current_target_snapshot_id: Option<i64>,
+}
+
+/// Complete accelerator watermark projection derived from one validated lake
+/// package. Never-published packages deliberately do not invent a waterline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MvLakePublishedProjection {
+    NeverPublished,
+    Published {
+        last_refresh_ms: i64,
+        last_refresh_rows: i64,
+        last_refreshed_iceberg_snapshot_id: i64,
+        base_snapshots: BTreeMap<String, i64>,
+        base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+    },
 }
 
 impl MvLakePackageObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
-        descriptor: MvDescriptorV2,
+        descriptor: MvDescriptorV3,
+        current_target_snapshot: Option<MvLakeTargetSnapshot>,
         publication: MvLakePublication,
     ) -> Result<Self, ConnectorError> {
         validate_table_identity(&table, "MV lake package")?;
         validate_descriptor(&descriptor)?;
+        if let Some(snapshot) = current_target_snapshot
+            && (snapshot.snapshot_id < 0 || snapshot.timestamp_ms < 0)
+        {
+            return corrupt("MV lake package has a negative current target snapshot value");
+        }
         if let MvLakePublication::Published(facts) = &publication {
             facts.validate()?;
+            let snapshot = current_target_snapshot.ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "published MV lake package is missing its current target snapshot",
+                )
+            })?;
+            if snapshot.snapshot_id != facts.target_snapshot_id {
+                return corrupt(format!(
+                    "published MV lake package target snapshot mismatch: current {}, provenance {}",
+                    snapshot.snapshot_id, facts.target_snapshot_id
+                ));
+            }
         }
         Ok(Self {
             table,
             descriptor,
+            current_target_snapshot,
             publication,
         })
+    }
+
+    pub fn source_revision(&self) -> Result<MvLakeSourceRevision, ConnectorError> {
+        Ok(MvLakeSourceRevision {
+            table: self.table.clone(),
+            descriptor_content_hash: self.descriptor.content_hash().map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!("hash MV lake descriptor for source revision: {error}"),
+                )
+            })?,
+            current_target_snapshot_id: self
+                .current_target_snapshot
+                .map(|snapshot| snapshot.snapshot_id),
+        })
+    }
+
+    pub fn published_projection(&self) -> Result<MvLakePublishedProjection, ConnectorError> {
+        match &self.publication {
+            MvLakePublication::NeverPublished => Ok(MvLakePublishedProjection::NeverPublished),
+            MvLakePublication::Published(facts) => {
+                let current_target_snapshot = self.current_target_snapshot.ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "published MV lake package is missing its current target snapshot",
+                    )
+                })?;
+                if current_target_snapshot.snapshot_id != facts.target_snapshot_id {
+                    return corrupt(
+                        "published MV lake package target snapshot changed after validation",
+                    );
+                }
+                Ok(MvLakePublishedProjection::Published {
+                    last_refresh_ms: current_target_snapshot.timestamp_ms,
+                    last_refresh_rows: facts.rows,
+                    last_refreshed_iceberg_snapshot_id: facts.target_snapshot_id,
+                    base_snapshots: facts
+                        .bases
+                        .iter()
+                        .map(|base| (base.table_fqn.clone(), base.to_snapshot))
+                        .collect(),
+                    base_table_object_ids: facts
+                        .bases
+                        .iter()
+                        .map(|base| (base.table_fqn.clone(), base.object_id.clone()))
+                        .collect(),
+                })
+            }
+        }
     }
 }
 
@@ -1017,22 +1117,39 @@ fn lake_package_from_spi(
     observation: SpiLakePackageObservation,
 ) -> Result<MvLakePackageObservation, ConnectorError> {
     let descriptor_projection = observation.descriptor();
-    let mut properties = HashMap::from([(
-        crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP.to_string(),
-        descriptor_projection.inline_descriptor().to_string(),
-    )]);
-    if let Some(content_hash) = descriptor_projection.content_hash() {
-        properties.insert(
+    let content_hash = descriptor_projection.content_hash().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "MV lake descriptor projection is missing its required content hash",
+        )
+    })?;
+    let properties = HashMap::from([
+        (
+            crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP.to_string(),
+            descriptor_projection.package_id().to_string(),
+        ),
+        (
             crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP.to_string(),
             content_hash.to_string(),
-        );
-    }
-    let descriptor = MvDescriptorV2::from_storage_properties(&properties).map_err(|error| {
+        ),
+        (
+            crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP.to_string(),
+            descriptor_projection.inline_descriptor().to_string(),
+        ),
+    ]);
+    let descriptor = MvDescriptorV3::from_storage_properties(&properties).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             format!("decode MV storage descriptor: {error}"),
         )
     })?;
+    let current_target_snapshot =
+        observation
+            .current_target_snapshot()
+            .map(|snapshot| MvLakeTargetSnapshot {
+                snapshot_id: snapshot.snapshot_id(),
+                timestamp_ms: snapshot.timestamp_ms(),
+            });
     let publication = match observation.publication() {
         SpiLakePublicationObservation::NeverPublished => MvLakePublication::NeverPublished,
         SpiLakePublicationObservation::Published(facts) => {
@@ -1068,7 +1185,12 @@ fn lake_package_from_spi(
             )?)
         }
     };
-    MvLakePackageObservation::try_new(observation.table().clone(), descriptor, publication)
+    MvLakePackageObservation::try_new(
+        observation.table().clone(),
+        descriptor,
+        current_target_snapshot,
+        publication,
+    )
 }
 
 fn refresh_base_from_spi(
@@ -1418,12 +1540,12 @@ fn validate_table_identity(
     Ok(())
 }
 
-fn validate_descriptor(descriptor: &MvDescriptorV2) -> Result<(), ConnectorError> {
+fn validate_descriptor(descriptor: &MvDescriptorV3) -> Result<(), ConnectorError> {
     require_non_empty(&descriptor.package_id, "MV descriptor package ID")?;
-    descriptor.query_definition.validate().map_err(|error| {
+    descriptor.desired_semantics().map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
-            format!("invalid MV descriptor query definition: {error}"),
+            format!("invalid MV descriptor desired semantics: {error}"),
         )
     })?;
     descriptor
@@ -1612,21 +1734,29 @@ mod tests {
         MvLakeDescriptorProjection as SpiLakeDescriptorProjection,
         MvLakePackageObservation as SpiLakePackageObservation,
         MvLakePublicationObservation as SpiLakePublicationObservation,
+        MvLakeTargetSnapshotObservation as SpiLakeTargetSnapshotObservation,
         MvObservedField as SpiObservedField, MvObservedPartitionField as SpiObservedPartitionField,
         MvObservedPartitionSpec as SpiObservedPartitionSpec,
         MvObservedPartitionTransform as SpiObservedPartitionTransform,
     };
 
     use super::{
-        BTreeMap, MvLakePackageObservation, MvLakePublication, MvMaintenanceMetadataObservation,
-        MvObservedMaintenancePolicy, MvObservedSnapshot, MvObservedTargetField,
-        MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
-        MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
-        MvTargetCreationObservation,
+        BTreeMap, MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
+        MvLakeTargetSnapshot, MvMaintenanceMetadataObservation, MvObservedMaintenancePolicy,
+        MvObservedSnapshot, MvObservedTargetField, MvPublishedBaseFact, MvPublishedLakeFacts,
+        MvPublishedRefreshTechnique, MvRefreshBaseObservation, MvRefreshTargetObservation,
+        MvSchemaValidationObservation, MvTargetCreationObservation,
     };
     use crate::mv::domain::persistence::{
-        descriptor::MvDescriptorV2,
-        schema::{MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract},
+        definition::StoredMvRefreshPolicy,
+        descriptor::{DescriptorDependency, MvDescriptorV3},
+        schema::{
+            BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+            HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+            MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
+            TargetContract, TargetVisibleColumn,
+        },
+        semantic::{MvDesiredSemantics, MvRefreshDesiredConfiguration},
     };
 
     fn table() -> ConnectorTableIdentity {
@@ -1641,11 +1771,10 @@ mod tests {
         ConnectorTableObjectId::try_new(Bytes::from_static(bytes)).expect("bounded object ID")
     }
 
-    fn descriptor() -> MvDescriptorV2 {
-        MvDescriptorV2 {
-            descriptor_version: 2,
-            package_id: "package-1".to_string(),
-            query_definition:
+    fn descriptor() -> MvDescriptorV3 {
+        MvDescriptorV3::from_desired_semantics(
+            MvDesiredSemantics::new(
+                "package-1".to_string(),
                 crate::common::persisted_query_definition::PersistedQueryDefinition::new(
                     "select 1",
                     crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
@@ -1653,13 +1782,75 @@ mod tests {
                     "db",
                 )
                 .unwrap(),
-            visible_columns: vec!["c1".to_string()],
-            hidden_columns: vec![],
-            base_dependencies: vec![],
-            schema_contract: None,
-            refresh_contract: None,
-            created_at_ms: 1,
-        }
+                vec!["c1".to_string()],
+                vec![],
+                vec![DescriptorDependency {
+                    catalog: "iceberg".to_string(),
+                    namespace: "db".to_string(),
+                    name: "base".to_string(),
+                    object_type: "table".to_string(),
+                    storage_engine: "iceberg".to_string(),
+                }],
+                vec![],
+                MvSchemaContract {
+                    contract_version: 1,
+                    base: BaseContract {
+                        table_fqn: "iceberg.db.base".to_string(),
+                        table_object_id: object_id(b"base-object"),
+                        alias_at_create: None,
+                        schema_id_at_create: 0,
+                        schema_at_create: BaseSchemaSnapshot {
+                            fields: vec![BaseFieldRecord {
+                                field_id: 1,
+                                name_at_create: "c1".to_string(),
+                                type_signature: "int".to_string(),
+                                required: true,
+                            }],
+                        },
+                    },
+                    bases: vec![],
+                    output: OutputContract {
+                        columns: vec![OutputColumnLineage {
+                            expression: ExpressionLineage {
+                                kind: ExpressionKind::Column,
+                                referenced_base_field_ids: vec![1],
+                                referenced_base_fields: vec![],
+                            },
+                        }],
+                        filter: None,
+                    },
+                    join: None,
+                    aggregate: None,
+                    branch: None,
+                    target: TargetContract {
+                        table_fqn: "iceberg.db.mv_target".to_string(),
+                        table_uuid: "target-uuid".to_string(),
+                        schema_id_at_create: 0,
+                        visible_columns: vec![TargetVisibleColumn {
+                            output_name: "c1".to_string(),
+                            target_field_id: 1,
+                            type_signature: "int".to_string(),
+                            nullable: false,
+                        }],
+                        hidden_apply_key: HiddenApplyKeyContract {
+                            column_name: "__nova_base_row_id".to_string(),
+                            target_field_id: 2,
+                            source: novarocks_sql::planning::mv::ApplyKeySource::BaseRowId,
+                        },
+                        partition: None,
+                    },
+                },
+                MvRefreshDesiredConfiguration::new(
+                    StoredMvRefreshPolicy::Manual,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap(),
+        )
     }
 
     fn target_fields() -> Vec<MvObservedTargetField> {
@@ -1889,6 +2080,7 @@ mod tests {
         let observed = MvLakePackageObservation::try_new(
             table(),
             descriptor(),
+            None,
             MvLakePublication::NeverPublished,
         )
         .unwrap();
@@ -1897,16 +2089,73 @@ mod tests {
         let observed = MvLakePackageObservation::try_new(
             table(),
             descriptor(),
+            Some(MvLakeTargetSnapshot {
+                snapshot_id: 10,
+                timestamp_ms: 1_700_000_010_000,
+            }),
             MvLakePublication::Published(published_facts()),
         )
         .unwrap();
         assert_eq!(observed.table.table.as_ref(), "mv_target");
+        assert_eq!(
+            observed
+                .source_revision()
+                .unwrap()
+                .current_target_snapshot_id,
+            Some(10)
+        );
+        assert_eq!(
+            observed.published_projection().unwrap(),
+            MvLakePublishedProjection::Published {
+                last_refresh_ms: 1_700_000_010_000,
+                last_refresh_rows: 1,
+                last_refreshed_iceberg_snapshot_id: 10,
+                base_snapshots: BTreeMap::from([("iceberg.db.base".to_string(), 9)]),
+                base_table_object_ids: BTreeMap::from([(
+                    "iceberg.db.base".to_string(),
+                    object_id(b"base-object"),
+                )]),
+            }
+        );
+
+        let missing_current = MvLakePackageObservation::try_new(
+            table(),
+            descriptor(),
+            None,
+            MvLakePublication::Published(published_facts()),
+        )
+        .unwrap_err();
+        assert!(
+            missing_current
+                .to_string()
+                .contains("missing its current target snapshot")
+        );
+
+        let mismatched_current = MvLakePackageObservation::try_new(
+            table(),
+            descriptor(),
+            Some(MvLakeTargetSnapshot {
+                snapshot_id: 9,
+                timestamp_ms: 1_700_000_009_000,
+            }),
+            MvLakePublication::Published(published_facts()),
+        )
+        .unwrap_err();
+        assert!(
+            mismatched_current
+                .to_string()
+                .contains("target snapshot mismatch")
+        );
 
         let mut invalid = descriptor();
         invalid.package_id.clear();
-        let err =
-            MvLakePackageObservation::try_new(table(), invalid, MvLakePublication::NeverPublished)
-                .unwrap_err();
+        let err = MvLakePackageObservation::try_new(
+            table(),
+            invalid,
+            None,
+            MvLakePublication::NeverPublished,
+        )
+        .unwrap_err();
         assert_eq!(
             err.kind(),
             novarocks_spi::connector::ConnectorErrorKind::CorruptData
@@ -1940,6 +2189,10 @@ mod tests {
         let observed = SpiLakePackageObservation::try_new(
             table(),
             projection,
+            Some(
+                SpiLakeTargetSnapshotObservation::try_new(10, 1_700_000_010_000)
+                    .expect("valid target snapshot"),
+            ),
             SpiLakePublicationObservation::NeverPublished,
         )
         .unwrap();
@@ -1951,6 +2204,13 @@ mod tests {
             converted.publication,
             MvLakePublication::NeverPublished
         ));
+        assert_eq!(
+            converted.current_target_snapshot,
+            Some(MvLakeTargetSnapshot {
+                snapshot_id: 10,
+                timestamp_ms: 1_700_000_010_000,
+            })
+        );
     }
 
     #[test]

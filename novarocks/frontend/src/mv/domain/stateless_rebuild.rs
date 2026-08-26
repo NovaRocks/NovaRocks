@@ -54,8 +54,11 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
 use crate::mv::domain::repository::MvRepository;
-use crate::mv::domain::storage_observation::{MvLakePackageObservation, MvLakePublication};
+use crate::mv::domain::storage_observation::{
+    MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
+};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
@@ -119,6 +122,47 @@ pub(crate) struct ImvStatelessRebuildRequest {
     pub namespace: String,
     pub mv: String,
     pub required_level: StatelessLevel,
+}
+
+/// Test-only semantic projection compared across an accelerator wipe. It
+/// deliberately omits StateStore identity, runtime attempt fields, record
+/// versions and next-run bookkeeping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MvRebuildEquivalenceSnapshot {
+    query_definition: crate::common::persisted_query_definition::PersistedQueryDefinition,
+    base_table_refs: Vec<String>,
+    primary_key_columns: Vec<String>,
+    schema_contract: crate::mv::domain::persistence::schema::MvSchemaContract,
+    partition_spec: Option<crate::mv::domain::persistence::schema::MvPartitionContract>,
+    refresh: MvRefreshDesiredConfiguration,
+    created_at_ms: i64,
+    publication: MvLakePublishedProjection,
+}
+
+fn equivalence_snapshot(
+    definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+    package: &MvLakePackageObservation,
+) -> Result<MvRebuildEquivalenceSnapshot, String> {
+    let schema_contract = definition.schema_contract.clone().ok_or_else(|| {
+        "stateless rebuild equivalence requires a rebuilt MV schema contract".to_string()
+    })?;
+    Ok(MvRebuildEquivalenceSnapshot {
+        query_definition: definition.query_definition.clone(),
+        base_table_refs: definition.base_table_refs.clone(),
+        primary_key_columns: definition.primary_key_columns.clone(),
+        partition_spec: definition.partition_spec.clone(),
+        schema_contract,
+        refresh: MvRefreshDesiredConfiguration::new(
+            definition.refresh_policy.clone(),
+            definition.refresh_paused,
+            definition.refresh_interval_ms,
+            definition.max_staleness_ms,
+        )?,
+        created_at_ms: definition.created_at_ms,
+        publication: package
+            .published_projection()
+            .map_err(|error| format!("project lake publication for equivalence: {error}"))?,
+    })
 }
 
 impl ImvStatelessRebuildRequest {
@@ -265,7 +309,7 @@ fn execute_request_with_context(
         mv_storage_observation,
         &exact_lease,
         &loaded_table,
-        connector_context,
+        connector_context.clone(),
     )
     .map_err(|error| format!("observe stateless rebuild lake package: {error}"))?
     .ok_or_else(|| {
@@ -287,7 +331,33 @@ fn execute_request_with_context(
     // behind the test-only env flag (checked by the caller) and runs only when
     // the requested level is `full`.
     if req.required_level == StatelessLevel::Full {
+        let source_revision = package
+            .source_revision()
+            .map_err(|error| format!("derive stateless rebuild source revision: {error}"))?;
         clear_sqlite_and_rebuild_from_lake(mv_repository, &package)?;
+        let reloaded_table = crate::connector::metadata_load_connector_table_with_planning_lease(
+            &exact_lease,
+            connector_context.clone(),
+            &table.namespace,
+            &table.table,
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+        )
+        .map_err(|error| format!("reload stateless rebuild table metadata: {error}"))?;
+        let reobserved = crate::mv::domain::storage_observation::observe_lake_package(
+            mv_storage_observation,
+            &exact_lease,
+            &reloaded_table,
+            connector_context,
+        )
+        .map_err(|error| format!("reobserve stateless rebuild lake package: {error}"))?
+        .ok_or_else(|| "stateless rebuild source changed: lake package disappeared".to_string())?;
+        if reobserved
+            .source_revision()
+            .map_err(|error| format!("derive reobserved source revision: {error}"))?
+            != source_revision
+        {
+            return Err("stateless rebuild source changed during accelerator wipe".to_string());
+        }
         // The descriptor/provenance hashes are functions of the lake package,
         // which the round-trip left untouched, so they are identical to the
         // pre-rebuild values computed above. Reporting them from here documents
@@ -340,7 +410,7 @@ fn clear_sqlite_and_rebuild_from_lake(
     let existing = mv_repository
         .find_by_target(&target)
         .map_err(|e| format!("look up MV definition before full rebuild failed: {e}"))?;
-    if existing.is_none() {
+    let Some(existing) = existing else {
         return Err(format!(
             "{PROCEDURE_NAME} full level: MV '{}.{}' has no repository definition to clear (target {}.{}.{}); cannot prove a clear+rebuild round-trip",
             package.table.namespace,
@@ -349,12 +419,15 @@ fn clear_sqlite_and_rebuild_from_lake(
             package.table.namespace,
             package.table.table
         ));
-    }
+    };
+    let before = equivalence_snapshot(&existing, package)?;
 
-    // 2. Clear the SQLite records for this MV target. The lake MV table is
-    //    left untouched — exactly the "SQLite forgot, lake remembers" state.
+    // 2. Clear only rebuildable accelerator records. Historical refresh
+    // records remain intact, and the repository rejects an active refresh.
+    // The lake MV table is untouched — exactly the "SQLite forgot, lake
+    // remembers" state.
     let dropped = mv_repository
-        .drop_by_target(&target)
+        .wipe_rebuildable_projection_by_target(&target)
         .map_err(|e| format!("clear MV repository definition for full rebuild failed: {e}"))?;
     if !dropped {
         return Err(format!(
@@ -376,12 +449,18 @@ fn clear_sqlite_and_rebuild_from_lake(
     let rebuilt = mv_repository
         .find_by_target(&target)
         .map_err(|e| format!("verify MV definition after full rebuild failed: {e}"))?;
-    if rebuilt.is_none() {
+    let Some(rebuilt) = rebuilt else {
         return Err(format!(
             "{PROCEDURE_NAME} full level: MV repository definition for target {}.{}.{} did not reappear after lake rebuild; statelessness not proven",
             package.table.instance_id.as_str(),
             package.table.namespace,
             package.table.table
+        ));
+    };
+    let after = equivalence_snapshot(&rebuilt, package)?;
+    if before != after {
+        return Err(format!(
+            "{PROCEDURE_NAME} full level: rebuilt accelerator semantics differ from the pre-wipe projection"
         ));
     }
 

@@ -45,11 +45,10 @@ use crate::mv::domain::repository::{
     CreateMvRepositoryWithIdRequest, FinalizeMvRefreshWithPartitionsRequest,
     FinalizeRecoveredMvRefreshRequest, MvRepository, MvRepositoryAvailability, MvRepositoryError,
     MvRepositoryErrorKind, MvTarget, MvTargetLookup, RebuildMvRepositoryRequest,
-    RecordExternalCommitAndFinalizeRequest, RecordFrontendMvRecoveryCleanupOutcomeRequest,
-    RecordFrontendMvRecoveryObservationRequest,
+    RebuiltMvPublicationProjection, RecordExternalCommitAndFinalizeRequest,
+    RecordFrontendMvRecoveryCleanupOutcomeRequest, RecordFrontendMvRecoveryObservationRequest,
 };
 use crate::state_store::metrics::StateStoreMetrics;
-use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, WriteTransaction,
 };
@@ -513,7 +512,7 @@ impl StateStoreMvRepository {
         operation_id: Uuid,
         request: CreateMvRepositoryRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        self.create_with_optional_id_async(operation_id, None, request)
+        self.create_with_optional_id_async(operation_id, None, request, None)
             .await
     }
 
@@ -522,12 +521,17 @@ impl StateStoreMvRepository {
         operation_id: Uuid,
         explicit_id: Option<i64>,
         request: CreateMvRepositoryRequest,
+        rebuilt_publication: Option<RebuiltMvPublicationProjection>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         validate_create_request(&request)?;
+        if let Some(publication) = &rebuilt_publication {
+            validate_rebuilt_publication(publication)?;
+        }
         prevalidate_create_operation(operation_id, explicit_id, &request)?;
         let attachment_observations =
             self.capture_catalog_attachment_observations(catalog_references_for_create(&request))?;
         let recovery_request = request.clone();
+        let recovery_publication = rebuilt_publication.clone();
         let store = Arc::clone(&self.store);
         let metrics = &self.runner_metrics;
         let outcome =
@@ -538,6 +542,7 @@ impl StateStoreMvRepository {
                 "create materialized view",
                 move |transaction| {
                     let request = request.clone();
+                    let rebuilt_publication = rebuilt_publication.clone();
                     let attachment_observations = attachment_observations.clone();
                     Box::pin(async move {
                         assert_attachment_versions(transaction, &attachment_observations).await?;
@@ -570,7 +575,11 @@ impl StateStoreMvRepository {
                         if transaction.get(&definition_key).await?.is_some() {
                             return Err(conflict_state_store("mv definition already exists"));
                         }
-                        let definition = definition_from_request(mv_id, &request);
+                        let mut definition = definition_from_request(mv_id, &request);
+                        if let Some(publication) = &rebuilt_publication {
+                            apply_rebuilt_publication(&mut definition, publication)
+                                .map_err(|error| invalid_state_store(error.message()))?;
+                        }
                         let sequence_value = encode_record(
                             MvRecordKind::Sequence,
                             operation_id,
@@ -643,7 +652,12 @@ impl StateStoreMvRepository {
                 );
                 match operation::resolve_commit(self.store.as_ref(), &transaction_id).await? {
                     novarocks_spi::state_store::CommitResolution::Committed(_) => self
-                        .recover_create(operation_id, &recovery_request, original)
+                        .recover_create(
+                            operation_id,
+                            &recovery_request,
+                            recovery_publication.as_ref(),
+                            original,
+                        )
                         .await
                         .map_err(|recovery| {
                             if recovery.kind() == MvRepositoryErrorKind::CommitUnknown {
@@ -659,12 +673,18 @@ impl StateStoreMvRepository {
                             operation_id,
                             explicit_id,
                             recovery_request,
+                            recovery_publication,
                         ))
                         .await
                     }
                     novarocks_spi::state_store::CommitResolution::Unresolved => {
-                        self.recover_create(operation_id, &recovery_request, original)
-                            .await
+                        self.recover_create(
+                            operation_id,
+                            &recovery_request,
+                            recovery_publication.as_ref(),
+                            original,
+                        )
+                        .await
                     }
                 }
             }
@@ -676,6 +696,7 @@ impl StateStoreMvRepository {
         &self,
         operation_id: Uuid,
         request: &CreateMvRepositoryRequest,
+        rebuilt_publication: Option<&RebuiltMvPublicationProjection>,
         original: MvRepositoryError,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         // A durable, exact operation-ID match is authoritative even if the provider
@@ -688,7 +709,10 @@ impl StateStoreMvRepository {
             let matches_definition = decode_definition(&key, &record.value)
                 .map(|decoded| decoded.operation_id == operation_id)
                 .unwrap_or(false)
-                && definition_matches_request(&definition, request);
+                && definition_matches_request(&definition, request)
+                && rebuilt_publication.is_none_or(|publication| {
+                    definition_matches_rebuilt_publication(&definition, publication)
+                });
             if !matches_definition {
                 continue;
             }
@@ -1021,7 +1045,11 @@ impl StateStoreMvRepository {
         self.replace_dependencies_async(mv_id, Vec::new()).await
     }
 
-    async fn drop_by_id_async(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
+    async fn drop_by_id_async(
+        &self,
+        mv_id: i64,
+        preserve_refresh_records: bool,
+    ) -> Result<bool, MvRepositoryError> {
         if mv_id <= 0 {
             return Err(invalid("mv definition id must be positive"));
         }
@@ -1042,17 +1070,20 @@ impl StateStoreMvRepository {
                 .ok_or_else(|| corruption("MV dependency index is asymmetric before MV drop"))?;
             existing_dependencies.push((downstream, upstream));
         }
-        let existing_refreshes = self
-            .scan_prefix(refresh_prefix().map_err(corruption)?)
-            .await?
-            .into_iter()
-            .filter_map(|record| {
-                decode_record::<StoredMvRefresh>(&record.key, &record.value)
-                    .map(|refresh| (refresh.value.mv_id == mv_id).then_some(record))
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(corruption)?;
+        let existing_refreshes = if preserve_refresh_records {
+            Vec::new()
+        } else {
+            self.scan_prefix(refresh_prefix().map_err(corruption)?)
+                .await?
+                .into_iter()
+                .filter_map(|record| {
+                    decode_record::<StoredMvRefresh>(&record.key, &record.value)
+                        .map(|refresh| (refresh.value.mv_id == mv_id).then_some(record))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(corruption)?
+        };
         let store = Arc::clone(&self.store);
         operation::run(
             store.as_ref(),
@@ -1186,53 +1217,6 @@ impl StateStoreMvRepository {
                     )
                     .await?;
                     delete_partition_states_transaction(transaction, &existing_partitions).await?;
-                    Ok(definition)
-                })
-            },
-        )
-        .await
-    }
-
-    async fn initialize_rebuilt_refresh_watermark_async(
-        &self,
-        mv_id: i64,
-        base_snapshots: BTreeMap<String, i64>,
-        base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        self.require_definition_async(mv_id).await?;
-        let operation_id = Uuid::now_v7();
-        let store = Arc::clone(&self.store);
-        // Deliberately unfenced: see the port's contract. This only ever fills
-        // an absent watermark, so it cannot roll a refresh back, and it has to
-        // work during startup restore where no refresh owner exists yet.
-        operation::run(
-            store.as_ref(),
-            &self.runner_metrics,
-            operation_id,
-            "initialize rebuilt MV refresh watermark",
-            move |transaction| {
-                let base_snapshots = base_snapshots.clone();
-                let base_table_object_ids = base_table_object_ids.clone();
-                Box::pin(async move {
-                    let (record, mut definition) =
-                        load_definition_transaction(transaction, mv_id).await?;
-                    if !definition.last_refresh_snapshots.is_empty()
-                        || !definition.last_refresh_table_object_ids.is_empty()
-                    {
-                        // A refresh, or a racing rebuild, already established a
-                        // watermark. Lake truth is the weaker fact of the two, so
-                        // leave what is there.
-                        return Ok(definition);
-                    }
-                    definition.last_refresh_snapshots = base_snapshots;
-                    definition.last_refresh_table_object_ids = base_table_object_ids;
-                    put_definition_transaction(
-                        transaction,
-                        operation_id,
-                        &definition,
-                        Precondition::Version(record.version),
-                    )
-                    .await?;
                     Ok(definition)
                 })
             },
@@ -2818,6 +2802,7 @@ impl MvRepository for StateStoreMvRepository {
             operation_id,
             Some(request.mv_id),
             request.create,
+            None,
         ))
     }
     fn rebuild(
@@ -2825,7 +2810,12 @@ impl MvRepository for StateStoreMvRepository {
         operation_id: Uuid,
         request: RebuildMvRepositoryRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        self.blocking(self.create_async(operation_id, request.create))
+        self.blocking(self.create_with_optional_id_async(
+            operation_id,
+            None,
+            request.create,
+            Some(request.publication),
+        ))
     }
     fn reserve_definition_id(&self, mv_id: i64) -> Result<(), MvRepositoryError> {
         self.blocking(self.reserve_definition_id_async(mv_id))
@@ -2843,11 +2833,20 @@ impl MvRepository for StateStoreMvRepository {
         self.blocking(self.list_definitions_async())
     }
     fn drop_by_id(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
-        self.blocking(self.drop_by_id_async(mv_id))
+        self.blocking(self.drop_by_id_async(mv_id, false))
     }
     fn drop_by_target(&self, target: &MvTarget) -> Result<bool, MvRepositoryError> {
         match self.find_by_target(target)? {
             Some(definition) => self.drop_by_id(definition.mv_id),
+            None => Ok(false),
+        }
+    }
+    fn wipe_rebuildable_projection_by_target(
+        &self,
+        target: &MvTarget,
+    ) -> Result<bool, MvRepositoryError> {
+        match self.find_by_target(target)? {
+            Some(definition) => self.blocking(self.drop_by_id_async(definition.mv_id, true)),
             None => Ok(false),
         }
     }
@@ -2901,18 +2900,6 @@ impl MvRepository for StateStoreMvRepository {
         upstream: &MvDependencyObjectRef,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
         self.blocking(self.list_dependencies_upstream_async(upstream))
-    }
-    fn initialize_rebuilt_refresh_watermark(
-        &self,
-        mv_id: i64,
-        base_snapshots: BTreeMap<String, i64>,
-        base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        self.blocking(self.initialize_rebuilt_refresh_watermark_async(
-            mv_id,
-            base_snapshots,
-            base_table_object_ids,
-        ))
     }
     fn update_refresh_metadata(
         &self,
@@ -3166,6 +3153,82 @@ fn definition_matches_request(
         && definition.refresh_interval_ms == request.refresh.interval_ms
         && definition.max_staleness_ms == request.refresh.max_staleness_ms
         && definition.next_refresh_after_ms == request.refresh.next_refresh_after_ms
+}
+
+fn validate_rebuilt_publication(
+    publication: &RebuiltMvPublicationProjection,
+) -> Result<(), MvRepositoryError> {
+    if let RebuiltMvPublicationProjection::Published(waterline) = publication {
+        if waterline.last_refreshed_iceberg_snapshot_id < 0 || waterline.last_refresh_ms < 0 {
+            return Err(invalid(
+                "rebuilt MV published waterline contains a negative target snapshot value",
+            ));
+        }
+        if waterline.last_refresh_rows < 0 {
+            return Err(invalid(
+                "rebuilt MV published waterline contains a negative row count",
+            ));
+        }
+        if waterline.base_snapshots.len() != waterline.base_table_object_ids.len()
+            || waterline
+                .base_snapshots
+                .keys()
+                .any(|key| !waterline.base_table_object_ids.contains_key(key))
+        {
+            return Err(invalid(
+                "rebuilt MV published waterline has inconsistent base snapshot identities",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_rebuilt_publication(
+    definition: &mut StoredMvDefinition,
+    publication: &RebuiltMvPublicationProjection,
+) -> Result<(), MvRepositoryError> {
+    validate_rebuilt_publication(publication)?;
+    match publication {
+        RebuiltMvPublicationProjection::NeverPublished => {
+            definition.last_refresh_ms = None;
+            definition.last_refresh_rows = None;
+            definition.last_refresh_snapshots.clear();
+            definition.last_refresh_table_object_ids.clear();
+            definition.last_refreshed_iceberg_snapshot_id = None;
+        }
+        RebuiltMvPublicationProjection::Published(waterline) => {
+            definition.last_refresh_ms = Some(waterline.last_refresh_ms);
+            definition.last_refresh_rows = Some(waterline.last_refresh_rows);
+            definition.last_refresh_snapshots = waterline.base_snapshots.clone();
+            definition.last_refresh_table_object_ids = waterline.base_table_object_ids.clone();
+            definition.last_refreshed_iceberg_snapshot_id =
+                Some(waterline.last_refreshed_iceberg_snapshot_id);
+        }
+    }
+    Ok(())
+}
+
+fn definition_matches_rebuilt_publication(
+    definition: &StoredMvDefinition,
+    publication: &RebuiltMvPublicationProjection,
+) -> bool {
+    match publication {
+        RebuiltMvPublicationProjection::NeverPublished => {
+            definition.last_refresh_ms.is_none()
+                && definition.last_refresh_rows.is_none()
+                && definition.last_refresh_snapshots.is_empty()
+                && definition.last_refresh_table_object_ids.is_empty()
+                && definition.last_refreshed_iceberg_snapshot_id.is_none()
+        }
+        RebuiltMvPublicationProjection::Published(waterline) => {
+            definition.last_refresh_ms == Some(waterline.last_refresh_ms)
+                && definition.last_refresh_rows == Some(waterline.last_refresh_rows)
+                && definition.last_refresh_snapshots == waterline.base_snapshots
+                && definition.last_refresh_table_object_ids == waterline.base_table_object_ids
+                && definition.last_refreshed_iceberg_snapshot_id
+                    == Some(waterline.last_refreshed_iceberg_snapshot_id)
+        }
+    }
 }
 
 fn validate_create_request(request: &CreateMvRepositoryRequest) -> Result<(), MvRepositoryError> {

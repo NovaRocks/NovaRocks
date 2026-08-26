@@ -41,7 +41,7 @@ use super::repository::{
     CreateMvDependencyRequest, CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest,
     FinalizeMvRefreshWithPartitionsRequest, MvRepository, MvRepositoryAvailability,
     MvRepositoryError, MvRepositoryErrorKind, MvTarget, RebuildMvRepositoryRequest,
-    RecordExternalCommitAndFinalizeRequest,
+    RebuiltMvPublicationProjection, RecordExternalCommitAndFinalizeRequest,
 };
 
 #[derive(Default)]
@@ -288,6 +288,50 @@ fn definition_from_request(
     }
 }
 
+fn apply_rebuilt_publication(
+    definition: &mut StoredMvDefinition,
+    publication: &RebuiltMvPublicationProjection,
+) -> Result<(), MvRepositoryError> {
+    match publication {
+        RebuiltMvPublicationProjection::NeverPublished => {
+            definition.last_refresh_ms = None;
+            definition.last_refresh_rows = None;
+            definition.last_refresh_snapshots.clear();
+            definition.last_refresh_table_object_ids.clear();
+            definition.last_refreshed_iceberg_snapshot_id = None;
+        }
+        RebuiltMvPublicationProjection::Published(waterline) => {
+            if waterline.last_refreshed_iceberg_snapshot_id < 0 || waterline.last_refresh_ms < 0 {
+                return Err(MvRepositoryError::new(
+                    MvRepositoryErrorKind::InvalidRequest,
+                    "rebuilt MV published waterline contains a negative target snapshot value",
+                ));
+            }
+            definition.last_refresh_ms = Some(waterline.last_refresh_ms);
+            definition.last_refresh_rows = Some(waterline.last_refresh_rows);
+            definition.last_refresh_snapshots = waterline.base_snapshots.clone();
+            definition.last_refresh_table_object_ids = waterline.base_table_object_ids.clone();
+            definition.last_refreshed_iceberg_snapshot_id =
+                Some(waterline.last_refreshed_iceberg_snapshot_id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_rebuilt_publication(
+    publication: &RebuiltMvPublicationProjection,
+) -> Result<(), MvRepositoryError> {
+    if let RebuiltMvPublicationProjection::Published(waterline) = publication
+        && (waterline.last_refreshed_iceberg_snapshot_id < 0 || waterline.last_refresh_ms < 0)
+    {
+        return Err(MvRepositoryError::new(
+            MvRepositoryErrorKind::InvalidRequest,
+            "rebuilt MV published waterline contains a negative target snapshot value",
+        ));
+    }
+    Ok(())
+}
+
 impl MvRepository for InMemoryMvRepository {
     fn availability(&self) -> MvRepositoryAvailability {
         MvRepositoryAvailability::Available
@@ -319,15 +363,17 @@ impl MvRepository for InMemoryMvRepository {
     }
     fn rebuild(
         &self,
-        operation_id: Uuid,
+        _: Uuid,
         request: RebuildMvRepositoryRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        let definition = self.create(operation_id, request.create)?;
-        self.initialize_rebuilt_refresh_watermark(
-            definition.mv_id,
-            request.base_snapshots,
-            request.base_table_object_ids,
-        )
+        fail_if_requested(TestMvRepositoryFailurePoint::Create)?;
+        validate_rebuilt_publication(&request.publication)?;
+        let mut state = self.state()?;
+        let id = Self::allocate(&mut state);
+        let mut definition = Self::create_locked(&mut state, id, request.create)?;
+        apply_rebuilt_publication(&mut definition, &request.publication)?;
+        state.definitions.insert(id, definition.clone());
+        Ok(definition)
     }
     fn reserve_definition_id(&self, mv_id: i64) -> Result<(), MvRepositoryError> {
         let mut state = self.state()?;
@@ -373,22 +419,30 @@ impl MvRepository for InMemoryMvRepository {
             .map(|definition| definition.mv_id);
         id.map_or(Ok(false), |mv_id| self.drop_by_id(mv_id))
     }
-    fn initialize_rebuilt_refresh_watermark(
+    fn wipe_rebuildable_projection_by_target(
         &self,
-        mv_id: i64,
-        base_snapshots: BTreeMap<String, i64>,
-        base_table_object_ids: BTreeMap<String, novarocks_spi::connector::ConnectorTableObjectId>,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
+        target: &MvTarget,
+    ) -> Result<bool, MvRepositoryError> {
         let mut state = self.state()?;
-        let definition = state.definitions.get_mut(&mv_id).ok_or_else(|| {
-            MvRepositoryError::new(
-                MvRepositoryErrorKind::NotFound,
-                format!("MV definition {mv_id} does not exist"),
-            )
-        })?;
-        definition.last_refresh_snapshots = base_snapshots;
-        definition.last_refresh_table_object_ids = base_table_object_ids;
-        Ok(definition.clone())
+        let Some(mv_id) = state
+            .definitions
+            .values()
+            .find(|definition| Self::target(definition).as_ref() == Some(target))
+            .map(|definition| definition.mv_id)
+        else {
+            return Ok(false);
+        };
+        let definition = state.definitions.get(&mv_id).expect("selected definition");
+        if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "mv definition has refresh in progress",
+            ));
+        }
+        state.definitions.remove(&mv_id);
+        state.dependencies.remove(&mv_id);
+        state.partitions.retain(|(id, _), _| *id != mv_id);
+        Ok(true)
     }
     fn update_refresh_metadata(
         &self,

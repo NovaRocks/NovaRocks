@@ -29,7 +29,9 @@ use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroun
 use crate::mv::domain::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
+use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
 use crate::mv::domain::repository::{MvRepository, MvRepositoryError, MvTarget};
+use crate::mv::domain::storage_observation::MvLakePublishedProjection;
 
 /// Existing standalone scheduler settings, now interpreted by the frontend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +79,85 @@ impl Default for FrontendMvSchedulerConfig {
 pub(crate) enum ScheduledRefreshReason {
     Interval,
     SnapshotChange,
+}
+
+/// The complete, reproducible scheduling interpretation of lake-authoritative
+/// desired refresh semantics and its published projection. Runtime queue,
+/// activity, and failure-backoff gates deliberately do not enter this value:
+/// wipe-start equivalence compares this decision directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MvSchedulerSemanticDecision {
+    Paused,
+    Manual,
+    IntervalNotDue { eligible_at_ms: i64 },
+    IntervalDue,
+    OnChangeNotDue,
+    OnChangeDue,
+    Invalid { reason: String },
+}
+
+/// Derive scheduler eligibility from the complete durable semantics.
+///
+/// `current_base_snapshots` is required only for `ASYNC_ON_CHANGE`, where it
+/// must be one exact provider observation captured for this decision. The
+/// caller owns observation failures; this pure function only diagnoses absent
+/// or malformed semantic inputs.
+pub(crate) fn mv_scheduler_semantic_decision(
+    refresh: &MvRefreshDesiredConfiguration,
+    publication: &MvLakePublishedProjection,
+    now_ms: i64,
+    current_base_snapshots: Option<&BTreeMap<String, Option<i64>>>,
+) -> MvSchedulerSemanticDecision {
+    if refresh.paused {
+        return MvSchedulerSemanticDecision::Paused;
+    }
+    if let Err(error) = refresh.validate() {
+        return MvSchedulerSemanticDecision::Invalid { reason: error };
+    }
+
+    match &refresh.policy {
+        StoredMvRefreshPolicy::Manual => MvSchedulerSemanticDecision::Manual,
+        StoredMvRefreshPolicy::AsyncInterval => {
+            let interval_ms = refresh.interval_ms.expect("validated above");
+            match publication {
+                MvLakePublishedProjection::NeverPublished => {
+                    MvSchedulerSemanticDecision::IntervalDue
+                }
+                MvLakePublishedProjection::Published {
+                    last_refresh_ms, ..
+                } => {
+                    let eligible_at_ms = last_refresh_ms.saturating_add(interval_ms);
+                    if now_ms >= eligible_at_ms {
+                        MvSchedulerSemanticDecision::IntervalDue
+                    } else {
+                        MvSchedulerSemanticDecision::IntervalNotDue { eligible_at_ms }
+                    }
+                }
+            }
+        }
+        StoredMvRefreshPolicy::AsyncOnChange => {
+            let Some(current_base_snapshots) = current_base_snapshots else {
+                return MvSchedulerSemanticDecision::Invalid {
+                    reason:
+                        "ASYNC_ON_CHANGE scheduler decision requires exact current base snapshots"
+                            .to_string(),
+                };
+            };
+            match publication {
+                MvLakePublishedProjection::NeverPublished => {
+                    MvSchedulerSemanticDecision::OnChangeDue
+                }
+                MvLakePublishedProjection::Published { base_snapshots, .. }
+                    if current_base_snapshots_match(base_snapshots, current_base_snapshots) =>
+                {
+                    MvSchedulerSemanticDecision::OnChangeNotDue
+                }
+                MvLakePublishedProjection::Published { .. } => {
+                    MvSchedulerSemanticDecision::OnChangeDue
+                }
+            }
+        }
+    }
 }
 
 /// A request that has passed scheduling admission but has not yet acquired the
@@ -337,56 +418,68 @@ impl FrontendMvScheduler {
                 return Ok(());
             }
         };
-        let reason = match definition.refresh_policy {
-            StoredMvRefreshPolicy::Manual => return Ok(()),
-            StoredMvRefreshPolicy::AsyncInterval => {
-                let Some(interval_ms) = definition.refresh_interval_ms else {
-                    self.persist_discovery_disposition(
-                        repository,
-                        &definition,
-                        ScheduledRefreshDisposition::InvalidDefinition(
-                            "ASYNC_INTERVAL materialized view is missing its interval".to_string(),
-                        ),
-                        now_ms,
-                    )?;
-                    return Ok(());
-                };
-                if interval_ms <= 0 {
-                    self.persist_discovery_disposition(
-                        repository,
-                        &definition,
-                        ScheduledRefreshDisposition::InvalidDefinition(
-                            "ASYNC_INTERVAL materialized view interval must be positive"
-                                .to_string(),
-                        ),
-                        now_ms,
-                    )?;
-                    return Ok(());
-                }
-                if !definition
-                    .next_refresh_after_ms
-                    .map(|next| next <= now_ms)
-                    .unwrap_or(true)
-                {
-                    return Ok(());
-                }
-                ScheduledRefreshReason::Interval
+        let refresh = match desired_refresh_configuration(&definition) {
+            Ok(refresh) => refresh,
+            Err(error) => {
+                self.persist_discovery_disposition(
+                    repository,
+                    &definition,
+                    ScheduledRefreshDisposition::InvalidDefinition(error),
+                    now_ms,
+                )?;
+                return Ok(());
             }
-            StoredMvRefreshPolicy::AsyncOnChange => match engine.current_base_snapshots(&target) {
-                Ok(current) if snapshots_require_refresh(&definition, &current) => {
-                    ScheduledRefreshReason::SnapshotChange
+        };
+        let publication = match published_projection(&definition) {
+            Ok(publication) => publication,
+            Err(error) => {
+                self.persist_discovery_disposition(
+                    repository,
+                    &definition,
+                    ScheduledRefreshDisposition::InvalidDefinition(error),
+                    now_ms,
+                )?;
+                return Ok(());
+            }
+        };
+        let current_base_snapshots =
+            if matches!(&refresh.policy, StoredMvRefreshPolicy::AsyncOnChange) {
+                match engine.current_base_snapshots(&target) {
+                    Ok(current) => Some(current),
+                    Err(error) => {
+                        self.persist_discovery_disposition(
+                            repository,
+                            &definition,
+                            ScheduledRefreshDisposition::from_background_error(error),
+                            now_ms,
+                        )?;
+                        return Ok(());
+                    }
                 }
-                Ok(_) => return Ok(()),
-                Err(error) => {
-                    self.persist_discovery_disposition(
-                        repository,
-                        &definition,
-                        ScheduledRefreshDisposition::from_background_error(error),
-                        now_ms,
-                    )?;
-                    return Ok(());
-                }
-            },
+            } else {
+                None
+            };
+        let reason = match mv_scheduler_semantic_decision(
+            &refresh,
+            &publication,
+            now_ms,
+            current_base_snapshots.as_ref(),
+        ) {
+            MvSchedulerSemanticDecision::IntervalDue => ScheduledRefreshReason::Interval,
+            MvSchedulerSemanticDecision::OnChangeDue => ScheduledRefreshReason::SnapshotChange,
+            MvSchedulerSemanticDecision::Paused
+            | MvSchedulerSemanticDecision::Manual
+            | MvSchedulerSemanticDecision::IntervalNotDue { .. }
+            | MvSchedulerSemanticDecision::OnChangeNotDue => return Ok(()),
+            MvSchedulerSemanticDecision::Invalid { reason } => {
+                self.persist_discovery_disposition(
+                    repository,
+                    &definition,
+                    ScheduledRefreshDisposition::InvalidDefinition(reason),
+                    now_ms,
+                )?;
+                return Ok(());
+            }
         };
         self.queue.push_back(ScheduledRefreshRequest {
             definition: definition.clone(),
@@ -497,20 +590,73 @@ fn mv_target(definition: &StoredMvDefinition) -> Result<MvTarget, ScheduledRefre
     }
 }
 
-/// `None` is part of the provider vector: a base whose current snapshot was
-/// removed differs from a persisted `Some(id)`.  The empty durable watermark is
-/// intentionally always due, including for an otherwise empty current vector.
-fn snapshots_require_refresh(
+/// Translate the accelerator projection into the complete publication fact
+/// consumed by the semantic decision. Partial StateStore fields are invalid:
+/// no scheduler path may fabricate a published waterline.
+fn desired_refresh_configuration(
     definition: &StoredMvDefinition,
+) -> Result<MvRefreshDesiredConfiguration, String> {
+    MvRefreshDesiredConfiguration::new(
+        definition.refresh_policy.clone(),
+        definition.refresh_paused,
+        definition.refresh_interval_ms,
+        definition.max_staleness_ms,
+    )
+}
+
+fn published_projection(
+    definition: &StoredMvDefinition,
+) -> Result<MvLakePublishedProjection, String> {
+    let values = (
+        definition.last_refresh_ms,
+        definition.last_refresh_rows,
+        definition.last_refreshed_iceberg_snapshot_id,
+    );
+    match values {
+        (None, None, None)
+            if definition.last_refresh_snapshots.is_empty()
+                && definition.last_refresh_table_object_ids.is_empty() =>
+        {
+            Ok(MvLakePublishedProjection::NeverPublished)
+        }
+        (Some(last_refresh_ms), Some(last_refresh_rows), Some(last_refreshed_iceberg_snapshot_id))
+            if definition.last_refresh_snapshots.keys().eq(
+                definition.last_refresh_table_object_ids.keys(),
+            ) =>
+        {
+            if last_refresh_ms < 0
+                || last_refresh_rows < 0
+                || last_refreshed_iceberg_snapshot_id < 0
+                || definition
+                    .last_refresh_snapshots
+                    .values()
+                    .any(|snapshot| *snapshot < 0)
+            {
+                return Err("published MV scheduler projection contains a negative value".to_string());
+            }
+            Ok(MvLakePublishedProjection::Published {
+                last_refresh_ms,
+                last_refresh_rows,
+                last_refreshed_iceberg_snapshot_id,
+                base_snapshots: definition.last_refresh_snapshots.clone(),
+                base_table_object_ids: definition.last_refresh_table_object_ids.clone(),
+            })
+        }
+        _ => Err(
+            "MV scheduler projection is neither complete published state nor complete never-published state"
+                .to_string(),
+        ),
+    }
+}
+
+fn current_base_snapshots_match(
+    published: &BTreeMap<String, i64>,
     current: &BTreeMap<String, Option<i64>>,
 ) -> bool {
-    if definition.last_refresh_snapshots.is_empty() {
-        return true;
-    }
-    current.len() != definition.last_refresh_snapshots.len()
-        || current.iter().any(|(base, snapshot)| {
-            definition.last_refresh_snapshots.get(base).copied() != *snapshot
-        })
+    published.len() == current.len()
+        && current
+            .iter()
+            .all(|(base, snapshot)| published.get(base).copied() == *snapshot)
 }
 
 fn metadata_request(
@@ -545,6 +691,8 @@ mod tests {
     };
 
     fn definition(policy: StoredMvRefreshPolicy) -> StoredMvDefinition {
+        let refresh_interval_ms =
+            matches!(&policy, StoredMvRefreshPolicy::AsyncInterval).then_some(100);
         StoredMvDefinition {
             mv_id: 7,
             query_definition: PersistedQueryDefinition::new(
@@ -573,7 +721,7 @@ mod tests {
             refresh_target_snapshots: BTreeMap::new(),
             refresh_policy: policy,
             refresh_paused: false,
-            refresh_interval_ms: Some(100),
+            refresh_interval_ms,
             max_staleness_ms: None,
             last_scheduler_error: None,
             next_refresh_after_ms: None,
@@ -582,21 +730,129 @@ mod tests {
     }
 
     #[test]
-    fn initial_on_change_watermark_is_due_without_an_observation_cache() {
-        let definition = definition(StoredMvRefreshPolicy::AsyncOnChange);
-        assert!(snapshots_require_refresh(&definition, &BTreeMap::new()));
+    fn never_published_async_on_change_is_due_for_an_exact_empty_observation() {
+        let refresh = MvRefreshDesiredConfiguration::new(
+            StoredMvRefreshPolicy::AsyncOnChange,
+            false,
+            None,
+            None,
+        )
+        .expect("valid desired refresh");
+        assert_eq!(
+            mv_scheduler_semantic_decision(
+                &refresh,
+                &MvLakePublishedProjection::NeverPublished,
+                100,
+                Some(&BTreeMap::new()),
+            ),
+            MvSchedulerSemanticDecision::OnChangeDue
+        );
     }
 
     #[test]
-    fn on_change_compares_current_provider_vector_to_durable_watermark() {
-        let mut definition = definition(StoredMvRefreshPolicy::AsyncOnChange);
-        definition
-            .last_refresh_snapshots
-            .insert("iceberg.db.base".to_string(), 11);
+    fn on_change_compares_exact_current_vector_to_complete_published_projection() {
+        let refresh = MvRefreshDesiredConfiguration::new(
+            StoredMvRefreshPolicy::AsyncOnChange,
+            false,
+            None,
+            None,
+        )
+        .expect("valid desired refresh");
+        let published = MvLakePublishedProjection::Published {
+            last_refresh_ms: 10,
+            last_refresh_rows: 1,
+            last_refreshed_iceberg_snapshot_id: 20,
+            base_snapshots: BTreeMap::from([("iceberg.db.base".to_string(), 11)]),
+            base_table_object_ids: BTreeMap::new(),
+        };
         let same = BTreeMap::from([("iceberg.db.base".to_string(), Some(11))]);
         let changed = BTreeMap::from([("iceberg.db.base".to_string(), Some(12))]);
-        assert!(!snapshots_require_refresh(&definition, &same));
-        assert!(snapshots_require_refresh(&definition, &changed));
+        assert_eq!(
+            mv_scheduler_semantic_decision(&refresh, &published, 100, Some(&same)),
+            MvSchedulerSemanticDecision::OnChangeNotDue
+        );
+        assert_eq!(
+            mv_scheduler_semantic_decision(&refresh, &published, 100, Some(&changed)),
+            MvSchedulerSemanticDecision::OnChangeDue
+        );
+    }
+
+    #[test]
+    fn interval_uses_published_refresh_timestamp_not_runtime_next_run_state() {
+        let refresh = MvRefreshDesiredConfiguration::new(
+            StoredMvRefreshPolicy::AsyncInterval,
+            false,
+            Some(100),
+            None,
+        )
+        .expect("valid desired refresh");
+        let published = MvLakePublishedProjection::Published {
+            last_refresh_ms: 1_000,
+            last_refresh_rows: 1,
+            last_refreshed_iceberg_snapshot_id: 20,
+            base_snapshots: BTreeMap::new(),
+            base_table_object_ids: BTreeMap::new(),
+        };
+        assert_eq!(
+            mv_scheduler_semantic_decision(&refresh, &published, 1_099, None),
+            MvSchedulerSemanticDecision::IntervalNotDue {
+                eligible_at_ms: 1_100,
+            }
+        );
+        assert_eq!(
+            mv_scheduler_semantic_decision(&refresh, &published, 1_100, None),
+            MvSchedulerSemanticDecision::IntervalDue
+        );
+    }
+
+    #[test]
+    fn paused_manual_and_missing_on_change_observation_are_not_reinterpreted() {
+        let paused = MvRefreshDesiredConfiguration::new(
+            StoredMvRefreshPolicy::AsyncInterval,
+            true,
+            Some(100),
+            None,
+        )
+        .expect("valid desired refresh");
+        assert_eq!(
+            mv_scheduler_semantic_decision(
+                &paused,
+                &MvLakePublishedProjection::NeverPublished,
+                100,
+                None,
+            ),
+            MvSchedulerSemanticDecision::Paused
+        );
+
+        let manual =
+            MvRefreshDesiredConfiguration::new(StoredMvRefreshPolicy::Manual, false, None, None)
+                .expect("valid desired refresh");
+        assert_eq!(
+            mv_scheduler_semantic_decision(
+                &manual,
+                &MvLakePublishedProjection::NeverPublished,
+                100,
+                None,
+            ),
+            MvSchedulerSemanticDecision::Manual
+        );
+
+        let on_change = MvRefreshDesiredConfiguration::new(
+            StoredMvRefreshPolicy::AsyncOnChange,
+            false,
+            None,
+            None,
+        )
+        .expect("valid desired refresh");
+        assert!(matches!(
+            mv_scheduler_semantic_decision(
+                &on_change,
+                &MvLakePublishedProjection::NeverPublished,
+                100,
+                None,
+            ),
+            MvSchedulerSemanticDecision::Invalid { .. }
+        ));
     }
 
     #[test]

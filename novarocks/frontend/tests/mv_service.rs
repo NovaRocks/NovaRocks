@@ -19,6 +19,9 @@ use novarocks_frontend::mv::domain::persistence::definition::{
 use novarocks_frontend::mv::domain::persistence::dependency::{
     CreateMvDependencyRequest, StoredMvDependency,
 };
+use novarocks_frontend::mv::domain::persistence::descriptor::{
+    DescriptorDependency, MvDescriptorV3,
+};
 use novarocks_frontend::mv::domain::persistence::partition::{
     RecordFailedMvPartitionStatesRequest, ReplaceMvPartitionStatesRequest, StoredMvPartitionState,
     UpdateMvPartitionContractRequest,
@@ -28,13 +31,19 @@ use novarocks_frontend::mv::domain::persistence::refresh::{
     RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvRefresh,
     UpdateStarRocksMvRefreshSummaryRequest,
 };
+use novarocks_frontend::mv::domain::persistence::schema::{
+    BaseContract, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage, HiddenApplyKeyContract,
+    MvSchemaContract, OutputContract, TargetContract,
+};
+use novarocks_frontend::mv::domain::persistence::semantic::{
+    MvDesiredSemantics, MvRefreshDesiredConfiguration,
+};
 use novarocks_frontend::mv::domain::repository::{
     CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest,
     FinalizeMvRefreshWithPartitionsRequest, InitialMvRefreshConfiguration, MvRepository,
     MvRepositoryAvailability, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
     RebuildMvRepositoryRequest, RecordExternalCommitAndFinalizeRequest, UnavailableMvRepository,
 };
-use novarocks_spi::connector::ConnectorTableObjectId;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,13 +140,14 @@ impl MvEngine for FakeEngine {
         self.call("inspect")?;
         Ok(PreparedMvDefinition {
             repository_request: create_request(),
+            descriptor: descriptor(),
         })
     }
 
     fn sync_target_descriptor(
         &self,
         _target: &CreatedMvTarget,
-        _definition: &StoredMvDefinition,
+        _definition: &MvDescriptorV3,
     ) -> Result<(), MvEngineError> {
         self.call("sync")
     }
@@ -221,14 +231,6 @@ impl MvRepository for FakeRepository {
         unused_repository_method!()
     }
     fn drop_by_target(&self, _: &MvTarget) -> Result<bool, MvRepositoryError> {
-        unused_repository_method!()
-    }
-    fn initialize_rebuilt_refresh_watermark(
-        &self,
-        _: i64,
-        _: BTreeMap<String, i64>,
-        _: BTreeMap<String, ConnectorTableObjectId>,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
         unused_repository_method!()
     }
     fn update_refresh_metadata(
@@ -381,6 +383,77 @@ fn target() -> MvTarget {
         database: "db".to_string(),
         name: "mv".to_string(),
     }
+}
+
+fn descriptor() -> MvDescriptorV3 {
+    let object_id = novarocks_spi::connector::ConnectorTableObjectId::try_new(
+        bytes::Bytes::from_static(b"base"),
+    )
+    .unwrap();
+    MvDescriptorV3::from_desired_semantics(
+        MvDesiredSemantics::new(
+            "db.mv".to_string(),
+            PersistedQueryDefinition::new(
+                "SELECT 1",
+                PersistedQueryDialect::StarRocks,
+                "ice",
+                "db",
+            )
+            .unwrap(),
+            vec!["c1".to_string()],
+            vec![],
+            vec![DescriptorDependency {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                name: "base".to_string(),
+                object_type: "table".to_string(),
+                storage_engine: "iceberg".to_string(),
+            }],
+            vec![],
+            MvSchemaContract {
+                contract_version: 1,
+                base: BaseContract {
+                    table_fqn: "ice.db.base".to_string(),
+                    table_object_id: object_id,
+                    alias_at_create: None,
+                    schema_id_at_create: 0,
+                    schema_at_create: BaseSchemaSnapshot { fields: vec![] },
+                },
+                bases: vec![],
+                output: OutputContract {
+                    columns: vec![
+                        novarocks_frontend::mv::domain::persistence::schema::OutputColumnLineage {
+                            expression: ExpressionLineage {
+                                kind: ExpressionKind::Literal,
+                                referenced_base_field_ids: vec![],
+                                referenced_base_fields: vec![],
+                            },
+                        },
+                    ],
+                    filter: None,
+                },
+                join: None,
+                aggregate: None,
+                branch: None,
+                target: TargetContract {
+                    table_fqn: "ice.db.mv".to_string(),
+                    table_uuid: "target".to_string(),
+                    schema_id_at_create: 0,
+                    visible_columns: vec![],
+                    hidden_apply_key: HiddenApplyKeyContract {
+                        column_name: "__nova_base_row_id".to_string(),
+                        target_field_id: 1,
+                        source: novarocks_sql::planning::mv::ApplyKeySource::BaseRowId,
+                    },
+                    partition: None,
+                },
+            },
+            MvRefreshDesiredConfiguration::new(StoredMvRefreshPolicy::Manual, false, None, None)
+                .unwrap(),
+            1,
+        )
+        .unwrap(),
+    )
 }
 
 fn create_request() -> CreateMvRepositoryRequest {

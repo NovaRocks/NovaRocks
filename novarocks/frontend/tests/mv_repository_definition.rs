@@ -17,6 +17,7 @@ use novarocks_frontend::mv::domain::persistence::definition::{
 use novarocks_frontend::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use novarocks_frontend::mv::domain::repository::{
     CreateMvRepositoryRequest, InitialMvRefreshConfiguration, MvRepository, MvTarget,
+    RebuildMvRepositoryRequest, RebuiltMvPublicationProjection, RebuiltMvPublishedWaterline,
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_spi::state_store::{
@@ -321,6 +322,66 @@ fn create_allocates_monotonic_ids_and_persists_target_and_dependencies_atomicall
             .len(),
         2,
         "a duplicate target must not leave an orphan definition or advance visible state"
+    );
+}
+
+#[test]
+fn rebuild_persists_complete_lake_projection_in_its_create_transaction() {
+    let (_temp, _runtime, _host, repository) = repository();
+    let base_snapshots = std::collections::BTreeMap::from([("ice.sales.orders".to_string(), 77)]);
+    let base_table_object_ids = std::collections::BTreeMap::from([(
+        "ice.sales.orders".to_string(),
+        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::from_static(b"orders"))
+            .expect("bounded object ID"),
+    )]);
+    let mut create = create_request("rebuild_projection");
+    create.refresh = InitialMvRefreshConfiguration {
+        policy: StoredMvRefreshPolicy::AsyncInterval,
+        paused: true,
+        interval_ms: Some(60_000),
+        max_staleness_ms: Some(300_000),
+        next_refresh_after_ms: None,
+    };
+    let definition = repository
+        .rebuild(
+            uuid::Uuid::now_v7(),
+            RebuildMvRepositoryRequest {
+                create,
+                publication: RebuiltMvPublicationProjection::Published(
+                    RebuiltMvPublishedWaterline {
+                        last_refresh_ms: 1_700_000_000_300,
+                        last_refresh_rows: 42,
+                        last_refreshed_iceberg_snapshot_id: 300,
+                        base_snapshots: base_snapshots.clone(),
+                        base_table_object_ids: base_table_object_ids.clone(),
+                    },
+                ),
+            },
+        )
+        .expect("atomically rebuild definition and lake projection");
+
+    assert_eq!(definition.last_refresh_ms, Some(1_700_000_000_300));
+    assert_eq!(definition.last_refresh_rows, Some(42));
+    assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(300));
+    assert_eq!(definition.last_refresh_snapshots, base_snapshots);
+    assert_eq!(
+        definition.last_refresh_table_object_ids,
+        base_table_object_ids
+    );
+    assert_eq!(
+        definition.refresh_policy,
+        StoredMvRefreshPolicy::AsyncInterval
+    );
+    assert!(definition.refresh_paused);
+    assert_eq!(definition.refresh_interval_ms, Some(60_000));
+    assert_eq!(definition.max_staleness_ms, Some(300_000));
+    assert_eq!(definition.next_refresh_after_ms, None);
+    assert!(
+        repository
+            .list_dependencies_by_downstream(definition.mv_id)
+            .expect("dependencies committed with rebuilt definition")
+            .len()
+            == 1
     );
 }
 

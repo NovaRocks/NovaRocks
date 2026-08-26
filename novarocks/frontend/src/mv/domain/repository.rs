@@ -152,6 +152,24 @@ pub struct CreateMvRepositoryWithIdRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RebuildMvRepositoryRequest {
     pub create: CreateMvRepositoryRequest,
+    /// The complete lake-derived publication projection. This is deliberately
+    /// explicit: `NeverPublished` is not inferred from empty maps, and a
+    /// published waterline is installed in the same atomic write as the
+    /// rebuilt definition.
+    pub publication: RebuiltMvPublicationProjection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RebuiltMvPublicationProjection {
+    NeverPublished,
+    Published(RebuiltMvPublishedWaterline),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebuiltMvPublishedWaterline {
+    pub last_refresh_ms: i64,
+    pub last_refresh_rows: i64,
+    pub last_refreshed_iceberg_snapshot_id: i64,
     pub base_snapshots: BTreeMap<String, i64>,
     pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
 }
@@ -257,22 +275,16 @@ pub trait MvRepository: Send + Sync {
     fn list_definitions(&self) -> Result<Vec<StoredMvDefinition>, MvRepositoryError>;
     fn drop_by_id(&self, mv_id: i64) -> Result<bool, MvRepositoryError>;
     fn drop_by_target(&self, target: &MvTarget) -> Result<bool, MvRepositoryError>;
-
-    /// Fill in the refresh watermark of a definition rebuilt from lake truth,
-    /// and only if it does not have one yet.
-    ///
-    /// This is initialization, not a refresh transition, which is why it needs
-    /// no refresh lease: the caller has just created a definition that was
-    /// absent, and the operation is defined to leave an existing watermark
-    /// alone. A refresh that reached the target first therefore wins, and a
-    /// rebuild can never roll one back. Requiring a lease instead would fail
-    /// closed on startup restore, which runs before any refresh owner exists.
-    fn initialize_rebuilt_refresh_watermark(
+    /// Test-only accelerator wipe: remove only rebuildable definition/index/
+    /// dependency/partition projection records, preserving historical refresh
+    /// records and refusing an active refresh boundary.
+    fn wipe_rebuildable_projection_by_target(
         &self,
-        mv_id: i64,
-        base_snapshots: BTreeMap<String, i64>,
-        base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    ) -> Result<StoredMvDefinition, MvRepositoryError>;
+        _target: &MvTarget,
+    ) -> Result<bool, MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+
     fn update_refresh_metadata(
         &self,
         request: UpdateMvRefreshMetadataRequest,
@@ -512,15 +524,6 @@ impl MvRepository for UnavailableMvRepository {
     }
 
     fn drop_by_target(&self, _target: &MvTarget) -> Result<bool, MvRepositoryError> {
-        unavailable!()
-    }
-
-    fn initialize_rebuilt_refresh_watermark(
-        &self,
-        _mv_id: i64,
-        _base_snapshots: BTreeMap<String, i64>,
-        _base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
         unavailable!()
     }
 

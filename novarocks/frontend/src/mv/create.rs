@@ -54,23 +54,23 @@ pub(super) fn handle_create(
             ));
         }
     };
-    let definition = match repository.create(operation_id, definition.repository_request) {
-        Ok(definition) => definition,
+    if let Err(error) = engine.sync_target_descriptor(&target, &definition.descriptor) {
+        // The descriptor mutation may be commit-unknown, so the lake target
+        // cannot be purged after this authority-boundary attempt.
+        return Err(engine_error(error));
+    }
+    match repository.create(operation_id, definition.repository_request) {
+        Ok(_) => {}
         Err(error) if error.kind() == MvRepositoryErrorKind::CommitUnknown => {
             return Err(repository_error(error));
         }
         Err(error) => {
-            return Err(cleanup_known_uncommitted(
-                engine,
-                &target,
-                repository_error(error),
+            return Err(MvApplicationError::new(
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                error.to_string(),
             ));
         }
     };
-
-    engine
-        .sync_target_descriptor(&target, &definition)
-        .map_err(known_committed_finalize_error)?;
     engine
         .register_target(&target)
         .map_err(known_committed_finalize_error)?;

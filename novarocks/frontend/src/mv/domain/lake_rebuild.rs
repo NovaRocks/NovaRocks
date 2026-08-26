@@ -26,7 +26,6 @@
 //! the MV repository. No catalog I/O happens here — every input is already in
 //! memory.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::mv::domain::dependency::model::{
@@ -36,19 +35,21 @@ use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::DescriptorDependency;
+use crate::mv::domain::repository::{
+    InitialMvRefreshConfiguration, RebuildMvRepositoryRequest, RebuiltMvPublicationProjection,
+    RebuiltMvPublishedWaterline,
+};
 use crate::mv::domain::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, discover_mv_lake_packages,
+    MvLakePackageObservation, MvLakePublishedProjection, discover_mv_lake_packages,
 };
 
-/// Output of [`rebuild_mv_definition_from_lake`]: the definition-create
-/// request `create_iceberg_mv` would have issued, plus the refresh watermark
-/// maps `StoredMvDefinition` separately tracks (`CreateMvDefinitionRequest`
-/// has no watermark fields — a freshly-created MV has never refreshed).
+/// Output of [`rebuild_mv_definition_from_lake`]: the complete definition,
+/// desired refresh configuration, and explicit publication projection to
+/// install in one repository rebuild command.
 pub(crate) struct RebuiltMvDefinition {
     pub create_request: CreateMvDefinitionRequest,
-    pub last_refresh_snapshots: BTreeMap<String, i64>,
-    pub last_refresh_table_object_ids:
-        BTreeMap<String, novarocks_spi::connector::ConnectorTableObjectId>,
+    pub refresh: InitialMvRefreshConfiguration,
+    pub publication: RebuiltMvPublicationProjection,
 }
 
 /// Reconstruct an MV's repository definition-create inputs purely from its lake
@@ -65,43 +66,52 @@ pub(crate) fn rebuild_mv_definition_from_lake(
         .map(|dep| format!("{}.{}.{}", dep.catalog, dep.namespace, dep.name))
         .collect();
 
-    let schema_contract = descriptor.schema_contract_typed()?;
-    let partition_spec = schema_contract
-        .as_ref()
-        .and_then(|contract| contract.target.partition.clone());
+    let schema_contract = descriptor.schema_contract.clone();
+    let partition_spec = schema_contract.target.partition.clone();
 
     let create_request = CreateMvDefinitionRequest {
         query_definition: descriptor.query_definition.clone(),
         base_table_refs,
-        // W1 descriptors carry no primary-key metadata; a rebuilt definition
-        // is indistinguishable from one created without `PRIMARY KEY (...)`.
-        primary_key_columns: Vec::new(),
+        primary_key_columns: descriptor.primary_key_columns.clone(),
         storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
         target_catalog: Some(package.table.instance_id.as_str().to_string()),
         target_namespace: Some(package.table.namespace.to_string()),
         target_table: Some(package.table.table.to_string()),
-        schema_contract,
+        schema_contract: Some(schema_contract),
         partition_spec,
         created_at_ms: descriptor.created_at_ms,
     };
-
-    let (last_refresh_snapshots, last_refresh_table_object_ids) = match &package.publication {
-        MvLakePublication::Published(facts) => {
-            let mut snapshots = BTreeMap::new();
-            let mut table_object_ids = BTreeMap::new();
-            for base in &facts.bases {
-                snapshots.insert(base.table_fqn.clone(), base.to_snapshot);
-                table_object_ids.insert(base.table_fqn.clone(), base.object_id.clone());
-            }
-            (snapshots, table_object_ids)
-        }
-        MvLakePublication::NeverPublished => (BTreeMap::new(), BTreeMap::new()),
+    let refresh = InitialMvRefreshConfiguration {
+        policy: descriptor.refresh.policy.clone(),
+        paused: descriptor.refresh.paused,
+        interval_ms: descriptor.refresh.interval_ms,
+        max_staleness_ms: descriptor.refresh.max_staleness_ms,
+        next_refresh_after_ms: None,
+    };
+    let publication = match package
+        .published_projection()
+        .map_err(|error| format!("derive MV lake publication projection: {error}"))?
+    {
+        MvLakePublishedProjection::NeverPublished => RebuiltMvPublicationProjection::NeverPublished,
+        MvLakePublishedProjection::Published {
+            last_refresh_ms,
+            last_refresh_rows,
+            last_refreshed_iceberg_snapshot_id,
+            base_snapshots,
+            base_table_object_ids,
+        } => RebuiltMvPublicationProjection::Published(RebuiltMvPublishedWaterline {
+            last_refresh_ms,
+            last_refresh_rows,
+            last_refreshed_iceberg_snapshot_id,
+            base_snapshots,
+            base_table_object_ids,
+        }),
     };
 
     Ok(RebuiltMvDefinition {
         create_request,
-        last_refresh_snapshots,
-        last_refresh_table_object_ids,
+        refresh,
+        publication,
     })
 }
 
@@ -113,8 +123,9 @@ pub(crate) fn rebuild_mv_definition_from_lake(
 /// (MV-table inline descriptor), and for each MV whose target is not already
 /// recorded in the repository we
 /// reconstruct its definition-create inputs with
-/// [`rebuild_mv_definition_from_lake`] and persist them (definition + refresh
-/// watermark + dependencies) through the repository's ordinary create path.
+/// [`rebuild_mv_definition_from_lake`] and persist them (definition, desired
+/// refresh configuration, publication waterline, and dependencies) through
+/// the repository's atomic rebuild path.
 ///
 /// Idempotent: MVs already present in the repository (matched by target
 /// `catalog.namespace.table`) are skipped, so calling this at startup
@@ -266,23 +277,19 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
     let dependencies =
         dependency_requests_from_descriptor(&package.descriptor.base_dependencies, created_at_ms)?;
 
-    let definition = repository
-        .create(
+    repository
+        .rebuild(
             uuid::Uuid::new_v4(),
-            crate::mv::domain::repository::CreateMvRepositoryRequest {
-                definition: rebuilt.create_request,
-                refresh: Default::default(),
-                dependencies: dependencies.clone(),
+            RebuildMvRepositoryRequest {
+                create: crate::mv::domain::repository::CreateMvRepositoryRequest {
+                    definition: rebuilt.create_request,
+                    refresh: rebuilt.refresh,
+                    dependencies,
+                },
+                publication: rebuilt.publication,
             },
         )
         .map_err(|e| format!("rebuild iceberg MV repository metadata failed: {e}"))?;
-    repository
-        .initialize_rebuilt_refresh_watermark(
-            definition.mv_id,
-            rebuilt.last_refresh_snapshots,
-            rebuilt.last_refresh_table_object_ids,
-        )
-        .map_err(|e| format!("stamp rebuilt iceberg MV refresh watermark failed: {e}"))?;
     Ok(())
 }
 
@@ -350,21 +357,24 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV2};
+    use crate::mv::domain::persistence::definition::StoredMvRefreshPolicy;
+    use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
     use crate::mv::domain::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
+    use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
     use crate::mv::domain::storage_observation::{
-        MvLakePackageObservation, MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts,
-        MvPublishedRefreshTechnique,
+        MvLakePackageObservation, MvLakePublication, MvLakeTargetSnapshot, MvPublishedBaseFact,
+        MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     };
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableObjectId,
     };
     use novarocks_sql::planning::mv::ApplyKeySource;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     fn object_id(value: &'static [u8]) -> ConnectorTableObjectId {
@@ -433,8 +443,8 @@ mod tests {
     }
 
     fn sample_package(publication: MvLakePublication) -> MvLakePackageObservation {
-        let mut descriptor = MvDescriptorV2 {
-            descriptor_version: 2,
+        let descriptor = MvDescriptorV3 {
+            descriptor_version: 3,
             package_id: "analytics.mv_orders".to_string(),
             query_definition:
                 crate::common::persisted_query_definition::PersistedQueryDefinition::new(
@@ -453,13 +463,22 @@ mod tests {
                 object_type: "table".to_string(),
                 storage_engine: "iceberg".to_string(),
             }],
-            schema_contract: None,
-            refresh_contract: None,
+            primary_key_columns: vec!["id".to_string()],
+            schema_contract: sample_contract(),
+            refresh: MvRefreshDesiredConfiguration::new(
+                StoredMvRefreshPolicy::AsyncInterval,
+                true,
+                Some(60_000),
+                Some(300_000),
+            )
+            .expect("valid desired refresh"),
             created_at_ms: 123,
         };
-        descriptor
-            .set_schema_contract(&sample_contract())
-            .expect("set schema contract");
+        let current_target_snapshot = matches!(publication, MvLakePublication::Published(_))
+            .then_some(MvLakeTargetSnapshot {
+                snapshot_id: 300,
+                timestamp_ms: 1_700_000_000_300,
+            });
         MvLakePackageObservation::try_new(
             ConnectorTableIdentity {
                 instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
@@ -467,6 +486,7 @@ mod tests {
                 table: Arc::from("mv_orders"),
             },
             descriptor,
+            current_target_snapshot,
             publication,
         )
         .expect("valid lake package")
@@ -510,7 +530,7 @@ mod tests {
             request.base_table_refs,
             vec!["ice.sales.orders".to_string()]
         );
-        assert!(request.primary_key_columns.is_empty());
+        assert_eq!(request.primary_key_columns, vec!["id"]);
         assert_eq!(
             request.storage_engine,
             MvStorageEngine::Iceberg.as_sql_str()
@@ -531,15 +551,23 @@ mod tests {
         assert_eq!(partition.fields.len(), 1);
         assert_eq!(partition.fields[0].partition_field_name, "id_bucket");
 
+        assert_eq!(rebuilt.refresh.policy, StoredMvRefreshPolicy::AsyncInterval);
+        assert!(rebuilt.refresh.paused);
+        assert_eq!(rebuilt.refresh.interval_ms, Some(60_000));
+        assert_eq!(rebuilt.refresh.max_staleness_ms, Some(300_000));
+        assert_eq!(rebuilt.refresh.next_refresh_after_ms, None);
         assert_eq!(
-            rebuilt.last_refresh_snapshots.get("ice.sales.orders"),
-            Some(&200)
-        );
-        assert_eq!(
-            rebuilt
-                .last_refresh_table_object_ids
-                .get("ice.sales.orders"),
-            Some(&object_id(b"orders-object-id"))
+            rebuilt.publication,
+            RebuiltMvPublicationProjection::Published(RebuiltMvPublishedWaterline {
+                last_refresh_ms: 1_700_000_000_300,
+                last_refresh_rows: 42,
+                last_refreshed_iceberg_snapshot_id: 300,
+                base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 200)]),
+                base_table_object_ids: BTreeMap::from([(
+                    "ice.sales.orders".to_string(),
+                    object_id(b"orders-object-id"),
+                )]),
+            })
         );
     }
 
@@ -549,8 +577,10 @@ mod tests {
 
         let rebuilt = rebuild_mv_definition_from_lake(&package).expect("rebuild succeeds");
 
-        assert!(rebuilt.last_refresh_snapshots.is_empty());
-        assert!(rebuilt.last_refresh_table_object_ids.is_empty());
+        assert_eq!(
+            rebuilt.publication,
+            RebuiltMvPublicationProjection::NeverPublished
+        );
         // The create request is still fully valid even with no refresh history.
         assert_eq!(
             rebuilt.create_request.query_definition.raw_query_source,

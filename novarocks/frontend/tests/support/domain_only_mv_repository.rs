@@ -105,15 +105,6 @@ impl MvRepository for DomainOnlyMvRepository {
         Ok(false)
     }
 
-    fn initialize_rebuilt_refresh_watermark(
-        &self,
-        _mv_id: i64,
-        _base_snapshots: BTreeMap<String, i64>,
-        _base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        unsupported()
-    }
-
     fn update_refresh_metadata(
         &self,
         _request: UpdateMvRefreshMetadataRequest,

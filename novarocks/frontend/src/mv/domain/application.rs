@@ -21,6 +21,7 @@ use std::fmt;
 
 use uuid::Uuid;
 
+use crate::mv::domain::persistence::descriptor::MvDescriptorV3;
 use crate::mv::domain::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
@@ -416,6 +417,9 @@ pub struct CreatedMvTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedMvDefinition {
     pub repository_request: CreateMvRepositoryRequest,
+    /// The complete lake authority assembled only after exact target
+    /// observation. It must commit before the StateStore projection exists.
+    pub descriptor: MvDescriptorV3,
 }
 
 pub trait MvApplicationService: Send + Sync {
@@ -449,7 +453,7 @@ pub trait MvEngine: Send + Sync {
     fn sync_target_descriptor(
         &self,
         target: &CreatedMvTarget,
-        definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+        descriptor: &MvDescriptorV3,
     ) -> Result<(), MvEngineError>;
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError>;
