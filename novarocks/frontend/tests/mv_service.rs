@@ -566,7 +566,7 @@ fn execute(
 }
 
 #[test]
-fn create_success_sequences_one_repository_command_before_sync_and_register() {
+fn create_success_commits_lake_descriptor_before_repository_projection() {
     let (result, engine, repository) = execute(&[]);
     assert!(matches!(result, Ok(Some(MvStatementResult::Ok))));
     assert_eq!(
@@ -585,39 +585,48 @@ fn create_success_sequences_one_repository_command_before_sync_and_register() {
 }
 
 #[test]
-fn create_known_uncommitted_failures_clean_up_target_and_preserve_primary_error() {
-    for failure in [
-        FailurePoint::Inspect,
-        FailurePoint::Repository(MvRepositoryErrorKind::Conflict),
-    ] {
-        let (result, engine, _) = execute(&[failure]);
-        assert!(result.is_err());
-        assert_eq!(engine.calls().last(), Some(&"cleanup"));
-    }
+fn create_pre_authority_failure_cleans_up_target() {
+    let (result, engine, _) = execute(&[FailurePoint::Inspect]);
+    assert!(result.is_err());
+    assert_eq!(engine.calls().last(), Some(&"cleanup"));
 }
 
 #[test]
-fn create_commit_unknown_retains_target_for_recovery() {
+fn create_repository_failure_after_lake_authority_retains_target() {
+    let (result, engine, _) = execute(&[FailurePoint::Repository(MvRepositoryErrorKind::Conflict)]);
+    assert_eq!(
+        result
+            .expect_err("projection failure after descriptor commit")
+            .kind(),
+        MvApplicationErrorKind::KnownCommittedFinalizeFailed
+    );
+    assert_eq!(engine.calls(), ["prepare", "create", "inspect", "sync"]);
+}
+
+#[test]
+fn create_descriptor_attempt_and_register_failures_retain_target() {
+    let (result, engine, _) = execute(&[FailurePoint::Sync]);
+    assert_eq!(
+        result.expect_err("descriptor attempt failure").kind(),
+        MvApplicationErrorKind::Engine
+    );
+    assert!(!engine.calls().contains(&"cleanup"));
+
+    let (result, engine, _) = execute(&[FailurePoint::Register]);
+    assert_eq!(
+        result.expect_err("register failure").kind(),
+        MvApplicationErrorKind::KnownCommittedFinalizeFailed
+    );
+    assert!(!engine.calls().contains(&"cleanup"));
+
     let (result, engine, _) = execute(&[FailurePoint::Repository(
         MvRepositoryErrorKind::CommitUnknown,
     )]);
     assert_eq!(
-        result.expect_err("commit unknown").kind(),
+        result.expect_err("repository commit unknown").kind(),
         MvApplicationErrorKind::CommitUnknown
     );
-    assert_eq!(engine.calls(), ["prepare", "create", "inspect"]);
-}
-
-#[test]
-fn create_after_commit_failures_retain_target_and_are_typed_finalize_failures() {
-    for failure in [FailurePoint::Sync, FailurePoint::Register] {
-        let (result, engine, _) = execute(&[failure]);
-        assert_eq!(
-            result.expect_err("finalize failure").kind(),
-            MvApplicationErrorKind::KnownCommittedFinalizeFailed
-        );
-        assert!(!engine.calls().contains(&"cleanup"));
-    }
+    assert!(!engine.calls().contains(&"cleanup"));
 }
 
 #[test]

@@ -1,0 +1,2 @@
+# LNP-3A is a native product-topology acceptance gate, not an all-in-one suite.
+explicit_only = true

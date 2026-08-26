@@ -3524,14 +3524,17 @@ fn validate_lake_publication_preflight(
     cluster_size: usize,
     jobs: usize,
 ) -> Result<()> {
-    if !suite_names.iter().any(|suite| suite == "lake-publication") {
+    let requires_native_lake_gate = suite_names
+        .iter()
+        .any(|suite| suite == "lake-publication" || suite == "lnp-3a-mv-rebuild");
+    if !requires_native_lake_gate {
         return Ok(());
     }
     if mode != ClusterMode::CrossProcess || cluster_size != 3 {
-        bail!("lake-publication requires --cluster-mode cross-process --cluster-size 3");
+        bail!("lake publication suites require --cluster-mode cross-process --cluster-size 3");
     }
     if jobs != 1 {
-        bail!("lake-publication requires -j 1 because its fixture owns one bounded fault token");
+        bail!("lake publication suites require -j 1 because their fixtures own one destructive token");
     }
     Ok(())
 }
@@ -4798,19 +4801,21 @@ mod tests {
     }
 
     #[test]
-    fn lake_publication_requires_native_serial_selection() {
-        let suites = vec!["lake-publication".to_string()];
-        validate_lake_publication_preflight(&suites, ClusterMode::CrossProcess, 3, 1)
-            .expect("canonical native selection");
-        for (mode, size, jobs) in [
-            (ClusterMode::AllInOne, 1, 1),
-            (ClusterMode::CrossProcess, 2, 1),
-            (ClusterMode::CrossProcess, 3, 2),
-        ] {
-            assert!(
-                validate_lake_publication_preflight(&suites, mode, size, jobs).is_err(),
-                "noncanonical lake-publication selection must fail"
-            );
+    fn lake_publication_suites_require_native_serial_selection() {
+        for suite in ["lake-publication", "lnp-3a-mv-rebuild"] {
+            let suites = vec![suite.to_string()];
+            validate_lake_publication_preflight(&suites, ClusterMode::CrossProcess, 3, 1)
+                .expect("canonical native selection");
+            for (mode, size, jobs) in [
+                (ClusterMode::AllInOne, 1, 1),
+                (ClusterMode::CrossProcess, 2, 1),
+                (ClusterMode::CrossProcess, 3, 2),
+            ] {
+                assert!(
+                    validate_lake_publication_preflight(&suites, mode, size, jobs).is_err(),
+                    "noncanonical {suite} selection must fail"
+                );
+            }
         }
     }
 
