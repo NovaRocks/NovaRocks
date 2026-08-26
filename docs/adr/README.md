@@ -267,7 +267,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0096 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
 - ADR-0075 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（active）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
-- ADR-0108 — MV lake descriptor 为何是 desired semantics 的重建 authority，StateStore definition 仅为可重建 projection（active）
+- ADR-0109 — MV lake descriptor 为何是 desired semantics 的重建 authority，StateStore definition 仅为可重建 projection（active）
 
 #### 历史
 

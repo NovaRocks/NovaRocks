@@ -1,5 +1,5 @@
 ---
-id: ADR-0108
+id: ADR-0109
 title: "MV lake descriptor is the rebuild authority for desired semantics"
 domain: [frontend-mv, provider-spi]
 status: active
