@@ -432,19 +432,51 @@ impl MvPublishedRefreshObservation {
 pub struct MvLakePackageObservation {
     table: ConnectorTableIdentity,
     descriptor: MvLakeDescriptorProjection,
+    current_target_snapshot: Option<MvLakeTargetSnapshotObservation>,
     publication: MvLakePublicationObservation,
+}
+
+/// Exact target snapshot metadata projected from the same sealed metadata
+/// value as an MV lake package. It is a revision identity, not a refresh
+/// watermark: a never-published bootstrap snapshot may legitimately appear.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MvLakeTargetSnapshotObservation {
+    snapshot_id: i64,
+    timestamp_ms: i64,
+}
+
+impl MvLakeTargetSnapshotObservation {
+    pub fn try_new(snapshot_id: i64, timestamp_ms: i64) -> Result<Self, ConnectorError> {
+        if snapshot_id < 0 || timestamp_ms < 0 {
+            return corrupt("MV lake target snapshot observation has a negative value");
+        }
+        Ok(Self {
+            snapshot_id,
+            timestamp_ms,
+        })
+    }
+
+    pub const fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    pub const fn timestamp_ms(&self) -> i64 {
+        self.timestamp_ms
+    }
 }
 
 impl MvLakePackageObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
         descriptor: MvLakeDescriptorProjection,
+        current_target_snapshot: Option<MvLakeTargetSnapshotObservation>,
         publication: MvLakePublicationObservation,
     ) -> Result<Self, ConnectorError> {
         validate_table(&table, "MV lake package")?;
         Ok(Self {
             table,
             descriptor,
+            current_target_snapshot,
             publication,
         })
     }
@@ -453,6 +485,9 @@ impl MvLakePackageObservation {
     }
     pub const fn descriptor(&self) -> &MvLakeDescriptorProjection {
         &self.descriptor
+    }
+    pub const fn current_target_snapshot(&self) -> Option<MvLakeTargetSnapshotObservation> {
+        self.current_target_snapshot
     }
     pub const fn publication(&self) -> &MvLakePublicationObservation {
         &self.publication
@@ -1085,6 +1120,41 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), ConnectorErrorKind::ResourceExhausted);
         assert_eq!(unavailable().kind(), ConnectorErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn lake_package_preserves_exact_current_target_snapshot() {
+        let descriptor = MvLakeDescriptorProjection::try_new(
+            "pkg".into(),
+            "descriptor".into(),
+            None,
+            &context(),
+        )
+        .unwrap();
+        let snapshot = MvLakeTargetSnapshotObservation::try_new(42, 1_700_000_042_000).unwrap();
+        let package = MvLakePackageObservation::try_new(
+            table(),
+            descriptor,
+            Some(snapshot),
+            MvLakePublicationObservation::NeverPublished,
+        )
+        .unwrap();
+
+        assert_eq!(package.current_target_snapshot(), Some(snapshot));
+        assert_eq!(snapshot.snapshot_id(), 42);
+        assert_eq!(snapshot.timestamp_ms(), 1_700_000_042_000);
+        assert_eq!(
+            MvLakeTargetSnapshotObservation::try_new(-1, 0)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        assert_eq!(
+            MvLakeTargetSnapshotObservation::try_new(1, -1)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::CorruptData
+        );
     }
 
     #[test]

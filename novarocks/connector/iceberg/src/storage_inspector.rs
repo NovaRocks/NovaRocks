@@ -159,7 +159,18 @@ pub struct IcebergStorageRefreshMarker {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergStorageLakePackageObservation {
     pub descriptor_properties: BTreeMap<String, String>,
+    /// The exact current target snapshot from the same decoded metadata value
+    /// as the descriptor and publication facts. This is intentionally distinct
+    /// from publication provenance: an unrefreshed bootstrap snapshot is still
+    /// an exact target revision, but not a refresh watermark.
+    pub current_target_snapshot: Option<IcebergStorageLakeTargetSnapshotObservation>,
     pub publication: IcebergStorageLakePublication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcebergStorageLakeTargetSnapshotObservation {
+    pub snapshot_id: i64,
+    pub timestamp_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -633,7 +644,13 @@ fn lake_package_observation(
             "Iceberg MV package is missing its inline descriptor property",
         ));
     }
-    let publication = match table.current_snapshot() {
+    let current_snapshot = table.current_snapshot();
+    let current_target_snapshot =
+        current_snapshot.map(|snapshot| IcebergStorageLakeTargetSnapshotObservation {
+            snapshot_id: snapshot.snapshot_id(),
+            timestamp_ms: snapshot.timestamp_ms(),
+        });
+    let publication = match current_snapshot {
         None => IcebergStorageLakePublication::NeverPublished,
         Some(snapshot) => match MvProvenanceV1::from_snapshot_summary(snapshot).map_err(corrupt)? {
             None => IcebergStorageLakePublication::NeverPublished,
@@ -648,6 +665,7 @@ fn lake_package_observation(
     validate_context(context)?;
     Ok(Some(IcebergStorageLakePackageObservation {
         descriptor_properties,
+        current_target_snapshot,
         publication,
     }))
 }
@@ -973,6 +991,38 @@ mod tests {
         )
         .expect_err("payload limit");
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    }
+
+    #[test]
+    fn lake_projection_preserves_current_target_snapshot_from_one_metadata_value() {
+        let table = maintenance_metadata(
+            vec![SnapshotFixture::new(42, 1_700_000_042_000).on_main()],
+            HashMap::from([
+                (
+                    MV_DESCRIPTOR_PACKAGE_ID_PROP.to_string(),
+                    "analytics.mv_orders".to_string(),
+                ),
+                (
+                    MV_DESCRIPTOR_INLINE_PROP.to_string(),
+                    "descriptor".to_string(),
+                ),
+            ]),
+        );
+
+        let package = lake_package_observation(&table, &context(4096))
+            .expect("lake package observation")
+            .expect("MV package");
+        assert_eq!(
+            package.current_target_snapshot,
+            Some(IcebergStorageLakeTargetSnapshotObservation {
+                snapshot_id: 42,
+                timestamp_ms: 1_700_000_042_000,
+            })
+        );
+        assert_eq!(
+            package.publication,
+            IcebergStorageLakePublication::NeverPublished
+        );
     }
 
     #[test]

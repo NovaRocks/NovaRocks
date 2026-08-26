@@ -33,7 +33,8 @@ use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
 use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
 use novarocks_connector_iceberg::resources::{IcebergControlResources, IcebergExecutionResources};
 use novarocks_connector_iceberg::storage_inspector::{
-    IcebergStorageInspector, IcebergStorageLakePublication, IcebergStoragePartitionTransform,
+    IcebergStorageInspector, IcebergStorageLakePublication,
+    IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
 };
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
@@ -52,12 +53,13 @@ use novarocks_spi::connector::{
     ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionInstaller, ConnectorExecutionProviderKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
-    MvLakePackageObservation, MvLakePublicationObservation, MvMaintenanceMetadataObservation,
-    MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
-    MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
-    MvObservedSnapshot, MvPublishedBaseObservation, MvPublishedRefreshObservation,
-    MvPublishedRefreshTechnique, MvRefreshBaseObservation, MvRefreshTargetObservation,
-    MvSchemaValidationObservation, MvStorageObservationPort, WriteCommitEvidenceLimits,
+    MvLakePackageObservation, MvLakePublicationObservation, MvLakeTargetSnapshotObservation,
+    MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
+    MvObservedPartitionField, MvObservedPartitionSpec, MvObservedPartitionTransform,
+    MvObservedRefreshMarker, MvObservedSnapshot, MvPublishedBaseObservation,
+    MvPublishedRefreshObservation, MvPublishedRefreshTechnique, MvRefreshBaseObservation,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
+    WriteCommitEvidenceLimits,
 };
 use novarocks_spi::state_store::{
     MAX_KEY_BYTES, StateStoreProviderAccessMode, StateStoreProviderDescriptor,
@@ -115,6 +117,19 @@ fn mv_partition_observation(
             })
             .collect(),
     )
+}
+
+/// Preserve the exact snapshot identity carried by the provider package
+/// observation. Publication consistency is frontend policy; this adapter only
+/// translates the sealed provider value without loading metadata again.
+fn mv_lake_target_snapshot_observation(
+    observed: Option<IcebergStorageLakeTargetSnapshotObservation>,
+) -> Result<Option<MvLakeTargetSnapshotObservation>, ConnectorError> {
+    observed
+        .map(|snapshot| {
+            MvLakeTargetSnapshotObservation::try_new(snapshot.snapshot_id, snapshot.timestamp_ms)
+        })
+        .transpose()
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
@@ -224,6 +239,8 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 .cloned(),
             &context,
         )?;
+        let current_target_snapshot =
+            mv_lake_target_snapshot_observation(observed.current_target_snapshot)?;
         let publication = match observed.publication {
             IcebergStorageLakePublication::NeverPublished => {
                 MvLakePublicationObservation::NeverPublished
@@ -263,8 +280,13 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 )?)
             }
         };
-        MvLakePackageObservation::try_new(metadata.identity.clone(), descriptor, publication)
-            .map(Some)
+        MvLakePackageObservation::try_new(
+            metadata.identity.clone(),
+            descriptor,
+            current_target_snapshot,
+            publication,
+        )
+        .map(Some)
     }
 
     fn observe_refresh_base(
@@ -823,8 +845,26 @@ pub fn state_store_provider_registry(
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_backend_execution_installers, compose_frontend_control_factories};
+    use super::{
+        IcebergStorageLakeTargetSnapshotObservation, compose_backend_execution_installers,
+        compose_frontend_control_factories, mv_lake_target_snapshot_observation,
+    };
     use novarocks_spi::connector::ConnectorExecutionProviderKind;
+
+    #[test]
+    fn lake_target_snapshot_adapter_preserves_provider_metadata() {
+        let observed = mv_lake_target_snapshot_observation(Some(
+            IcebergStorageLakeTargetSnapshotObservation {
+                snapshot_id: 42,
+                timestamp_ms: 1_700_000_042_000,
+            },
+        ))
+        .expect("SPI snapshot observation")
+        .expect("snapshot");
+
+        assert_eq!(observed.snapshot_id(), 42);
+        assert_eq!(observed.timestamp_ms(), 1_700_000_042_000);
+    }
 
     #[test]
     fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
