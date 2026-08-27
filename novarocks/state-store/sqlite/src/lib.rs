@@ -46,25 +46,70 @@ pub const SQLITE_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
 #[derive(Clone)]
 pub struct SqliteStateStoreContribution {
     path: PathBuf,
-    deployment_owner: String,
+    history_retention: SqliteHistoryRetentionConfig,
 }
 
 impl SqliteStateStoreContribution {
-    pub fn new(path: PathBuf, deployment_owner: String) -> Self {
+    pub fn new(path: PathBuf, history_retention: SqliteHistoryRetentionConfig) -> Self {
         Self {
             path,
-            deployment_owner,
+            history_retention,
         }
     }
 
     pub fn into_factory(self) -> SqliteStateStoreProviderFactory {
-        SqliteStateStoreProviderFactory::new(self.path, self.deployment_owner)
+        SqliteStateStoreProviderFactory::new(self.path, self.history_retention)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqliteHistoryRetentionConfig {
+    pub max_age_secs: u64,
+    pub max_change_rows: usize,
+    pub max_commit_receipts: usize,
+    pub maintenance_interval_commits: usize,
+    pub incremental_vacuum_pages: usize,
+}
+
+impl Default for SqliteHistoryRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_age_secs: 7 * 24 * 60 * 60,
+            max_change_rows: 1_000_000,
+            max_commit_receipts: 1_000_000,
+            maintenance_interval_commits: 256,
+            incremental_vacuum_pages: 1024,
+        }
+    }
+}
+
+impl SqliteHistoryRetentionConfig {
+    fn validate(&self, limits: &StateStoreLimits) -> Result<(), StateStoreError> {
+        if self.max_age_secs == 0
+            || self.max_change_rows == 0
+            || self.max_commit_receipts == 0
+            || self.maintenance_interval_commits == 0
+            || self.incremental_vacuum_pages == 0
+        {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "SQLite history retention values must be non-zero",
+            ));
+        }
+        if self.max_change_rows < limits.max_transaction_operations {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "SQLite max change rows must cover one maximum transaction",
+            ));
+        }
+        Ok(())
     }
 }
 
 struct SqliteStateStore {
     path: PathBuf,
     limits: StateStoreLimits,
+    history_retention: SqliteHistoryRetentionConfig,
     metrics: Arc<StateStoreMetrics>,
     commit_registry: txn::CommitRegistry,
     #[cfg(test)]
@@ -137,15 +182,10 @@ impl StateStore for SqliteStateStore {
 impl SqliteStateStore {
     async fn open(
         path: PathBuf,
-        deployment_owner: String,
+        history_retention: SqliteHistoryRetentionConfig,
         request: StateStoreOpenRequest,
     ) -> Result<Self, StateStoreError> {
-        if request.deployment.active_fe_count.get() != 1 {
-            return Err(StateStoreError::new(
-                StateStoreErrorKind::UnsupportedDeployment,
-                "sqlite state store requires exactly one active FE",
-            ));
-        }
+        history_retention.validate(&request.limits)?;
 
         if is_memory_path(&path) {
             return Err(StateStoreError::new(
@@ -155,7 +195,7 @@ impl SqliteStateStore {
         }
 
         tokio::task::spawn_blocking(move || {
-            open_blocking(path, deployment_owner, request.cluster_id, request.limits)
+            open_blocking(path, history_retention, request.cluster_id, request.limits)
         })
         .await
         .map_err(|_| {
@@ -169,24 +209,19 @@ impl SqliteStateStore {
 
 fn open_blocking(
     path: PathBuf,
-    deployment_owner: String,
+    history_retention: SqliteHistoryRetentionConfig,
     cluster_id: String,
     limits: StateStoreLimits,
 ) -> Result<SqliteStateStore, StateStoreError> {
     let path = canonicalize_database_path(&path)?;
-    let database_path = database_path_bytes(&path)?;
     let owner_lock = acquire_owner_lock(&path)?;
     let mut connection = open_connection(&path)?;
-    let identity = schema::initialize(
-        &mut connection,
-        cluster_id.as_bytes(),
-        deployment_owner.as_bytes(),
-        &database_path,
-    )?;
+    let identity = schema::initialize(&mut connection, cluster_id.as_bytes())?;
 
     Ok(SqliteStateStore {
         path,
         limits,
+        history_retention,
         metrics: Arc::new(StateStoreMetrics::new(SQLITE_STATE_STORE_PROVIDER_ID)),
         commit_registry: txn::new_commit_registry(),
         #[cfg(test)]
@@ -289,39 +324,6 @@ fn canonicalize_database_path(path: &Path) -> Result<PathBuf, StateStoreError> {
     let canonical_parent = fs::canonicalize(parent)
         .map_err(|_| path_error("failed to canonicalize SQLite state store directory"))?;
     Ok(canonical_parent.join(file_name))
-}
-
-fn database_path_bytes(path: &Path) -> Result<Vec<u8>, StateStoreError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        let native_path = path.as_os_str().as_bytes();
-        let mut encoded = Vec::with_capacity(b"unix\0".len() + native_path.len());
-        encoded.extend_from_slice(b"unix\0");
-        encoded.extend_from_slice(native_path);
-        Ok(encoded)
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-
-        let mut encoded = b"windows-utf16le\0".to_vec();
-        for code_unit in path.as_os_str().encode_wide() {
-            encoded.extend_from_slice(&code_unit.to_le_bytes());
-        }
-        Ok(encoded)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        Err(StateStoreError::new(
-            StateStoreErrorKind::InvalidConfiguration,
-            "SQLite state store native path identity encoding is unsupported on this target",
-        ))
-    }
 }
 
 fn acquire_owner_lock(path: &Path) -> Result<File, StateStoreError> {

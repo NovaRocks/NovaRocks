@@ -1286,26 +1286,29 @@ fn commit_blocking(
     }
 
     let revision_i64 = i64::try_from(revision).expect("revision checked above");
+    let committed_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
     for (sequence, key) in changed_keys.iter().enumerate() {
         if let Err(error) = state.connection.execute(
-            "INSERT INTO state_store_changes(revision, sequence, key) VALUES (?1, ?2, ?3)",
-            params![revision_i64, sequence as i64, key.as_bytes()],
+            "INSERT INTO state_store_changes(revision, sequence, key, committed_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![revision_i64, sequence as i64, key.as_bytes(), committed_at_ms],
         ) {
             let outcome = classify_apply_error(&error);
             return rollback_outcome(state, outcome);
         }
     }
 
-    let committed_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64;
     if let Err(error) = state.connection.execute(
         "INSERT INTO state_store_commits(transaction_id, revision, committed_at_ms) VALUES (?1, ?2, ?3)",
         params![transaction_id.as_uuid().as_bytes(), revision_i64, committed_at_ms],
     ) {
         let outcome = classify_apply_error(&error);
+        return rollback_outcome(state, outcome);
+    }
+    if let Err(outcome) = refresh_history_row_counters(&state.connection) {
         return rollback_outcome(state, outcome);
     }
     match state.connection.execute(
@@ -1340,6 +1343,44 @@ fn commit_blocking(
             })
         }
         Err(error) => classify_commit_error(state, transaction_id, path, &error),
+    }
+}
+
+fn refresh_history_row_counters(connection: &Connection) -> Result<(), CommitOutcome> {
+    let changes = count_history_rows(connection, "state_store_changes")?;
+    let commits = count_history_rows(connection, "state_store_commits")?;
+    update_u64_metadata(connection, schema::CHANGE_ROW_COUNT_KEY, changes)?;
+    update_u64_metadata(connection, schema::COMMIT_RECEIPT_COUNT_KEY, commits)
+}
+
+fn count_history_rows(connection: &Connection, table: &'static str) -> Result<u64, CommitOutcome> {
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    let count = connection
+        .query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .map_err(|error| classify_apply_error(&error))?;
+    u64::try_from(count).map_err(|_| {
+        CommitOutcome::DefiniteFailure(StateStoreError::new(
+            StateStoreErrorKind::Corruption,
+            "SQLite history row count is malformed",
+        ))
+    })
+}
+
+fn update_u64_metadata(
+    connection: &Connection,
+    key: &[u8],
+    value: u64,
+) -> Result<(), CommitOutcome> {
+    match connection.execute(
+        "UPDATE state_store_meta SET value = ?1 WHERE key = ?2",
+        params![value.to_be_bytes().as_slice(), key],
+    ) {
+        Ok(1) => Ok(()),
+        Ok(_) => Err(CommitOutcome::DefiniteFailure(StateStoreError::new(
+            StateStoreErrorKind::Corruption,
+            "SQLite history metadata is missing",
+        ))),
+        Err(error) => Err(classify_apply_error(&error)),
     }
 }
 
@@ -1826,7 +1867,6 @@ impl WriteTransaction for SqliteWriteTransaction {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     use bytes::Bytes;
@@ -1886,14 +1926,10 @@ mod tests {
         Arc::new(
             SqliteStateStore::open(
                 temp.path().join("state-store.sqlite"),
-                "fe-a".to_owned(),
+                super::super::SqliteHistoryRetentionConfig::default(),
                 StateStoreOpenRequest {
                     cluster_id: "cluster-a".to_owned(),
                     limits: resolve_state_store_limits(&limits),
-                    deployment: novarocks_spi::state_store::FeDeploymentView {
-                        active_fe_count: NonZeroUsize::new(1).expect("one FE"),
-                        topology_revision: Bytes::from_static(b"topology-r1"),
-                    },
                     deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
                 },
             )

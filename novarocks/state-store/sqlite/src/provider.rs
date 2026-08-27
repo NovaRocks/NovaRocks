@@ -22,28 +22,27 @@ use std::time::Instant;
 use async_trait::async_trait;
 use novarocks_spi::state_store::{
     MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
-    StateStoreProviderInstance, StateStoreProviderLifecycle,
+    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
+    StateStoreProviderLifecycle,
 };
 
-use super::{SQLITE_STATE_STORE_PROVIDER_ID, SqliteStateStore};
+use super::{SQLITE_STATE_STORE_PROVIDER_ID, SqliteHistoryRetentionConfig, SqliteStateStore};
 
 pub struct SqliteStateStoreProviderFactory {
     descriptor: StateStoreProviderDescriptor,
     path: PathBuf,
-    deployment_owner: String,
+    history_retention: SqliteHistoryRetentionConfig,
 }
 
 impl SqliteStateStoreProviderFactory {
-    pub fn new(path: PathBuf, deployment_owner: String) -> Self {
+    pub fn new(path: PathBuf, history_retention: SqliteHistoryRetentionConfig) -> Self {
         Self {
             descriptor: StateStoreProviderDescriptor::new(
                 SQLITE_STATE_STORE_PROVIDER_ID,
-                StateStoreProviderAccessMode::ExclusiveSingleFrontend,
                 MAX_KEY_BYTES,
             ),
             path,
-            deployment_owner,
+            history_retention,
         }
     }
 }
@@ -62,7 +61,7 @@ impl StateStoreProviderFactory for SqliteStateStoreProviderFactory {
             return Err(deadline_error());
         }
         let store =
-            SqliteStateStore::open(self.path, self.deployment_owner, request.clone()).await?;
+            SqliteStateStore::open(self.path, self.history_retention, request.clone()).await?;
         if Instant::now() >= request.deadline {
             drop(store);
             return Err(deadline_error());
@@ -138,11 +137,9 @@ fn deadline_error() -> StateStoreError {
 #[cfg(test)]
 mod tests {
     use std::future::{Future, poll_fn};
-    use std::num::NonZeroUsize;
     use std::task::Poll;
     use std::time::Duration;
 
-    use bytes::Bytes;
     use tempfile::TempDir;
 
     use super::*;
@@ -151,10 +148,6 @@ mod tests {
         StateStoreOpenRequest {
             cluster_id: "cluster-a".to_owned(),
             limits: novarocks_spi::state_store::StateStoreLimits::default(),
-            deployment: novarocks_spi::state_store::FeDeploymentView {
-                active_fe_count: NonZeroUsize::new(1).unwrap(),
-                topology_revision: Bytes::from_static(b"topology-r1"),
-            },
             deadline,
         }
     }
@@ -165,7 +158,7 @@ mod tests {
     ) -> Box<dyn StateStoreProviderInstance> {
         Box::new(SqliteStateStoreProviderFactory::new(
             temp.path().join("state-store.sqlite"),
-            "fe-a".to_owned(),
+            SqliteHistoryRetentionConfig::default(),
         ))
         .open(request(deadline))
         .await
