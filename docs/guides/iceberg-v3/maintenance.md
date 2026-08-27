@@ -53,10 +53,9 @@ maintenance 的三层职责是固定的：
 provider = "sqlite"
 path = "/absolute/path/frontend-state.sqlite"
 cluster_id = "cluster-a"
-deployment_owner = "fe-1"
 ```
 
-重启 FE 时复用同一绝对 `path`、`cluster_id` 与 `deployment_owner`，已完成的
+重启 FE 时复用同一绝对 `path` 与 `cluster_id`，已完成的
 `SHOW ALTER TABLE OPTIMIZE` 历史仍可见，新 job 也可继续提交。未配置 StateStore 时，
 `ALTER TABLE ... OPTIMIZE`、`SHOW ALTER TABLE OPTIMIZE` 与 automatic optimize 会返回明确的
 unavailable error；`REWRITE MANIFESTS`、`EXPIRE SNAPSHOTS`、`REMOVE ORPHAN FILES` 和

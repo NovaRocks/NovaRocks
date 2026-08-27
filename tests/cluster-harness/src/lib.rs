@@ -5408,7 +5408,6 @@ mod tests {
 provider = "sqlite"
 cluster_id = "novarocks-sql-test-cross-process"
 path = "tmp/novarocks-sql-test-state-store.sqlite"
-deployment_owner = "fe-1"
 
 [catalog_source]
 mode = "dynamic-state-store"

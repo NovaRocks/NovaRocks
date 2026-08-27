@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0119 (docs/adr/ADR-0119-sqlite-is-the-only-production-state-store.md)
+
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
@@ -76,3 +78,4 @@ impl StateStoreAppConfig {
         self.store.validate()
     }
 }
+// Design: ADR-0119 (docs/adr/ADR-0119-sqlite-is-the-only-production-state-store.md)

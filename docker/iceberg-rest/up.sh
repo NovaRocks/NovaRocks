@@ -395,7 +395,6 @@ exchange_wait_ms = 300000
 provider = "sqlite"
 path = "$runtime_dir/frontend-state.sqlite"
 cluster_id = "$env_id"
-deployment_owner = "fe-1"
 
 [standalone_server]
 mysql_port = $mysql_port
@@ -684,7 +683,7 @@ Do not guess ports.
 - Spark defaults: \`$spark_defaults_file\`
 - Spark v3 smoke SQL: \`$spark_v3_smoke_sql\`
 
-The generated FE config uses this worktree-local StateStore. Frontend
+The generated FE config uses this worktree-local SQLite StateStore. Frontend
 \`ALTER TABLE ... OPTIMIZE\` job history is durable across restarts only while
 the same runtime entry and StateStore path are retained.
 

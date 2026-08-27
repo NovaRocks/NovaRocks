@@ -35,15 +35,13 @@
 # - `[connector.object_store]`: every registered scenario creates its Iceberg
 #   warehouse on the local filesystem under the harness runtime directory, so
 #   the system stage needs neither MinIO nor the iceberg-rest Docker fixture.
-# - FoundationDB / MySQL StateStore settings: this baseline stays on SQLite so a
-#   feature-enabled binary running it proves coexistence only, never that a
-#   query used a specific StateStore provider.
+# - SQLite is the only production StateStore provider. MySQL/FoundationDB leaf
+#   checks are experimental and do not participate in this native scenario.
 
 [state_store]
 provider = "sqlite"
 cluster_id = "novarocks-system-scenarios"
 path = "tmp/system-scenarios-state-store.sqlite"
-deployment_owner = "fe-1"
 
 [catalog_source]
 # System scenarios create and mutate catalogs through SQL, so their FE uses

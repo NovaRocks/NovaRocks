@@ -54,9 +54,10 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
 - 如果使用对象存储，所有节点的凭据、endpoint 和 path-style 设置应保持一致。
 - `role=fe` 必须显式选择 `[catalog_source]`。StaticFile 从一份挂载的完整 snapshot 启动；
-  DynamicStateStore 才要求可用的 `[state_store]` 并允许 SQL catalog mutation。StateStore
+  DynamicStateStore 才要求可用的 SQLite `[state_store]` 并允许 SQL catalog mutation。StateStore
   不是 backend membership source。backend desired lifecycle 属于外部 orchestrator，FE 的 observed
-  registry 会由 BE announce 和 FE-pull heartbeat 在重启后重建。SQLite 只适用于恰好一个 active FE。
+  registry 会由 BE announce 和 FE-pull heartbeat 在重启后重建。SQLite 只适用于恰好一个 active FE；多 FE
+  fencing/takeover 尚未实现，不能由 StateStore SPI 或 SQLite 配置字段推断。
 
 ## 编译 NovaRocks
 
@@ -155,7 +156,6 @@ log_level = "info"
 provider = "sqlite"
 cluster_id = "production-cluster"
 path = "meta/fe-state-store.sqlite"
-deployment_owner = "fe-a"
 
 [catalog_source]
 # This distributed example creates catalogs through SQL.

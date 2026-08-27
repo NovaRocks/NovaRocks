@@ -2,9 +2,9 @@
 id: ADR-0093
 title: "StateStore providers are leaf crates and Frontend owns consumer runtime"
 domain: [crate-boundary]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0119
 date: 2026-08-20
 provenance:
   - "discussion: 2026-08-20 StateStore provider and Frontend composition ownership"

@@ -149,7 +149,6 @@ never selects the source mode implicitly and never owns backend membership.
 provider = "sqlite"
 path = "meta/frontend-state.sqlite"
 cluster_id = "local-cluster"
-deployment_owner = "fe-1"
 
 [native_trust]
 deployment_id = "analytics-prod"
@@ -183,6 +182,13 @@ process identity. Persistent
 user tables belong to explicitly created external Iceberg catalogs;
 `[connector.object_store]` supplies process-local object-store credentials for
 connector execution and does not create a native internal table store.
+
+SQLite is the only production StateStore provider. Its file uses schema v2; an
+old v1 file is rejected rather than migrated or reset. MySQL and FoundationDB
+implementations remain experimental leaf crates and are not Server configuration
+options. Optional `[state_store.history_retention]` values bound provider-owned
+change and commit-resolution history; all five fields have safe defaults in the
+FE example and a configured SQLite failure blocks FE startup.
 Secret-bearing scalars may be literal for local development or an exact
 `${ENV:VAR}` reference. References are resolved once by Server startup; missing,
 empty, malformed, and non-UTF-8 values fail startup without exposing the value.
