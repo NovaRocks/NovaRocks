@@ -1229,8 +1229,8 @@ fn join_distribution_label(
     }
 }
 
-fn dict_actual_suffix(actual: &SqlOperatorMetrics) -> String {
-    if actual.dict_input_rows == 0 && actual.dict_input_columns == 0 {
+fn dict_actual_suffix(actual: &SqlOperatorMetrics, render_zero_counters: bool) -> String {
+    if !render_zero_counters && actual.dict_input_rows == 0 && actual.dict_input_columns == 0 {
         return String::new();
     }
     format!(
@@ -1280,7 +1280,14 @@ where
                 s.push_str(&format!(" out_probe={}", fmt_time_ns(metrics.out_probe_ns)));
             }
             s.push_str(&format!(" peak={}}}", fmt_bytes(metrics.peak_mem_bytes)));
-            s.push_str(&dict_actual_suffix(&metrics));
+            // A scan owns the carrier boundary.  Keep its zero-valued counters
+            // visible so EXPLAIN ANALYZE distinguishes an observed plain scan
+            // from a missing runtime profile; non-scan nodes stay compact
+            // until they actually receive a dictionary carrier.
+            s.push_str(&dict_actual_suffix(
+                &metrics,
+                matches!(node.payload, DistributedNodeKind::Scan(_)),
+            ));
             s
         }
         None => String::new(),
@@ -2352,8 +2359,14 @@ mod tests {
             "nodes absent from the actuals map must not print act=:\n{text}"
         );
         assert!(
-            !text.contains("dict={"),
-            "zero dictionary counters must not render dictionary actuals:\n{text}"
+            text.contains(
+                "1:SCAN test_db.t (alias=t) stats={rows=3 conf=fallback} act={rows=11 time=450us peak=64B} dict={in_rows=0, kept_rows=0, hydrated_rows=0, in_cols=0, kept_cols=0, hydrated_cols=0, unsupported_cols=0}"
+            ),
+            "scan runtime profiles must render zero dictionary counters:\n{text}"
+        );
+        assert!(
+            !text.contains("3:HASH AGGREGATE (SINGLE, group by: [t.k]) stats={rows=3 conf=fallback} act={rows=7 time=2.3ms peak=4.0MB} dict={"),
+            "non-scan nodes must remain compact for zero dictionary counters:\n{text}"
         );
     }
 
