@@ -2,9 +2,9 @@
 id: ADR-0104
 title: "Typed Connector Execution Binding Host"
 domain: [provider-spi, distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0120
 date: 2026-08-24
 provenance:
   - "PR: pending local implementation"

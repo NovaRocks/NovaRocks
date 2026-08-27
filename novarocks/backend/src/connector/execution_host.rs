@@ -41,7 +41,7 @@ use super::typed_registry::{InstalledReadExecution, InstalledReadExecutionRegist
 
 const CONNECTOR_BINDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Design: ADR-0104 (docs/adr/ADR-0104-typed-connector-execution-binding-declaration.md)
+// Design: ADR-0120 (docs/adr/ADR-0120-connector-binding-restart-reconciliation.md)
 /// Process-scoped owner of BE-only execution bindings. Its built-in installer
 /// set is sealed before readiness, and fragments resolve only query-leased
 /// exact generations.
@@ -325,35 +325,8 @@ impl ConnectorExecutionHost {
                 if let Err(rejection) = ensure_admissible(&state, query, &key) {
                     return rejected(rejection);
                 }
-                // A frontend restart remints the process-local connector
-                // incarnation while a live backend keeps its prior binding.
-                // Replacement is safe only when no admitted query still
-                // leases the older generation; there is no FE takeover fence
-                // and no attempt migration hidden in this path.
-                let superseded = state
-                    .bindings
-                    .keys()
-                    .filter(|candidate| {
-                        candidate.instance_id() == key.instance_id() && *candidate != &key
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if !superseded.is_empty() {
-                    let old_generation_is_leased = state.query_leases.values().any(|leases| {
-                        superseded
-                            .iter()
-                            .any(|candidate| leases.contains(candidate))
-                    });
-                    if old_generation_is_leased {
-                        return rejected(host_unavailable(
-                            "connector instance has an active prior incarnation",
-                        ));
-                    }
-                    for old_key in superseded {
-                        state.bindings.remove(&old_key);
-                        state.retiring.remove(&old_key);
-                        state.typed_registry.retire(&old_key);
-                    }
+                if let Err(rejection) = retire_unleased_prior_generations(&mut state, &key) {
+                    return rejected(rejection);
                 }
                 let Some(installer) = state.installers.get(&declaration.provider_kind()).cloned()
                 else {
@@ -586,6 +559,71 @@ fn ensure_admissible(
             false,
             "one query cannot lease multiple connector incarnations for the same instance",
         ));
+    }
+    Ok(())
+}
+
+/// Reconciles a restarted frontend's newly-created generation with this
+/// backend process's former generation of the same connector instance.
+///
+/// The frontend control host is intentionally process-local. After a clean
+/// frontend restart it cannot name the former generation to retire it through
+/// the normal exact-key control RPC. The backend is nevertheless authoritative
+/// for whether that former binding still serves a query: only an entirely
+/// unleased, ready (or terminally failed) generation may be retired here. An
+/// installing generation and every generation leased by an active query remain
+/// a typed refusal, never an overwrite.
+fn retire_unleased_prior_generations(
+    state: &mut ExecutionHostState,
+    key: &ConnectorExecutionBindingKey,
+) -> Result<(), EnsureConnectorExecutionBindingRejection> {
+    let prior = state
+        .bindings
+        .keys()
+        .filter(|candidate| {
+            candidate.instance_id == key.instance_id && candidate.incarnation != key.incarnation
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if prior.is_empty() {
+        return Ok(());
+    }
+
+    if state
+        .query_leases
+        .values()
+        .any(|leases| prior.iter().any(|candidate| leases.contains(candidate)))
+    {
+        return Err(rejection(
+            EnsureConnectorExecutionBindingRejectionReason::QueryIncarnationConflict,
+            false,
+            "a prior connector generation is still leased by an active query",
+        ));
+    }
+
+    for candidate in &prior {
+        let Some(cell) = state.bindings.get(candidate) else {
+            continue;
+        };
+        let cell_state = cell.state.lock().map_err(|_| {
+            internal_text("connector execution replacement could not inspect a prior generation")
+        })?;
+        if matches!(
+            *cell_state,
+            BindingCellState::Installing { .. } | BindingCellState::RetryableFailed { .. }
+        ) {
+            return Err(rejection(
+                EnsureConnectorExecutionBindingRejectionReason::InternalFailure,
+                true,
+                "a prior connector generation is still changing state",
+            ));
+        }
+    }
+
+    for candidate in prior {
+        state.bindings.remove(&candidate);
+        state.retiring.insert(candidate.clone());
+        state.typed_registry.retire(&candidate);
     }
     Ok(())
 }
@@ -1073,29 +1111,47 @@ mod tests {
     }
 
     #[test]
-    fn idle_incarnation_is_replaced_after_frontend_restart() {
-        let host = host(Arc::new(AtomicUsize::new(0)), None);
-        let old = declaration(1, "default");
+    fn restarted_frontend_replaces_an_unleased_generation() {
+        let execution_host = host(Arc::new(AtomicUsize::new(0)), None);
+        let old = declaration(7, "default");
         let old_key = ConnectorExecutionBindingKey::from(&old);
         let old_query = query(1);
         assert!(matches!(
-            host.ensure(old_query, &admitted(old)).outcome(),
+            execution_host.ensure(old_query, &admitted(old)).outcome(),
             EnsureConnectorExecutionBindingOutcome::Ensured
         ));
-        host.release_query(old_query)
-            .expect("release completed old query lease");
+        execution_host
+            .release_query(old_query)
+            .expect("completed query releases its binding generation");
 
-        let replacement = declaration(2, "default");
+        let replacement = declaration(8, "default");
         let replacement_key = ConnectorExecutionBindingKey::from(&replacement);
         assert!(matches!(
-            host.ensure(query(2), &admitted(replacement)).outcome(),
+            execution_host
+                .ensure(query(2), &admitted(replacement))
+                .outcome(),
             EnsureConnectorExecutionBindingOutcome::Ensured
         ));
-        assert!(
-            host.resolver_for(query(2))
-                .resolve(&replacement_key)
-                .is_ok()
+
+        let state = execution_host.state.lock().expect("host state");
+        assert!(!state.bindings.contains_key(&old_key));
+        assert!(state.retiring.contains(&old_key));
+        assert!(state.bindings.contains_key(&replacement_key));
+    }
+
+    #[test]
+    fn restarted_frontend_never_replaces_a_leased_generation() {
+        let execution_host = host(Arc::new(AtomicUsize::new(0)), None);
+        let old = declaration(7, "default");
+        assert!(matches!(
+            execution_host.ensure(query(1), &admitted(old)).outcome(),
+            EnsureConnectorExecutionBindingOutcome::Ensured
+        ));
+
+        assert_eq!(
+            rejection(execution_host.ensure(query(2), &admitted(declaration(8, "default"))))
+                .reason(),
+            EnsureConnectorExecutionBindingRejectionReason::QueryIncarnationConflict,
         );
-        assert!(host.resolver_for(query(2)).resolve(&old_key).is_err());
     }
 }

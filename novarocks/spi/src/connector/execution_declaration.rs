@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Design: ADR-0104 (docs/adr/ADR-0104-typed-connector-execution-binding-declaration.md)
+// Design: ADR-0120 (docs/adr/ADR-0120-connector-binding-restart-reconciliation.md)
 use std::sync::Arc;
 
 use super::{
