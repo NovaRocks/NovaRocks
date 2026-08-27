@@ -229,6 +229,14 @@ impl<'a> PreparedFragmentSchedulingView<'a> {
         self.scan_bindings.connector_read(fragment_id, node_id)
     }
 
+    pub(crate) fn typed_scan(
+        self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&'a super::scan::PreparedTypedConnectorScan> {
+        self.scan_bindings.typed_scan(fragment_id, node_id)
+    }
+
     #[allow(
         dead_code,
         reason = "Boundary projection remains available to target-gated native encoding paths."

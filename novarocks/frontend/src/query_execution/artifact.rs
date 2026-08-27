@@ -895,7 +895,7 @@ impl<'a> SchedulingFragmentView<'a> {
     /// parallelism to whatever enumeration happened to produce first.
     pub fn reads_through_connector(self, node_id: PlanNodeId) -> bool {
         self.view
-            .connector_read(self.fragment.fragment_id(), node_id)
+            .typed_scan(self.fragment.fragment_id(), node_id)
             .is_some()
     }
 

@@ -119,6 +119,7 @@ fn run_accepted_after_ack_drop(context: &mut ScenarioContext) -> Result<()> {
     let mut control = connect_control(context, "connect retry scenario control session")?;
     let tables = create_runtime_filter_tables(context, &mut control, "retry")?;
     configure_partitioned_runtime_filter(&mut control)?;
+    assert_partitioned_runtime_filter_plan(&mut control, &tables)?;
     let before_candidate_execution_id = latest_execution_id(context)?;
 
     let candidate_rows: Vec<i64> = control
@@ -362,6 +363,32 @@ fn runtime_filter_count_query(tables: &RuntimeFilterTables) -> String {
         probe = tables.probe,
         build = tables.build,
     )
+}
+
+fn assert_partitioned_runtime_filter_plan(
+    control: &mut mysql::Conn,
+    tables: &RuntimeFilterTables,
+) -> Result<()> {
+    let explain: Vec<String> = control
+        .query(format!(
+            "EXPLAIN VERBOSE {}",
+            runtime_filter_count_query(tables)
+        ))
+        .context("explain native partitioned Runtime Filter candidate query")?;
+    let explain = explain.join("\n");
+    ensure!(
+        explain.contains("HASH JOIN (PARTITIONED"),
+        "Runtime Filter candidate did not select a partitioned hash join: {explain}"
+    );
+    ensure!(
+        explain.contains("HASH_PARTITIONED (k)"),
+        "Runtime Filter candidate did not expose a key-aligned hash partition: {explain}"
+    );
+    ensure!(
+        explain.contains("producer binding") && explain.contains("consumer binding"),
+        "Runtime Filter candidate did not expose producer and consumer bindings: {explain}"
+    );
+    Ok(())
 }
 
 fn runtime_filter_blocking_query(tables: &RuntimeFilterTables) -> String {
