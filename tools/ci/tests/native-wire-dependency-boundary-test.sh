@@ -130,13 +130,15 @@ for forbidden in \
 done
 
 # Lower-layer owners must never acquire either wire crate, including through a
-# transitive normal edge.  The Server is intentionally excluded: it composes
-# FE/BE and therefore has a wire-containing transitive closure by design.
+# transitive normal edge.  ADR-0114 deliberately excludes Iceberg and
+# Execution: Iceberg owns typed provider conversion and Execution owns the
+# typed per-attempt split queue.  The Server is also excluded because it
+# composes FE/BE and therefore has a wire-containing transitive closure by
+# design.
 for lower_layer in \
   novarocks-spi \
   novarocks-types \
   novarocks-sql \
-  novarocks-execution \
   novarocks-state-store-foundationdb \
   novarocks-state-store-mysql \
   novarocks-state-store-sqlite \
