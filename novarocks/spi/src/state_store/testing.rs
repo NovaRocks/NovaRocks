@@ -116,7 +116,6 @@ impl InMemoryStateStore {
                 identity: StoreIdentity {
                     store_id: Uuid::now_v7(),
                     cluster_id: cluster_id.into(),
-                    initial_incarnation: 1,
                 },
                 revision: 0,
                 records: BTreeMap::new(),

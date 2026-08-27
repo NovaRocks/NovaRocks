@@ -21,7 +21,7 @@ use std::fmt;
 pub enum StateStoreErrorKind {
     InvalidRequest,
     InvalidConfiguration,
-    UnsupportedDeployment,
+    UnsupportedFormat,
     LimitExceeded,
     DeadlineExceeded,
     PreconditionFailed,

@@ -134,7 +134,6 @@ pub struct RangePage {
 pub struct StoreIdentity {
     pub store_id: Uuid,
     pub cluster_id: String,
-    pub initial_incarnation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

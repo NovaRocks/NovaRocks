@@ -43,8 +43,8 @@ pub use metrics::{
     StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
 };
 pub use provider::{
-    FeDeploymentView, StateStoreOpenRequest, StateStoreProviderAccessMode,
-    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
-    StateStoreProviderIdError, StateStoreProviderInstance, StateStoreProviderLifecycle,
+    StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
+    StateStoreProviderId, StateStoreProviderIdError, StateStoreProviderInstance,
+    StateStoreProviderLifecycle,
 };
 pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};

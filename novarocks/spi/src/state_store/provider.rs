@@ -16,11 +16,8 @@
 // under the License.
 
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
-
-use bytes::Bytes;
 
 use super::{MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreLimits};
 
@@ -89,45 +86,22 @@ impl fmt::Display for StateStoreProviderIdError {
 impl std::error::Error for StateStoreProviderIdError {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-// Design: ADR-0093 keeps provider deployment capabilities in SPI while runtime ownership stays in Frontend.
 pub struct StateStoreProviderDescriptor {
     pub id: StateStoreProviderId,
-    pub access_mode: StateStoreProviderAccessMode,
     pub max_key_bytes: usize,
 }
 
 impl StateStoreProviderDescriptor {
-    pub const fn new(
-        id: StateStoreProviderId,
-        access_mode: StateStoreProviderAccessMode,
-        max_key_bytes: usize,
-    ) -> Self {
+    pub const fn new(id: StateStoreProviderId, max_key_bytes: usize) -> Self {
         assert!(max_key_bytes > 0 && max_key_bytes <= MAX_KEY_BYTES);
-        Self {
-            id,
-            access_mode,
-            max_key_bytes,
-        }
+        Self { id, max_key_bytes }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum StateStoreProviderAccessMode {
-    ExclusiveSingleFrontend,
-    SharedMultiFrontend,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeDeploymentView {
-    pub active_fe_count: NonZeroUsize,
-    pub topology_revision: Bytes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateStoreOpenRequest {
     pub cluster_id: String,
     pub limits: StateStoreLimits,
-    pub deployment: FeDeploymentView,
     pub deadline: Instant,
 }
 

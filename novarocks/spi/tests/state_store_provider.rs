@@ -20,26 +20,20 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, MAX_KEY_BYTES, StateStore, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
-    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
-    StateStoreProviderId, StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity,
-    TransactionId,
+    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
+    StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity, TransactionId,
 };
 
 const TEST_PROVIDER_ID: StateStoreProviderId = StateStoreProviderId::new("test-provider");
-const TEST_DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
-    TEST_PROVIDER_ID,
-    StateStoreProviderAccessMode::SharedMultiFrontend,
-    MAX_KEY_BYTES,
-);
+const TEST_DESCRIPTOR: StateStoreProviderDescriptor =
+    StateStoreProviderDescriptor::new(TEST_PROVIDER_ID, MAX_KEY_BYTES);
 
 fn assert_factory_object_safe(_: Box<dyn StateStoreProviderFactory>) {}
 fn assert_instance_object_safe(_: Box<dyn StateStoreProviderInstance>) {}
@@ -215,17 +209,9 @@ fn provider_id_has_value_order_hash_and_descriptor_identity() {
         hash_of(StateStoreProviderId::new("sqlite"))
     );
 
-    let descriptor = StateStoreProviderDescriptor::new(
-        sqlite,
-        StateStoreProviderAccessMode::ExclusiveSingleFrontend,
-        MAX_KEY_BYTES,
-    );
+    let descriptor = StateStoreProviderDescriptor::new(sqlite, MAX_KEY_BYTES);
     assert_eq!(descriptor.id, sqlite);
     assert_ne!(descriptor.id, mysql);
-    assert_eq!(
-        descriptor.access_mode,
-        StateStoreProviderAccessMode::ExclusiveSingleFrontend
-    );
     assert_eq!(descriptor.max_key_bytes, MAX_KEY_BYTES);
 }
 
@@ -282,10 +268,6 @@ async fn factory_open_preserves_requested_limits_in_exposed_store() {
         limits: StateStoreLimits {
             max_page_size: 17,
             ..StateStoreLimits::default()
-        },
-        deployment: novarocks_spi::state_store::FeDeploymentView {
-            active_fe_count: NonZeroUsize::new(1).expect("non-zero"),
-            topology_revision: Bytes::from_static(b"topology"),
         },
         deadline: Instant::now() + Duration::from_secs(1),
     };
