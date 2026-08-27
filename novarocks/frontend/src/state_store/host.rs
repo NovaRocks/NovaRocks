@@ -51,7 +51,6 @@ impl StateStoreHost {
         let request = StateStoreOpenRequest {
             cluster_id: input.cluster_id,
             limits: input.limits,
-            deployment: input.deployment,
             deadline,
         };
         let mut instance = bound.factory.open(request).await.map_err(|error| {

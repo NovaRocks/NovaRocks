@@ -287,7 +287,6 @@ impl FrontendCatalogController {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     use crate::catalog_application::desired_state::CatalogDesiredStateSource;
@@ -301,16 +300,14 @@ mod tests {
         StateStoreLimitOverrides, StateStoreProviderConfig, TEST_STATE_STORE_PROVIDER_ID,
         builtin_state_store_provider_registry,
     };
-    use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
         ConnectorControlResolver, ConnectorError, ConnectorProviderId,
     };
     use novarocks_spi::state_store::{
-        ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction,
-        StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-        StateStoreMetricsSnapshot, StoreIdentity, TransactionId, WriteTransaction,
-        conformance::FaultInjectingStateStore,
+        ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore,
+        StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+        StoreIdentity, TransactionId, WriteTransaction, conformance::FaultInjectingStateStore,
     };
 
     use super::*;
@@ -704,20 +701,11 @@ mod tests {
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: directory.path().join("state-store.sqlite"),
-                            deployment_owner: "catalog-controller-test".to_string(),
                         },
                     },
                     mysql_client: None,
                 },
                 foundationdb_client: None,
-            },
-            FeDeploymentView {
-                // SQLite is a single-FE StateStore provider. This fixture
-                // still instantiates two independent local controller hosts
-                // over its shared StateStore surface; it is not a production
-                // multi-process deployment claim.
-                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
-                topology_revision: Bytes::from_static(b"catalog-controller-test-r1"),
             },
             Instant::now() + Duration::from_secs(5),
         )
@@ -1373,7 +1361,6 @@ mod tests {
         let changed_identity = StoreIdentity {
             store_id: uuid::Uuid::now_v7(),
             cluster_id: original_identity.cluster_id.clone(),
-            initial_incarnation: original_identity.initial_incarnation + 1,
         };
         let changed_store: Arc<dyn StateStore> = Arc::new(IdentityChangedStore {
             inner: Arc::clone(&store),

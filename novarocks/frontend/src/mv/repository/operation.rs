@@ -34,7 +34,7 @@ pub(crate) fn state_store_error(error: StateStoreError) -> MvRepositoryError {
         StateStoreErrorKind::Corruption => MvRepositoryErrorKind::Corruption,
         StateStoreErrorKind::DeadlineExceeded => MvRepositoryErrorKind::CommitUnknown,
         StateStoreErrorKind::InvalidConfiguration
-        | StateStoreErrorKind::UnsupportedDeployment
+        | StateStoreErrorKind::UnsupportedFormat
         | StateStoreErrorKind::Transient
         | StateStoreErrorKind::ProviderUnavailable
         | StateStoreErrorKind::Cancelled

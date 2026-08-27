@@ -19,8 +19,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::state_store::{
-    FeDeploymentView, StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderFactory,
-    StateStoreProviderId,
+    StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
 };
 
 use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
@@ -31,7 +30,6 @@ pub struct StateStoreHostInput {
     pub cluster_id: String,
     pub provider_id: StateStoreProviderId,
     pub limits: StateStoreLimits,
-    pub deployment: FeDeploymentView,
 }
 
 /// A provider factory builder supplied by the concrete composition root.

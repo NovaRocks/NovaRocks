@@ -629,7 +629,6 @@ fn run_failure(context: &str, failure: RunFailure) -> CatalogAttachmentError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
     use crate::mv::domain::dependency::model::{
@@ -642,7 +641,7 @@ mod tests {
     };
     use bytes::Bytes;
     use novarocks_spi::state_store::{
-        CommitOutcome, FeDeploymentView, Precondition, StateStore, TransactionId,
+        CommitOutcome, Precondition, StateStore, TransactionId,
         conformance::{FaultGate, FaultInjectingStateStore},
     };
 
@@ -691,16 +690,11 @@ mod tests {
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: directory.path().join("state-store.sqlite"),
-                            deployment_owner: "catalog-attachment-test".to_string(),
                         },
                     },
                     mysql_client: None,
                 },
                 foundationdb_client: None,
-            },
-            FeDeploymentView {
-                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
-                topology_revision: Bytes::from_static(b"catalog-attachment-test-r1"),
             },
             Instant::now() + Duration::from_secs(5),
         )
@@ -769,16 +763,11 @@ mod tests {
                         },
                         provider: StateStoreProviderConfig::Sqlite {
                             path: directory.path().join("state-store.sqlite"),
-                            deployment_owner: "catalog-attachment-budget-test".to_string(),
                         },
                     },
                     mysql_client: None,
                 },
                 foundationdb_client: None,
-            },
-            FeDeploymentView {
-                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
-                topology_revision: Bytes::from_static(b"catalog-attachment-budget-r1"),
             },
             Instant::now() + Duration::from_secs(5),
         )
@@ -836,16 +825,11 @@ mod tests {
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: directory.path().join("state-store.sqlite"),
-                            deployment_owner: "catalog-attachment-commit-unknown-test".to_string(),
                         },
                     },
                     mysql_client: None,
                 },
                 foundationdb_client: None,
-            },
-            FeDeploymentView {
-                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
-                topology_revision: Bytes::from_static(b"catalog-attachment-commit-unknown-r1"),
             },
             Instant::now() + Duration::from_secs(5),
         )
@@ -915,16 +899,11 @@ mod tests {
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: directory.path().join("state-store.sqlite"),
-                            deployment_owner: "catalog-attachment-mv-fence-test".to_string(),
                         },
                     },
                     mysql_client: None,
                 },
                 foundationdb_client: None,
-            },
-            FeDeploymentView {
-                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
-                topology_revision: Bytes::from_static(b"catalog-attachment-mv-fence-r1"),
             },
             Instant::now() + Duration::from_secs(5),
         )
@@ -1017,16 +996,11 @@ mod tests {
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: directory.path().join("state-store.sqlite"),
-                            deployment_owner: "catalog-attachment-mv-assert-test".to_string(),
                         },
                     },
                     mysql_client: None,
                 },
                 foundationdb_client: None,
-            },
-            FeDeploymentView {
-                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
-                topology_revision: Bytes::from_static(b"catalog-attachment-mv-assert-r1"),
             },
             Instant::now() + Duration::from_secs(5),
         )

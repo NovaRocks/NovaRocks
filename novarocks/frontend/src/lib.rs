@@ -25,7 +25,6 @@ pub mod client_connection;
 pub mod common;
 pub mod connector;
 pub mod coordinator;
-pub mod deployment;
 pub mod dml;
 pub(crate) mod durable;
 pub mod maintenance;

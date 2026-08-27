@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,9 +36,7 @@ use novarocks_frontend::mv::domain::repository::{
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_spi::state_store::{
-    CommitOutcome, FeDeploymentView, Key, Precondition, TransactionId, Value,
-};
+use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
 #[path = "common/mod.rs"]
 mod common;
 use common::state_store_fixture::{
@@ -67,16 +64,11 @@ pub(crate) fn repository() -> (
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: temp.path().join("state-store.sqlite"),
-                            deployment_owner: "mv-accelerator-test".to_string(),
                         },
                     },
                     mysql_client: None,
                 },
                 foundationdb_client: None,
-            },
-            FeDeploymentView {
-                active_fe_count: NonZeroUsize::new(1).expect("one FE"),
-                topology_revision: Bytes::from_static(b"mv-accelerator-test-r1"),
             },
             Instant::now() + Duration::from_secs(5),
         ))

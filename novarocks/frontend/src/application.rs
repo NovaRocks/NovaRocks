@@ -1188,8 +1188,8 @@ mod tests {
     };
     use async_trait::async_trait;
     use novarocks_spi::state_store::{
-        StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderAccessMode,
-        StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
+        StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderDescriptor,
+        StateStoreProviderFactory, StateStoreProviderInstance,
     };
 
     use super::{
@@ -1199,7 +1199,6 @@ mod tests {
 
     const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
         TEST_STATE_STORE_PROVIDER_ID,
-        StateStoreProviderAccessMode::SharedMultiFrontend,
         novarocks_spi::state_store::MAX_KEY_BYTES,
     );
 

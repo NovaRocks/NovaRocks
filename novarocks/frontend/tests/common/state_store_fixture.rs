@@ -20,23 +20,21 @@
 #![allow(dead_code, unused_imports)]
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use novarocks_frontend::state_store::StateStoreProviderRegistration;
 use novarocks_frontend::{
     StateStoreHost as FrontendStateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,
 };
 use novarocks_spi::state_store::testing::InMemoryStateStore;
 use novarocks_spi::state_store::{
-    FeDeploymentView, StateStore, StateStoreError, StateStoreLimits, StateStoreOpenRequest,
-    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
-    StateStoreProviderId, StateStoreProviderInstance, StateStoreProviderLifecycle,
+    StateStore, StateStoreError, StateStoreLimits, StateStoreOpenRequest,
+    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
+    StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 
 pub const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
@@ -45,7 +43,6 @@ pub const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
 pub const TEST_STATE_STORE_DESCRIPTOR: StateStoreProviderDescriptor =
     StateStoreProviderDescriptor::new(
         TEST_STATE_STORE_PROVIDER_ID,
-        StateStoreProviderAccessMode::SharedMultiFrontend,
         novarocks_spi::state_store::MAX_KEY_BYTES,
     );
 
@@ -122,10 +119,6 @@ pub fn input(cluster_id: impl Into<String>) -> StateStoreHostInput {
         cluster_id: cluster_id.into(),
         provider_id: TEST_STATE_STORE_PROVIDER_ID,
         limits: StateStoreLimits::default(),
-        deployment: FeDeploymentView {
-            active_fe_count: NonZeroUsize::new(1).expect("one Frontend"),
-            topology_revision: Bytes::from_static(b"frontend-test-topology-r1"),
-        },
     }
 }
 
@@ -170,7 +163,6 @@ pub struct StateStoreLimitOverrides {
 pub enum StateStoreProviderConfig {
     Sqlite {
         path: PathBuf,
-        deployment_owner: String,
     },
     Mysql {
         database: String,
@@ -206,11 +198,9 @@ impl TestStateStoreHost {
     pub async fn open(
         _registry: &StateStoreProviderRegistry,
         config: StateStoreHostConfig,
-        deployment: FeDeploymentView,
         deadline: Instant,
     ) -> Result<Self, novarocks_frontend::state_store::StateStoreHostError> {
         let mut opening = input(config.state_store.store.cluster_id);
-        opening.deployment = deployment;
         let limits = config.state_store.store.limits;
         if let Some(value) = limits.max_key_bytes {
             opening.limits.max_key_bytes = value;
