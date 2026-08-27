@@ -1,11 +1,11 @@
-# FoundationDB 7.3.69 fixture
+# FoundationDB 7.3.69 experimental fixture
 
 This fixture provides a worktree-scoped FoundationDB client and single-server
-cluster for NovaRocks state-store tests. The server image and official native
+cluster for NovaRocks experimental state-store leaf-provider tests. The server image and official native
 client are pinned to FoundationDB 7.3.69. The Rust binding selects API version
-730 separately at compile time. The dedicated production gate runs only on
+730 separately at compile time. The dedicated live-fixture check runs only on
 Linux x86_64. macOS results are developer auxiliary evidence and do not replace
-that production gate. Starting the server requires Docker 29 or newer with
+that check. Starting the server requires Docker 29 or newer with
 Docker Compose.
 
 Supported client platforms:
@@ -13,7 +13,7 @@ Supported client platforms:
 - macOS arm64 developer machines:
   `FoundationDB-7.3.69_arm64.pkg`, SHA-256
   `6bfbd48ac21356de0baa0c1e84c6e33d15d95d0b9d022c35a7625e5d9293b71e`.
-- Linux x86_64 production CI:
+- Linux x86_64 experimental CI:
   `foundationdb-clients_7.3.69-1_amd64.deb`, SHA-256
   `ea59d1708519798c7bc4f514cd29af1ac8e41dccbec4371f22d86b713ea81cbf`.
 
@@ -28,8 +28,8 @@ and Linux x86_64 asset SHA-256
 `ea59d1708519798c7bc4f514cd29af1ac8e41dccbec4371f22d86b713ea81cbf`.
 The executable fixture scripts remain the source of truth used by CI. The
 workflow invokes `docker/foundationdb/up.sh`, whose exact self-check verifies
-the pinned version, API, and platform-specific asset SHA. The production gate
-then consumes the generated environment and validates its existence, Linux
+the pinned version, API, and platform-specific asset SHA. The experimental
+check then consumes the generated environment and validates its existence, Linux
 x86_64 platform, and required client artifacts; it does not duplicate those
 pinned constants.
 
@@ -55,20 +55,17 @@ docker/foundationdb/up.sh
 docker/foundationdb/status.sh
 ```
 
-On Linux x86_64, run the complete production gate after the fixture is ready:
+On Linux x86_64, run the optional experimental check after the fixture is ready:
 
 ```bash
 tools/ci/foundationdb-provider.sh
 ```
 
-The gate verifies the provider owner, shared contract, SQLite regression,
-architecture boundary, live single-runtime conformance, two independent helper
-processes, production feature build, and the existing 1FE+3BE baseline. The
-helper processes are separate FDB clients, not NovaRocks FEs. They prove
-cross-process provider semantics only. The 1FE+3BE baseline deliberately does
-not enable FoundationDB; it proves that the additive provider has not introduced
-a fallback or regression in the normal distributed query path. Real multi-FE
-protocol and failover evidence belongs to the later control-plane work.
+The check verifies the SPI boundary, the live single-runtime conformance, and
+two independent helper processes. The helpers are separate FDB clients, not
+NovaRocks FEs, and provide experimental cross-process provider evidence only.
+Remote provider format design, multi-FE protocol, and failover behavior remain
+future work.
 
 `status.sh` prints the cluster-file path, but never prints its contents. The
 host cluster file points at the worktree-specific published port. Compose uses
@@ -104,11 +101,10 @@ docker/foundationdb/down.sh --docker
 Shutdown order is strict: stop accepting new state-store work, finish or cancel
 callers, drop all read/write transactions and store handles, call
 `StateStoreRuntime::shutdown()` until it succeeds, and only then stop the
-fixture or production FDB client environment. A shutdown deadline leaves the
+fixture or FDB client environment. A shutdown deadline leaves the
 runtime owner intact so the caller can release remaining handles and retry; it
 is not permission to tear down the native client underneath live handles.
 
-Production deployments must install and verify the official client before
-NovaRocks starts. They must provide network/host/TLS access control because an
-FDB keyspace is logical isolation, not a user-level ACL. They must not use this
-fixture as a runtime downloader.
+This fixture is not a supported NovaRocks deployment path or runtime downloader.
+Any future remote-provider deployment design must separately define client
+installation, network/host/TLS access control, and operational ownership.

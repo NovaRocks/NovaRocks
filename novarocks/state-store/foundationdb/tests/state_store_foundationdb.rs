@@ -17,7 +17,6 @@
 
 #![cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
 
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(feature = "state-store-test-hooks")]
@@ -30,8 +29,8 @@ use bytes::Bytes;
 use foundationdb::Database;
 use foundationdb::options::TransactionOption;
 use novarocks_spi::state_store::{
-    ChangePollRequest, CommitOutcome, CommitResolution, Direction, FeDeploymentView, Key, KeyRange,
-    Precondition, RangeRequest, StateStore, StateStoreErrorKind, TransactionId, Value,
+    ChangePollRequest, CommitOutcome, CommitResolution, Direction, Key, KeyRange, Precondition,
+    RangeRequest, StateStore, StateStoreErrorKind, TransactionId, Value,
 };
 use novarocks_state_store_foundationdb::{
     FoundationDbClientConfig, FoundationDbProviderTestHarness, FoundationDbTestLimitOverrides,
@@ -81,13 +80,6 @@ fn transaction_store_config(cluster_id: &str, keyspace_id: Uuid) -> FoundationDb
     let mut config = store_config(cluster_id, keyspace_id);
     config.limits.max_transaction_bytes = Some(16 * 1024);
     config
-}
-
-fn deployment() -> FeDeploymentView {
-    FeDeploymentView {
-        active_fe_count: NonZeroUsize::new(2).expect("non-zero FE count"),
-        topology_revision: Bytes::from_static(b"foundationdb-suite-topology"),
-    }
 }
 
 fn test_deadline() -> Instant {
@@ -173,7 +165,6 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
     let store = harness
         .open_store(
             transaction_store_config("transaction-cluster", keyspace_id),
-            deployment(),
             test_deadline(),
         )
         .await
@@ -444,7 +435,6 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
                     keyspace_id: limited_keyspace_id,
                 },
             },
-            deployment(),
             test_deadline(),
         )
         .await
@@ -503,7 +493,6 @@ async fn durable_commit_and_change_scenarios(harness: &FoundationDbProviderTestH
     let store = harness
         .open_store(
             transaction_store_config("durable-cluster", Uuid::new_v4()),
-            deployment(),
             test_deadline(),
         )
         .await
@@ -698,7 +687,6 @@ async fn cancellation_safe_supervisor_scenarios(harness: &FoundationDbProviderTe
     let store = harness
         .open_store(
             transaction_store_config("supervisor-cluster", Uuid::new_v4()),
-            deployment(),
             test_deadline(),
         )
         .await
@@ -797,10 +785,6 @@ fn conformance_factory(runtime: Rc<FoundationDbProviderTestHarness>) -> StateSto
                             cluster_file: cluster_file(),
                             keyspace_id: Uuid::new_v4(),
                         },
-                    },
-                    FeDeploymentView {
-                        active_fe_count: NonZeroUsize::new(2).expect("non-zero FE count"),
-                        topology_revision: Bytes::from_static(b"foundationdb-conformance-topology"),
                     },
                     test_deadline(),
                 )
@@ -901,8 +885,8 @@ async fn foundationdb_suite() {
     let keyspace_id = Uuid::new_v4();
     let config = store_config("identity-cluster", keyspace_id);
     let (left, right) = tokio::join!(
-        runtime.open_store(config.clone(), deployment(), test_deadline()),
-        runtime.open_store(config, deployment(), test_deadline())
+        runtime.open_store(config.clone(), test_deadline()),
+        runtime.open_store(config, test_deadline())
     );
     let left = left.expect("initialize FoundationDB keyspace");
     let right = right.expect("concurrent open converges on keyspace identity");
@@ -910,12 +894,10 @@ async fn foundationdb_suite() {
     let right_identity = right.identity().await.expect("read right identity");
     assert_eq!(left_identity, right_identity);
     assert_eq!(left_identity.cluster_id, "identity-cluster");
-    assert_eq!(left_identity.initial_incarnation, 1);
 
     let mismatch = match runtime
         .open_store(
             store_config("different-cluster", keyspace_id),
-            deployment(),
             test_deadline(),
         )
         .await
@@ -930,7 +912,6 @@ async fn foundationdb_suite() {
     let corruption = match runtime
         .open_store(
             store_config("identity-cluster", corrupt_keyspace),
-            deployment(),
             test_deadline(),
         )
         .await

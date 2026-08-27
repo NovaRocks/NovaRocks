@@ -28,7 +28,7 @@ arch="$(uname -m)"
 case "$os/$arch" in
   Linux/x86_64|Linux/amd64) ;;
   *)
-    echo "the FoundationDB production gate requires Linux x86_64; found: $os/$arch" >&2
+    echo "the FoundationDB experimental fixture requires Linux x86_64; found: $os/$arch" >&2
     exit 1
     ;;
 esac

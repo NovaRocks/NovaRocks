@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::PathBuf;
-
 use novarocks_spi::state_store::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS,
     MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
@@ -39,15 +37,8 @@ pub struct FoundationDbTestLimitOverrides {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FoundationDbTestProviderConfig {
     Foundationdb {
-        cluster_file: PathBuf,
+        cluster_file: std::path::PathBuf,
         keyspace_id: Uuid,
-    },
-    Sqlite {
-        path: PathBuf,
-        deployment_owner: String,
-    },
-    Mysql {
-        database: String,
     },
 }
 

@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use novarocks_spi::state_store::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
-    StateStoreProviderInstance, StateStoreProviderLifecycle,
+    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
+    StateStoreProviderLifecycle,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -336,7 +336,6 @@ impl MysqlStateStoreProviderFactory {
         Self {
             descriptor: StateStoreProviderDescriptor::new(
                 MYSQL_STATE_STORE_PROVIDER_ID,
-                StateStoreProviderAccessMode::SharedMultiFrontend,
                 MYSQL_MAX_KEY_BYTES,
             ),
             database,
@@ -446,18 +445,15 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "state-store-test-hooks")]
-    use bytes::Bytes;
     #[cfg(feature = "state-store-test-hooks")]
     use futures::future::BoxFuture;
     #[cfg(feature = "state-store-test-hooks")]
     use novarocks_spi::state_store::{
-        ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction,
-        StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
-        StoreIdentity, TransactionId, WriteTransaction,
+        ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStoreErrorKind,
+        StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest, StoreIdentity,
+        TransactionId, WriteTransaction,
     };
-    use novarocks_spi::state_store::{
-        StateStoreProviderAccessMode, StateStoreProviderFactory, StateStoreProviderInstance,
-    };
+    use novarocks_spi::state_store::{StateStoreProviderFactory, StateStoreProviderInstance};
     #[cfg(feature = "state-store-test-hooks")]
     use tokio::sync::Notify;
 
@@ -700,10 +696,6 @@ mod tests {
         StateStoreOpenRequest {
             cluster_id: "cluster-a".to_owned(),
             limits: StateStoreLimits::default(),
-            deployment: FeDeploymentView {
-                active_fe_count: std::num::NonZeroUsize::new(1).unwrap(),
-                topology_revision: Bytes::from_static(b"topology-r1"),
-            },
             deadline,
         }
     }
@@ -828,10 +820,6 @@ mod tests {
             },
         );
         assert_eq!(factory.descriptor().id, MYSQL_STATE_STORE_PROVIDER_ID);
-        assert_eq!(
-            factory.descriptor().access_mode,
-            StateStoreProviderAccessMode::SharedMultiFrontend
-        );
         assert_eq!(factory.descriptor().max_key_bytes, MYSQL_MAX_KEY_BYTES);
         assert_mysql_instance_contract::<super::MysqlStateStoreProviderInstance>();
     }
@@ -848,7 +836,6 @@ mod tests {
         let mut instance = MysqlStateStoreProviderInstance {
             descriptor: StateStoreProviderDescriptor::new(
                 MYSQL_STATE_STORE_PROVIDER_ID,
-                StateStoreProviderAccessMode::SharedMultiFrontend,
                 MYSQL_MAX_KEY_BYTES,
             ),
             lifecycle: StateStoreProviderLifecycle::Ready,

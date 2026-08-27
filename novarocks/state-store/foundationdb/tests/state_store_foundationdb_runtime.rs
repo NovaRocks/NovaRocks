@@ -17,13 +17,11 @@
 
 #![cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
 
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use novarocks_spi::state_store::{FeDeploymentView, StateStoreErrorKind};
+use novarocks_spi::state_store::StateStoreErrorKind;
 use novarocks_state_store_foundationdb::{
     FoundationDbClientConfig, FoundationDbProviderTestHarness, FoundationDbTestLimitOverrides,
     FoundationDbTestProviderConfig, FoundationDbTestStoreConfig,
@@ -57,13 +55,6 @@ fn fdb_store_config() -> FoundationDbTestStoreConfig {
             )
             .expect("valid FoundationDB fixture keyspace id"),
         },
-    }
-}
-
-fn deployment(active_fe_count: usize) -> FeDeploymentView {
-    FeDeploymentView {
-        active_fe_count: NonZeroUsize::new(active_fe_count).expect("non-zero FE count"),
-        topology_revision: Bytes::from_static(b"runtime-topology"),
     }
 }
 
@@ -115,35 +106,8 @@ async fn foundationdb_runtime_lifecycle() {
         "fresh exec process must boot independently"
     );
 
-    let wrong_fdb_provider = match harness
-        .open_store(
-            FoundationDbTestStoreConfig {
-                cluster_id: "runtime-cluster".to_owned(),
-                limits: FoundationDbTestLimitOverrides::default(),
-                provider: FoundationDbTestProviderConfig::Sqlite {
-                    path: PathBuf::from("wrong-runtime.sqlite"),
-                    deployment_owner: "runtime-fe".to_owned(),
-                },
-            },
-            deployment(1),
-            Instant::now() + Duration::from_secs(5),
-        )
-        .await
-    {
-        Ok(_) => panic!("FoundationDB runtime must reject the SQLite provider"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        wrong_fdb_provider.kind(),
-        StateStoreErrorKind::InvalidConfiguration
-    );
-
     let store = harness
-        .open_store(
-            fdb_store_config(),
-            deployment(2),
-            Instant::now() + Duration::from_secs(5),
-        )
+        .open_store(fdb_store_config(), Instant::now() + Duration::from_secs(5))
         .await
         .expect("open FoundationDB runtime handle");
     let held = harness
@@ -153,11 +117,7 @@ async fn foundationdb_runtime_lifecycle() {
     assert_eq!(held.kind(), StateStoreErrorKind::DeadlineExceeded);
 
     let blocked = match harness
-        .open_store(
-            fdb_store_config(),
-            deployment(2),
-            Instant::now() + Duration::from_secs(5),
-        )
+        .open_store(fdb_store_config(), Instant::now() + Duration::from_secs(5))
         .await
     {
         Ok(_) => panic!("draining harness must not open another store"),

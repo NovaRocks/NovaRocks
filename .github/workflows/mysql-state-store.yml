@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: MySQL state store
+name: MySQL experimental state store
 
 on:
   # Keep the provider gate available without blocking every pull request.
@@ -38,7 +38,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
-      - name: Run MySQL state-store production gate
+      - name: Run MySQL experimental provider checks
         env:
           NOVAROCKS_RUN_MYSQL_DOCKER_OWNERSHIP_TEST: "1"
         run: |

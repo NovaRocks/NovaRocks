@@ -54,15 +54,11 @@ cargo test -p novarocks-spi
 cargo check -p novarocks-spi --no-default-features
 "$SCRIPT_DIR/check-spi-dependency-boundary.py" \
   --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
+cargo check -p novarocks-state-store-mysql --all-targets --all-features
 cargo test -p novarocks-state-store-mysql --lib --features state-store-test-hooks
-cargo test -p novarocks-server --test state_store_app_config -- --list | \
-  awk '$1 == "foundationdb_config_feature_off_open_fails_without_fallback:" { n++ } END { exit(n != 1) }'
-cargo test -p novarocks-server --test state_store_app_config foundationdb_config_feature_off_open_fails_without_fallback -- --exact
-cargo check -p novarocks-state-store-mysql --all-features
-cargo build -p novarocks-server --profile dev-opt
 
 READINESS_DB="$NOVAROCKS_MYSQL_DATABASE"
-PROBE_DB="$(docker/mysql-state-store/provision-test-database.sh create production-gate-probes)"
+PROBE_DB="$(docker/mysql-state-store/provision-test-database.sh create experimental-provider-probes)"
 cleanup_probe_db() {
   docker/mysql-state-store/provision-test-database.sh drop "$PROBE_DB"
 }
@@ -93,23 +89,4 @@ cargo test -p novarocks-state-store-mysql --features state-store-test-hooks --te
 cargo test -p novarocks-state-store-mysql --features state-store-test-hooks \
   --test state_store_mysql_cross_process mysql_cross_process_suite \
   -- --exact --nocapture --test-threads=1
-cargo build -p novarocks-server --profile dev-opt --features mysql-state-store-provider
-
-# Feature-binary coexistence smoke, NOT provider runtime evidence.
-#
-# This proves only that a MySQL-StateStore-feature-enabled `novarocks` binary
-# still completes a standard native 1FE+3BE topology, query and cleanup. It runs
-# on the provider-neutral SQLite base config, so it says nothing about whether a
-# query used the MySQL StateStore. Provider correctness is established above by
-# the provider contract, runtime and cross-process tests.
-cargo build -p novarocks-system-test-runner --profile dev-opt
-MYSQL_BASELINE_ARTIFACTS="$(mktemp -d)"
-trap 'rm -rf "$MYSQL_BASELINE_ARTIFACTS"' EXIT
-target/dev-opt/novarocks-system-tests \
-  --binary target/dev-opt/novarocks \
-  --config tools/ci/fixtures/system-scenarios-base.toml \
-  --artifact-root "$MYSQL_BASELINE_ARTIFACTS" \
-  --cluster-size 3 \
-  --timeout-secs 300 \
-  --only query-lifecycle/distributed-baseline
 git diff --check

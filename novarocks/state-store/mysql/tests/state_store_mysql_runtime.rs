@@ -24,11 +24,10 @@
     reason = "tests serialize shared MySQL fixture environment mutations across await points"
 )]
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use novarocks_secret::SecretValue;
-use novarocks_spi::state_store::{FeDeploymentView, StateStoreErrorKind};
+use novarocks_spi::state_store::StateStoreErrorKind;
 use novarocks_state_store_mysql::test_support::{
     MysqlProviderTestHarness, acquire_operation, acquire_provider_handle, active_readiness,
     begin_shutdown, hold_connection, is_accepting, pollute_session, pool_count, prepare_pool,
@@ -38,10 +37,7 @@ use novarocks_state_store_mysql::test_support::{
 use novarocks_state_store_mysql::test_support::{
     delayed_active_readiness, run_sleep_until_deadline,
 };
-use novarocks_state_store_mysql::{
-    MySqlClientConfig, MySqlTlsMode, MysqlTestLimitOverrides, MysqlTestProviderConfig,
-    MysqlTestStoreConfig,
-};
+use novarocks_state_store_mysql::{MySqlClientConfig, MySqlTlsMode};
 
 fn client_config(password: &str) -> MySqlClientConfig {
     MySqlClientConfig {
@@ -58,37 +54,6 @@ fn client_config(password: &str) -> MySqlClientConfig {
         pool_max: 2,
         inactive_connection_ttl_ms: 1_000,
     }
-}
-
-fn sqlite_store_config() -> MysqlTestStoreConfig {
-    MysqlTestStoreConfig {
-        cluster_id: "runtime-test-cluster".to_owned(),
-        limits: MysqlTestLimitOverrides::default(),
-        provider: MysqlTestProviderConfig::Sqlite {
-            path: PathBuf::from("/tmp/unused-state-store-runtime.sqlite"),
-            deployment_owner: "runtime-test".to_owned(),
-        },
-    }
-}
-
-fn deployment() -> FeDeploymentView {
-    FeDeploymentView {
-        active_fe_count: std::num::NonZeroUsize::new(1).expect("one is non-zero"),
-        topology_revision: bytes::Bytes::from_static(b"runtime-test"),
-    }
-}
-
-async fn open_mysql_store(
-    runtime: &MysqlProviderTestHarness,
-    config: MysqlTestStoreConfig,
-    deployment: FeDeploymentView,
-) -> Result<
-    std::sync::Arc<dyn novarocks_spi::state_store::StateStore>,
-    novarocks_spi::state_store::StateStoreError,
-> {
-    runtime
-        .open_store(config, deployment, Instant::now() + Duration::from_secs(30))
-        .await
 }
 
 fn fixture_client_config() -> MySqlClientConfig {
@@ -161,21 +126,6 @@ fn mysql_runtime_rejects_independent_tokio_runtime() {
     first
         .block_on(runtime.shutdown(Instant::now() + Duration::from_secs(5)))
         .expect("shutdown on owner runtime");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn mysql_runtime_rejects_provider_mismatch() {
-    let mut runtime =
-        MysqlProviderTestHarness::boot(client_config("secret")).expect("construct MySQL runtime");
-    let error = match open_mysql_store(&runtime, sqlite_store_config(), deployment()).await {
-        Ok(_) => panic!("MySQL runtime must reject SQLite"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
-    runtime
-        .shutdown(Instant::now() + Duration::from_secs(5))
-        .await
-        .expect("shutdown owner runtime");
 }
 
 #[tokio::test(flavor = "current_thread")]

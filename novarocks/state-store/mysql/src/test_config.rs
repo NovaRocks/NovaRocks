@@ -17,8 +17,6 @@
 
 //! Test-only input compatibility for the MySQL provider harness.
 
-use std::path::PathBuf;
-
 use novarocks_spi::state_store::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS, MAX_TRANSACTION_BYTES,
     MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreError, StateStoreErrorKind,
@@ -42,13 +40,7 @@ pub struct MysqlTestLimitOverrides {
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MysqlTestProviderConfig {
-    Mysql {
-        database: String,
-    },
-    Sqlite {
-        path: PathBuf,
-        deployment_owner: String,
-    },
+    Mysql { database: String },
 }
 
 #[doc(hidden)]
@@ -61,12 +53,7 @@ pub struct MysqlTestStoreConfig {
 
 impl MysqlTestStoreConfig {
     pub(crate) fn into_mysql_open(self) -> Result<MysqlStateStoreOpenConfig, StateStoreError> {
-        let MysqlTestProviderConfig::Mysql { database } = self.provider else {
-            return Err(StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "operation requires a MySQL state store configuration",
-            ));
-        };
+        let MysqlTestProviderConfig::Mysql { database } = self.provider;
         Ok(MysqlStateStoreOpenConfig {
             cluster_id: self.cluster_id,
             database,

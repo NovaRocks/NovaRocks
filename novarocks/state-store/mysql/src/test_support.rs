@@ -21,8 +21,7 @@ use novarocks_spi::state_store::{
     StateRecord, StoreRevision, TransactionId, Value,
 };
 use novarocks_spi::state_store::{
-    FeDeploymentView, Precondition, StateStore, StateStoreError, StateStoreErrorKind,
-    StateStoreOpenRequest,
+    Precondition, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
 };
 
 use super::client::MysqlPoolConnection;
@@ -121,7 +120,6 @@ impl MysqlProviderTestHarness {
     pub async fn open_store(
         &self,
         config: MysqlTestStoreConfig,
-        deployment: FeDeploymentView,
         deadline: Instant,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
         let config = config.into_mysql_open()?;
@@ -131,7 +129,6 @@ impl MysqlProviderTestHarness {
                 StateStoreOpenRequest {
                     cluster_id: config.cluster_id,
                     limits: config.limits,
-                    deployment,
                     deadline,
                 },
             )

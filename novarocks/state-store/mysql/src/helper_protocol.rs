@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,9 +36,8 @@ use crate::{
 use novarocks_secret::SecretValue;
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, ContinuationToken,
-    Direction as StoreDirection, FeDeploymentView, Key, KeyRange,
-    Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, StateStoreError,
-    TransactionId, Value, VersionToken, WriteTransaction,
+    Direction as StoreDirection, Key, KeyRange, Precondition as StorePrecondition, RangeRequest,
+    StateRecord, StateStore, StateStoreError, TransactionId, Value, VersionToken, WriteTransaction,
 };
 
 const MAX_LINE_BYTES: usize = 160 * 1024;
@@ -382,7 +380,6 @@ impl HelperState {
                     limits: MysqlTestLimitOverrides::default(),
                     provider: MysqlTestProviderConfig::Mysql { database },
                 },
-                deployment(),
                 Instant::now() + COMMAND_DEADLINE,
             )
             .await
@@ -699,13 +696,6 @@ fn configuration_error(id: u64) -> ProtocolError {
     )
 }
 
-fn deployment() -> FeDeploymentView {
-    FeDeploymentView {
-        active_fe_count: NonZeroUsize::new(1).expect("one is non-zero"),
-        topology_revision: Bytes::from_static(b"mysql-helper-client-topology"),
-    }
-}
-
 fn store_key(id: u64, encoded: &str) -> Result<Key, ProtocolError> {
     let raw = decode_hex(id, "key", encoded, MAX_KEY_HEX_BYTES)?;
     Key::try_from(Bytes::from(raw))
@@ -948,20 +938,5 @@ pub fn run_stdio() -> i32 {
             eprintln!("state-store-mysql-helper: runtime startup failed");
             1
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn helper_deployment_models_one_fe_client() {
-        let deployment = deployment();
-        assert_eq!(deployment.active_fe_count.get(), 1);
-        assert_eq!(
-            deployment.topology_revision,
-            Bytes::from_static(b"mysql-helper-client-topology")
-        );
     }
 }

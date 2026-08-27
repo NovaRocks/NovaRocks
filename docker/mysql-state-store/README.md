@@ -1,7 +1,7 @@
 # MySQL state-store fixture
 
-This fixture is the production acceptance environment for the NovaRocks MySQL
-state-store provider. It runs the Docker Official MySQL 8.4.10 LTS image at the
+This fixture is an optional live-test environment for the experimental NovaRocks
+MySQL state-store leaf provider. It runs the Docker Official MySQL 8.4.10 LTS image at the
 index digest frozen in `compose.yml`, with a 16 KiB InnoDB page, DYNAMIC row
 format, UTC, and strict SQL mode.
 
@@ -18,19 +18,18 @@ docker/mysql-state-store/up.sh
 source docker/mysql-state-store/runtime/current/env.sh
 ```
 
-The dedicated Linux x86_64 production gate is the only supported acceptance
-entrypoint. It consumes the generated environment and never copies the image
+The dedicated Linux x86_64 experimental check consumes the generated environment
+and never copies the image
 tag, digest, or provisioner credential into CI:
 
 ```bash
 tools/ci/mysql-state-store-provider.sh
 ```
 
-The gate runs the raw InnoDB contract before the public 3072/3073-byte key
-boundary, 13-case shared conformance, and two-process suites. It also verifies
-the default and feature-off dependency trees, builds both default and MySQL
-`dev-opt` profiles, and keeps the 1FE+3BE regression provider-disabled. The
-GitHub workflow owns fixture startup and teardown; the gate only consumes an
+The check runs the raw InnoDB contract before the public 3072/3073-byte key
+boundary, shared conformance, and two-process suites. It validates only the SPI
+dependency boundary and experimental leaf-provider behavior. The GitHub
+workflow owns fixture startup and teardown; the check only consumes an
 already-running fixture.
 
 `up.sh --prepare-only` creates the private runtime files without starting

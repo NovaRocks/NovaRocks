@@ -1,4 +1,4 @@
-name: FoundationDB state store
+name: FoundationDB experimental state store
 
 on:
   # Keep the provider gate available without blocking every pull request.
@@ -29,7 +29,7 @@ jobs:
       - name: Prepare FoundationDB fixture
         run: docker/foundationdb/up.sh
 
-      - name: Run FoundationDB production gate
+      - name: Run FoundationDB experimental provider checks
         run: tools/ci/foundationdb-provider.sh
 
       - name: Stop FoundationDB fixture

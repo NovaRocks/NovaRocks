@@ -16,16 +16,14 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::state_store::{
-    CommitOutcome, CommitResolution, FeDeploymentView, Key, KeyRange,
-    Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, TransactionId, Value,
-    VersionToken, WriteTransaction,
+    CommitOutcome, CommitResolution, Key, KeyRange, Precondition as StorePrecondition,
+    RangeRequest, StateRecord, StateStore, TransactionId, Value, VersionToken, WriteTransaction,
 };
 use novarocks_state_store_foundationdb::{
     FoundationDbClientConfig, FoundationDbProviderTestHarness, FoundationDbTestLimitOverrides,
@@ -381,7 +379,6 @@ impl HelperState {
                         keyspace_id,
                     },
                 },
-                deployment(),
                 test_deadline(),
             )
             .await
@@ -611,13 +608,6 @@ fn cluster_file() -> Result<PathBuf, String> {
     std::env::var("NOVAROCKS_FDB_CLUSTER_FILE")
         .map(PathBuf::from)
         .map_err(|_| "NOVAROCKS_FDB_CLUSTER_FILE is required".to_owned())
-}
-
-fn deployment() -> FeDeploymentView {
-    FeDeploymentView {
-        active_fe_count: NonZeroUsize::new(2).expect("non-zero FE count"),
-        topology_revision: Bytes::from_static(b"foundationdb-cross-process"),
-    }
 }
 
 fn store_key(raw: Vec<u8>) -> Result<Key, String> {

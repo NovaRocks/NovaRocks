@@ -132,7 +132,9 @@ pub(super) fn decode_meta_rows(
             "MySQL state store cluster identity does not match configuration",
         ));
     }
-    let initial_incarnation = codec.decode_initial_incarnation(value(INITIAL_INCARNATION_KEY)?)?;
+    // This experimental provider retains its legacy physical metadata while
+    // the public StoreIdentity exposes only store and cluster identity.
+    codec.decode_initial_incarnation(value(INITIAL_INCARNATION_KEY)?)?;
     let current_revision = codec.decode_revision(value(CURRENT_REVISION_KEY)?)?;
     let change_retention_floor = codec.decode_cursor(value(CHANGE_RETENTION_FLOOR_KEY)?)?;
     if change_retention_floor != (0, u32::MAX) {
@@ -145,7 +147,6 @@ pub(super) fn decode_meta_rows(
         identity: StoreIdentity {
             store_id,
             cluster_id,
-            initial_incarnation,
         },
         current_revision,
         change_retention_floor,

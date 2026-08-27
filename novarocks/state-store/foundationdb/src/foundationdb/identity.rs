@@ -76,7 +76,6 @@ pub(super) async fn open_identity(
                     identity: StoreIdentity {
                         store_id,
                         cluster_id: cluster_id.to_owned(),
-                        initial_incarnation: 1,
                     },
                     high_watermark: [0; REVISION_BYTES],
                     retention_floor: [0; REVISION_BYTES],
@@ -122,14 +121,15 @@ pub(super) fn decode_identity_values(
         ));
     }
     let store_id = codec.decode_store_id(value(2))?;
-    let initial_incarnation = codec.decode_initial_incarnation(value(3))?;
+    // This experimental provider retains its legacy physical metadata while
+    // the public StoreIdentity exposes only store and cluster identity.
+    codec.decode_initial_incarnation(value(3))?;
     let high_watermark = codec.decode_revision(value(4))?;
     let retention_floor = codec.decode_revision(value(5))?;
     Ok(IdentityRead::Present(IdentitySnapshot {
         identity: StoreIdentity {
             store_id,
             cluster_id: stored_cluster_id,
-            initial_incarnation,
         },
         high_watermark,
         retention_floor,
@@ -303,7 +303,6 @@ mod tests {
         };
         assert_eq!(snapshot.identity.store_id, store_id);
         assert_eq!(snapshot.identity.cluster_id, "cluster-a");
-        assert_eq!(snapshot.identity.initial_incarnation, 1);
         assert_eq!(snapshot.high_watermark, [0; 10]);
         assert_eq!(snapshot.retention_floor, [0; 10]);
     }

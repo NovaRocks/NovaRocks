@@ -23,8 +23,8 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use novarocks_spi::state_store::{
     MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
-    StateStoreProviderInstance, StateStoreProviderLifecycle,
+    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
+    StateStoreProviderLifecycle,
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -259,7 +259,6 @@ impl FoundationDbStateStoreProviderFactory {
         Ok(Self {
             descriptor: StateStoreProviderDescriptor::new(
                 FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
-                StateStoreProviderAccessMode::SharedMultiFrontend,
                 MAX_KEY_BYTES,
             ),
             cluster_file: config.cluster_file,
@@ -361,21 +360,12 @@ impl FoundationDbProviderTestHarness {
     pub async fn open_store(
         &self,
         config: FoundationDbTestStoreConfig,
-        deployment: novarocks_spi::state_store::FeDeploymentView,
         deadline: Instant,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
-        let (cluster_file, keyspace_id) = match config.provider {
-            FoundationDbTestProviderConfig::Foundationdb {
-                cluster_file,
-                keyspace_id,
-            } => (cluster_file, keyspace_id),
-            _ => {
-                return Err(StateStoreError::new(
-                    StateStoreErrorKind::InvalidConfiguration,
-                    "FoundationDB test harness requires FoundationDB provider configuration",
-                ));
-            }
-        };
+        let FoundationDbTestProviderConfig::Foundationdb {
+            cluster_file,
+            keyspace_id,
+        } = config.provider;
         let limits = resolve_test_limits(&config.limits).map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
@@ -396,7 +386,6 @@ impl FoundationDbProviderTestHarness {
                 StateStoreOpenRequest {
                     cluster_id: config.cluster_id,
                     limits,
-                    deployment,
                     deadline,
                 },
             )
@@ -427,10 +416,10 @@ mod tests {
     use uuid::Uuid;
 
     use novarocks_spi::state_store::{
-        ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction,
-        StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-        StateStoreMetricsSnapshot, StateStoreOpenRequest, StateStoreProviderFactory,
-        StateStoreProviderInstance, StoreIdentity, TransactionId, WriteTransaction,
+        ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore,
+        StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+        StateStoreOpenRequest, StateStoreProviderFactory, StateStoreProviderInstance,
+        StoreIdentity, TransactionId, WriteTransaction,
     };
 
     use crate::{
@@ -633,10 +622,6 @@ mod tests {
         StateStoreOpenRequest {
             cluster_id: "cluster-a".to_owned(),
             limits: StateStoreLimits::default(),
-            deployment: FeDeploymentView {
-                active_fe_count: std::num::NonZeroUsize::new(1).unwrap(),
-                topology_revision: Bytes::from_static(b"topology-r1"),
-            },
             deadline,
         }
     }

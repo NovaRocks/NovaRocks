@@ -22,7 +22,6 @@
 
 #[cfg(feature = "state-store-test-hooks")]
 use std::cell::RefCell;
-use std::num::NonZeroUsize;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -34,8 +33,8 @@ use novarocks_secret::SecretValue;
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_spi::state_store::ContinuationToken;
 use novarocks_spi::state_store::{
-    CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, Precondition, RangeRequest,
-    StateStore, StateStoreErrorKind, TransactionId, Value,
+    CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, StateStore,
+    StateStoreErrorKind, TransactionId, Value,
 };
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_state_store_mysql::test_support::{
@@ -158,20 +157,12 @@ fn transaction_store_config(
     }
 }
 
-fn deployment() -> FeDeploymentView {
-    FeDeploymentView {
-        active_fe_count: NonZeroUsize::new(2).expect("two is non-zero"),
-        topology_revision: Bytes::from_static(b"mysql-schema-test-topology"),
-    }
-}
-
 async fn open_mysql_store(
     runtime: &MysqlProviderTestHarness,
     config: MysqlTestStoreConfig,
-    deployment: FeDeploymentView,
 ) -> Result<Arc<dyn StateStore>, novarocks_spi::state_store::StateStoreError> {
     runtime
-        .open_store(config, deployment, Instant::now() + Duration::from_secs(30))
+        .open_store(config, Instant::now() + Duration::from_secs(30))
         .await
 }
 
@@ -181,12 +172,7 @@ async fn open_store(
     cluster_id: &str,
     deadline_ms: u64,
 ) -> Result<std::sync::Arc<dyn StateStore>, novarocks_spi::state_store::StateStoreError> {
-    open_mysql_store(
-        runtime,
-        store_config(database, cluster_id, deadline_ms),
-        deployment(),
-    )
-    .await
+    open_mysql_store(runtime, store_config(database, cluster_id, deadline_ms)).await
 }
 
 fn key(bytes: impl Into<Bytes>) -> Key {
@@ -332,10 +318,6 @@ fn mysql_conformance_factory(
                         database: database_name,
                     },
                 },
-                FeDeploymentView {
-                    active_fe_count: NonZeroUsize::new(2).expect("two is non-zero"),
-                    topology_revision: Bytes::from_static(b"mysql-conformance-topology"),
-                },
             )
             .await?;
             Ok(StateStoreConformanceFixture::new(
@@ -431,7 +413,6 @@ async fn mysql_schema_bootstraps_exact_four_tables_and_meta() {
     assert_eq!(store.limits().max_key_bytes, 3072);
     let identity = store.identity().await.expect("store identity");
     assert_eq!(identity.cluster_id, CLUSTER_ID);
-    assert_eq!(identity.initial_incarnation, 1);
     assert_eq!(identity.store_id.get_version(), Some(Version::SortRand));
 
     let snapshot = schema_snapshot(&runtime, &database.name, Duration::from_secs(4))
@@ -1432,7 +1413,7 @@ async fn mysql_shared_limits_before_io() {
             runner_max_attempts: Some(2),
         },
     );
-    let store = open_mysql_store(&runtime, config, deployment())
+    let store = open_mysql_store(&runtime, config)
         .await
         .expect("open limited MySQL store");
     let factory = shared_factory(store);
@@ -1886,7 +1867,6 @@ async fn mysql_write_budget_accepts_and_rejects_exact_boundaries() {
                 ..MysqlTestLimitOverrides::default()
             },
         ),
-        deployment(),
     )
     .await
     .expect("open budgeted MySQL store");
@@ -1943,7 +1923,6 @@ async fn mysql_write_budget_rejects_fixed_envelope_before_io() {
                 ..MysqlTestLimitOverrides::default()
             },
         ),
-        deployment(),
     )
     .await
     .expect("open under-envelope store");
@@ -1970,7 +1949,6 @@ async fn mysql_write_budget_rejects_fixed_envelope_before_io() {
                 ..MysqlTestLimitOverrides::default()
             },
         ),
-        deployment(),
     )
     .await
     .expect("open exact-envelope store");
@@ -2013,7 +1991,6 @@ async fn mysql_write_budget_accepts_exact_mutation_and_rejects_plus_one_before_i
                     ..MysqlTestLimitOverrides::default()
                 },
             ),
-            deployment(),
         )
         .await
         .expect("open exact-mutation store");
