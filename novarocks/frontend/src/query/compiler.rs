@@ -92,6 +92,40 @@ impl From<TimeTravelRewriteError> for FrontendQueryCompilerError {
     }
 }
 
+/// A lake-native MV target is a physical provider table, but it is not an
+/// ordinary external relation once this frontend has recorded it as an MV.
+/// If startup quarantined that target, admitting its provider scan would let a
+/// stale MV publication bypass the readiness boundary through plain SQL.
+fn reject_quarantined_mv_targets(
+    bindings: &QueryTableBindingStore,
+    readiness: &MvReadinessPort,
+) -> Result<(), FrontendQueryCompilerError> {
+    for (_, binding) in bindings.captured_bindings() {
+        let identity =
+            novarocks_sql::planning::catalog::materialization_identity_facts(&binding.resolved);
+        let target = crate::mv::domain::model::MvTarget {
+            catalog: Some(identity.catalog().to_string()),
+            database: identity.namespace().to_string(),
+            name: identity.table().to_string(),
+        };
+        match readiness.load_ready(&target) {
+            Ok(_) => {}
+            Err(error)
+                if error.kind()
+                    == crate::mv::domain::repository::MvRepositoryErrorKind::Unavailable =>
+            {
+                return Err(FrontendQueryCompilerError::Engine(format!(
+                    "unknown table: {}.{}",
+                    identity.namespace(),
+                    identity.table()
+                )));
+            }
+            Err(error) => return Err(FrontendQueryCompilerError::Engine(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct FrontendQueryCompiler {
     query: QueryPreparationKernel,
@@ -341,6 +375,10 @@ impl FrontendQueryCompiler {
                     },
                 )?)
                 .map_err(FrontendQueryCompilerError::from_compile)?;
+                reject_quarantined_mv_targets(
+                    materializer.query_table_bindings().as_ref(),
+                    self.mv_readiness.as_ref(),
+                )?;
                 let output = if force_logical_explain {
                     analyzed
                         .into_complete()
@@ -447,6 +485,7 @@ impl FrontendQueryCompiler {
         .map_err(FrontendQueryCompilerError::from_compile)?
         .into_pending()
         .map_err(FrontendQueryCompilerError::from_compile)?;
+        reject_quarantined_mv_targets(bindings.as_ref(), self.mv_readiness.as_ref())?;
         let statistics = query_statistics_snapshot(&self.query, &materializer, &connector_context)?;
         let distributed_plan =
             SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))

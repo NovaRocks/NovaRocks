@@ -777,27 +777,22 @@ impl Catalog for HadoopFileSystemCatalog {
         Ok(result.table)
     }
 
-    /// Load a table from its registered metadata location.
+    /// Load a table through the filesystem-owned catalog pointer.
     ///
-    /// When the table is not in the in-memory registry (e.g. after a server
-    /// restart or when a different catalog instance created the table), this
-    /// falls back to reading `version-hint.text` from the filesystem to locate
-    /// the current metadata file.
+    /// The in-memory registry is an accelerator only. A different Hadoop
+    /// catalog client can replace or drop the table, so serving its cached
+    /// location without first resolving `version-hint.text` would make this
+    /// client observe a stale table identity.
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
         let key = Self::table_key(table);
-        let metadata_location = {
-            let cached = self.tables.lock().await.get(&key).cloned();
-            if let Some(loc) = cached {
-                loc
-            } else {
-                // Fall back to filesystem: read version-hint.text written by
-                // create_table and populate the cache via try_cache_existing_table.
-                self.try_cache_existing_table(table).await?.ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::TableNotFound,
-                        format!("table not found: {}", key),
-                    )
-                })?
+        let metadata_location = match self.try_cache_existing_table(table).await? {
+            Some(location) => location,
+            None => {
+                self.tables.lock().await.remove(&key);
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("table not found: {}", key),
+                ));
             }
         };
 
@@ -855,12 +850,13 @@ impl Catalog for HadoopFileSystemCatalog {
 
     async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
         let key = Self::table_key(table);
-        if self.tables.lock().await.contains_key(&key) {
-            return Ok(true);
+        // The filesystem pointer is the catalog authority. Do not let a local
+        // cache hide an external drop or replacement made by another client.
+        let exists = self.try_cache_existing_table(table).await?.is_some();
+        if !exists {
+            self.tables.lock().await.remove(&key);
         }
-        // Fall back to filesystem: check version-hint.text and populate the
-        // in-memory cache so that a subsequent load_table call is cache-hot.
-        Ok(self.try_cache_existing_table(table).await?.is_some())
+        Ok(exists)
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
@@ -1173,6 +1169,53 @@ mod tests {
             catalog.file_io.exists(&data_file).await.expect("stat"),
             "objects survive the drop and are left to identity-aware collection"
         );
+    }
+
+    #[tokio::test]
+    async fn external_drop_invalidates_a_cached_table_existence() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let server_catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        let external_catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location,
+        );
+
+        server_catalog
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-create".to_string(),
+            )
+            .await
+            .expect("create table");
+        assert!(
+            server_catalog
+                .table_exists(&ident)
+                .await
+                .expect("cache table existence")
+        );
+
+        external_catalog
+            .drop_table(&ident)
+            .await
+            .expect("drop table through an external client");
+
+        assert!(
+            !server_catalog
+                .table_exists(&ident)
+                .await
+                .expect("observe external drop")
+        );
+        assert!(matches!(
+            server_catalog.load_table(&ident).await,
+            Err(error) if error.kind() == ErrorKind::TableNotFound
+        ));
     }
 
     #[tokio::test]

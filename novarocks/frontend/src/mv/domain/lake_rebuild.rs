@@ -26,6 +26,7 @@
 //! the MV repository. No catalog I/O happens here — every input is already in
 //! memory.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::mv::domain::dependency::model::{
@@ -40,9 +41,11 @@ use crate::mv::domain::repository::{
     InitialMvRefreshConfiguration, MvPublishedProjection, MvPublishedWaterline,
 };
 use crate::mv::domain::storage_observation::{
-    MvLakeCatalogDiscovery, MvLakePackageObservation, MvLakePackageOutcome,
+    MvLakeCatalogDiscovery, MvLakePackageObservation, MvLakePackageOutcome, MvLakePublication,
     MvLakePublishedProjection, discover_mv_lake_packages,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_types::naming::TableIdentity;
 
 /// Output of [`rebuild_mv_definition_from_lake`]: the complete definition,
 /// desired refresh configuration, and explicit publication projection to
@@ -261,6 +264,16 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
                 );
                 continue;
             }
+            if let Err(error) = verify_published_base_identities(ctx, &package, &context) {
+                ctx.readiness.quarantine(target, error.clone());
+                tracing::warn!(
+                    catalog = instance_id.as_str(),
+                    mv_target = %package.table.table,
+                    error = %error,
+                    "skipping MV startup rebuild because a published base identity changed"
+                );
+                continue;
+            }
             if let Err(error) = rebuild_one_lake_package_if_missing(ctx, &package) {
                 ctx.readiness.quarantine(
                     target,
@@ -274,6 +287,68 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// A retained Accelerator projection is only eligible for startup reuse when
+/// every physical base object published with the lake package still resolves to
+/// the same provider-owned identity. Logical names are intentionally
+/// insufficient: a drop-and-recreate can preserve them while changing the
+/// table that the MV was built from.
+fn verify_published_base_identities(
+    ctx: &LakeRebuildContext<'_>,
+    package: &MvLakePackageObservation,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    let MvLakePublication::Published(_) = &package.publication else {
+        // An unpublished MV has no materialized result whose provenance could
+        // be rebound to a replacement table.
+        return Ok(());
+    };
+
+    let mut observed = BTreeMap::new();
+    for dependency in &package.descriptor.base_dependencies {
+        let table =
+            TableIdentity::new(&dependency.catalog, &dependency.namespace, &dependency.name);
+        let observation =
+            crate::mv::domain::refresh::observation::observe_schema_validation_for_table(
+                ctx.connector_control,
+                ctx.mv_storage_observation,
+                &table,
+                connector_context,
+            )?;
+        let object_id = observation.table_object_id().cloned().ok_or_else(|| {
+            format!(
+                "startup MV base identity observation is missing an object ID for {}",
+                table.fqn()
+            )
+        })?;
+        observed.insert(table.fqn(), object_id);
+    }
+
+    validate_published_base_identity_map(package, observed)
+}
+
+fn validate_published_base_identity_map(
+    package: &MvLakePackageObservation,
+    observed: BTreeMap<String, ConnectorTableObjectId>,
+) -> Result<(), String> {
+    let MvLakePublication::Published(publication) = &package.publication else {
+        return Ok(());
+    };
+    let expected = publication
+        .bases
+        .iter()
+        .map(|base| (base.table_fqn.clone(), base.object_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if observed != expected {
+        return Err(format!(
+            "published MV base object identities no longer match the live catalog for {}.{}.{}",
+            package.table.instance_id.as_str(),
+            package.table.namespace,
+            package.table.table
+        ));
     }
     Ok(())
 }
@@ -618,6 +693,25 @@ mod tests {
             )
             .expect("valid published facts"),
         )
+    }
+
+    #[test]
+    fn published_base_identity_mismatch_rejects_startup_reuse() {
+        let package = sample_package(sample_publication());
+        let expected = BTreeMap::from([(
+            "ice.sales.orders".to_string(),
+            object_id(b"orders-object-id"),
+        )]);
+        validate_published_base_identity_map(&package, expected)
+            .expect("the published base identity remains valid");
+
+        let replaced = BTreeMap::from([(
+            "ice.sales.orders".to_string(),
+            object_id(b"replacement-object-id"),
+        )]);
+        let error = validate_published_base_identity_map(&package, replaced)
+            .expect_err("a same-name replacement must not revive the old MV");
+        assert!(error.contains("object identities"), "error={error}");
     }
 
     #[test]
