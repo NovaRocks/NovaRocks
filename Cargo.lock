@@ -3452,8 +3452,6 @@ dependencies = [
  "novarocks-native-trust",
  "novarocks-secret",
  "novarocks-spi",
- "novarocks-state-store-foundationdb",
- "novarocks-state-store-mysql",
  "novarocks-state-store-sqlite",
  "novarocks-test-support",
  "novarocks-types",

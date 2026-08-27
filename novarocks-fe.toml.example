@@ -43,7 +43,13 @@ static_file_path = "novarocks-catalogs.toml"
 provider = "sqlite"
 cluster_id = "production-cluster"
 path = "meta/frontend-state.sqlite"
-deployment_owner = "fe-a"
+
+[state_store.history_retention]
+max_age_secs = 604800
+max_change_rows = 1000000
+max_commit_receipts = 1000000
+maintenance_interval_commits = 256
+incremental_vacuum_pages = 1024
 
 [standalone_server]
 mysql_port = 9030

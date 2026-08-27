@@ -589,7 +589,7 @@ mod tests {
             18040,
             Some(19030),
             &format!(
-                "sys_log_dir = \"{}\"\n\n[state_store]\nprovider = \"sqlite\"\ncluster_id = \"test\"\npath = \"{}\"\ndeployment_owner = \"test\"\n",
+                "sys_log_dir = \"{}\"\n\n[state_store]\nprovider = \"sqlite\"\ncluster_id = \"test\"\npath = \"{}\"\n",
                 log_dir.display(),
                 state_store.display()
             ),

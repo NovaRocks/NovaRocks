@@ -20,15 +20,12 @@ use std::path::{Path, PathBuf};
 
 use crate::catalog_source_config::{CatalogSourceConfig, preflight_catalog_source};
 use crate::env_reference::resolve_env_references;
-use crate::state_store_config::{
-    FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
-    StateStoreConfig, StateStoreProviderConfig,
-};
+use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
+use novarocks_state_store_sqlite::SqliteHistoryRetentionConfig;
 use novarocks_types::{ClusterRole, NativeEndpoint};
-use uuid::Uuid;
 
 pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
@@ -55,8 +52,6 @@ fn default_sys_log_roll_num() -> usize {
 #[serde(rename_all = "snake_case")]
 enum StateStoreProviderKindWire {
     Sqlite,
-    Foundationdb,
-    Mysql,
 }
 
 #[derive(Deserialize)]
@@ -64,14 +59,11 @@ enum StateStoreProviderKindWire {
 struct StateStoreAppConfigWire {
     provider: StateStoreProviderKindWire,
     cluster_id: String,
-    path: Option<PathBuf>,
-    deployment_owner: Option<String>,
-    cluster_file: Option<PathBuf>,
-    keyspace_id: Option<Uuid>,
-    database: Option<String>,
+    path: PathBuf,
     #[serde(default)]
     limits: StateStoreLimitOverridesWire,
-    mysql_client: Option<MySqlClientConfigWire>,
+    #[serde(default)]
+    history_retention: SqliteHistoryRetentionConfigWire,
 }
 
 #[derive(Default, Deserialize)]
@@ -99,140 +91,49 @@ impl From<StateStoreLimitOverridesWire> for StateStoreLimitOverrides {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum MySqlTlsModeWire {
-    Disabled,
-    Required,
-    VerifyIdentity,
-}
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MySqlClientConfigWire {
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    tls_mode: MySqlTlsModeWire,
-    tls_ca_path: Option<PathBuf>,
-    tls_cert_path: Option<PathBuf>,
-    tls_key_path: Option<PathBuf>,
-    connect_timeout_ms: u64,
-    pool_min: usize,
-    pool_max: usize,
-    inactive_connection_ttl_ms: u64,
+struct SqliteHistoryRetentionConfigWire {
+    max_age_secs: Option<u64>,
+    max_change_rows: Option<usize>,
+    max_commit_receipts: Option<usize>,
+    maintenance_interval_commits: Option<usize>,
+    incremental_vacuum_pages: Option<usize>,
 }
-impl From<MySqlClientConfigWire> for MySqlClientConfig {
-    fn from(w: MySqlClientConfigWire) -> Self {
+impl From<SqliteHistoryRetentionConfigWire> for SqliteHistoryRetentionConfig {
+    fn from(w: SqliteHistoryRetentionConfigWire) -> Self {
+        let defaults = SqliteHistoryRetentionConfig::default();
         Self {
-            host: w.host,
-            port: w.port,
-            username: w.username,
-            password: SecretValue::new(w.password),
-            tls_mode: match w.tls_mode {
-                MySqlTlsModeWire::Disabled => MySqlTlsMode::Disabled,
-                MySqlTlsModeWire::Required => MySqlTlsMode::Required,
-                MySqlTlsModeWire::VerifyIdentity => MySqlTlsMode::VerifyIdentity,
-            },
-            tls_ca_path: w.tls_ca_path,
-            tls_cert_path: w.tls_cert_path,
-            tls_key_path: w.tls_key_path,
-            connect_timeout_ms: w.connect_timeout_ms,
-            pool_min: w.pool_min,
-            pool_max: w.pool_max,
-            inactive_connection_ttl_ms: w.inactive_connection_ttl_ms,
+            max_age_secs: w.max_age_secs.unwrap_or(defaults.max_age_secs),
+            max_change_rows: w.max_change_rows.unwrap_or(defaults.max_change_rows),
+            max_commit_receipts: w
+                .max_commit_receipts
+                .unwrap_or(defaults.max_commit_receipts),
+            maintenance_interval_commits: w
+                .maintenance_interval_commits
+                .unwrap_or(defaults.maintenance_interval_commits),
+            incremental_vacuum_pages: w
+                .incremental_vacuum_pages
+                .unwrap_or(defaults.incremental_vacuum_pages),
         }
     }
 }
 
-fn state_store_from_wire<E: serde::de::Error>(
-    wire: StateStoreAppConfigWire,
-) -> std::result::Result<StateStoreAppConfig, E> {
-    let provider = match wire.provider {
-        StateStoreProviderKindWire::Sqlite => {
-            if wire.cluster_file.is_some() || wire.keyspace_id.is_some() || wire.database.is_some()
-            {
-                return Err(E::custom(
-                    "non-SQLite fields are not valid for the sqlite state store provider",
-                ));
-            }
-            StateStoreProviderConfig::Sqlite {
-                path: wire.path.ok_or_else(|| E::missing_field("path"))?,
-                deployment_owner: wire
-                    .deployment_owner
-                    .ok_or_else(|| E::missing_field("deployment_owner"))?,
-            }
-        }
-        StateStoreProviderKindWire::Foundationdb => {
-            if wire.path.is_some() || wire.deployment_owner.is_some() || wire.database.is_some() {
-                return Err(E::custom(
-                    "non-FoundationDB fields are not valid for the foundationdb state store provider",
-                ));
-            }
-            StateStoreProviderConfig::Foundationdb {
-                cluster_file: wire
-                    .cluster_file
-                    .ok_or_else(|| E::missing_field("cluster_file"))?,
-                keyspace_id: wire
-                    .keyspace_id
-                    .ok_or_else(|| E::missing_field("keyspace_id"))?,
-            }
-        }
-        StateStoreProviderKindWire::Mysql => {
-            if wire.path.is_some()
-                || wire.deployment_owner.is_some()
-                || wire.cluster_file.is_some()
-                || wire.keyspace_id.is_some()
-            {
-                return Err(E::custom(
-                    "non-MySQL fields are not valid for the mysql state store provider",
-                ));
-            }
-            StateStoreProviderConfig::Mysql {
-                database: wire.database.ok_or_else(|| E::missing_field("database"))?,
-            }
-        }
-    };
-    Ok(StateStoreAppConfig {
+fn state_store_from_wire(wire: StateStoreAppConfigWire) -> StateStoreAppConfig {
+    let StateStoreProviderKindWire::Sqlite = wire.provider;
+    StateStoreAppConfig {
         store: StateStoreConfig {
             cluster_id: wire.cluster_id,
+            path: wire.path,
             limits: wire.limits.into(),
-            provider,
+            history_retention: wire.history_retention.into(),
         },
-        mysql_client: wire.mysql_client.map(Into::into),
-    })
+    }
 }
 fn deserialize_state_store<'de, D: Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<Option<StateStoreAppConfig>, D::Error> {
-    Option::<StateStoreAppConfigWire>::deserialize(d)?
-        .map(state_store_from_wire)
-        .transpose()
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FoundationDbClientConfigWire {
-    disable_multi_version_client: bool,
-    tls_cert_path: Option<PathBuf>,
-    tls_key_path: Option<PathBuf>,
-    tls_ca_path: Option<PathBuf>,
-    tls_verify_peers: Option<String>,
-    tls_password: Option<String>,
-}
-fn deserialize_foundationdb_client<'de, D: Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<Option<FoundationDbClientConfig>, D::Error> {
-    Ok(
-        Option::<FoundationDbClientConfigWire>::deserialize(d)?.map(|w| FoundationDbClientConfig {
-            disable_multi_version_client: w.disable_multi_version_client,
-            tls_cert_path: w.tls_cert_path,
-            tls_key_path: w.tls_key_path,
-            tls_ca_path: w.tls_ca_path,
-            tls_verify_peers: w.tls_verify_peers,
-            tls_password: w.tls_password.map(SecretValue::new),
-        }),
-    )
+    Ok(Option::<StateStoreAppConfigWire>::deserialize(d)?.map(state_store_from_wire))
 }
 
 /// Configuration for the `[cluster]` TOML section.
@@ -526,8 +427,8 @@ pub struct NovaRocksConfig {
     #[serde(default, deserialize_with = "deserialize_state_store")]
     pub state_store: Option<StateStoreAppConfig>,
 
-    #[serde(default, deserialize_with = "deserialize_foundationdb_client")]
-    pub foundationdb_client: Option<FoundationDbClientConfig>,
+    #[serde(default, rename = "foundationdb_client")]
+    rejected_foundationdb_client: Option<toml::Value>,
 
     #[serde(default)]
     pub standalone_server: Option<StandaloneServerConfig>,
@@ -738,7 +639,7 @@ impl Default for NovaRocksConfig {
             catalog_source: None,
             runtime: RuntimeConfig::default(),
             state_store: None,
-            foundationdb_client: None,
+            rejected_foundationdb_client: None,
             standalone_server: None,
             connector: ConnectorConfig::default(),
             spill: SpillStorageConfig::default(),
@@ -749,30 +650,13 @@ impl Default for NovaRocksConfig {
 }
 
 fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
+    if config.rejected_foundationdb_client.is_some() {
+        bail!("InvalidStateStoreConfig: [foundationdb_client] is not supported by the server");
+    }
     if let Some(state_store) = &config.state_store {
         state_store.validate()?;
     }
-
-    match (
-        config
-            .state_store
-            .as_ref()
-            .map(|state_store| &state_store.store.provider),
-        &config.foundationdb_client,
-    ) {
-        (None, None)
-        | (Some(StateStoreProviderConfig::Sqlite { .. }), None)
-        | (Some(StateStoreProviderConfig::Mysql { .. }), None) => Ok(()),
-        (Some(StateStoreProviderConfig::Foundationdb { .. }), Some(client)) => client.validate(),
-        (Some(StateStoreProviderConfig::Foundationdb { .. }), None) => {
-            bail!("InvalidStateStoreConfig: foundationdb provider requires [foundationdb_client]")
-        }
-        (None, Some(_))
-        | (Some(StateStoreProviderConfig::Sqlite { .. }), Some(_))
-        | (Some(StateStoreProviderConfig::Mysql { .. }), Some(_)) => bail!(
-            "InvalidStateStoreConfig: [foundationdb_client] requires the foundationdb state store provider"
-        ),
-    }
+    Ok(())
 }
 
 #[derive(Clone, Deserialize)]
@@ -2071,8 +1955,6 @@ impl Default for CacheConfig {
 
 #[cfg(test)]
 mod tests {
-    use crate::state_store_config::StateStoreProviderConfig;
-
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, NovaRocksConfig, RuntimeConfig, StandaloneServerConfig,
         validate_query_control_config,
@@ -2227,16 +2109,16 @@ query_control_max_active_entries = 0
 provider = "sqlite"
 path = "meta/state-store.sqlite"
 cluster_id = "cluster-a"
-deployment_owner = "fe-a"
 "#,
         )?;
 
         let cfg = NovaRocksConfig::load_from_file(temp.path())?;
 
-        assert!(matches!(
-            cfg.state_store.expect("state store config").store.provider,
-            StateStoreProviderConfig::Sqlite { .. }
-        ));
+        let state_store = cfg.state_store.expect("state store config");
+        assert_eq!(
+            state_store.store.path,
+            std::path::PathBuf::from("meta/state-store.sqlite")
+        );
         Ok(())
     }
 
@@ -2249,7 +2131,6 @@ deployment_owner = "fe-a"
 [state_store]
 path = "meta/state-store.sqlite"
 cluster_id = "cluster-a"
-deployment_owner = "fe-a"
 "#,
         )?;
 
@@ -2269,10 +2150,10 @@ deployment_owner = "fe-a"
             temp.path(),
             r#"
 [state_store]
-provider = "foundationdb"
+provider = "mysql"
 path = "meta/state-store.sqlite"
 cluster_id = "cluster-a"
-deployment_owner = "fe-a"
+database = "remote_state"
 "#,
         )?;
 
@@ -2295,7 +2176,6 @@ deployment_owner = "fe-a"
 provider = "sqlite"
 path = "meta/state-store.sqlite"
 cluster_id = "cluster-a"
-deployment_owner = "fe-a"
 
 [state_store.limits]
 max_key_bytes = 8193

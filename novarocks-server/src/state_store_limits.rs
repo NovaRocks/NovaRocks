@@ -20,8 +20,6 @@ use novarocks_spi::state_store::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS,
     MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
 };
-pub(crate) const MYSQL_MAX_KEY_BYTES: usize = 3072;
-pub(crate) const MYSQL_MAX_META_VALUE_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StateStoreLimitOverrides {
@@ -254,57 +252,5 @@ mod tests {
             assert!(message.contains("InvalidStateStoreConfig"), "{message}");
             assert!(message.contains(field), "{message}");
         }
-    }
-
-    #[test]
-    fn mysql_effective_key_limit_defaults_to_3072() {
-        let limits =
-            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MYSQL_MAX_KEY_BYTES)
-                .expect("MySQL effective limits");
-
-        assert_eq!(limits.max_key_bytes, 3072);
-    }
-
-    #[test]
-    fn mysql_effective_key_limit_rejects_3073_before_io() {
-        let error = resolve_state_store_limits(
-            &StateStoreLimitOverrides {
-                max_key_bytes: Some(3073),
-                ..StateStoreLimitOverrides::default()
-            },
-            MYSQL_MAX_KEY_BYTES,
-        )
-        .expect_err("3073-byte MySQL key limit must fail before provider I/O");
-
-        assert_eq!(
-            error.to_string(),
-            "InvalidStateStoreConfig: max_key_bytes must be between 1 and 3072, got 3073"
-        );
-    }
-
-    #[test]
-    fn mysql_limit_does_not_change_sqlite_or_foundationdb() {
-        let common =
-            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MAX_KEY_BYTES)
-                .expect("common provider limits");
-        let explicit_common =
-            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MAX_KEY_BYTES)
-                .expect("explicit common provider limits");
-        let mysql =
-            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MYSQL_MAX_KEY_BYTES)
-                .expect("MySQL effective limits");
-
-        assert_eq!(common.max_key_bytes, MAX_KEY_BYTES);
-        assert_eq!(explicit_common, common);
-        assert_eq!(mysql.max_key_bytes, 3072);
-        assert_eq!(mysql.max_value_bytes, common.max_value_bytes);
-        assert_eq!(mysql.max_page_size, common.max_page_size);
-        assert_eq!(
-            mysql.max_transaction_operations,
-            common.max_transaction_operations
-        );
-        assert_eq!(mysql.max_transaction_bytes, common.max_transaction_bytes);
-        assert_eq!(mysql.transaction_deadline, common.transaction_deadline);
-        assert_eq!(mysql.runner_max_attempts, common.runner_max_attempts);
     }
 }

@@ -132,7 +132,6 @@ mode = "dynamic-state-store"
 provider = "sqlite"
 cluster_id = "server-binary-smoke"
 path = "{}"
-deployment_owner = "server-binary-smoke-fe"
 "#,
                 log_dir.display(),
                 state_store.display(),
@@ -582,7 +581,6 @@ mode = "dynamic-state-store"
 provider = "sqlite"
 cluster_id = "preflight"
 path = "{}"
-deployment_owner = "preflight-fe"
 "#,
             log_dir.display(),
             pair.fe_http_port,

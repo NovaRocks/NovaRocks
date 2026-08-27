@@ -19,8 +19,6 @@ novarocks-native-trust = { path = "../novarocks/native-trust" }
 novarocks-secret = { path = "../novarocks/secret" }
 novarocks-spi = { path = "../novarocks/spi" }
 novarocks-state-store-sqlite = { path = "../novarocks/state-store/sqlite" }
-novarocks-state-store-foundationdb = { path = "../novarocks/state-store/foundationdb", optional = true }
-novarocks-state-store-mysql = { path = "../novarocks/state-store/mysql", optional = true }
 novarocks-types = { path = "../novarocks/types" }
 anyhow = "1"
 atty = "0.2"
@@ -34,8 +32,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "time"
 uuid = "1"
 
 [features]
-foundationdb-provider = ["dep:novarocks-state-store-foundationdb", "novarocks-state-store-foundationdb/foundationdb-provider"]
-mysql-state-store-provider = ["dep:novarocks-state-store-mysql"]
 mv-first-refresh-staging-test-support = []
 
 [dev-dependencies]
