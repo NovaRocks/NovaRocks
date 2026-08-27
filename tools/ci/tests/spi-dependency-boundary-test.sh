@@ -42,7 +42,7 @@ write_fixture() {
   local fixture_root="$1"
 
   mkdir -p "$fixture_root/src"
-  for dependency in arrow async-trait bytes sha2 tokio uuid; do
+  for dependency in arrow async-trait bytes serde sha2 tokio uuid; do
     write_dependency_package "$fixture_root" "$dependency"
   done
   cat >"$fixture_root/Cargo.toml" <<'EOF'
@@ -56,6 +56,7 @@ arrow = { path = "deps/arrow" }
 async-trait = { path = "deps/async-trait" }
 bytes = { path = "deps/bytes" }
 sha2 = { path = "deps/sha2" }
+serde = { path = "deps/serde" }
 tokio = { path = "deps/tokio", optional = true }
 uuid = { path = "deps/uuid" }
 
@@ -83,13 +84,13 @@ write_fixture "$valid_root"
 
 extra_dependency_root="$tmpdir/extra-dependency"
 cp -R "$valid_root" "$extra_dependency_root"
-write_dependency_package "$extra_dependency_root" serde
+write_dependency_package "$extra_dependency_root" tracing
 sed -i.bak '/sha2 =/a\
-serde = { path = "deps/serde" }
+tracing = { path = "deps/tracing" }
 ' "$extra_dependency_root/Cargo.toml"
 rm "$extra_dependency_root/Cargo.toml.bak"
 assert_rejected "$extra_dependency_root" \
-  "required normal dependencies must be exactly: arrow, async-trait, bytes, sha2, uuid"
+  "required normal dependencies must be exactly: arrow, async-trait, bytes, serde, sha2, uuid"
 
 required_tokio_root="$tmpdir/required-tokio"
 cp -R "$valid_root" "$required_tokio_root"
