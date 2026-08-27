@@ -284,6 +284,7 @@ fn complete_profile(
             "RuntimeFilterScanUnits",
         ),
         (CONNECTOR_FILE_COUNTER_NAMES, "ConnectorFileMetrics"),
+        (TYPED_CONNECTOR_COUNTER_NAMES, "TypedConnectorMetrics"),
     ] {
         if let Some(counters) =
             crate::query_execution::profile::format_counter_sums_from_profile_trees(
@@ -378,6 +379,10 @@ const CONNECTOR_FILE_COUNTER_NAMES: &[&str] = &[
     "ConnectorFilePageIndexRowsConsidered",
     "ConnectorFilePageIndexRowsPruned",
 ];
+const TYPED_CONNECTOR_COUNTER_NAMES: &[&str] = &[
+    "TypedConnectorPageSourcesOpened",
+    "TypedConnectorSplitsRead",
+];
 
 fn format_distributed_profile_summary(
     summary: &crate::query_execution::profile::DistributedProfileSummary,
@@ -429,6 +434,17 @@ mod tests {
                 "ConnectorFilePageIndexFallbacks",
                 "ConnectorFilePageIndexRowsConsidered",
                 "ConnectorFilePageIndexRowsPruned",
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_connector_summary_includes_carrier_native_counters() {
+        assert_eq!(
+            super::TYPED_CONNECTOR_COUNTER_NAMES,
+            [
+                "TypedConnectorPageSourcesOpened",
+                "TypedConnectorSplitsRead"
             ]
         );
     }

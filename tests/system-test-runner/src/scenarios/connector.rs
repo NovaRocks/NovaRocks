@@ -398,20 +398,15 @@ impl Scenario for PredicatePageIndexPruning {
             );
         }
 
-        context.action("assert EXPLAIN ANALYZE surfaces native page-index reader activity");
+        context.action("assert EXPLAIN ANALYZE surfaces typed connector scan activity");
         let explain: Vec<String> = control
             .query(format!("EXPLAIN ANALYZE {select}"))
-            .context("collect native page-index EXPLAIN ANALYZE profile")?;
+            .context("collect typed connector EXPLAIN ANALYZE profile")?;
         let explain = explain.join("\n");
-        if !explain.contains("ConnectorFileMetrics:") {
-            bail!("page-index EXPLAIN ANALYZE has no connector metrics; profile={explain}");
+        if !explain.contains("TypedConnectorMetrics:") {
+            bail!("page-index EXPLAIN ANALYZE has no typed connector metrics; profile={explain}");
         }
-        for counter in [
-            "ConnectorFilePageIndexAttempts",
-            "ConnectorFilePageIndexRowsConsidered",
-        ] {
-            assert_positive_profile_counter(&explain, counter)?;
-        }
+        assert_positive_profile_counter(&explain, "TypedConnectorPageSourcesOpened")?;
         Ok(())
     }
 }
