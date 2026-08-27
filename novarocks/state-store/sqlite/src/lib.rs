@@ -223,8 +223,9 @@ fn open_blocking(
 ) -> Result<SqliteStateStore, StateStoreError> {
     let path = canonicalize_database_path(&path)?;
     let owner_lock = acquire_owner_lock(&path)?;
-    let mut connection = open_connection(&path)?;
+    let mut connection = open_connection_raw(&path)?;
     let identity = schema::initialize(&mut connection, cluster_id.as_bytes())?;
+    configure_connection(&connection)?;
     history::reclaim_pending_on_open(&connection, &history_retention)?;
 
     Ok(SqliteStateStore {
@@ -241,6 +242,12 @@ fn open_blocking(
 }
 
 fn open_connection(path: &Path) -> Result<Connection, StateStoreError> {
+    let connection = open_connection_raw(path)?;
+    configure_connection(&connection)?;
+    Ok(connection)
+}
+
+fn open_connection_raw(path: &Path) -> Result<Connection, StateStoreError> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -253,6 +260,10 @@ fn open_connection(path: &Path) -> Result<Connection, StateStoreError> {
             "failed to open SQLite state store database",
         )
     })?;
+    Ok(connection)
+}
+
+fn configure_connection(connection: &Connection) -> Result<(), StateStoreError> {
     let journal_mode = connection
         .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
         .map_err(|error| {
@@ -305,7 +316,7 @@ fn open_connection(path: &Path) -> Result<Connection, StateStoreError> {
     if synchronous != 2 || foreign_keys != 1 {
         return Err(connection_configuration_error());
     }
-    Ok(connection)
+    Ok(())
 }
 
 fn canonicalize_database_path(path: &Path) -> Result<PathBuf, StateStoreError> {
