@@ -720,9 +720,6 @@ fn decode_optional_transaction_id(value: &[u8]) -> Result<Option<Uuid>, StateSto
     }
     let transaction_id = Uuid::from_slice(value)
         .map_err(|_| schema_error("SQLite retired transaction id is malformed"))?;
-    if transaction_id.get_version() != Some(Version::SortRand) {
-        return Err(schema_error("SQLite retired transaction id is not UUIDv7"));
-    }
     Ok(Some(transaction_id))
 }
 

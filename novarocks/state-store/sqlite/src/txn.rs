@@ -36,7 +36,7 @@ use novarocks_spi::state_store::{
 
 use novarocks_spi::state_store::StateStoreMetrics;
 
-use super::{SqliteStateStore, open_connection, schema};
+use super::{SqliteHistoryRetentionConfig, SqliteStateStore, history, open_connection, schema};
 
 const MUTATION_KIND_BYTES: usize = 1;
 const PRECONDITION_KIND_BYTES: usize = 1;
@@ -283,6 +283,7 @@ pub(super) struct SqliteWriteTransaction {
     metrics: Arc<StateStoreMetrics>,
     transaction_id: TransactionId,
     path: PathBuf,
+    history_retention: SqliteHistoryRetentionConfig,
     commit_registry: CommitRegistry,
     #[cfg(test)]
     test_hooks: TestHooks,
@@ -326,11 +327,24 @@ impl SqliteStateStore {
         };
         record_result(&self.metrics, StateStoreOperation::Begin, started, &result);
         let owner = result?;
+        let transaction_id_bytes = *transaction_id.as_uuid().as_bytes();
+        if let Err(error) = run_operation(&owner, move |state| {
+            if history::transaction_id_is_retired(&state.connection, &transaction_id_bytes)? {
+                return Err(retired_transaction_error());
+            }
+            Ok(())
+        })
+        .await
+        {
+            schedule_rollback(owner);
+            return Err(error);
+        }
         Ok(SqliteWriteTransaction {
             owner: Some(owner),
             metrics: Arc::clone(&self.metrics),
             transaction_id,
             path: self.path.clone(),
+            history_retention: self.history_retention.clone(),
             commit_registry: Arc::clone(&self.commit_registry),
             #[cfg(test)]
             test_hooks: Arc::clone(&self.test_hooks),
@@ -356,9 +370,10 @@ impl SqliteStateStore {
                 RecoveryReservation::new(&registry, transaction_id)
             };
 
-            let terminal = match lookup_commit(&path, transaction_id)? {
-                Some(receipt) => CommitRegistryState::Committed(receipt),
-                None => CommitRegistryState::NotCommitted,
+            let terminal = match lookup_commit_resolution(&path, transaction_id)? {
+                CommitResolution::Committed(receipt) => CommitRegistryState::Committed(receipt),
+                CommitResolution::NotCommitted => CommitRegistryState::NotCommitted,
+                CommitResolution::Unresolved => CommitRegistryState::InFlight,
             };
             #[cfg(test)]
             test_hooks.pause_resolve_after_lookup();
@@ -604,6 +619,7 @@ impl SqliteWriteTransaction {
         let path = self.path.clone();
         let recovery_registry = Arc::clone(&registry);
         let recovery_path = path.clone();
+        let history_retention = self.history_retention.clone();
         #[cfg(test)]
         let test_hooks = Arc::clone(&self.test_hooks);
         let mut cancel_guard = CancelOnDrop::new(&owner);
@@ -614,7 +630,9 @@ impl SqliteWriteTransaction {
                 test_hooks.panic_commit_before_apply();
             }
             let outcome = match state.lock() {
-                Ok(mut state) => commit_blocking(&mut state, transaction_id, &path),
+                Ok(mut state) => {
+                    commit_blocking(&mut state, transaction_id, &path, &history_retention)
+                }
                 Err(_) => CommitOutcome::CommitUnknown(internal_error()),
             };
             #[cfg(test)]
@@ -1181,6 +1199,7 @@ fn commit_blocking(
     state: &mut SqliteTxnState,
     transaction_id: TransactionId,
     path: &Path,
+    history_retention: &SqliteHistoryRetentionConfig,
 ) -> CommitOutcome {
     if !state.active {
         return CommitOutcome::DefiniteFailure(transaction_finished());
@@ -1207,6 +1226,17 @@ fn commit_blocking(
         Err(error) => {
             return rollback_outcome(state, classify_precommit_error(error));
         }
+    }
+    let transaction_id_bytes = *transaction_id.as_uuid().as_bytes();
+    match history::transaction_id_is_retired(&state.connection, &transaction_id_bytes) {
+        Ok(true) => {
+            return rollback_outcome(
+                state,
+                CommitOutcome::DefiniteFailure(retired_transaction_error()),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => return rollback_outcome(state, classify_precommit_error(error)),
     }
 
     let current_revision = match load_current_revision(&state.connection) {
@@ -1308,9 +1338,6 @@ fn commit_blocking(
         let outcome = classify_apply_error(&error);
         return rollback_outcome(state, outcome);
     }
-    if let Err(outcome) = refresh_history_row_counters(&state.connection) {
-        return rollback_outcome(state, outcome);
-    }
     match state.connection.execute(
         "UPDATE state_store_meta SET value = ?1 WHERE key = ?2",
         params![
@@ -1334,53 +1361,30 @@ fn commit_blocking(
         }
     }
 
+    let reclaim_pending = match history::maintain_after_commit(
+        &state.connection,
+        history_retention,
+        revision,
+        committed_at_ms,
+    ) {
+        Ok(reclaim_pending) => reclaim_pending,
+        Err(error) => return rollback_outcome(state, classify_precommit_error(error)),
+    };
+
     match state.connection.execute_batch("COMMIT") {
         Ok(()) => {
             state.active = false;
+            if let Err(error) =
+                history::reclaim_after_commit(&state.connection, history_retention, reclaim_pending)
+            {
+                let _ = error;
+            }
             CommitOutcome::Committed(CommitReceipt {
                 transaction_id,
                 revision: revision_token(revision),
             })
         }
         Err(error) => classify_commit_error(state, transaction_id, path, &error),
-    }
-}
-
-fn refresh_history_row_counters(connection: &Connection) -> Result<(), CommitOutcome> {
-    let changes = count_history_rows(connection, "state_store_changes")?;
-    let commits = count_history_rows(connection, "state_store_commits")?;
-    update_u64_metadata(connection, schema::CHANGE_ROW_COUNT_KEY, changes)?;
-    update_u64_metadata(connection, schema::COMMIT_RECEIPT_COUNT_KEY, commits)
-}
-
-fn count_history_rows(connection: &Connection, table: &'static str) -> Result<u64, CommitOutcome> {
-    let sql = format!("SELECT COUNT(*) FROM {table}");
-    let count = connection
-        .query_row(&sql, [], |row| row.get::<_, i64>(0))
-        .map_err(|error| classify_apply_error(&error))?;
-    u64::try_from(count).map_err(|_| {
-        CommitOutcome::DefiniteFailure(StateStoreError::new(
-            StateStoreErrorKind::Corruption,
-            "SQLite history row count is malformed",
-        ))
-    })
-}
-
-fn update_u64_metadata(
-    connection: &Connection,
-    key: &[u8],
-    value: u64,
-) -> Result<(), CommitOutcome> {
-    match connection.execute(
-        "UPDATE state_store_meta SET value = ?1 WHERE key = ?2",
-        params![value.to_be_bytes().as_slice(), key],
-    ) {
-        Ok(1) => Ok(()),
-        Ok(_) => Err(CommitOutcome::DefiniteFailure(StateStoreError::new(
-            StateStoreErrorKind::Corruption,
-            "SQLite history metadata is missing",
-        ))),
-        Err(error) => Err(classify_apply_error(&error)),
     }
 }
 
@@ -1634,6 +1638,24 @@ fn lookup_commit(
     lookup_commit_on_connection(&connection, transaction_id)
 }
 
+fn lookup_commit_resolution(
+    path: &Path,
+    transaction_id: TransactionId,
+) -> Result<CommitResolution, StateStoreError> {
+    let connection = open_connection(path)?;
+    match lookup_commit_on_connection(&connection, transaction_id)? {
+        Some(receipt) => Ok(CommitResolution::Committed(receipt)),
+        None if history::transaction_id_is_retired(
+            &connection,
+            transaction_id.as_uuid().as_bytes(),
+        )? =>
+        {
+            Ok(CommitResolution::Unresolved)
+        }
+        None => Ok(CommitResolution::NotCommitted),
+    }
+}
+
 fn lookup_commit_on_connection(
     connection: &Connection,
     transaction_id: TransactionId,
@@ -1679,6 +1701,13 @@ fn registry_resolution(state: &CommitRegistryState) -> CommitResolution {
         CommitRegistryState::Committed(receipt) => CommitResolution::Committed(receipt.clone()),
         CommitRegistryState::NotCommitted => CommitResolution::NotCommitted,
     }
+}
+
+const fn retired_transaction_error() -> StateStoreError {
+    StateStoreError::new(
+        StateStoreErrorKind::InvalidRequest,
+        "SQLite transaction id is within retired history bounds",
+    )
 }
 
 fn is_busy_snapshot(error: &rusqlite::Error) -> bool {
@@ -1874,7 +1903,7 @@ mod tests {
     use tokio::sync::Barrier;
     use uuid::Uuid;
 
-    use super::super::SqliteStateStore;
+    use super::super::{SqliteHistoryRetentionConfig, SqliteStateStore};
     use super::*;
     use novarocks_spi::state_store::{
         CommitOutcome, CommitReceipt, CommitResolution, Direction, Key, KeyRange, Precondition,
@@ -1886,6 +1915,7 @@ mod tests {
     struct StateStoreLimitOverrides {
         max_key_bytes: Option<usize>,
         max_transaction_bytes: Option<usize>,
+        max_transaction_operations: Option<usize>,
         transaction_deadline_ms: Option<u64>,
     }
 
@@ -1896,6 +1926,9 @@ mod tests {
         }
         if let Some(value) = limits.max_transaction_bytes {
             resolved.max_transaction_bytes = value;
+        }
+        if let Some(value) = limits.max_transaction_operations {
+            resolved.max_transaction_operations = value;
         }
         if let Some(value) = limits.transaction_deadline_ms {
             resolved.transaction_deadline = std::time::Duration::from_millis(value);
@@ -1927,6 +1960,26 @@ mod tests {
             SqliteStateStore::open(
                 temp.path().join("state-store.sqlite"),
                 super::super::SqliteHistoryRetentionConfig::default(),
+                StateStoreOpenRequest {
+                    cluster_id: "cluster-a".to_owned(),
+                    limits: resolve_state_store_limits(&limits),
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                },
+            )
+            .await
+            .expect("open SQLite store"),
+        )
+    }
+
+    async fn store_with_policy(
+        temp: &TempDir,
+        limits: StateStoreLimitOverrides,
+        policy: SqliteHistoryRetentionConfig,
+    ) -> Arc<SqliteStateStore> {
+        Arc::new(
+            SqliteStateStore::open(
+                temp.path().join("state-store.sqlite"),
+                policy,
                 StateStoreOpenRequest {
                     cluster_id: "cluster-a".to_owned(),
                     limits: resolve_state_store_limits(&limits),
@@ -3224,6 +3277,75 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_history_capacity_pruning_keeps_resolution_conservative() {
+        let temp = TempDir::new().expect("temporary directory");
+        let store = store_with_policy(
+            &temp,
+            StateStoreLimitOverrides {
+                max_transaction_operations: Some(1),
+                ..StateStoreLimitOverrides::default()
+            },
+            SqliteHistoryRetentionConfig {
+                max_age_secs: 60 * 60,
+                max_change_rows: 1,
+                max_commit_receipts: 1,
+                maintenance_interval_commits: 64,
+                incremental_vacuum_pages: 1,
+            },
+        )
+        .await;
+        let first = transaction_id();
+        let second = transaction_id();
+        for (transaction_id, key) in [(first, key(b"history-a")), (second, key(b"history-b"))] {
+            let mut transaction = store
+                .begin_write(transaction_id)
+                .await
+                .expect("begin retained-history transaction");
+            transaction
+                .put(key, value(b"value"), Precondition::Any)
+                .await
+                .expect("stage retained-history mutation");
+            committed(transaction.commit().await);
+        }
+
+        assert_eq!(durable_counts(&store).await, (2, 1, 1));
+        drop(store);
+        let store = store_with_policy(
+            &temp,
+            StateStoreLimitOverrides {
+                max_transaction_operations: Some(1),
+                ..StateStoreLimitOverrides::default()
+            },
+            SqliteHistoryRetentionConfig {
+                max_age_secs: 60 * 60,
+                max_change_rows: 1,
+                max_commit_receipts: 1,
+                maintenance_interval_commits: 64,
+                incremental_vacuum_pages: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            store
+                .resolve_commit(&first)
+                .await
+                .expect("resolve retired id"),
+            CommitResolution::Unresolved
+        ));
+        match store.begin_write(first).await {
+            Ok(_) => panic!("retired transaction id must not be reusable"),
+            Err(error) => assert_eq!(error.kind(), StateStoreErrorKind::InvalidRequest),
+        }
+        assert!(matches!(
+            store
+                .resolve_commit(&Uuid::now_v7().into())
+                .await
+                .expect("resolve unknown id"),
+            CommitResolution::NotCommitted
+        ));
     }
 
     #[test]

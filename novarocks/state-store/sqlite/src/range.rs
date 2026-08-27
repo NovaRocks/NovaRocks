@@ -353,13 +353,12 @@ fn poll_changes_blocking(
     let high_watermark_i64 = i64::try_from(high_watermark).map_err(|_| malformed_revision())?;
     let mut statement = connection
         .prepare(
-            "SELECT changes.revision, changes.sequence, changes.key, commits.committed_at_ms \
-             FROM state_store_changes AS changes \
-             JOIN state_store_commits AS commits ON commits.revision = changes.revision \
-             WHERE changes.revision <= ?1 \
-               AND ((changes.revision > ?2) OR \
-                    (changes.revision = ?2 AND changes.sequence > ?3)) \
-             ORDER BY changes.revision ASC, changes.sequence ASC LIMIT ?4",
+            "SELECT revision, sequence, key, committed_at_ms \
+             FROM state_store_changes \
+             WHERE revision <= ?1 \
+               AND ((revision > ?2) OR \
+                    (revision = ?2 AND sequence > ?3)) \
+             ORDER BY revision ASC, sequence ASC LIMIT ?4",
         )
         .map_err(|error| {
             operation_error(&error, "failed to prepare bounded SQLite change query")

@@ -17,6 +17,7 @@
 
 //! SQLite StateStore provider implementation.
 
+mod history;
 mod provider;
 mod range;
 mod schema;
@@ -100,6 +101,13 @@ impl SqliteHistoryRetentionConfig {
             return Err(StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
                 "SQLite max change rows must cover one maximum transaction",
+            ));
+        }
+        if self.max_change_rows > i64::MAX as usize || self.max_commit_receipts > i64::MAX as usize
+        {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "SQLite history row limits exceed the supported integer range",
             ));
         }
         Ok(())
@@ -217,6 +225,7 @@ fn open_blocking(
     let owner_lock = acquire_owner_lock(&path)?;
     let mut connection = open_connection(&path)?;
     let identity = schema::initialize(&mut connection, cluster_id.as_bytes())?;
+    history::reclaim_pending_on_open(&connection, &history_retention)?;
 
     Ok(SqliteStateStore {
         path,
