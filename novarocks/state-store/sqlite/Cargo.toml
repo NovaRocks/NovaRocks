@@ -10,6 +10,7 @@ doctest = false
 async-trait = "0.1"
 bytes = "1"
 fs2 = "0.4"
+log = "0.4"
 novarocks-spi = { path = "../../spi" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

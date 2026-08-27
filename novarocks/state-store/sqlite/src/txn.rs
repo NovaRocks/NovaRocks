@@ -1377,7 +1377,9 @@ fn commit_blocking(
             if let Err(error) =
                 history::reclaim_after_commit(&state.connection, history_retention, reclaim_pending)
             {
-                let _ = error;
+                log::warn!(
+                    "SQLite StateStore committed revision {revision}, but deferred physical history reclamation failed: {error}"
+                );
             }
             CommitOutcome::Committed(CommitReceipt {
                 transaction_id,

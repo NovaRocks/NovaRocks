@@ -221,7 +221,7 @@ fn open_blocking(
     cluster_id: String,
     limits: StateStoreLimits,
 ) -> Result<SqliteStateStore, StateStoreError> {
-    let path = canonicalize_database_path(&path)?;
+    let path = canonicalize_path(&path)?;
     let owner_lock = acquire_owner_lock(&path)?;
     let mut connection = open_connection_raw(&path)?;
     let identity = schema::initialize(&mut connection, cluster_id.as_bytes())?;
@@ -319,7 +319,7 @@ fn configure_connection(connection: &Connection) -> Result<(), StateStoreError> 
     Ok(())
 }
 
-fn canonicalize_database_path(path: &Path) -> Result<PathBuf, StateStoreError> {
+fn canonicalize_path(path: &Path) -> Result<PathBuf, StateStoreError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -419,5 +419,47 @@ fn sqlite_error_kind(
             | SqliteErrorCode::SchemaChanged,
         ) => StateStoreErrorKind::Corruption,
         _ => fallback,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn legacy_v1_fails_before_connection_configuration() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("state-store.sqlite");
+        let connection = Connection::open(&path).expect("open legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE state_store_meta (key BLOB PRIMARY KEY, value BLOB NOT NULL);\
+                 INSERT INTO state_store_meta(key, value) VALUES (x'736368656d615f76657273696f6e', x'00000001');",
+            )
+            .expect("create legacy metadata");
+        let journal_mode = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .expect("inspect legacy journal mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+        drop(connection);
+
+        let error = match open_blocking(
+            path.clone(),
+            SqliteHistoryRetentionConfig::default(),
+            "test-cluster".to_owned(),
+            StateStoreLimits::default(),
+        ) {
+            Ok(_) => panic!("legacy schema unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsupportedFormat);
+
+        let connection = Connection::open(path).expect("reopen legacy database");
+        let journal_mode = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .expect("inspect retained journal mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
     }
 }
