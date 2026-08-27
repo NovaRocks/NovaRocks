@@ -582,15 +582,11 @@ impl NlJoinProbeProcessorOperator {
         if filtered.num_rows() == 0 {
             return Ok(None);
         }
-        let probe_schema = if self.probe_is_left {
-            &self.left_chunk_schema
-        } else {
-            &self.right_chunk_schema
-        };
-        Ok(Some(Chunk::try_new_with_chunk_schema(
-            filtered,
-            Arc::clone(probe_schema),
-        )?))
+        // A semi/anti NL join returns the probe rows themselves.  Preserve
+        // the input's frozen chunk contract rather than substituting the
+        // logical child schema: scan-side bindings may carry provider-owned
+        // field labels while retaining the same slot identities.
+        Ok(Some(Chunk::try_new_like(filtered, &probe_chunk)?))
     }
 
     fn read_outer(&mut self, chunk_size: usize) -> Result<Option<Chunk>, String> {
