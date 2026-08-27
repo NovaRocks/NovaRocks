@@ -599,6 +599,14 @@ fn execute_scheduled_refresh(
         Ok(snapshot) => snapshot,
         Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.to_string()),
     };
+    // FE restart begins before authenticated BE announces have rebuilt the
+    // runtime topology. The MV definition remains valid, so retry after the
+    // frontend observes at least one admitted backend instead of blocking it.
+    if topology.targets().is_empty() {
+        return ScheduledRefreshDisposition::TransientUnavailable(
+            "scheduler refresh is waiting for a non-empty admitted backend topology".to_string(),
+        );
+    }
     let deadline = match Instant::now().checked_add(dependencies.attempt_timeout) {
         Some(deadline) => deadline,
         None => {
