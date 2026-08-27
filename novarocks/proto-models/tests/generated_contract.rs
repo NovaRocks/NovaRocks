@@ -334,11 +334,13 @@ fn the_typed_connector_scan_source_carries_no_split_list_or_private_payload() {
             (6, "dynamic_filters".to_owned()),
             (7, "max_batch_rows".to_owned()),
             (8, "max_batch_bytes".to_owned()),
+            (9, "work_source".to_owned()),
         ]
     );
 
     // The whole point of the typed source: no eager split list, no provider
-    // payload, and no Arrow IPC schema crossing the boundary.
+    // payload, and no Arrow IPC schema crossing the boundary. `work_source`
+    // is a neutral scheduling fact, not provider-private scan content.
     for forbidden in [
         "splits",
         "scan_payload",
