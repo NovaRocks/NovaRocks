@@ -1083,6 +1083,27 @@ fn constant_column(
     }
 }
 
+fn runtime_page_schema(schema: &ArrowSchema, columns: &[ArrayRef]) -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .zip(columns)
+            .map(|(field, column)| {
+                Arc::new(
+                    Field::new(
+                        field.name(),
+                        column.data_type().clone(),
+                        field.is_nullable() || column.null_count() > 0,
+                    )
+                    .with_metadata(field.metadata().clone()),
+                )
+            })
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // The Parquet page source
 // ---------------------------------------------------------------------------
@@ -1659,8 +1680,9 @@ impl IcebergParquetPageSource {
             };
             let columns = binding.materialize(&file_batch.batch, positions.as_ref(), &facts)?;
             let rows = file_batch.batch.num_rows();
+            let runtime_schema = runtime_page_schema(page_schema, &columns);
             let page_batch = RecordBatch::try_new_with_options(
-                Arc::clone(page_schema),
+                runtime_schema,
                 columns.clone(),
                 &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
             )

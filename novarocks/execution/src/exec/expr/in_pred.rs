@@ -642,10 +642,12 @@ fn normalize_nested_candidate_types(
     }
     if check_exact(left.data_type(), right.data_type()).is_ok() {
         let right = retag_column(&right, left.data_type()).map_err(|m| format!("{m:?}"))?;
+        let left = retag_column(&left, right.data_type()).map_err(|m| format!("{m:?}"))?;
         return Ok((left, right));
     }
     if check_exact(right.data_type(), left.data_type()).is_ok() {
         let left = retag_column(&left, right.data_type()).map_err(|m| format!("{m:?}"))?;
+        let right = retag_column(&right, left.data_type()).map_err(|m| format!("{m:?}"))?;
         return Ok((left, right));
     }
     if same_nested_kind(left.data_type(), right.data_type())

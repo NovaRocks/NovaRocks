@@ -18,10 +18,11 @@
 //! Iceberg-owned use of connector-neutral physical file I/O.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{ArrayData, ArrayRef, make_array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, FieldRef};
 use bytes::Bytes;
 use novarocks_fs::{
     FileBatch, FileFormat, FileIdentity, FileProjection, FileReadBudget, FileReadContext,
@@ -61,7 +62,12 @@ pub fn retag_iceberg_array(array: &ArrayRef, target: &DataType) -> Result<ArrayR
 fn retag_iceberg_array_data(data: ArrayData, target: &DataType) -> Result<ArrayData, String> {
     use DataType::*;
 
-    if data.data_type() == target {
+    if data.data_type() == target
+        && !matches!(
+            target,
+            DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_)
+        )
+    {
         return Ok(data);
     }
     let source = data.data_type().clone();
@@ -76,30 +82,49 @@ fn retag_iceberg_array_data(data: ArrayData, target: &DataType) -> Result<ArrayD
             Vec::new()
         }
         (Utf8, Binary) | (Binary, Utf8) => Vec::new(),
-        (List(_), List(target_field)) => vec![retag_iceberg_array_data(
-            data.child_data()[0].clone(),
-            target_field.data_type(),
-        )?],
-        (LargeList(_), LargeList(target_field)) => vec![retag_iceberg_array_data(
-            data.child_data()[0].clone(),
-            target_field.data_type(),
-        )?],
-        (Map(_, source_ordered), Map(target_field, target_ordered))
+        (List(source_field), List(target_field)) => {
+            let child =
+                retag_iceberg_array_data(data.child_data()[0].clone(), target_field.data_type())?;
+            let target = List(runtime_iceberg_field(target_field, source_field, &child));
+            return rebuild_iceberg_array_data(data, &source, target, vec![child]);
+        }
+        (LargeList(source_field), LargeList(target_field)) => {
+            let child =
+                retag_iceberg_array_data(data.child_data()[0].clone(), target_field.data_type())?;
+            let target = LargeList(runtime_iceberg_field(target_field, source_field, &child));
+            return rebuild_iceberg_array_data(data, &source, target, vec![child]);
+        }
+        (Map(source_field, source_ordered), Map(target_field, target_ordered))
             if source_ordered == target_ordered =>
         {
-            vec![retag_iceberg_array_data(
-                data.child_data()[0].clone(),
-                target_field.data_type(),
-            )?]
+            let child =
+                retag_iceberg_array_data(data.child_data()[0].clone(), target_field.data_type())?;
+            let target = Map(
+                runtime_iceberg_field(target_field, source_field, &child),
+                *target_ordered,
+            );
+            return rebuild_iceberg_array_data(data, &source, target, vec![child]);
         }
-        (Struct(_), Struct(target_fields)) if data.child_data().len() == target_fields.len() => {
-            target_fields
+        (Struct(source_fields), Struct(target_fields))
+            if data.child_data().len() == target_fields.len()
+                && source_fields.len() == target_fields.len() =>
+        {
+            let children = target_fields
                 .iter()
                 .enumerate()
                 .map(|(index, field)| {
                     retag_iceberg_array_data(data.child_data()[index].clone(), field.data_type())
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let fields = target_fields
+                .iter()
+                .zip(source_fields.iter())
+                .zip(children.iter())
+                .map(|((target_field, source_field), child)| {
+                    runtime_iceberg_field(target_field, source_field, child)
+                })
+                .collect::<Vec<_>>();
+            return rebuild_iceberg_array_data(data, &source, Struct(fields.into()), children);
         }
         _ => {
             return Err(format!(
@@ -107,6 +132,23 @@ fn retag_iceberg_array_data(data: ArrayData, target: &DataType) -> Result<ArrayD
             ));
         }
     };
+    rebuild_iceberg_array_data(data, &source, target.clone(), children)
+}
+
+fn runtime_iceberg_field(target: &FieldRef, source: &FieldRef, child: &ArrayData) -> FieldRef {
+    let nullable = target.is_nullable() || source.is_nullable() || child.null_count() > 0;
+    Arc::new(
+        Field::new(target.name(), child.data_type().clone(), nullable)
+            .with_metadata(target.metadata().clone()),
+    )
+}
+
+fn rebuild_iceberg_array_data(
+    data: ArrayData,
+    source: &DataType,
+    target: DataType,
+    children: Vec<ArrayData>,
+) -> Result<ArrayData, String> {
     let mut builder = data.into_builder().data_type(target.clone());
     if !children.is_empty() {
         builder = builder.child_data(children);
@@ -329,8 +371,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use arrow::array::StringArray;
-    use arrow::datatypes::DataType;
+    use arrow::array::{Array, Int32Array, Int64Array, MapArray, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Fields};
 
     use super::*;
 
@@ -416,6 +459,55 @@ mod tests {
 
         assert_eq!(retagged.data_type(), &DataType::Binary);
         assert_eq!(retagged.to_data().buffers(), source.to_data().buffers());
+    }
+
+    #[test]
+    fn retags_iceberg_map_without_narrowing_runtime_key_nullability() {
+        let keys = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
+        let values = Arc::new(Int64Array::from(vec![Some(10), Some(20)])) as ArrayRef;
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("key", DataType::Int32, true),
+                Field::new("value", DataType::Int64, true),
+            ]),
+            vec![keys, values],
+            None,
+        );
+        let source = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::from_lengths([2]),
+            entries,
+            None,
+            false,
+        )) as ArrayRef;
+        let target = DataType::Map(
+            Arc::new(Field::new(
+                "iceberg_entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("iceberg_key", DataType::Int32, false)),
+                        Arc::new(Field::new("iceberg_value", DataType::Int64, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+
+        let out = retag_iceberg_array(&source, &target).expect("retag nullable map key");
+
+        let DataType::Map(entries, false) = out.data_type() else {
+            panic!("expected map");
+        };
+        assert_eq!(entries.name(), "iceberg_entries");
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected entries struct");
+        };
+        assert_eq!(fields[0].name(), "iceberg_key");
+        assert!(fields[0].is_nullable());
+        let map = out.as_any().downcast_ref::<MapArray>().expect("map array");
+        assert!(map.keys().is_null(1));
     }
 
     #[test]

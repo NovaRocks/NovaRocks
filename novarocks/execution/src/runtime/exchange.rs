@@ -1049,7 +1049,23 @@ fn normalize_exchange_batch_for_schema(
         .zip(schema.fields().iter())
         .map(|(array, field)| normalize_exchange_array_for_field(array, field.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    RecordBatch::try_new(Arc::clone(schema), columns).map_err(|e| {
+    let fields = schema
+        .fields()
+        .iter()
+        .zip(columns.iter())
+        .map(|(field, column)| {
+            Arc::new(
+                arrow::datatypes::Field::new(
+                    field.name(),
+                    column.data_type().clone(),
+                    field.is_nullable() || column.null_count() > 0,
+                )
+                .with_metadata(field.metadata().clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let runtime_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(runtime_schema, columns).map_err(|e| {
         format!(
             "failed to normalize exchange chunk schema at index {}: {e}",
             chunk_index
@@ -1122,7 +1138,10 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
         for (i, chunk) in chunks.iter().enumerate() {
             batches.push(normalize_exchange_batch_for_schema(chunk, &schema, i)?);
         }
-        schema
+        batches
+            .first()
+            .map(|batch| batch.schema())
+            .unwrap_or(schema)
     };
     let mut writer = StreamWriter::try_new(&mut buffer, &writer_schema)
         .map_err(|e| format!("failed to create Arrow IPC writer: {e}"))?;
@@ -1297,7 +1316,7 @@ fn materialize_chunk_for_wire_meta(
                         out_column = retagged;
                         out_field = arrow::datatypes::Field::new(
                             field.name(),
-                            expected_arrow_type.clone(),
+                            out_column.data_type().clone(),
                             field.is_nullable(),
                         )
                         .with_metadata(field.metadata().clone());
@@ -2125,7 +2144,7 @@ mod tests {
                 Field::new("value", DataType::Int32, true),
             ]),
             vec![
-                Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![Some(10), Some(20)])) as ArrayRef,
             ],
             None,
@@ -2189,10 +2208,14 @@ mod tests {
             decoded[0].chunk_schema().slots()[0].slot_id(),
             SlotId::new(5)
         );
-        assert!(matches!(
-            decoded[0].batch.schema().field(0).data_type(),
-            DataType::Map(_, false)
-        ));
+        let decoded_schema = decoded[0].batch.schema();
+        let DataType::Map(entries, false) = decoded_schema.field(0).data_type() else {
+            panic!("expected map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected entries struct");
+        };
+        assert!(fields[0].is_nullable());
         assert_eq!(decoded[0].batch.column(0).len(), 1);
     }
 

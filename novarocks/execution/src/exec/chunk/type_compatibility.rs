@@ -46,8 +46,10 @@
 //! nullability reconciliation (and the root-boundary `required -> null`
 //! fail-fast) is a separate concern layered on top at descriptor boundaries.
 
+use std::sync::Arc;
+
 use arrow::array::{Array, ArrayData, ArrayRef, make_array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, FieldRef};
 
 /// One step on the path from a top-level type to a nested mismatch, for
 /// diagnostics that can name `col.field[2].list.item` precisely.
@@ -184,10 +186,12 @@ fn check_exact_inner(
     }
 }
 
-/// Retag `array` so its type equals `target`, changing only metadata — never a
-/// single value. This is an explicit metadata-only rebuild primitive, not a
-/// compatibility policy. Descriptor-bound runtime callers must run
-/// [`check_exact`] before using it.
+/// Retag `array` toward `target`, changing only metadata — never a single
+/// value. Nested field nullability is widened when the source field or child
+/// data proves nullable, so a runtime carrier is never rebuilt with a false
+/// non-null assertion. All other target metadata remains authoritative. This
+/// is an explicit metadata-only rebuild primitive, not a compatibility policy.
+/// Descriptor-bound runtime callers must run [`check_exact`] before using it.
 ///
 /// The legitimate retag cases are: identity; a decimal precision change at the
 /// SAME scale within the same physical width (an `i128`/`i256` buffer is
@@ -208,7 +212,12 @@ fn retag_data(
     use DataType::*;
     use TypeMismatchKind::*;
 
-    if data.data_type() == target {
+    if data.data_type() == target
+        && !matches!(
+            target,
+            DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_)
+        )
+    {
         return Ok(data);
     }
     let source = data.data_type().clone();
@@ -230,22 +239,26 @@ fn retag_data(
             Err(retag_mismatch(path, target, &source, ScalarMismatch))
         }
         (Utf8, Binary) | (Binary, Utf8) => finish_retag(data, target, Vec::new(), path, &source),
-        (List(_), List(tf)) => {
+        (List(sf), List(tf)) => {
             path.push(NestedStep::ListItem);
             let child = retag_data(data.child_data()[0].clone(), tf.data_type(), path);
             path.pop();
-            finish_retag(data, target, vec![child?], path, &source)
+            let child = child?;
+            let target = List(runtime_field(tf, sf, &child));
+            finish_retag(data, &target, vec![child], path, &source)
         }
-        (LargeList(_), LargeList(tf)) => {
+        (LargeList(sf), LargeList(tf)) => {
             path.push(NestedStep::LargeListItem);
             let child = retag_data(data.child_data()[0].clone(), tf.data_type(), path);
             path.pop();
-            finish_retag(data, target, vec![child?], path, &source)
+            let child = child?;
+            let target = LargeList(runtime_field(tf, sf, &child));
+            finish_retag(data, &target, vec![child], path, &source)
         }
         (List(_) | LargeList(_), _) | (_, List(_) | LargeList(_)) => {
             Err(retag_mismatch(path, target, &source, ListKindMismatch))
         }
-        (Map(_, so), Map(tf, to)) => {
+        (Map(sf, so), Map(tf, to)) => {
             if so != to {
                 return Err(retag_mismatch(path, target, &source, MapOrderingMismatch));
             }
@@ -253,24 +266,38 @@ fn retag_data(
             path.push(NestedStep::StructField(0));
             let child = retag_data(data.child_data()[0].clone(), tf.data_type(), path);
             path.pop();
-            finish_retag(data, target, vec![child?], path, &source)
+            let child = child?;
+            let target = Map(runtime_field(tf, sf, &child), *to);
+            finish_retag(data, &target, vec![child], path, &source)
         }
-        (Struct(_), Struct(tfields)) => {
+        (Struct(sfields), Struct(tfields)) => {
             let n = data.child_data().len();
-            if n != tfields.len() {
+            if n != tfields.len() || n != sfields.len() {
                 return Err(retag_mismatch(path, target, &source, StructArityMismatch));
             }
             let mut children = Vec::with_capacity(n);
+            let mut fields = Vec::with_capacity(n);
             for (idx, tf) in tfields.iter().enumerate() {
                 path.push(NestedStep::StructField(idx));
                 let c = retag_data(data.child_data()[idx].clone(), tf.data_type(), path);
                 path.pop();
-                children.push(c?);
+                let child = c?;
+                fields.push(runtime_field(tf, &sfields[idx], &child));
+                children.push(child);
             }
-            finish_retag(data, target, children, path, &source)
+            let target = Struct(fields.into());
+            finish_retag(data, &target, children, path, &source)
         }
         _ => Err(retag_mismatch(path, target, &source, ScalarMismatch)),
     }
+}
+
+fn runtime_field(target: &FieldRef, source: &FieldRef, child: &ArrayData) -> FieldRef {
+    let nullable = target.is_nullable() || source.is_nullable() || child.null_count() > 0;
+    Arc::new(
+        Field::new(target.name(), child.data_type().clone(), nullable)
+            .with_metadata(target.metadata().clone()),
+    )
 }
 
 /// Rebuild `data` with `target` as its type, reusing the original buffers/nulls
@@ -340,7 +367,7 @@ mod tests {
     use super::{NestedStep, check_exact, nested_path_label, retag_column};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, Decimal128Array, DictionaryArray, Int32Array, Int64Array,
-        LargeStringDictionaryBuilder, ListArray, StringArray, StructArray,
+        LargeStringDictionaryBuilder, ListArray, MapArray, StringArray, StructArray,
         TimestampMicrosecondArray,
     };
     use arrow::buffer::OffsetBuffer;
@@ -692,6 +719,40 @@ mod tests {
             .unwrap();
         assert_eq!(items.value(0), 123);
         assert_eq!(items.value(1), 456);
+    }
+
+    #[test]
+    fn retag_column_widens_runtime_map_key_nullability() {
+        let keys = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
+        let values = Arc::new(Int64Array::from(vec![Some(10), Some(20)])) as ArrayRef;
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("key", DataType::Int32, true),
+                Field::new("value", DataType::Int64, true),
+            ]),
+            vec![keys, values],
+            None,
+        );
+        let source = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::from_lengths([2]),
+            entries,
+            None,
+            false,
+        )) as ArrayRef;
+        let target = map(DataType::Int32, DataType::Int64, false);
+
+        let out = retag_column(&source, &target).expect("retag nullable map key");
+
+        let DataType::Map(entries, false) = out.data_type() else {
+            panic!("expected map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected entries struct");
+        };
+        assert!(fields[0].is_nullable());
+        let map = out.as_any().downcast_ref::<MapArray>().expect("map array");
+        assert!(map.keys().is_null(1));
     }
 
     #[test]

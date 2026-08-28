@@ -282,7 +282,43 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
     if is_dictionary_string_carrier(expected, actual) {
         return Ok(actual.clone());
     }
-    Ok(expected.clone())
+    match (expected, actual) {
+        (DataType::List(expected_field), DataType::List(actual_field)) => Ok(DataType::List(
+            reconcile_nested_chunk_field(expected_field, actual_field)?,
+        )),
+        (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => Ok(
+            DataType::LargeList(reconcile_nested_chunk_field(expected_field, actual_field)?),
+        ),
+        (DataType::Map(expected_field, expected_ordered), DataType::Map(actual_field, _)) => {
+            Ok(DataType::Map(
+                reconcile_nested_chunk_field(expected_field, actual_field)?,
+                *expected_ordered,
+            ))
+        }
+        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
+            let fields = expected_fields
+                .iter()
+                .zip(actual_fields.iter())
+                .map(|(expected_field, actual_field)| {
+                    reconcile_nested_chunk_field(expected_field, actual_field)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DataType::Struct(fields.into()))
+        }
+        _ => Ok(expected.clone()),
+    }
+}
+
+fn reconcile_nested_chunk_field(
+    expected: &Arc<Field>,
+    actual: &Arc<Field>,
+) -> Result<Arc<Field>, String> {
+    let data_type = reconcile_chunk_data_type(expected.data_type(), actual.data_type())?;
+    Ok(Arc::new(rebuild_chunk_field(
+        expected,
+        data_type,
+        expected.is_nullable() || actual.is_nullable(),
+    )))
 }
 
 fn is_dictionary_string_carrier(expected: &DataType, actual: &DataType) -> bool {
@@ -696,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn align_chunk_schema_to_columns_keeps_descriptor_map_key_nullability() {
+    fn align_chunk_schema_to_columns_widens_runtime_map_key_nullability() {
         let expected_map = DataType::Map(
             Arc::new(Field::new(
                 "entries",
@@ -744,10 +780,7 @@ mod tests {
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
             panic!("expected entry struct");
         };
-        assert!(
-            !entry_fields[0].is_nullable(),
-            "map key should keep descriptor nullability"
-        );
+        assert!(entry_fields[0].is_nullable(), "runtime map key must widen");
     }
 
     #[test]
