@@ -385,19 +385,16 @@ impl ConnectorExecutionHost {
                 // role matching factory and codec for one exact generation;
                 // it does not grant discovery or lifecycle authority.
                 if executions.resolve(&key).is_none() {
-                    let Some(bundle_factory) = bundle_factory else {
-                        return rejected(host_unavailable(
-                            "connector read execution bundle factory is not installed",
-                        ));
-                    };
-                    let bundle = match bundle_factory.build(&key) {
-                        Ok(bundle) => bundle,
-                        Err(error) => return rejected(internal_failure(&error)),
-                    };
-                    executions.install_or_resolve(
-                        key.clone(),
-                        InstalledReadExecution::new(bundle.provider_factory(), bundle.codec()),
-                    );
+                    if let Some(bundle_factory) = bundle_factory {
+                        let bundle = match bundle_factory.build(&key) {
+                            Ok(bundle) => bundle,
+                            Err(error) => return rejected(internal_failure(&error)),
+                        };
+                        executions.install_or_resolve(
+                            key.clone(),
+                            InstalledReadExecution::new(bundle.provider_factory(), bundle.codec()),
+                        );
+                    }
                 }
                 let mut state = match self.state.lock() {
                     Ok(state) => state,
@@ -623,7 +620,7 @@ fn retire_unleased_prior_generations(
     for candidate in prior {
         state.bindings.remove(&candidate);
         state.retiring.insert(candidate.clone());
-        state.typed_registry.retire(&candidate);
+        state.read_executions.retire(&candidate);
     }
     Ok(())
 }
