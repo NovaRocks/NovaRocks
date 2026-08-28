@@ -227,6 +227,16 @@ impl<'a> PreparedFragmentSchedulingView<'a> {
             .is_some()
     }
 
+    pub(crate) fn typed_connector_work_source(
+        self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<novarocks_spi::connector::read_stack::ConnectorReadWorkSource> {
+        self.scan_bindings
+            .typed_scan(fragment_id, node_id)
+            .map(|scan| scan.prepared.table_scan.work_source())
+    }
+
     pub(crate) fn typed_scan(
         self,
         fragment_id: FragmentId,

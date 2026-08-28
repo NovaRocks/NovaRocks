@@ -32,6 +32,7 @@ use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 #[cfg(test)]
 use novarocks_proto_codec::membership::BackendProcessDescriptor;
+use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_types::BackendProcessId;
 
 #[derive(Clone)]
@@ -224,24 +225,13 @@ impl FrontendFragmentScheduler {
             let count = if has_gather {
                 1
             } else if fragment.has_scan_nodes() {
-                fragment
-                    .scan_node_ids()
-                    .iter()
-                    .map(|&node_id| {
+                scan_fragment_parallelism(
+                    fragment.scan_node_ids().iter().map(|&node_id| {
                         let file_ranges = fragment.scan_range_count(node_id).unwrap_or_default();
-                        // A connector scan's work arrives at runtime, so its
-                        // parallelism is the live backend fanout capped below,
-                        // not a split count planning happened to freeze.
-                        let connector_parallelism = if fragment.reads_through_connector(node_id) {
-                            backend_count
-                        } else {
-                            0
-                        };
-                        file_ranges.max(connector_parallelism)
-                    })
-                    .max()
-                    .unwrap_or_default()
-                    .clamp(1, backend_count)
+                        (file_ranges, fragment.connector_work_source(node_id))
+                    }),
+                    backend_count,
+                )
             } else {
                 incoming
                     .get(&fragment_id)
@@ -302,6 +292,32 @@ impl FrontendFragmentScheduler {
         bind_query_lifecycle_fault_scopes(execution_id, &self.backends)?;
         Ok(schedule)
     }
+}
+
+/// Choose one fragment's scan fanout without enumerating connector splits.
+///
+/// Runtime split sources can feed every admitted task. A whole-relation scan
+/// has no split at all, so any fragment containing one must have exactly one
+/// instance; otherwise each instance would read and return the complete
+/// relation. Other scans in the same fragment still run correctly on that one
+/// instance, although with intentionally reduced parallelism.
+fn scan_fragment_parallelism(
+    scans: impl IntoIterator<Item = (usize, Option<ConnectorReadWorkSource>)>,
+    backend_count: usize,
+) -> usize {
+    let mut parallelism = 1;
+    for (file_ranges, work_source) in scans {
+        match work_source {
+            Some(ConnectorReadWorkSource::WholeRelation) => return 1,
+            Some(ConnectorReadWorkSource::RuntimeSplits) => {
+                parallelism = parallelism.max(backend_count);
+            }
+            None => {
+                parallelism = parallelism.max(file_ranges);
+            }
+        }
+    }
+    parallelism.clamp(1, backend_count)
 }
 
 #[cfg(debug_assertions)]
@@ -507,10 +523,34 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 
 #[cfg(test)]
 mod tests {
-    use super::FrontendBackendSnapshot;
+    use super::{FrontendBackendSnapshot, scan_fragment_parallelism};
     use crate::query_execution::contract::DistributedQueryErrorKind;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
     use novarocks_types::QueryId;
+
+    #[test]
+    fn whole_relation_constrains_its_fragment_to_one_backend() {
+        assert_eq!(
+            scan_fragment_parallelism(
+                [
+                    (0, Some(ConnectorReadWorkSource::RuntimeSplits)),
+                    (0, Some(ConnectorReadWorkSource::WholeRelation)),
+                    (8, None),
+                ],
+                3,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_splits_retain_live_backend_fanout() {
+        assert_eq!(
+            scan_fragment_parallelism([(0, Some(ConnectorReadWorkSource::RuntimeSplits))], 3,),
+            3
+        );
+    }
 
     #[allow(
         dead_code,

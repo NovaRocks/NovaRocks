@@ -887,16 +887,18 @@ impl<'a> SchedulingFragmentView<'a> {
             .map(<[_]>::len)
     }
 
-    /// Whether this scan node reads through a connector.
+    /// How this connector scan receives its physical work.
     ///
-    /// It deliberately reports presence, not a count. A typed connector scan
-    /// has no frozen split set: its work arrives at runtime, so planning
-    /// cannot count it, and a count taken here would pin the query's
-    /// parallelism to whatever enumeration happened to produce first.
-    pub fn reads_through_connector(self, node_id: PlanNodeId) -> bool {
+    /// Runtime splits can use every admitted task, while a whole relation has
+    /// no split and must execute on exactly one backend. Preserving that
+    /// distinction here prevents scheduling from duplicating direct metadata
+    /// reads on every live backend.
+    pub fn connector_work_source(
+        self,
+        node_id: PlanNodeId,
+    ) -> Option<novarocks_spi::connector::read_stack::ConnectorReadWorkSource> {
         self.view
-            .typed_scan(self.fragment.fragment_id(), node_id)
-            .is_some()
+            .typed_connector_work_source(self.fragment.fragment_id(), node_id)
     }
 
     pub fn is_terminal_write(self) -> bool {
