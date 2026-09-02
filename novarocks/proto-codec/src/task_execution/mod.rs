@@ -607,6 +607,113 @@ mod tests {
     }
 
     #[test]
+    fn a_half_reported_writer_pair_is_refused_rather_than_dropped() {
+        let process = backend();
+        let value = identity(2, 3, process);
+        let finished = TaskStatus::try_new(
+            value,
+            TaskStatusVersion::new(5).expect("nonzero"),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("legal");
+
+        let mut half = encode_task_status(&finished);
+        half.writer = Some(novarocks::TaskWriterFacts {
+            written_rows: Some(7),
+            written_bytes: None,
+            prepared_write_entries: None,
+        });
+        assert_eq!(
+            decode_task_status(&half, FieldPath::root("status"))
+                .expect_err("a half-reported pair loses a metric silently otherwise")
+                .kind(),
+            ProtocolErrorKind::InconsistentFields
+        );
+
+        let mut both = encode_task_status(&finished);
+        both.writer = Some(novarocks::TaskWriterFacts {
+            written_rows: Some(7),
+            written_bytes: Some(64),
+            prepared_write_entries: Some(2),
+        });
+        let decoded =
+            decode_task_status(&both, FieldPath::root("status")).expect("a complete pair is legal");
+        let writer = decoded.writer().expect("writer facts");
+        assert_eq!(writer.written_rows(), Some(7));
+        assert_eq!(writer.written_bytes(), Some(64));
+        assert_eq!(writer.prepared_write_entries(), Some(2));
+
+        // The output pair has always behaved this way; the writer pair now
+        // matches it.
+        let mut half_output = encode_task_status(&finished);
+        half_output.output = Some(novarocks::TaskOutputFacts {
+            responsibility_complete: true,
+            buffered_rows: Some(1),
+            buffered_bytes: None,
+        });
+        assert_eq!(
+            decode_task_status(&half_output, FieldPath::root("status"))
+                .expect_err("the output pair is equally all-or-nothing")
+                .kind(),
+            ProtocolErrorKind::InconsistentFields
+        );
+    }
+
+    #[test]
+    fn final_task_info_is_checked_against_the_task_the_caller_asked_about() {
+        use super::status::decode_final_task_info;
+
+        let process = backend();
+        let asked_about = identity(2, 3, process);
+        let answered_about = identity(2, 4, process);
+        let terminal = TaskStatus::try_new(
+            answered_about,
+            TaskStatusVersion::new(9).expect("nonzero"),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("legal");
+        let wire = novarocks::FinalTaskInfo {
+            final_status: Some(encode_task_status(&terminal)),
+            operator_statistics: Vec::new(),
+            operator_statistics_truncated: false,
+        };
+
+        // The wire message carries only a status, so without the expected
+        // identity a caller would accept another task's final info.
+        assert_eq!(
+            decode_final_task_info(asked_about, &wire, FieldPath::root("info"))
+                .expect_err("final info must answer the task that was asked about")
+                .kind(),
+            ProtocolErrorKind::InconsistentFields
+        );
+        let matched = decode_final_task_info(answered_about, &wire, FieldPath::root("info"))
+            .expect("the matching task is legal");
+        assert_eq!(matched.final_status().version().get(), 9);
+
+        // A non-terminal status is never a final info.
+        let running = TaskStatus::try_new(
+            answered_about,
+            TaskStatusVersion::new(9).expect("nonzero"),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .expect("legal");
+        let not_terminal = novarocks::FinalTaskInfo {
+            final_status: Some(encode_task_status(&running)),
+            operator_statistics: Vec::new(),
+            operator_statistics_truncated: false,
+        };
+        assert!(
+            decode_final_task_info(answered_about, &not_terminal, FieldPath::root("info")).is_err()
+        );
+    }
+
+    #[test]
     fn an_absent_state_and_the_client_only_outcomes_have_no_wire_form() {
         assert_eq!(encode_query_context_state(QueryContextState::Absent), None);
         assert!(encode_query_context_state(QueryContextState::Active).is_some());

@@ -29,7 +29,7 @@
 //! owner passes in whether the live content matched, so a secret can never be
 //! fingerprinted, rendered, or retained here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// How a backend must answer one domain operation.
@@ -742,7 +742,13 @@ impl EdgeOpenVersion {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExchangeEdgeDomain {
     edges: BTreeMap<ExchangeEdgeId, EdgeSendPermission>,
-    opened_at_version: BTreeMap<ExchangeEdgeId, EdgeOpenVersion>,
+    /// The exact edge set each applied version opened.
+    ///
+    /// Recording the set, not just a version per edge, is what makes a
+    /// subset replay a conflict instead of an accidental acknowledgement: one
+    /// version must mean one edge set, and `[1]` is not the request that
+    /// opened `[1, 2]`.
+    opened_sets: BTreeMap<EdgeOpenVersion, BTreeSet<ExchangeEdgeId>>,
 }
 
 impl ExchangeEdgeDomain {
@@ -753,7 +759,7 @@ impl ExchangeEdgeDomain {
                 .into_iter()
                 .map(|edge| (edge, EdgeSendPermission::Closed))
                 .collect(),
-            opened_at_version: BTreeMap::new(),
+            opened_sets: BTreeMap::new(),
         }
     }
 
@@ -784,34 +790,34 @@ impl ExchangeEdgeDomain {
         if requested.is_empty() {
             return DomainProgression::Conflict(DomainConflict::UnknownMember);
         }
-        let mut seen = std::collections::BTreeSet::new();
+        let mut set = BTreeSet::new();
         for edge in requested {
             if !self.edges.contains_key(edge) {
                 return DomainProgression::Conflict(DomainConflict::UnknownMember);
             }
-            if !seen.insert(*edge) {
+            if !set.insert(*edge) {
                 return DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent);
             }
         }
-        let already_open: Vec<ExchangeEdgeId> = requested
-            .iter()
-            .copied()
-            .filter(|edge| self.edges.get(edge) == Some(&EdgeSendPermission::Open))
-            .collect();
-        if already_open.is_empty() {
-            return DomainProgression::Apply;
+        // An exact replay of an applied version is idempotent. Any other
+        // request naming an already-open edge conflicts, including a subset or
+        // a superset of what that version opened.
+        if let Some(applied) = self.opened_sets.get(&version) {
+            return if *applied == set {
+                DomainProgression::Idempotent
+            } else {
+                DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+            };
         }
-        if already_open.len() != requested.len() {
-            // A partially overlapping set would make the same version mean two
-            // different things.
+        if set
+            .iter()
+            .any(|edge| self.edges.get(edge) == Some(&EdgeSendPermission::Open))
+        {
+            // Another version already opened one of these edges, so this
+            // version cannot mean what it claims.
             return DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent);
         }
-        for edge in requested {
-            if self.opened_at_version.get(edge) != Some(&version) {
-                return DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent);
-            }
-        }
-        DomainProgression::Idempotent
+        DomainProgression::Apply
     }
 
     /// Applies an open the caller already classified as
@@ -819,8 +825,9 @@ impl ExchangeEdgeDomain {
     pub fn apply_open(&mut self, version: EdgeOpenVersion, requested: &[ExchangeEdgeId]) {
         for edge in requested {
             self.edges.insert(*edge, EdgeSendPermission::Open);
-            self.opened_at_version.insert(*edge, version);
         }
+        self.opened_sets
+            .insert(version, requested.iter().copied().collect());
     }
 }
 
@@ -1128,7 +1135,56 @@ mod tests {
             "one version may not mean two different edge sets"
         );
 
-        domain.apply_open(EdgeOpenVersion::FIRST, &[edge(2)]);
+        // A second version may open the edges the first one did not touch.
+        let second = EdgeOpenVersion::new(2).expect("nonzero version");
+        assert_eq!(
+            domain.classify_open(second, &[edge(2)]),
+            DomainProgression::Apply
+        );
+        domain.apply_open(second, &[edge(2)]);
         assert!(domain.all_open());
+        assert_eq!(
+            domain.classify_open(second, &[edge(2)]),
+            DomainProgression::Idempotent
+        );
+        assert_eq!(
+            domain.classify_open(second, &[edge(1)]),
+            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent),
+            "a version may not later claim an edge another version opened"
+        );
+    }
+
+    #[test]
+    fn a_subset_replay_of_an_opened_edge_set_is_a_conflict_not_an_acknowledgement() {
+        // Recording only a version per edge would answer this idempotent,
+        // because every named edge would look correctly versioned. One version
+        // has to mean one exact set.
+        let mut domain = ExchangeEdgeDomain::from_frozen_edges([edge(1), edge(2), edge(3)]);
+        assert_eq!(
+            domain.classify_open(EdgeOpenVersion::FIRST, &[edge(1), edge(2)]),
+            DomainProgression::Apply
+        );
+        domain.apply_open(EdgeOpenVersion::FIRST, &[edge(1), edge(2)]);
+
+        assert_eq!(
+            domain.classify_open(EdgeOpenVersion::FIRST, &[edge(1), edge(2)]),
+            DomainProgression::Idempotent,
+            "the exact request is the only idempotent one"
+        );
+        assert_eq!(
+            domain.classify_open(EdgeOpenVersion::FIRST, &[edge(1)]),
+            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent),
+            "a subset is a different request"
+        );
+        assert_eq!(
+            domain.classify_open(EdgeOpenVersion::FIRST, &[edge(1), edge(2), edge(3)]),
+            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent),
+            "a superset is a different request"
+        );
+        assert_eq!(
+            domain.classify_open(EdgeOpenVersion::FIRST, &[edge(2), edge(1)]),
+            DomainProgression::Idempotent,
+            "the set is unordered, so a reordered replay is still exact"
+        );
     }
 }

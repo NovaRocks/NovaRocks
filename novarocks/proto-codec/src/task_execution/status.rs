@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use novarocks_execution::task_execution::domain::DomainVersion;
+use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
     FinalTaskInfo, OperatorStatistics, SAFE_DETAIL_MAX_BYTES, SafeDetail, TaskFailure,
@@ -266,7 +267,7 @@ pub fn decode_task_status(
         None => status,
     };
     let status = match src.writer.as_ref() {
-        Some(writer) => status.with_writer(decode_writer(writer)),
+        Some(writer) => status.with_writer(decode_writer(writer, path.field("writer"))?),
         None => status,
     };
     Ok(status)
@@ -289,15 +290,27 @@ fn decode_resources(src: &novarocks::TaskResourceFacts) -> TaskResourceFacts {
     facts
 }
 
-fn decode_writer(src: &novarocks::TaskWriterFacts) -> TaskWriterFacts {
+fn decode_writer(
+    src: &novarocks::TaskWriterFacts,
+    path: FieldPath,
+) -> Result<TaskWriterFacts, ProtocolError> {
     let mut facts = TaskWriterFacts::empty();
-    if let (Some(rows), Some(bytes)) = (src.written_rows, src.written_bytes) {
-        facts = facts.with_written(rows, bytes);
+    match (src.written_rows, src.written_bytes) {
+        (Some(rows), Some(bytes)) => facts = facts.with_written(rows, bytes),
+        (None, None) => {}
+        // Dropping the half that was reported would lose a metric silently,
+        // which is worse than refusing the snapshot.
+        _ => {
+            return Err(inconsistent(
+                path,
+                "written rows and written bytes must be reported together",
+            ));
+        }
     }
     if let Some(value) = src.prepared_write_entries {
         facts = facts.with_prepared_write_entries(value);
     }
-    facts
+    Ok(facts)
 }
 
 pub fn encode_task_status(value: &TaskStatus) -> novarocks::TaskStatus {
@@ -355,7 +368,13 @@ pub fn encode_task_status_cursor(value: TaskStatusCursor) -> novarocks::TaskStat
 }
 
 /// Decodes the final observation of one terminal task.
+/// Decodes the final observation of one terminal task.
+///
+/// `expected` is the task the caller asked about. The wire message carries only
+/// the status, so without it a caller could be handed another task's final info
+/// and never notice.
 pub fn decode_final_task_info(
+    expected: TaskIdentity,
     src: &novarocks::FinalTaskInfo,
     path: FieldPath,
 ) -> Result<FinalTaskInfo, ProtocolError> {
@@ -386,7 +405,7 @@ pub fn decode_final_task_info(
         statistics.push(stats);
     }
     FinalTaskInfo::try_new(
-        status.identity(),
+        expected,
         status,
         statistics,
         src.operator_statistics_truncated,

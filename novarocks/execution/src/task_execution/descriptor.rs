@@ -158,6 +158,25 @@ impl ExchangeEdge {
                 return Err(DescriptorError::EdgeDestinationNodeMismatch(edge_id));
             }
         }
+        // A destination set is a set, on both addresses. A repeated task would
+        // double-count senders on this edge, and a repeated kernel key would
+        // make a send ambiguous. This mirrors what an inbound node already
+        // requires of its source set.
+        let mut by_task: Vec<TaskIdentity> = destinations
+            .iter()
+            .map(|destination| destination.task())
+            .collect();
+        by_task.sort_unstable();
+        by_task.dedup();
+        let mut by_key: Vec<UniqueId> = destinations
+            .iter()
+            .map(|destination| destination.fragment_instance_id())
+            .collect();
+        by_key.sort_unstable();
+        by_key.dedup();
+        if by_task.len() != destinations.len() || by_key.len() != destinations.len() {
+            return Err(DescriptorError::DuplicateEdgeDestination(edge_id));
+        }
         Ok(Self {
             edge_id,
             destination_node_id,
@@ -343,6 +362,7 @@ pub enum DescriptorError {
     },
     EdgeWithoutDestinations(ExchangeEdgeId),
     EdgeDestinationNodeMismatch(ExchangeEdgeId),
+    DuplicateEdgeDestination(ExchangeEdgeId),
     InboundWithoutSources(FragmentNodeId),
     DuplicateInboundSource(FragmentNodeId),
     DuplicateEdgeId,
@@ -372,6 +392,9 @@ impl fmt::Display for DescriptorError {
                 formatter,
                 "exchange edge {edge} has a destination on another node"
             ),
+            Self::DuplicateEdgeDestination(edge) => {
+                write!(formatter, "exchange edge {edge} repeats a destination")
+            }
             Self::InboundWithoutSources(node) => {
                 write!(formatter, "inbound exchange node {node:?} has no source")
             }
@@ -826,6 +849,58 @@ mod tests {
         assert_eq!(
             edge.partitioning(),
             DataStreamPartitionType::HashPartitioned
+        );
+    }
+
+    #[test]
+    fn an_edges_destination_set_is_a_set_on_both_addresses() {
+        let backend = BackendProcessId::new_v7();
+        let target = task(2, 1, backend);
+        let repeated = destination(target, 10, 0, 2);
+        assert_eq!(
+            ExchangeEdge::try_new(
+                edge_id(1),
+                FragmentNodeId::new(10),
+                DataStreamPartitionType::HashPartitioned,
+                vec![repeated.clone(), repeated]
+            ),
+            Err(DescriptorError::DuplicateEdgeDestination(edge_id(1))),
+            "a repeated destination would double-count senders on this edge"
+        );
+
+        // Two distinct tasks may not share one kernel key either: a send
+        // naming that key would be ambiguous.
+        let shared_key = ExchangeDestination::try_new(
+            task(2, 2, backend),
+            key(2, 1),
+            endpoint(),
+            FragmentNodeId::new(10),
+            1,
+            count(2),
+        )
+        .expect("legal destination");
+        assert_eq!(
+            ExchangeEdge::try_new(
+                edge_id(1),
+                FragmentNodeId::new(10),
+                DataStreamPartitionType::HashPartitioned,
+                vec![destination(target, 10, 0, 2), shared_key]
+            ),
+            Err(DescriptorError::DuplicateEdgeDestination(edge_id(1)))
+        );
+
+        assert!(
+            ExchangeEdge::try_new(
+                edge_id(1),
+                FragmentNodeId::new(10),
+                DataStreamPartitionType::HashPartitioned,
+                vec![
+                    destination(task(2, 1, backend), 10, 0, 2),
+                    destination(task(2, 2, backend), 10, 1, 2),
+                ]
+            )
+            .is_ok(),
+            "two distinct destinations remain legal"
         );
     }
 
