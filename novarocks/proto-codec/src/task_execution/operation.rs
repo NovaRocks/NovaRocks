@@ -948,6 +948,42 @@ pub fn decode_fetch_task_result(
     Ok((root, max_wait))
 }
 
+/// Decodes one server-reported operation outcome.
+///
+/// A read whose response reports why it has nothing to return needs this: the
+/// category is the answer, and a caller must not have to read a message string
+/// to learn it.
+pub fn decode_operation_outcome(
+    value: i32,
+    path: FieldPath,
+) -> Result<OperationOutcome, ProtocolError> {
+    decode_outcome(value, path)
+}
+
+/// Encodes a final info read request.
+pub fn encode_get_final_task_info(identity: TaskIdentity) -> novarocks::GetFinalTaskInfoRequest {
+    novarocks::GetFinalTaskInfoRequest {
+        identity: Some(crate::task_execution::identity::encode_task_identity(
+            identity,
+        )),
+    }
+}
+
+/// Encodes a root result poll request.
+pub fn encode_fetch_task_result(
+    root_task: TaskIdentity,
+    max_wait: MaxWait,
+) -> novarocks::FetchTaskResultRequest {
+    novarocks::FetchTaskResultRequest {
+        root_task: Some(crate::task_execution::identity::encode_task_identity(
+            root_task,
+        )),
+        // `MaxWait` is already bounded by `MAX_REPRESENTABLE`, so this cannot
+        // narrow a wait the caller asked for.
+        max_wait_millis: u64::try_from(max_wait.get().as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
 /// Encodes the credential receipt of one query context.
 ///
 /// Only the accepted epoch is reported: no credential material, and no digest

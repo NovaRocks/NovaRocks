@@ -41,6 +41,7 @@
 //! steps.
 
 mod clock;
+mod credential_slot;
 mod domains;
 mod entry;
 mod host;
@@ -48,12 +49,14 @@ pub(crate) mod ingress;
 mod observation;
 mod receipt;
 mod registry;
+pub(crate) mod shared_facts;
 mod status;
 
 #[cfg(test)]
 mod tests;
 
 pub use clock::{BackendMonotonicClock, ManualClock, ProcessMonotonicClock};
+pub use credential_slot::QueryContextCredentialSlot;
 pub use host::{
     HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskDynamicFilterRead,
     TaskExecutionHost,
@@ -71,6 +74,6 @@ pub use registry::{
     DeadlineSweep, RegistryCounters, TaskExecutionRegistry, TaskExecutionRegistryConfig,
 };
 pub use status::{
-    METRIC_PUBLISH_MIN_INTERVAL, StatusAdvance, TaskMetricsSink, TaskStatusOwner,
-    TaskStatusReporter,
+    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
+    TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
 };

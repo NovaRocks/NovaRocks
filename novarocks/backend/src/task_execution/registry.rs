@@ -51,6 +51,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
+use novarocks_execution::exec::fragment::program::FragmentSinkKind;
 use novarocks_execution::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution::task_execution::domain::{
     ContentFingerprint, CredentialDomain, DomainConflict, DomainProgression, DomainVersion,
@@ -76,7 +77,6 @@ use novarocks_execution::task_execution::transition::{
     ContextOperationKind, ContextTransition, LatchOutcome, OperationAdmission, QueryContextEvent,
     QueryContextState, classify_context_transition, classify_operation_admission,
 };
-use novarocks_types::UniqueId;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 
 use super::clock::{BackendMonotonicClock, ProcessMonotonicClock};
@@ -93,7 +93,8 @@ use super::receipt::{
     UpdateTaskOutcome,
 };
 use super::status::{
-    METRIC_PUBLISH_MIN_INTERVAL, StatusAdvance, TaskStatusOwner, TaskStatusReporter,
+    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
+    TaskStatusOwner, TaskStatusReporter,
 };
 
 const REGISTRY_LOCK: &str = "task execution registry lock";
@@ -355,25 +356,41 @@ impl TaskExecutionRegistry {
 
     /// Whether one task identity is currently findable as a live task.
     /// The execution kernel's key for one live task on this process.
+    /// Resolves one root result poll against this process's task set.
     ///
-    /// The root result data plane is addressed by task identity, but the
-    /// result buffer is keyed by the kernel key the descriptor froze. This is
-    /// the one mapping between them, and it answers `None` for a task this
-    /// process does not own, so a result poll is fenced before it reaches a
-    /// buffer.
-    pub fn task_kernel_key(&self, identity: TaskIdentity) -> Option<UniqueId> {
+    /// Three facts are checked here and nowhere else: the identity addresses a
+    /// task of this exact process, that task is live, and its descriptor's
+    /// sink is the query's result sink. The last one is why routing by buffer
+    /// key alone is not enough: every task has a buffer key, but only the
+    /// result owner owes the coordinator a result, and answering a poll out of
+    /// any other task's buffer would hand back an exchange producer's output
+    /// as if it were the query's answer.
+    pub fn root_result_route(&self, identity: TaskIdentity) -> RootResultRoute {
         if identity.backend_process_id() != self.config.backend_process_id {
-            return None;
+            return RootResultRoute::UnknownTask;
         }
         let state = self.state.lock().expect(REGISTRY_LOCK);
-        match state
-            .task_index
-            .get(&identity)
-            .and_then(|context| state.contexts.get(context))
-            .and_then(|entry| entry.tasks.get(&identity))
-        {
-            Some(TaskEntry::Live(task)) => Some(task.descriptor.fragment_instance_id()),
-            _ => None,
+        let Some(context) = state.task_index.get(&identity).copied() else {
+            return RootResultRoute::UnknownTask;
+        };
+        match self.locate_task_locked(&state, context, identity) {
+            TaskLocation::Live => {
+                let live = live_task(&state, context, identity).expect("located live task");
+                if live.descriptor.sink_kind() != FragmentSinkKind::Result {
+                    return RootResultRoute::NotResultOwner;
+                }
+                RootResultRoute::Serve(RootResultBinding::new(
+                    live.descriptor.fragment_instance_id(),
+                    Arc::clone(&live.status),
+                ))
+            }
+            TaskLocation::Creating => RootResultRoute::Creating,
+            TaskLocation::Retired => {
+                let retired = retired_task(&state, context, identity).expect("retired task");
+                RootResultRoute::Terminal(retired.status.state())
+            }
+            TaskLocation::Gone => RootResultRoute::Gone,
+            TaskLocation::Unknown => RootResultRoute::UnknownTask,
         }
     }
 

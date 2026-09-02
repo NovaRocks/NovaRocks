@@ -92,6 +92,43 @@ pub fn classify_task_transition(from: TaskState, to: TaskState) -> TaskTransitio
     }
 }
 
+/// What an end-of-stream delivery on the root result plane means for the root
+/// task's own status.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RootDrainAction {
+    /// Execution completed and the result stream is drained: this is the one
+    /// moment a root task's output responsibility becomes complete, so publish
+    /// `FINISHED`.
+    Finish,
+    /// The task is already terminating for another reason. Record that the
+    /// output drained and publish it, but never turn a termination into a
+    /// success.
+    RecordOnly,
+    /// The task is already terminal. The first terminal wins.
+    AlreadyTerminal,
+    /// A task that never started running cannot have produced a complete
+    /// result stream. Fail loudly instead of inventing a `FINISHED`.
+    Illegal,
+}
+
+/// Classifies an end-of-stream delivery against the root task's state.
+///
+/// This is what keeps the result data plane from becoming a second terminal
+/// authority: end-of-stream is evidence about *output*, and it may only
+/// complete a task that was still executing normally.
+pub const fn classify_root_drain(state: TaskState) -> RootDrainAction {
+    match state {
+        TaskState::Running | TaskState::Flushing => RootDrainAction::Finish,
+        TaskState::Canceling | TaskState::Aborting | TaskState::Failing => {
+            RootDrainAction::RecordOnly
+        }
+        TaskState::Finished | TaskState::Canceled | TaskState::Aborted | TaskState::Failed => {
+            RootDrainAction::AlreadyTerminal
+        }
+        TaskState::Planned => RootDrainAction::Illegal,
+    }
+}
+
 /// A first-wins termination latch.
 ///
 /// Explicit abort, lease expiry, and a task failure all race for the same
@@ -549,10 +586,10 @@ pub fn terminals_are_success_compatible<'a>(
 mod tests {
     use super::{
         AttemptDrainFacts, ContextOperationKind, ContextTransition, LatchOutcome,
-        OperationAdmission, QueryContextEvent, QueryContextState, RootReadFacts, StageState,
-        TaskTransition, TerminationLatch, WriteCompletionFacts, classify_context_transition,
-        classify_operation_admission, classify_task_transition, derive_stage_state,
-        parent_released_children,
+        OperationAdmission, QueryContextEvent, QueryContextState, RootDrainAction, RootReadFacts,
+        StageState, TaskTransition, TerminationLatch, WriteCompletionFacts,
+        classify_context_transition, classify_operation_admission, classify_root_drain,
+        classify_task_transition, derive_stage_state, parent_released_children,
     };
     use crate::task_execution::status::{
         AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskState,
@@ -1042,6 +1079,47 @@ mod tests {
         assert!(
             !WriteCompletionFacts::new(true, true, true, true, true).client_visible_completion(),
             "a cancelled writer can never be counted as success"
+        );
+    }
+
+    #[test]
+    fn an_end_of_stream_completes_only_a_task_that_was_still_executing() {
+        for state in [TaskState::Running, TaskState::Flushing] {
+            assert_eq!(
+                classify_root_drain(state),
+                RootDrainAction::Finish,
+                "{state}"
+            );
+        }
+        // A task already standing down, being aborted, or converging on its own
+        // failure must not be turned into a success by its buffer draining.
+        for state in [
+            TaskState::Canceling,
+            TaskState::Aborting,
+            TaskState::Failing,
+        ] {
+            assert_eq!(
+                classify_root_drain(state),
+                RootDrainAction::RecordOnly,
+                "{state}"
+            );
+        }
+        for state in [
+            TaskState::Finished,
+            TaskState::Canceled,
+            TaskState::Aborted,
+            TaskState::Failed,
+        ] {
+            assert_eq!(
+                classify_root_drain(state),
+                RootDrainAction::AlreadyTerminal,
+                "{state}"
+            );
+        }
+        assert_eq!(
+            classify_root_drain(TaskState::Planned),
+            RootDrainAction::Illegal,
+            "a task that never ran cannot have drained a result stream"
         );
     }
 

@@ -145,6 +145,24 @@ pub trait CodecOwnedContent: std::fmt::Debug + Send + Sync {
 
     /// The encoded size, for payload bounds.
     fn encoded_len(&self) -> usize;
+
+    /// The stored value, for the one crate that owns this representation.
+    ///
+    /// Content this handle carries has to be consumed eventually: a catalog
+    /// binding has to be materialized, a filter envelope has to reach the
+    /// filter runtime, a retained domain has to be answerable to a read. The
+    /// neutral layer cannot name any of those types, so it cannot hand them
+    /// over. What it can do is offer the stored value's identity and let the
+    /// crate that produced it recover its own type.
+    ///
+    /// This is deliberately narrower than a general downcast. It returns
+    /// `None` unless an implementation opts in, and naming the concrete type
+    /// is itself the capability: only the central codec can name a generated
+    /// message, so only the codec can project one. A business owner that holds
+    /// this handle still cannot reach or walk the payload.
+    fn stored_representation(&self) -> Option<&(dyn std::any::Any + 'static)> {
+        None
+    }
 }
 
 /// Confidential content that must never be fingerprinted, rendered, or
@@ -163,6 +181,23 @@ pub trait ConfidentialContent: Send + Sync {
 
     /// Whether this content is byte-identical to `other`.
     fn matches(&self, other: &dyn ConfidentialContent) -> bool;
+
+    /// The stored value, for the one owner that installs this material.
+    ///
+    /// A vended credential is useless unless something eventually installs it
+    /// where a connector can read it, and the neutral layer cannot name the
+    /// type it arrives as. This is the same opt-in projection
+    /// [`CodecOwnedContent::stored_representation`] offers, with one
+    /// difference that matters: what comes back *is* the secret.
+    ///
+    /// That is why this trait still has no `Debug` bound and no fingerprint.
+    /// Recovering the value does not make it renderable, comparable by digest,
+    /// or retainable — the only things anyone can do with it are install it and
+    /// drop it. The single caller is the backend's credential slot; nothing on
+    /// a status, receipt, failure, profile, or retention path may call this.
+    fn stored_representation(&self) -> Option<&(dyn std::any::Any + 'static)> {
+        None
+    }
 }
 
 /// Monotonic scalar progression token of a versioned domain.

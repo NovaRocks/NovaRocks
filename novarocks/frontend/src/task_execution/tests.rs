@@ -1303,9 +1303,23 @@ fn the_client_visible_read_completes_without_waiting_for_upstream_cancellation()
     harness.publish(leaf, TaskState::Running, None, false);
     harness.publish(root, TaskState::Finished, None, true);
 
+    // A backend's claim that its output responsibility is complete is not this
+    // frontend's evidence that it received the end of the stream. Completing
+    // here would tell a client the answer is whole before the last packet was
+    // read.
+    assert!(
+        !harness.execution.client_visible_completion(),
+        "a root FINISHED without an observed end of stream is not a completion"
+    );
+
+    harness
+        .execution
+        .consume_root_result_packet(harness.identity(root), 0, true)
+        .expect("the root's own end of stream is accepted");
+
     assert!(
         harness.execution.client_visible_completion(),
-        "the read completes as soon as the root's own output responsibility is complete"
+        "the read completes once the root finished and its stream ended"
     );
     assert!(
         !harness.execution.attempt_drained(),

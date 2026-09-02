@@ -109,6 +109,16 @@ pub(super) fn validate_membership(
                     ));
                 }
             }
+            // A filter domain has nothing descriptor-level to check, and that
+            // is not an omission. The descriptor freezes plan nodes and
+            // exchange edges, so those two can be fenced here; it freezes no
+            // filter channel or binding, because a task's filter role comes
+            // from the query context's installed contribution rather than from
+            // its own plan. ADR-0044 puts that fence one layer down: an
+            // envelope is decoded against the *installed* contract before any
+            // reduction, by the owner that holds it. Inventing a descriptor
+            // field to check here would create a second authority over the
+            // same fact.
             TaskDomainUpdate::TaskDynamicFilter { .. } => {}
             TaskDomainUpdate::OpenExchangeEdges { edges, .. } => {
                 for edge in edges {

@@ -52,9 +52,8 @@ use std::task::{Context, Poll};
 
 use novarocks_execution::task_execution::identity::TaskOperationId;
 use novarocks_execution::task_execution::operation::{OperationOutcome, TransportBudget};
-use novarocks_execution::task_execution::status::SafeDetail;
+use novarocks_execution::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::task_execution::identity::encode_task_identity;
 use novarocks_proto_codec::task_execution::operation::{
     DecodedOperation, decode_fetch_dynamic_filters, decode_fetch_task_result,
     decode_get_final_task_info, decode_operation_batch, decode_subscribe_task_status,
@@ -66,9 +65,12 @@ use novarocks_proto_codec::task_execution::status::{encode_final_task_info, enco
 use novarocks_proto_models::novarocks as proto;
 use tokio_stream::Stream;
 
+use super::host::HostRejection;
 use super::observation::{TaskStatusEvent, TaskStatusSource};
 use super::receipt::OperationReceipt;
 use super::registry::TaskExecutionRegistry;
+use super::shared_facts::encode_dynamic_filter_read;
+use super::status::{RootResultRoute, StatusAdvance};
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
 
@@ -144,6 +146,23 @@ impl RegistryTaskExecutionIngress {
                 })
             }
         }
+    }
+}
+
+/// Maps a host rejection onto a status code for a read that has no in-band
+/// outcome field.
+///
+/// The category matters to the caller: a protocol refusal is the reader's own
+/// request to fix, while anything else is this process failing to answer a
+/// legal question and must not read as "your request was wrong".
+fn rejection_status(rejection: HostRejection) -> tonic::Status {
+    let detail = rejection.detail().as_str().to_owned();
+    match rejection.category() {
+        TaskFailureCategory::Protocol => tonic::Status::invalid_argument(detail),
+        TaskFailureCategory::ResourceExhausted => tonic::Status::resource_exhausted(detail),
+        TaskFailureCategory::Execution
+        | TaskFailureCategory::Exchange
+        | TaskFailureCategory::Internal => tonic::Status::internal(detail),
     }
 }
 
@@ -226,27 +245,23 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let identity = read.identity();
         let receipt = self.registry.fetch_task_dynamic_filters(&read);
-        if let Some(advertised) = receipt.acknowledgement() {
-            return Err(tonic::Status::internal(format!(
-                "task advertised dynamic filter version {} whose retained payload has no wire \
-                 projection at this boundary",
-                advertised.version().get()
-            )));
-        }
-        if receipt.outcome() != OperationOutcome::Idempotent {
-            // This response has no outcome field, so a refusal has no in-band
-            // form and must not be dressed as an empty answer.
+        // `Accepted` carries a version newer than the caller acknowledged and
+        // `Idempotent` says it is already current; both are settled answers,
+        // with or without a payload. This response has no outcome field, so
+        // anything else is a refusal that must not be dressed as an empty
+        // answer.
+        if !matches!(
+            receipt.outcome(),
+            OperationOutcome::Accepted | OperationOutcome::Idempotent
+        ) {
             return Err(tonic::Status::failed_precondition(
                 receipt.detail().map_or("", SafeDetail::as_str).to_owned(),
             ));
         }
-        // Version zero is this field family's "nothing": `DomainVersion` is
-        // nonzero, so it cannot collide with a version a task published.
-        Ok(proto::FetchTaskDynamicFiltersResponse {
-            identity: Some(encode_task_identity(identity)),
-            version: 0,
-            domains: Vec::new(),
-        })
+        // A settled read with nothing advertised answers version zero, which
+        // is this field family's "nothing": `DomainVersion` is nonzero, so it
+        // cannot collide with a version a task published.
+        encode_dynamic_filter_read(identity, receipt.acknowledgement()).map_err(rejection_status)
     }
 
     fn get_final_task_info(
@@ -289,29 +304,55 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         let (identity, max_wait) =
             decode_fetch_task_result(&request, FieldPath::root("fetch_task_result"))
                 .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        // The result buffer is keyed by the kernel key the descriptor froze,
-        // and only a task this exact process owns has one. That is what fences
-        // a poll aimed at a replaced process before it reaches a buffer.
-        let Some(kernel_key) = self.registry.task_kernel_key(identity) else {
-            return Ok(fetch_result_response(
-                FetchStatus::Error,
-                "result poll names a task this backend process does not own".to_owned(),
-                0,
-                false,
-                Vec::new(),
-            ));
+        // Owning a result buffer and owing the coordinator a result are
+        // different facts. Every task has a kernel key, so routing by key
+        // alone would let a poll aimed at an exchange producer drain that
+        // producer's output as if it were the query's answer. The owner
+        // decides, and it also fences a replaced process and a terminal task
+        // whose buffer is gone.
+        let route = self.registry.root_result_route(identity);
+        let binding = match route {
+            RootResultRoute::Serve(binding) => binding,
+            refused => {
+                return Ok(fetch_result_response(
+                    FetchStatus::Error,
+                    refused
+                        .refusal_detail()
+                        .unwrap_or_else(|| "result poll refused".to_owned()),
+                    0,
+                    false,
+                    Vec::new(),
+                ));
+            }
         };
         // The decoder already bounds the wait by `MaxWait::MAX_REPRESENTABLE`,
         // so this conversion cannot shorten a wait a caller asked for.
         let max_wait_ms = i64::try_from(max_wait.as_millis()).unwrap_or(i64::MAX);
-        Ok(match wait_fetch_typed(kernel_key, max_wait_ms) {
-            TryFetchTypedResult::Ready(result) => fetch_result_response(
-                FetchStatus::Ready,
-                String::new(),
-                result.packet_seq,
-                result.eos,
-                result.payload,
-            ),
+        Ok(match wait_fetch_typed(binding.kernel_key(), max_wait_ms) {
+            TryFetchTypedResult::Ready(result) => {
+                // Delivering the end of the stream is the one moment a root's
+                // output responsibility completes, and the owner has to hear
+                // it from the poll that delivered it.
+                if result.eos {
+                    let advance = binding.note_result_stream_drained();
+                    if !matches!(
+                        advance,
+                        StatusAdvance::Published(_) | StatusAdvance::AlreadyTerminal(_)
+                    ) {
+                        return Err(tonic::Status::internal(format!(
+                            "root result stream drained but its status could not advance: \
+                             {advance:?}"
+                        )));
+                    }
+                }
+                fetch_result_response(
+                    FetchStatus::Ready,
+                    String::new(),
+                    result.packet_seq,
+                    result.eos,
+                    result.payload,
+                )
+            }
             TryFetchTypedResult::NotReady => {
                 fetch_result_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new())
             }
@@ -424,7 +465,7 @@ mod tests {
     };
     use novarocks_execution::task_execution::transition::QueryContextState;
     use novarocks_proto_codec::task_execution::identity::{
-        encode_query_context_ref, encode_task_operation_id,
+        encode_query_context_ref, encode_task_identity, encode_task_operation_id,
     };
     use novarocks_proto_models::{catalog, common, plan};
     use novarocks_types::identity::{
@@ -737,6 +778,40 @@ mod tests {
                 },
             )),
         }
+    }
+
+    /// The same task with a data-stream sink: a legitimate exchange producer,
+    /// which owns a result buffer but owes the coordinator no result.
+    fn create_producer_task(
+        context: QueryContextRef,
+        identity: TaskIdentity,
+        operation: TaskOperationId,
+    ) -> proto::TaskOperation {
+        let mut request = create_task(context, identity, operation);
+        let Some(proto::task_operation::Operation::CreateTask(create)) = request.operation.as_mut()
+        else {
+            unreachable!("create_task builds a create");
+        };
+        let fragment = create
+            .descriptor
+            .as_mut()
+            .and_then(|descriptor| descriptor.fragment.as_mut())
+            .expect("the fixture carries a fragment");
+        fragment
+            .plan
+            .as_mut()
+            .expect("the fixture carries a plan")
+            .sink = Some(plan::DataSink {
+            kind: Some(plan::data_sink::Kind::DataStream(
+                plan::DataStreamSink::default(),
+            )),
+        });
+        fragment
+            .instance_params
+            .as_mut()
+            .expect("the fixture carries instance params")
+            .typed_result_sink = false;
+        request
     }
 
     fn outcome_of(receipt: &proto::TaskOperationReceipt) -> proto::TaskOperationOutcome {
@@ -1062,6 +1137,92 @@ mod tests {
         // is the one honest way to say "nothing to fetch".
         assert_eq!(response.version, 0);
         assert!(response.domains.is_empty());
+    }
+
+    #[test]
+    fn a_result_poll_aimed_at_an_exchange_producer_is_refused() {
+        // Every task owns a result buffer keyed by its kernel key, so routing
+        // a poll by that key alone would hand back an exchange producer's
+        // output as if it were the query's answer. Owning a buffer and owing
+        // the coordinator a result are different facts.
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let producer = fixture.identity(3, 3);
+        fixture.apply(vec![
+            establish(context, TaskOperationId::new_v7()),
+            create_producer_task(context, producer, TaskOperationId::new_v7()),
+        ]);
+        assert!(fixture.registry.has_live_task(producer));
+
+        let response = fixture
+            .ingress
+            .fetch_task_result(proto::FetchTaskResultRequest {
+                root_task: Some(encode_task_identity(producer)),
+                max_wait_millis: 60_000,
+            })
+            .expect("a fenced poll is answered, not errored");
+        assert_eq!(
+            response.status,
+            proto::fetch_result_response::Status::Error as i32
+        );
+        assert_eq!(
+            response.message, "result poll names a task that does not own this query's result",
+            "the refusal must come from the ownership check, not from a buffer"
+        );
+        assert!(response.result_arrow_ipc.is_empty());
+    }
+
+    #[test]
+    fn a_codec_produced_filter_payload_reaches_the_reader() {
+        // The refusal path below only means something if the accepting path
+        // works: a projection that always failed would satisfy that test while
+        // making every real fetch useless.
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let identity = fixture.identity(1, 1);
+        fixture.apply(vec![
+            establish(context, TaskOperationId::new_v7()),
+            create_task(context, identity, TaskOperationId::new_v7()),
+        ]);
+        let envelope = novarocks_proto_models::filter::RuntimeFilterEnvelope {
+            channel_id: 7,
+            ..Default::default()
+        };
+        fixture
+            .task_host
+            .reporter(identity)
+            .advertise_dynamic_filters(
+                DomainVersion::new(4).expect("nonzero version"),
+                2,
+                Arc::new(
+                    novarocks_proto_codec::task_execution::domain::WireContent::new(
+                        b"novarocks.task_execution.task_dynamic_filter.v1",
+                        envelope.clone(),
+                    ),
+                ) as Arc<dyn CodecOwnedContent>,
+            );
+
+        let response = fixture
+            .ingress
+            .fetch_task_dynamic_filters(proto::FetchTaskDynamicFiltersRequest {
+                identity: Some(encode_task_identity(identity)),
+                acknowledged_version: 0,
+            })
+            .expect("a codec-produced payload projects back");
+        assert_eq!(response.version, 4);
+        assert_eq!(response.domains.len(), 1);
+        assert_eq!(response.domains[0].version, 4);
+        assert_eq!(response.domains[0].envelope.as_ref(), Some(&envelope));
+
+        // A caller that is already current is answered rather than refused.
+        let current = fixture
+            .ingress
+            .fetch_task_dynamic_filters(proto::FetchTaskDynamicFiltersRequest {
+                identity: Some(encode_task_identity(identity)),
+                acknowledged_version: 4,
+            })
+            .expect("an already-current read is settled, not refused");
+        assert_eq!(current.version, 4);
     }
 
     #[test]

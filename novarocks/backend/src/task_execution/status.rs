@@ -40,7 +40,10 @@ use novarocks_execution::task_execution::status::{
     FinalTaskInfo, OperatorStatistics, TaskFailure, TaskOutputFacts, TaskResourceFacts, TaskState,
     TaskStatus, TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
 };
-use novarocks_execution::task_execution::transition::{TaskTransition, classify_task_transition};
+use novarocks_execution::task_execution::transition::{
+    RootDrainAction, TaskTransition, classify_root_drain, classify_task_transition,
+};
+use novarocks_types::UniqueId;
 
 use super::clock::BackendMonotonicClock;
 use super::host::TaskDynamicFilterRead;
@@ -375,6 +378,65 @@ impl TaskStatusOwner {
         true
     }
 
+    /// Records that the root result stream reached end of stream.
+    ///
+    /// This is the one moment a root task's output responsibility becomes
+    /// complete: the pipeline closed the buffer, and the frontend has now
+    /// consumed everything in it including the end-of-stream marker. Until it
+    /// happens the root stays `FLUSHING`, because a drained pipeline that
+    /// still owes packets has not finished its job.
+    ///
+    /// It publishes immediately rather than under the metric throttle: this is
+    /// the fact the coordinator's completion is waiting for. It cannot turn a
+    /// termination into a success — a task already standing down only records
+    /// that its output drained.
+    pub fn note_root_result_drained(&self) -> StatusAdvance {
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("task status lock");
+        let from = state.current.state();
+        let advance = match classify_root_drain(from) {
+            RootDrainAction::AlreadyTerminal => return StatusAdvance::AlreadyTerminal(from),
+            RootDrainAction::Illegal => {
+                return StatusAdvance::Illegal {
+                    from,
+                    to: TaskState::Finished,
+                };
+            }
+            RootDrainAction::RecordOnly => {
+                // The buffered counts are deliberately left unreported rather
+                // than set to zero: absence means "not reported", and this
+                // path knows the stream drained, not what the task's other
+                // output did.
+                state.output = TaskOutputFacts::new(true);
+                self.republish_locked(&mut state, now, true)
+            }
+            RootDrainAction::Finish => {
+                let Some(version) = state.current.version().next() else {
+                    return StatusAdvance::VersionExhausted;
+                };
+                state.output = TaskOutputFacts::new(true);
+                let next = match self.compose(&state, version, TaskState::Finished, None) {
+                    Ok(next) => next,
+                    Err(error) => return StatusAdvance::Rejected(error),
+                };
+                state.final_info = FinalTaskInfo::try_new(
+                    self.identity,
+                    next.clone(),
+                    state.operator_statistics.clone(),
+                    state.operator_statistics_truncated,
+                )
+                .ok();
+                self.commit_locked(&mut state, next, now);
+                StatusAdvance::Published(version)
+            }
+        };
+        state.output_released = true;
+        drop(state);
+        // No snapshot carries the release fact, so the owner is told directly.
+        self.source.note_progress();
+        advance
+    }
+
     fn record_operator_statistics(&self, statistics: Vec<OperatorStatistics>) {
         let mut state = self.state.lock().expect("task status lock");
         let mut statistics = statistics;
@@ -586,5 +648,83 @@ impl TaskMetricsSink {
         writer: Option<TaskWriterFacts>,
     ) -> StatusAdvance {
         self.owner.report_metrics(resources, writer)
+    }
+}
+
+/// The result-plane binding of one live root task.
+///
+/// It pairs the execution kernel's buffer key with the status owner that must
+/// hear about the drain, so a result poll cannot reach a buffer without also
+/// being able to report what reaching its end means.
+#[derive(Clone, Debug)]
+pub struct RootResultBinding {
+    kernel_key: UniqueId,
+    status: Arc<TaskStatusOwner>,
+}
+
+impl RootResultBinding {
+    pub const fn new(kernel_key: UniqueId, status: Arc<TaskStatusOwner>) -> Self {
+        Self { kernel_key, status }
+    }
+
+    /// The execution kernel's key for this task's result buffer.
+    pub const fn kernel_key(&self) -> UniqueId {
+        self.kernel_key
+    }
+
+    pub fn identity(&self) -> TaskIdentity {
+        self.status.identity()
+    }
+
+    /// Reports that this poll delivered the end-of-stream marker.
+    pub fn note_result_stream_drained(&self) -> StatusAdvance {
+        self.status.note_root_result_drained()
+    }
+}
+
+/// Whether a root result poll may be served, and why not when it may not.
+///
+/// Owning a result buffer and owing the coordinator a result are two different
+/// facts. Every task has a kernel key; only the task whose sink is the query's
+/// result sink owes a result. A poll aimed at any other task is refused rather
+/// than answered out of that task's buffer, which is what stops a mistaken or
+/// forged identity from draining an exchange producer's output as if it were
+/// the query's answer.
+#[derive(Clone, Debug)]
+pub enum RootResultRoute {
+    /// This exact live task owns the query's client-visible result.
+    Serve(RootResultBinding),
+    /// No task of this identity exists on this exact backend process.
+    UnknownTask,
+    /// A live task, but its descriptor's sink is not the query's result sink.
+    NotResultOwner,
+    /// The creation transaction has not committed, so no buffer exists yet.
+    Creating,
+    /// The task already reached its terminal; its result buffer is gone.
+    Terminal(TaskState),
+    /// The retained terminal record was reclaimed.
+    Gone,
+}
+
+impl RootResultRoute {
+    /// A bounded, secret-free explanation of a refusal, for the poll's own
+    /// error field.
+    pub fn refusal_detail(&self) -> Option<String> {
+        match self {
+            Self::Serve(_) => None,
+            Self::UnknownTask => {
+                Some("result poll names a task this backend process does not own".to_owned())
+            }
+            Self::NotResultOwner => {
+                Some("result poll names a task that does not own this query's result".to_owned())
+            }
+            Self::Creating => {
+                Some("result poll names a task whose creation has not committed".to_owned())
+            }
+            Self::Terminal(state) => {
+                Some(format!("result poll names a task that is already {state}"))
+            }
+            Self::Gone => Some("result poll reached a reclaimed task record".to_owned()),
+        }
     }
 }

@@ -11,9 +11,12 @@ use novarocks_types::UniqueId;
 use super::data_plane_handlers;
 use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
+use crate::task_execution::{RootResultRoute, StatusAdvance, TaskExecutionRegistry};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::task_execution::operation::decode_fetch_task_result;
 use novarocks_proto_models as proto;
 use std::sync::Arc;
 
@@ -116,6 +119,84 @@ impl BackendDataPlane {
             }
         }
     }
+}
+
+/// Serves one root result poll addressed by an exact task identity.
+///
+/// The wire form this replaces addressed a fragment instance, which is a key
+/// any participant of any attempt could name. This one is fenced three ways
+/// before a buffer is touched — exact task, exact backend process, and result
+/// responsibility — and all three refusals are reported in band, because
+/// `FetchResultResponse` has an error status and a refusal must not arrive
+/// looking like an empty answer.
+///
+/// The end-of-stream packet is where this stops being a read: delivering it is
+/// the moment the root's output responsibility is complete, so the status
+/// owner is told before the response leaves. A frontend can then never see the
+/// end of its result stream before the status that corroborates it.
+pub fn fetch_task_result(
+    registry: &TaskExecutionRegistry,
+    request: proto::novarocks::FetchTaskResultRequest,
+) -> Result<proto::novarocks::FetchResultResponse, tonic::Status> {
+    use proto::novarocks::fetch_result_response::Status as FetchStatus;
+
+    let (identity, max_wait) =
+        decode_fetch_task_result(&request, FieldPath::root("fetch_task_result"))
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    let route = registry.root_result_route(identity);
+    let RootResultRoute::Serve(binding) = route else {
+        let detail = route
+            .refusal_detail()
+            .expect("only a served route has no refusal detail");
+        emit_typed_fetch_marker(FetchStatus::Error as i32);
+        return Ok(fetch_response(
+            FetchStatus::Error,
+            detail,
+            0,
+            false,
+            Vec::new(),
+        ));
+    };
+    // The decoder already bounds the wait, so this conversion cannot shorten a
+    // wait the caller asked for.
+    let max_wait_ms = i64::try_from(max_wait.as_millis()).unwrap_or(i64::MAX);
+    Ok(match wait_fetch_typed(binding.kernel_key(), max_wait_ms) {
+        TryFetchTypedResult::Ready(result) => {
+            if result.eos {
+                let advance = binding.note_result_stream_drained();
+                // A refused advance means this task's status can never
+                // corroborate the end of stream about to be returned. Failing
+                // the poll is the only answer that does not hand a frontend an
+                // unsubstantiated completion.
+                if matches!(
+                    advance,
+                    StatusAdvance::Illegal { .. }
+                        | StatusAdvance::Rejected(_)
+                        | StatusAdvance::VersionExhausted
+                ) {
+                    return Err(tonic::Status::internal(format!(
+                        "root task {identity} could not record its result drain: {advance:?}"
+                    )));
+                }
+            }
+            emit_typed_fetch_marker(FetchStatus::Ready as i32);
+            fetch_response(
+                FetchStatus::Ready,
+                String::new(),
+                result.packet_seq,
+                result.eos,
+                result.payload,
+            )
+        }
+        TryFetchTypedResult::NotReady => {
+            emit_typed_fetch_marker(FetchStatus::NotReady as i32);
+            fetch_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new())
+        }
+        TryFetchTypedResult::Error(error) => {
+            emit_typed_fetch_marker(FetchStatus::Error as i32);
+            fetch_response(FetchStatus::Error, error.message, 0, false, Vec::new())
+        }
+    })
 }
 
 fn fetch_response(

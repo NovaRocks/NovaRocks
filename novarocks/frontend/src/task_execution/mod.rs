@@ -34,7 +34,9 @@
 //! coordinator keeps owning distributed query execution untouched.
 
 pub mod clock;
+pub mod completion;
 pub mod context_owner;
+pub mod credential;
 pub mod dispatch;
 pub mod error;
 pub mod execution;
@@ -49,9 +51,13 @@ pub mod status_intake;
 mod tests;
 
 pub use clock::{ManualClock, ProcessMonotonicClock, TaskProtocolClock};
+pub use completion::{
+    ReadCompletionTracker, ReadVerdict, WriteCompletionTracker, WriteVerdict, accept_final_info,
+};
 pub use context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
 };
+pub use credential::{CredentialRefreshOwner, RefreshRefusal, RefreshTiming, refresh_timing};
 pub use dispatch::{ExpiredOperation, OperationDispatcher};
 pub use error::{CapacityBound, TaskExecutionError};
 pub use execution::{PumpReport, QueryTaskExecution, StatusReport};

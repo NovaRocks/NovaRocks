@@ -1,6 +1,6 @@
 //! Frontend-owned runtime-filter lifecycle contribution encoder.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use arrow::datatypes::DataType;
@@ -18,6 +18,9 @@ fn encoding_error(message: impl Into<String>) -> DistributedQueryError {
 /// arbitrary query artifact.
 pub(crate) struct EncodedRuntimeFilterDeployment {
     contributions: BTreeMap<usize, service::RuntimeFilterContribution>,
+    /// Backends present only to satisfy the retiring `InitQuery` coverage
+    /// rule. They host no task and own no filter role.
+    padded_backends: BTreeSet<usize>,
     feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration,
 }
 
@@ -139,6 +142,53 @@ impl EncodedRuntimeFilterDeployment {
             .map(|(backend_idx, contribution)| (*backend_idx, contribution.clone()))
     }
 
+    /// The contributions of backends that actually host a task.
+    ///
+    /// This is the deployment's own truth. [`Self::contributions`] can be
+    /// wider, because the retiring `InitQuery` path requires a manifest for
+    /// every frozen live backend; see [`Self::pad_to_frozen_live_backends`].
+    pub(crate) fn task_hosting_contributions(
+        &self,
+    ) -> impl Iterator<Item = (usize, &service::RuntimeFilterContribution)> + '_ {
+        self.contributions
+            .iter()
+            .filter(|(backend_idx, _)| !self.padded_backends.contains(*backend_idx))
+            .map(|(backend_idx, contribution)| (*backend_idx, contribution))
+    }
+
+    /// Adds an explicitly empty contribution for every frozen live backend
+    /// that hosts no task.
+    ///
+    /// `InitQuery` admits a participant only if it carries fragments or a
+    /// filter contribution, and its attachment demands one entry per frozen
+    /// live backend, so a task-free backend still has to appear there. The
+    /// deployment no longer has a participant for such a backend: this pads
+    /// the wire table alone, so the padding is confined to the boundary that
+    /// requires it and is deleted with that path rather than living on in the
+    /// participant model.
+    pub(crate) fn pad_to_frozen_live_backends(
+        &mut self,
+        frozen_live_backend_ids: impl IntoIterator<Item = usize>,
+        lifecycle: filter::RuntimeFilterQueryLifecycleOptions,
+    ) -> Result<(), DistributedQueryError> {
+        if self.contributions.is_empty() {
+            // An empty graph contributes nothing at all, and the attachment
+            // accepts that as a whole. Padding it would invent a deployment.
+            return Ok(());
+        }
+        for backend_idx in frozen_live_backend_ids {
+            if self.contributions.contains_key(&backend_idx) {
+                continue;
+            }
+            let participant = FrontendRuntimeFilterParticipant::without_local_role(backend_idx)
+                .map_err(|error| encoding_error(error.to_string()))?;
+            self.contributions
+                .insert(backend_idx, encode_participant(lifecycle, &participant));
+            self.padded_backends.insert(backend_idx);
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.contributions.is_empty()
     }
@@ -172,6 +222,7 @@ pub(crate) fn encode_install_contributions(
     }
     Ok(EncodedRuntimeFilterDeployment {
         contributions,
+        padded_backends: BTreeSet::new(),
         feedback_declaration,
     })
 }
@@ -189,18 +240,24 @@ fn encode_participant(
 
 #[cfg(test)]
 mod tests {
-    use super::encode_participant;
+    use super::{
+        EncodedRuntimeFilterDeployment, FrontendRuntimeFilterFeedbackDeclaration,
+        encode_participant,
+    };
+
+    use std::collections::{BTreeMap, BTreeSet};
 
     use crate::runtime_filter::model::{
         FrontendRuntimeFilterLifecycle, FrontendRuntimeFilterParticipant,
     };
+    use novarocks_proto_models::filter;
 
     #[test]
-    fn service_only_contribution_carries_the_typed_empty_install_and_lifecycle() {
+    fn a_participant_without_a_local_role_carries_the_typed_empty_install() {
         // Keep this assertion focused on the owner-local contribution shape;
         // constructing a sealed artifact belongs to the schedule-view seam.
-        let participant = FrontendRuntimeFilterParticipant::service_only(3)
-            .expect("service-only participant is valid");
+        let participant = FrontendRuntimeFilterParticipant::without_local_role(3)
+            .expect("a participant with no local role is valid");
         let lifecycle = FrontendRuntimeFilterLifecycle::new(10, 20, 30, 2, 40, 50, 60)
             .expect("lifecycle is valid");
 
@@ -211,5 +268,79 @@ mod tests {
         let install = contribution.install.expect("typed install is required");
         assert!(install.core_channels.is_empty());
         assert!(install.routing_channels.is_empty());
+    }
+
+    #[test]
+    fn padding_addresses_only_backends_the_deployment_left_out() {
+        let lifecycle = FrontendRuntimeFilterLifecycle::new(10, 20, 30, 2, 40, 50, 60)
+            .expect("lifecycle is valid");
+        let install = filter::RuntimeFilterParticipantInstall {
+            core_channels: vec![filter::RuntimeFilterChannelDeployment {
+                channel_id: 1,
+                ..filter::RuntimeFilterChannelDeployment::default()
+            }],
+            routing_channels: Vec::new(),
+        };
+        let participant = FrontendRuntimeFilterParticipant::active(1, install)
+            .expect("an active participant is valid");
+        let mut encoded = EncodedRuntimeFilterDeployment {
+            contributions: BTreeMap::from([(
+                1,
+                encode_participant(lifecycle.to_wire(), &participant),
+            )]),
+            padded_backends: BTreeSet::new(),
+            feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration::default(),
+        };
+
+        encoded
+            .pad_to_frozen_live_backends([0, 1, 2], lifecycle.to_wire())
+            .expect("padding is legal");
+
+        // The wire table covers every live backend, because the retiring
+        // attachment demands it. The deployment's own truth does not: a
+        // padded backend hosts no task and owns no role.
+        assert_eq!(
+            encoded
+                .contributions()
+                .map(|(idx, _)| idx)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            encoded
+                .task_hosting_contributions()
+                .map(|(idx, _)| idx)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "padding must not be mistaken for a task-hosting participant"
+        );
+        let padded = encoded
+            .contributions()
+            .find(|(idx, _)| *idx == 0)
+            .expect("backend zero was padded")
+            .1;
+        let padded_install = padded.install.expect("typed install is required");
+        assert!(padded_install.core_channels.is_empty());
+        assert!(padded_install.routing_channels.is_empty());
+    }
+
+    #[test]
+    fn an_empty_deployment_is_never_padded_into_existence() {
+        let lifecycle = FrontendRuntimeFilterLifecycle::new(10, 20, 30, 2, 40, 50, 60)
+            .expect("lifecycle is valid");
+        let mut encoded = EncodedRuntimeFilterDeployment {
+            contributions: BTreeMap::new(),
+            padded_backends: BTreeSet::new(),
+            feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration::default(),
+        };
+
+        encoded
+            .pad_to_frozen_live_backends([0, 1, 2], lifecycle.to_wire())
+            .expect("padding an empty graph is a no-op");
+
+        assert!(
+            encoded.is_empty(),
+            "a query with no filter graph must contribute nothing at all"
+        );
     }
 }

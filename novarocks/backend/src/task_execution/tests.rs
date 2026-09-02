@@ -62,7 +62,9 @@ use super::host::{
 use super::observation::{CursorObservation, TaskStatusEvent, TaskStatusSource};
 use super::receipt::OperationReceipt;
 use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
-use super::status::{METRIC_PUBLISH_MIN_INTERVAL, StatusAdvance, TaskStatusReporter};
+use super::status::{
+    METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute, StatusAdvance, TaskStatusReporter,
+};
 
 // ------------------------------------------------------------------- fixtures
 
@@ -95,6 +97,39 @@ impl PhysicalFragmentPlan for FakePlan {
 
     fn sink_kind(&self) -> FragmentSinkKind {
         FragmentSinkKind::Result
+    }
+}
+
+/// A plan whose sink streams to an exchange destination instead of producing
+/// the query's client-visible result.
+#[derive(Debug)]
+struct FakeStreamPlan {
+    fingerprint: u8,
+}
+
+impl FakeStreamPlan {
+    fn arc(fingerprint: u8) -> Arc<dyn PhysicalFragmentPlan> {
+        Arc::new(Self { fingerprint })
+    }
+}
+
+impl CodecOwnedContent for FakeStreamPlan {
+    fn fingerprint(&self) -> ContentFingerprint {
+        ContentFingerprint::from_bytes([self.fingerprint; 16])
+    }
+
+    fn encoded_len(&self) -> usize {
+        1024
+    }
+}
+
+impl PhysicalFragmentPlan for FakeStreamPlan {
+    fn contract_version(&self) -> FragmentContractVersion {
+        FragmentContractVersion::CURRENT
+    }
+
+    fn sink_kind(&self) -> FragmentSinkKind {
+        FragmentSinkKind::DataStream
     }
 }
 
@@ -1811,6 +1846,303 @@ fn a_dynamic_filter_read_returns_what_the_task_advertised() {
             Some(version),
         ));
     assert_eq!(acknowledged.outcome(), OperationOutcome::Idempotent);
+}
+
+// -------------------------------------------------------------- root result
+
+/// Polls the root result plane the way the RPC boundary does.
+fn poll_root_result(
+    registry: &TaskExecutionRegistry,
+    identity: TaskIdentity,
+) -> novarocks_proto_models::novarocks::FetchResultResponse {
+    crate::rpc::data_plane::fetch_task_result(
+        registry,
+        novarocks_proto_models::novarocks::FetchTaskResultRequest {
+            root_task: Some(
+                novarocks_proto_codec::task_execution::identity::encode_task_identity(identity),
+            ),
+            max_wait_millis: 1,
+        },
+    )
+    .expect("a poll that reaches a decision is answered in band")
+}
+
+fn fetch_status(
+    response: &novarocks_proto_models::novarocks::FetchResultResponse,
+) -> novarocks_proto_models::novarocks::fetch_result_response::Status {
+    novarocks_proto_models::novarocks::fetch_result_response::Status::try_from(response.status)
+        .expect("a known fetch status")
+}
+
+#[test]
+fn only_the_task_that_owns_the_query_result_may_be_polled_for_it() {
+    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+
+    let fixture = Fixture::new();
+    let context = fixture.establish(71);
+    let root = fixture.identity(71, 71, 1);
+    let producer = fixture.identity(71, 72, 2);
+    fixture.create(root, 5);
+
+    // A second task of the same query whose sink streams to an exchange
+    // destination. It has a result buffer key like any other task, and that is
+    // exactly why the sink kind has to be checked: answering here would hand a
+    // producer's exchange payload back as the query's answer.
+    let streaming = TaskDescriptor::try_new(
+        producer,
+        UniqueId::new(72, 2),
+        std::num::NonZeroUsize::new(1).expect("nonzero dop"),
+        Vec::new(),
+        ExchangeTopology::default(),
+        FakeStreamPlan::arc(9),
+    )
+    .expect("a legal descriptor");
+    let receipt = fixture.registry.create_task(
+        &CreateTask::try_new(TaskOperationId::new_v7(), context, streaming, Vec::new())
+            .expect("a legal create"),
+    );
+    assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+
+    assert!(matches!(
+        fixture.registry.root_result_route(root),
+        RootResultRoute::Serve(_)
+    ));
+    assert!(matches!(
+        fixture.registry.root_result_route(producer),
+        RootResultRoute::NotResultOwner
+    ));
+    let refused = poll_root_result(&fixture.registry, producer);
+    assert_eq!(fetch_status(&refused), FetchStatus::Error);
+    assert!(
+        refused.message.contains("does not own this query's result"),
+        "{}",
+        refused.message
+    );
+    assert!(refused.result_arrow_ipc.is_empty());
+}
+
+#[test]
+fn a_result_poll_is_fenced_against_a_foreign_process_and_an_unknown_task() {
+    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+
+    let fixture = Fixture::new();
+    fixture.establish(73);
+    let root = fixture.identity(73, 73, 1);
+    fixture.create(root, 5);
+
+    // The same query, stage, and task on a replaced backend process. A
+    // restarted backend that reuses an endpoint must not answer a poll minted
+    // for its predecessor.
+    let replaced = TaskIdentity::new(
+        root.query_execution_id(),
+        root.stage_id(),
+        root.task_id(),
+        BackendProcessId::new_v7(),
+    );
+    assert!(matches!(
+        fixture.registry.root_result_route(replaced),
+        RootResultRoute::UnknownTask
+    ));
+    let refused = poll_root_result(&fixture.registry, replaced);
+    assert_eq!(fetch_status(&refused), FetchStatus::Error);
+    assert!(
+        refused.message.contains("does not own"),
+        "{}",
+        refused.message
+    );
+
+    // A task identity of this process that was never created.
+    let absent = fixture.identity(73, 73, 2);
+    assert!(matches!(
+        fixture.registry.root_result_route(absent),
+        RootResultRoute::UnknownTask
+    ));
+    assert_eq!(
+        fetch_status(&poll_root_result(&fixture.registry, absent)),
+        FetchStatus::Error
+    );
+
+    crate::runtime::result_buffer::discard(UniqueId::new(73, 1));
+}
+
+#[test]
+fn the_root_stays_flushing_until_the_frontend_consumes_end_of_stream() {
+    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+
+    let fixture = Fixture::new();
+    fixture.establish(74);
+    let root = fixture.identity(74, 74, 1);
+    let kernel_key = UniqueId::new(74, 1);
+    let reporter = fixture.create(root, 5);
+    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
+
+    crate::runtime::result_buffer::create_typed_sender(kernel_key);
+    crate::runtime::result_buffer::insert_typed(kernel_key, vec![1, 2, 3]).expect("one payload");
+    // The pipeline is done producing, so the runtime moves the task to
+    // FLUSHING and closes the buffer. The output responsibility is still
+    // outstanding: the coordinator has not read a byte.
+    crate::runtime::result_buffer::close_ok(kernel_key);
+    assert!(matches!(reporter.flushing(), StatusAdvance::Published(_)));
+    assert_eq!(reporter.current().state(), TaskState::Flushing);
+    assert!(!reporter.current().output().responsibility_complete());
+
+    let payload = poll_root_result(&fixture.registry, root);
+    assert_eq!(fetch_status(&payload), FetchStatus::Ready);
+    assert!(!payload.eos);
+    assert_eq!(payload.result_arrow_ipc, vec![1, 2, 3]);
+    assert_eq!(
+        reporter.current().state(),
+        TaskState::Flushing,
+        "a delivered payload is not the end of the stream"
+    );
+
+    let version_before = reporter.current().version();
+    let end = poll_root_result(&fixture.registry, root);
+    assert_eq!(fetch_status(&end), FetchStatus::Ready);
+    assert!(end.eos);
+    let terminal = reporter.current();
+    assert_eq!(terminal.state(), TaskState::Finished);
+    assert!(terminal.output().responsibility_complete());
+    assert!(
+        terminal.version() > version_before,
+        "the drain publishes a new version immediately"
+    );
+    // A release may not linearize before the output is gone, so the drain is
+    // also what reports the output released.
+    assert!(
+        fixture
+            .registry
+            .root_result_route(root)
+            .refusal_detail()
+            .is_none()
+    );
+    let info = fixture
+        .registry
+        .get_final_task_info(&GetFinalTaskInfo::new(TaskOperationId::new_v7(), root));
+    assert_eq!(info.outcome(), OperationOutcome::Accepted);
+    assert_eq!(
+        info.acknowledgement()
+            .expect("a terminal task has final info")
+            .final_status(),
+        &terminal,
+        "final info is exactly the terminal that was published"
+    );
+
+    crate::runtime::result_buffer::discard(kernel_key);
+}
+
+#[test]
+fn an_end_of_stream_never_turns_a_terminating_root_into_a_success() {
+    let fixture = Fixture::new();
+    fixture.establish(75);
+    let root = fixture.identity(75, 75, 1);
+    let reporter = fixture.create(root, 5);
+    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
+    assert!(matches!(
+        reporter.aborting(AbortCause::QueryFailed),
+        StatusAdvance::Published(_)
+    ));
+
+    let RootResultRoute::Serve(binding) = fixture.registry.root_result_route(root) else {
+        panic!("the root owns its result while it is live");
+    };
+    let advance = binding.note_result_stream_drained();
+    assert!(
+        matches!(advance, StatusAdvance::Republished(_)),
+        "{advance:?}"
+    );
+    let status = reporter.current();
+    assert_eq!(
+        status.state(),
+        TaskState::Aborting,
+        "a drained buffer is evidence about output, never about success"
+    );
+    assert!(status.output().responsibility_complete());
+
+    // Once the abort completes, the drain is still not a second terminal.
+    assert!(matches!(
+        reporter.aborted(AbortCause::QueryFailed),
+        StatusAdvance::Published(_)
+    ));
+    assert!(matches!(
+        binding.note_result_stream_drained(),
+        StatusAdvance::AlreadyTerminal(TaskState::Aborted)
+    ));
+}
+
+#[test]
+fn an_end_of_stream_from_a_root_that_never_ran_is_refused_rather_than_finished() {
+    let fixture = Fixture::new();
+    fixture.establish(76);
+    let root = fixture.identity(76, 76, 1);
+    let reporter = fixture.create(root, 5);
+    assert_eq!(reporter.current().state(), TaskState::Planned);
+
+    let RootResultRoute::Serve(binding) = fixture.registry.root_result_route(root) else {
+        panic!("the root owns its result while it is live");
+    };
+    assert!(
+        matches!(
+            binding.note_result_stream_drained(),
+            StatusAdvance::Illegal {
+                from: TaskState::Planned,
+                to: TaskState::Finished,
+            }
+        ),
+        "a task that never started cannot have produced a complete result stream"
+    );
+    assert_eq!(reporter.current().state(), TaskState::Planned);
+    assert!(!reporter.current().output().responsibility_complete());
+}
+
+#[test]
+fn a_result_poll_after_retirement_reports_the_terminal_rather_than_a_buffer() {
+    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+
+    let fixture = Fixture::new();
+    let context = fixture.establish(77);
+    let root = fixture.identity(77, 77, 1);
+    let reporter = fixture.create(root, 5);
+    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
+
+    // A running root keeps serving, and a sweep must not retire it. Draining
+    // the stream is the one moment its output responsibility completes, so it
+    // is the drain that publishes FINISHED rather than a separate report: a
+    // root that announced FINISHED first would have claimed completion while
+    // still holding rows nobody had read.
+    fixture.registry.advance_deadlines();
+    assert!(fixture.registry.has_live_task(root));
+    let RootResultRoute::Serve(binding) = fixture.registry.root_result_route(root) else {
+        panic!("a running root owns the query's result buffer");
+    };
+    assert!(matches!(
+        binding.note_result_stream_drained(),
+        StatusAdvance::Published(_)
+    ));
+    assert_eq!(reporter.current().state(), TaskState::Finished);
+    assert!(reporter.current().output().responsibility_complete());
+
+    // Only now can the owner retire it.
+    fixture.registry.advance_deadlines();
+    assert!(!fixture.registry.has_live_task(root));
+
+    let route = fixture.registry.root_result_route(root);
+    assert!(
+        matches!(route, RootResultRoute::Terminal(TaskState::Finished)),
+        "{route:?}"
+    );
+    let refused = poll_root_result(&fixture.registry, root);
+    assert_eq!(fetch_status(&refused), FetchStatus::Error);
+    assert!(
+        refused.message.contains("already FINISHED"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Active,
+        "a retired task never releases its context on its own"
+    );
 }
 
 // ----------------------------------------------------------------- fencing

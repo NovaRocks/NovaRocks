@@ -66,16 +66,17 @@ pub use operation::{
     TaskDomainUpdate, TransportBudget, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
 pub use status::{
-    AbortCause, CancelReason, DynamicFilterAdvertisement, FinalTaskInfo, FinalTaskInfoError,
-    GoneObservation, OperatorStatistics, SafeDetail, SafeFieldPath, SafeTextTooLong,
-    StatusObservation, TaskFailure, TaskFailureCategory, TaskOutputFacts, TaskResourceFacts,
-    TaskState, TaskStatus, TaskStatusCursor, TaskStatusError, TaskStatusVersion, TaskWriterFacts,
-    TerminationDetail, classify_gone, classify_observation,
+    AbortCause, CancelReason, DynamicFilterAdvertisement, FinalInfoDisagreement, FinalTaskInfo,
+    FinalTaskInfoError, GoneObservation, OperatorStatistics, ResultPacketVerdict, RootResultStream,
+    SafeDetail, SafeFieldPath, SafeTextTooLong, StatusObservation, TaskFailure,
+    TaskFailureCategory, TaskOutputFacts, TaskResourceFacts, TaskState, TaskStatus,
+    TaskStatusCursor, TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
+    classify_gone, classify_observation, verify_final_info,
 };
 pub use transition::{
     AttemptDrainFacts, ContextOperationKind, ContextTransition, LatchOutcome, OperationAdmission,
-    QueryContextEvent, QueryContextState, RootReadFacts, StageState, TaskTransition,
-    TerminationLatch, WriteCompletionFacts, classify_context_transition,
-    classify_operation_admission, classify_task_transition, derive_stage_state,
-    parent_released_children, terminals_are_success_compatible,
+    QueryContextEvent, QueryContextState, RootDrainAction, RootReadFacts, StageState,
+    TaskTransition, TerminationLatch, WriteCompletionFacts, classify_context_transition,
+    classify_operation_admission, classify_root_drain, classify_task_transition,
+    derive_stage_state, parent_released_children, terminals_are_success_compatible,
 };

@@ -75,8 +75,9 @@ mod tests {
         encode_lease_receipt,
     };
     use super::operation::{
-        DecodedOperation, decode_operation_batch, decode_receipt_batch, encode_operation_outcome,
-        encode_query_context_state,
+        DecodedOperation, decode_fetch_task_result, decode_get_final_task_info,
+        decode_operation_batch, decode_receipt_batch, encode_fetch_task_result,
+        encode_get_final_task_info, encode_operation_outcome, encode_query_context_state,
     };
     use super::status::{decode_task_status, encode_task_status};
     use crate::{FieldPath, ProtocolErrorKind};
@@ -88,7 +89,7 @@ mod tests {
     };
     use novarocks_execution::task_execution::lease::{LeaseReceipt, LeaseSequence, LeaseValidFor};
     use novarocks_execution::task_execution::operation::{
-        OperationKind, OperationOutcome, ReleaseOutcome, TransportBudget,
+        MaxWait, OperationKind, OperationOutcome, ReleaseOutcome, TransportBudget,
     };
     use novarocks_execution::task_execution::status::{
         AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
@@ -123,6 +124,58 @@ mod tests {
 
     fn context(process: BackendProcessId) -> QueryContextRef {
         QueryContextRef::new(execution(), FrontendProcessId::new_v7(), process)
+    }
+
+    /// A descriptor and an envelope that actually pair.
+    ///
+    /// These go through the same `validate_initial_credential_lease_envelopes`
+    /// the old lifecycle stack uses, which requires each envelope to match its
+    /// descriptor exactly and every secret scalar to be non-empty. A
+    /// `default()` descriptor beside an `s3: None` envelope satisfies neither,
+    /// so building the pair properly is what makes these tests exercise the
+    /// real rule.
+    fn credential_descriptor(epoch: u64) -> novarocks::CredentialLeaseDescriptor {
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
+            CredentialLeaseId, CredentialLeaseProvider, StorageAccessDomainId,
+            StorageCredentialScopePrefix,
+        };
+
+        crate::lifecycle::encode_credential_lease_descriptor(
+            &CredentialLeaseDescriptor::try_new(
+                CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
+                epoch,
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("warehouse").expect("instance"),
+                    CatalogVersion::from_bytes([7; 32]),
+                ),
+                CredentialLeaseProvider::S3,
+                vec![
+                    StorageCredentialScopePrefix::try_from_normalized("s3://bucket/data")
+                        .expect("prefix"),
+                ],
+                99,
+                true,
+                StorageAccessDomainId::from_bytes([8; 32]),
+            )
+            .expect("descriptor"),
+        )
+    }
+
+    fn credential_envelope(epoch: u64, secret: &str) -> novarocks::CredentialLeaseSecretEnvelope {
+        use novarocks_spi::connector::CredentialLeaseId;
+
+        crate::lifecycle::encode_credential_lease_secret_envelope(
+            &crate::lifecycle::CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
+                CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
+                epoch,
+                "access-key-id".to_owned(),
+                secret.to_owned(),
+                "session-token".to_owned(),
+                99,
+            )
+            .expect("envelope"),
+        )
     }
 
     fn unique(hi: i64, lo: i64) -> common::UniqueId {
@@ -733,6 +786,45 @@ mod tests {
         assert!(encode_operation_outcome(OperationOutcome::ResourceExhausted).is_some());
     }
 
+    #[test]
+    fn the_two_observation_reads_round_trip_their_exact_task_identity() {
+        let process = backend();
+        let root = identity(4, 7, process);
+
+        let poll = encode_fetch_task_result(root, MaxWait::default_for(OperationKind::CancelTask));
+        let (decoded, max_wait) =
+            decode_fetch_task_result(&poll, FieldPath::root("fetch")).expect("a legal poll");
+        assert_eq!(decoded, root);
+        assert_eq!(max_wait, MaxWait::DEFAULT_UPDATE);
+
+        // A poll that names no task cannot be answered from "the" result
+        // buffer, because the address is the only thing that says which one.
+        let anonymous = novarocks::FetchTaskResultRequest {
+            root_task: None,
+            max_wait_millis: 1_000,
+        };
+        assert_eq!(
+            decode_fetch_task_result(&anonymous, FieldPath::root("fetch"))
+                .expect_err("no identity")
+                .kind(),
+            ProtocolErrorKind::MissingField
+        );
+        // Zero is not "wait as little as possible": it is a duration this
+        // contract does not represent.
+        let zero = novarocks::FetchTaskResultRequest {
+            root_task: Some(encode_task_identity(root)),
+            max_wait_millis: 0,
+        };
+        assert!(decode_fetch_task_result(&zero, FieldPath::root("fetch")).is_err());
+
+        let read = encode_get_final_task_info(root);
+        let operation = TaskOperationId::new_v7();
+        let decoded = decode_get_final_task_info(&read, operation, FieldPath::root("info"))
+            .expect("a legal read");
+        assert_eq!(decoded.identity(), root);
+        assert_eq!(decoded.envelope().operation_id(), operation);
+    }
+
     fn envelope(kind: OperationKind) -> (TaskOperationId, novarocks::TaskOperationEnvelope) {
         let id = TaskOperationId::new_v7();
         let millis = match kind {
@@ -902,51 +994,46 @@ mod tests {
             novarocks::ApplyTaskOperationsRequest {
                 operations: vec![novarocks::TaskOperation {
                     envelope: Some(envelope_value.clone()),
-                    operation: Some(
-                        novarocks::task_operation::Operation::UpdateQueryContext(
-                            novarocks::UpdateQueryContextRequest {
-                                command: Some(
-                                    novarocks::update_query_context_request::Command::Establish(
-                                        novarocks::EstablishQueryContextRequest {
-                                            query_context: Some(encode_query_context_ref(
-                                                context(process),
-                                            )),
-                                            catalog_set: Some(catalog::CatalogSet::default()),
-                                            initial_runtime_filter: Some(
-                                                novarocks::RuntimeFilterContribution::default(),
-                                            ),
-                                            initial_credential: Some(
-                                                novarocks::QueryContextCredentialDomain {
-                                                    lease_id: 1,
-                                                    epoch: 1,
-                                                    descriptors: vec![
-                                                        novarocks::CredentialLeaseDescriptor::default();
-                                                        descriptors
-                                                    ],
-                                                    envelopes: vec![
-                                                        novarocks::CredentialLeaseSecretEnvelope {
-                                                            lease_id: vec![1u8; 16],
-                                                            epoch: 1,
-                                                            s3: None,
-                                                        };
-                                                        envelopes
-                                                    ],
-                                                },
-                                            ),
-                                            initial_lease: Some(
-                                                novarocks::QueryExecutionLeaseGrant {
-                                                    sequence,
-                                                    valid_for_millis: 30_000,
-                                                },
-                                            ),
-                                            query_options: Some(query_options(1)),
-                                            native_compatibility_id: None,
-                                        },
-                                    ),
+                    operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
+                        novarocks::UpdateQueryContextRequest {
+                            command: Some(
+                                novarocks::update_query_context_request::Command::Establish(
+                                    novarocks::EstablishQueryContextRequest {
+                                        query_context: Some(encode_query_context_ref(context(
+                                            process,
+                                        ))),
+                                        catalog_set: Some(catalog::CatalogSet::default()),
+                                        initial_runtime_filter: Some(
+                                            novarocks::RuntimeFilterContribution::default(),
+                                        ),
+                                        initial_credential: Some(
+                                            novarocks::QueryContextCredentialDomain {
+                                                lease_id: 1,
+                                                epoch: 1,
+                                                descriptors: vec![
+                                                    credential_descriptor(1);
+                                                    descriptors
+                                                ],
+                                                envelopes: vec![
+                                                    credential_envelope(
+                                                        1,
+                                                        SECRET_SENTINEL
+                                                    );
+                                                    envelopes
+                                                ],
+                                            },
+                                        ),
+                                        initial_lease: Some(novarocks::QueryExecutionLeaseGrant {
+                                            sequence,
+                                            valid_for_millis: 30_000,
+                                        }),
+                                        query_options: Some(query_options(1)),
+                                        native_compatibility_id: None,
+                                    },
                                 ),
-                            },
-                        ),
-                    ),
+                            ),
+                        },
+                    )),
                 }],
             }
         };
@@ -970,6 +1057,9 @@ mod tests {
             .detail(),
             "an initial lease must carry sequence zero"
         );
+        // The rule itself belongs to the shared credential validator, so this
+        // asserts the refusal comes from there rather than from a second
+        // cardinality check maintained here.
         assert_eq!(
             decode_operation_batch(
                 &establish(0, 2, 1),
@@ -978,7 +1068,8 @@ mod tests {
             )
             .expect_err("a descriptor without its secret cannot be installed")
             .detail(),
-            "each credential descriptor requires exactly one envelope"
+            "credential lease descriptors and confidential envelopes must have identical \
+             cardinality"
         );
     }
 
@@ -1003,24 +1094,11 @@ mod tests {
                                                 novarocks::QueryContextCredentialDomain {
                                                     lease_id: 1,
                                                     epoch: 2,
-                                                    descriptors: vec![
-                                                        novarocks::CredentialLeaseDescriptor::default(),
-                                                    ],
-                                                    envelopes: vec![
-                                                        novarocks::CredentialLeaseSecretEnvelope {
-                                                            lease_id: vec![2u8; 16],
-                                                            epoch: 2,
-                                                            s3: Some(
-                                                                novarocks::CredentialLeaseS3SecretMaterial {
-                                                                    access_key_id: "AKIA".to_owned(),
-                                                                    secret_access_key: SECRET_SENTINEL
-                                                                        .to_owned(),
-                                                                    session_token: String::new(),
-                                                                    session_token_expires_at_unix_ms: 1,
-                                                                },
-                                                            ),
-                                                        },
-                                                    ],
+                                                    descriptors: vec![credential_descriptor(2)],
+                                                    envelopes: vec![credential_envelope(
+                                                        2,
+                                                        SECRET_SENTINEL,
+                                                    )],
                                                 },
                                             ),
                                         ),

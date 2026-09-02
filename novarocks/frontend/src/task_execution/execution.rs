@@ -29,13 +29,14 @@ use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
     AbortCause, AttemptDrainFacts, DispatchBudget, GoneObservation, LatchOutcome, OperationKind,
-    QueryContextRef, RootReadFacts, StageState, StatusObservation, TaskDomainUpdate, TaskIdentity,
+    QueryContextRef, StageState, StatusObservation, TaskDomainUpdate, TaskIdentity,
     TaskOperationId, TaskState, TaskStatus, TerminationDetail, TerminationLatch, TransportBudget,
     parent_released_children,
 };
 use novarocks_types::identity::{StageId, TaskId};
 
 use super::clock::TaskProtocolClock;
+use super::completion::{ReadCompletionTracker, ReadVerdict};
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
 use super::dispatch::{ExpiredOperation, OperationDispatcher};
 use super::error::TaskExecutionError;
@@ -86,7 +87,7 @@ pub struct QueryTaskExecution {
     intake: StatusIntake,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     failure: TerminationLatch,
-    root_eof_observed: bool,
+    read: ReadCompletionTracker,
     drained_tasks: BTreeSet<TaskId>,
     released_outputs: BTreeSet<TaskId>,
     released_children_of: BTreeSet<StageId>,
@@ -141,6 +142,7 @@ impl QueryTaskExecution {
             );
         }
 
+        let read = ReadCompletionTracker::new(graph.root_identity());
         Ok(Self {
             graph,
             stages,
@@ -153,7 +155,7 @@ impl QueryTaskExecution {
             intake,
             operation_targets: BTreeMap::new(),
             failure: TerminationLatch::open(),
-            root_eof_observed: false,
+            read,
             drained_tasks: BTreeSet::new(),
             released_outputs: BTreeSet::new(),
             released_children_of: BTreeSet::new(),
@@ -467,9 +469,6 @@ impl QueryTaskExecution {
             StatusObservation::Accept => report.accepted += 1,
             _ => report.ignored += 1,
         }
-        if identity == self.graph.root_identity() && task.output_released() {
-            self.root_eof_observed = true;
-        }
         if let Some(terminal) = task.terminal_report() {
             if let Some(detail) = &terminal.termination
                 && !detail.is_success_compatible()
@@ -545,23 +544,45 @@ impl QueryTaskExecution {
         Ok(())
     }
 
-    /// Whether the client may be told the read is complete.
+    /// Records one packet the root result data plane delivered.
+    ///
+    /// This is the frontend's own evidence about its result stream, and it is
+    /// the only thing that can satisfy the end-of-stream half of a read
+    /// completion. A backend's claim that its output responsibility is
+    /// complete is a different fact, published on a different channel, and it
+    /// cannot substitute for what this process received.
+    pub fn consume_root_result_packet(
+        &mut self,
+        root: TaskIdentity,
+        packet_sequence: u64,
+        end_of_stream: bool,
+    ) -> Result<(), TaskExecutionError> {
+        self.read
+            .consume_packet(root, packet_sequence, end_of_stream)
+    }
+
+    /// Whether the client may be told the read is complete, and why not when
+    /// it may not.
     ///
     /// This deliberately does not wait for upstream tasks to finish standing
     /// down, and it does not wait for any context to be released. Draining is
     /// internal resource closure and never gates a completion that has
     /// already been linearized.
-    pub fn client_visible_completion(&self) -> bool {
-        let root = self.graph.root_identity();
+    pub fn read_completion(&self) -> ReadVerdict {
         let root_state = self
-            .task_by_identity_ref(root)
+            .task_by_identity_ref(self.read.root())
             .map_or(TaskState::Planned, RemoteTask::task_state);
-        RootReadFacts::new(
-            root_state,
-            self.root_eof_observed,
-            self.failure.is_latched(),
-        )
-        .client_visible_completion()
+        self.read.verdict(root_state, self.failure.is_latched())
+    }
+
+    /// Whether the client may be told the read is complete.
+    pub fn client_visible_completion(&self) -> bool {
+        self.read_completion().is_complete()
+    }
+
+    /// Whether this frontend consumed the end of the root result stream.
+    pub fn root_end_of_stream_observed(&self) -> bool {
+        self.read.end_of_stream_observed()
     }
 
     /// Whether the whole attempt has drained.

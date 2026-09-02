@@ -24,8 +24,9 @@
 use std::fmt;
 
 use novarocks_execution::task_execution::{
-    DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
-    OperationOutcome, RequestError, StatusObservation, TaskState,
+    DescriptorError, DomainConflict, ExchangeEdgeId, FinalInfoDisagreement, IdentityMismatch,
+    OperationKind, OperationOutcome, RequestError, ResultPacketVerdict, StatusObservation,
+    TaskState,
 };
 use novarocks_types::identity::{BackendProcessId, TaskId};
 
@@ -69,6 +70,12 @@ pub enum TaskExecutionError {
         kind: OperationKind,
         outcome: OperationOutcome,
     },
+    /// The root result stream lost, repeated, or overran a packet, so the
+    /// result this frontend holds is not provably the whole result.
+    ResultStream(ResultPacketVerdict),
+    /// A fetched final task info contradicts the terminal status this attempt
+    /// already observed.
+    FinalInfo(FinalInfoDisagreement),
 }
 
 /// Which transport capacity bound was reached.
@@ -179,6 +186,10 @@ impl fmt::Display for TaskExecutionError {
             Self::OperationFailed { kind, outcome } => {
                 write!(formatter, "{kind} failed closed with {outcome:?}")
             }
+            Self::ResultStream(verdict) => {
+                write!(formatter, "root result stream is not intact: {verdict}")
+            }
+            Self::FinalInfo(disagreement) => write!(formatter, "{disagreement}"),
         }
     }
 }

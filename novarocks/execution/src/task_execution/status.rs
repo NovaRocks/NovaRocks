@@ -1020,15 +1020,189 @@ impl FinalTaskInfo {
     }
 }
 
+/// Why a final task info does not agree with the terminal already observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FinalInfoDisagreement {
+    /// The info addresses a different task or a replaced backend process.
+    Identity(IdentityMismatch),
+    /// The info carries a different terminal version than the one observed.
+    TerminalVersion {
+        observed: TaskStatusVersion,
+        carried: TaskStatusVersion,
+    },
+    /// The same terminal version with a different snapshot. A terminal
+    /// snapshot is immutable, so this is a protocol conflict.
+    SnapshotConflict(TaskStatusVersion),
+}
+
+impl fmt::Display for FinalInfoDisagreement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity(mismatch) => write!(formatter, "final task info {mismatch}"),
+            Self::TerminalVersion { observed, carried } => write!(
+                formatter,
+                "final task info carries terminal version {carried}, but version {observed} was \
+                 observed"
+            ),
+            Self::SnapshotConflict(version) => write!(
+                formatter,
+                "final task info carries a different snapshot under terminal version {version}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FinalInfoDisagreement {}
+
+/// Checks a fetched final info against the terminal status already observed.
+///
+/// Final info is observation only, so a *missing* one costs diagnostics and
+/// nothing else. One that disagrees with the terminal is a different matter:
+/// it would mean two answers exist for the one question this protocol allows
+/// exactly one answer to, so it is refused rather than preferred either way.
+pub fn verify_final_info(
+    observed_terminal: &TaskStatus,
+    info: &FinalTaskInfo,
+) -> Result<(), FinalInfoDisagreement> {
+    let carried = info.final_status();
+    if let Err(mismatch) = observed_terminal
+        .identity()
+        .verify_matches(carried.identity())
+    {
+        return Err(FinalInfoDisagreement::Identity(mismatch));
+    }
+    if carried.version() != observed_terminal.version() {
+        return Err(FinalInfoDisagreement::TerminalVersion {
+            observed: observed_terminal.version(),
+            carried: carried.version(),
+        });
+    }
+    if carried != observed_terminal {
+        return Err(FinalInfoDisagreement::SnapshotConflict(carried.version()));
+    }
+    Ok(())
+}
+
+/// How one delivered root-result packet compares with what a frontend has
+/// already consumed.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResultPacketVerdict {
+    /// The next packet in sequence.
+    Accept,
+    /// A packet this frontend already consumed, delivered again.
+    Duplicate { expected: u64, observed: u64 },
+    /// Packets between the cursor and this one were never delivered, so rows
+    /// this query produced are missing.
+    Gap { expected: u64, observed: u64 },
+    /// A packet after the stream's own end-of-stream marker.
+    AfterEndOfStream,
+}
+
+impl ResultPacketVerdict {
+    /// Whether this verdict means the result stream can no longer be trusted
+    /// to be complete.
+    pub const fn is_fatal(self) -> bool {
+        matches!(
+            self,
+            Self::Duplicate { .. } | Self::Gap { .. } | Self::AfterEndOfStream
+        )
+    }
+}
+
+impl fmt::Display for ResultPacketVerdict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accept => formatter.write_str("in sequence"),
+            Self::Duplicate { expected, observed } => write!(
+                formatter,
+                "root result packet {observed} was already consumed; {expected} was expected"
+            ),
+            Self::Gap { expected, observed } => write!(
+                formatter,
+                "root result packet {expected} was never delivered; {observed} arrived instead"
+            ),
+            Self::AfterEndOfStream => {
+                formatter.write_str("a root result packet arrived after end of stream")
+            }
+        }
+    }
+}
+
+/// A frontend's own accounting of the root result stream.
+///
+/// "The backend says its output responsibility is complete" and "this
+/// frontend received every packet and the end-of-stream marker" are two
+/// different facts, and only the second one can justify telling a client that
+/// its read succeeded. This type is the second fact, and it is deliberately
+/// strict about sequence: the backend hands out one contiguous sequence and
+/// drops each packet as it is delivered, so a gap is not a reordering to
+/// tolerate — it is result rows that no longer exist anywhere.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct RootResultStream {
+    next_expected: u64,
+    end_of_stream_at: Option<u64>,
+}
+
+impl RootResultStream {
+    pub const fn new() -> Self {
+        Self {
+            next_expected: 0,
+            end_of_stream_at: None,
+        }
+    }
+
+    /// How many packets this frontend has consumed, end-of-stream included.
+    pub const fn packets_consumed(self) -> u64 {
+        self.next_expected
+    }
+
+    /// Whether this frontend observed the stream's end-of-stream marker.
+    pub const fn end_of_stream_observed(self) -> bool {
+        self.end_of_stream_at.is_some()
+    }
+
+    pub const fn classify(self, packet_sequence: u64) -> ResultPacketVerdict {
+        if self.end_of_stream_at.is_some() {
+            return ResultPacketVerdict::AfterEndOfStream;
+        }
+        if packet_sequence < self.next_expected {
+            return ResultPacketVerdict::Duplicate {
+                expected: self.next_expected,
+                observed: packet_sequence,
+            };
+        }
+        if packet_sequence > self.next_expected {
+            return ResultPacketVerdict::Gap {
+                expected: self.next_expected,
+                observed: packet_sequence,
+            };
+        }
+        ResultPacketVerdict::Accept
+    }
+
+    /// Consumes one delivered packet, advancing only on `Accept`.
+    pub fn consume(&mut self, packet_sequence: u64, end_of_stream: bool) -> ResultPacketVerdict {
+        let verdict = self.classify(packet_sequence);
+        if matches!(verdict, ResultPacketVerdict::Accept) {
+            self.next_expected = packet_sequence.saturating_add(1);
+            if end_of_stream {
+                self.end_of_stream_at = Some(packet_sequence);
+            }
+        }
+        verdict
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
-        FinalTaskInfo, FinalTaskInfoError, GoneObservation, OperatorStatistics,
-        SAFE_DETAIL_MAX_BYTES, SafeDetail, SafeFieldPath, StatusObservation, TaskFailure,
-        TaskFailureCategory, TaskOutputFacts, TaskResourceFacts, TaskState, TaskStatus,
-        TaskStatusCursor, TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
-        classify_gone, classify_observation,
+        FinalInfoDisagreement, FinalTaskInfo, FinalTaskInfoError, GoneObservation,
+        OperatorStatistics, ResultPacketVerdict, RootResultStream, SAFE_DETAIL_MAX_BYTES,
+        SafeDetail, SafeFieldPath, StatusObservation, TaskFailure, TaskFailureCategory,
+        TaskOutputFacts, TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor,
+        TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail, classify_gone,
+        classify_observation, verify_final_info,
     };
     use crate::task_execution::domain::DomainVersion;
     use crate::task_execution::identity::{IdentityField, IdentityMismatch, TaskIdentity};
@@ -1472,6 +1646,130 @@ mod tests {
             }),
             "a truncation marker does not license exceeding the bound"
         );
+    }
+
+    #[test]
+    fn a_final_info_that_disagrees_with_the_observed_terminal_is_refused() {
+        let id = identity(BackendProcessId::new_v7());
+        let terminal = TaskStatus::try_new(
+            id,
+            version(11),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("legal");
+        let info =
+            FinalTaskInfo::try_new(id, terminal.clone(), Vec::new(), false).expect("matching");
+        assert_eq!(verify_final_info(&terminal, &info), Ok(()));
+
+        // A different terminal version means one of the two is stale, and
+        // nothing here can tell which.
+        let later = TaskStatus::try_new(
+            id,
+            version(12),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("legal");
+        assert_eq!(
+            verify_final_info(&later, &info),
+            Err(FinalInfoDisagreement::TerminalVersion {
+                observed: version(12),
+                carried: version(11),
+            })
+        );
+
+        // The same version carrying a different snapshot: a terminal snapshot
+        // is immutable, so this can only be a protocol conflict.
+        let same_version_other_content = TaskStatus::try_new(
+            id,
+            version(11),
+            TaskState::Aborted,
+            Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+            TaskOutputFacts::default(),
+        )
+        .expect("legal");
+        assert_eq!(
+            verify_final_info(&same_version_other_content, &info),
+            Err(FinalInfoDisagreement::SnapshotConflict(version(11)))
+        );
+
+        let other = identity(BackendProcessId::new_v7());
+        let other_terminal = TaskStatus::try_new(
+            other,
+            version(11),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("legal");
+        assert_eq!(
+            verify_final_info(&other_terminal, &info),
+            Err(FinalInfoDisagreement::Identity(IdentityMismatch::new(
+                IdentityField::BackendProcess
+            )))
+        );
+    }
+
+    #[test]
+    fn the_root_result_stream_accepts_one_contiguous_sequence() {
+        let mut stream = RootResultStream::new();
+        assert!(!stream.end_of_stream_observed());
+        assert_eq!(stream.packets_consumed(), 0);
+
+        assert_eq!(stream.consume(0, false), ResultPacketVerdict::Accept);
+        assert_eq!(stream.consume(1, false), ResultPacketVerdict::Accept);
+        assert_eq!(stream.packets_consumed(), 2);
+        assert!(!stream.end_of_stream_observed());
+
+        assert_eq!(stream.consume(2, true), ResultPacketVerdict::Accept);
+        assert!(stream.end_of_stream_observed());
+        assert_eq!(stream.packets_consumed(), 3);
+    }
+
+    #[test]
+    fn a_lost_or_repeated_result_packet_is_fatal_rather_than_tolerated() {
+        // A gap means the backend already dropped those packets, so the rows
+        // they carried exist nowhere. Accepting the tail would deliver a
+        // truncated answer as a complete one.
+        let mut stream = RootResultStream::new();
+        assert_eq!(stream.consume(0, false), ResultPacketVerdict::Accept);
+        let gap = stream.consume(2, false);
+        assert_eq!(
+            gap,
+            ResultPacketVerdict::Gap {
+                expected: 1,
+                observed: 2,
+            }
+        );
+        assert!(gap.is_fatal());
+        assert_eq!(
+            stream.packets_consumed(),
+            1,
+            "a refused packet must not advance the cursor"
+        );
+
+        let duplicate = stream.consume(0, false);
+        assert_eq!(
+            duplicate,
+            ResultPacketVerdict::Duplicate {
+                expected: 1,
+                observed: 0,
+            }
+        );
+        assert!(duplicate.is_fatal());
+
+        let mut ended = RootResultStream::new();
+        assert_eq!(ended.consume(0, true), ResultPacketVerdict::Accept);
+        assert_eq!(
+            ended.consume(1, false),
+            ResultPacketVerdict::AfterEndOfStream
+        );
+        assert!(ended.end_of_stream_observed());
+        assert!(ResultPacketVerdict::AfterEndOfStream.is_fatal());
+        assert!(!ResultPacketVerdict::Accept.is_fatal());
     }
 
     #[test]
