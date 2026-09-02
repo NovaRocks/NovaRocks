@@ -3437,6 +3437,7 @@ dependencies = [
 name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
+ "novarocks-execution",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",

@@ -23,3 +23,6 @@ pub mod lifecycle;
 
 /// Validated membership and backend process wire values.
 pub mod membership;
+
+/// Central codec for the native task protocol.
+pub mod task_execution;

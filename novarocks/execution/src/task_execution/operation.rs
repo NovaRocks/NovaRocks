@@ -271,6 +271,9 @@ pub enum OperationOutcome {
     TerminalRejected,
     /// The retained record was reaped, or a retirement fence rejected it.
     Gone,
+    /// A per-context or per-backend capacity bound was reached. This fails
+    /// closed rather than degrading: there is no older path to fall back to.
+    ResourceExhausted,
 }
 
 /// What a frontend does with an outcome.
@@ -317,7 +320,8 @@ impl OperationOutcome {
             | Self::LeaseExpired
             | Self::DestinationFailure
             | Self::InvalidStateOrRequest
-            | Self::TerminalRejected => FrontendAction::FailAttempt,
+            | Self::TerminalRejected
+            | Self::ResourceExhausted => FrontendAction::FailAttempt,
         }
     }
 
@@ -1352,7 +1356,7 @@ mod tests {
     use crate::task_execution::identity::TaskOperationId;
     use std::time::Duration;
 
-    const ALL_OUTCOMES: [OperationOutcome; 18] = [
+    const ALL_OUTCOMES: [OperationOutcome; 19] = [
         OperationOutcome::Accepted,
         OperationOutcome::Idempotent,
         OperationOutcome::RetryableTransportUnknown,
@@ -1371,6 +1375,7 @@ mod tests {
         OperationOutcome::InvalidStateOrRequest,
         OperationOutcome::TerminalRejected,
         OperationOutcome::Gone,
+        OperationOutcome::ResourceExhausted,
     ];
 
     #[test]
@@ -1482,6 +1487,7 @@ mod tests {
             OperationOutcome::DestinationFailure,
             OperationOutcome::InvalidStateOrRequest,
             OperationOutcome::TerminalRejected,
+            OperationOutcome::ResourceExhausted,
         ] {
             assert_eq!(
                 fatal.frontend_action(),

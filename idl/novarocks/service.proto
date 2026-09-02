@@ -1031,3 +1031,662 @@ enum ProfileUnit {
   PROFILE_UNIT_TIME_S = 6;
   PROFILE_UNIT_NONE = 7;
 }
+
+// ============================================================================
+// Native task protocol.
+//
+// Eight typed operations plus one logical status subscription are the whole
+// control and observation surface of a task; the root result keeps its own
+// data plane. Every operation carries its own identity and deadline and
+// produces its own receipt, so batching several onto one wire request never
+// gives them shared atomicity, a shared revision, or a shared success.
+//
+// Every bound stated in a comment here is enforced at the central codec
+// boundary, before anything walks the contents.
+// ============================================================================
+
+// Process-lifetime identity of one frontend process. It fences query context
+// ownership across frontend restarts. It is not a health proof: application
+// liveness is carried by QueryExecutionLeaseGrant.
+message FrontendProcessId {
+  bytes value = 1;  // exactly 16 non-nil UUID-v7 bytes
+}
+
+// Identity of one protocol operation. An unknown transport outcome is resolved
+// by replaying the exact same immutable request under the same id; replaying
+// different content under one id is a conflict, never an update.
+message TaskOperationId {
+  bytes value = 1;  // exactly 16 non-nil UUID-v7 bytes
+}
+
+// The indivisible wire identity of one task. Every component is compared
+// exactly. Because the backend process is part of it, a restarted backend that
+// reuses an endpoint can never accept or impersonate a request minted for its
+// predecessor.
+message TaskIdentity {
+  QueryExecutionId query_execution_id = 1;
+  uint32 stage_id = 2;  // nonzero, never reused inside one query execution
+  uint32 task_id = 3;   // nonzero, never reused inside one stage
+  BackendProcessId backend_process_id = 4;
+}
+
+// Exact reference to the shared execution context of one query on one backend
+// process. A backend holds at most one context per reference, and a backend
+// carrying no task never establishes one.
+message QueryContextRef {
+  QueryExecutionId query_execution_id = 1;
+  FrontendProcessId frontend_process_id = 2;
+  BackendProcessId backend_process_id = 3;
+}
+
+// Identity and deadline carried by every operation. max_wait is a duration,
+// never a cross-host absolute deadline: the backend clamps it to its own
+// configured cap and times it from its own monotonic clock on arrival.
+message TaskOperationEnvelope {
+  TaskOperationId operation_id = 1;
+  uint64 max_wait_millis = 2;  // nonzero, <= 300000
+}
+
+// How a producer distributes rows across one edge's frozen destination set.
+enum ExchangePartitioning {
+  EXCHANGE_PARTITIONING_UNSPECIFIED = 0;
+  EXCHANGE_PARTITIONING_UNPARTITIONED = 1;
+  EXCHANGE_PARTITIONING_RANDOM = 2;
+  EXCHANGE_PARTITIONING_HASH = 3;
+  EXCHANGE_PARTITIONING_BUCKET_SHUFFLE_HASH = 4;
+}
+
+// One frozen destination of one push exchange edge.
+//
+// It carries both addresses on purpose. The task identity is the protocol
+// fence: it is what lets an inbound frame be checked against an exact process.
+// The fragment instance id is the execution kernel's key, and it is what an
+// actual exchange frame carries on the wire. Freezing the one-to-one mapping
+// here is what makes the two provably the same target instead of two
+// independently derived guesses.
+message TaskExchangeDestination {
+  TaskIdentity task = 1;
+  novarocks.common.UniqueId fragment_instance_id = 2;
+  QueryControlEndpoint endpoint = 3;
+  int32 destination_node_id = 4;  // nonnegative
+  uint32 sender_ordinal = 5;      // strictly below sender_count
+  uint32 sender_count = 6;        // nonzero
+}
+
+// One frozen source of one inbound exchange node, with the same dual
+// addressing as a destination.
+message TaskExchangeSource {
+  TaskIdentity task = 1;
+  novarocks.common.UniqueId fragment_instance_id = 2;
+}
+
+// One outbound push exchange edge. The destination set is frozen here and
+// nowhere else: opening an edge grants send permission and can never add a
+// destination.
+message TaskExchangeEdge {
+  uint32 edge_id = 1;             // nonzero, unique inside one topology
+  int32 destination_node_id = 2;  // nonnegative; every destination must match
+  ExchangePartitioning partitioning = 3;
+  repeated TaskExchangeDestination destinations = 4;  // 1..=4096
+}
+
+// One inbound exchange node. The frozen source set doubles as the expected
+// sender count, so the two can never disagree.
+message TaskExchangeInbound {
+  int32 destination_node_id = 1;          // nonnegative, unique inside one topology
+  repeated TaskExchangeSource sources = 2;  // 1..=4096, no duplicate task and no
+                                            // duplicate fragment instance id
+}
+
+// The complete, frozen push exchange topology of one task. Exchange membership
+// is not an incremental domain: there is no operation in this protocol that
+// could change it.
+message TaskExchangeTopology {
+  repeated TaskExchangeEdge outbound = 1;   // <= 256
+  repeated TaskExchangeInbound inbound = 2; // <= 256
+}
+
+// The physical plan of one task and the per-instance parameters the execution
+// kernel consumes. This is the descriptor's plan carrier, and it stays the
+// stored representation of the plan: the only transport-neutral plan form in
+// this engine is not a value, so there is nothing neutral to store instead.
+// The central codec is the only place that reads it, and it exposes only typed
+// accessors to either role.
+message TaskFragmentPlan {
+  novarocks.plan.PlanFragment plan = 1;
+  InstanceParams instance_params = 2;
+}
+
+// The immutable creation contract of one task. It is frozen exactly once and
+// compared for exact equality on every replay.
+//
+// The neutral protocol facts below are a validated projection of the plan
+// carrier, not a second authority: the codec proves the fragment instance id,
+// the parallelism, the destination set, and the per-exchange sender counts all
+// agree with instance_params before either role sees the descriptor.
+message TaskDescriptor {
+  TaskIdentity identity = 1;
+  // The execution kernel's local key, derived one-to-one from identity. It is
+  // never a second wire admission identity: nothing selects a backend,
+  // retries, or reaches a terminal state through it.
+  novarocks.common.UniqueId fragment_instance_id = 2;
+  uint32 pipeline_dop = 3;               // nonzero
+  repeated int32 split_plan_nodes = 4;   // <= 1024, nonnegative, no duplicates
+  TaskExchangeTopology topology = 5;
+  TaskFragmentPlan fragment = 6;         // <= 16 MiB encoded
+}
+
+// One contiguous split assignment batch for one plan node. The watermark
+// contract is exactly ADR-0123's: sequences are consecutive per plan node, an
+// exact replay is idempotent, a gap fails closed, and nothing may follow
+// no_more_splits.
+message TaskSplitAssignmentDomain {
+  novarocks.connector_read.SplitAssignment assignment = 1;
+}
+
+// A task-scoped dynamic filter domain. The status snapshot advertises only the
+// version; this payload is delivered here or read back through
+// FetchTaskDynamicFilters, never inside a status.
+message TaskDynamicFilterDomain {
+  uint64 version = 1;  // nonzero, strictly monotonic
+  novarocks.filter.RuntimeFilterEnvelope envelope = 2;
+}
+
+// Grants send permission on edges the descriptor already froze. The only legal
+// move is closed to open; this release has no close, reconfigure, or dynamic
+// membership operation.
+message OpenExchangeEdgesDomain {
+  uint32 version = 1;             // exactly 1 in this release
+  repeated uint32 edge_ids = 2;   // 1..=256, all frozen by the descriptor
+}
+
+// A closed task-scoped domain change.
+message TaskDomainUpdate {
+  oneof domain {
+    TaskSplitAssignmentDomain split_assignment = 1;
+    TaskDynamicFilterDomain dynamic_filter = 2;
+    OpenExchangeEdgesDomain open_exchange_edges = 3;
+  }
+}
+
+// A shared catalog binding of one query context.
+message QueryContextCatalogDomain {
+  uint64 version = 1;  // nonzero, strictly monotonic
+  novarocks.catalog.CatalogSet catalog_set = 2;
+}
+
+// A shared dynamic filter domain of one query context.
+message QueryContextSharedDynamicFilterDomain {
+  uint64 version = 1;  // nonzero, strictly monotonic
+  RuntimeFilterContribution contribution = 2;
+}
+
+// A credential rotation of one query context. Only the exact next epoch of the
+// same lease is accepted; a gap fails closed rather than silently skipping a
+// rotation.
+//
+// The envelopes are confidential: they are legal only on a TLS native
+// transport, they take part in no digest, and they must never appear in a
+// status, a final info, a receipt, a retained record, or any rendering. Same
+// epoch equality is answered by the owner of the live material, never by a
+// digest of it.
+message QueryContextCredentialDomain {
+  uint64 lease_id = 1;
+  uint64 epoch = 2;  // nonzero; exactly accepted_epoch + 1 to advance
+  repeated CredentialLeaseDescriptor descriptors = 3;      // <= 64
+  repeated CredentialLeaseSecretEnvelope envelopes = 4;    // exactly one per descriptor
+}
+
+// A closed query-context domain change.
+message QueryContextDomainUpdate {
+  oneof domain {
+    QueryContextCatalogDomain catalog_binding = 1;
+    QueryContextSharedDynamicFilterDomain shared_dynamic_filter = 2;
+    QueryContextCredentialDomain credential = 3;
+  }
+}
+
+// One grant of the query execution lease. The sequence is zero for the initial
+// grant carried by EstablishQueryContext and exactly one higher for every
+// renewal, so a gap fails closed. valid_for is a duration: the backend clamps
+// it into its accepted range and computes expiry from its own monotonic clock.
+message QueryExecutionLeaseGrant {
+  uint64 sequence = 1;
+  uint64 valid_for_millis = 2;  // nonzero, <= 3600000; clamped to 1000..=30000
+}
+
+// Create one task. The descriptor is a required field of this message and of
+// no other: there is no optional descriptor anywhere in this protocol, so no
+// request can be ambiguous about whether it creates or updates.
+message CreateTaskRequest {
+  QueryContextRef query_context = 1;  // query and backend must equal the
+                                      // descriptor identity field for field
+  TaskDescriptor descriptor = 2;
+  repeated TaskDomainUpdate initial_domains = 3;  // <= 256
+}
+
+// Advance one task's own domains. This message has no descriptor field:
+// creating a task and updating one are different messages, not different modes
+// of one request.
+message UpdateTaskRequest {
+  TaskIdentity identity = 1;
+  repeated TaskDomainUpdate domains = 2;  // 1..=256
+}
+
+// Create one query context and install its shared facts atomically. This is
+// the only message that may create one.
+//
+// It deliberately carries no expected local task manifest and no task set
+// digest. ReleaseQueryContext is the frontend's explicit closure statement
+// instead, so a backend never has to guess whether its local task set is
+// closed.
+message EstablishQueryContextRequest {
+  QueryContextRef query_context = 1;
+  novarocks.catalog.CatalogSet catalog_set = 2;
+  RuntimeFilterContribution initial_runtime_filter = 3;
+  QueryContextCredentialDomain initial_credential = 4;
+  QueryExecutionLeaseGrant initial_lease = 5;  // sequence must be 0
+  QueryOptions query_options = 6;
+  NativeCompatibilityId native_compatibility_id = 7;
+}
+
+// Advance one shared domain of an existing query context. It cannot create
+// one: a backend that receives it against a genuinely absent context with no
+// retirement fence fails closed.
+message AdvanceQueryContextDomainRequest {
+  QueryContextRef query_context = 1;
+  QueryContextDomainUpdate domain = 2;
+}
+
+// Renew the application lease. Only the single frontend query context owner
+// sends this. No status stream, keepalive, or process announce may stand in
+// for it.
+message RenewQueryExecutionLeaseRequest {
+  QueryContextRef query_context = 1;
+  QueryExecutionLeaseGrant lease = 2;
+}
+
+// The closed command set of UpdateQueryContext.
+message UpdateQueryContextRequest {
+  oneof command {
+    EstablishQueryContextRequest establish = 1;
+    AdvanceQueryContextDomainRequest advance_domain = 2;
+    RenewQueryExecutionLeaseRequest renew_lease = 3;
+  }
+}
+
+// The only normal cancellation reason this release recognises. A closed
+// single-reason enum is what keeps a real failure from being dressed up as a
+// success-compatible cancellation.
+enum TaskCancelReason {
+  TASK_CANCEL_REASON_UNSPECIFIED = 0;
+  TASK_CANCEL_REASON_UPSTREAM_NO_LONGER_NEEDED = 1;
+}
+
+// Stand one task down normally.
+message CancelTaskRequest {
+  TaskIdentity identity = 1;
+  TaskCancelReason reason = 2;
+}
+
+// Why a query context and all its tasks are being forced down. Client
+// cancellation, query failure, and lease expiry all take this path and produce
+// ABORTED, never a success-compatible CANCELED.
+enum QueryContextAbortCause {
+  QUERY_CONTEXT_ABORT_CAUSE_UNSPECIFIED = 0;
+  QUERY_CONTEXT_ABORT_CAUSE_QUERY_FAILED = 1;
+  QUERY_CONTEXT_ABORT_CAUSE_LEASE_EXPIRED = 2;
+  QUERY_CONTEXT_ABORT_CAUSE_PEER_TASK_FAILED = 3;
+}
+
+message AbortQueryContextRequest {
+  QueryContextRef query_context = 1;
+  QueryContextAbortCause cause = 2;
+}
+
+// Declare that no legal create can follow and close the shared context. It
+// carries no task manifest and no digest: the backend verifies only what it
+// can observe locally, and answers NOT_READY while anything still drains.
+message ReleaseQueryContextRequest {
+  QueryContextRef query_context = 1;
+}
+
+// Read one task's dynamic filter domains. This is an observation read: it
+// creates nothing, advances no status, and renews no lease.
+message FetchTaskDynamicFiltersRequest {
+  TaskIdentity identity = 1;
+  uint64 acknowledged_version = 2;  // 0 means nothing acknowledged yet
+}
+
+message FetchTaskDynamicFiltersResponse {
+  TaskIdentity identity = 1;
+  uint64 version = 2;  // never below the version that triggered the fetch
+  repeated TaskDynamicFilterDomain domains = 3;  // <= 16 MiB encoded in total
+}
+
+// Read one terminal task's final info.
+message GetFinalTaskInfoRequest {
+  TaskIdentity identity = 1;
+}
+
+// One operation inside a per-backend batch.
+message TaskOperation {
+  TaskOperationEnvelope envelope = 1;
+  oneof operation {
+    CreateTaskRequest create_task = 2;
+    UpdateTaskRequest update_task = 3;
+    UpdateQueryContextRequest update_query_context = 4;
+    CancelTaskRequest cancel_task = 5;
+    AbortQueryContextRequest abort_query_context = 6;
+    ReleaseQueryContextRequest release_query_context = 7;
+  }
+}
+
+// A per-backend batch of operations. The batch is a transport convenience and
+// nothing more: it provides no atomicity, no shared revision, and no
+// batch-global success. A partial failure leaves every other item exactly as
+// its own receipt reports.
+message ApplyTaskOperationsRequest {
+  repeated TaskOperation operations = 1;  // 1..=32, <= 48 MiB encoded
+}
+
+// The machine-readable outcome categories of one operation. Retry, failure,
+// and observation recovery are decided from this category alone; nothing in
+// this protocol classifies an outcome by inspecting an error message.
+enum TaskOperationOutcome {
+  TASK_OPERATION_OUTCOME_UNSPECIFIED = 0;
+  TASK_OPERATION_OUTCOME_ACCEPTED = 1;
+  TASK_OPERATION_OUTCOME_IDEMPOTENT = 2;
+  TASK_OPERATION_OUTCOME_OPERATION_TIMED_OUT = 3;
+  TASK_OPERATION_OUTCOME_IDENTITY_MISMATCH = 4;
+  TASK_OPERATION_OUTCOME_CREATE_CONFLICT = 5;
+  TASK_OPERATION_OUTCOME_CONTEXT_NOT_ESTABLISHED = 6;
+  TASK_OPERATION_OUTCOME_CONTEXT_CONFLICT = 7;
+  TASK_OPERATION_OUTCOME_DOMAIN_CONFLICT = 8;
+  TASK_OPERATION_OUTCOME_LEASE_EXPIRED = 9;
+  TASK_OPERATION_OUTCOME_RELEASE_NOT_READY = 10;
+  TASK_OPERATION_OUTCOME_CONTEXT_TERMINAL_RECEIPT = 11;
+  TASK_OPERATION_OUTCOME_INVALID_STATE_OR_REQUEST = 12;
+  TASK_OPERATION_OUTCOME_TERMINAL_REJECTED = 13;
+  TASK_OPERATION_OUTCOME_GONE = 14;
+  TASK_OPERATION_OUTCOME_RESOURCE_EXHAUSTED = 15;
+  // A genuinely unknown transport outcome is never a server-reported category:
+  // it is what the client concludes when no receipt arrives at all.
+  reserved 16;
+  reserved "TASK_OPERATION_OUTCOME_RETRYABLE_TRANSPORT_UNKNOWN";
+}
+
+// Per plan node, the highest sequence this task has accepted and whether that
+// node has seen its terminal marker. There is deliberately no task-global
+// split sequence.
+message TaskSplitPlanNodeReceipt {
+  int32 plan_node_id = 1;
+  uint64 accepted_through_sequence = 2;
+  bool no_more_splits = 3;
+  optional uint64 queued_splits = 4;  // absent means not reported, never zero
+}
+
+message TaskSplitAssignmentReceipt {
+  repeated TaskSplitPlanNodeReceipt nodes = 1;  // <= 1024
+}
+
+// The receipt of any scalar-versioned domain: task dynamic filter, catalog
+// binding, or shared dynamic filter. A version may skip values; only strict
+// monotonicity matters.
+message ScalarDomainReceipt {
+  uint64 accepted_version = 1;  // 0 means nothing accepted yet
+}
+
+message OpenExchangeEdgesReceipt {
+  repeated uint32 opened_edge_ids = 1;  // <= 256
+}
+
+// The receipt of one task-scoped domain.
+message TaskDomainReceipt {
+  oneof receipt {
+    TaskSplitAssignmentReceipt split_assignment = 1;
+    ScalarDomainReceipt dynamic_filter = 2;
+    OpenExchangeEdgesReceipt open_exchange_edges = 3;
+  }
+}
+
+// The receipt of one query-context domain. Only the accepted credential epoch
+// is reported: no credential material, and no digest of any, ever appears in a
+// receipt.
+message QueryContextDomainReceipt {
+  oneof receipt {
+    ScalarDomainReceipt catalog_binding = 1;
+    ScalarDomainReceipt shared_dynamic_filter = 2;
+    QueryContextCredentialReceipt credential = 3;
+  }
+}
+
+message QueryContextCredentialReceipt {
+  uint64 lease_id = 1;
+  uint64 accepted_epoch = 2;
+}
+
+message QueryExecutionLeaseReceipt {
+  uint64 sequence = 1;
+  uint64 requested_valid_for_millis = 2;
+  uint64 effective_valid_for_millis = 3;  // the only duration the frontend may
+                                          // schedule its next renewal from
+}
+
+// Acknowledgement of a task creation. Receiving it proves the task, its
+// receiver, and its inbound capability are installed and the task was
+// submitted as runnable: there is no separate ready state or registry. It
+// carries the current status, which closes the window between creating a task
+// and observing it.
+message CreateTaskAck {
+  TaskIdentity identity = 1;
+  repeated TaskDomainReceipt accepted_domains = 2;  // <= 256
+  TaskStatus current_status = 3;
+}
+
+message UpdateTaskAck {
+  TaskIdentity identity = 1;
+  repeated TaskDomainReceipt accepted_domains = 2;  // <= 256
+}
+
+// Lifecycle state of one query context. There is no state and no event meaning
+// "every task I currently know about is terminal".
+enum QueryContextState {
+  QUERY_CONTEXT_STATE_UNSPECIFIED = 0;
+  QUERY_CONTEXT_STATE_ESTABLISHING = 1;
+  QUERY_CONTEXT_STATE_ACTIVE = 2;
+  QUERY_CONTEXT_STATE_RELEASING = 3;
+  QUERY_CONTEXT_STATE_ABORTING = 4;
+  QUERY_CONTEXT_STATE_TERMINAL_RETAINED = 5;
+  QUERY_CONTEXT_STATE_GONE = 6;
+}
+
+message QueryContextAck {
+  QueryContextRef query_context = 1;
+  QueryContextState state = 2;
+  optional QueryExecutionLeaseReceipt lease = 3;
+  repeated QueryContextDomainReceipt accepted_domains = 4;  // <= 16
+  // Present once the context is terminal. It reports the shared-resource
+  // lifecycle cause only; it is never a second authority over a task terminal.
+  optional QueryContextAbortCause termination_cause = 5;
+}
+
+enum ReleaseQueryContextOutcome {
+  RELEASE_QUERY_CONTEXT_OUTCOME_UNSPECIFIED = 0;
+  RELEASE_QUERY_CONTEXT_OUTCOME_RELEASED = 1;
+  // Local tasks, output, reads, or operations are still draining. Nothing was
+  // applied and this does not occupy the first-wins position, so the identical
+  // request may be retried once state advances.
+  RELEASE_QUERY_CONTEXT_OUTCOME_NOT_READY = 2;
+  RELEASE_QUERY_CONTEXT_OUTCOME_ALREADY_TERMINAL = 3;
+}
+
+message ReleaseQueryContextAck {
+  QueryContextRef query_context = 1;
+  ReleaseQueryContextOutcome outcome = 2;
+  QueryContextState state = 3;
+  optional QueryContextAbortCause termination_cause = 4;
+}
+
+// The receipt of exactly one operation from a batch.
+message TaskOperationReceipt {
+  TaskOperationId operation_id = 1;
+  TaskOperationOutcome outcome = 2;
+  string safe_detail = 3;               // <= 512 bytes, redacted by the producer
+  optional string safe_field_path = 4;  // <= 256 bytes when present
+  oneof ack {
+    CreateTaskAck create_task = 5;
+    UpdateTaskAck update_task = 6;
+    QueryContextAck query_context = 7;
+    ReleaseQueryContextAck release_query_context = 8;
+    TaskStatus cancel_task = 9;
+  }
+}
+
+message ApplyTaskOperationsResponse {
+  repeated TaskOperationReceipt receipts = 1;  // exactly one per request item,
+                                               // in request order
+}
+
+// Lifecycle state of one task. The families are kept distinct on purpose: a
+// task that finished executing but still owes output is FLUSHING, and a normal
+// stand-down is a different terminal state from a failure and from an abort.
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PLANNED = 1;
+  TASK_STATE_RUNNING = 2;
+  TASK_STATE_FLUSHING = 3;
+  TASK_STATE_FINISHED = 4;
+  TASK_STATE_CANCELING = 5;
+  TASK_STATE_CANCELED = 6;
+  TASK_STATE_ABORTING = 7;
+  TASK_STATE_ABORTED = 8;
+  TASK_STATE_FAILING = 9;
+  TASK_STATE_FAILED = 10;
+}
+
+enum TaskFailureCategory {
+  TASK_FAILURE_CATEGORY_UNSPECIFIED = 0;
+  TASK_FAILURE_CATEGORY_EXECUTION = 1;
+  TASK_FAILURE_CATEGORY_RESOURCE_EXHAUSTED = 2;
+  TASK_FAILURE_CATEGORY_EXCHANGE = 3;
+  TASK_FAILURE_CATEGORY_PROTOCOL = 4;
+  TASK_FAILURE_CATEGORY_INTERNAL = 5;
+}
+
+message TaskFailure {
+  TaskFailureCategory category = 1;
+  string safe_detail = 2;  // <= 512 bytes, redacted by the producer
+}
+
+// The cause a terminating or terminal state must carry. FINISHED carries none.
+message TaskTermination {
+  oneof cause {
+    TaskCancelReason canceled = 1;
+    QueryContextAbortCause aborted = 2;
+    TaskFailure failed = 3;
+  }
+}
+
+// Output facts of one task. responsibility_complete is the fact that separates
+// FLUSHING from FINISHED: an operator returning end-of-stream is not enough,
+// this task's output must also have been produced, consumed, or acknowledged.
+message TaskOutputFacts {
+  bool responsibility_complete = 1;
+  optional uint64 buffered_rows = 2;   // absent means not reported, never zero
+  optional uint64 buffered_bytes = 3;
+}
+
+// Resource facts of one task. Every metric is optional and absence never means
+// zero: a consumer must not substitute a default or size anything from one.
+message TaskResourceFacts {
+  optional uint64 queued_splits = 1;
+  optional uint32 running_drivers = 2;
+  optional uint64 memory_reservation_bytes = 3;
+  optional uint64 cpu_time_millis = 4;
+}
+
+// Writer facts of a distributed write task. Absent for a read task.
+message TaskWriterFacts {
+  optional uint64 written_rows = 1;
+  optional uint64 written_bytes = 2;
+  optional uint32 prepared_write_entries = 3;
+}
+
+// One immutable, complete status snapshot. A published version is bound to
+// exactly this value: a backend may drop a coalesced non-current snapshot, but
+// it may never publish a different value under a version it already used, and
+// a terminal snapshot is immutable and first-wins.
+message TaskStatus {
+  TaskIdentity identity = 1;
+  uint64 status_version = 2;  // nonzero; the CreateTaskAck snapshot is 1
+  TaskState state = 3;
+  optional TaskTermination termination = 4;
+  // Only the latest dynamic filter version and a bounded count. The payload is
+  // read separately, so a large filter can never inflate this channel.
+  optional uint64 dynamic_filter_version = 5;
+  optional uint32 dynamic_filter_domain_count = 6;
+  TaskOutputFacts output = 7;
+  TaskResourceFacts resources = 8;
+  optional TaskWriterFacts writer = 9;
+}
+
+// The frontend's observation position for one task.
+message TaskStatusCursor {
+  TaskIdentity identity = 1;
+  uint64 current_version = 2;  // 0 means never observed
+}
+
+// One logical query-by-backend subscription. It is an observation channel only:
+// it creates no task and no context, freezes no task set, and owns no
+// admission, edge-open, terminal, or cancel authority. A new task joins it
+// automatically.
+message SubscribeTaskStatusRequest {
+  QueryContextRef query_context = 1;
+  repeated TaskStatusCursor cursors = 2;  // <= 4096
+}
+
+// Retained state for this task was reclaimed. Inside the legal request horizon
+// this cannot rebuild the task.
+message TaskGone {
+  TaskIdentity identity = 1;
+}
+
+// A full immutable snapshot, never a delta that depends on a previous frame.
+message TaskStatusStreamEvent {
+  oneof event {
+    TaskStatus task_status = 1;
+    TaskGone task_gone = 2;
+  }
+}
+
+// Bounded operator statistics of one final info entry.
+message TaskOperatorStatistics {
+  int32 plan_node_id = 1;
+  string operator = 2;  // <= 512 bytes
+  optional uint64 input_rows = 3;
+  optional uint64 output_rows = 4;
+  optional uint64 wall_time_millis = 5;
+}
+
+// The bounded, redacted final observation of one terminal task. It is frozen
+// once and never changes, and losing it costs diagnostics only: success and
+// failure are decided by TaskStatus alone.
+//
+// It carries no result payload, no raw split, no credential, and no commit
+// fragment: each of those has its own owner and data plane.
+message FinalTaskInfo {
+  TaskStatus final_status = 1;  // must be terminal and identity-exact
+  repeated TaskOperatorStatistics operator_statistics = 2;  // <= 4096
+  // Reported explicitly rather than silently, so a missing operator is never
+  // mistaken for an operator that did no work.
+  bool operator_statistics_truncated = 3;
+}
+
+// Coordinator long-poll request for the root task's result stream. Unlike the
+// fragment-instance-addressed form it replaces, this is fenced against an
+// exact task and backend process.
+message FetchTaskResultRequest {
+  TaskIdentity root_task = 1;
+  uint64 max_wait_millis = 2;  // nonzero, <= 300000
+}

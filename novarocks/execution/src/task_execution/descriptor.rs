@@ -40,14 +40,13 @@ use std::sync::Arc;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::BackendProcessId;
 
-use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId, FragmentSinkKind};
 use crate::exec::fragment::sink::DataStreamPartitionType;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::task_execution::domain::{
     CodecOwnedContent, ContentFingerprint, ExchangeEdgeId, PlanNodeId,
 };
-use crate::task_execution::identity::{IdentityMismatch, TaskIdentity};
+use crate::task_execution::identity::TaskIdentity;
 
 /// The physical fragment plan of one task, owned by the central codec.
 ///
@@ -64,9 +63,16 @@ pub trait PhysicalFragmentPlan: CodecOwnedContent {
 }
 
 /// One frozen destination of one push exchange edge.
+///
+/// It carries both addresses on purpose. The task identity is the protocol
+/// fence; the fragment instance id is the execution kernel's key, and it is
+/// what an actual exchange frame carries. Freezing the one-to-one mapping here
+/// is what makes the two provably the same target rather than two
+/// independently derived guesses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExchangeDestination {
     task: TaskIdentity,
+    fragment_instance_id: UniqueId,
     endpoint: RuntimeEndpoint,
     destination_node_id: FragmentNodeId,
     sender_ordinal: u32,
@@ -76,6 +82,7 @@ pub struct ExchangeDestination {
 impl ExchangeDestination {
     pub fn try_new(
         task: TaskIdentity,
+        fragment_instance_id: UniqueId,
         endpoint: RuntimeEndpoint,
         destination_node_id: FragmentNodeId,
         sender_ordinal: u32,
@@ -89,11 +96,17 @@ impl ExchangeDestination {
         }
         Ok(Self {
             task,
+            fragment_instance_id,
             endpoint,
             destination_node_id,
             sender_ordinal,
             sender_count,
         })
+    }
+
+    /// The execution kernel's key for this destination.
+    pub const fn fragment_instance_id(&self) -> UniqueId {
+        self.fragment_instance_id
     }
 
     pub const fn task(&self) -> TaskIdentity {
@@ -170,45 +183,82 @@ impl ExchangeEdge {
     }
 }
 
+/// One frozen source of one inbound exchange node.
+///
+/// An inbound frame identifies its sender by the kernel key, so the frozen set
+/// has to be searchable by that key. Carrying the task identity alongside it
+/// is what turns "a frame from some instance" into "a frame from exactly this
+/// task on exactly this process".
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ExchangeSource {
+    task: TaskIdentity,
+    fragment_instance_id: UniqueId,
+}
+
+impl ExchangeSource {
+    pub const fn new(task: TaskIdentity, fragment_instance_id: UniqueId) -> Self {
+        Self {
+            task,
+            fragment_instance_id,
+        }
+    }
+
+    pub const fn task(self) -> TaskIdentity {
+        self.task
+    }
+
+    pub const fn fragment_instance_id(self) -> UniqueId {
+        self.fragment_instance_id
+    }
+}
+
 /// One inbound exchange node of a consumer task.
 ///
 /// The source set and the expected sender count are frozen together, so an
 /// inbound frame can be checked against the topology before anything decodes
 /// an Arrow payload or allocates a receiver.
+///
+/// The expected chunk schema is deliberately absent. It is a property of the
+/// plan, and the receiver registry already refuses a mismatched registration;
+/// duplicating it here would create a second authority over the same fact
+/// without adding a check the pre-decode capability is allowed to make.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExchangeInbound {
     node_id: FragmentNodeId,
-    sources: Vec<TaskIdentity>,
-    expected_schema: ChunkSchemaRef,
+    sources: Vec<ExchangeSource>,
 }
 
 impl ExchangeInbound {
     pub fn try_new(
         node_id: FragmentNodeId,
-        sources: Vec<TaskIdentity>,
-        expected_schema: ChunkSchemaRef,
+        sources: Vec<ExchangeSource>,
     ) -> Result<Self, DescriptorError> {
         if sources.is_empty() {
             return Err(DescriptorError::InboundWithoutSources(node_id));
         }
-        let mut sorted = sources.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        if sorted.len() != sources.len() {
+        let mut by_task: Vec<TaskIdentity> = sources.iter().map(|source| source.task()).collect();
+        by_task.sort_unstable();
+        by_task.dedup();
+        let mut by_key: Vec<UniqueId> = sources
+            .iter()
+            .map(|source| source.fragment_instance_id())
+            .collect();
+        by_key.sort_unstable();
+        by_key.dedup();
+        // Both addresses must be unique: two tasks sharing one kernel key
+        // would make a frame ambiguous, and one task appearing twice would
+        // inflate the expected sender count.
+        if by_task.len() != sources.len() || by_key.len() != sources.len() {
             return Err(DescriptorError::DuplicateInboundSource(node_id));
         }
-        Ok(Self {
-            node_id,
-            sources,
-            expected_schema,
-        })
+        Ok(Self { node_id, sources })
     }
 
     pub const fn node_id(&self) -> FragmentNodeId {
         self.node_id
     }
 
-    pub fn sources(&self) -> &[TaskIdentity] {
+    pub fn sources(&self) -> &[ExchangeSource] {
         &self.sources
     }
 
@@ -218,12 +268,16 @@ impl ExchangeInbound {
         NonZeroU32::new(self.sources.len() as u32).expect("a validated inbound has sources")
     }
 
-    pub const fn expected_schema(&self) -> &ChunkSchemaRef {
-        &self.expected_schema
+    pub fn accepts_source(&self, source: TaskIdentity) -> bool {
+        self.sources.iter().any(|frozen| frozen.task() == source)
     }
 
-    pub fn accepts_source(&self, source: TaskIdentity) -> bool {
-        self.sources.contains(&source)
+    /// Resolves the frozen source that an inbound frame's kernel key names.
+    pub fn source_by_kernel_key(&self, key: UniqueId) -> Option<ExchangeSource> {
+        self.sources
+            .iter()
+            .copied()
+            .find(|frozen| frozen.fragment_instance_id() == key)
     }
 }
 
@@ -354,11 +408,11 @@ impl std::error::Error for DescriptorError {}
 /// Arrow payload is decoded and before a receiver is allocated.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum IngressRejection {
-    /// The frame addresses a different task or a replaced process.
-    Identity(IdentityMismatch),
+    /// The frame's destination key is not this task.
+    UnknownDestinationTask,
     /// The destination node is not an inbound exchange node of this task.
     UnknownDestinationNode(FragmentNodeId),
-    /// The sending task is not in this node's frozen source set.
+    /// The sending instance is not in this node's frozen source set.
     SourceNotFrozen,
     /// The frame's sender count disagrees with the frozen source set.
     SenderCountMismatch { expected: u32, received: u32 },
@@ -369,7 +423,9 @@ pub enum IngressRejection {
 impl fmt::Display for IngressRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Identity(mismatch) => write!(formatter, "inbound frame {mismatch}"),
+            Self::UnknownDestinationTask => {
+                formatter.write_str("inbound frame names another task as its destination")
+            }
             Self::UnknownDestinationNode(node) => {
                 write!(formatter, "inbound frame names unknown node {node:?}")
             }
@@ -502,26 +558,32 @@ impl TaskDescriptor {
 
     /// Whether an inbound exchange frame may be admitted.
     ///
+    /// The parameters are exactly the fields an exchange frame carries, which
+    /// is why they are kernel keys rather than task identities: the frame has
+    /// no identity in it. Resolving the sender through the frozen source set
+    /// is what turns "a frame from some instance" into "a frame from exactly
+    /// this task on exactly this process", and it is the returned value.
+    ///
     /// This runs before an Arrow payload is decoded and before a receiver is
     /// allocated. It does not claim to prevent the byte buffer the gRPC and
     /// protobuf receive layers have already allocated.
     pub fn authorize_inbound_frame(
         &self,
-        destination: TaskIdentity,
+        destination_kernel_key: UniqueId,
         destination_node_id: FragmentNodeId,
-        source: TaskIdentity,
+        source_kernel_key: UniqueId,
         sender_ordinal: u32,
         sender_count: u32,
-    ) -> Result<(), IngressRejection> {
-        self.identity
-            .verify_matches(destination)
-            .map_err(IngressRejection::Identity)?;
+    ) -> Result<ExchangeSource, IngressRejection> {
+        if destination_kernel_key != self.fragment_instance_id {
+            return Err(IngressRejection::UnknownDestinationTask);
+        }
         let node = self.topology.inbound_node(destination_node_id).ok_or(
             IngressRejection::UnknownDestinationNode(destination_node_id),
         )?;
-        if !node.accepts_source(source) {
-            return Err(IngressRejection::SourceNotFrozen);
-        }
+        let source = node
+            .source_by_kernel_key(source_kernel_key)
+            .ok_or(IngressRejection::SourceNotFrozen)?;
         let expected = node.expected_sender_count().get();
         if sender_count != expected {
             return Err(IngressRejection::SenderCountMismatch {
@@ -535,7 +597,7 @@ impl TaskDescriptor {
                 expected,
             });
         }
-        Ok(())
+        Ok(source)
     }
 
     /// The backend process this task belongs to.
@@ -563,11 +625,10 @@ impl Eq for TaskDescriptor {}
 #[cfg(test)]
 mod tests {
     use super::{
-        DescriptorError, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeTopology,
-        IngressRejection, PhysicalFragmentPlan, TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES,
-        TaskDescriptor,
+        DescriptorError, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource,
+        ExchangeTopology, IngressRejection, PhysicalFragmentPlan,
+        TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES, TaskDescriptor,
     };
-    use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
     use crate::exec::fragment::program::{
         FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
     };
@@ -577,7 +638,7 @@ mod tests {
         CodecOwnedContent, ContentFingerprint, EdgeSendPermission, ExchangeEdgeDomain,
         ExchangeEdgeId, PlanNodeId,
     };
-    use crate::task_execution::identity::{IdentityField, IdentityMismatch, TaskIdentity};
+    use crate::task_execution::identity::TaskIdentity;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -629,6 +690,8 @@ mod tests {
         }
     }
 
+    const OWN_KEY: UniqueId = UniqueId::new(1, 2);
+
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(1).expect("nonzero"))
             .expect("nonzero query")
@@ -643,12 +706,14 @@ mod tests {
         )
     }
 
-    fn endpoint() -> RuntimeEndpoint {
-        RuntimeEndpoint::new("127.0.0.1", 9060).expect("valid endpoint")
+    /// The kernel key the frontend derives for one task. The mapping only has
+    /// to be one-to-one, which a distinct value per task id satisfies.
+    fn key(stage: u32, id: u32) -> UniqueId {
+        UniqueId::new(i64::from(stage), i64::from(id))
     }
 
-    fn schema() -> ChunkSchemaRef {
-        Arc::new(ChunkSchema::empty())
+    fn endpoint() -> RuntimeEndpoint {
+        RuntimeEndpoint::new("127.0.0.1", 9060).expect("valid endpoint")
     }
 
     fn count(value: u32) -> NonZeroU32 {
@@ -660,19 +725,24 @@ mod tests {
     }
 
     fn destination(
-        task: TaskIdentity,
+        target: TaskIdentity,
         node: i32,
         ordinal: u32,
         senders: u32,
     ) -> ExchangeDestination {
         ExchangeDestination::try_new(
-            task,
+            target,
+            key(target.stage_id().get(), target.task_id().get()),
             endpoint(),
             FragmentNodeId::new(node),
             ordinal,
             count(senders),
         )
         .expect("legal destination")
+    }
+
+    fn source(from: TaskIdentity) -> ExchangeSource {
+        ExchangeSource::new(from, key(from.stage_id().get(), from.task_id().get()))
     }
 
     fn descriptor(
@@ -683,7 +753,7 @@ mod tests {
     ) -> TaskDescriptor {
         TaskDescriptor::try_new(
             identity,
-            UniqueId::new(1, 2),
+            OWN_KEY,
             NonZeroUsize::new(4).expect("nonzero dop"),
             vec![PlanNodeId::new(3).expect("nonnegative")],
             ExchangeTopology::try_new(outbound, inbound).expect("legal topology"),
@@ -694,9 +764,11 @@ mod tests {
 
     #[test]
     fn a_destination_ordinal_must_be_below_its_sender_count() {
+        let backend = BackendProcessId::new_v7();
         assert_eq!(
             ExchangeDestination::try_new(
-                task(1, 1, BackendProcessId::new_v7()),
+                task(1, 1, backend),
+                key(1, 1),
                 endpoint(),
                 FragmentNodeId::new(10),
                 3,
@@ -707,16 +779,16 @@ mod tests {
                 count: 3
             })
         );
-        assert!(
-            ExchangeDestination::try_new(
-                task(1, 1, BackendProcessId::new_v7()),
-                endpoint(),
-                FragmentNodeId::new(10),
-                2,
-                count(3)
-            )
-            .is_ok()
-        );
+        let legal = ExchangeDestination::try_new(
+            task(1, 1, backend),
+            key(1, 1),
+            endpoint(),
+            FragmentNodeId::new(10),
+            2,
+            count(3),
+        )
+        .expect("legal");
+        assert_eq!(legal.fragment_instance_id(), key(1, 1));
     }
 
     #[test]
@@ -761,27 +833,45 @@ mod tests {
     fn an_inbound_nodes_sender_count_is_exactly_its_frozen_source_set() {
         let backend = BackendProcessId::new_v7();
         assert_eq!(
-            ExchangeInbound::try_new(FragmentNodeId::new(10), Vec::new(), schema()),
+            ExchangeInbound::try_new(FragmentNodeId::new(10), Vec::new()),
             Err(DescriptorError::InboundWithoutSources(FragmentNodeId::new(
                 10
             )))
         );
-        let repeated = task(1, 1, backend);
+        let repeated = source(task(1, 1, backend));
         assert_eq!(
-            ExchangeInbound::try_new(FragmentNodeId::new(10), vec![repeated, repeated], schema()),
+            ExchangeInbound::try_new(FragmentNodeId::new(10), vec![repeated, repeated]),
+            Err(DescriptorError::DuplicateInboundSource(
+                FragmentNodeId::new(10)
+            ))
+        );
+        // Two distinct tasks may not share one kernel key either: a frame
+        // naming that key would be ambiguous.
+        assert_eq!(
+            ExchangeInbound::try_new(
+                FragmentNodeId::new(10),
+                vec![
+                    ExchangeSource::new(task(1, 1, backend), key(9, 9)),
+                    ExchangeSource::new(task(1, 2, backend), key(9, 9)),
+                ]
+            ),
             Err(DescriptorError::DuplicateInboundSource(
                 FragmentNodeId::new(10)
             ))
         );
         let inbound = ExchangeInbound::try_new(
             FragmentNodeId::new(10),
-            vec![task(1, 1, backend), task(1, 2, backend)],
-            schema(),
+            vec![source(task(1, 1, backend)), source(task(1, 2, backend))],
         )
         .expect("legal inbound");
         assert_eq!(inbound.expected_sender_count(), count(2));
         assert!(inbound.accepts_source(task(1, 2, backend)));
         assert!(!inbound.accepts_source(task(1, 3, backend)));
+        assert_eq!(
+            inbound.source_by_kernel_key(key(1, 2)).map(|s| s.task()),
+            Some(task(1, 2, backend))
+        );
+        assert_eq!(inbound.source_by_kernel_key(key(4, 4)), None);
     }
 
     #[test]
@@ -802,7 +892,7 @@ mod tests {
         );
 
         let inbound = || {
-            ExchangeInbound::try_new(FragmentNodeId::new(20), vec![task(1, 1, backend)], schema())
+            ExchangeInbound::try_new(FragmentNodeId::new(20), vec![source(task(1, 1, backend))])
                 .expect("legal inbound")
         };
         assert_eq!(
@@ -858,7 +948,7 @@ mod tests {
         assert_eq!(
             TaskDescriptor::try_new(
                 identity,
-                UniqueId::new(1, 2),
+                OWN_KEY,
                 NonZeroUsize::new(1).expect("nonzero"),
                 vec![node, node],
                 ExchangeTopology::default(),
@@ -869,7 +959,7 @@ mod tests {
         assert_eq!(
             TaskDescriptor::try_new(
                 identity,
-                UniqueId::new(1, 2),
+                OWN_KEY,
                 NonZeroUsize::new(1).expect("nonzero"),
                 Vec::new(),
                 ExchangeTopology::default(),
@@ -918,7 +1008,7 @@ mod tests {
             ContentFingerprint::from_bytes([3; 16])
         );
         assert_eq!(descriptor.plan().encoded_len(), 1024);
-        assert_eq!(descriptor.fragment_instance_id(), UniqueId::new(1, 2));
+        assert_eq!(descriptor.fragment_instance_id(), OWN_KEY);
         assert_eq!(descriptor.pipeline_dop().get(), 4);
         assert!(descriptor.accepts_split_plan_node(PlanNodeId::new(3).expect("nonnegative")));
         assert!(!descriptor.accepts_split_plan_node(PlanNodeId::new(4).expect("nonnegative")));
@@ -930,45 +1020,37 @@ mod tests {
         let identity = task(9, 1, backend);
         let source_a = task(1, 1, backend);
         let source_b = task(1, 2, backend);
-        let inbound =
-            ExchangeInbound::try_new(FragmentNodeId::new(20), vec![source_a, source_b], schema())
-                .expect("legal inbound");
+        let inbound = ExchangeInbound::try_new(
+            FragmentNodeId::new(20),
+            vec![source(source_a), source(source_b)],
+        )
+        .expect("legal inbound");
         let descriptor = descriptor(identity, vec![inbound], Vec::new(), 1);
 
+        // A legal frame resolves to the exact frozen source, which is what
+        // gives the caller back a task identity the frame never carried.
         assert_eq!(
-            descriptor.authorize_inbound_frame(identity, FragmentNodeId::new(20), source_a, 0, 2),
-            Ok(())
+            descriptor
+                .authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 1), 0, 2)
+                .map(|resolved| resolved.task()),
+            Ok(source_a)
         );
 
-        // Wrong destination task or replaced process.
+        // A frame for another task's kernel key.
         assert_eq!(
             descriptor.authorize_inbound_frame(
-                task(9, 2, backend),
+                UniqueId::new(9, 9),
                 FragmentNodeId::new(20),
-                source_a,
+                key(1, 1),
                 0,
                 2
             ),
-            Err(IngressRejection::Identity(IdentityMismatch::new(
-                IdentityField::Task
-            )))
-        );
-        assert_eq!(
-            descriptor.authorize_inbound_frame(
-                task(9, 1, BackendProcessId::new_v7()),
-                FragmentNodeId::new(20),
-                source_a,
-                0,
-                2
-            ),
-            Err(IngressRejection::Identity(IdentityMismatch::new(
-                IdentityField::BackendProcess
-            )))
+            Err(IngressRejection::UnknownDestinationTask)
         );
 
         // Unknown node.
         assert_eq!(
-            descriptor.authorize_inbound_frame(identity, FragmentNodeId::new(21), source_a, 0, 2),
+            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(21), key(1, 1), 0, 2),
             Err(IngressRejection::UnknownDestinationNode(
                 FragmentNodeId::new(21)
             ))
@@ -976,26 +1058,20 @@ mod tests {
 
         // A sender outside the frozen source set.
         assert_eq!(
-            descriptor.authorize_inbound_frame(
-                identity,
-                FragmentNodeId::new(20),
-                task(1, 3, backend),
-                0,
-                2
-            ),
+            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 3), 0, 2),
             Err(IngressRejection::SourceNotFrozen)
         );
 
         // Sender count and ordinal must match the frozen set.
         assert_eq!(
-            descriptor.authorize_inbound_frame(identity, FragmentNodeId::new(20), source_a, 0, 3),
+            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 1), 0, 3),
             Err(IngressRejection::SenderCountMismatch {
                 expected: 2,
                 received: 3
             })
         );
         assert_eq!(
-            descriptor.authorize_inbound_frame(identity, FragmentNodeId::new(20), source_b, 2, 2),
+            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 2), 2, 2),
             Err(IngressRejection::SenderOrdinalOutOfRange {
                 ordinal: 2,
                 expected: 2
@@ -1009,13 +1085,7 @@ mod tests {
         let identity = task(1, 1, backend);
         let descriptor = descriptor(identity, Vec::new(), Vec::new(), 1);
         assert_eq!(
-            descriptor.authorize_inbound_frame(
-                identity,
-                FragmentNodeId::new(20),
-                task(2, 1, backend),
-                0,
-                1
-            ),
+            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(2, 1), 0, 1),
             Err(IngressRejection::UnknownDestinationNode(
                 FragmentNodeId::new(20)
             ))

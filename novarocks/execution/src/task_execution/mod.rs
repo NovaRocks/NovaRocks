@@ -39,8 +39,8 @@ pub mod status;
 pub mod transition;
 
 pub use descriptor::{
-    DescriptorError, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeTopology,
-    IngressRejection, PhysicalFragmentPlan, TaskDescriptor,
+    DescriptorError, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource,
+    ExchangeTopology, IngressRejection, PhysicalFragmentPlan, TaskDescriptor,
 };
 pub use domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomain, CredentialEpoch,
