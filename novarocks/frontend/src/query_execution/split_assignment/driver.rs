@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use novarocks_execution::task_execution::OperationOutcome;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
 
@@ -221,6 +222,29 @@ impl fmt::Display for SplitAssignmentDriverError {
 }
 
 impl std::error::Error for SplitAssignmentDriverError {}
+
+impl SplitAssignmentDriverError {
+    /// This delivery failure in the neutral task-protocol vocabulary.
+    ///
+    /// The task-protocol owners consume this rather than restating which
+    /// delivery failures may be replayed, so the two owners cannot drift on
+    /// the one rule that matters: only a genuinely unknown transport outcome
+    /// is retryable, and every typed rejection fails closed however transient
+    /// its wording looks.
+    pub(crate) const fn as_operation_outcome(&self) -> OperationOutcome {
+        match self {
+            // The driver already exhausted its retry budget on an unknown
+            // outcome before surfacing this, and the identical immutable
+            // request is still the only legal resend.
+            Self::Transport { .. } => OperationOutcome::RetryableTransportUnknown,
+            Self::Closed => OperationOutcome::ContextTerminalReceipt,
+            Self::Rejected { .. } | Self::Assignment(_) | Self::NoAdmittedTask { .. } => {
+                OperationOutcome::InvalidStateOrRequest
+            }
+            Self::SplitSource { .. } => OperationOutcome::ResourceExhausted,
+        }
+    }
+}
 
 impl From<SplitAssignmentError> for SplitAssignmentDriverError {
     fn from(error: SplitAssignmentError) -> Self {

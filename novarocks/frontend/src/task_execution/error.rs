@@ -1,0 +1,221 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The frontend task-protocol owners' closed failure set.
+//!
+//! Every variant is a fail-closed protocol or capacity fact. None of them is
+//! a hint to try something weaker: there is no fallback path, no guessed
+//! default, and no message-text classification anywhere in this module.
+
+use std::fmt;
+
+use novarocks_execution::task_execution::{
+    DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
+    OperationOutcome, RequestError, StatusObservation, TaskState,
+};
+use novarocks_types::identity::{BackendProcessId, TaskId};
+
+use crate::query_execution::FragmentInstancePlacement;
+
+/// Why the frontend task-protocol owners refuse to continue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskExecutionError {
+    /// The static schedule cannot be turned into a legal task graph.
+    Schedule(String),
+    /// A descriptor built from the static schedule is not a legal value.
+    Descriptor(DescriptorError),
+    /// A request built from the static schedule is not a legal value.
+    Request(RequestError),
+    /// A frozen backend process identity is missing for a scheduled backend.
+    UnknownBackend { backend_idx: usize },
+    /// Two tasks of one query execution derive the same kernel key, so a
+    /// destination address would be ambiguous.
+    KernelKeyCollision { first: TaskId, second: TaskId },
+    /// A capacity bound of the operation transport was reached.
+    Capacity(CapacityBound),
+    /// An acknowledgement named an operation this owner never sent, or named
+    /// one that is already settled.
+    UnknownOperation,
+    /// An acknowledgement carried the wrong receipt shape for its operation.
+    MissingReceipt(OperationKind),
+    /// A receipt addressed a different task, stage, query, or process.
+    Identity(IdentityMismatch),
+    /// An update would move one of a task's domains backwards.
+    DomainRegression(DomainConflict),
+    /// An edge-open decision repeats an edge this owner already opened.
+    EdgeAlreadyOpened(ExchangeEdgeId),
+    /// A published status snapshot cannot be reconciled with what this owner
+    /// already holds.
+    Observation(StatusObservation),
+    /// A task reached a state the protocol does not allow from its current
+    /// one.
+    IllegalTaskTransition { from: TaskState, to: TaskState },
+    /// A backend answered an operation with an outcome that fails the attempt.
+    OperationFailed {
+        kind: OperationKind,
+        outcome: OperationOutcome,
+    },
+}
+
+/// Which transport capacity bound was reached.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CapacityBound {
+    /// This query's queued operations for one backend.
+    QueryBackendOperations { limit: usize },
+    /// This query's queued bytes for one backend.
+    QueryBackendBytes { limit: usize },
+    /// Queued operations across every backend of this query.
+    BackendOperations { limit: usize },
+    /// Queued bytes across every backend of this query.
+    BackendBytes { limit: usize },
+    /// Tasks in one query context.
+    TasksPerContext { limit: usize },
+    /// Active tasks this query places on one backend.
+    ActiveTasksPerBackend {
+        backend: BackendProcessId,
+        limit: usize,
+    },
+    /// One descriptor's encoded plan.
+    DescriptorBytes { limit: usize, actual: usize },
+}
+
+impl CapacityBound {
+    /// Every capacity bound fails closed: there is no older or cheaper path to
+    /// degrade onto.
+    pub const fn as_operation_outcome(self) -> OperationOutcome {
+        OperationOutcome::ResourceExhausted
+    }
+}
+
+impl fmt::Display for CapacityBound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueryBackendOperations { limit } => write!(
+                formatter,
+                "queued operations for one backend of this query reached {limit}"
+            ),
+            Self::QueryBackendBytes { limit } => write!(
+                formatter,
+                "queued bytes for one backend of this query reached {limit}"
+            ),
+            Self::BackendOperations { limit } => {
+                write!(formatter, "queued operations reached {limit}")
+            }
+            Self::BackendBytes { limit } => write!(formatter, "queued bytes reached {limit}"),
+            Self::TasksPerContext { limit } => {
+                write!(formatter, "tasks in one query context reached {limit}")
+            }
+            Self::ActiveTasksPerBackend { backend, limit } => write!(
+                formatter,
+                "active tasks on backend {backend} reached {limit}"
+            ),
+            Self::DescriptorBytes { limit, actual } => write!(
+                formatter,
+                "descriptor plan is {actual} bytes, limit is {limit}"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for TaskExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Schedule(detail) => write!(
+                formatter,
+                "static schedule is not schedulable as a task graph: {detail}"
+            ),
+            Self::Descriptor(error) => {
+                write!(formatter, "task descriptor is not a legal value: {error}")
+            }
+            Self::Request(error) => write!(
+                formatter,
+                "task protocol request is not a legal value: {error}"
+            ),
+            Self::UnknownBackend { backend_idx } => write!(
+                formatter,
+                "scheduled backend {backend_idx} has no frozen backend process identity"
+            ),
+            Self::KernelKeyCollision { first, second } => write!(
+                formatter,
+                "tasks {first} and {second} derive the same fragment instance id"
+            ),
+            Self::Capacity(bound) => write!(formatter, "task protocol capacity bound: {bound}"),
+            Self::UnknownOperation => {
+                formatter.write_str("acknowledgement names an operation this owner did not send")
+            }
+            Self::MissingReceipt(kind) => {
+                write!(formatter, "{kind} was accepted without its receipt")
+            }
+            Self::Identity(mismatch) => write!(formatter, "task protocol receipt {mismatch}"),
+            Self::DomainRegression(conflict) => {
+                write!(
+                    formatter,
+                    "task domain update is not a progression: {conflict}"
+                )
+            }
+            Self::EdgeAlreadyOpened(edge) => {
+                write!(formatter, "exchange edge {edge} was already opened")
+            }
+            Self::Observation(observation) => {
+                write!(formatter, "published status is not usable: {observation:?}")
+            }
+            Self::IllegalTaskTransition { from, to } => {
+                write!(formatter, "task state {from} may not become {to}")
+            }
+            Self::OperationFailed { kind, outcome } => {
+                write!(formatter, "{kind} failed closed with {outcome:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaskExecutionError {}
+
+impl From<DescriptorError> for TaskExecutionError {
+    fn from(error: DescriptorError) -> Self {
+        Self::Descriptor(error)
+    }
+}
+
+impl From<RequestError> for TaskExecutionError {
+    fn from(error: RequestError) -> Self {
+        Self::Request(error)
+    }
+}
+
+impl From<IdentityMismatch> for TaskExecutionError {
+    fn from(error: IdentityMismatch) -> Self {
+        Self::Identity(error)
+    }
+}
+
+impl From<CapacityBound> for TaskExecutionError {
+    fn from(bound: CapacityBound) -> Self {
+        Self::Capacity(bound)
+    }
+}
+
+/// A schedule fact that names the placement it came from.
+pub(crate) fn schedule_error(
+    placement: &FragmentInstancePlacement,
+    detail: impl fmt::Display,
+) -> TaskExecutionError {
+    TaskExecutionError::Schedule(format!(
+        "fragment {} instance {}: {detail}",
+        placement.fragment_id, placement.instance_index
+    ))
+}
