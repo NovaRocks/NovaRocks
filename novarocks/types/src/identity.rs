@@ -88,6 +88,77 @@ impl std::str::FromStr for BackendProcessId {
     }
 }
 
+/// Process-lifetime identity for one frontend process.
+///
+/// A frontend mints this identifier once per process start. It fences query
+/// context ownership across frontend restarts so that a request from a dead
+/// frontend incarnation can never be applied under a live owner. It is not a
+/// health proof: application liveness is carried by the query execution lease.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct FrontendProcessId(Uuid);
+
+/// Transport-neutral validation failure for a frontend process identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrontendProcessIdentityError {
+    Nil,
+    NotUuidV7,
+}
+
+impl fmt::Display for FrontendProcessIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Nil => "frontend process id must not be nil",
+            Self::NotUuidV7 => "frontend process id must be UUIDv7",
+        })
+    }
+}
+
+impl std::error::Error for FrontendProcessIdentityError {}
+
+impl FrontendProcessId {
+    /// Allocates a fresh process-lifetime UUIDv7 identity.
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub fn try_from_uuid(value: Uuid) -> Result<Self, FrontendProcessIdentityError> {
+        if value.is_nil() {
+            return Err(FrontendProcessIdentityError::Nil);
+        }
+        if value.get_version_num() != 7 {
+            return Err(FrontendProcessIdentityError::NotUuidV7);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn try_from_bytes(value: [u8; 16]) -> Result<Self, FrontendProcessIdentityError> {
+        Self::try_from_uuid(Uuid::from_bytes(value))
+    }
+
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0.into_bytes()
+    }
+
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for FrontendProcessId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for FrontendProcessId {
+    type Err = FrontendProcessIdentityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = Uuid::parse_str(value).map_err(|_| FrontendProcessIdentityError::NotUuidV7)?;
+        Self::try_from_uuid(value)
+    }
+}
+
 /// Bit-exact identifier used for protocol, fragment, and execution identities.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct UniqueId {
@@ -159,6 +230,8 @@ impl fmt::Display for QueryId {
 pub enum ExecutionIdentityError {
     ZeroAttemptId,
     ZeroQueryId,
+    ZeroStageId,
+    ZeroTaskId,
 }
 
 impl fmt::Display for ExecutionIdentityError {
@@ -166,6 +239,8 @@ impl fmt::Display for ExecutionIdentityError {
         formatter.write_str(match self {
             Self::ZeroAttemptId => "attempt id must be nonzero",
             Self::ZeroQueryId => "query id must be nonzero",
+            Self::ZeroStageId => "stage id must be nonzero",
+            Self::ZeroTaskId => "task id must be nonzero",
         })
     }
 }
@@ -232,6 +307,58 @@ impl Ord for QueryExecutionId {
 impl PartialOrd for QueryExecutionId {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// Nonzero, never-reused logical stage identity inside one query execution.
+///
+/// The frontend planner and coordinator freeze stage ids; a transport retry
+/// never re-mints one, and an id is never reused inside the same
+/// [`QueryExecutionId`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct StageId(std::num::NonZeroU32);
+
+impl StageId {
+    pub fn new(value: u32) -> Result<Self, ExecutionIdentityError> {
+        std::num::NonZeroU32::new(value)
+            .map(Self)
+            .ok_or(ExecutionIdentityError::ZeroStageId)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for StageId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.get().fmt(formatter)
+    }
+}
+
+/// Nonzero, never-reused task identity inside one stage.
+///
+/// The owning `StageExecution` allocates task ids. They are stable for the
+/// lifetime of the query execution and are never reused, so a late request can
+/// always be matched against exactly one task.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TaskId(std::num::NonZeroU32);
+
+impl TaskId {
+    pub fn new(value: u32) -> Result<Self, ExecutionIdentityError> {
+        std::num::NonZeroU32::new(value)
+            .map(Self)
+            .ok_or(ExecutionIdentityError::ZeroTaskId)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.get().fmt(formatter)
     }
 }
 
@@ -364,8 +491,8 @@ mod tests {
 
     use super::{
         AttemptId, BackendProcessId, BackendProcessIdentityError, ExecutionIdentityError,
-        LocalQuerySequence, QueryExecutionId, QueryId, QueryIdAttribution, QueryProcessNamespace,
-        UniqueId, format_uuid,
+        FrontendProcessId, FrontendProcessIdentityError, LocalQuerySequence, QueryExecutionId,
+        QueryId, QueryIdAttribution, QueryProcessNamespace, StageId, TaskId, UniqueId, format_uuid,
     };
     use uuid::Uuid;
 
@@ -464,5 +591,41 @@ mod tests {
         let mut values = HashSet::new();
         values.insert(first);
         assert!(values.contains(&first));
+    }
+
+    #[test]
+    fn frontend_process_id_is_exact_uuid_v7_and_non_nil() {
+        let id = FrontendProcessId::new_v7();
+        assert_eq!(FrontendProcessId::try_from_bytes(id.to_bytes()), Ok(id));
+        assert_eq!(id.as_uuid().get_version_num(), 7);
+        assert_eq!(
+            FrontendProcessId::try_from_uuid(Uuid::nil()),
+            Err(FrontendProcessIdentityError::Nil)
+        );
+        assert_eq!(
+            FrontendProcessId::try_from_uuid(Uuid::new_v4()),
+            Err(FrontendProcessIdentityError::NotUuidV7)
+        );
+        assert_ne!(FrontendProcessId::new_v7(), id);
+    }
+
+    #[test]
+    fn stage_and_task_ids_reject_zero_and_stay_ordered() {
+        assert_eq!(StageId::new(0), Err(ExecutionIdentityError::ZeroStageId));
+        assert_eq!(TaskId::new(0), Err(ExecutionIdentityError::ZeroTaskId));
+
+        let first = StageId::new(1).expect("nonzero stage");
+        let second = StageId::new(2).expect("nonzero stage");
+        assert!(first < second);
+        assert_eq!(first.get(), 1);
+        assert_eq!(first.to_string(), "1");
+
+        let task = TaskId::new(7).expect("nonzero task");
+        assert_eq!(task.get(), 7);
+        assert_eq!(task.to_string(), "7");
+
+        let mut values = HashSet::new();
+        values.insert(task);
+        assert!(values.contains(&TaskId::new(7).expect("nonzero task")));
     }
 }

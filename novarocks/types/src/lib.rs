@@ -52,8 +52,8 @@ pub use field_render::{
 pub use field_render_schema::FieldRenderSchema;
 pub use identity::{
     AttemptId, BackendProcessId, BackendProcessIdentityError, ExecutionIdentityError,
-    LocalQuerySequence, QueryExecutionId, QueryId, QueryIdAttribution, QueryProcessNamespace,
-    UniqueId, format_uuid,
+    FrontendProcessId, FrontendProcessIdentityError, LocalQuerySequence, QueryExecutionId, QueryId,
+    QueryIdAttribution, QueryProcessNamespace, StageId, TaskId, UniqueId, format_uuid,
 };
 pub use native_compatibility::{NativeCompatibilityId, NativeCompatibilityIdError};
 pub use network::{
