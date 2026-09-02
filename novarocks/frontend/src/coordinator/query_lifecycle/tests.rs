@@ -3667,6 +3667,8 @@ struct FrontendLifecycleWireService {
 type EmptyExchangeStream =
     Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::ExchangeResponse, Status>> + Send>>;
 type LifecycleResponseStream = ReceiverStream<Result<proto::QueryControlResponse, Status>>;
+type EmptyTaskStatusStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::TaskStatusStreamEvent, Status>> + Send>>;
 
 impl FrontendLifecycleWireService {
     fn rejected(rpc: &str) -> Status {
@@ -3693,12 +3695,48 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
 {
     type ExchangeStream = EmptyExchangeStream;
     type QueryControlStreamStream = LifecycleResponseStream;
+    type SubscribeTaskStatusStream = EmptyTaskStatusStream;
 
     async fn announce_backend(
         &self,
         _request: Request<proto::AnnounceBackendRequest>,
     ) -> Result<Response<proto::AnnounceBackendResponse>, Status> {
         Err(Self::rejected("AnnounceBackend"))
+    }
+
+    async fn apply_task_operations(
+        &self,
+        _request: Request<proto::ApplyTaskOperationsRequest>,
+    ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
+        Err(Self::rejected("ApplyTaskOperations"))
+    }
+
+    async fn subscribe_task_status(
+        &self,
+        _request: Request<proto::SubscribeTaskStatusRequest>,
+    ) -> Result<Response<Self::SubscribeTaskStatusStream>, Status> {
+        Err(Self::rejected("SubscribeTaskStatus"))
+    }
+
+    async fn fetch_task_dynamic_filters(
+        &self,
+        _request: Request<proto::FetchTaskDynamicFiltersRequest>,
+    ) -> Result<Response<proto::FetchTaskDynamicFiltersResponse>, Status> {
+        Err(Self::rejected("FetchTaskDynamicFilters"))
+    }
+
+    async fn get_final_task_info(
+        &self,
+        _request: Request<proto::GetFinalTaskInfoRequest>,
+    ) -> Result<Response<proto::GetFinalTaskInfoResponse>, Status> {
+        Err(Self::rejected("GetFinalTaskInfo"))
+    }
+
+    async fn fetch_task_result(
+        &self,
+        _request: Request<proto::FetchTaskResultRequest>,
+    ) -> Result<Response<proto::FetchResultResponse>, Status> {
+        Err(Self::rejected("FetchTaskResult"))
     }
 
     async fn exchange(

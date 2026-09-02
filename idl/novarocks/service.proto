@@ -81,6 +81,28 @@ service NovaRocksGrpc {
   // FE-pull cluster heartbeat (unary). Consumer: src/runtime/heartbeat_mgr.rs.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
+  // Native task protocol. One batched mutation entry, two typed observation
+  // reads, one status subscription, and the root result data plane.
+  //
+  // The batch is a transport convenience only: each item carries its own
+  // identity and deadline and gets its own receipt, and a partial failure
+  // leaves every other item exactly as its own receipt reports.
+  rpc ApplyTaskOperations(ApplyTaskOperationsRequest)
+      returns (ApplyTaskOperationsResponse);
+  // One logical query-by-backend subscription. Observation only: it creates
+  // nothing, freezes no task set, and owns no admission or cancel authority.
+  // A dropped stream is resubscribed by cursor and never abandons a task.
+  rpc SubscribeTaskStatus(SubscribeTaskStatusRequest)
+      returns (stream TaskStatusStreamEvent);
+  // Dynamic filter payloads travel here rather than in a status, so a large
+  // filter cannot inflate the lifecycle channel.
+  rpc FetchTaskDynamicFilters(FetchTaskDynamicFiltersRequest)
+      returns (FetchTaskDynamicFiltersResponse);
+  rpc GetFinalTaskInfo(GetFinalTaskInfoRequest)
+      returns (GetFinalTaskInfoResponse);
+  // Root result poll, fenced against an exact task and backend process.
+  rpc FetchTaskResult(FetchTaskResultRequest) returns (FetchResultResponse);
+
 }
 
 // Immutable identity for one physical execution attempt of a logical query.
@@ -1441,6 +1463,21 @@ message OpenExchangeEdgesReceipt {
   repeated uint32 opened_edge_ids = 1;  // <= 256
 }
 
+// How one accepted domain progressed.
+//
+// A receipt only ever describes an applied operation, and a conflicting domain
+// refuses its whole operation with TASK_OPERATION_OUTCOME_DOMAIN_CONFLICT and
+// carries no acknowledgement body at all. So a conflict has no value here by
+// construction, and an encoder that holds one must refuse rather than pick the
+// nearest representable neighbour. APPLY and IDEMPOTENT report the requested
+// token; OLDER reports the retained one, because a domain never rolls back.
+enum AcceptedDomainProgression {
+  ACCEPTED_DOMAIN_PROGRESSION_UNSPECIFIED = 0;
+  ACCEPTED_DOMAIN_PROGRESSION_APPLY = 1;
+  ACCEPTED_DOMAIN_PROGRESSION_IDEMPOTENT = 2;
+  ACCEPTED_DOMAIN_PROGRESSION_OLDER = 3;
+}
+
 // The receipt of one task-scoped domain.
 message TaskDomainReceipt {
   oneof receipt {
@@ -1448,6 +1485,7 @@ message TaskDomainReceipt {
     ScalarDomainReceipt dynamic_filter = 2;
     OpenExchangeEdgesReceipt open_exchange_edges = 3;
   }
+  AcceptedDomainProgression progression = 4;
 }
 
 // The receipt of one query-context domain. Only the accepted credential epoch
@@ -1459,6 +1497,7 @@ message QueryContextDomainReceipt {
     ScalarDomainReceipt shared_dynamic_filter = 2;
     QueryContextCredentialReceipt credential = 3;
   }
+  AcceptedDomainProgression progression = 4;
 }
 
 message QueryContextCredentialReceipt {
@@ -1681,6 +1720,16 @@ message FinalTaskInfo {
   // Reported explicitly rather than silently, so a missing operator is never
   // mistaken for an operator that did no work.
   bool operator_statistics_truncated = 3;
+}
+
+message GetFinalTaskInfoResponse {
+  oneof result {
+    FinalTaskInfo info = 1;
+    // Why the info is not available: the task is not terminal yet, its
+    // retention ended, or the identity does not address a task here. It is
+    // never an error, because losing final info costs diagnostics only.
+    TaskOperationOutcome unavailable = 2;
+  }
 }
 
 // Coordinator long-poll request for the root task's result stream. Unlike the

@@ -34,14 +34,17 @@
 //!        `-- TaskStatusSource (one per context: the observation channel)
 //! ```
 //!
-//! Nothing here is wired into a running backend yet. The composition that
-//! routes real traffic through it, and the retirement of the fragment-based
-//! lifecycle stack it replaces, are separate steps.
+//! [`ingress`] puts this owner behind the backend's RPC boundary, which makes
+//! the protocol reachable over the wire. It routes no traffic: the
+//! fragment-based lifecycle stack still owns every query, and binding this
+//! owner to execution, then retiring the stack it replaces, are separate
+//! steps.
 
 mod clock;
 mod domains;
 mod entry;
 mod host;
+pub(crate) mod ingress;
 mod observation;
 mod receipt;
 mod registry;
@@ -55,6 +58,7 @@ pub use host::{
     HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskDynamicFilterRead,
     TaskExecutionHost,
 };
+pub(crate) use ingress::RegistryTaskExecutionIngress;
 pub use observation::{
     CursorObservation, TaskStatusEvent, TaskStatusSource, TaskStatusSourceStats,
 };

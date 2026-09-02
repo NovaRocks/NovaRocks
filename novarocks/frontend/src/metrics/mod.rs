@@ -421,6 +421,7 @@ impl FrontendMetricsRegistry {
         }
         crate::catalog_projection_metrics::register_collectors(&registry)?;
         dml_publication::register_collectors(&registry)?;
+        crate::native::task_transport::register_metric_collectors(&registry)?;
         Ok(Arc::new(Self { registry }))
     }
 

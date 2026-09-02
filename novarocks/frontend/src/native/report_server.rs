@@ -742,6 +742,13 @@ impl NovaRocksGrpc for FrontendReportService {
                 + 'static,
         >,
     >;
+    type SubscribeTaskStatusStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<proto::TaskStatusStreamEvent, tonic::Status>>
+                + Send
+                + 'static,
+        >,
+    >;
 
     async fn announce_backend(
         &self,
@@ -843,6 +850,41 @@ impl NovaRocksGrpc for FrontendReportService {
         _request: tonic::Request<proto::TaskUpdateRequest>,
     ) -> Result<tonic::Response<proto::TaskUpdateResponse>, tonic::Status> {
         Err(Self::rejected("TaskUpdate"))
+    }
+
+    async fn apply_task_operations(
+        &self,
+        _request: tonic::Request<proto::ApplyTaskOperationsRequest>,
+    ) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
+        Err(Self::rejected("ApplyTaskOperations"))
+    }
+
+    async fn subscribe_task_status(
+        &self,
+        _request: tonic::Request<proto::SubscribeTaskStatusRequest>,
+    ) -> Result<tonic::Response<Self::SubscribeTaskStatusStream>, tonic::Status> {
+        Err(Self::rejected("SubscribeTaskStatus"))
+    }
+
+    async fn fetch_task_dynamic_filters(
+        &self,
+        _request: tonic::Request<proto::FetchTaskDynamicFiltersRequest>,
+    ) -> Result<tonic::Response<proto::FetchTaskDynamicFiltersResponse>, tonic::Status> {
+        Err(Self::rejected("FetchTaskDynamicFilters"))
+    }
+
+    async fn get_final_task_info(
+        &self,
+        _request: tonic::Request<proto::GetFinalTaskInfoRequest>,
+    ) -> Result<tonic::Response<proto::GetFinalTaskInfoResponse>, tonic::Status> {
+        Err(Self::rejected("GetFinalTaskInfo"))
+    }
+
+    async fn fetch_task_result(
+        &self,
+        _request: tonic::Request<proto::FetchTaskResultRequest>,
+    ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
+        Err(Self::rejected("FetchTaskResult"))
     }
 
     async fn start_prepared_query(

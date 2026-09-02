@@ -27,16 +27,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution::task_execution::domain::{CredentialEpoch, DomainVersion};
+use novarocks_execution::task_execution::domain::{
+    CodecOwnedContent, CredentialEpoch, CredentialLeaseId, DomainProgression, DomainVersion,
+    ExchangeEdgeId,
+};
 use novarocks_execution::task_execution::identity::{
     QueryContextRef, TaskIdentity, TaskOperationId,
 };
 use novarocks_execution::task_execution::lease::LeaseValidFor;
 use novarocks_execution::task_execution::operation::{
-    AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, EstablishQueryContext,
-    FetchTaskDynamicFilters, GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind,
-    OperationOutcome, ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease,
-    TransportBudget, UpdateTask,
+    AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, CreateTaskReceipt,
+    EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo, MaxWait, OperationEnvelope,
+    OperationKind, OperationOutcome, QueryContextDomainReceipt, QueryContextReceipt,
+    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, TaskDomainReceipt,
+    TransportBudget, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
 use novarocks_execution::task_execution::transition::QueryContextState;
 use novarocks_proto_models::novarocks;
@@ -44,9 +48,18 @@ use prost::Message;
 
 use crate::task_execution::descriptor::{WireFragmentPlan, decode_task_descriptor};
 use crate::task_execution::domain::{
-    DecodedQueryContextDomain, DecodedTaskDomain, MAX_DOMAIN_UPDATES, decode_credential_domain,
-    decode_query_context_domain, decode_task_domain,
+    DecodedQueryContextDomain, DecodedTaskDomain, MAX_DOMAIN_UPDATES, WireContent,
+    decode_credential_domain, decode_plan_node_split_receipt, decode_query_context_domain,
+    decode_task_domain,
 };
+
+/// Domain separation tags for the two shared facts an establish installs.
+/// They are distinct from the tags an advance uses, because the same content
+/// arriving as an install and as a rotation is not the same operation.
+const ESTABLISH_CATALOG_DOMAIN_TAG: &[u8] =
+    b"novarocks.task_execution.establish.catalog_binding.v1";
+const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
+    b"novarocks.task_execution.establish.initial_runtime_filter.v1";
 use crate::task_execution::identity::{
     decode_query_context_ref, decode_task_operation_id, encode_query_context_ref,
     encode_task_operation_id,
@@ -134,8 +147,8 @@ impl DecodedUpdateTask {
 pub struct DecodedEstablishQueryContext {
     context: QueryContextRef,
     envelope: OperationEnvelope,
-    catalog_set: novarocks_proto_models::catalog::CatalogSet,
-    initial_runtime_filter: novarocks::RuntimeFilterContribution,
+    catalog_set: Arc<WireContent<novarocks_proto_models::catalog::CatalogSet>>,
+    initial_runtime_filter: Arc<WireContent<novarocks::RuntimeFilterContribution>>,
     initial_credential: DecodedQueryContextDomain,
     initial_lease_valid_for: LeaseValidFor,
 }
@@ -149,12 +162,20 @@ impl DecodedEstablishQueryContext {
         self.envelope
     }
 
-    pub const fn catalog_set(&self) -> &novarocks_proto_models::catalog::CatalogSet {
-        &self.catalog_set
+    /// The catalog binding, for the backend's shared-fact owner.
+    pub fn catalog_set(&self) -> &novarocks_proto_models::catalog::CatalogSet {
+        self.catalog_set.wire()
     }
 
-    pub const fn initial_runtime_filter(&self) -> &novarocks::RuntimeFilterContribution {
-        &self.initial_runtime_filter
+    /// The initial runtime filter, for the backend's shared-fact owner.
+    pub fn initial_runtime_filter(&self) -> &novarocks::RuntimeFilterContribution {
+        self.initial_runtime_filter.wire()
+    }
+
+    /// The credential rotation, whose material stays behind its confidential
+    /// handle.
+    pub const fn credential(&self) -> &DecodedQueryContextDomain {
+        &self.initial_credential
     }
 
     pub const fn initial_credential(&self) -> &DecodedQueryContextDomain {
@@ -183,6 +204,58 @@ pub enum DecodedUpdateQueryContext {
 }
 
 impl DecodedUpdateQueryContext {
+    /// The neutral command the backend's own owner consumes.
+    ///
+    /// The typed content stays reachable through the decoded form; this is the
+    /// projection that carries only what the neutral contract defines, which
+    /// is what keeps the owner from ever naming a wire type.
+    pub fn as_neutral(&self) -> Option<UpdateQueryContext> {
+        match self {
+            Self::Establish(request) => {
+                let DecodedQueryContextDomain::Credential { update, .. } =
+                    &request.initial_credential
+                else {
+                    // The decoder only ever builds this variant from a
+                    // credential domain, so anything else is a codec bug
+                    // rather than a wire condition.
+                    return None;
+                };
+                Some(UpdateQueryContext::Establish(EstablishQueryContext::new(
+                    request.envelope().operation_id(),
+                    request.context(),
+                    Arc::clone(&request.catalog_set) as Arc<dyn CodecOwnedContent>,
+                    Arc::clone(&request.initial_runtime_filter) as Arc<dyn CodecOwnedContent>,
+                    update.clone(),
+                    request.initial_lease_valid_for(),
+                )))
+            }
+            Self::AdvanceDomain {
+                context,
+                envelope,
+                domain,
+            } => Some(UpdateQueryContext::AdvanceDomain(
+                AdvanceQueryContextDomain::new(
+                    envelope.operation_id(),
+                    *context,
+                    domain.as_neutral(),
+                ),
+            )),
+            Self::RenewLease {
+                context,
+                envelope,
+                sequence,
+                valid_for,
+            } => Some(UpdateQueryContext::RenewLease(
+                RenewQueryExecutionLease::new(
+                    envelope.operation_id(),
+                    *context,
+                    *sequence,
+                    *valid_for,
+                ),
+            )),
+        }
+    }
+
     pub const fn context(&self) -> QueryContextRef {
         match self {
             Self::Establish(request) => request.context(),
@@ -455,6 +528,7 @@ fn decode_update_query_context(
                     "establish requires a catalog set",
                 )
             })?;
+            let catalog_set = Arc::new(WireContent::new(ESTABLISH_CATALOG_DOMAIN_TAG, catalog_set));
             let initial_runtime_filter =
                 establish.initial_runtime_filter.clone().ok_or_else(|| {
                     missing(
@@ -462,6 +536,10 @@ fn decode_update_query_context(
                         "establish requires an initial runtime filter",
                     )
                 })?;
+            let initial_runtime_filter = Arc::new(WireContent::new(
+                ESTABLISH_FILTER_DOMAIN_TAG,
+                initial_runtime_filter,
+            ));
             let credential = establish.initial_credential.as_ref().ok_or_else(|| {
                 missing(
                     establish_path.clone().field("initial_credential"),
@@ -1127,10 +1205,155 @@ pub fn encode_operation_batch(
 }
 
 /// Encodes one task-domain receipt.
+
+/// Encodes the progression of one *accepted* domain.
+///
+/// Returns `None` for a conflict, which has no value on the wire because a
+/// conflicting domain refuses its whole operation and carries no
+/// acknowledgement body at all. Folding it into `APPLY` would report a refusal
+/// as an application, so this refuses instead.
+fn encode_accepted_progression(value: DomainProgression) -> Option<i32> {
+    let encoded = match value {
+        DomainProgression::Apply => novarocks::AcceptedDomainProgression::Apply,
+        DomainProgression::Idempotent => novarocks::AcceptedDomainProgression::Idempotent,
+        DomainProgression::Older => novarocks::AcceptedDomainProgression::Older,
+        DomainProgression::Conflict(_) => return None,
+    };
+    Some(encoded as i32)
+}
+
+/// Decodes the progression of one accepted domain.
+fn decode_accepted_progression(
+    value: i32,
+    path: FieldPath,
+) -> Result<DomainProgression, ProtocolError> {
+    match novarocks::AcceptedDomainProgression::try_from(value) {
+        Ok(novarocks::AcceptedDomainProgression::Apply) => Ok(DomainProgression::Apply),
+        Ok(novarocks::AcceptedDomainProgression::Idempotent) => Ok(DomainProgression::Idempotent),
+        Ok(novarocks::AcceptedDomainProgression::Older) => Ok(DomainProgression::Older),
+        Ok(novarocks::AcceptedDomainProgression::Unspecified) => Err(invalid_enum(
+            path,
+            "an accepted domain receipt requires a progression",
+        )),
+        Err(_) => Err(invalid_enum(
+            path,
+            "unknown accepted domain progression value",
+        )),
+    }
+}
+
+/// Reads the accepted version of one scalar-versioned domain receipt.
+///
+/// Version zero means nothing has been accepted yet, which is a legal state
+/// rather than a malformed receipt.
+fn decode_scalar_receipt(src: &novarocks::ScalarDomainReceipt) -> Option<DomainVersion> {
+    DomainVersion::new(src.accepted_version).ok()
+}
+
+/// Decodes one task-scoped domain receipt.
+pub fn decode_task_domain_receipt(
+    src: &novarocks::TaskDomainReceipt,
+    path: FieldPath,
+) -> Result<TaskDomainReceipt, ProtocolError> {
+    let progression =
+        decode_accepted_progression(src.progression, path.clone().field("progression"))?;
+    let receipt = src.receipt.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("receipt"),
+            "a task domain receipt requires a typed body",
+        )
+    })?;
+    match receipt {
+        novarocks::task_domain_receipt::Receipt::SplitAssignment(split) => {
+            let node_path = path.field("split_assignment").field("nodes");
+            let mut nodes = Vec::with_capacity(split.nodes.len());
+            for (index, node) in split.nodes.iter().enumerate() {
+                nodes.push(decode_plan_node_split_receipt(
+                    node,
+                    node_path.clone().index(index),
+                )?);
+            }
+            Ok(TaskDomainReceipt::SplitAssignment { nodes, progression })
+        }
+        novarocks::task_domain_receipt::Receipt::DynamicFilter(scalar) => {
+            Ok(TaskDomainReceipt::TaskDynamicFilter {
+                accepted_version: decode_scalar_receipt(scalar),
+                progression,
+            })
+        }
+        novarocks::task_domain_receipt::Receipt::OpenExchangeEdges(edges) => {
+            let edge_path = path.field("open_exchange_edges").field("opened_edge_ids");
+            let mut opened = Vec::with_capacity(edges.opened_edge_ids.len());
+            for (index, edge) in edges.opened_edge_ids.iter().enumerate() {
+                opened.push(
+                    ExchangeEdgeId::new(*edge).map_err(|error| {
+                        invalid(edge_path.clone().index(index), error.to_string())
+                    })?,
+                );
+            }
+            Ok(TaskDomainReceipt::OpenExchangeEdges {
+                opened,
+                progression,
+            })
+        }
+    }
+}
+
+/// Decodes one query-context domain receipt.
+pub fn decode_query_context_domain_receipt(
+    src: &novarocks::QueryContextDomainReceipt,
+    path: FieldPath,
+) -> Result<QueryContextDomainReceipt, ProtocolError> {
+    let progression =
+        decode_accepted_progression(src.progression, path.clone().field("progression"))?;
+    let receipt = src.receipt.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("receipt"),
+            "a query context domain receipt requires a typed body",
+        )
+    })?;
+    match receipt {
+        novarocks::query_context_domain_receipt::Receipt::CatalogBinding(scalar) => {
+            Ok(QueryContextDomainReceipt::CatalogBinding {
+                accepted_version: decode_scalar_receipt(scalar),
+                progression,
+            })
+        }
+        novarocks::query_context_domain_receipt::Receipt::SharedDynamicFilter(scalar) => {
+            Ok(QueryContextDomainReceipt::SharedDynamicFilter {
+                accepted_version: decode_scalar_receipt(scalar),
+                progression,
+            })
+        }
+        novarocks::query_context_domain_receipt::Receipt::Credential(credential) => {
+            let credential_path = path.field("credential");
+            let accepted_epoch =
+                CredentialEpoch::new(credential.accepted_epoch).map_err(|error| {
+                    invalid(
+                        credential_path.clone().field("accepted_epoch"),
+                        error.to_string(),
+                    )
+                })?;
+            Ok(QueryContextDomainReceipt::Credential {
+                lease_id: CredentialLeaseId::new(credential.lease_id),
+                accepted_epoch,
+                progression,
+            })
+        }
+    }
+}
+
+/// Returns `None` when the receipt holds a conflict, which no acknowledgement
+/// body can carry: a conflicting domain refuses its whole operation instead.
 pub fn encode_task_domain_receipt(
-    value: &novarocks_execution::task_execution::operation::TaskDomainReceipt,
-) -> novarocks::TaskDomainReceipt {
+    value: &TaskDomainReceipt,
+) -> Option<novarocks::TaskDomainReceipt> {
     use novarocks_execution::task_execution::operation::TaskDomainReceipt as Receipt;
+    let progression = encode_accepted_progression(match value {
+        Receipt::SplitAssignment { progression, .. }
+        | Receipt::TaskDynamicFilter { progression, .. }
+        | Receipt::OpenExchangeEdges { progression, .. } => *progression,
+    })?;
     let receipt = match value {
         Receipt::SplitAssignment { nodes, .. } => {
             novarocks::task_domain_receipt::Receipt::SplitAssignment(
@@ -1158,16 +1381,24 @@ pub fn encode_task_domain_receipt(
             )
         }
     };
-    novarocks::TaskDomainReceipt {
+    Some(novarocks::TaskDomainReceipt {
         receipt: Some(receipt),
-    }
+        progression,
+    })
 }
 
 /// Encodes one query-context domain receipt.
+/// Returns `None` when the receipt holds a conflict, for the same reason its
+/// task-scoped sibling does.
 pub fn encode_query_context_domain_receipt(
-    value: &novarocks_execution::task_execution::operation::QueryContextDomainReceipt,
-) -> novarocks::QueryContextDomainReceipt {
+    value: &QueryContextDomainReceipt,
+) -> Option<novarocks::QueryContextDomainReceipt> {
     use novarocks_execution::task_execution::operation::QueryContextDomainReceipt as Receipt;
+    let progression = encode_accepted_progression(match value {
+        Receipt::CatalogBinding { progression, .. }
+        | Receipt::SharedDynamicFilter { progression, .. }
+        | Receipt::Credential { progression, .. } => *progression,
+    })?;
     let receipt = match value {
         Receipt::CatalogBinding {
             accepted_version, ..
@@ -1194,44 +1425,187 @@ pub fn encode_query_context_domain_receipt(
             },
         ),
     };
-    novarocks::QueryContextDomainReceipt {
+    Some(novarocks::QueryContextDomainReceipt {
         receipt: Some(receipt),
-    }
+        progression,
+    })
 }
 
 /// Encodes a create acknowledgement.
-pub fn encode_create_task_ack(
-    value: &novarocks_execution::task_execution::operation::CreateTaskReceipt,
-) -> novarocks::CreateTaskAck {
-    novarocks::CreateTaskAck {
+///
+/// Returns `None` when any accepted domain holds a progression the wire cannot
+/// carry, so a conflict can never be shipped as part of an applied create.
+pub fn encode_create_task_ack(value: &CreateTaskReceipt) -> Option<novarocks::CreateTaskAck> {
+    Some(novarocks::CreateTaskAck {
         identity: Some(crate::task_execution::identity::encode_task_identity(
             value.identity(),
         )),
-        accepted_domains: value
-            .domains()
-            .iter()
-            .map(encode_task_domain_receipt)
-            .collect(),
+        accepted_domains: encode_task_domain_receipts(value.domains())?,
         current_status: Some(crate::task_execution::status::encode_task_status(
             value.current_status(),
         )),
-    }
+    })
 }
 
 /// Encodes an update acknowledgement.
-pub fn encode_update_task_ack(
-    value: &novarocks_execution::task_execution::operation::UpdateTaskReceipt,
-) -> novarocks::UpdateTaskAck {
-    novarocks::UpdateTaskAck {
+///
+/// Returns `None` for the same reason a create acknowledgement does.
+pub fn encode_update_task_ack(value: &UpdateTaskReceipt) -> Option<novarocks::UpdateTaskAck> {
+    Some(novarocks::UpdateTaskAck {
         identity: Some(crate::task_execution::identity::encode_task_identity(
             value.identity(),
         )),
-        accepted_domains: value
-            .domains()
-            .iter()
-            .map(encode_task_domain_receipt)
-            .collect(),
+        accepted_domains: encode_task_domain_receipts(value.domains())?,
+    })
+}
+
+/// Encodes every task domain receipt, or nothing if one of them cannot be
+/// represented. A partially encoded list would silently shorten an
+/// acknowledgement, which reads as "that domain was never in the request".
+fn encode_task_domain_receipts(
+    values: &[TaskDomainReceipt],
+) -> Option<Vec<novarocks::TaskDomainReceipt>> {
+    values.iter().map(encode_task_domain_receipt).collect()
+}
+
+/// Decodes a create acknowledgement against the identity the caller sent.
+///
+/// The expected identity is the caller's, not the message's: a receipt that
+/// agrees with itself proves nothing, and a create acknowledgement addressed
+/// to a different task must not be read as this task's proof of installation.
+pub fn decode_create_task_ack(
+    src: &novarocks::CreateTaskAck,
+    expected: TaskIdentity,
+    path: FieldPath,
+) -> Result<CreateTaskReceipt, ProtocolError> {
+    let identity = decode_identity_field(
+        src.identity.as_ref(),
+        path.clone(),
+        "a create acknowledgement requires a task identity",
+    )?;
+    if identity != expected {
+        return Err(invalid(
+            path.clone().field("identity"),
+            "a create acknowledgement names a different task than the request",
+        ));
     }
+    let domains = decode_task_domain_receipts(&src.accepted_domains, path.clone())?;
+    let status = src.current_status.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("current_status"),
+            "a create acknowledgement requires the task's current status",
+        )
+    })?;
+    let status_path = path.field("current_status");
+    let status = crate::task_execution::status::decode_task_status(status, status_path.clone())?;
+    if status.identity() != expected {
+        return Err(invalid(
+            status_path.field("identity"),
+            "a create acknowledgement carries the status of a different task",
+        ));
+    }
+    Ok(CreateTaskReceipt::new(identity, domains, status))
+}
+
+/// Decodes an update acknowledgement against the identity the caller sent.
+pub fn decode_update_task_ack(
+    src: &novarocks::UpdateTaskAck,
+    expected: TaskIdentity,
+    path: FieldPath,
+) -> Result<UpdateTaskReceipt, ProtocolError> {
+    let identity = decode_identity_field(
+        src.identity.as_ref(),
+        path.clone(),
+        "an update acknowledgement requires a task identity",
+    )?;
+    if identity != expected {
+        return Err(invalid(
+            path.clone().field("identity"),
+            "an update acknowledgement names a different task than the request",
+        ));
+    }
+    let domains = decode_task_domain_receipts(&src.accepted_domains, path)?;
+    Ok(UpdateTaskReceipt::new(identity, domains))
+}
+
+fn decode_task_domain_receipts(
+    src: &[novarocks::TaskDomainReceipt],
+    path: FieldPath,
+) -> Result<Vec<TaskDomainReceipt>, ProtocolError> {
+    let domain_path = path.field("accepted_domains");
+    if src.len() > MAX_DOMAIN_UPDATES {
+        return Err(out_of_range(
+            domain_path,
+            "an acknowledgement reports more domains than one operation may carry",
+        ));
+    }
+    let mut domains = Vec::with_capacity(src.len());
+    for (index, domain) in src.iter().enumerate() {
+        domains.push(decode_task_domain_receipt(
+            domain,
+            domain_path.clone().index(index),
+        )?);
+    }
+    Ok(domains)
+}
+
+/// Decodes a query-context acknowledgement against the context the caller
+/// sent, returning the receipt and the termination cause the backend reported.
+///
+/// The cause is returned rather than validated and dropped: it is the only
+/// statement of why a context the frontend still believed in is gone.
+pub fn decode_query_context_ack(
+    src: &novarocks::QueryContextAck,
+    expected: QueryContextRef,
+    path: FieldPath,
+) -> Result<
+    (
+        QueryContextReceipt,
+        Option<novarocks_execution::task_execution::status::AbortCause>,
+    ),
+    ProtocolError,
+> {
+    let context = src.query_context.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("query_context"),
+            "a query context acknowledgement requires a context reference",
+        )
+    })?;
+    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    if context != expected {
+        return Err(invalid(
+            path.clone().field("query_context"),
+            "a query context acknowledgement names a different context than the request",
+        ));
+    }
+    let state = decode_context_state(src.state, path.clone().field("state"))?;
+    let mut receipt = QueryContextReceipt::new(context, state);
+    if let Some(lease) = src.lease.as_ref() {
+        receipt = receipt.with_lease(crate::task_execution::lease::decode_lease_receipt(
+            lease,
+            path.clone().field("lease"),
+        )?);
+    }
+    let domain_path = path.clone().field("accepted_domains");
+    if src.accepted_domains.len() > MAX_DOMAIN_UPDATES {
+        return Err(out_of_range(
+            domain_path,
+            "an acknowledgement reports more domains than one operation may carry",
+        ));
+    }
+    let mut domains = Vec::with_capacity(src.accepted_domains.len());
+    for (index, domain) in src.accepted_domains.iter().enumerate() {
+        domains.push(decode_query_context_domain_receipt(
+            domain,
+            domain_path.clone().index(index),
+        )?);
+    }
+    receipt = receipt.with_domains(domains);
+    let cause = src
+        .termination_cause
+        .map(|cause| decode_abort_cause(cause, path.field("termination_cause")))
+        .transpose()?;
+    Ok((receipt, cause))
 }
 
 /// Encodes a query-context acknowledgement.
@@ -1252,7 +1626,7 @@ pub fn encode_query_context_ack(
             .domains()
             .iter()
             .map(encode_query_context_domain_receipt)
-            .collect(),
+            .collect::<Option<Vec<_>>>()?,
         termination_cause: termination_cause.map(encode_abort_cause),
     })
 }

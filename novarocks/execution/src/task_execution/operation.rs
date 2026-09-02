@@ -679,6 +679,66 @@ impl TransportBudget {
         frontend_queue_residence: Duration::from_secs(15),
     };
 
+    /// Builds a budget, rejecting a zero or an inverted bound.
+    ///
+    /// The defaults are the frozen contract, but a deployment has to be able
+    /// to tighten them and a test has to be able to prove the enforcement
+    /// path without manufacturing a 48 MiB payload. The ordering rules are
+    /// what make the bounds a hierarchy rather than four unrelated numbers: a
+    /// descriptor has to fit in a batch, a batch in one query's queue, and
+    /// that queue in the process's.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every bound is independent; grouping them would invent a hierarchy the contract does not have"
+    )]
+    pub fn new(
+        max_batch_items: usize,
+        max_batch_encoded_bytes: usize,
+        max_descriptor_encoded_bytes: usize,
+        max_query_backend_queued_operations: usize,
+        max_query_backend_queued_bytes: usize,
+        max_backend_queued_operations: usize,
+        max_backend_queued_bytes: usize,
+        max_tasks_per_context: usize,
+        max_active_tasks_per_backend: usize,
+        frontend_queue_residence: Duration,
+    ) -> Option<Self> {
+        if max_batch_items == 0
+            || max_batch_encoded_bytes == 0
+            || max_descriptor_encoded_bytes == 0
+            || max_query_backend_queued_operations == 0
+            || max_query_backend_queued_bytes == 0
+            || max_backend_queued_operations == 0
+            || max_backend_queued_bytes == 0
+            || max_tasks_per_context == 0
+            || max_active_tasks_per_backend == 0
+            || frontend_queue_residence.is_zero()
+        {
+            return None;
+        }
+        if max_descriptor_encoded_bytes > max_batch_encoded_bytes
+            || max_batch_encoded_bytes > max_query_backend_queued_bytes
+            || max_query_backend_queued_bytes > max_backend_queued_bytes
+            || max_batch_items > max_query_backend_queued_operations
+            || max_query_backend_queued_operations > max_backend_queued_operations
+            || max_tasks_per_context > max_active_tasks_per_backend
+        {
+            return None;
+        }
+        Some(Self {
+            max_batch_items,
+            max_batch_encoded_bytes,
+            max_descriptor_encoded_bytes,
+            max_query_backend_queued_operations,
+            max_query_backend_queued_bytes,
+            max_backend_queued_operations,
+            max_backend_queued_bytes,
+            max_tasks_per_context,
+            max_active_tasks_per_backend,
+            frontend_queue_residence,
+        })
+    }
+
     pub const fn max_batch_items(self) -> usize {
         self.max_batch_items
     }
@@ -1600,6 +1660,135 @@ mod tests {
             "a create burst must never be able to starve a renewal"
         );
         assert!(DispatchBudget::new(1, 1, 0).is_none());
+    }
+
+    #[test]
+    fn a_tightened_budget_is_accepted_and_an_inverted_hierarchy_is_not() {
+        // A deployment must be able to tighten these, and a test must be able
+        // to prove the enforcement path without manufacturing a 48 MiB
+        // payload.
+        let tight = TransportBudget::new(
+            2,
+            4096,
+            1024,
+            8,
+            8192,
+            16,
+            16_384,
+            4,
+            8,
+            Duration::from_secs(1),
+        )
+        .expect("a tightened budget is legal");
+        assert!(tight.batch_fits(2, 4096));
+        assert!(!tight.batch_fits(3, 1));
+        assert!(!tight.batch_fits(1, 4097));
+
+        // Every zero is refused.
+        assert!(
+            TransportBudget::new(
+                0,
+                4096,
+                1024,
+                8,
+                8192,
+                16,
+                16_384,
+                4,
+                8,
+                Duration::from_secs(1)
+            )
+            .is_none()
+        );
+        assert!(
+            TransportBudget::new(2, 4096, 1024, 8, 8192, 16, 16_384, 4, 8, Duration::ZERO)
+                .is_none()
+        );
+
+        // The bounds are a hierarchy: a descriptor fits in a batch, a batch in
+        // one query's queue, that queue in the process's.
+        assert!(
+            TransportBudget::new(
+                2,
+                1024,
+                4096,
+                8,
+                8192,
+                16,
+                16_384,
+                4,
+                8,
+                Duration::from_secs(1)
+            )
+            .is_none(),
+            "a descriptor larger than a batch could never be sent"
+        );
+        assert!(
+            TransportBudget::new(
+                2,
+                8192,
+                1024,
+                8,
+                4096,
+                16,
+                16_384,
+                4,
+                8,
+                Duration::from_secs(1)
+            )
+            .is_none(),
+            "a batch larger than one query's queue could never be enqueued"
+        );
+        assert!(
+            TransportBudget::new(
+                2,
+                4096,
+                1024,
+                8,
+                8192,
+                16,
+                4096,
+                4,
+                8,
+                Duration::from_secs(1)
+            )
+            .is_none(),
+            "one query may not be allowed more than the whole process"
+        );
+        assert!(
+            TransportBudget::new(
+                2,
+                4096,
+                1024,
+                8,
+                8192,
+                16,
+                16_384,
+                8,
+                4,
+                Duration::from_secs(1)
+            )
+            .is_none(),
+            "one context may not hold more tasks than the backend allows"
+        );
+
+        // The frozen default satisfies its own hierarchy.
+        let default = TransportBudget::DEFAULT;
+        assert!(
+            TransportBudget::new(
+                default.max_batch_items(),
+                default.max_batch_encoded_bytes(),
+                default.max_descriptor_encoded_bytes(),
+                default.max_query_backend_queued_operations(),
+                default.max_query_backend_queued_bytes(),
+                default.max_backend_queued_operations(),
+                default.max_backend_queued_bytes(),
+                default.max_tasks_per_context(),
+                default.max_active_tasks_per_backend(),
+                default.frontend_queue_residence(),
+            )
+            .is_some()
+        );
     }
 
     #[test]

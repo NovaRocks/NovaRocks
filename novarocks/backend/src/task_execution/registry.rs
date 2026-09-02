@@ -76,6 +76,7 @@ use novarocks_execution::task_execution::transition::{
     ContextOperationKind, ContextTransition, LatchOutcome, OperationAdmission, QueryContextEvent,
     QueryContextState, classify_context_transition, classify_operation_admission,
 };
+use novarocks_types::UniqueId;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 
 use super::clock::{BackendMonotonicClock, ProcessMonotonicClock};
@@ -353,6 +354,29 @@ impl TaskExecutionRegistry {
     }
 
     /// Whether one task identity is currently findable as a live task.
+    /// The execution kernel's key for one live task on this process.
+    ///
+    /// The root result data plane is addressed by task identity, but the
+    /// result buffer is keyed by the kernel key the descriptor froze. This is
+    /// the one mapping between them, and it answers `None` for a task this
+    /// process does not own, so a result poll is fenced before it reaches a
+    /// buffer.
+    pub fn task_kernel_key(&self, identity: TaskIdentity) -> Option<UniqueId> {
+        if identity.backend_process_id() != self.config.backend_process_id {
+            return None;
+        }
+        let state = self.state.lock().expect(REGISTRY_LOCK);
+        match state
+            .task_index
+            .get(&identity)
+            .and_then(|context| state.contexts.get(context))
+            .and_then(|entry| entry.tasks.get(&identity))
+        {
+            Some(TaskEntry::Live(task)) => Some(task.descriptor.fragment_instance_id()),
+            _ => None,
+        }
+    }
+
     pub fn has_live_task(&self, identity: TaskIdentity) -> bool {
         let state = self.state.lock().expect(REGISTRY_LOCK);
         state

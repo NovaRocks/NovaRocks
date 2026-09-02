@@ -143,7 +143,7 @@ impl FrontendNativeTransport {
     }
 }
 
-type AuthenticatedNovaRocksGrpcClient =
+pub(super) type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
 
 /// A Native channel either fails before an outbound connection is attempted,
@@ -151,17 +151,17 @@ type AuthenticatedNovaRocksGrpcClient =
 /// that distinction: the latter has an unknown remote outcome, while the
 /// former cannot be repaired by resending an immutable request.
 #[derive(Debug)]
-enum ChannelAcquisitionError {
+pub(super) enum ChannelAcquisitionError {
     Fatal(String),
     RetryableNetwork(String),
 }
 
 impl ChannelAcquisitionError {
-    fn fatal(detail: impl Into<String>) -> Self {
+    pub(super) fn fatal(detail: impl Into<String>) -> Self {
         Self::Fatal(detail.into())
     }
 
-    fn retryable_network(detail: impl Into<String>) -> Self {
+    pub(super) fn retryable_network(detail: impl Into<String>) -> Self {
         Self::RetryableNetwork(detail.into())
     }
 }
@@ -177,13 +177,13 @@ impl std::fmt::Display for ChannelAcquisitionError {
 impl std::error::Error for ChannelAcquisitionError {}
 
 #[derive(Clone)]
-struct Client {
+pub(super) struct Client {
     endpoint: NativeEndpoint,
     data_runtime: FrontendDataRuntime,
 }
 
 impl Client {
-    fn new(endpoint: NativeEndpoint, data_runtime: FrontendDataRuntime) -> Self {
+    pub(super) fn new(endpoint: NativeEndpoint, data_runtime: FrontendDataRuntime) -> Self {
         Self {
             endpoint,
             data_runtime,
@@ -196,7 +196,7 @@ impl Client {
             .map_err(|error| error.to_string())
     }
 
-    async fn grpc_with_channel_error(
+    pub(super) async fn grpc_with_channel_error(
         &self,
     ) -> Result<AuthenticatedNovaRocksGrpcClient, ChannelAcquisitionError> {
         Ok(NovaRocksGrpcClient::with_interceptor(

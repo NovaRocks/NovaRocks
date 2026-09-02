@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
+
 use novarocks_connector_binding::ConnectorExecutionRoleBindingFactory;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
@@ -34,13 +36,36 @@ use crate::query_lifecycle::{
 use crate::rpc::client::BackendRpcClient;
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
+use crate::rpc::task_execution::TaskExecutionIngress;
 use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
+use crate::task_execution::{
+    HostRejection, QueryContextHost, RegistryTaskExecutionIngress, RunnableTask,
+    SharedFactsRequest, TaskExecutionHost, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+    TaskStatusReporter,
+};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
+use novarocks_execution::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution::task_execution::identity::QueryContextRef;
+use novarocks_execution::task_execution::operation::{QueryContextDomainUpdate, TaskDomainUpdate};
+use novarocks_execution::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How often the task protocol owner re-evaluates its own deadlines.
+///
+/// Nothing in that protocol expires by itself: a lease expiry, a creation-gate
+/// timeout, a retention sweep, and a throttled metric report all become
+/// decisions only inside `advance_deadlines`, so this interval is what bounds
+/// how late each of them can be. It has to stay well inside the shortest thing
+/// it decides — the one-second minimum lease of `LeaseBounds::DEFAULT` — and no
+/// coarser than the 250 ms status metric throttle it flushes, so a delayed
+/// report waits for one tick rather than for a whole tick period on top of the
+/// throttle. One sweep of an idle owner is a pair of ordered-map walks under
+/// one mutex, so paying it ten times a second costs nothing.
+const TASK_DEADLINE_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct BackendServerConfig {
     pub bind_host: String,
@@ -122,6 +147,7 @@ pub struct BackendApplicationHost {
     _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     _execution_runtime: Arc<ExecutionRuntime>,
     query_lifecycle_sweep: QueryLifecycleSweepTask,
+    task_deadline_tick: TaskDeadlineTickTask,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
     announce_task: BackendAnnounceTask,
@@ -274,6 +300,170 @@ struct BackendApplicationServices {
     execution_runtime: Arc<ExecutionRuntime>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
+    task_execution_registry: Arc<TaskExecutionRegistry>,
+    task_execution_ingress: Arc<dyn TaskExecutionIngress>,
+}
+
+/// What the two unrouted hosts below report.
+const UNROUTED_DETAIL: &str = "the native task protocol has no execution binding in this process";
+
+/// The query-context half of the execution binding the task protocol owner
+/// does not have yet.
+///
+/// The protocol is reachable over the wire, but the fragment-based lifecycle
+/// stack still owns every query, so nothing in this process can materialize
+/// shared facts, install a receiver, or start a worker on the owner's behalf.
+/// Refusing each of those explicitly is what keeps the gap visible: an
+/// establish or a create is answered with a typed refusal, while every
+/// decision the owner makes on its own — termination, observation, retention —
+/// keeps working. Binding this to real execution is a separate step.
+struct UnroutedQueryContextHost;
+
+impl QueryContextHost for UnroutedQueryContextHost {
+    fn materialize(&self, _request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+        Err(HostRejection::new(
+            TaskFailureCategory::Internal,
+            UNROUTED_DETAIL,
+        ))
+    }
+
+    fn release(&self, _context: QueryContextRef) {}
+
+    fn advance_shared_domain(
+        &self,
+        _context: QueryContextRef,
+        _domain: &QueryContextDomainUpdate,
+    ) -> Result<(), HostRejection> {
+        Err(HostRejection::new(
+            TaskFailureCategory::Internal,
+            UNROUTED_DETAIL,
+        ))
+    }
+}
+
+/// The task half of the same missing binding.
+struct UnroutedTaskExecutionHost;
+
+impl TaskExecutionHost for UnroutedTaskExecutionHost {
+    fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+        Err(HostRejection::new(
+            TaskFailureCategory::Internal,
+            UNROUTED_DETAIL,
+        ))
+    }
+
+    fn remove_receiver(&self, _descriptor: &TaskDescriptor) {}
+
+    fn install_inbound_capability(
+        &self,
+        _descriptor: &TaskDescriptor,
+    ) -> Result<(), HostRejection> {
+        Err(HostRejection::new(
+            TaskFailureCategory::Internal,
+            UNROUTED_DETAIL,
+        ))
+    }
+
+    fn remove_inbound_capability(&self, _descriptor: &TaskDescriptor) {}
+
+    fn submit_runnable(
+        &self,
+        _descriptor: &TaskDescriptor,
+        _reporter: TaskStatusReporter,
+    ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
+        Err(HostRejection::new(
+            TaskFailureCategory::Internal,
+            UNROUTED_DETAIL,
+        ))
+    }
+
+    fn apply_task_domain(
+        &self,
+        _descriptor: &TaskDescriptor,
+        _domain: &TaskDomainUpdate,
+    ) -> Result<(), HostRejection> {
+        Err(HostRejection::new(
+            TaskFailureCategory::Internal,
+            UNROUTED_DETAIL,
+        ))
+    }
+}
+
+/// The maintenance tick of the task protocol owner.
+///
+/// The owner never sleeps against a wall clock, so elapsed time becomes a
+/// decision only when something calls `advance_deadlines`. This is that
+/// something: without it no lease ever expires, no creation gate ever times
+/// out, and no retained record is ever reclaimed.
+struct TaskDeadlineTickTask {
+    stop: watch::Sender<bool>,
+    failure_rx: mpsc::Receiver<String>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TaskDeadlineTickTask {
+    fn start(
+        runtime: &BackendDataRuntime,
+        registry: Arc<TaskExecutionRegistry>,
+        interval: Duration,
+    ) -> Self {
+        let (stop, mut stopped) = watch::channel(false);
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let join = runtime.handle().spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick of a Tokio interval completes immediately and
+            // there is nothing to sweep at composition time.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = stopped.changed() => return,
+                    _ = ticker.tick() => {}
+                }
+                let registry = Arc::clone(&registry);
+                // One sweep takes the owner's mutex, so it runs on the
+                // blocking pool rather than on a runtime worker.
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || registry.advance_deadlines()).await
+                {
+                    // Nothing else re-evaluates a deadline, so a dead sweep is
+                    // a supervision failure rather than a missed tick.
+                    let _ = failure_tx.send(format!(
+                        "task execution deadline sweep stopped running: {error}"
+                    ));
+                    return;
+                }
+            }
+        });
+        Self {
+            stop,
+            failure_rx,
+            join: Some(join),
+        }
+    }
+
+    fn poll_failure(&mut self) -> Option<String> {
+        self.failure_rx.try_recv().ok()
+    }
+
+    /// Asks the tick to return, then drops it.
+    ///
+    /// The abort is a backstop for a runtime that is already winding down: the
+    /// loop's only await points are the tick, the stop signal, and the join of
+    /// one sweep, and a sweep that has already started runs to completion on
+    /// the blocking pool, so nothing is left half applied.
+    fn stop(&mut self) {
+        let _ = self.stop.send(true);
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
+    }
+}
+
+impl Drop for TaskDeadlineTickTask {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Backend composition root for the QLC-3 Stage/Start transaction.  The
@@ -524,12 +714,23 @@ fn compose_backend_application_services(
             registry: Arc::clone(&query_lifecycle_registry),
             fragments: Arc::clone(&native_fragment_service),
         });
+    // One task protocol owner per process, on this process's own identity and
+    // its monotonic clock. It is reachable over the wire and routes nothing.
+    let task_execution_registry = TaskExecutionRegistry::with_process_clock(
+        TaskExecutionRegistryConfig::for_process(query_lifecycle_ingress.backend_process_id()),
+        Arc::new(UnroutedQueryContextHost),
+        Arc::new(UnroutedTaskExecutionHost),
+    );
+    let task_execution_ingress: Arc<dyn TaskExecutionIngress> =
+        RegistryTaskExecutionIngress::new(Arc::clone(&task_execution_registry));
     Ok(BackendApplicationServices {
         native_fragment_service,
         query_lifecycle_registry,
         execution_runtime,
         exchange_receiver_port,
         query_lifecycle_ingress,
+        task_execution_registry,
+        task_execution_ingress,
     })
 }
 
@@ -583,6 +784,7 @@ impl BackendApplicationHost {
             self.grpc_server.poll_failure(),
             self.metrics_http_server.poll_failure(),
             self.query_lifecycle_sweep.poll_failure(),
+            Ok(self.task_deadline_tick.poll_failure()),
         ] {
             match failure {
                 Ok(Some(error)) => {
@@ -605,6 +807,7 @@ impl BackendApplicationHost {
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
         self.announce_task.stop();
+        self.task_deadline_tick.stop();
         let listener_shutdown = self.grpc_server.stop();
         let sweep_result = self.query_lifecycle_sweep.stop();
         let metrics_result = self.metrics_http_server.stop();
@@ -700,6 +903,14 @@ impl BackendApplicationHost {
             }
         };
 
+        // Started before the listener: the owner is reachable the moment its
+        // RPCs are, and a deadline that elapses must already be decidable.
+        let task_deadline_tick = TaskDeadlineTickTask::start(
+            &readiness_runtime,
+            Arc::clone(&services.task_execution_registry),
+            TASK_DEADLINE_TICK_INTERVAL,
+        );
+
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
             services.query_lifecycle_registry.clone();
         let mut grpc_server = match BackendRpcServerHandle::start(
@@ -707,6 +918,7 @@ impl BackendApplicationHost {
             grpc_port,
             BackendRpcService::new(
                 services.query_lifecycle_ingress.clone(),
+                Arc::clone(&services.task_execution_ingress),
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
                 process_descriptor.clone(),
@@ -765,6 +977,7 @@ impl BackendApplicationHost {
             _query_lifecycle_registry: services.query_lifecycle_registry,
             _execution_runtime: services.execution_runtime,
             query_lifecycle_sweep,
+            task_deadline_tick,
             metrics_http_server,
             process_descriptor,
             announce_task,
@@ -941,8 +1154,9 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendServerConfig, QueryLifecycleRegistryConfig, combine_primary_and_shutdown,
-        compose_backend_application_services,
+        BackendServerConfig, QueryContextRef, QueryLifecycleRegistryConfig, TaskDeadlineTickTask,
+        TaskExecutionRegistryConfig, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
+        combine_primary_and_shutdown, compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
     use crate::rpc::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
@@ -1006,6 +1220,69 @@ mod tests {
 
     fn test_data_runtime() -> crate::BackendDataRuntime {
         crate::rpc::runtime::test_backend_data_runtime()
+    }
+
+    /// The tick is the only thing that turns elapsed time into a decision, so
+    /// this asserts an actual reclamation rather than that a task was spawned.
+    ///
+    /// An abort of a context this backend never established leaves a retained
+    /// terminal fence, which needs no execution binding at all. Nothing else
+    /// reclaims it: the clock moves, and only a sweep can notice.
+    #[test]
+    fn the_deadline_tick_drives_the_task_owner_forward() {
+        use novarocks_execution::task_execution::identity::TaskOperationId;
+        use novarocks_execution::task_execution::operation::AbortQueryContext;
+        use novarocks_execution::task_execution::status::AbortCause;
+        use novarocks_execution::task_execution::transition::QueryContextState;
+        use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, QueryId};
+
+        let backend = novarocks_types::BackendProcessId::new_v7();
+        let clock = Arc::new(crate::task_execution::ManualClock::new());
+        let registry = crate::task_execution::TaskExecutionRegistry::new(
+            TaskExecutionRegistryConfig::for_process(backend),
+            Arc::clone(&clock) as Arc<dyn crate::task_execution::BackendMonotonicClock>,
+            Arc::new(UnroutedQueryContextHost),
+            Arc::new(UnroutedTaskExecutionHost),
+        );
+        let context = QueryContextRef::new(
+            QueryExecutionId::new(
+                QueryId::new(5, 6),
+                novarocks_types::identity::AttemptId::new(1).expect("nonzero attempt"),
+            )
+            .expect("nonzero query"),
+            FrontendProcessId::new_v7(),
+            backend,
+        );
+        registry.abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
+        ));
+        assert_eq!(
+            registry.context_state(context),
+            QueryContextState::TerminalRetained
+        );
+
+        let mut tick = TaskDeadlineTickTask::start(
+            &test_data_runtime(),
+            Arc::clone(&registry),
+            Duration::from_millis(5),
+        );
+        clock.advance(Duration::from_secs(600));
+        let mut reclaimed = false;
+        for _ in 0..500 {
+            if registry.context_state(context) == QueryContextState::Gone {
+                reclaimed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tick.stop();
+        assert!(
+            reclaimed,
+            "the maintenance tick never re-evaluated the retention horizon"
+        );
+        assert_eq!(tick.poll_failure(), None);
     }
 
     fn http_get(port: u16, path: &str) -> std::io::Result<String> {

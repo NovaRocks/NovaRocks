@@ -95,9 +95,14 @@ struct SourceState {
 }
 
 /// The observation channel of one query context.
+///
+/// Taking a frame is a poll, but waiting for one is not. Terminal delivery is
+/// on the critical path of every query's completion, so an observer parks on
+/// `wake` instead of sampling on a timer, and any state change wakes it.
 #[derive(Debug, Default)]
 pub struct TaskStatusSource {
     state: Mutex<SourceState>,
+    wake: tokio::sync::Notify,
 }
 
 impl TaskStatusSource {
@@ -133,6 +138,8 @@ impl TaskStatusSource {
         if status_state.is_failure() {
             state.failure_seen = true;
         }
+        drop(state);
+        self.wake.notify_waiters();
     }
 
     /// Records that a task's retained state was reclaimed.
@@ -147,6 +154,28 @@ impl TaskStatusSource {
             state.order.push_back(identity);
         }
         state.revision = state.revision.saturating_add(1);
+        drop(state);
+        self.wake.notify_waiters();
+    }
+
+    /// Waits until a frame is owed, then takes it.
+    ///
+    /// `None` means the source was woken but another observer took the frame,
+    /// which a caller treats as "keep waiting" rather than "nothing more will
+    /// come".
+    pub async fn next_event_owned(&self) -> Option<TaskStatusEvent> {
+        loop {
+            // Registering before the check closes the gap where a publish
+            // lands between taking a frame and starting to wait.
+            let woken = self.wake.notified();
+            if let Some(event) = self.next_event() {
+                return Some(event);
+            }
+            woken.await;
+            if let Some(event) = self.next_event() {
+                return Some(event);
+            }
+        }
     }
 
     /// Takes the next frame owed to an observer, round-robin across tasks.

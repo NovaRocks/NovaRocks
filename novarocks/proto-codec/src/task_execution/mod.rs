@@ -1429,8 +1429,9 @@ mod tests {
             accepted_epoch: CredentialEpoch::new(4).expect("nonzero"),
             progression: DomainProgression::Apply,
         };
-        let encoded = encode_query_context_domain_receipt(&receipt);
-        match encoded.receipt.expect("a receipt body") {
+        let encoded =
+            encode_query_context_domain_receipt(&receipt).expect("an applied receipt encodes");
+        match encoded.receipt.clone().expect("a receipt body") {
             novarocks::query_context_domain_receipt::Receipt::Credential(credential) => {
                 assert_eq!(
                     credential.lease_id, 7,
@@ -1453,5 +1454,241 @@ mod tests {
         );
         assert_eq!(EdgeOpenVersion::FIRST.get(), 1);
         assert!(ExchangeEdgeId::new(0).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Acknowledgement bodies
+    //
+    // These close the direction the wire could not previously answer: the
+    // frontend could send an operation and read its outcome, but could not
+    // read what the backend accepted. An applied create whose body cannot be
+    // decoded settles as a missing receipt, which reads to the scheduler as
+    // "installed nothing".
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_accepted_domain_receipt_survives_a_round_trip() {
+        use super::operation::{
+            decode_query_context_domain_receipt, decode_task_domain_receipt,
+            encode_query_context_domain_receipt, encode_task_domain_receipt,
+        };
+        use novarocks_execution::task_execution::domain::{
+            CredentialLeaseId, DomainProgression, SplitSequence, SplitWatermark,
+        };
+        use novarocks_execution::task_execution::operation::{
+            PlanNodeSplitReceipt, QueryContextDomainReceipt, TaskDomainReceipt,
+        };
+
+        let progressions = [
+            DomainProgression::Apply,
+            DomainProgression::Idempotent,
+            DomainProgression::Older,
+        ];
+        for progression in progressions {
+            let watermark =
+                SplitWatermark::empty().apply_batch(SplitSequence::new(4).expect("nonzero"), true);
+            let task_cases = vec![
+                TaskDomainReceipt::SplitAssignment {
+                    nodes: vec![
+                        PlanNodeSplitReceipt::new(
+                            PlanNodeId::new(7).expect("nonnegative"),
+                            watermark,
+                        )
+                        .with_queued_splits(3),
+                    ],
+                    progression,
+                },
+                TaskDomainReceipt::TaskDynamicFilter {
+                    accepted_version: Some(DomainVersion::new(9).expect("nonzero")),
+                    progression,
+                },
+                // Nothing accepted yet is a legal receipt, not a malformed one.
+                TaskDomainReceipt::TaskDynamicFilter {
+                    accepted_version: None,
+                    progression,
+                },
+                TaskDomainReceipt::OpenExchangeEdges {
+                    opened: vec![
+                        ExchangeEdgeId::new(1).expect("nonzero"),
+                        ExchangeEdgeId::new(4).expect("nonzero"),
+                    ],
+                    progression,
+                },
+            ];
+            for case in task_cases {
+                let encoded =
+                    encode_task_domain_receipt(&case).expect("an applied receipt encodes");
+                let decoded = decode_task_domain_receipt(&encoded, FieldPath::root("receipt"))
+                    .expect("decodes");
+                assert_eq!(decoded, case, "a task domain receipt lost information");
+            }
+
+            let context_cases = vec![
+                QueryContextDomainReceipt::CatalogBinding {
+                    accepted_version: Some(DomainVersion::new(2).expect("nonzero")),
+                    progression,
+                },
+                QueryContextDomainReceipt::SharedDynamicFilter {
+                    accepted_version: None,
+                    progression,
+                },
+                QueryContextDomainReceipt::Credential {
+                    lease_id: CredentialLeaseId::new(7),
+                    accepted_epoch: CredentialEpoch::new(4).expect("nonzero"),
+                    progression,
+                },
+            ];
+            for case in context_cases {
+                let encoded =
+                    encode_query_context_domain_receipt(&case).expect("an applied receipt encodes");
+                let decoded =
+                    decode_query_context_domain_receipt(&encoded, FieldPath::root("receipt"))
+                        .expect("decodes");
+                assert_eq!(decoded, case, "a context domain receipt lost information");
+            }
+        }
+    }
+
+    #[test]
+    fn a_conflicting_domain_never_ships_inside_an_applied_acknowledgement() {
+        use super::operation::{
+            encode_create_task_ack, encode_query_context_domain_receipt,
+            encode_task_domain_receipt, encode_update_task_ack,
+        };
+        use novarocks_execution::task_execution::domain::{DomainConflict, DomainProgression};
+        use novarocks_execution::task_execution::operation::{
+            CreateTaskReceipt, QueryContextDomainReceipt, TaskDomainReceipt, UpdateTaskReceipt,
+        };
+
+        // A conflicting domain refuses its whole operation, so no ack body can
+        // represent one. The encoders must refuse rather than pick the nearest
+        // representable neighbour, which would report a refusal as an apply.
+        for conflict in [
+            DomainConflict::SameTokenDifferentContent,
+            DomainConflict::Gap,
+            DomainConflict::AfterSeal,
+            DomainConflict::UnknownMember,
+            DomainConflict::NotMonotonic,
+        ] {
+            let task = TaskDomainReceipt::TaskDynamicFilter {
+                accepted_version: None,
+                progression: DomainProgression::Conflict(conflict),
+            };
+            assert!(
+                encode_task_domain_receipt(&task).is_none(),
+                "{conflict:?} must not encode as an accepted task domain"
+            );
+            let context = QueryContextDomainReceipt::CatalogBinding {
+                accepted_version: None,
+                progression: DomainProgression::Conflict(conflict),
+            };
+            assert!(
+                encode_query_context_domain_receipt(&context).is_none(),
+                "{conflict:?} must not encode as an accepted context domain"
+            );
+
+            // And the refusal must propagate: an ack whose domain list cannot
+            // be encoded must not ship a shortened list, which would read as
+            // "that domain was never in the request".
+            let process = backend();
+            let task_identity = identity(1, 1, process);
+            assert!(
+                encode_create_task_ack(&CreateTaskReceipt::new(
+                    task_identity,
+                    vec![task.clone()],
+                    TaskStatus::created(task_identity),
+                ))
+                .is_none(),
+                "a create acknowledgement must refuse an unrepresentable domain"
+            );
+            assert!(
+                encode_update_task_ack(&UpdateTaskReceipt::new(task_identity, vec![task]))
+                    .is_none(),
+                "an update acknowledgement must refuse an unrepresentable domain"
+            );
+        }
+    }
+
+    #[test]
+    fn an_acknowledgement_for_another_task_is_not_this_task_s_proof() {
+        use super::operation::{
+            decode_create_task_ack, decode_query_context_ack, decode_update_task_ack,
+            encode_create_task_ack, encode_query_context_ack, encode_update_task_ack,
+        };
+        use novarocks_execution::task_execution::operation::{
+            CreateTaskReceipt, QueryContextReceipt, UpdateTaskReceipt,
+        };
+
+        let process = backend();
+        let mine = identity(1, 1, process);
+        let theirs = identity(1, 2, process);
+
+        let create = encode_create_task_ack(&CreateTaskReceipt::new(
+            theirs,
+            Vec::new(),
+            TaskStatus::created(theirs),
+        ))
+        .expect("an applied create encodes");
+        assert_eq!(
+            decode_create_task_ack(&create, mine, FieldPath::root("ack"))
+                .expect_err("a create acknowledgement for another task is refused")
+                .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+        // The same body against its own task decodes, so the fence above is the
+        // identity check and not a broken decoder.
+        let decoded = decode_create_task_ack(&create, theirs, FieldPath::root("ack"))
+            .expect("its own acknowledgement decodes");
+        assert_eq!(decoded.identity(), theirs);
+        assert_eq!(decoded.current_status().identity(), theirs);
+
+        let update = encode_update_task_ack(&UpdateTaskReceipt::new(theirs, Vec::new()))
+            .expect("an applied update encodes");
+        assert_eq!(
+            decode_update_task_ack(&update, mine, FieldPath::root("ack"))
+                .expect_err("an update acknowledgement for another task is refused")
+                .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+
+        let my_context = context(process);
+        let their_context = context(process);
+        let ack = encode_query_context_ack(
+            &QueryContextReceipt::new(their_context, QueryContextState::Active),
+            None,
+        )
+        .expect("an active receipt encodes");
+        assert_eq!(
+            decode_query_context_ack(&ack, my_context, FieldPath::root("ack"))
+                .expect_err("a context acknowledgement for another context is refused")
+                .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+        let (receipt, cause) =
+            decode_query_context_ack(&ack, their_context, FieldPath::root("ack"))
+                .expect("its own acknowledgement decodes");
+        assert_eq!(receipt.state(), QueryContextState::Active);
+        assert!(cause.is_none(), "an active context has no cause");
+    }
+
+    #[test]
+    fn a_terminated_context_reports_why_rather_than_dropping_it() {
+        use super::operation::{decode_query_context_ack, encode_query_context_ack};
+        use novarocks_execution::task_execution::operation::QueryContextReceipt;
+
+        // The cause is the only statement of why a context the frontend still
+        // believed in is gone. Validating and discarding it would leave the
+        // frontend with a terminal state and no reason.
+        let process = backend();
+        let ctx = context(process);
+        let ack = encode_query_context_ack(
+            &QueryContextReceipt::new(ctx, QueryContextState::TerminalRetained),
+            Some(AbortCause::LeaseExpired),
+        )
+        .expect("a terminally retained receipt encodes");
+        let (receipt, cause) =
+            decode_query_context_ack(&ack, ctx, FieldPath::root("ack")).expect("decodes");
+        assert_eq!(receipt.state(), QueryContextState::TerminalRetained);
+        assert_eq!(cause, Some(AbortCause::LeaseExpired));
     }
 }
