@@ -425,9 +425,10 @@ pub enum QueryContextDomainReceipt {
         accepted_version: Option<DomainVersion>,
         progression: DomainProgression,
     },
-    /// Only the accepted epoch is reported. No credential material, and no
-    /// digest of any, ever appears in a receipt.
+    /// Only the lease and the accepted epoch are reported. No credential
+    /// material, and no digest of any, ever appears in a receipt.
     Credential {
+        lease_id: CredentialLeaseId,
         accepted_epoch: CredentialEpoch,
         progression: DomainProgression,
     },

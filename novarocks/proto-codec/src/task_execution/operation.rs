@@ -33,8 +33,9 @@ use novarocks_execution::task_execution::identity::{
 };
 use novarocks_execution::task_execution::lease::LeaseValidFor;
 use novarocks_execution::task_execution::operation::{
-    AbortQueryContext, CancelTask, CreateTask, FetchTaskDynamicFilters, GetFinalTaskInfo, MaxWait,
-    OperationEnvelope, OperationKind, OperationOutcome, ReleaseOutcome, ReleaseQueryContext,
+    AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, EstablishQueryContext,
+    FetchTaskDynamicFilters, GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind,
+    OperationOutcome, ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease,
     TransportBudget, UpdateTask,
 };
 use novarocks_execution::task_execution::transition::QueryContextState;
@@ -940,4 +941,452 @@ pub fn encode_operation_outcome(value: OperationOutcome) -> Option<i32> {
 /// Encodes a query context state back onto the wire, or `None` for `Absent`.
 pub fn encode_query_context_state(value: QueryContextState) -> Option<i32> {
     encode_context_state(value)
+}
+
+/// The frontend side of the operation surface: building requests, and reading
+/// the acknowledgements back.
+///
+/// These are separate from the decoders above because the two roles use
+/// opposite halves. A backend decodes an operation and encodes a receipt; a
+/// frontend encodes an operation and decodes a receipt. Keeping both halves in
+/// one module is what makes it impossible for them to drift apart.
+/// Encodes one task-scoped domain change from its neutral form.
+///
+/// The split and filter variants need their typed content, which the neutral
+/// form holds only a fingerprint of, so the frontend passes the content it
+/// already has rather than reconstructing it.
+pub fn encode_create_task(
+    request: &CreateTask,
+    fragment: &WireFragmentPlan,
+    initial_domains: Vec<novarocks::TaskDomainUpdate>,
+) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::CreateTask(
+            novarocks::CreateTaskRequest {
+                query_context: Some(encode_query_context_ref(request.context())),
+                descriptor: Some(crate::task_execution::descriptor::encode_task_descriptor(
+                    request.descriptor(),
+                    fragment,
+                )),
+                initial_domains,
+            },
+        )),
+    }
+}
+
+pub fn encode_update_task(
+    request: &UpdateTask,
+    domains: Vec<novarocks::TaskDomainUpdate>,
+) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::UpdateTask(
+            novarocks::UpdateTaskRequest {
+                identity: Some(crate::task_execution::identity::encode_task_identity(
+                    request.identity(),
+                )),
+                domains,
+            },
+        )),
+    }
+}
+
+pub fn encode_cancel_task(request: CancelTask) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::CancelTask(
+            novarocks::CancelTaskRequest {
+                identity: Some(crate::task_execution::identity::encode_task_identity(
+                    request.identity(),
+                )),
+                reason: encode_cancel_reason(request.reason()),
+            },
+        )),
+    }
+}
+
+pub fn encode_abort_query_context(request: AbortQueryContext) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::AbortQueryContext(
+            novarocks::AbortQueryContextRequest {
+                query_context: Some(encode_query_context_ref(request.context())),
+                cause: encode_abort_cause(request.cause()),
+            },
+        )),
+    }
+}
+
+pub fn encode_release_query_context(request: ReleaseQueryContext) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::ReleaseQueryContext(
+            novarocks::ReleaseQueryContextRequest {
+                query_context: Some(encode_query_context_ref(request.context())),
+            },
+        )),
+    }
+}
+
+/// Encodes one lease renewal.
+pub fn encode_renew_lease(request: &RenewQueryExecutionLease) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
+            novarocks::UpdateQueryContextRequest {
+                command: Some(
+                    novarocks::update_query_context_request::Command::RenewLease(
+                        novarocks::RenewQueryExecutionLeaseRequest {
+                            query_context: Some(encode_query_context_ref(request.context())),
+                            lease: Some(crate::task_execution::lease::encode_lease_grant(
+                                crate::task_execution::lease::LeaseGrant::new(
+                                    request.sequence(),
+                                    request.valid_for(),
+                                ),
+                            )),
+                        },
+                    ),
+                ),
+            },
+        )),
+    }
+}
+
+/// Encodes one shared-domain advance.
+pub fn encode_advance_query_context_domain(
+    request: &AdvanceQueryContextDomain,
+    domain: novarocks::QueryContextDomainUpdate,
+) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
+            novarocks::UpdateQueryContextRequest {
+                command: Some(
+                    novarocks::update_query_context_request::Command::AdvanceDomain(
+                        novarocks::AdvanceQueryContextDomainRequest {
+                            query_context: Some(encode_query_context_ref(request.context())),
+                            domain: Some(domain),
+                        },
+                    ),
+                ),
+            },
+        )),
+    }
+}
+
+/// Encodes one establish.
+pub fn encode_establish_query_context(
+    request: &EstablishQueryContext,
+    catalog_set: novarocks_proto_models::catalog::CatalogSet,
+    initial_runtime_filter: novarocks::RuntimeFilterContribution,
+    initial_credential: novarocks::QueryContextCredentialDomain,
+    query_options: novarocks::QueryOptions,
+    native_compatibility_id: Option<novarocks::NativeCompatibilityId>,
+) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
+            novarocks::UpdateQueryContextRequest {
+                command: Some(novarocks::update_query_context_request::Command::Establish(
+                    novarocks::EstablishQueryContextRequest {
+                        query_context: Some(encode_query_context_ref(request.context())),
+                        catalog_set: Some(catalog_set),
+                        initial_runtime_filter: Some(initial_runtime_filter),
+                        initial_credential: Some(initial_credential),
+                        initial_lease: Some(crate::task_execution::lease::encode_lease_grant(
+                            crate::task_execution::lease::LeaseGrant::new(
+                                request.initial_lease_sequence(),
+                                request.initial_lease_valid_for(),
+                            ),
+                        )),
+                        query_options: Some(query_options),
+                        native_compatibility_id,
+                    },
+                )),
+            },
+        )),
+    }
+}
+
+/// Bundles operations into one per-backend batch, refusing anything that
+/// exceeds the transport budget before it reaches the wire.
+pub fn encode_operation_batch(
+    operations: Vec<novarocks::TaskOperation>,
+    budget: TransportBudget,
+) -> Result<novarocks::ApplyTaskOperationsRequest, ProtocolError> {
+    let request = novarocks::ApplyTaskOperationsRequest { operations };
+    let encoded_len = request.encoded_len();
+    if !budget.batch_fits(request.operations.len(), encoded_len) {
+        return Err(out_of_range(
+            FieldPath::root("apply_task_operations").field("operations"),
+            "operation batch exceeds its item or byte budget",
+        ));
+    }
+    Ok(request)
+}
+
+/// Encodes one task-domain receipt.
+pub fn encode_task_domain_receipt(
+    value: &novarocks_execution::task_execution::operation::TaskDomainReceipt,
+) -> novarocks::TaskDomainReceipt {
+    use novarocks_execution::task_execution::operation::TaskDomainReceipt as Receipt;
+    let receipt = match value {
+        Receipt::SplitAssignment { nodes, .. } => {
+            novarocks::task_domain_receipt::Receipt::SplitAssignment(
+                novarocks::TaskSplitAssignmentReceipt {
+                    nodes: nodes
+                        .iter()
+                        .copied()
+                        .map(crate::task_execution::domain::encode_plan_node_split_receipt)
+                        .collect(),
+                },
+            )
+        }
+        Receipt::TaskDynamicFilter {
+            accepted_version, ..
+        } => {
+            novarocks::task_domain_receipt::Receipt::DynamicFilter(novarocks::ScalarDomainReceipt {
+                accepted_version: accepted_version.map_or(0, DomainVersion::get),
+            })
+        }
+        Receipt::OpenExchangeEdges { opened, .. } => {
+            novarocks::task_domain_receipt::Receipt::OpenExchangeEdges(
+                novarocks::OpenExchangeEdgesReceipt {
+                    opened_edge_ids: opened.iter().map(|edge| edge.get()).collect(),
+                },
+            )
+        }
+    };
+    novarocks::TaskDomainReceipt {
+        receipt: Some(receipt),
+    }
+}
+
+/// Encodes one query-context domain receipt.
+pub fn encode_query_context_domain_receipt(
+    value: &novarocks_execution::task_execution::operation::QueryContextDomainReceipt,
+) -> novarocks::QueryContextDomainReceipt {
+    use novarocks_execution::task_execution::operation::QueryContextDomainReceipt as Receipt;
+    let receipt = match value {
+        Receipt::CatalogBinding {
+            accepted_version, ..
+        } => novarocks::query_context_domain_receipt::Receipt::CatalogBinding(
+            novarocks::ScalarDomainReceipt {
+                accepted_version: accepted_version.map_or(0, DomainVersion::get),
+            },
+        ),
+        Receipt::SharedDynamicFilter {
+            accepted_version, ..
+        } => novarocks::query_context_domain_receipt::Receipt::SharedDynamicFilter(
+            novarocks::ScalarDomainReceipt {
+                accepted_version: accepted_version.map_or(0, DomainVersion::get),
+            },
+        ),
+        Receipt::Credential {
+            lease_id,
+            accepted_epoch,
+            ..
+        } => novarocks::query_context_domain_receipt::Receipt::Credential(
+            novarocks::QueryContextCredentialReceipt {
+                lease_id: lease_id.get(),
+                accepted_epoch: accepted_epoch.get(),
+            },
+        ),
+    };
+    novarocks::QueryContextDomainReceipt {
+        receipt: Some(receipt),
+    }
+}
+
+/// Encodes a create acknowledgement.
+pub fn encode_create_task_ack(
+    value: &novarocks_execution::task_execution::operation::CreateTaskReceipt,
+) -> novarocks::CreateTaskAck {
+    novarocks::CreateTaskAck {
+        identity: Some(crate::task_execution::identity::encode_task_identity(
+            value.identity(),
+        )),
+        accepted_domains: value
+            .domains()
+            .iter()
+            .map(encode_task_domain_receipt)
+            .collect(),
+        current_status: Some(crate::task_execution::status::encode_task_status(
+            value.current_status(),
+        )),
+    }
+}
+
+/// Encodes an update acknowledgement.
+pub fn encode_update_task_ack(
+    value: &novarocks_execution::task_execution::operation::UpdateTaskReceipt,
+) -> novarocks::UpdateTaskAck {
+    novarocks::UpdateTaskAck {
+        identity: Some(crate::task_execution::identity::encode_task_identity(
+            value.identity(),
+        )),
+        accepted_domains: value
+            .domains()
+            .iter()
+            .map(encode_task_domain_receipt)
+            .collect(),
+    }
+}
+
+/// Encodes a query-context acknowledgement.
+///
+/// Returns `None` when the receipt reports the one state that has no wire
+/// representation.
+pub fn encode_query_context_ack(
+    value: &novarocks_execution::task_execution::operation::QueryContextReceipt,
+    termination_cause: Option<novarocks_execution::task_execution::status::AbortCause>,
+) -> Option<novarocks::QueryContextAck> {
+    Some(novarocks::QueryContextAck {
+        query_context: Some(encode_query_context_ref(value.context())),
+        state: encode_context_state(value.state())?,
+        lease: value
+            .lease()
+            .map(crate::task_execution::lease::encode_lease_receipt),
+        accepted_domains: value
+            .domains()
+            .iter()
+            .map(encode_query_context_domain_receipt)
+            .collect(),
+        termination_cause: termination_cause.map(encode_abort_cause),
+    })
+}
+
+/// Encodes one operation receipt.
+///
+/// Returns `None` when the outcome has no wire representation, which is the
+/// only way a caller can be stopped from shipping a client-only category as
+/// something a backend claimed.
+pub fn encode_receipt(
+    operation_id: TaskOperationId,
+    outcome: OperationOutcome,
+    safe_detail: &str,
+    ack: Option<novarocks::task_operation_receipt::Ack>,
+) -> Option<novarocks::TaskOperationReceipt> {
+    Some(novarocks::TaskOperationReceipt {
+        operation_id: Some(encode_task_operation_id(operation_id)),
+        outcome: encode_outcome(outcome)?,
+        safe_detail: safe_detail.to_owned(),
+        safe_field_path: None,
+        ack,
+    })
+}
+
+/// Encodes one status stream event.
+pub fn encode_status_event(
+    value: &novarocks_execution::task_execution::status::TaskStatus,
+) -> novarocks::TaskStatusStreamEvent {
+    novarocks::TaskStatusStreamEvent {
+        event: Some(novarocks::task_status_stream_event::Event::TaskStatus(
+            crate::task_execution::status::encode_task_status(value),
+        )),
+    }
+}
+
+/// Encodes a task-gone event.
+pub fn encode_task_gone_event(identity: TaskIdentity) -> novarocks::TaskStatusStreamEvent {
+    novarocks::TaskStatusStreamEvent {
+        event: Some(novarocks::task_status_stream_event::Event::TaskGone(
+            novarocks::TaskGone {
+                identity: Some(crate::task_execution::identity::encode_task_identity(
+                    identity,
+                )),
+            },
+        )),
+    }
+}
+
+/// Decodes one status stream event.
+pub fn decode_status_event(
+    src: &novarocks::TaskStatusStreamEvent,
+    path: FieldPath,
+) -> Result<StatusStreamEvent, ProtocolError> {
+    let event = src
+        .event
+        .as_ref()
+        .ok_or_else(|| missing(path.clone(), "a status event requires a body"))?;
+    match event {
+        novarocks::task_status_stream_event::Event::TaskStatus(status) => Ok(
+            StatusStreamEvent::Status(crate::task_execution::status::decode_task_status(
+                status,
+                path.field("task_status"),
+            )?),
+        ),
+        novarocks::task_status_stream_event::Event::TaskGone(gone) => {
+            let gone_path = path.field("task_gone");
+            let identity = decode_identity_field(
+                gone.identity.as_ref(),
+                gone_path,
+                "a task-gone event requires a task identity",
+            )?;
+            Ok(StatusStreamEvent::Gone(identity))
+        }
+    }
+}
+
+/// One observed status event.
+#[derive(Clone, Debug)]
+pub enum StatusStreamEvent {
+    Status(novarocks_execution::task_execution::status::TaskStatus),
+    Gone(TaskIdentity),
+}
+
+/// Encodes a status subscription request.
+pub fn encode_subscribe_task_status(
+    context: QueryContextRef,
+    cursors: &[novarocks_execution::task_execution::status::TaskStatusCursor],
+) -> Result<novarocks::SubscribeTaskStatusRequest, ProtocolError> {
+    if cursors.len() > crate::task_execution::status::MAX_SUBSCRIPTION_CURSORS {
+        return Err(out_of_range(
+            FieldPath::root("subscribe_task_status").field("cursors"),
+            "cursor count exceeds the hard limit",
+        ));
+    }
+    Ok(novarocks::SubscribeTaskStatusRequest {
+        query_context: Some(encode_query_context_ref(context)),
+        cursors: cursors
+            .iter()
+            .copied()
+            .map(crate::task_execution::status::encode_task_status_cursor)
+            .collect(),
+    })
+}
+
+/// Decodes a status subscription request.
+pub fn decode_subscribe_task_status(
+    src: &novarocks::SubscribeTaskStatusRequest,
+    path: FieldPath,
+) -> Result<
+    (
+        QueryContextRef,
+        Vec<novarocks_execution::task_execution::status::TaskStatusCursor>,
+    ),
+    ProtocolError,
+> {
+    let context = src.query_context.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("query_context"),
+            "a subscription requires a query context reference",
+        )
+    })?;
+    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    if src.cursors.len() > crate::task_execution::status::MAX_SUBSCRIPTION_CURSORS {
+        return Err(out_of_range(
+            path.clone().field("cursors"),
+            "cursor count exceeds the hard limit",
+        ));
+    }
+    let mut cursors = Vec::with_capacity(src.cursors.len());
+    for (index, cursor) in src.cursors.iter().enumerate() {
+        cursors.push(crate::task_execution::status::decode_task_status_cursor(
+            cursor,
+            path.clone().field("cursors").index(index),
+        )?);
+    }
+    Ok((context, cursors))
 }

@@ -1192,6 +1192,149 @@ mod tests {
         );
     }
 
+    /// The frontend encodes and the backend decodes, so the two halves have to
+    /// agree. Going through the encode side and back is the only check that
+    /// catches them drifting apart.
+    #[test]
+    fn what_the_frontend_encodes_is_what_the_backend_decodes() {
+        use super::descriptor::{WireFragmentPlan, decode_task_descriptor};
+        use super::operation::{
+            encode_cancel_task, encode_create_task, encode_operation_batch,
+            encode_release_query_context, encode_renew_lease,
+        };
+        use novarocks_execution::task_execution::operation::{
+            CancelTask, CreateTask, ReleaseQueryContext, RenewQueryExecutionLease,
+        };
+
+        let process = backend();
+        let identity = identity(2, 3, process);
+        let context = context(process);
+
+        let wire_descriptor = simple_descriptor(process);
+        let (descriptor, _) = decode_task_descriptor(&wire_descriptor, FieldPath::root("d"))
+            .expect("legal descriptor");
+        let fragment = WireFragmentPlan::parse(
+            wire_descriptor.fragment.clone().expect("fragment"),
+            FieldPath::root("fragment"),
+        )
+        .expect("legal fragment plan");
+
+        let create_id = TaskOperationId::new_v7();
+        let create = CreateTask::try_new(create_id, context, descriptor, Vec::new())
+            .expect("matching context");
+        let cancel_id = TaskOperationId::new_v7();
+        let cancel = CancelTask::new(cancel_id, identity, CancelReason::UpstreamNoLongerNeeded);
+        let renew_id = TaskOperationId::new_v7();
+        let renew = RenewQueryExecutionLease::new(
+            renew_id,
+            context,
+            LeaseSequence::new(1),
+            LeaseValidFor::new(Duration::from_secs(5)).expect("representable"),
+        );
+        let release_id = TaskOperationId::new_v7();
+        let release = ReleaseQueryContext::new(release_id, context);
+
+        let batch = encode_operation_batch(
+            vec![
+                encode_create_task(&create, &fragment, Vec::new()),
+                encode_cancel_task(cancel),
+                encode_renew_lease(&renew),
+                encode_release_query_context(release),
+            ],
+            TransportBudget::DEFAULT,
+        )
+        .expect("inside the transport budget");
+
+        let decoded =
+            decode_operation_batch(&batch, TransportBudget::DEFAULT, FieldPath::root("batch"))
+                .expect("what was encoded must decode");
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|operation| operation.envelope().operation_id())
+                .collect::<Vec<_>>(),
+            vec![create_id, cancel_id, renew_id, release_id],
+            "operation ids must survive in request order"
+        );
+        assert_eq!(
+            decoded
+                .iter()
+                .map(DecodedOperation::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                OperationKind::CreateTask,
+                OperationKind::CancelTask,
+                OperationKind::UpdateQueryContext,
+                OperationKind::ReleaseQueryContext,
+            ]
+        );
+        match &decoded[0] {
+            DecodedOperation::CreateTask(create) => {
+                assert_eq!(create.descriptor().identity(), identity);
+                assert_eq!(create.request().context(), context);
+                assert_eq!(create.fragment().plan().fragment_id, 4);
+            }
+            other => panic!("expected a create, got {other:?}"),
+        }
+        match &decoded[2] {
+            DecodedOperation::UpdateQueryContext(command) => {
+                assert!(!command.may_create(), "a renewal never creates a context");
+                assert_eq!(command.context(), context);
+            }
+            other => panic!("expected a context update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_encoded_batch_over_the_budget_is_refused_before_the_wire() {
+        use super::operation::{encode_cancel_task, encode_operation_batch};
+        use novarocks_execution::task_execution::operation::CancelTask;
+
+        let process = backend();
+        let one = encode_cancel_task(CancelTask::new(
+            TaskOperationId::new_v7(),
+            identity(2, 3, process),
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let over = vec![one; TransportBudget::DEFAULT.max_batch_items() + 1];
+        assert_eq!(
+            encode_operation_batch(over, TransportBudget::DEFAULT)
+                .expect_err("over the item budget")
+                .kind(),
+            ProtocolErrorKind::OutOfRange,
+            "the sender refuses its own oversized batch rather than shipping it"
+        );
+        assert!(
+            encode_operation_batch(Vec::new(), TransportBudget::DEFAULT).is_err(),
+            "an empty batch is not a batch on either side"
+        );
+    }
+
+    #[test]
+    fn a_credential_receipt_reports_its_lease_and_epoch() {
+        use super::operation::encode_query_context_domain_receipt;
+        use novarocks_execution::task_execution::domain::{CredentialLeaseId, DomainProgression};
+        use novarocks_execution::task_execution::operation::QueryContextDomainReceipt;
+
+        let receipt = QueryContextDomainReceipt::Credential {
+            lease_id: CredentialLeaseId::new(7),
+            accepted_epoch: CredentialEpoch::new(4).expect("nonzero"),
+            progression: DomainProgression::Apply,
+        };
+        let encoded = encode_query_context_domain_receipt(&receipt);
+        match encoded.receipt.expect("a receipt body") {
+            novarocks::query_context_domain_receipt::Receipt::Credential(credential) => {
+                assert_eq!(
+                    credential.lease_id, 7,
+                    "the lease must be reported, not zero"
+                );
+                assert_eq!(credential.accepted_epoch, 4);
+            }
+            other => panic!("expected a credential receipt, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_domain_version_may_skip_values_but_a_credential_epoch_may_not() {
         assert!(DomainVersion::new(9).is_ok());
