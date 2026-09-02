@@ -87,12 +87,6 @@ impl fmt::Display for DomainRejection {
     }
 }
 
-/// One classified domain update, ready to be applied.
-struct Classified<'a> {
-    update: &'a TaskDomainUpdate,
-    progression: DomainProgression,
-}
-
 /// Rejects an update naming something the frozen descriptor does not contain.
 ///
 /// This is the structural half of creation validation: an initial domain that
@@ -133,45 +127,78 @@ pub(super) fn validate_membership(
     Ok(())
 }
 
-/// Applies one operation's domain updates, or none of them.
+/// Classifies one operation's domain updates without applying anything.
+///
+/// It runs against a copy, so two batches for the same plan node inside one
+/// request are judged in order while nothing is committed. The result decides
+/// which updates the execution side is asked to apply.
+pub(super) fn plan_updates(
+    descriptor: &TaskDescriptor,
+    domains: &TaskDomains,
+    updates: &[TaskDomainUpdate],
+) -> Result<Vec<DomainProgression>, DomainRejection> {
+    validate_membership(descriptor, updates)?;
+    let mut speculative = domains.clone();
+    updates
+        .iter()
+        .map(|update| classify(&mut speculative, update))
+        .collect()
+}
+
+/// Applies one operation's domain updates to the authoritative token state.
+///
+/// Every update is re-classified here, against the tokens as they are now
+/// rather than as they were when the plan was made. That is what keeps two
+/// concurrent advances from rolling a token backwards: an operation whose
+/// version was overtaken while the execution side was applying finds itself
+/// `Older` and commits nothing.
+pub(super) fn commit_updates(
+    domains: &mut TaskDomains,
+    updates: &[TaskDomainUpdate],
+) -> Result<(Vec<TaskDomainReceipt>, bool), DomainRejection> {
+    let mut receipts = Vec::with_capacity(updates.len());
+    let mut applied_any = false;
+    for update in updates {
+        let mut speculative = domains.clone();
+        let progression = classify(&mut speculative, update)?;
+        applied_any |= matches!(progression, DomainProgression::Apply);
+        receipts.push(commit(domains, update, progression));
+    }
+    Ok((receipts, applied_any))
+}
+
+/// Classifies, applies through the execution side, then commits.
+///
+/// This is the single-threaded form, for a task identity a creation
+/// transaction still owns exclusively.
 pub(super) fn apply_updates(
     host: &dyn TaskExecutionHost,
     descriptor: &TaskDescriptor,
     domains: &mut TaskDomains,
     updates: &[TaskDomainUpdate],
 ) -> Result<(Vec<TaskDomainReceipt>, bool), DomainRejection> {
-    validate_membership(descriptor, updates)?;
+    let plan = plan_updates(descriptor, domains, updates)?;
+    apply_planned(host, descriptor, updates, &plan)?;
+    commit_updates(domains, updates)
+}
 
-    // Pass one classifies against a speculative copy so that two batches for
-    // the same plan node inside one request are judged in order, without any
-    // of them being committed yet.
-    let mut speculative = domains.clone();
-    let mut classified = Vec::with_capacity(updates.len());
-    for update in updates {
-        let progression = classify(&mut speculative, update)?;
-        classified.push(Classified {
-            update,
-            progression,
-        });
-    }
-
-    // The execution side applies before any token moves. A rejection here
-    // leaves every token exactly where it was, so the identical request stays
-    // a clean replay instead of a partially advanced domain.
-    for entry in &classified {
-        if matches!(entry.progression, DomainProgression::Apply) {
-            host.apply_task_domain(descriptor, entry.update)
+/// Asks the execution side to apply exactly the updates the plan accepted.
+///
+/// A rejection here leaves every token where it was, so the identical request
+/// stays a clean replay instead of a partially advanced domain.
+pub(super) fn apply_planned(
+    host: &dyn TaskExecutionHost,
+    descriptor: &TaskDescriptor,
+    updates: &[TaskDomainUpdate],
+    plan: &[DomainProgression],
+) -> Result<(), DomainRejection> {
+    for (update, progression) in updates.iter().zip(plan) {
+        if matches!(progression, DomainProgression::Apply) {
+            host.apply_task_domain(descriptor, update)
                 .map_err(rejection_from_host)?;
         }
     }
-
-    let mut receipts = Vec::with_capacity(classified.len());
-    let mut applied_any = false;
-    for entry in classified {
-        applied_any |= matches!(entry.progression, DomainProgression::Apply);
-        receipts.push(commit(domains, entry.update, entry.progression));
-    }
-    Ok((receipts, applied_any))
+    Ok(())
 }
 
 fn rejection_from_host(rejection: HostRejection) -> DomainRejection {

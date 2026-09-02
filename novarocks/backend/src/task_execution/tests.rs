@@ -297,6 +297,8 @@ struct FakeTaskHost {
     fail_capability: AtomicBool,
     fail_submit: AtomicBool,
     fail_task_domain: AtomicBool,
+    /// Held inside `submit_runnable`, after every install has succeeded.
+    submit_gate: Arc<HostGate>,
     ignore_stand_down: Arc<AtomicBool>,
     arrivals: AtomicUsize,
     /// `install_receiver` waits until this many creates have arrived, which is
@@ -314,6 +316,7 @@ impl FakeTaskHost {
             fail_capability: AtomicBool::new(false),
             fail_submit: AtomicBool::new(false),
             fail_task_domain: AtomicBool::new(false),
+            submit_gate: Arc::new(HostGate::opened()),
             ignore_stand_down: Arc::new(AtomicBool::new(false)),
             arrivals: AtomicUsize::new(0),
             require_arrivals: AtomicUsize::new(0),
@@ -385,6 +388,7 @@ impl TaskExecutionHost for FakeTaskHost {
         reporter: TaskStatusReporter,
     ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
         self.ledger.submit_attempts.fetch_add(1, Ordering::SeqCst);
+        self.submit_gate.wait();
         if self.fail_submit.load(Ordering::SeqCst) {
             // Nothing is allocated and no worker exists: this is the only
             // step that could have started one.
@@ -2016,5 +2020,113 @@ fn an_uncooperative_task_is_terminated_after_the_termination_grace() {
             .final_status()
             .state(),
         TaskState::Aborted
+    );
+}
+
+#[test]
+fn a_create_that_loses_to_an_abort_rolls_back_its_submitted_worker() {
+    let fixture = Fixture::new();
+    let context = fixture.establish(1);
+    let identity = fixture.identity(1, 1, 1);
+
+    // Hold the creation owner inside `submit_runnable`, after both installs
+    // have already succeeded.
+    fixture.task_host.submit_gate.close();
+    let registry = Arc::clone(&fixture.registry);
+    let request = fixture.create_request(identity, 5);
+    let creating = std::thread::spawn(move || registry.create_task(&request));
+    while HostLedger::get(&fixture.ledger.submit_attempts) == 0 {
+        std::thread::yield_now();
+    }
+
+    let abort = fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
+        ));
+    assert_eq!(abort.outcome(), OperationOutcome::Accepted);
+
+    fixture.task_host.submit_gate.open();
+    let created = creating.join().expect("creating thread");
+    assert_eq!(
+        created.outcome(),
+        OperationOutcome::ContextTerminalReceipt,
+        "the abort linearized first, so the create must not install a task"
+    );
+    assert!(created.acknowledgement().is_none());
+
+    // Nothing was left behind: no live task, both installs undone, and the
+    // submitted worker was stood down rather than orphaned.
+    assert!(!fixture.registry.has_live_task(identity));
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.receivers_installed),
+        HostLedger::get(&fixture.ledger.receivers_removed)
+    );
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.capabilities_installed),
+        HostLedger::get(&fixture.ledger.capabilities_removed)
+    );
+    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.aborts), 1);
+    assert_eq!(fixture.registry.counters().creations_rolled_back, 1);
+    assert_eq!(fixture.registry.counters().tasks_created, 0);
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::TerminalRetained
+    );
+}
+
+#[test]
+fn two_concurrent_advances_never_roll_a_shared_token_backwards() {
+    let fixture = Fixture::new();
+    let context = fixture.establish(1);
+
+    let mut handles = Vec::new();
+    for version in [2u64, 3, 4, 5] {
+        let registry = Arc::clone(&fixture.registry);
+        handles.push(std::thread::spawn(move || {
+            registry.update_query_context(&UpdateQueryContext::AdvanceDomain(
+                AdvanceQueryContextDomain::new(
+                    TaskOperationId::new_v7(),
+                    context,
+                    QueryContextDomainUpdate::CatalogBinding {
+                        version: DomainVersion::new(version).expect("nonzero"),
+                        payload: FakeContent::arc(version as u8),
+                    },
+                ),
+            ))
+        }));
+    }
+    for handle in handles {
+        let receipt = handle.join().expect("advance thread");
+        assert!(
+            matches!(
+                receipt.outcome(),
+                OperationOutcome::Accepted | OperationOutcome::Idempotent
+            ),
+            "{receipt:?}"
+        );
+    }
+
+    // Whatever the interleaving, the accepted version is the highest one and
+    // never an earlier writer's.
+    let observed = fixture
+        .registry
+        .update_query_context(&UpdateQueryContext::AdvanceDomain(
+            AdvanceQueryContextDomain::new(
+                TaskOperationId::new_v7(),
+                context,
+                QueryContextDomainUpdate::CatalogBinding {
+                    version: DomainVersion::new(5).expect("nonzero"),
+                    payload: FakeContent::arc(5),
+                },
+            ),
+        ));
+    assert_eq!(
+        observed.outcome(),
+        OperationOutcome::Idempotent,
+        "version five must already be the accepted token"
     );
 }

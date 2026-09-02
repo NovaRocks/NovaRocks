@@ -483,7 +483,7 @@ impl TaskExecutionRegistry {
         };
 
         let receipt = CreateTaskReceipt::new(identity, receipts, status.current());
-        transaction.commit(LiveTask {
+        if let Some(orphan) = transaction.commit(LiveTask {
             descriptor: Arc::clone(&transaction.descriptor),
             fingerprint,
             initial_domains: initial_keys,
@@ -493,7 +493,21 @@ impl TaskExecutionRegistry {
             domains: task_domains,
             receiver_installed: true,
             capability_installed: true,
-        });
+        }) {
+            // The context closed while this task was being built. Stand the
+            // submitted worker down before its handle is dropped, so the
+            // rollback does not leave a thread nothing owns.
+            let cause = self
+                .termination_cause(context)
+                .unwrap_or(AbortCause::QueryFailed);
+            orphan.runnable.abort(cause);
+            orphan.status.force_terminal(cause);
+            return transaction.abandon(
+                operation,
+                OperationOutcome::ContextTerminalReceipt,
+                "the query context closed while this task was being created",
+            );
+        }
         self.counters.tasks_created.fetch_add(1, Ordering::Relaxed);
         OperationReceipt::acknowledged(operation, OperationOutcome::Accepted, receipt)
     }
@@ -708,9 +722,10 @@ impl TaskExecutionRegistry {
         };
         let _scope = OperationScope::enter(self, context, Lane::Mutation);
 
-        // The descriptor and the current domain state are taken under the
-        // lock; the execution-side apply then runs without it.
-        let (descriptor, mut task_domains) = {
+        // The descriptor and a snapshot of the current tokens are taken under
+        // the lock. The snapshot only decides what the execution side is
+        // asked to do; the authoritative tokens are re-classified on commit.
+        let (descriptor, task_domains) = {
             let mut state = self.state.lock().expect(REGISTRY_LOCK);
             let now = self.clock.now();
             self.expire_leases_locked(&mut state, now);
@@ -750,13 +765,8 @@ impl TaskExecutionRegistry {
             }
         };
 
-        let (receipts, applied) = match domains::apply_updates(
-            &*self.task_host,
-            &descriptor,
-            &mut task_domains,
-            request.domains(),
-        ) {
-            Ok(result) => result,
+        let plan = match domains::plan_updates(&descriptor, &task_domains, request.domains()) {
+            Ok(plan) => plan,
             Err(rejection) => {
                 return OperationReceipt::rejected(
                     operation,
@@ -765,20 +775,34 @@ impl TaskExecutionRegistry {
                 );
             }
         };
-
+        if let Err(rejection) =
+            domains::apply_planned(&*self.task_host, &descriptor, request.domains(), &plan)
         {
+            return OperationReceipt::rejected(operation, rejection.outcome(), rejection.detail());
+        }
+
+        let (receipts, applied) = {
             let mut state = self.state.lock().expect(REGISTRY_LOCK);
-            match live_task_mut(&mut state, context, identity) {
-                Some(live) => live.domains = task_domains,
-                None => {
+            let Some(live) = live_task_mut(&mut state, context, identity) else {
+                return OperationReceipt::rejected(
+                    operation,
+                    OperationOutcome::TerminalRejected,
+                    "the task terminated while its update was being applied",
+                );
+            };
+            // Re-classified against the tokens as they are now, so a
+            // concurrent update cannot be rolled back by this one.
+            match domains::commit_updates(&mut live.domains, request.domains()) {
+                Ok(result) => result,
+                Err(rejection) => {
                     return OperationReceipt::rejected(
                         operation,
-                        OperationOutcome::TerminalRejected,
-                        "the task terminated while its update was being applied",
+                        rejection.outcome(),
+                        rejection.detail(),
                     );
                 }
             }
-        }
+        };
         let outcome = if applied {
             OperationOutcome::Accepted
         } else {
@@ -1028,6 +1052,7 @@ impl TaskExecutionRegistry {
             classify_shared_domain(entry, request.domain())
         };
 
+        // A conflict is decided before the execution side is touched at all.
         if let DomainProgression::Conflict(conflict) = progression {
             return OperationReceipt::rejected(
                 operation,
@@ -1055,6 +1080,17 @@ impl TaskExecutionRegistry {
                 "the query context was reclaimed while its domain was advancing",
             );
         };
+        // Re-classified against the accepted token as it is now: an advance
+        // whose version was overtaken while the execution side was applying
+        // finds itself `Older` and commits nothing.
+        let progression = classify_shared_domain(entry, request.domain());
+        if let DomainProgression::Conflict(conflict) = progression {
+            return OperationReceipt::rejected(
+                operation,
+                OperationOutcome::DomainConflict,
+                conflict.to_string(),
+            );
+        }
         if matches!(progression, DomainProgression::Apply) {
             apply_shared_domain(entry, request.domain());
         }
@@ -1067,7 +1103,7 @@ impl TaskExecutionRegistry {
             DomainProgression::Idempotent | DomainProgression::Older => {
                 OperationOutcome::Idempotent
             }
-            DomainProgression::Conflict(_) => unreachable!("conflicts returned above"),
+            DomainProgression::Conflict(_) => unreachable!("conflicts return above"),
         };
         drop(state);
         OperationReceipt::acknowledged(operation, outcome, receipt)
@@ -2371,13 +2407,24 @@ impl CreationTransaction<'_> {
         OperationReceipt::rejected(operation, outcome, detail)
     }
 
-    fn commit(&mut self, live: LiveTask) {
+    /// Installs the task, or hands it back when the context closed underneath
+    /// the transaction.
+    ///
+    /// The installs and the submission ran with the lock released, so an abort
+    /// may have linearized in the meantime. Committing into a closed context
+    /// would leave a live task nothing has agreed to supervise, so the create
+    /// loses the race instead.
+    fn commit(&mut self, live: LiveTask) -> Option<LiveTask> {
         let status = Arc::clone(&live.status);
         {
             let mut state = self.registry.state.lock().expect(REGISTRY_LOCK);
+            let closed = state.context_state(self.context) != QueryContextState::Active;
             let Some(entry) = state.contexts.get_mut(&self.context) else {
-                return;
+                return Some(live);
             };
+            if closed {
+                return Some(live);
+            }
             entry
                 .tasks
                 .insert(self.identity, TaskEntry::Live(Box::new(live)));
@@ -2387,6 +2434,7 @@ impl CreationTransaction<'_> {
         }
         self.committed = true;
         self.registry.gate.notify_all();
+        None
     }
 }
 
