@@ -996,6 +996,54 @@ mod tests {
     }
 
     #[test]
+    fn one_domain_advancing_leaves_every_other_receipt_untouched() {
+        // There is no global revision or digest, so a change in one domain
+        // must be invisible to the others. This is what lets a local retry
+        // conflict without dragging an unrelated domain down with it.
+        let lease = CredentialLeaseId::new(1);
+        let credential = CredentialDomain::install(lease, epoch(4));
+        let catalog = ScalarDomain::empty().apply(version(2), fingerprint(1));
+        let shared_filter = ScalarDomain::empty().apply(version(7), fingerprint(2));
+        let mut splits = SplitDomain::new();
+        splits.set_watermark(
+            node(3),
+            SplitWatermark::empty().apply_batch(sequence(5), false),
+        );
+
+        let advanced_credential = credential.apply_refresh(epoch(5));
+        assert_eq!(advanced_credential.accepted_epoch(), epoch(5));
+        assert_eq!(
+            catalog.accepted_version(),
+            Some(version(2)),
+            "the catalog receipt must not move when a credential rotates"
+        );
+        assert_eq!(shared_filter.accepted_version(), Some(version(7)));
+        assert_eq!(
+            splits.watermark(node(3)).accepted_through(),
+            Some(sequence(5))
+        );
+
+        // And the reverse: a conflicting catalog advance leaves the credential
+        // epoch and the split watermark exactly where they were.
+        assert_eq!(
+            catalog.classify(version(2), fingerprint(9)),
+            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+        );
+        assert_eq!(advanced_credential.accepted_epoch(), epoch(5));
+        assert_eq!(
+            splits.watermark(node(3)).accepted_through(),
+            Some(sequence(5))
+        );
+
+        // A sealed split node does not seal anything else.
+        let mut sealed = splits.clone();
+        sealed.set_watermark(node(3), sealed.watermark(node(3)).apply_no_more());
+        assert!(sealed.watermark(node(3)).no_more_splits());
+        assert!(!sealed.watermark(node(7)).no_more_splits());
+        assert!(!catalog.is_sealed());
+    }
+
+    #[test]
     fn credential_domain_accepts_only_the_exact_next_epoch() {
         let lease = CredentialLeaseId::new(11);
         let domain = CredentialDomain::install(lease, epoch(4));

@@ -627,6 +627,52 @@ mod tests {
     }
 
     #[test]
+    fn a_clamped_lease_is_scheduled_from_the_effective_duration_not_the_requested_one() {
+        // This is the trap the contract exists to close. A frontend that asks
+        // for 600 seconds and schedules from its own request would renew long
+        // after the backend has already expired the lease and torn the query
+        // down.
+        let requested = valid_for(600);
+        let installed = InstalledLease::install_initial(requested, LeaseBounds::DEFAULT, at(100));
+        let effective = installed.receipt().effective_valid_for();
+        assert_eq!(effective, Duration::from_secs(30));
+        assert_eq!(installed.expires_at(), at(130));
+
+        let schedule = RenewSchedule::after(at(100), effective);
+        assert_eq!(schedule.conservative_expiry(), at(130));
+        assert!(schedule.next_renew_at() < installed.expires_at());
+
+        let scheduled_from_request = RenewSchedule::after(at(100), requested.get());
+        assert!(
+            scheduled_from_request.next_renew_at() > installed.expires_at(),
+            "scheduling from the requested duration would renew after expiry"
+        );
+    }
+
+    #[test]
+    fn renewal_scheduling_never_reads_a_clock_it_does_not_own() {
+        // The schedule is a pure function of the frontend's own send time and
+        // the returned effective duration. Response latency therefore cannot
+        // be mistaken for extra lease lifetime: a slow ack shortens the
+        // remaining window rather than extending the deadline.
+        let effective = Duration::from_secs(5);
+        let sent_at = at(100);
+        let schedule = RenewSchedule::after(sent_at, effective);
+
+        let ack_arrived_late = at(103);
+        assert!(
+            schedule.must_renew_at(ack_arrived_late),
+            "an ack that arrives past the scheduled point must renew immediately"
+        );
+        assert_eq!(schedule.delay_from(ack_arrived_late), Duration::ZERO);
+        assert_eq!(
+            schedule.conservative_expiry(),
+            at(105),
+            "expiry is measured from the send, not from the ack"
+        );
+    }
+
+    #[test]
     fn request_horizon_is_one_hundred_and_twenty_seconds() {
         let horizon = RequestHorizon::DEFAULT;
         assert_eq!(horizon.total(), Duration::from_secs(120));
