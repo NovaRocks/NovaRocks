@@ -88,7 +88,7 @@ mod tests {
     };
     use novarocks_execution::task_execution::lease::{LeaseReceipt, LeaseSequence, LeaseValidFor};
     use novarocks_execution::task_execution::operation::{
-        OperationKind, OperationOutcome, TransportBudget,
+        OperationKind, OperationOutcome, ReleaseOutcome, TransportBudget,
     };
     use novarocks_execution::task_execution::status::{
         AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
@@ -1673,7 +1673,10 @@ mod tests {
 
     #[test]
     fn a_terminated_context_reports_why_rather_than_dropping_it() {
-        use super::operation::{decode_query_context_ack, encode_query_context_ack};
+        use super::operation::{
+            decode_query_context_ack, decode_release_ack, encode_query_context_ack,
+            encode_release_ack,
+        };
         use novarocks_execution::task_execution::operation::QueryContextReceipt;
 
         // The cause is the only statement of why a context the frontend still
@@ -1689,6 +1692,24 @@ mod tests {
         let (receipt, cause) =
             decode_query_context_ack(&ack, ctx, FieldPath::root("ack")).expect("decodes");
         assert_eq!(receipt.state(), QueryContextState::TerminalRetained);
+        assert_eq!(cause, Some(AbortCause::LeaseExpired));
+
+        // The release acknowledgement answers the same question, so it must
+        // not be the one path that validates the cause and throws it away.
+        let mut release = encode_release_ack(
+            ctx,
+            ReleaseOutcome::AlreadyTerminal,
+            QueryContextState::TerminalRetained,
+        )
+        .expect("a terminally retained release encodes");
+        release.termination_cause = Some(super::operation::encode_abort_cause_field(
+            AbortCause::LeaseExpired,
+        ));
+        let (acked, outcome, state, cause) =
+            decode_release_ack(&release, FieldPath::root("ack")).expect("decodes");
+        assert_eq!(acked, ctx);
+        assert_eq!(outcome, ReleaseOutcome::AlreadyTerminal);
+        assert_eq!(state, QueryContextState::TerminalRetained);
         assert_eq!(cause, Some(AbortCause::LeaseExpired));
     }
 }

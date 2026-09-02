@@ -366,12 +366,20 @@ fn decode_ack(
             proto::task_operation_receipt::Ack::ReleaseQueryContext(ack),
             AckAddress::Context(context),
         ) => {
-            let (acked, outcome, state) =
+            let (acked, outcome, state, cause) =
                 codec::decode_release_ack(ack, path()).map_err(|error| error.to_string())?;
             if acked != context {
                 return Err(
                     "a release acknowledgement names a different context than the request"
                         .to_owned(),
+                );
+            }
+            if let Some(cause) = cause {
+                // A release that answers on a terminated context reports why.
+                tracing::info!(
+                    %context,
+                    ?cause,
+                    "release acknowledgement reports a termination cause"
                 );
             }
             Ok(AckPayload::Release {

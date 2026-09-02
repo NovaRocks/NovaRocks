@@ -684,9 +684,12 @@ impl TransportBudget {
     /// The defaults are the frozen contract, but a deployment has to be able
     /// to tighten them and a test has to be able to prove the enforcement
     /// path without manufacturing a 48 MiB payload. The ordering rules are
-    /// what make the bounds a hierarchy rather than four unrelated numbers: a
+    /// what make the bounds a hierarchy rather than ten unrelated numbers: a
     /// descriptor has to fit in a batch, a batch in one query's queue, and
-    /// that queue in the process's.
+    /// that queue in the process's, or the smaller bound makes the larger one
+    /// unreachable. The task counts nest for the same reason — a
+    /// `QueryContextRef` names one query on one backend, so one context's
+    /// tasks are a subset of that backend's.
     #[expect(
         clippy::too_many_arguments,
         reason = "every bound is independent; grouping them would invent a hierarchy the contract does not have"

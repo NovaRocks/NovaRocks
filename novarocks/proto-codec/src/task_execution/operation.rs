@@ -976,11 +976,23 @@ pub fn encode_release_ack(
     })
 }
 
-/// Decodes a release acknowledgement.
+/// Decodes a release acknowledgement, returning the termination cause the
+/// backend reported rather than validating and discarding it.
+///
+/// A release that comes back on a context that was terminated instead of
+/// released carries the only statement of why.
 pub fn decode_release_ack(
     src: &novarocks::ReleaseQueryContextAck,
     path: FieldPath,
-) -> Result<(QueryContextRef, ReleaseOutcome, QueryContextState), ProtocolError> {
+) -> Result<
+    (
+        QueryContextRef,
+        ReleaseOutcome,
+        QueryContextState,
+        Option<novarocks_execution::task_execution::status::AbortCause>,
+    ),
+    ProtocolError,
+> {
     let context = src.query_context.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("query_context"),
@@ -989,11 +1001,12 @@ pub fn decode_release_ack(
     })?;
     let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
     let outcome = decode_release_outcome(src.outcome, path.clone().field("outcome"))?;
-    let state = decode_context_state(src.state, path.field("state"))?;
-    if let Some(cause) = src.termination_cause {
-        let _ = decode_abort_cause(cause, FieldPath::root("termination_cause"))?;
-    }
-    Ok((context, outcome, state))
+    let state = decode_context_state(src.state, path.clone().field("state"))?;
+    let cause = src
+        .termination_cause
+        .map(|cause| decode_abort_cause(cause, path.field("termination_cause")))
+        .transpose()?;
+    Ok((context, outcome, state, cause))
 }
 
 /// Encodes a cancel reason back onto the wire, for a receipt or a status.
