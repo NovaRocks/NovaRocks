@@ -53,20 +53,50 @@ const IO_TIMEOUT_CAP: Duration = Duration::from_secs(30);
 const SHALLOW_QUERY: &str =
     "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3) t ORDER BY v";
 
-/// A stacked-exchange plan. Each grouped level adds a shuffle above the last,
-/// so the control plane has to build a deeper fragment chain for the same
-/// trivial amount of data. The row count stays tiny on purpose: this measures
-/// startup, not scan throughput.
-const DEEP_QUERY: &str = "\
-SELECT SUM(total) AS grand_total FROM ( \
-  SELECT k3, SUM(total) AS total FROM ( \
-    SELECT k2 AS k3, SUM(total) AS total FROM ( \
-      SELECT k1 AS k2, SUM(v) AS total FROM ( \
-        SELECT 1 AS k1, 1 AS v UNION ALL SELECT 2, 2 UNION ALL SELECT 1, 3 UNION ALL SELECT 2, 4 \
-      ) leaf GROUP BY k1 \
-    ) level_one GROUP BY k2 \
-  ) level_two GROUP BY k3 \
-) level_three";
+/// Candidate deep fixtures, measured rather than assumed.
+///
+/// Which shape actually stacks exchanges is the optimizer's decision, not this
+/// scenario's: grouping every level on the same key lets it keep one
+/// partitioning and collapse the chain. So the scenario explains every
+/// candidate, picks the one that really is deepest, and records what it
+/// picked. That keeps the pair honest across optimizer changes instead of
+/// silently measuring a flat plan under a name that claims depth.
+///
+/// Every candidate stays tiny on purpose: this measures startup, not scan
+/// throughput. Each must return at least one row so there is a first row to
+/// time.
+const DEEP_CANDIDATES: &[(&str, &str)] = &[
+    (
+        "regrouped-levels",
+        "SELECT SUM(c3) AS total FROM ( \
+           SELECT g3, SUM(c2) AS c3 FROM ( \
+             SELECT k2 % 3 AS g3, SUM(c1) AS c2 FROM ( \
+               SELECT k1 * 7 AS k2, SUM(v) AS c1 FROM ( \
+                 SELECT 1 AS k1, 1 AS v UNION ALL SELECT 2, 2 UNION ALL \
+                 SELECT 3, 3 UNION ALL SELECT 4, 4 UNION ALL SELECT 5, 5 \
+               ) leaf GROUP BY k1 \
+             ) lvl1 GROUP BY k2 % 3 \
+           ) lvl2 GROUP BY g3 \
+         ) lvl3",
+    ),
+    (
+        "distinct-then-regroup",
+        "SELECT COUNT(*) AS total FROM ( \
+           SELECT DISTINCT k % 2 AS g FROM ( \
+             SELECT DISTINCT k * 3 AS k FROM ( \
+               SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 \
+             ) leaf \
+           ) lvl1 \
+         ) lvl2",
+    ),
+    (
+        "shuffle-join-chain",
+        "SELECT COUNT(*) AS total FROM \
+           (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) a \
+           JOIN (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) b ON a.k = b.k \
+           JOIN (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) c ON b.k = c.k",
+    ),
+];
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(StartupBaseline)]
@@ -103,10 +133,31 @@ impl Scenario for StartupBaseline {
             mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
         context.action("connected through the public MySQL protocol");
 
-        let mut reports = Vec::new();
-        for (name, query) in [("shallow", SHALLOW_QUERY), ("deep", DEEP_QUERY)] {
+        let shallow_shape = measure_plan_shape(&mut connection, SHALLOW_QUERY)
+            .context("explain the shallow fixture")?;
+
+        // Pick the candidate the optimizer actually plans deepest, and record
+        // how deep every candidate came out.
+        let mut candidates = Vec::with_capacity(DEEP_CANDIDATES.len());
+        for (name, query) in DEEP_CANDIDATES {
             let shape = measure_plan_shape(&mut connection, query)
-                .with_context(|| format!("explain the {name} fixture"))?;
+                .with_context(|| format!("explain the {name} deep candidate"))?;
+            context.action(format!(
+                "deep candidate {name}: {} plan fragments, {} exchange levels",
+                shape.plan_fragments, shape.exchange_levels
+            ));
+            candidates.push((*name, *query, shape));
+        }
+        let deepest = candidates
+            .into_iter()
+            .max_by_key(|(_, _, shape)| (shape.exchange_levels, shape.plan_fragments))
+            .expect("the candidate list is not empty");
+
+        let mut reports = Vec::new();
+        for (name, query, shape) in [
+            ("shallow", SHALLOW_QUERY, shallow_shape),
+            (deepest.0, deepest.1, deepest.2),
+        ] {
             let report = measure_fixture(context, &mut connection, name, query, shape)?;
             context.action(format!(
                 "measured {name}: {} plan fragments, {} exchange levels, median first row {:?}, median total {:?}",
@@ -126,8 +177,10 @@ impl Scenario for StartupBaseline {
         let deep = &reports[1];
         ensure!(
             deep.exchange_levels > shallow.exchange_levels,
-            "the deep fixture must stack more exchange levels than the shallow one, \
-             got deep={} shallow={}; the pair no longer measures plan depth",
+            "no deep candidate stacks more exchange levels than the shallow fixture \
+             (deepest was {} with {} levels against {}), so the pair would not measure \
+             plan depth. Add a candidate the optimizer cannot flatten.",
+            deep.name,
             deep.exchange_levels,
             shallow.exchange_levels
         );
@@ -172,9 +225,11 @@ struct PlanShape {
 }
 
 fn measure_plan_shape(connection: &mut mysql::Conn, query: &str) -> Result<PlanShape> {
+    // Only the detailed levels label fragments; plain `EXPLAIN` prints the
+    // operator tree without the `PLAN FRAGMENT` headers this counts.
     let lines: Vec<String> = connection
-        .query(format!("EXPLAIN {query}"))
-        .context("EXPLAIN the fixture")?;
+        .query(format!("EXPLAIN VERBOSE {query}"))
+        .context("EXPLAIN VERBOSE the fixture")?;
     let plan_fragments = lines
         .iter()
         .filter(|line| line.contains("PLAN FRAGMENT"))
@@ -185,7 +240,14 @@ fn measure_plan_shape(connection: &mut mysql::Conn, query: &str) -> Result<PlanS
         .count();
     ensure!(
         plan_fragments > 0,
-        "EXPLAIN produced no plan fragments; the fixture is not distributed"
+        "EXPLAIN VERBOSE produced no plan fragments, so the fixture is not \
+         distributed and there is no startup to measure. Plan was:\n{}",
+        lines
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     Ok(PlanShape {
         plan_fragments,
