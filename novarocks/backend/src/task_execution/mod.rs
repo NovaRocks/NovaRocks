@@ -1,0 +1,72 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The backend-local owner of the native task protocol.
+//!
+//! This module owns query context lifecycle, the task registry and its
+//! creation transaction, per-task status, the observation channel, and
+//! terminal retention. It owns no transport: every entry point takes a neutral
+//! typed request from
+//! `novarocks_execution::task_execution::operation` and returns a neutral
+//! typed receipt, so it is fully drivable by an in-process caller and a
+//! transport adapter adds only encoding.
+//!
+//! ```text
+//! caller (transport adapter, or a test's fake caller)
+//!   `- TaskExecutionRegistry ------ QueryContextHost   (shared facts)
+//!        |                     `--- TaskExecutionHost  (receiver, capability, runnable)
+//!        |
+//!        +-- TaskStatusOwner  (one per task: the only status serializer)
+//!        `-- TaskStatusSource (one per context: the observation channel)
+//! ```
+//!
+//! Nothing here is wired into a running backend yet. The composition that
+//! routes real traffic through it, and the retirement of the fragment-based
+//! lifecycle stack it replaces, are separate steps.
+
+mod clock;
+mod domains;
+mod entry;
+mod host;
+mod observation;
+mod receipt;
+mod registry;
+mod status;
+
+#[cfg(test)]
+mod tests;
+
+pub use clock::{BackendMonotonicClock, ManualClock, ProcessMonotonicClock};
+pub use host::{
+    HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskDynamicFilterRead,
+    TaskExecutionHost,
+};
+pub use observation::{
+    CursorObservation, TaskStatusEvent, TaskStatusSource, TaskStatusSourceStats,
+};
+pub use receipt::{
+    CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome, FinalTaskInfoOutcome,
+    OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
+    UpdateTaskOutcome,
+};
+pub use registry::{
+    DeadlineSweep, RegistryCounters, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+};
+pub use status::{
+    METRIC_PUBLISH_MIN_INTERVAL, StatusAdvance, TaskMetricsSink, TaskStatusOwner,
+    TaskStatusReporter,
+};
