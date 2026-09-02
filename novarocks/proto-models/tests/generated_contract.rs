@@ -1352,8 +1352,18 @@ fn a_credential_domain_separates_descriptors_from_envelopes() {
     let domain = pool
         .get_message_by_name("novarocks.QueryContextCredentialDomain")
         .expect("QueryContextCredentialDomain descriptor");
-    assert!(domain.get_field_by_name("descriptors").expect("descriptors").is_list());
-    assert!(domain.get_field_by_name("envelopes").expect("envelopes").is_list());
+    assert!(
+        domain
+            .get_field_by_name("descriptors")
+            .expect("descriptors")
+            .is_list()
+    );
+    assert!(
+        domain
+            .get_field_by_name("envelopes")
+            .expect("envelopes")
+            .is_list()
+    );
     assert!(domain.get_field_by_name("epoch").is_some());
 
     let receipt = pool
