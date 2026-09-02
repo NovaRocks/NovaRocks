@@ -30,11 +30,13 @@
 //! domain's payload fails closed here instead of being misread one layer down.
 //! Nothing else in the backend may name a wire type to get at a payload.
 
+use novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan;
 use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
 use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_execution::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::catalog::CatalogSet;
+use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
 use novarocks_proto_codec::task_execution::domain::{
     WireCredential, encode_task_dynamic_filter_domain, stored_credential, stored_message,
 };
@@ -120,6 +122,20 @@ pub fn encode_dynamic_filter_read(
     })
 }
 
+/// Recovers the encoded fragment plan a descriptor carries.
+///
+/// A descriptor's plan is an `Arc<dyn PhysicalFragmentPlan>` that answers only
+/// the contract version and the sink kind, because those are the only
+/// questions the neutral layer may ask of a physical plan. Submitting one
+/// needs the generated message itself, and only the crate that produced it can
+/// name that type. A plan this backend did not receive over its own codec is
+/// refused rather than guessed at.
+pub fn fragment_plan(plan: &dyn PhysicalFragmentPlan) -> Result<&WireFragmentPlan, HostRejection> {
+    plan.stored_representation()
+        .and_then(|stored| stored.downcast_ref::<WireFragmentPlan>())
+        .ok_or_else(|| internal("task descriptor plan is not a codec-produced fragment plan"))
+}
+
 /// The version a projection will report, without building it.
 ///
 /// A caller that has to decide an outcome before encoding needs this; encoding
@@ -150,7 +166,8 @@ fn protocol(detail: &str) -> HostRejection {
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog_bindings, credential_material, encode_dynamic_filter_read, runtime_filter_install,
+        catalog_bindings, credential_material, encode_dynamic_filter_read, fragment_plan,
+        runtime_filter_install,
     };
 
     use std::sync::Arc;
@@ -291,5 +308,73 @@ mod tests {
         let rendered = format!("{update:?}");
         assert!(!rendered.contains(SECRET_SENTINEL), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn a_descriptor_plan_projects_back_only_when_this_codec_produced_it() {
+        use novarocks_execution::exec::fragment::program::{
+            FragmentContractVersion, FragmentSinkKind,
+        };
+        use novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan;
+        use novarocks_execution::task_execution::domain::ContentFingerprint;
+        use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
+        use novarocks_proto_models::plan;
+
+        let wire = WireFragmentPlan::parse(
+            proto::TaskFragmentPlan {
+                plan: Some(plan::PlanFragment {
+                    fragment_id: 4,
+                    sink: Some(plan::DataSink {
+                        kind: Some(plan::data_sink::Kind::Result(true)),
+                    }),
+                    ..Default::default()
+                }),
+                instance_params: Some(proto::InstanceParams {
+                    fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
+                        hi: 11,
+                        lo: 12,
+                    }),
+                    ..Default::default()
+                }),
+            },
+            FieldPath::root("plan"),
+        )
+        .expect("a legal fragment plan");
+
+        // Through the neutral handle, which is how a descriptor carries it.
+        let handle: Arc<dyn PhysicalFragmentPlan> = Arc::new(wire);
+        let recovered = fragment_plan(handle.as_ref()).expect("this codec produced it");
+        assert_eq!(recovered.plan().fragment_id, 4);
+        assert_eq!(
+            recovered
+                .instance_params()
+                .fragment_instance_id
+                .as_ref()
+                .map(|id| (id.hi, id.lo)),
+            Some((11, 12))
+        );
+
+        // A plan this backend did not receive over its own codec cannot be
+        // submitted, and saying so is better than guessing at its shape.
+        #[derive(Debug)]
+        struct ForeignPlan;
+        impl CodecOwnedContent for ForeignPlan {
+            fn fingerprint(&self) -> ContentFingerprint {
+                ContentFingerprint::from_bytes([0x5a; 16])
+            }
+            fn encoded_len(&self) -> usize {
+                1
+            }
+        }
+        impl PhysicalFragmentPlan for ForeignPlan {
+            fn contract_version(&self) -> FragmentContractVersion {
+                FragmentContractVersion::CURRENT
+            }
+            fn sink_kind(&self) -> FragmentSinkKind {
+                FragmentSinkKind::Result
+            }
+        }
+        let foreign: Arc<dyn PhysicalFragmentPlan> = Arc::new(ForeignPlan);
+        assert!(fragment_plan(foreign.as_ref()).is_err());
     }
 }

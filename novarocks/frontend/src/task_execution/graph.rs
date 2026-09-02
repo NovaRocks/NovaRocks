@@ -62,9 +62,21 @@ pub struct FragmentPlanFacts {
     pub pipeline_dop: NonZeroUsize,
 }
 
-/// Where a fragment's physical plan comes from.
+/// Where a fragment instance's physical plan comes from.
+///
+/// Keyed by instance, not by fragment. The encoded plan carries this
+/// instance's own parameters -- its fragment instance id, its destinations,
+/// its per-exchange sender counts -- and the backend refuses a descriptor
+/// whose plan names a different instance than the descriptor does. Sharing one
+/// encoding across a fragment's instances would therefore be rejected for
+/// every instance but one, which is every non-root fragment on a multi-backend
+/// cluster.
 pub trait FragmentPlanSource {
-    fn plan_for(&self, fragment_id: FragmentId) -> Result<FragmentPlanFacts, TaskExecutionError>;
+    fn plan_for(
+        &self,
+        fragment_id: FragmentId,
+        instance_index: usize,
+    ) -> Result<FragmentPlanFacts, TaskExecutionError>;
 }
 
 /// Immutable per-task facts, ids only.
@@ -475,15 +487,15 @@ pub fn build_task_graph(
 
     let mut descriptors = BTreeMap::<TaskId, TaskDescriptor>::new();
     for (&fragment_id, placements) in inputs.placements {
-        let facts = plans.plan_for(fragment_id)?;
-        if facts.plan.encoded_len() > inputs.transport_budget.max_descriptor_encoded_bytes() {
-            return Err(CapacityBound::DescriptorBytes {
-                limit: inputs.transport_budget.max_descriptor_encoded_bytes(),
-                actual: facts.plan.encoded_len(),
-            }
-            .into());
-        }
         for placement in placements {
+            let facts = plans.plan_for(fragment_id, placement.instance_index)?;
+            if facts.plan.encoded_len() > inputs.transport_budget.max_descriptor_encoded_bytes() {
+                return Err(CapacityBound::DescriptorBytes {
+                    limit: inputs.transport_budget.max_descriptor_encoded_bytes(),
+                    actual: facts.plan.encoded_len(),
+                }
+                .into());
+            }
             let task_id = task_of_instance[&(fragment_id, placement.instance_index)];
             let node = &tasks[&task_id];
             let topology = ExchangeTopology::try_new(

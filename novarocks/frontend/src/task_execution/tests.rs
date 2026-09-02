@@ -21,7 +21,7 @@
 //! sleeps, polls, or reads a wall clock, so a failure is always a real
 //! ordering or bound violation rather than a timing artefact.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -160,9 +160,16 @@ struct FakePlans {
 }
 
 impl FragmentPlanSource for FakePlans {
-    fn plan_for(&self, fragment_id: FragmentId) -> Result<FragmentPlanFacts, TaskExecutionError> {
+    fn plan_for(
+        &self,
+        fragment_id: FragmentId,
+        instance_index: usize,
+    ) -> Result<FragmentPlanFacts, TaskExecutionError> {
+        // Distinct per instance, like the real encoding: two instances of one
+        // fragment do not share a plan handle.
+        let seed = (fragment_id as u8).wrapping_mul(16) ^ (instance_index as u8);
         Ok(FragmentPlanFacts {
-            plan: FakePlan::new(fragment_id as u8, self.plan_bytes),
+            plan: FakePlan::new(seed, self.plan_bytes),
             pipeline_dop: NonZeroUsize::new(2).expect("two is nonzero"),
         })
     }
@@ -302,6 +309,34 @@ fn chain_edges() -> Vec<FragmentEdge> {
         stream_edge(LEAF_FRAGMENT, MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
         stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
     ]
+}
+
+#[test]
+fn every_instance_of_one_fragment_gets_its_own_plan_handle() {
+    // The encoded plan carries this instance's own parameters, and the backend
+    // refuses a descriptor whose plan names a different instance. One handle
+    // shared across a fragment's instances would therefore be rejected for
+    // every instance but one -- which on the 1FE+3BE baseline is every
+    // non-root fragment.
+    let processes = backends(3);
+    let schedule = chain_schedule(&[0, 1, 2], &[0, 1]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+
+    let mut fingerprints = BTreeMap::<TaskId, ContentFingerprint>::new();
+    for task in graph.tasks() {
+        let descriptor = graph
+            .descriptor(task.task_id())
+            .expect("a built graph owns every descriptor");
+        fingerprints.insert(task.task_id(), descriptor.plan().fingerprint());
+    }
+    assert_eq!(fingerprints.len(), 6, "three leaves, two middles, one root");
+
+    let distinct: BTreeSet<ContentFingerprint> = fingerprints.values().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        fingerprints.len(),
+        "two instances of one fragment must not share a plan handle"
+    );
 }
 
 fn build_graph(

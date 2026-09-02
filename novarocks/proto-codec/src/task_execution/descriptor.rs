@@ -165,6 +165,16 @@ impl CodecOwnedContent for WireFragmentPlan {
     fn encoded_len(&self) -> usize {
         self.encoded_len
     }
+
+    /// The stored plan, for the backend that has to decode and run it.
+    ///
+    /// A descriptor hands its plan around as `Arc<dyn PhysicalFragmentPlan>`,
+    /// and that trait answers only the two questions the neutral layer is
+    /// allowed to ask. Without this, the plan could reach the one owner that
+    /// must submit it and still be unusable there.
+    fn stored_representation(&self) -> Option<&(dyn std::any::Any + 'static)> {
+        Some(self)
+    }
 }
 
 impl PhysicalFragmentPlan for WireFragmentPlan {
