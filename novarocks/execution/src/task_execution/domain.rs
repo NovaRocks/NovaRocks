@@ -365,8 +365,19 @@ impl fmt::Display for SplitSequence {
 /// The accepted split watermark of one plan node.
 ///
 /// This reproduces the delivery contract of ADR-0123 exactly: sequences are
-/// consecutive per plan node, an exact replay is idempotent, a gap fails
-/// closed, and nothing may follow `no_more_splits`.
+/// consecutive per plan node, a gap fails closed, and nothing may follow
+/// `no_more_splits`.
+///
+/// One property is deliberately weaker than the rest of this protocol. A
+/// sequence at or below the watermark is a duplicate *regardless of its
+/// content*: the receiver keeps only the watermark, never the payloads it
+/// already accepted, so it cannot tell an exact replay from a sender that
+/// reused a sequence with different content. ADR-0123 recorded that as an
+/// accepted compromise — receiver memory grows with pending work rather than
+/// with delivery history, and a lost acknowledgement stays recoverable on the
+/// existing wire — and treats a reused sequence as a sender bug rather than a
+/// verifiable cross-process guarantee. Adding a content check here would
+/// silently reintroduce the per-split payload evidence that decision removed.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct SplitWatermark {
     accepted_through: Option<SplitSequence>,
@@ -401,25 +412,21 @@ impl SplitWatermark {
     ///
     /// `first` and `last` are the batch's lowest and highest sequences; the
     /// codec already proved the batch is contiguous and strictly increasing.
+    /// Content is deliberately not an input: see the type documentation.
     pub fn classify_batch(
         self,
         first: SplitSequence,
         last: SplitSequence,
         no_more: bool,
-        fingerprint_matches_accepted: bool,
     ) -> DomainProgression {
         if last < first {
             return DomainProgression::Conflict(DomainConflict::NotMonotonic);
         }
         let next_expected = self.next_expected();
         if last.get() < next_expected {
-            // Everything in this batch is at or below the watermark. An exact
-            // replay is idempotent; anything else contradicts accepted data.
-            return if fingerprint_matches_accepted {
-                DomainProgression::Idempotent
-            } else {
-                DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
-            };
+            // Every sequence in this batch is at or below the watermark, so it
+            // enqueues nothing.
+            return DomainProgression::Idempotent;
         }
         if self.no_more {
             return DomainProgression::Conflict(DomainConflict::AfterSeal);
@@ -427,11 +434,8 @@ impl SplitWatermark {
         if first.get() > next_expected {
             return DomainProgression::Conflict(DomainConflict::Gap);
         }
-        if first.get() < next_expected && !fingerprint_matches_accepted {
-            // The batch straddles the watermark: its already-accepted prefix
-            // must be byte-identical to what was accepted before.
-            return DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent);
-        }
+        // A batch straddling the watermark applies its new suffix; the
+        // duplicate prefix is ignored rather than compared.
         let _ = no_more;
         DomainProgression::Apply
     }
@@ -439,10 +443,18 @@ impl SplitWatermark {
     /// Classifies a standalone `no_more_splits` marker.
     pub fn classify_no_more(self, through: Option<SplitSequence>) -> DomainProgression {
         if self.no_more {
-            return if through == self.accepted_through {
-                DomainProgression::Idempotent
-            } else {
-                DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+            // The terminal marker is idempotent. A replay naming an older
+            // watermark is still the same marker, because a sealed node can
+            // never accept anything further.
+            return match through {
+                Some(through)
+                    if self
+                        .accepted_through
+                        .is_some_and(|accepted| through > accepted) =>
+                {
+                    DomainProgression::Conflict(DomainConflict::AfterSeal)
+                }
+                _ => DomainProgression::Idempotent,
             };
         }
         match (through, self.accepted_through) {
@@ -889,11 +901,11 @@ mod tests {
         let empty = SplitWatermark::empty();
         assert_eq!(empty.next_expected(), 1);
         assert_eq!(
-            empty.classify_batch(sequence(1), sequence(3), false, false),
+            empty.classify_batch(sequence(1), sequence(3), false),
             DomainProgression::Apply
         );
         assert_eq!(
-            empty.classify_batch(sequence(2), sequence(3), false, false),
+            empty.classify_batch(sequence(2), sequence(3), false),
             DomainProgression::Conflict(DomainConflict::Gap)
         );
 
@@ -901,31 +913,24 @@ mod tests {
         assert_eq!(accepted.accepted_through(), Some(sequence(3)));
         assert_eq!(accepted.next_expected(), 4);
         assert_eq!(
-            accepted.classify_batch(sequence(1), sequence(3), false, true),
-            DomainProgression::Idempotent
+            accepted.classify_batch(sequence(1), sequence(3), false),
+            DomainProgression::Idempotent,
+            "a replay at or below the watermark enqueues nothing, whatever it carries"
         );
         assert_eq!(
-            accepted.classify_batch(sequence(1), sequence(3), false, false),
-            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+            accepted.classify_batch(sequence(3), sequence(5), false),
+            DomainProgression::Apply,
+            "a straddling batch applies its new suffix and ignores the duplicate prefix"
         );
         assert_eq!(
-            accepted.classify_batch(sequence(3), sequence(5), false, false),
-            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent),
-            "a straddling batch must replay its accepted prefix byte for byte"
-        );
-        assert_eq!(
-            accepted.classify_batch(sequence(3), sequence(5), false, true),
-            DomainProgression::Apply
-        );
-        assert_eq!(
-            accepted.classify_batch(sequence(5), sequence(6), false, false),
+            accepted.classify_batch(sequence(5), sequence(6), false),
             DomainProgression::Conflict(DomainConflict::Gap)
         );
 
         let sealed = accepted.apply_no_more();
         assert!(sealed.no_more_splits());
         assert_eq!(
-            sealed.classify_batch(sequence(4), sequence(4), false, false),
+            sealed.classify_batch(sequence(4), sequence(4), false),
             DomainProgression::Conflict(DomainConflict::AfterSeal)
         );
         assert_eq!(
@@ -934,7 +939,8 @@ mod tests {
         );
         assert_eq!(
             sealed.classify_no_more(Some(sequence(4))),
-            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+            DomainProgression::Conflict(DomainConflict::AfterSeal),
+            "a sealed node can never accept a higher watermark"
         );
     }
 

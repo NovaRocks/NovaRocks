@@ -770,8 +770,14 @@ message ConnectorTableScanSource {
 // ---------------------------------------------------------------------------
 
 // One split placed in one task's plan-node queue. `sequence_id` is monotonic
-// within one (task attempt, plan node); an exact replay is idempotent and the
-// same sequence with different canonical bytes is a conflict.
+// within one (task attempt, plan node).
+//
+// A sequence at or below the receiver's accepted watermark is a duplicate and
+// enqueues nothing, regardless of what it carries. The receiver keeps only the
+// watermark, never the payloads it already accepted, so it cannot distinguish
+// an exact replay from a sender that reused a sequence with different content;
+// ADR-0123 recorded that as an accepted compromise and treats a reused
+// sequence as a sender bug rather than a verifiable cross-process guarantee.
 message ScheduledSplit {
   uint64 sequence_id = 1;
   int32 plan_node_id = 2;

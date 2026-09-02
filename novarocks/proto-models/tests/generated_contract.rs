@@ -1040,3 +1040,467 @@ fn retired_write_operation_aggregate_wire_fields_fail_closed() {
     assert_eq!(snapshot.backend_num, 0);
     assert!(snapshot.tablet_commit_infos.is_empty());
 }
+
+/// The type-level separation of create from update is the whole reason this
+/// protocol cannot be misassembled at runtime, so it is asserted on the
+/// descriptor rather than trusted to review. A descriptor is required on
+/// exactly one message, and no update may name one under any field.
+#[test]
+fn the_task_protocol_separates_create_from_update_on_the_descriptor() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    let create = pool
+        .get_message_by_name("novarocks.CreateTaskRequest")
+        .expect("CreateTaskRequest descriptor");
+    let descriptor = create
+        .get_field_by_name("descriptor")
+        .expect("a create carries a descriptor");
+    assert_eq!(
+        descriptor
+            .kind()
+            .as_message()
+            .expect("TaskDescriptor message")
+            .full_name(),
+        "novarocks.TaskDescriptor"
+    );
+    assert!(
+        !descriptor.is_list() && !descriptor.is_map(),
+        "a task is created from exactly one descriptor"
+    );
+    assert!(
+        create.get_field_by_name("query_context").is_some(),
+        "a create must address the query context of its own backend"
+    );
+
+    // Nothing that updates may carry a descriptor, under that name or any
+    // other. Checking the field type as well as the name is what makes this a
+    // contract rather than a naming convention.
+    for message_name in [
+        "novarocks.UpdateTaskRequest",
+        "novarocks.AdvanceQueryContextDomainRequest",
+        "novarocks.RenewQueryExecutionLeaseRequest",
+        "novarocks.EstablishQueryContextRequest",
+        "novarocks.CancelTaskRequest",
+        "novarocks.AbortQueryContextRequest",
+        "novarocks.ReleaseQueryContextRequest",
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        assert!(
+            message.get_field_by_name("descriptor").is_none(),
+            "{message_name} must not carry a descriptor field"
+        );
+        for field in message.fields() {
+            let names_a_descriptor = field
+                .kind()
+                .as_message()
+                .is_some_and(|message| message.full_name() == "novarocks.TaskDescriptor");
+            assert!(
+                !names_a_descriptor,
+                "{message_name}.{} must not name a TaskDescriptor",
+                field.name()
+            );
+        }
+    }
+}
+
+/// Only an establish may create a query context, and the command set that can
+/// reach a context is closed.
+#[test]
+fn the_task_operation_and_query_context_command_sets_are_closed() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    for (message_name, oneof_name, expected_variants) in [
+        (
+            "novarocks.TaskOperation",
+            "operation",
+            &[
+                "create_task",
+                "update_task",
+                "update_query_context",
+                "cancel_task",
+                "abort_query_context",
+                "release_query_context",
+            ][..],
+        ),
+        (
+            "novarocks.UpdateQueryContextRequest",
+            "command",
+            &["establish", "advance_domain", "renew_lease"][..],
+        ),
+        (
+            "novarocks.TaskDomainUpdate",
+            "domain",
+            &["split_assignment", "dynamic_filter", "open_exchange_edges"][..],
+        ),
+        (
+            "novarocks.QueryContextDomainUpdate",
+            "domain",
+            &["catalog_binding", "shared_dynamic_filter", "credential"][..],
+        ),
+        (
+            "novarocks.TaskTermination",
+            "cause",
+            &["canceled", "aborted", "failed"][..],
+        ),
+        (
+            "novarocks.TaskStatusStreamEvent",
+            "event",
+            &["task_status", "task_gone"][..],
+        ),
+        (
+            "novarocks.TaskDomainReceipt",
+            "receipt",
+            &["split_assignment", "dynamic_filter", "open_exchange_edges"][..],
+        ),
+        (
+            "novarocks.QueryContextDomainReceipt",
+            "receipt",
+            &["catalog_binding", "shared_dynamic_filter", "credential"][..],
+        ),
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        let oneof = message
+            .oneofs()
+            .find(|oneof| oneof.name() == oneof_name)
+            .unwrap_or_else(|| panic!("{message_name} must declare the {oneof_name} oneof"));
+        let variants = oneof
+            .fields()
+            .map(|field| field.name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            variants, expected_variants,
+            "{message_name}.{oneof_name} variant set changed"
+        );
+    }
+}
+
+/// A frozen exchange endpoint carries both addresses. The task identity is the
+/// process fence; the fragment instance id is what an actual exchange frame
+/// carries. Losing either one makes a frame uncheckable.
+#[test]
+fn the_task_exchange_topology_freezes_both_addresses() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    for message_name in [
+        "novarocks.TaskExchangeDestination",
+        "novarocks.TaskExchangeSource",
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        assert_eq!(
+            message
+                .get_field_by_name("task")
+                .expect("the protocol fence")
+                .kind()
+                .as_message()
+                .expect("TaskIdentity message")
+                .full_name(),
+            "novarocks.TaskIdentity",
+            "{message_name} must be fenced by an exact task identity"
+        );
+        assert_eq!(
+            message
+                .get_field_by_name("fragment_instance_id")
+                .expect("the kernel key")
+                .kind()
+                .as_message()
+                .expect("UniqueId message")
+                .full_name(),
+            "novarocks.common.UniqueId",
+            "{message_name} must carry the kernel key an exchange frame uses"
+        );
+    }
+
+    // The sender count of an inbound node is its frozen source set, so there
+    // is deliberately no separate count field that could disagree with it.
+    let inbound = pool
+        .get_message_by_name("novarocks.TaskExchangeInbound")
+        .expect("TaskExchangeInbound descriptor");
+    assert!(
+        inbound.get_field_by_name("expected_sender_count").is_none(),
+        "the source set is the sender count; a second field could disagree"
+    );
+    assert!(
+        inbound
+            .get_field_by_name("sources")
+            .expect("frozen source set")
+            .is_list()
+    );
+}
+
+/// A status snapshot advertises a dynamic filter version and never carries its
+/// payload, so a large filter cannot inflate the lifecycle channel.
+#[test]
+fn a_task_status_advertises_a_filter_version_but_never_a_payload() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let status = pool
+        .get_message_by_name("novarocks.TaskStatus")
+        .expect("TaskStatus descriptor");
+    assert!(status.get_field_by_name("dynamic_filter_version").is_some());
+    assert!(
+        status
+            .get_field_by_name("dynamic_filter_domain_count")
+            .is_some()
+    );
+    for field in status.fields() {
+        if let Some(message) = field.kind().as_message() {
+            assert_ne!(
+                message.full_name(),
+                "novarocks.filter.RuntimeFilterEnvelope",
+                "TaskStatus.{} must not carry a filter payload",
+                field.name()
+            );
+        }
+        assert!(
+            !matches!(field.kind(), prost_reflect::Kind::Bytes),
+            "TaskStatus.{} must not carry an opaque payload",
+            field.name()
+        );
+    }
+}
+
+/// Final task info is observation only: bounded, redacted, and free of every
+/// payload that has its own owner and data plane.
+#[test]
+fn final_task_info_carries_no_result_credential_or_commit_payload() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let info = pool
+        .get_message_by_name("novarocks.FinalTaskInfo")
+        .expect("FinalTaskInfo descriptor");
+    assert_eq!(
+        info.get_field_by_name("final_status")
+            .expect("the terminal status it must agree with")
+            .kind()
+            .as_message()
+            .expect("TaskStatus message")
+            .full_name(),
+        "novarocks.TaskStatus"
+    );
+    assert!(
+        info.get_field_by_name("operator_statistics_truncated")
+            .is_some(),
+        "truncation is reported explicitly, never silently"
+    );
+    for field in info.fields() {
+        assert!(
+            !matches!(field.kind(), prost_reflect::Kind::Bytes),
+            "FinalTaskInfo.{} must not carry an opaque payload",
+            field.name()
+        );
+        if let Some(message) = field.kind().as_message() {
+            for forbidden in [
+                "novarocks.CredentialLeaseSecretEnvelope",
+                "novarocks.CredentialLeaseDescriptor",
+                "novarocks.FetchResultResponse",
+            ] {
+                assert_ne!(
+                    message.full_name(),
+                    forbidden,
+                    "FinalTaskInfo.{} must not carry {forbidden}",
+                    field.name()
+                );
+            }
+        }
+    }
+}
+
+/// The root result poll is fenced against an exact task and process, which is
+/// what the fragment-instance-addressed form it replaces could not do.
+#[test]
+fn the_root_result_poll_is_addressed_by_task_identity() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let request = pool
+        .get_message_by_name("novarocks.FetchTaskResultRequest")
+        .expect("FetchTaskResultRequest descriptor");
+    assert_eq!(
+        request
+            .get_field_by_name("root_task")
+            .expect("root task identity")
+            .kind()
+            .as_message()
+            .expect("TaskIdentity message")
+            .full_name(),
+        "novarocks.TaskIdentity"
+    );
+    assert!(
+        request.get_field_by_name("finst_id").is_none(),
+        "the root result is no longer addressed by a fragment instance id"
+    );
+    assert!(
+        request.get_field_by_name("max_wait_millis").is_some(),
+        "the poll budget is a duration the backend times itself"
+    );
+}
+
+/// A credential rotation keeps its non-secret descriptors and its confidential
+/// envelopes in separate fields, and reports back only an epoch.
+#[test]
+fn a_credential_domain_separates_descriptors_from_envelopes() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let domain = pool
+        .get_message_by_name("novarocks.QueryContextCredentialDomain")
+        .expect("QueryContextCredentialDomain descriptor");
+    assert!(domain.get_field_by_name("descriptors").expect("descriptors").is_list());
+    assert!(domain.get_field_by_name("envelopes").expect("envelopes").is_list());
+    assert!(domain.get_field_by_name("epoch").is_some());
+
+    let receipt = pool
+        .get_message_by_name("novarocks.QueryContextCredentialReceipt")
+        .expect("QueryContextCredentialReceipt descriptor");
+    let reported = receipt
+        .fields()
+        .map(|field| field.name().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reported,
+        vec!["lease_id".to_owned(), "accepted_epoch".to_owned()],
+        "a credential receipt reports only an epoch, never material or a digest of it"
+    );
+}
+
+/// The unknown-transport outcome has no server-reported value on purpose: it is
+/// what a client concludes when no receipt arrives at all. Reserving the name
+/// keeps it from being reintroduced as something a backend can claim.
+#[test]
+fn the_operation_outcome_enum_reserves_the_client_only_category() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let outcome = pool
+        .get_enum_by_name("novarocks.TaskOperationOutcome")
+        .expect("TaskOperationOutcome descriptor");
+    assert!(
+        outcome
+            .reserved_names()
+            .any(|name| name == "TASK_OPERATION_OUTCOME_RETRYABLE_TRANSPORT_UNKNOWN"),
+        "the unknown-transport name must stay reserved"
+    );
+    assert!(
+        outcome.reserved_ranges().any(|range| range.contains(&16)),
+        "the unknown-transport value must stay reserved"
+    );
+    // Every remaining value is a real category a backend can report.
+    for expected in [
+        "TASK_OPERATION_OUTCOME_ACCEPTED",
+        "TASK_OPERATION_OUTCOME_IDEMPOTENT",
+        "TASK_OPERATION_OUTCOME_OPERATION_TIMED_OUT",
+        "TASK_OPERATION_OUTCOME_IDENTITY_MISMATCH",
+        "TASK_OPERATION_OUTCOME_CREATE_CONFLICT",
+        "TASK_OPERATION_OUTCOME_DOMAIN_CONFLICT",
+        "TASK_OPERATION_OUTCOME_LEASE_EXPIRED",
+        "TASK_OPERATION_OUTCOME_RELEASE_NOT_READY",
+        "TASK_OPERATION_OUTCOME_GONE",
+        "TASK_OPERATION_OUTCOME_RESOURCE_EXHAUSTED",
+    ] {
+        assert!(
+            outcome.values().any(|value| value.name() == expected),
+            "{expected} must exist"
+        );
+    }
+}
+
+/// A batch is a transport convenience. Its response carries one receipt per
+/// item and no batch-global verdict that could collapse them.
+#[test]
+fn an_operation_batch_has_no_batch_global_outcome() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let request = pool
+        .get_message_by_name("novarocks.ApplyTaskOperationsRequest")
+        .expect("ApplyTaskOperationsRequest descriptor");
+    let request_fields = request
+        .fields()
+        .map(|field| field.name().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(request_fields, vec!["operations".to_owned()]);
+
+    let response = pool
+        .get_message_by_name("novarocks.ApplyTaskOperationsResponse")
+        .expect("ApplyTaskOperationsResponse descriptor");
+    let response_fields = response
+        .fields()
+        .map(|field| field.name().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_fields,
+        vec!["receipts".to_owned()],
+        "a batch response has no shared outcome, revision, or digest"
+    );
+
+    // Every item carries its own envelope, so a batch cannot impose one
+    // deadline or one identity on all of them.
+    let operation = pool
+        .get_message_by_name("novarocks.TaskOperation")
+        .expect("TaskOperation descriptor");
+    assert_eq!(
+        operation
+            .get_field_by_name("envelope")
+            .expect("per-item envelope")
+            .kind()
+            .as_message()
+            .expect("TaskOperationEnvelope message")
+            .full_name(),
+        "novarocks.TaskOperationEnvelope"
+    );
+}
+
+/// Establish installs the shared facts and the initial lease together, and it
+/// deliberately does not carry an expected task manifest or a task set digest.
+#[test]
+fn establish_installs_shared_facts_without_a_task_manifest_or_digest() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let establish = pool
+        .get_message_by_name("novarocks.EstablishQueryContextRequest")
+        .expect("EstablishQueryContextRequest descriptor");
+    for required in [
+        "query_context",
+        "catalog_set",
+        "initial_runtime_filter",
+        "initial_credential",
+        "initial_lease",
+    ] {
+        assert!(
+            establish.get_field_by_name(required).is_some(),
+            "establish must install {required} atomically"
+        );
+    }
+    for forbidden in [
+        "expected_fragment_instance_ids",
+        "expected_task_identities",
+        "task_set_digest",
+        "init_digest",
+        "pre_start_timeout_ms",
+        "report_endpoint",
+        "query_deadline_unix_ms",
+    ] {
+        assert!(
+            establish.get_field_by_name(forbidden).is_none(),
+            "establish must not carry {forbidden}"
+        );
+    }
+
+    let release = pool
+        .get_message_by_name("novarocks.ReleaseQueryContextRequest")
+        .expect("ReleaseQueryContextRequest descriptor");
+    let release_fields = release
+        .fields()
+        .map(|field| field.name().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        release_fields,
+        vec!["query_context".to_owned()],
+        "release is the frontend's closure statement, not a manifest"
+    );
+}
