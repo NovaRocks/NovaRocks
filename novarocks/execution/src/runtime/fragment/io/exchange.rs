@@ -1,6 +1,9 @@
+use std::fmt;
+
 use novarocks_types::UniqueId;
 
 use crate::runtime::endpoint::RuntimeEndpoint;
+use crate::task_execution::status::CancelReason;
 
 use super::FragmentIoError;
 
@@ -21,9 +24,66 @@ pub struct ExchangeFrame {
     pub payload: Vec<u8>,
 }
 
+/// Why a destination refused one exchange frame.
+///
+/// A destination's normal departure and a real failure reach the producer
+/// through the same call, and only one of them is this producer's error. The
+/// enum is closed and keeps [`FragmentIoError`] for everything else, so a
+/// failure can never be reported as a success-compatible cancellation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExchangeTransmitRejection {
+    /// The destination withdrew its ingress capability because it no longer
+    /// needs this producer's output. The producer closes that one edge,
+    /// discards that edge's frames, and waits to be cancelled by its
+    /// coordinator; it never concludes on its own that its stage succeeded.
+    DestinationCanceled(CancelReason),
+    /// Every other outcome: a failed, aborted, finished, or unknown
+    /// destination, an identity, process, source, or edge mismatch, a
+    /// malformed request, and every transport error.
+    Failed(FragmentIoError),
+}
+
+impl ExchangeTransmitRejection {
+    /// The normal cancellation reason, if this is a destination's normal
+    /// departure rather than a failure.
+    pub const fn cancel_reason(&self) -> Option<CancelReason> {
+        match self {
+            Self::DestinationCanceled(reason) => Some(*reason),
+            Self::Failed(_) => None,
+        }
+    }
+
+    /// The producer's own failure cause, if this rejection is one.
+    pub const fn failure(&self) -> Option<&FragmentIoError> {
+        match self {
+            Self::DestinationCanceled(_) => None,
+            Self::Failed(error) => Some(error),
+        }
+    }
+}
+
+impl fmt::Display for ExchangeTransmitRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DestinationCanceled(reason) => {
+                write!(formatter, "exchange destination cancelled: {reason}")
+            }
+            Self::Failed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ExchangeTransmitRejection {}
+
+impl From<FragmentIoError> for ExchangeTransmitRejection {
+    fn from(error: FragmentIoError) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// Host-owned transport boundary for exchange frames.
 pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
-    fn transmit(&self, frame: ExchangeFrame) -> Result<(), FragmentIoError>;
+    fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection>;
 }
 
 #[cfg(test)]
@@ -36,7 +96,7 @@ struct DiscardExchangeFrameTransmitter;
 
 #[cfg(test)]
 impl ExchangeFrameTransmitter for DiscardExchangeFrameTransmitter {
-    fn transmit(&self, _frame: ExchangeFrame) -> Result<(), FragmentIoError> {
+    fn transmit(&self, _frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
         Ok(())
     }
 }

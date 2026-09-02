@@ -121,6 +121,18 @@ pub trait ProcessorOperator: Operator {
 
     fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String>;
 
+    /// Whether `set_finishing` still has work it could not complete.
+    ///
+    /// Default false: for almost every operator, finishing completes in the
+    /// one call the driver makes. An operator that can be legitimately unable
+    /// to finish yet — an exchange sink whose outbound edge has not been
+    /// granted send permission, for instance — reports true so the driver
+    /// retries instead of latching it as done. It must become false on its
+    /// own once the obstacle clears; the driver never forces it.
+    fn finishing_is_pending(&self) -> bool {
+        false
+    }
+
     /// Whether this operator can consume the given column in its current
     /// physical encoding WITHOUT hydration. Default: false - the driver
     /// hydrates every encoded column before `push_chunk`. C1-C4 override

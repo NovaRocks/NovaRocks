@@ -33,8 +33,12 @@ use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactory
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::fragment::io::exchange_queue::{ExchangeSendTask, ExchangeSendTracker};
-use crate::runtime::fragment::io::{ExchangeFrame, ExchangeFrameTransmitter};
+use crate::runtime::fragment::io::{
+    EdgeSendGate, EdgeSendState, ExchangeDestinationKey, ExchangeEdgeGates, ExchangeFrame,
+    ExchangeFrameTransmitter,
+};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
+use crate::task_execution::domain::ExchangeEdgeId;
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
 use novarocks_types::{UniqueId, format_uuid};
@@ -1029,6 +1033,7 @@ pub struct DataStreamSinkFactory {
     plan_node_id: i32,
     finish_state: Arc<DataStreamSinkFinishState>,
     shared_sequence: Arc<AtomicI64>,
+    edge_gates: Option<Arc<ExchangeEdgeGates>>,
 }
 
 impl DataStreamSinkFactory {
@@ -1061,7 +1066,36 @@ impl DataStreamSinkFactory {
             plan_node_id,
             finish_state: Arc::new(DataStreamSinkFinishState::default()),
             shared_sequence: Arc::new(AtomicI64::new(0)),
+            edge_gates: None,
         }
+    }
+
+    /// Installs the send permission of this producer's outbound edges.
+    ///
+    /// Every gated edge starts closed, so nothing is sent on it until the
+    /// frontend opens it. A sink left ungated keeps its ungated behavior,
+    /// which is what the fragment paths that have no frozen edge topology
+    /// still rely on.
+    pub fn with_edge_gates(mut self, gates: Arc<ExchangeEdgeGates>) -> Self {
+        self.edge_gates = Some(gates);
+        self
+    }
+
+    /// The outbound edges a normal downstream cancellation closed, lowest id
+    /// first, so a status producer can report normal downstream cancellation
+    /// rather than a failure. Empty for an ungated sink.
+    pub fn normally_canceled_edges(&self) -> Vec<ExchangeEdgeId> {
+        self.edge_gates
+            .as_ref()
+            .map(|gates| gates.normally_canceled_edges())
+            .unwrap_or_default()
+    }
+
+    /// How many outbound edges a normal downstream cancellation closed.
+    pub fn normally_canceled_edge_count(&self) -> usize {
+        self.edge_gates
+            .as_ref()
+            .map_or(0, |gates| gates.normally_canceled_edge_count())
     }
 }
 
@@ -1156,6 +1190,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             pending_payload_mem_tracker: None,
             send_queue_mem_tracker: None,
             exchange_queue: None,
+            edge_gates: self.edge_gates.clone(),
         })
     }
 
@@ -1177,6 +1212,9 @@ struct PendingPayload {
 enum PayloadEnqueue {
     Enqueued,
     NoCapacity(PendingPayload),
+    /// The destination's edge was closed by a normal downstream cancellation,
+    /// so the payload is dropped rather than parked or sent.
+    Discarded,
 }
 
 struct DataStreamSinkOperator {
@@ -1208,6 +1246,7 @@ struct DataStreamSinkOperator {
     pending_payload_mem_tracker: Option<Arc<MemTracker>>,
     send_queue_mem_tracker: Option<Arc<MemTracker>>,
     exchange_queue: Option<Arc<crate::runtime::fragment::io::exchange_queue::ExchangeSendQueue>>,
+    edge_gates: Option<Arc<ExchangeEdgeGates>>,
 }
 
 impl Operator for DataStreamSinkOperator {
@@ -1321,10 +1360,71 @@ impl DataStreamSinkOperator {
         self.pending_per_dest.iter().map(VecDeque::len).sum()
     }
 
+    /// The gate of one destination's edge.
+    ///
+    /// `Ok(None)` means this sink is ungated. An installed gate set that does
+    /// not know a destination is a topology error, never an implicit
+    /// permission: each destination belongs to exactly one edge, and that is
+    /// what keeps a decision about one edge away from another's destinations.
+    fn destination_gate(
+        &self,
+        dest: &FragmentDestination,
+    ) -> Result<Option<Arc<EdgeSendGate>>, String> {
+        let Some(gates) = self.edge_gates.as_ref() else {
+            return Ok(None);
+        };
+        let key = ExchangeDestinationKey::new(*dest.finst_id(), self.input.dest_node_id);
+        gates
+            .gate_for_destination(key)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "exchange destination {key} is not attributed to any outbound edge of this producer"
+                )
+            })
+    }
+
+    /// The send state of the destination at `idx` for the read-only
+    /// predicates. A destination the gates do not know reports `None`; the
+    /// enqueue path is where that becomes an explicit error.
+    fn destination_state_at(&self, idx: usize) -> Option<EdgeSendState> {
+        let dest = self.destinations().get(idx)?;
+        self.destination_gate(dest).ok()?.map(|gate| gate.state())
+    }
+
+    /// Whether the destination at `idx` abandoned its frames through a normal
+    /// downstream cancellation. Such data is discarded, so it must never hold
+    /// this sink open.
+    fn destination_withdrawn(&self, idx: usize) -> bool {
+        self.destination_state_at(idx) == Some(EdgeSendState::NormallyCanceled)
+    }
+
+    /// Whether any destination this sink still owes output to is waiting for
+    /// its edge to be opened.
+    ///
+    /// A producer whose input drains before the frontend opens its edge is a
+    /// normal race, not a failure: the open follows one round trip after every
+    /// destination acknowledges creation, and a small fragment can finish
+    /// reading in less than that. So finishing waits here rather than failing,
+    /// and the driver retries once the edge opens. A blocked driver is polled,
+    /// so the wait is bounded even without a wake-up.
+    fn awaits_edge_permission(&self) -> bool {
+        self.input
+            .destinations
+            .iter()
+            .enumerate()
+            .any(|(idx, dest)| {
+                !Self::is_pseudo_destination(dest)
+                    && self.destination_state_at(idx) == Some(EdgeSendState::AwaitingPermission)
+            })
+    }
+
     fn has_pending_chunks(&self) -> bool {
         self.pending_per_dest
             .iter()
-            .any(|chunks| !chunks.is_empty())
+            .enumerate()
+            .any(|(idx, chunks)| !chunks.is_empty() && !self.destination_withdrawn(idx))
     }
 
     fn pending_payload_bytes_total(&self) -> usize {
@@ -1342,7 +1442,10 @@ impl DataStreamSinkOperator {
     }
 
     fn has_pending_payloads(&self) -> bool {
-        self.pending_payloads_per_dest.iter().any(|p| p.is_some())
+        self.pending_payloads_per_dest
+            .iter()
+            .enumerate()
+            .any(|(idx, payload)| payload.is_some() && !self.destination_withdrawn(idx))
     }
 
     fn has_pending_data(&self) -> bool {
@@ -1351,11 +1454,20 @@ impl DataStreamSinkOperator {
 
     fn pending_payloads_can_send(&self) -> bool {
         let max_inflight = self.exchange_queue().max_inflight_bytes();
-        for payload in self
-            .pending_payloads_per_dest
-            .iter()
-            .filter_map(|p| p.as_ref())
-        {
+        for (idx, payload) in self.pending_payloads_per_dest.iter().enumerate() {
+            let Some(payload) = payload.as_ref() else {
+                continue;
+            };
+            match self.destination_state_at(idx) {
+                // A payload parked on an edge that has no send permission yet
+                // is the whole of a closed edge's backpressure: it keeps its
+                // single per-destination slot and the sink stops taking input.
+                Some(EdgeSendState::AwaitingPermission) => return false,
+                // A withdrawn edge's payload is dropped on the next flush, so
+                // it must not hold this sink back.
+                Some(EdgeSendState::NormallyCanceled) => continue,
+                None | Some(EdgeSendState::Open) => {}
+            }
             if payload.payload_bytes > max_inflight {
                 continue;
             }
@@ -1435,8 +1547,12 @@ impl DataStreamSinkOperator {
         if self.finished.load(Ordering::Acquire) {
             return true;
         }
+        // A destination still awaiting permission is owed its end-of-stream
+        // even when no data is parked for it. Finishing without that marker
+        // would leave the destination counting senders forever.
         if self.finishing.load(Ordering::Acquire)
             && !self.has_pending_data()
+            && !self.awaits_edge_permission()
             && self.send_tracker.is_idle()
         {
             self.finished.store(true, Ordering::Release);
@@ -1588,6 +1704,21 @@ impl DataStreamSinkOperator {
                 self.fragment_instance_id.low(),
             ));
         }
+        let edge_gate = self.destination_gate(dest)?;
+        match edge_gate.as_ref().map(|gate| gate.state()) {
+            None | Some(EdgeSendState::Open) => {}
+            // A closed edge sends nothing and reserves nothing. The payload
+            // keeps the sink's existing single per-destination slot, which is
+            // what makes waiting for permission bounded backpressure rather
+            // than a second buffer.
+            Some(EdgeSendState::AwaitingPermission) => {
+                return Ok(PayloadEnqueue::NoCapacity(pending));
+            }
+            // The destination left normally, so its frames are dropped here
+            // rather than parked or sent.
+            Some(EdgeSendState::NormallyCanceled) => return Ok(PayloadEnqueue::Discarded),
+        }
+
         let allow_overflow =
             allow_overflow || pending.payload_bytes > self.exchange_queue().max_inflight_bytes();
         let reserve_bytes = pending.payload_bytes.max(1);
@@ -1617,7 +1748,12 @@ impl DataStreamSinkOperator {
         ) {
             accounting.transfer_to(Arc::clone(tracker));
         }
-        let task = self.build_exchange_send_task(dest.clone(), pending, Arc::clone(error_state));
+        let task = self.build_exchange_send_task(
+            dest.clone(),
+            pending,
+            Arc::clone(error_state),
+            edge_gate,
+        );
         if allow_overflow {
             self.exchange_queue().try_submit(task, true)?;
             return Ok(PayloadEnqueue::Enqueued);
@@ -1631,6 +1767,7 @@ impl DataStreamSinkOperator {
         destination: FragmentDestination,
         pending: PendingPayload,
         error_state: Arc<RuntimeErrorState>,
+        edge_gate: Option<Arc<EdgeSendGate>>,
     ) -> ExchangeSendTask {
         #[cfg(test)]
         record_payload_identity_for_test(self.fragment_instance_id, pending.be_number, pending.eos);
@@ -1656,6 +1793,7 @@ impl DataStreamSinkOperator {
             notify: Arc::clone(&self.send_observable),
             error_state,
             tracker: Arc::clone(&self.send_tracker),
+            edge_gate,
         }
     }
 
@@ -1747,7 +1885,28 @@ impl DataStreamSinkOperator {
                 );
                 Ok(PayloadEnqueue::Enqueued)
             }
+            PayloadEnqueue::Discarded => {
+                debug!(
+                    "DataStreamSink::transmit_partition discarded: dest_finst={} node_id={} eos={} seq={} bytes={} reason=destination_cancelled_normally",
+                    dest_finst_id, self.input.dest_node_id, eos, sequence, payload_bytes
+                );
+                Ok(PayloadEnqueue::Discarded)
+            }
             PayloadEnqueue::NoCapacity(payload) => Ok(PayloadEnqueue::NoCapacity(payload)),
+        }
+    }
+
+    /// Drops everything still owed to one abandoned destination: its buffered
+    /// chunks, their byte accounting, and its single parked payload.
+    fn discard_pending_for_dest(&mut self, dest_idx: usize) {
+        if let Some(chunks) = self.pending_per_dest.get_mut(dest_idx) {
+            chunks.clear();
+        }
+        if let Some(bytes) = self.pending_bytes_per_dest.get_mut(dest_idx) {
+            *bytes = 0;
+        }
+        if let Some(payload) = self.pending_payloads_per_dest.get_mut(dest_idx) {
+            *payload = None;
         }
     }
 
@@ -1849,6 +2008,22 @@ impl DataStreamSinkOperator {
             if Self::is_pseudo_destination(dest) {
                 continue;
             }
+            let send_state = self.destination_state_at(i);
+            // A destination that left normally abandons its own edge's frames
+            // and nothing else.
+            if send_state == Some(EdgeSendState::NormallyCanceled) {
+                self.discard_pending_for_dest(i);
+                continue;
+            }
+            // A closed edge must not stall the destinations that can send, so
+            // it parks its own payload and the loop moves on to the next
+            // destination instead of abandoning the whole flush.
+            // A closed edge parks its own payload and lets the loop move on:
+            // `try_enqueue_payload` reserves nothing for it, on the finishing
+            // drain exactly as on a normal one. The operator then reports
+            // finishing as still pending, so the driver comes back instead of
+            // treating a legitimate race as a failure.
+            let closed_edge = send_state == Some(EdgeSendState::AwaitingPermission);
             let pending_payload = self
                 .pending_payloads_per_dest
                 .get_mut(i)
@@ -1856,9 +2031,12 @@ impl DataStreamSinkOperator {
                 .take();
             if let Some(payload) = pending_payload {
                 match self.try_enqueue_payload(dest, payload, allow_overflow)? {
-                    PayloadEnqueue::Enqueued => {}
+                    PayloadEnqueue::Enqueued | PayloadEnqueue::Discarded => {}
                     PayloadEnqueue::NoCapacity(payload) => {
                         self.pending_payloads_per_dest[i] = Some(payload);
+                        if closed_edge {
+                            continue;
+                        }
                         return Ok(());
                     }
                 }
@@ -1874,8 +2052,15 @@ impl DataStreamSinkOperator {
                 }
                 match self.transmit_partition(i, dest, &chunks, false, allow_overflow)? {
                     PayloadEnqueue::Enqueued => {}
+                    PayloadEnqueue::Discarded => {
+                        self.discard_pending_for_dest(i);
+                        break;
+                    }
                     PayloadEnqueue::NoCapacity(payload) => {
                         self.pending_payloads_per_dest[i] = Some(payload);
+                        if closed_edge {
+                            break;
+                        }
                         return Ok(());
                     }
                 }
@@ -1895,8 +2080,20 @@ impl DataStreamSinkOperator {
             if Self::is_pseudo_destination(dest) {
                 continue;
             }
+            match self.destination_state_at(i) {
+                // A destination that left normally is not owed an
+                // end-of-stream marker either.
+                Some(EdgeSendState::NormallyCanceled) => {
+                    self.discard_pending_for_dest(i);
+                    continue;
+                }
+                // End-of-stream is output too, so it waits for permission
+                // like any other frame.
+                Some(EdgeSendState::AwaitingPermission) => continue,
+                None | Some(EdgeSendState::Open) => {}
+            }
             match self.transmit_partition(i, dest, &[], true, true)? {
-                PayloadEnqueue::Enqueued => {}
+                PayloadEnqueue::Enqueued | PayloadEnqueue::Discarded => {}
                 PayloadEnqueue::NoCapacity(_) => {
                     return Err("exchange send EOS unexpectedly blocked".to_string());
                 }
@@ -1907,6 +2104,10 @@ impl DataStreamSinkOperator {
 }
 
 impl ProcessorOperator for DataStreamSinkOperator {
+    fn finishing_is_pending(&self) -> bool {
+        self.finishing.load(Ordering::Acquire) && self.awaits_edge_permission()
+    }
+
     fn accepts_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
         is_low_cardinality_exchange_dictionary(data_type)
             && matches!(
@@ -2216,6 +2417,7 @@ mod tests {
                     Arc::new(crate::runtime::io::IoExecutor::new(1)),
                 ),
             )),
+            edge_gates: None,
         }
     }
 
@@ -2228,6 +2430,71 @@ mod tests {
             1,
         )
         .expect("destination")
+    }
+
+    fn destination_with_finst(low: i64) -> FragmentDestination {
+        FragmentDestination::new(
+            UniqueId::new(9, low),
+            RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+            UniqueId::new(1, 2),
+            0,
+            1,
+        )
+        .expect("destination")
+    }
+
+    fn edge_id(value: u32) -> ExchangeEdgeId {
+        ExchangeEdgeId::new(value).expect("nonzero edge")
+    }
+
+    /// Gates the sink's destinations one edge per destination, all closed, so
+    /// each edge's decision is observable in isolation.
+    fn gate_destinations(op: &mut DataStreamSinkOperator, dests: Vec<FragmentDestination>) {
+        let gates = ExchangeEdgeGates::try_new(dests.iter().enumerate().map(|(idx, dest)| {
+            (
+                edge_id(idx as u32 + 1),
+                vec![ExchangeDestinationKey::new(
+                    *dest.finst_id(),
+                    op.input.dest_node_id,
+                )],
+            )
+        }))
+        .expect("legal gate set");
+        op.input.destinations = dests;
+        op.edge_gates = Some(gates);
+    }
+
+    /// One version opens one exact edge set, so every edge a test needs open
+    /// is named in a single request.
+    fn open_edges(op: &DataStreamSinkOperator, edges: &[ExchangeEdgeId]) {
+        op.edge_gates
+            .as_ref()
+            .expect("gated sink")
+            .open(crate::task_execution::domain::EdgeOpenVersion::FIRST, edges)
+            .expect("open edges");
+    }
+
+    fn cancel_edge(op: &DataStreamSinkOperator, edge: ExchangeEdgeId) {
+        assert!(
+            op.edge_gates
+                .as_ref()
+                .expect("gated sink")
+                .gate(edge)
+                .expect("gated edge")
+                .close_for_normal_cancellation()
+        );
+    }
+
+    fn test_payload(bytes: usize) -> PendingPayload {
+        PendingPayload {
+            be_number: 0,
+            payload: vec![7; bytes],
+            payload_bytes: bytes,
+            encode_ns: 0,
+            sequence: 0,
+            eos: false,
+            accounting: None,
+        }
     }
 
     fn make_test_exchange_send_task() -> ExchangeSendTask {
@@ -2252,6 +2519,7 @@ mod tests {
                 accounting: None,
             },
             Arc::new(RuntimeErrorState::default()),
+            None,
         )
     }
 
@@ -2383,6 +2651,277 @@ mod tests {
             "non-empty payloads must carry wire meta because enqueue is not delivery confirmation"
         );
         assert!(!DataStreamSinkOperator::should_include_wire_meta(true));
+    }
+
+    #[test]
+    fn a_closed_edge_enqueues_no_frame_and_reserves_no_bytes() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest.clone()]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+
+        assert!(matches!(
+            op.try_enqueue_payload(&dest, test_payload(4), false),
+            Ok(PayloadEnqueue::NoCapacity(_))
+        ));
+        assert!(
+            op.send_tracker.is_idle(),
+            "a closed edge must hand nothing to the send queue"
+        );
+        assert_eq!(
+            op.exchange_queue().inflight_bytes(),
+            0,
+            "a closed edge must not hold any of the shared byte budget"
+        );
+    }
+
+    #[test]
+    fn opening_an_edge_lets_the_sinks_frames_through() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest.clone()]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+
+        open_edges(&op, &[edge_id(1)]);
+        assert!(matches!(
+            op.try_enqueue_payload(&dest, test_payload(4), false),
+            Ok(PayloadEnqueue::Enqueued)
+        ));
+
+        // Opening is monotonic and idempotent, so a replay changes nothing.
+        open_edges(&op, &[edge_id(1)]);
+        assert!(matches!(
+            op.try_enqueue_payload(&dest, test_payload(4), false),
+            Ok(PayloadEnqueue::Enqueued)
+        ));
+    }
+
+    #[test]
+    fn a_normally_cancelled_edge_discards_its_payload_and_its_pending_chunks() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest.clone()]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        open_edges(&op, &[edge_id(1)]);
+
+        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        assert!(op.has_pending_chunks());
+
+        cancel_edge(&op, edge_id(1));
+        assert!(matches!(
+            op.try_enqueue_payload(&dest, test_payload(4), false),
+            Ok(PayloadEnqueue::Discarded)
+        ));
+
+        op.flush_pending(true, false).expect("flush pending");
+        assert_eq!(op.pending_chunk_count_total(), 0);
+        assert_eq!(op.pending_payload_count(), 0);
+        assert!(
+            !op.has_pending_data(),
+            "abandoned data must not hold the sink open"
+        );
+        assert!(op.send_tracker.is_idle(), "no frame reaches the send queue");
+        assert_eq!(op.exchange_queue().inflight_bytes(), 0);
+        assert_eq!(
+            op.current_error(),
+            None,
+            "a destination's normal departure is not this producer's failure"
+        );
+    }
+
+    #[test]
+    fn a_normally_cancelled_edge_leaves_the_other_destinations_sending() {
+        let mut op = make_test_operator();
+        let abandoned = destination_with_finst(1);
+        let healthy = destination_with_finst(2);
+        gate_destinations(&mut op, vec![abandoned.clone(), healthy.clone()]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        open_edges(&op, &[edge_id(1), edge_id(2)]);
+
+        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        assert_eq!(op.pending_per_dest.len(), 2);
+        assert!(!op.pending_per_dest[0].is_empty() && !op.pending_per_dest[1].is_empty());
+
+        cancel_edge(&op, edge_id(1));
+        op.flush_pending(true, false).expect("flush pending");
+
+        assert!(
+            op.pending_per_dest[0].is_empty(),
+            "the abandoned edge's chunks are dropped"
+        );
+        assert!(
+            op.pending_per_dest[1].is_empty() && op.pending_payloads_per_dest[1].is_none(),
+            "the healthy edge's chunks are handed to the send queue, not dropped or parked"
+        );
+        assert!(matches!(
+            op.try_enqueue_payload(&abandoned, test_payload(4), false),
+            Ok(PayloadEnqueue::Discarded)
+        ));
+        assert!(
+            op.edge_gates
+                .as_ref()
+                .expect("gated sink")
+                .gate(edge_id(2))
+                .expect("edge two")
+                .may_send(),
+            "the healthy edge keeps its send permission"
+        );
+        assert_eq!(op.current_error(), None);
+    }
+
+    #[test]
+    fn a_closed_edge_does_not_stall_a_destination_that_can_send() {
+        let mut op = make_test_operator();
+        let closed = destination_with_finst(1);
+        let open = destination_with_finst(2);
+        gate_destinations(&mut op, vec![closed, open]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        open_edges(&op, &[edge_id(2)]);
+
+        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        op.flush_pending(true, false).expect("flush pending");
+
+        assert!(
+            op.pending_payloads_per_dest[0].is_some(),
+            "the closed edge parks its own payload"
+        );
+        assert!(
+            op.pending_payloads_per_dest[1].is_none() && op.pending_per_dest[1].is_empty(),
+            "one edge waiting for permission must not block another edge's flush"
+        );
+    }
+
+    #[test]
+    fn a_destination_no_edge_claims_fails_closed() {
+        let mut op = make_test_operator();
+        gate_destinations(&mut op, vec![destination_with_finst(1)]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+
+        let Err(error) = op.try_enqueue_payload(&destination_with_finst(7), test_payload(4), false)
+        else {
+            panic!("an unattributed destination must not send");
+        };
+        assert!(
+            error.contains("not attributed to any outbound edge"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_closed_edge_holds_at_most_one_payload_and_stops_taking_input() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest]);
+        // One byte batches every buffered chunk, so each push offers the
+        // closed edge a payload.
+        op.max_transmit_batched_bytes = 1;
+        let state = RuntimeState::default();
+
+        let mut pushed = 0;
+        while ProcessorOperator::need_input(&op) && pushed < 8 {
+            ProcessorOperator::push_chunk(&mut op, &state, int64_chunk(8)).expect("push chunk");
+            pushed += 1;
+        }
+
+        assert!(
+            pushed < 8,
+            "a closed edge must stop the sink from taking more input"
+        );
+        assert!(
+            op.pending_payload_count() <= op.destinations().len(),
+            "the single per-destination payload slot is the whole bound"
+        );
+        assert_eq!(
+            op.exchange_queue().inflight_bytes(),
+            0,
+            "a closed edge takes nothing from the global or the per-destination ceiling"
+        );
+        assert!(op.send_tracker.is_idle(), "nothing was handed to the queue");
+        let buffered = op.pending_chunk_bytes_total() + op.pending_payload_bytes_total();
+        let bound = op.exchange_queue().max_inflight_bytes();
+        assert!(
+            buffered <= bound,
+            "a closed edge held {buffered} bytes, above the send queue's own ceiling {bound}"
+        );
+        // A healthy destination can still claim the whole budget while the
+        // closed edge waits, because the closed edge reserved nothing.
+        assert!(op.exchange_queue().can_reserve(bound));
+
+        open_edges(&op, &[edge_id(1)]);
+        assert!(
+            ProcessorOperator::need_input(&op),
+            "opening the edge releases the backpressure"
+        );
+    }
+
+    /// A producer whose input drains before its edge opens is a normal race,
+    /// not a failure: the open follows a round trip after every destination
+    /// acknowledges creation, and a small fragment can finish reading sooner.
+    /// So the finishing drain waits, and the driver is told to come back.
+    #[test]
+    fn finishing_before_an_edge_opens_waits_instead_of_failing() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+
+        op.flush_pending(true, true)
+            .expect("the finishing drain parks a closed edge rather than failing");
+        assert!(
+            op.current_error().is_none(),
+            "waiting for permission is not the producer's error"
+        );
+        assert!(
+            op.awaits_edge_permission(),
+            "the sink must still be waiting on its edge"
+        );
+        assert_eq!(
+            op.exchange_queue().inflight_bytes(),
+            0,
+            "a closed edge reserved nothing while it waited"
+        );
+
+        op.finishing.store(true, Ordering::Release);
+        assert!(
+            ProcessorOperator::finishing_is_pending(&op),
+            "the driver must be told to come back"
+        );
+        assert!(
+            !op.maybe_mark_finished(),
+            "the sink cannot be finished while it still owes output"
+        );
+
+        open_edges(&op, &[edge_id(1)]);
+        assert!(!op.awaits_edge_permission());
+        op.flush_pending(true, true)
+            .expect("the drain now completes");
+        assert!(!ProcessorOperator::finishing_is_pending(&op));
+    }
+
+    /// The same race with nothing buffered. Only an end-of-stream is owed, and
+    /// forgetting it would leave the destination counting senders forever.
+    #[test]
+    fn a_closed_edge_owed_only_an_end_of_stream_still_blocks_finishing() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+
+        assert!(
+            !op.has_pending_data(),
+            "nothing is buffered, so only the end-of-stream is outstanding"
+        );
+        op.finishing.store(true, Ordering::Release);
+        assert!(
+            !op.maybe_mark_finished(),
+            "an unsent end-of-stream is still output this sink owes"
+        );
+        assert!(ProcessorOperator::finishing_is_pending(&op));
+
+        open_edges(&op, &[edge_id(1)]);
+        op.send_eos().expect("the end-of-stream now goes out");
+        assert!(!ProcessorOperator::finishing_is_pending(&op));
     }
 
     #[test]

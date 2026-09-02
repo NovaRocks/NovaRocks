@@ -731,9 +731,21 @@ impl PipelineDriver {
             if in_edge >= self.edge_closed.len() {
                 continue;
             }
-            if self.edge_closed[in_edge] && self.edge_chunks[in_edge].is_none() {
-                return true;
+            if !self.edge_closed[in_edge] || self.edge_chunks[in_edge].is_some() {
+                continue;
             }
+            // An operator whose finishing is pending is waiting on something
+            // else, so its finishing work is not ready. Claiming otherwise
+            // would spin this driver instead of parking it.
+            if self
+                .operators
+                .get(idx)
+                .and_then(|op| op.as_processor_ref())
+                .is_some_and(|proc| proc.finishing_is_pending())
+            {
+                continue;
+            }
+            return true;
         }
         false
     }
@@ -1310,8 +1322,15 @@ impl PipelineDriver {
                 "Driver set_finishing: driver_id={} op_idx={} op_name={} success. edge_closed[{}]={}",
                 self.driver_id, idx, op_name, in_edge, self.edge_closed[in_edge]
             );
-            self.operator_finishing_set[idx] = true;
-            *made_progress = true;
+            // Latch only once the operator says finishing is done. An operator
+            // that is still waiting stays unlatched so a later turn retries it;
+            // without this, `set_finishing` runs exactly once and an operator
+            // that could not finish yet would never get another chance.
+            let still_pending = proc.finishing_is_pending();
+            self.operator_finishing_set[idx] = !still_pending;
+            if !still_pending {
+                *made_progress = true;
+            }
         }
         Ok(())
     }
