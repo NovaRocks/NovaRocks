@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
-use novarocks_sql::plan_read::OutputColumn;
+use novarocks_proto_models::{common, plan};
+use novarocks_sql::plan_read::{DistributedNode, NodeExecutionColumn, OutputColumn, PlanFragment};
 
-pub(super) fn encode_fragment_output_contract(
+use super::{
+    NativePlanEncodeContext, encode_exprs, encode_type, optional_context_ref, required_context_ref,
+};
+
+pub(super) fn encode_fragment_output_contract<F>(
     src: &PlanFragment,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'_, F>,
 ) -> Result<
     (
         Vec<novarocks_proto_models::expr::Expr>,
@@ -43,9 +47,9 @@ pub(super) fn encode_fragment_output_contract(
 /// its root's execution output (unique wire ids for re-materialized projections,
 /// producer fragments forwarding their root wholesale); the encoder maps the
 /// result 1:1 instead of re-walking the encoded tree or falling back.
-fn encode_finalized_fragment_output_columns(
+fn encode_finalized_fragment_output_columns<F>(
     src: &PlanFragment,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'_, F>,
 ) -> Result<Vec<common::OutputColumn>, String> {
     let catalog = required_context_ref(ctx.fragment_edge_outputs, || {
         format!(
@@ -78,10 +82,10 @@ fn encode_finalized_fragment_output_columns(
 /// `ctx.node_outputs` is `None` only in the bare-node encoder unit tests, which
 /// have no sealed plan; there the payload columns encoded by `encode_physical_node`
 /// already stand (the same data the catalog is built from).
-pub(super) fn apply_sealed_node_output_columns(
+pub(super) fn apply_sealed_node_output_columns<F>(
     node: &mut plan::DistributedNode,
     src: &DistributedNode,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'_, F>,
 ) -> Result<(), String> {
     let Some(catalog) = optional_context_ref(ctx.node_outputs) else {
         return Ok(());

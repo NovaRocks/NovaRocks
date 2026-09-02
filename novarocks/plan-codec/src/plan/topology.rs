@@ -15,15 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
+use novarocks_proto_models::plan;
+use novarocks_sql::plan_read::{
+    DataSink, DistributedPlan, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
+    OutputColumn as AnalysisOutputColumn, PlanFragment,
+};
+
+use super::output;
+use super::scan_facts::NativeScanFacts;
 use super::type_mapping::{encode_data_partition, encode_edge_partition_type};
 use super::write::encode_change_stream_router_sink;
-use super::*;
-use novarocks_sql::plan_read::FragmentId;
+use super::{NativePlanEncodeContext, encode_node_with_context, required_context_ref};
 
-pub(super) fn attach_stream_sinks(
+pub(super) fn attach_stream_sinks<'a, F: NativeScanFacts<'a>>(
     src: &DistributedPlan,
     fragments: &mut [plan::PlanFragment],
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'a, F>,
 ) -> Result<(), String> {
     let fragment_index_by_id = fragments
         .iter()
@@ -73,8 +82,8 @@ pub(super) fn attach_stream_sinks(
 
 /// The finalized stream-edge projection for `edge`, as planner output columns
 /// read from the sealed fragment/edge contract.
-fn finalized_stream_edge_projection<'a>(
-    ctx: &'a NativePlanEncodeContext<'_>,
+fn finalized_stream_edge_projection<'a, F>(
+    ctx: &NativePlanEncodeContext<'a, F>,
     edge: &FragmentEdge,
 ) -> Result<&'a [AnalysisOutputColumn], String> {
     let catalog = required_context_ref(ctx.fragment_edge_outputs, || {
@@ -94,8 +103,8 @@ fn finalized_stream_edge_projection<'a>(
 }
 
 /// The sender-side slot ids (= projection column ids) for a stream edge.
-fn finalized_stream_edge_slot_ids(
-    ctx: &NativePlanEncodeContext<'_>,
+fn finalized_stream_edge_slot_ids<F>(
+    ctx: &NativePlanEncodeContext<'_, F>,
     edge: &FragmentEdge,
 ) -> Result<Vec<i32>, String> {
     finalized_stream_edge_projection(ctx, edge)?
@@ -111,9 +120,9 @@ fn finalized_stream_edge_slot_ids(
         .collect()
 }
 
-pub(super) fn encode_plan_fragment_with_context(
+pub(super) fn encode_plan_fragment_with_context<'a, F: NativeScanFacts<'a>>(
     src: &PlanFragment,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'a, F>,
 ) -> Result<plan::PlanFragment, String> {
     let root = encode_node_with_context(&src.root, ctx)?;
     let (output_exprs, output_columns) = output::encode_fragment_output_contract(src, ctx)?;
@@ -141,10 +150,10 @@ pub(super) fn encode_plan_fragment_with_context(
     })
 }
 
-fn encode_data_sink(
+fn encode_data_sink<F>(
     src: &DataSink,
     fragment_id: FragmentId,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'_, F>,
 ) -> Result<plan::DataSink, String> {
     use plan::data_sink::Kind;
 

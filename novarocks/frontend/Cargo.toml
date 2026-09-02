@@ -31,6 +31,7 @@ novarocks-native-trust = { path = "../native-trust" }
 novarocks-proto-codec = { path = "../proto-codec" }
 novarocks-proto-models = { path = "../proto-models" }
 novarocks-parser = { path = "../parser" }
+novarocks-plan-codec = { path = "../plan-codec" }
 novarocks-spi = { path = "../spi" }
 novarocks-sql = { path = "../sql" }
 novarocks-types = { path = "../types" }

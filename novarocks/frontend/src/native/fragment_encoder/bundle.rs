@@ -15,6 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! The frontend adapter onto the plan encoder.
+//!
+//! Unwrapping the prepared encoding view and sealing the result back into an
+//! artifact-bound attachment are frontend responsibilities; the encoding
+//! between them belongs to [`novarocks_plan_codec`], which cannot name either
+//! of those frontend types.
+
+use novarocks_plan_codec::SealedWriteTargets;
+
 pub use crate::query_execution::native_fragment::{
     NativeFragmentAttachment, NativeFragmentEncodingView,
 };
@@ -26,7 +35,7 @@ pub fn encode_native_fragment_bundle(
 ) -> Result<NativeFragmentAttachment, String> {
     let plan = source.distributed_plan();
     let scan_facts = source.scan_facts();
-    let encoded = super::plan::encode_distributed_plan(plan, scan_facts)?;
+    let encoded = novarocks_plan_codec::encode_distributed_plan(plan, scan_facts)?;
     source.seal(encoded.fragments)
 }
 
@@ -38,12 +47,15 @@ pub fn encode_native_fragment_bundle(
 /// submitting a writer the backend could not bind.
 pub(crate) fn encode_native_fragment_bundle_with_write_targets(
     source: NativeFragmentEncodingView<'_>,
-    write_targets: &super::plan::write_dataflow::SealedWriteTargets,
+    write_targets: &SealedWriteTargets,
 ) -> Result<NativeFragmentAttachment, String> {
     let plan = source.distributed_plan();
     let scan_facts = source.scan_facts();
-    let encoded =
-        super::plan::encode_distributed_plan_with_write_targets(plan, scan_facts, write_targets)?;
+    let encoded = novarocks_plan_codec::encode_distributed_plan_with_write_targets(
+        plan,
+        scan_facts,
+        write_targets,
+    )?;
     source.seal(encoded.fragments)
 }
 
@@ -71,7 +83,6 @@ mod tests {
     use novarocks_spi::connector::{CatalogHandle, CatalogVersion, ConnectorInstanceId};
     use novarocks_sql::test_support::{NativeWriteDataflowFixture, native_write_dataflow_plan};
 
-    use super::super::plan::write_dataflow::SealedWriteTargets;
     use super::*;
     use crate::query_execution::post_compile::NativeFragmentEncodingInput;
 

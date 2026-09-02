@@ -27,6 +27,7 @@ use crate::runtime::query_result::QueryResult;
 #[cfg(test)]
 use crate::runtime::query_result::build_string_query_result;
 use novarocks_parser::ast::Query;
+use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
@@ -1982,7 +1983,7 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    sealed_write_targets: crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets,
+    sealed_write_targets: SealedWriteTargets,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
     crate::connector::validate_request_context(connector_context)?;
     let scan_resolver =

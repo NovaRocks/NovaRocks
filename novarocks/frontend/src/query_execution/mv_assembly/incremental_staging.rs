@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -490,7 +491,7 @@ fn session_native_assembly(
     target_bindings: &QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &Arc<ConnectorWriteSession>,
-    sealed_write_targets: crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets,
+    sealed_write_targets: SealedWriteTargets,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
     let planned = crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
         query_kernel.connector_control().as_ref(),

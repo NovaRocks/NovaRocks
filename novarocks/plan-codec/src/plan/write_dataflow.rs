@@ -91,9 +91,9 @@ impl SealedWriteTargets {
     }
 }
 
-pub(super) fn encode_table_writer_node(
+pub(super) fn encode_table_writer_node<F>(
     src: &TableWriterNode,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'_, F>,
 ) -> Result<plan::TableWriterNode, String> {
     let targets = required_context_ref(ctx.write_targets, || {
         "native table writer node has no sealed write session".to_string()
@@ -149,6 +149,7 @@ mod tests {
     use novarocks_sql::plan_read::DistributedNodeKind;
     use novarocks_sql::test_support::{NativeWriteDataflowFixture, native_write_dataflow_plan};
 
+    use super::super::scan_facts::NoScanFacts;
     use super::super::{NativePlanEncodeContext, encode_distributed_plan_with_context};
     use super::*;
 
@@ -196,7 +197,7 @@ mod tests {
         let sealed_plan = native_write_dataflow_plan(fixture).expect("sealed dataflow write plan");
         let encoded = encode_distributed_plan_with_context(
             &sealed_plan,
-            NativePlanEncodeContext {
+            NativePlanEncodeContext::<NoScanFacts> {
                 scan_facts: None,
                 node_outputs: None,
                 fragment_edge_outputs: None,
@@ -263,7 +264,7 @@ mod tests {
             .expect("sealed dataflow write plan");
         let error = encode_distributed_plan_with_context(
             &sealed_plan,
-            NativePlanEncodeContext {
+            NativePlanEncodeContext::<NoScanFacts> {
                 scan_facts: None,
                 node_outputs: None,
                 fragment_edge_outputs: None,
@@ -289,7 +290,7 @@ mod tests {
                 .expect("sealed dataflow write plan");
         let error = encode_distributed_plan_with_context(
             &sealed_plan,
-            NativePlanEncodeContext {
+            NativePlanEncodeContext::<NoScanFacts> {
                 scan_facts: None,
                 node_outputs: None,
                 fragment_edge_outputs: None,

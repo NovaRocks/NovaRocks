@@ -20,7 +20,7 @@
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
-use super::plan::encode_type;
+use crate::plan::encode_type;
 use novarocks_proto_models::{common, expr};
 use novarocks_sql::plan_read::{
     BinOp, LiteralValue, SortItem, SqlExpressionRead, SqlExpressionReadKind, TypedExpr, UnOp,
@@ -28,7 +28,7 @@ use novarocks_sql::plan_read::{
 };
 use novarocks_types::largeint;
 
-pub(crate) fn encode_expr(e: &TypedExpr) -> Result<expr::Expr, String> {
+pub fn encode_expr(e: &TypedExpr) -> Result<expr::Expr, String> {
     let read = expression_read(e);
     Ok(expr::Expr {
         r#type: Some(encode_type(&read.data_type)?),
@@ -221,7 +221,7 @@ fn encode_exprs(values: &[TypedExpr]) -> Result<Vec<expr::Expr>, String> {
     values.iter().map(encode_expr).collect()
 }
 
-pub(super) fn encode_sort_items(values: &[SortItem]) -> Result<Vec<expr::SortItem>, String> {
+pub(crate) fn encode_sort_items(values: &[SortItem]) -> Result<Vec<expr::SortItem>, String> {
     values
         .iter()
         .map(|item| {
@@ -234,7 +234,7 @@ pub(super) fn encode_sort_items(values: &[SortItem]) -> Result<Vec<expr::SortIte
         .collect()
 }
 
-pub(super) fn encode_window_frame(frame: &WindowFrame) -> Result<expr::WindowFrame, String> {
+pub(crate) fn encode_window_frame(frame: &WindowFrame) -> Result<expr::WindowFrame, String> {
     Ok(expr::WindowFrame {
         frame_type: match frame.frame_type {
             WindowFrameType::Rows => expr::WindowFrameType::Rows as i32,
@@ -245,7 +245,7 @@ pub(super) fn encode_window_frame(frame: &WindowFrame) -> Result<expr::WindowFra
     })
 }
 
-pub(super) fn encode_window_bound(bound: &WindowBound) -> expr::WindowBound {
+pub(crate) fn encode_window_bound(bound: &WindowBound) -> expr::WindowBound {
     use expr::window_bound::Bound;
 
     expr::WindowBound {

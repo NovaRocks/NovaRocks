@@ -15,16 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use super::encode_type;
 use super::output::encode_output_columns;
 use super::scan::encode_scan_node;
+use super::scan_facts::NativeScanFacts;
 use super::type_mapping::{
     encode_agg_mode, encode_join_distribution, encode_join_execution_mode, encode_join_kind,
     encode_redistribute_mode, encode_row_mutation_effect, encode_set_op_kind,
     encode_sort_topn_type, encode_topn_phase, usize_to_u64,
 };
 use super::{NativePlanEncodeContext, encode_exprs};
+use crate::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use novarocks_proto_models::plan;
 use novarocks_sql::plan_read::{
     PhysicalPlanKind, PlanRowCountAssertion, SqlPhysicalPlanRead, physical_plan_read,
@@ -61,10 +62,10 @@ pub(super) fn encoded_physical_variant_names_for_test() -> &'static [&'static st
     ]
 }
 
-pub(super) fn encode_physical_node(
+pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
     src: &PhysicalPlanKind,
     node_id: i32,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'a, F>,
 ) -> Result<plan::PlanNode, String> {
     use plan::plan_node::Kind;
 

@@ -37,10 +37,10 @@ pub(super) fn encode_connector_write_input_binding(
     }
 }
 
-pub(super) fn encode_change_stream_router_sink(
+pub(super) fn encode_change_stream_router_sink<F>(
     src: &ChangeStreamRouterSink,
     fragment_id: FragmentId,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'_, F>,
 ) -> Result<plan::ChangeStreamRouterSink, String> {
     Ok(plan::ChangeStreamRouterSink {
         group_id: src.group_id(),
@@ -84,8 +84,8 @@ pub(super) fn encode_change_stream_router_sink(
 /// contract (CGO-9C Task 3). The planner already reconstructed the partition
 /// expression from the branch's ordinals against the router fragment's output
 /// columns at seal; the encoder maps the typed result 1:1.
-fn encode_finalized_router_branch_partition(
-    ctx: &NativePlanEncodeContext<'_>,
+fn encode_finalized_router_branch_partition<F>(
+    ctx: &NativePlanEncodeContext<'_, F>,
     fragment_id: FragmentId,
     route_id: novarocks_spi::connector::ConnectorWriteRouteId,
 ) -> Result<plan::DataPartition, String> {

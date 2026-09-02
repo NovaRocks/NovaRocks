@@ -3350,6 +3350,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-native-trust",
  "novarocks-parser",
+ "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-secret",
@@ -3431,6 +3432,21 @@ name = "novarocks-parser"
 version = "0.1.0"
 dependencies = [
  "novarocks-user-error",
+]
+
+[[package]]
+name = "novarocks-plan-codec"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-buffer",
+ "hex",
+ "novarocks-proto-codec",
+ "novarocks-proto-models",
+ "novarocks-spi",
+ "novarocks-sql",
+ "novarocks-types",
+ "prost 0.13.5",
 ]
 
 [[package]]

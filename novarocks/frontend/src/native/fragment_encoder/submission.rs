@@ -30,9 +30,10 @@ use crate::query_execution::artifact::{
     ValidatedNativeSubmission,
 };
 use crate::query_execution::assembly;
+use novarocks_plan_codec::encode_data_partition;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdgeKind, FragmentId};
 
-use super::{encode_data_partition, encode_instance_params};
+use super::instance::encode_instance_params;
 
 #[expect(
     clippy::type_complexity,

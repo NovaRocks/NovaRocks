@@ -15,25 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
-
 pub(crate) use self::type_mapping::encode_type;
-use super::expr::encode_expr;
-use crate::query_execution::preparation::NativeScanFactsView;
-use novarocks_proto_models::{common, plan};
+use crate::expr::encode_expr;
+use novarocks_proto_models::plan;
 use novarocks_sql::plan_read::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,
-    FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentStreamKind, NodeExecutionColumn,
-    NodeOutputCatalog, OutputColumn as AnalysisOutputColumn, PlanFragment, TypedExpr,
-    WriteContractCatalog, distributed_kind_to_physical,
+    DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan,
+    FragmentEdgeOutputCatalog, NodeOutputCatalog, TypedExpr, WriteContractCatalog,
+    distributed_kind_to_physical,
 };
 
 use output::apply_sealed_node_output_columns;
 use relational::encode_physical_node;
+use scan_facts::NativeScanFacts;
 
 mod output;
 mod relational;
 mod scan;
+pub(crate) mod scan_facts;
 mod topology;
 mod type_mapping;
 mod write;
@@ -41,8 +39,8 @@ pub(crate) mod write_dataflow;
 
 type ContextRef<'a, T> = Option<&'a T>;
 
-pub(super) struct NativePlanEncodeContext<'a> {
-    pub(super) scan_facts: Option<NativeScanFactsView<'a>>,
+pub(super) struct NativePlanEncodeContext<'a, F> {
+    pub(super) scan_facts: Option<F>,
     /// The sealed node-output contract. The encoder reads each covered node's
     /// (join / scan / set-op / sort) execution output from here rather than
     /// re-deriving or repairing it. `None` only in bare-node encoder unit tests
@@ -70,8 +68,8 @@ pub(super) struct NativePlanEncodeContext<'a> {
     pub(super) write_targets: ContextRef<'a, write_dataflow::SealedWriteTargets>,
 }
 
-impl<'a> NativePlanEncodeContext<'a> {
-    fn complete(src: &'a DistributedPlan, scan_facts: NativeScanFactsView<'a>) -> Self {
+impl<'a, F> NativePlanEncodeContext<'a, F> {
+    fn complete(src: &'a DistributedPlan, scan_facts: F) -> Self {
         Self {
             scan_facts: Some(scan_facts),
             node_outputs: Some(src.node_outputs()),
@@ -106,10 +104,10 @@ fn optional_context_ref<T>(value: Option<&T>) -> Option<&T> {
 
 /// Encode a plan whose writer nodes are stamped from the begin session's
 /// sealed targets.
-pub(super) fn encode_distributed_plan_with_write_targets(
-    src: &DistributedPlan,
-    scan_facts: NativeScanFactsView<'_>,
-    write_targets: &write_dataflow::SealedWriteTargets,
+pub fn encode_distributed_plan_with_write_targets<'a, F: NativeScanFacts<'a>>(
+    src: &'a DistributedPlan,
+    scan_facts: F,
+    write_targets: &'a write_dataflow::SealedWriteTargets,
 ) -> Result<plan::DistributedPlan, String> {
     encode_distributed_plan_with_context_inner(
         src,
@@ -117,9 +115,9 @@ pub(super) fn encode_distributed_plan_with_write_targets(
     )
 }
 
-pub(super) fn encode_distributed_plan(
-    src: &DistributedPlan,
-    scan_facts: NativeScanFactsView<'_>,
+pub fn encode_distributed_plan<'a, F: NativeScanFacts<'a>>(
+    src: &'a DistributedPlan,
+    scan_facts: F,
 ) -> Result<plan::DistributedPlan, String> {
     encode_distributed_plan_with_context_inner(
         src,
@@ -132,9 +130,9 @@ pub(super) fn encode_distributed_plan(
     dead_code,
     reason = "Retained for target-specific frontend integration and regression coverage."
 )]
-pub(super) fn encode_distributed_plan_with_context(
-    src: &DistributedPlan,
-    ctx: NativePlanEncodeContext<'_>,
+pub(super) fn encode_distributed_plan_with_context<'a, F: NativeScanFacts<'a>>(
+    src: &'a DistributedPlan,
+    ctx: NativePlanEncodeContext<'a, F>,
 ) -> Result<plan::DistributedPlan, String> {
     encode_distributed_plan_with_context_inner(
         src,
@@ -148,9 +146,9 @@ pub(super) fn encode_distributed_plan_with_context(
     )
 }
 
-fn encode_distributed_plan_with_context_inner(
-    src: &DistributedPlan,
-    ctx: NativePlanEncodeContext<'_>,
+fn encode_distributed_plan_with_context_inner<'a, F: NativeScanFacts<'a>>(
+    src: &'a DistributedPlan,
+    ctx: NativePlanEncodeContext<'a, F>,
 ) -> Result<plan::DistributedPlan, String> {
     // The sealed node-output contract of `src` is authoritative for every covered
     // node, so bind it here: all fragment/node encoding then reads each covered
@@ -173,7 +171,7 @@ fn encode_distributed_plan_with_context_inner(
     })
 }
 
-pub(crate) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPartition, String> {
+pub fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPartition, String> {
     type_mapping::encode_data_partition(src)
 }
 
@@ -185,7 +183,7 @@ pub(crate) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPar
 pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode, String> {
     encode_node_with_context(
         src,
-        &NativePlanEncodeContext {
+        &NativePlanEncodeContext::<scan_facts::NoScanFacts> {
             scan_facts: None,
             node_outputs: None,
             fragment_edge_outputs: None,
@@ -195,9 +193,9 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
     )
 }
 
-pub(super) fn encode_node_with_context(
+pub(super) fn encode_node_with_context<'a, F: NativeScanFacts<'a>>(
     src: &DistributedNode,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'a, F>,
 ) -> Result<plan::DistributedNode, String> {
     let children = src
         .children

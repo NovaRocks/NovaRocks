@@ -17,14 +17,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::super::expr::encode_sort_items;
 use super::output::{encode_output_column, encode_output_columns};
+use super::scan_facts::{
+    NativeConnectorRead, NativeScanBinding, NativeScanColumn, NativeScanColumnKind,
+    NativeScanExecutionKind, NativeScanFacts,
+};
 use super::type_mapping::encode_type;
 use super::type_mapping::{encode_edge_partition_type, encode_sql_type};
 use super::{NativePlanEncodeContext, encode_exprs};
-use crate::query_execution::preparation::{
-    NativeScanBindingView, NativeScanColumnKind, NativeScanColumnView, NativeScanExecutionKind,
-};
+use crate::expr::encode_sort_items;
 use novarocks_proto_models::{common, plan};
 use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::{
@@ -32,10 +33,10 @@ use novarocks_sql::plan_read::{
     SqlScanSourceRead, SqlTableDefRead,
 };
 
-pub(super) fn encode_scan_node(
+pub(super) fn encode_scan_node<'a, F: NativeScanFacts<'a>>(
     src: &SqlPlanScanNodeRead,
     node_id: i32,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'a, F>,
 ) -> Result<plan::ScanNode, String> {
     let binding = scan_binding_for_source(node_id, &src.table.source, ctx)?;
     // The columns the engine derives above the connector. They are part of the
@@ -98,13 +99,13 @@ pub(super) fn encode_scan_node(
     })
 }
 
-fn encode_bound_scan_output_columns(
+fn encode_bound_scan_output_columns<'a>(
     src: &SqlPlanScanNodeRead,
-    binding: NativeScanBindingView<'_>,
+    binding: impl NativeScanBinding<'a>,
 ) -> Result<Vec<common::OutputColumn>, String> {
     let physical_by_planner_id = binding
         .physical_columns()
-        .map(|column| (column.planner().column_id, column))
+        .map(|column| (column.planner.column_id, column))
         .collect::<HashMap<_, _>>();
     let synthetic_ids = src
         .variant_columns
@@ -122,20 +123,20 @@ fn encode_bound_scan_output_columns(
         }
     }
     for bound in binding.physical_columns() {
-        if seen_physical_ids.insert(bound.planner().column_id) {
+        if seen_physical_ids.insert(bound.planner.column_id) {
             encoded.push(encode_bound_scan_output_column(bound)?);
         }
     }
     Ok(encoded)
 }
 
-fn encode_bound_required_columns(
+fn encode_bound_required_columns<'a>(
     src: &SqlPlanScanNodeRead,
-    binding: NativeScanBindingView<'_>,
+    binding: impl NativeScanBinding<'a>,
 ) -> Vec<String> {
     let mut required = binding
         .required_reads()
-        .map(|read| read.source().name.clone())
+        .map(|read| read.name.clone())
         .collect::<Vec<_>>();
     for variant in &src.variant_columns {
         let required_by_planner = src.required_columns.as_ref().is_none_or(|columns| {
@@ -155,10 +156,10 @@ fn encode_bound_required_columns(
 }
 
 fn encode_bound_scan_output_column(
-    column: NativeScanColumnView<'_>,
+    column: NativeScanColumn<'_>,
 ) -> Result<common::OutputColumn, String> {
-    let source = column.source();
-    let planner = column.planner();
+    let source = column.source;
+    let planner = column.planner;
     let data_type = match source.logical_type.as_ref() {
         Some(logical_type) => encode_sql_type(logical_type)?,
         None => encode_type(&source.data_type)?,
@@ -225,14 +226,14 @@ fn encode_exchange_flavor(src: &ExchangeFlavor) -> Result<plan::ExchangeFlavor, 
     })
 }
 
-pub(super) fn encode_table_def_with_context(
+pub(super) fn encode_table_def_with_context<'a, F: NativeScanFacts<'a>>(
     src: &SqlTableDefRead,
     scan_node_id: Option<i32>,
     scan_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
     synthetic_output_column_ids: &HashSet<ColumnId>,
-    binding: Option<NativeScanBindingView<'_>>,
-    ctx: &NativePlanEncodeContext<'_>,
+    binding: Option<F::Binding>,
+    ctx: &NativePlanEncodeContext<'a, F>,
 ) -> Result<plan::TableDef, String> {
     let (columns, metadata_columns) = match binding {
         Some(binding) if scan_source_requires_resolved_binding(&src.source) => {
@@ -268,8 +269,8 @@ fn scan_source_requires_resolved_binding(_: &SqlScanSourceRead) -> bool {
     true
 }
 
-fn resolved_binding_table_columns(
-    binding: NativeScanBindingView<'_>,
+fn resolved_binding_table_columns<'a>(
+    binding: impl NativeScanBinding<'a>,
 ) -> (
     Vec<novarocks_types::schema::ColumnDef>,
     Vec<novarocks_types::schema::ColumnDef>,
@@ -279,27 +280,27 @@ fn resolved_binding_table_columns(
     let mut seen = HashSet::new();
 
     for bound in binding.physical_columns() {
-        if !seen.insert(bound.source().name.to_ascii_lowercase()) {
+        if !seen.insert(bound.source.name.to_ascii_lowercase()) {
             continue;
         }
-        match bound.kind() {
-            NativeScanColumnKind::PhysicalTable => columns.push(bound.source().clone()),
-            NativeScanColumnKind::IcebergMetadata => metadata_columns.push(bound.source().clone()),
+        match bound.kind {
+            NativeScanColumnKind::PhysicalTable => columns.push(bound.source.clone()),
+            NativeScanColumnKind::IcebergMetadata => metadata_columns.push(bound.source.clone()),
         }
     }
     for read in binding.required_reads() {
-        if seen.insert(read.source().name.to_ascii_lowercase()) {
-            columns.push(read.source().clone());
+        if seen.insert(read.name.to_ascii_lowercase()) {
+            columns.push(read.clone());
         }
     }
 
     (columns, metadata_columns)
 }
 
-fn merged_bound_table_columns(
+fn merged_bound_table_columns<'a>(
     src: &SqlTableDefRead,
     scan_columns: &[AnalysisOutputColumn],
-    binding: NativeScanBindingView<'_>,
+    binding: impl NativeScanBinding<'a>,
 ) -> (
     Vec<novarocks_types::schema::ColumnDef>,
     Vec<novarocks_types::schema::ColumnDef>,
@@ -307,28 +308,28 @@ fn merged_bound_table_columns(
     let mut columns = src.columns.clone();
     let mut metadata_columns = src.iceberg_row_lineage_metadata_columns.clone();
     for bound in binding.physical_columns() {
-        let target = match bound.kind() {
+        let target = match bound.kind {
             NativeScanColumnKind::PhysicalTable => &mut columns,
             NativeScanColumnKind::IcebergMetadata => &mut metadata_columns,
         };
         let planner_source_name = scan_columns
             .iter()
-            .find(|column| column.column_id == bound.planner().column_id)
+            .find(|column| column.column_id == bound.planner.column_id)
             .map(|column| column.name.as_str());
         overlay_bound_column(
             target,
-            &bound.planner().name,
+            &bound.planner.name,
             planner_source_name,
-            bound.source(),
+            bound.source,
         );
     }
     for read in binding.required_reads() {
-        if replace_column_by_name(&mut columns, read.source())
-            || replace_column_by_name(&mut metadata_columns, read.source())
+        if replace_column_by_name(&mut columns, read)
+            || replace_column_by_name(&mut metadata_columns, read)
         {
             continue;
         }
-        columns.push(read.source().clone());
+        columns.push(read.clone());
     }
     (columns, metadata_columns)
 }
@@ -379,11 +380,11 @@ pub(super) fn encode_column_def(
     })
 }
 
-fn scan_binding_for_source<'a>(
+fn scan_binding_for_source<'a, F: NativeScanFacts<'a>>(
     node_id: i32,
     source: &SqlScanSourceRead,
-    ctx: &'a NativePlanEncodeContext<'_>,
-) -> Result<Option<NativeScanBindingView<'a>>, String> {
+    ctx: &NativePlanEncodeContext<'a, F>,
+) -> Result<Option<F::Binding>, String> {
     let binding = ctx.scan_facts.and_then(|facts| facts.binding(node_id));
     let required = scan_source_requires_resolved_binding(source);
     if required && binding.is_none() {
@@ -470,12 +471,12 @@ fn resolved_execution_kind(execution: NativeScanExecutionKind) -> &'static str {
 /// The carrier has no split list, no opaque payload, and no Arrow IPC expected
 /// schema — its ordered assignments carry the output contract, and its splits
 /// arrive at runtime on the task-update queue.
-fn encode_scan_source(
+fn encode_scan_source<'a, F: NativeScanFacts<'a>>(
     src: &SqlScanSourceRead,
     scan_node_id: Option<i32>,
     scan_output_columns: Option<&[common::OutputColumn]>,
     synthetic_output_column_ids: &HashSet<ColumnId>,
-    ctx: &NativePlanEncodeContext<'_>,
+    ctx: &NativePlanEncodeContext<'a, F>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
 

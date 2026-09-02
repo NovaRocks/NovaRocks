@@ -18,7 +18,7 @@
 use arrow::datatypes::DataType;
 use prost::Message;
 
-use super::super::expr::encode_expr;
+use novarocks_plan_codec::encode_expr;
 use novarocks_proto_models::{common, expr};
 use novarocks_sql::plan_read::{LiteralValue, TypedExpr};
 use novarocks_sql::test_support::{
