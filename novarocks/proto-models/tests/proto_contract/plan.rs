@@ -487,6 +487,7 @@ fn classify_plan_node_kind(kind: plan::plan_node::Kind) -> &'static str {
         plan::plan_node::Kind::CteProduce(_) => "cte_produce",
         plan::plan_node::Kind::CteConsume(_) => "cte_consume",
         plan::plan_node::Kind::Redistribute(_) => "redistribute",
+        plan::plan_node::Kind::Unpivot(_) => "unpivot",
     }
 }
 
