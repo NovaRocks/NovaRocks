@@ -16,6 +16,18 @@
 -- under the License.
 
 -- @sequential=true
+--
+-- The participant-outcome directive is dropped, not replaced. It reads the
+-- frontend's structured lifecycle snapshot, which a task-path query does not
+-- produce -- the endpoint answers 404 because there is no lifecycle attempt --
+-- so the whole case failed on capturing that baseline and neither of the
+-- assertions below ever ran. They are the ones carrying the meaning: a
+-- fragment that fails after start fails the query, and the other fragments
+-- are cancelled exactly once each.
+--
+-- The participant-outcome proof itself has no task-protocol equivalent yet.
+-- Restoring it needs a task-execution convergence snapshot the frontend does
+-- not serve, which is its own work item rather than a directive swap.
 
 -- query 1
 -- @skip_result_check=true
@@ -40,7 +52,6 @@ INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
 -- query 5
 -- @fail_fragment_after_start_be_index=1
 -- @expect_error=fragment executor failure injected after start
--- @expect_participant_outcome=proof
 -- @be_log_exact_fragment_cancellation=3
 SELECT COUNT(*)
 FROM ${case_db}.fragment_execution_failure
