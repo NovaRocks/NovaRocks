@@ -28,7 +28,8 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use novarocks_execution::task_execution::{TaskIdentity, TaskStatus};
 
@@ -44,6 +45,47 @@ pub enum StatusEvent {
 /// How the runner is woken.
 pub trait StatusIntakeWake: std::fmt::Debug + Send + Sync {
     fn wake(&self);
+}
+
+/// Wakes a runner parked on a condition variable.
+///
+/// The coordinator's statement thread is blocking rather than async, so it
+/// parks here instead of on a `Notify` it would have to enter a runtime to
+/// await. It is a pacing aid and never a correctness condition: every wait is
+/// bounded, so a wake that is missed costs latency and nothing else.
+#[derive(Debug, Default)]
+pub struct CondvarWake {
+    woken: Mutex<bool>,
+    signal: Condvar,
+}
+
+impl CondvarWake {
+    /// Blocks until something wakes this, or `timeout` elapses.
+    ///
+    /// A wake that arrived while the caller was working is consumed here
+    /// rather than lost: without the flag, a publish between two waits would
+    /// be slept through, and on a control-plane-only turn nothing else would
+    /// arrive to end that sleep.
+    pub fn wait(&self, timeout: Duration) {
+        let mut woken = self.woken.lock().expect("task round wake lock");
+        if std::mem::take(&mut *woken) {
+            return;
+        }
+        let (mut guard, _) = self
+            .signal
+            .wait_timeout(woken, timeout)
+            .expect("task round wake condvar");
+        *guard = false;
+    }
+}
+
+impl StatusIntakeWake for CondvarWake {
+    fn wake(&self) {
+        let mut woken = self.woken.lock().expect("task round wake lock");
+        *woken = true;
+        drop(woken);
+        self.signal.notify_all();
+    }
 }
 
 /// Wakes a runner parked on a `Notify`.

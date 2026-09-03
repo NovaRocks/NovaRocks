@@ -22,14 +22,6 @@
 //! and this turns those into the graph, the transport and the runner that
 //! drive them. It decides nothing about placement, sequencing or completion.
 
-// `execute_round` calls this when it cuts over to the task substrate. `expect`
-// rather than `allow` so this fails once that lands rather than outliving its
-// reason.
-#![expect(
-    dead_code,
-    reason = "the coordinator assembles a round here when it cuts over to the task substrate"
-)]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -48,8 +40,10 @@ use crate::task_execution::clock::ProcessMonotonicClock;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::graph::{TaskGraphInputs, build_task_graph};
-use crate::task_execution::round::{StatusSubscriptions, TaskRound};
+use crate::task_execution::intent::TaskOperationSink;
+use crate::task_execution::round::{AcknowledgementObserver, StatusSubscriptions, TaskRound};
 use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
+use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{StatusIntake, StatusIntakeWake};
 
 /// How many status events one attempt may hold before the transport is told it
@@ -68,6 +62,17 @@ pub(crate) struct AttemptTransport {
     pub(crate) data_runtime: FrontendDataRuntime,
 }
 
+/// One assembled attempt: its runner and the split-delivery bridge that shares
+/// its substrate.
+///
+/// The bridge is returned rather than hidden inside the runner because its two
+/// halves belong to different threads: the runner drains its owner half on its
+/// own turn, while the split-assignment worker blocks on the transport half.
+pub(crate) struct AssembledRound {
+    pub(crate) round: TaskRound,
+    pub(crate) split_delivery: Arc<SplitDeliveryBridge>,
+}
+
 /// Builds the runner for one attempt.
 ///
 /// The backend set is frozen here and shared by the operation sink and the
@@ -84,7 +89,7 @@ pub(crate) fn assemble_round(
     establish: AttemptEstablishFacts,
     wake: Arc<dyn StatusIntakeWake>,
     transport: AttemptTransport,
-) -> Result<TaskRound, TaskExecutionError> {
+) -> Result<AssembledRound, TaskExecutionError> {
     let plans = SubmissionFragmentPlans::index(submissions, schedule)?;
     let graph = build_task_graph(
         TaskGraphInputs::from_schedule(
@@ -98,6 +103,11 @@ pub(crate) fn assemble_round(
         &plans,
     )?;
 
+    // Taken while the graph is still whole: the bridge resolves the driver's
+    // kernel-key addresses, and the substrate takes the graph's descriptors
+    // away in `QueryTaskExecution::new`.
+    let split_delivery = SplitDeliveryBridge::for_graph(&graph);
+
     let acks = TaskAckIntake::new(Arc::clone(&wake));
     let sink = NativeTaskOperationSink::new(
         backends,
@@ -107,6 +117,7 @@ pub(crate) fn assemble_round(
         transport.data_runtime.clone(),
     )
     .map_err(TaskExecutionError::Schedule)?;
+    let sink = split_delivery.sink(Arc::new(sink) as Arc<dyn TaskOperationSink>);
 
     let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
     let subscriber = Arc::new(
@@ -124,14 +135,19 @@ pub(crate) fn assemble_round(
         transport.budget,
         transport.transport,
         Arc::new(ProcessMonotonicClock::new()),
-        Arc::new(sink),
+        sink,
         intake,
     )?;
 
-    Ok(TaskRound::new(
+    let round = TaskRound::new(
         execution,
         acks,
         Box::new(establish),
         subscriber as Arc<dyn StatusSubscriptions>,
-    ))
+    )
+    .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>);
+    Ok(AssembledRound {
+        round,
+        split_delivery,
+    })
 }

@@ -92,33 +92,50 @@ pub(crate) fn assignment_endpoints(
 /// there, and a source dropped without closing leaves the connector holding
 /// whatever the enumeration opened.
 pub(crate) struct RoundSplitAssignmentPlan {
-    transport: Arc<dyn TaskUpdateTransport>,
     targets: BTreeMap<i32, Vec<AssignmentTarget>>,
     sources: Vec<RoundSplitSource>,
     retry_policy: TaskUpdateRetryPolicy,
     initial_dynamic_filter_wait_cap: std::time::Duration,
+    /// Every backend this round may address, frozen with the schedule.
+    ///
+    /// Carried on the plan because the schedule is consumed before either path
+    /// builds its transport, and a transport built from a later snapshot could
+    /// address a process this attempt never scheduled.
+    endpoints: Vec<(usize, RuntimeEndpoint)>,
 }
 
 impl RoundSplitAssignmentPlan {
+    /// Everything but the delivery transport.
+    ///
+    /// The transport arrives at [`SplitAssignmentRoundGuard::start`] because
+    /// the two are frozen at different moments: sources must be open before
+    /// the attempt's credential leases are sealed, while the task substrate's
+    /// delivery bridge cannot exist until the task graph does -- and the graph
+    /// is built from the encoder output, which comes later.
     pub(crate) fn new(
-        transport: Arc<dyn TaskUpdateTransport>,
         targets: BTreeMap<i32, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
         initial_dynamic_filter_wait_cap: std::time::Duration,
+        endpoints: Vec<(usize, RuntimeEndpoint)>,
     ) -> Self {
         Self {
-            transport,
             targets,
             sources,
             retry_policy,
             initial_dynamic_filter_wait_cap,
+            endpoints,
         }
     }
 
     /// The scan nodes this plan opened a source for.
     pub(crate) fn plan_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
         self.sources.iter().map(|source| source.plan_node_id)
+    }
+
+    /// Every backend this round may address.
+    pub(crate) fn endpoints(&self) -> &[(usize, RuntimeEndpoint)] {
+        &self.endpoints
     }
 }
 
@@ -154,11 +171,11 @@ impl SplitAssignmentRoundGuard {
     pub(crate) fn start(
         execution_id: QueryExecutionId,
         mut plan: RoundSplitAssignmentPlan,
+        transport: Arc<dyn TaskUpdateTransport>,
     ) -> Option<Self> {
         // Taken, not borrowed: the sources move into the round, so the plan's
         // own drop must not close what the round now owns.
         let sources = std::mem::take(&mut plan.sources);
-        let transport = Arc::clone(&plan.transport);
         let tasks = std::mem::take(&mut plan.targets);
         if sources.is_empty() {
             return None;
@@ -193,6 +210,19 @@ impl SplitAssignmentRoundGuard {
             stop,
             worker: Some(worker),
         })
+    }
+
+    /// Whether the worker has stopped.
+    ///
+    /// The task substrate's delivery bridge is settled by the round runner on
+    /// the statement thread, so a worker still waiting for an acknowledgement
+    /// can only be released by another turn. Joining it before it has stopped
+    /// would stop the very loop that releases it, so the caller asks first and
+    /// keeps turning until this is true.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
     }
 
     /// Wait for delivery to finish, returning the worker result.
@@ -256,12 +286,13 @@ mod tests {
             SplitAssignmentRoundGuard::start(
                 execution_id(),
                 RoundSplitAssignmentPlan::new(
-                    Arc::new(NeverCalled),
                     BTreeMap::new(),
                     Vec::new(),
                     TaskUpdateRetryPolicy::default(),
                     std::time::Duration::ZERO,
+                    Vec::new(),
                 ),
+                Arc::new(NeverCalled),
             )
             .is_none()
         );

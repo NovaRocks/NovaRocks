@@ -688,6 +688,64 @@ impl QueryCredentialLeases {
             storage_route.revoke();
         }
     }
+
+    /// Turns this attempt's frozen table into the storage capability its own
+    /// commit reads through.
+    ///
+    /// The table is moved because the caller must be finished contributing it:
+    /// on the task protocol the establish has already copied the material into
+    /// wire form, and a second owner of the same secrets would be a second
+    /// place it could outlive the attempt.
+    ///
+    /// The route connectors were handed during planning is re-pointed at the
+    /// returned owner, so one capability serves both that route and the
+    /// frontend's terminal commit. The route holds it weakly, so the caller
+    /// must keep the returned value alive for as long as either may resolve.
+    pub(crate) fn into_attempt_storage_resolver(self) -> Option<Arc<AttemptCredentialStorage>> {
+        if self.leases.is_empty() {
+            return None;
+        }
+        let owner = Arc::new(AttemptCredentialStorage {
+            leases: self.leases,
+            route: self.storage_route.clone(),
+        });
+        if let Some(route) = &self.storage_route {
+            route.adopt(Arc::clone(&owner) as Arc<dyn ConnectorStorageResolver>);
+        }
+        Some(owner)
+    }
+}
+
+/// One attempt's frozen credential table, as a storage resolver.
+///
+/// It is the task protocol's counterpart of the old lifecycle's terminal
+/// credential capability. There is no attempt state to gate on here because
+/// there is none to consult: the frontend holds the table itself, and the call
+/// site that hands this to a write session is the one that already proved the
+/// attempt completed.
+pub(crate) struct AttemptCredentialStorage {
+    leases: Vec<QueryCredentialLease>,
+    route: Option<Arc<AttemptCredentialLeaseStorageRoute>>,
+}
+
+impl ConnectorStorageResolver for AttemptCredentialStorage {
+    fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        resolve_vended_s3_access(&self.leases, request)
+    }
+}
+
+impl Drop for AttemptCredentialStorage {
+    /// Revokes the planning route rather than leaving it pointing at a dead
+    /// weak reference: a revoked route denies access, an expired one would
+    /// deny it with a message about the wrong thing.
+    fn drop(&mut self) {
+        if let Some(route) = &self.route {
+            route.revoke();
+        }
+    }
 }
 
 pub(crate) fn resolve_vended_s3_access(
@@ -887,6 +945,14 @@ impl QueryInitOptions {
 
     pub(crate) fn credential_leases(&self) -> &QueryCredentialLeases {
         &self.credential_leases
+    }
+
+    /// Takes the frozen credential table out of these options.
+    ///
+    /// Used once, after an establish has copied the material into wire form,
+    /// so the attempt keeps exactly one owner of the secrets rather than two.
+    pub(crate) fn take_credential_leases(&mut self) -> QueryCredentialLeases {
+        std::mem::replace(&mut self.credential_leases, QueryCredentialLeases::empty())
     }
 }
 

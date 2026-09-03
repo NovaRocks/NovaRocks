@@ -1878,6 +1878,94 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
 }
 
 #[test]
+fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    // The coordinator closes its pre-ready retry window on these two, so each
+    // has to mean "the backend answered", not "the frontend asked". A round
+    // that has only released its establishes is exactly the state in which a
+    // replaced backend may still be discovered, and closing the window there
+    // would strand the attempt on a process that is gone.
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let mut harness = Harness::from_graph(graph);
+
+    // Nothing acknowledged yet.
+    let released = harness.released();
+    assert!(
+        released
+            .iter()
+            .any(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext)),
+        "a fresh attempt owes an establish"
+    );
+    let subscriptions = Arc::new(RecordingSubscriptions::default())
+        as Arc<dyn crate::task_execution::round::StatusSubscriptions>;
+    {
+        let probe = TaskRound::new(
+            harness.execution,
+            TaskAckIntake::new(Arc::clone(&harness.wake) as Arc<dyn StatusIntakeWake>),
+            Box::new(FakeEstablish),
+            Arc::clone(&subscriptions),
+        );
+        assert!(
+            !probe.contexts_established(),
+            "a released establish is not an acknowledged one"
+        );
+        assert!(!probe.tasks_created());
+        harness.execution = probe.into_execution();
+    }
+
+    // Answer every establish, then every create.
+    for intent in &released {
+        if matches!(intent.kind(), OperationKind::UpdateQueryContext) {
+            harness.context_ack(intent, Duration::from_secs(30));
+        }
+    }
+    let creates = released
+        .iter()
+        .filter(|intent| matches!(intent.kind(), OperationKind::CreateTask))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!creates.is_empty(), "the attempt owes creates as well");
+    {
+        let probe = TaskRound::new(
+            harness.execution,
+            TaskAckIntake::new(Arc::clone(&harness.wake) as Arc<dyn StatusIntakeWake>),
+            Box::new(FakeEstablish),
+            Arc::clone(&subscriptions),
+        );
+        assert!(
+            probe.contexts_established(),
+            "every context answered its establish"
+        );
+        assert!(
+            !probe.tasks_created(),
+            "no create has been acknowledged yet"
+        );
+        harness.execution = probe.into_execution();
+    }
+
+    for intent in &creates {
+        harness
+            .create_ack(intent, OperationOutcome::Accepted)
+            .expect("a create acknowledgement settles");
+    }
+    let probe = TaskRound::new(
+        harness.execution,
+        TaskAckIntake::new(Arc::clone(&harness.wake) as Arc<dyn StatusIntakeWake>),
+        Box::new(FakeEstablish),
+        subscriptions,
+    );
+    assert!(probe.contexts_established());
+    assert!(
+        probe.tasks_created(),
+        "every task answered its create, so the attempt finished starting"
+    );
+}
+
+#[test]
 fn a_terminal_marker_after_a_task_took_its_splits_is_admitted() {
     // The sender gives every task of a plan node the terminal marker, so a
     // task whose splits all arrived in an earlier batch receives a final

@@ -24,9 +24,30 @@ use std::collections::HashMap;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::terminal_codec::decode_runtime_profile_tree;
+use novarocks_execution::task_execution::FinalTaskInfo;
 use novarocks_proto_codec::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
 use novarocks_proto_models::novarocks;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
+
+/// The counters a task's operator statistics are rendered as.
+///
+/// The same names the backend's own projection reads, so a profile built here
+/// and a profile projected there describe one operator in one vocabulary.
+const TASK_OPERATOR_INPUT_ROWS: &str = "PushRowNum";
+const TASK_OPERATOR_OUTPUT_ROWS: &str = "PullRowNum";
+const TASK_OPERATOR_TOTAL_TIME: &str = "OperatorTotalTime";
+/// Set when a task had more operators than its final info could carry.
+const OPERATOR_STATISTICS_TRUNCATED: &str = "OperatorStatisticsTruncated";
+
+/// Counters are signed; a value past the positive range is clamped rather than
+/// wrapped, because a wrapped count reads as a negative row count.
+const fn clamp_counter(value: u64) -> i64 {
+    if value > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        value as i64
+    }
+}
 
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
@@ -107,6 +128,76 @@ impl ProfileTerminalBuilder {
                     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
                 })?);
         }
+        Ok(())
+    }
+
+    /// Applies one task's operator statistics from its final info.
+    ///
+    /// This is the task protocol's whole profile source, and it is narrower
+    /// than what the old per-fragment telemetry carried. A backend projects
+    /// its runtime profile tree down to `(plan node, operator)` rows and a
+    /// wall time before it publishes; nothing else survives that projection,
+    /// so the tree rebuilt here carries exactly those three facts and no
+    /// invented structure around them. Dictionary metrics, runtime-filter
+    /// apply counters and the pipeline/driver nesting the old telemetry
+    /// carried are absent rather than zero -- a renderer that keys on them
+    /// finds nothing, which is the honest answer.
+    pub(crate) fn apply_task_operator_statistics(
+        &mut self,
+        info: &FinalTaskInfo,
+    ) -> Result<(), DistributedQueryError> {
+        if info.operator_statistics().is_empty() && !info.operator_statistics_truncated() {
+            return Ok(());
+        }
+        let identity = info.final_status().identity();
+        let task = RuntimeProfile::new(format!(
+            "Task (stage={} task={})",
+            identity.stage_id(),
+            identity.task_id()
+        ));
+        if info.operator_statistics_truncated() {
+            // Recorded on the task rather than dropped: a missing operator and
+            // an operator that did no work must not read the same way.
+            task.child(COMMON_METRICS).counter_set(
+                OPERATOR_STATISTICS_TRUNCATED,
+                ProfileUnit::Unit,
+                1,
+            );
+        }
+        for statistics in info.operator_statistics() {
+            // The plan node id travels in the name because that is where every
+            // reader of these trees already looks for it: `ProfileNode.node_id`
+            // is set only on a fragment root, so a real plan node zero and an
+            // unset field are indistinguishable there.
+            let operator = task.child(format!(
+                "{} (plan_node_id={})",
+                statistics.operator().as_str(),
+                statistics.plan_node_id()
+            ));
+            let common = operator.child(COMMON_METRICS);
+            if let Some(rows) = statistics.input_rows() {
+                common.counter_set(
+                    TASK_OPERATOR_INPUT_ROWS,
+                    ProfileUnit::Unit,
+                    clamp_counter(rows),
+                );
+            }
+            if let Some(rows) = statistics.output_rows() {
+                common.counter_set(
+                    TASK_OPERATOR_OUTPUT_ROWS,
+                    ProfileUnit::Unit,
+                    clamp_counter(rows),
+                );
+            }
+            if let Some(wall_time) = statistics.wall_time() {
+                common.counter_set(
+                    TASK_OPERATOR_TOTAL_TIME,
+                    ProfileUnit::TimeNs,
+                    clamp_counter(wall_time.as_nanos().min(u128::from(u64::MAX)) as u64),
+                );
+            }
+        }
+        self.profiles.push(task.to_native_tree());
         Ok(())
     }
 

@@ -572,6 +572,174 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             stage_bindings,
         })
     }
+
+    /// Freeze this attempt's shared facts for the task protocol.
+    ///
+    /// It performs the same admission the lifecycle path performs before it
+    /// may encode a submission -- the execution-id check and the query-wide
+    /// catalog freeze -- and deliberately stops there: on the task path a
+    /// query context is established by the substrate itself, so there is no
+    /// barrier to enter and no participant manifest to compile.
+    pub fn prepare_task_execution(
+        self,
+        options: QueryInitOptions,
+    ) -> Result<TaskExecutionPreparedQuery, DistributedQueryError> {
+        if options.execution_id().query_id() != self.schedule.execution_id.query_id()
+            || options.execution_id().attempt_id().get()
+                != self.schedule.execution_id.attempt_id().get()
+        {
+            return Err(contract_error(
+                "task execution preparation execution id does not match validated schedule",
+            ));
+        }
+        let catalog_lease = freeze_query_catalog_lease(&self.prepared, options.catalog_set())?;
+        let options = options.with_catalog_set(catalog_lease.catalog_set().clone());
+        Ok(TaskExecutionPreparedQuery {
+            handoff_id: self.handoff_id,
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule: self.schedule,
+            options,
+            catalog_lease,
+            runtime_filter_contributions: self.runtime_filter_contributions,
+        })
+    }
+}
+
+/// One attempt's frozen inputs for the task protocol.
+///
+/// It is the task path's counterpart of [`ControlReadyDistributedQuery`], and
+/// it exists because the two paths differ in exactly one thing: the old had to
+/// reach a lifecycle barrier before it was allowed to encode a submission,
+/// while the task path establishes its query contexts from the same frozen
+/// facts and creates tasks directly. Everything else -- the execution-id
+/// check, the query-wide catalog freeze, the retained planning leases -- is
+/// identical and is done here rather than duplicated at the call site.
+pub struct TaskExecutionPreparedQuery {
+    handoff_id: u64,
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentAttachment,
+    schedule: ValidatedFragmentSchedule,
+    options: QueryInitOptions,
+    /// Held, never read: the FE control leases inside it are released when it
+    /// drops, and this value is what keeps them alive for the whole attempt.
+    /// A backend still resolving a catalog through one of them must not find
+    /// its planning ownership already gone.
+    #[expect(
+        dead_code,
+        reason = "the catalog planning leases are retained for the attempt's lifetime, not read"
+    )]
+    catalog_lease: QueryCatalogLease,
+    runtime_filter_contributions: BTreeMap<usize, novarocks::RuntimeFilterContribution>,
+}
+
+impl TaskExecutionPreparedQuery {
+    /// Stable placement identity facts for the owner-local native submission
+    /// mapper, exactly as the lifecycle path's own typestate exposes them.
+    pub fn native_submission_view(
+        &self,
+    ) -> Result<NativeSubmissionEncodingView<'_>, DistributedQueryError> {
+        native_submission_encoding_view(
+            self.handoff_id,
+            self.schedule.execution_id,
+            &self.prepared,
+            &self.native_bundle,
+            &self.schedule.inner,
+            self.options.native_submission_options(),
+        )
+    }
+
+    /// The frozen placement result the task graph is built from.
+    pub(crate) const fn scheduling_plan(&self) -> &SchedulingPlan {
+        &self.schedule.inner
+    }
+
+    /// The exchange edges of this plan, in the planner's own order.
+    pub(crate) fn fragment_edges(&self) -> &[novarocks_sql::plan_read::FragmentEdge] {
+        self.prepared.scheduling_view().edges()
+    }
+
+    /// The query-wide catalog contribution every query context establishes.
+    pub(crate) fn catalog_set(&self) -> &CatalogSet {
+        self.options.catalog_set()
+    }
+
+    /// The runtime-filter contribution each scheduled backend establishes.
+    ///
+    /// Keyed by backend index because that is what the compiler produced; the
+    /// caller translates to process identity through the same ownership map
+    /// the graph is built with, so a contribution can never be established on
+    /// a process the schedule did not name.
+    pub(crate) const fn runtime_filter_contributions(
+        &self,
+    ) -> &BTreeMap<usize, novarocks::RuntimeFilterContribution> {
+        &self.runtime_filter_contributions
+    }
+
+    pub(crate) const fn init_options(&self) -> &QueryInitOptions {
+        &self.options
+    }
+
+    /// Takes this attempt's vended-storage capability, once.
+    ///
+    /// Called after the establish froze its own copy of the material: the
+    /// table moves into the capability so the attempt keeps one owner of the
+    /// secrets. A deployment that vends nothing has no capability to hand out
+    /// and gets `None`, which is a different statement from a denied one.
+    pub(crate) fn take_terminal_storage_resolver(
+        &mut self,
+    ) -> Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>> {
+        self.options
+            .take_credential_leases()
+            .into_attempt_storage_resolver()
+    }
+
+    /// Consume a matching native submission attachment.
+    ///
+    /// The attachment is validated against this exact handoff for the same
+    /// reason the lifecycle path validates it: a submission set produced for
+    /// another artifact would place tasks this schedule never admitted.
+    pub fn seal_task_submission(
+        &self,
+        attachment: NativeSubmissionAttachment,
+    ) -> Result<TaskExecutionSubmission, DistributedQueryError> {
+        if !attachment.matches(self.handoff_id, self.schedule.execution_id) {
+            return Err(contract_error(
+                "native submission attachment does not belong to this task execution handoff",
+            ));
+        }
+        let (submissions, root_fetch, expected_output) = attachment.into_parts();
+        Ok(TaskExecutionSubmission {
+            submissions,
+            root_fetch,
+            expected_output,
+        })
+    }
+}
+
+/// Everything the coordinator needs after the encoder has run.
+///
+/// The catalog lease deliberately does not travel with it: it stays on
+/// [`TaskExecutionPreparedQuery`], which the coordinator keeps alive for the
+/// whole attempt. Dropping the FE control leases while tasks are running would
+/// release planning ownership of a catalog the backends are still reading
+/// through.
+pub struct TaskExecutionSubmission {
+    submissions: Vec<ValidatedNativeSubmission>,
+    root_fetch: RootFetchMetadata,
+    expected_output: ExpectedOutputSchema,
+}
+
+impl TaskExecutionSubmission {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<ValidatedNativeSubmission>,
+        RootFetchMetadata,
+        ExpectedOutputSchema,
+    ) {
+        (self.submissions, self.root_fetch, self.expected_output)
+    }
 }
 
 /// Freeze every catalog required by typed reads into the exact query-wide Init
@@ -1373,6 +1541,28 @@ impl ValidatedNativeSubmission {
 
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
+    }
+
+    /// Whether this instance's plan contains a connector table writer.
+    ///
+    /// Read off the encoded plan rather than inferred from the intent: a
+    /// distributed write's writer set is what decides whether the write
+    /// completed, and "the query is a write" says nothing about which of its
+    /// fragments actually write. Absence of a writer node is a positive fact
+    /// here -- an exchange or scan fragment of a write plan is not a writer,
+    /// and counting it as one would make a normal stand-down look like a
+    /// partial write.
+    pub(crate) fn declares_table_writer(&self) -> bool {
+        fn contains_writer(node: &novarocks_proto_models::plan::DistributedNode) -> bool {
+            if matches!(
+                node.payload.as_ref(),
+                Some(novarocks_proto_models::plan::distributed_node::Payload::TableWriter(_))
+            ) {
+                return true;
+            }
+            node.children.iter().any(contains_writer)
+        }
+        self.plan.root.as_ref().is_some_and(contains_writer)
     }
 
     /// Packages this instance's plan and its own parameters for the task

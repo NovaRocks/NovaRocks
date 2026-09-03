@@ -26,17 +26,6 @@
 //! timed out, or finished -- it moves the state machine and lets the caller
 //! read the verdicts the machine already computes.
 
-// The coordinator drives this runner when it cuts over to the task substrate.
-// `expect` rather than `allow` so this fails once that lands rather than
-// outliving its reason.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the coordinator drives this runner when it cuts over to the task substrate"
-    )
-)]
-
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::identity::TaskIdentity;
@@ -48,7 +37,29 @@ use novarocks_execution::task_execution::status::TaskStatusCursor;
 use super::context_owner::ContextEstablishSource;
 use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
+use super::intent::OperationAcknowledgement;
+use super::remote_task::RemoteTaskState;
 use crate::native::task_transport::{TaskAckIntake, TaskStatusSubscriber};
+
+/// Something that must see every acknowledgement this runner settles.
+///
+/// The runner is the only thing that drains acknowledgements, so an owner that
+/// bound work to a released operation can learn its verdict nowhere else. That
+/// is exactly split delivery's position: its sender blocks on the substrate
+/// settling the operation that carried its submission, and a failed-closed
+/// acknowledgement carries no receipt to route by, so the sender would wait
+/// out its whole timeout for a verdict that had already arrived.
+///
+/// Observation happens before the state machine settles the operation, so an
+/// observer learns the real outcome even when settling it fails the attempt.
+pub(crate) trait AcknowledgementObserver: Send + Sync {
+    /// Records one acknowledgement, or reports why it could not be recorded.
+    ///
+    /// The error is a frontend bug rather than a query outcome, which is why
+    /// it is reported rather than logged: an observer that silently missed an
+    /// acknowledgement leaves whatever bound to it waiting forever.
+    fn observe_acknowledgement(&self, ack: &OperationAcknowledgement) -> Result<(), String>;
+}
 
 /// The one thing the runner asks of the status transport.
 ///
@@ -106,6 +117,7 @@ pub(crate) struct TaskRound {
     acks: TaskAckIntake,
     establish: Box<dyn ContextEstablishSource>,
     subscriber: Arc<dyn StatusSubscriptions>,
+    observers: Vec<Arc<dyn AcknowledgementObserver>>,
 }
 
 impl TaskRound {
@@ -120,7 +132,14 @@ impl TaskRound {
             acks,
             establish,
             subscriber,
+            observers: Vec::new(),
         }
+    }
+
+    /// Adds one owner that must see every acknowledgement this runner settles.
+    pub(crate) fn observing(mut self, observer: Arc<dyn AcknowledgementObserver>) -> Self {
+        self.observers.push(observer);
+        self
     }
 
     /// Steps the attempt once.
@@ -136,6 +155,14 @@ impl TaskRound {
 
         for ack in self.acks.drain() {
             report.acknowledgements += 1;
+            // Before the state machine settles it: settling can fail the
+            // attempt, and an observer that learned nothing in that case would
+            // leave a blocked owner waiting for a verdict that did arrive.
+            for observer in &self.observers {
+                observer
+                    .observe_acknowledgement(&ack)
+                    .map_err(TaskExecutionError::Schedule)?;
+            }
             self.execution.acknowledge(&ack)?;
         }
 
@@ -157,6 +184,34 @@ impl TaskRound {
         }
 
         Ok(report)
+    }
+
+    /// Whether every query context of this attempt has been established.
+    ///
+    /// This is the task protocol's ControlReady: past it, every backend that
+    /// hosts a task has acknowledged this attempt's shared facts. A caller
+    /// uses it to close a pre-ready retry window, so it must be an observation
+    /// of acknowledgements rather than of having sent them.
+    pub(crate) fn contexts_established(&self) -> bool {
+        self.execution.graph().contexts().all(|&context| {
+            self.execution
+                .owner(context)
+                .is_some_and(|owner| !owner.needs_establish())
+        })
+    }
+
+    /// Whether every task of this attempt has been created.
+    ///
+    /// This is the task protocol's Stage and Start: past it, every backend
+    /// holds the exact task the schedule placed on it. A task that already
+    /// went terminal does not count as created -- the question is whether the
+    /// attempt finished starting, and one that lost a task did not.
+    pub(crate) fn tasks_created(&self) -> bool {
+        self.execution.graph().tasks().all(|task| {
+            self.execution
+                .task(task.task_id())
+                .is_some_and(|task| matches!(task.state(), RemoteTaskState::Created))
+        })
     }
 
     /// The root task the client's result comes from.
@@ -188,6 +243,16 @@ impl TaskRound {
     /// The first termination cause this attempt latched.
     pub(crate) fn failure_cause(&self) -> Option<&TerminationDetail> {
         self.execution.failure_cause()
+    }
+
+    /// Takes the state machine back out.
+    ///
+    /// Only a test needs this: it lets one assert the runner's own view of a
+    /// state built through the state machine's API, without a second way to
+    /// construct that state.
+    #[cfg(test)]
+    pub(crate) fn into_execution(self) -> QueryTaskExecution {
+        self.execution
     }
 
     pub(crate) const fn execution(&self) -> &QueryTaskExecution {

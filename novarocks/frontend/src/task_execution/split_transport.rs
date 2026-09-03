@@ -51,13 +51,10 @@
 //! acknowledgement carries no receipt, so routing by the acknowledgement's own
 //! identity would strand exactly the senders that must not keep waiting.
 //!
-//! Nothing routes this bridge yet; the coordinator cutover is a separate step.
-//! The expectation below is deliberately `expect` rather than `allow`, so it
-//! stops compiling clean the moment a production caller appears.
-#![expect(
-    dead_code,
-    reason = "The coordinator still owns split delivery; this bridge is exercised by its own tests until the cutover lands."
-)]
+//! The acknowledgement itself reaches the owner half through
+//! [`super::round::AcknowledgementObserver`]: the round runner is the only
+//! thing that drains acknowledgements, so it is the only place a verdict for a
+//! blocked sender can be learned.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -572,6 +569,20 @@ fn delivered(outcome: DeliveryOutcome) -> Result<TaskUpdateOutcome, TaskUpdateTr
         DeliveryOutcome::Unknown(detail) => {
             Err(TaskUpdateTransportError::retryable_network(detail))
         }
+    }
+}
+
+impl super::round::AcknowledgementObserver for SplitDeliveryBridge {
+    /// Settles whatever submission this acknowledgement carried.
+    ///
+    /// Most acknowledgements carry none -- creates, lifecycle operations and
+    /// task updates from other producers -- and [`Self::settle`] reports that
+    /// as `Ignored` rather than as an error, because split delivery is one of
+    /// several task-update producers.
+    fn observe_acknowledgement(&self, ack: &OperationAcknowledgement) -> Result<(), String> {
+        self.settle(ack.operation_id(), ack)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
