@@ -1216,6 +1216,13 @@ fn report_terminal(
             // the result stream, not when the pipeline stops producing, so it
             // is the result plane that publishes FINISHED.
             FragmentSinkKind::Result => {
+                // Logged because this is the one terminal that deliberately
+                // is not FINISHED, and the frontend's read completion waits on
+                // FINISHED. A root parked in FLUSHING with no further line is
+                // the signature of a result stream the frontend never drained,
+                // and without this it cannot be told apart from a root whose
+                // pipeline never stopped producing at all.
+                debug!("root task reached FLUSHING; the result plane publishes FINISHED");
                 reporter.flushing();
             }
             _ => {

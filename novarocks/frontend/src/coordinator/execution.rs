@@ -31,7 +31,7 @@ use crate::common::backend_topology::{
 };
 use crate::native::fragment_transport::{
     FetchOutcome, FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport,
-    RootResultOutcome, TaskResultTransport,
+    RootResultOutcome, TaskReadGrace, TaskResultTransport,
 };
 use crate::query_execution::artifact::{
     PreparedDistributedQuery, RunningNativeExecutionParts,
@@ -1702,7 +1702,16 @@ impl FrontendDistributedQueryCoordinator {
         )
         .map_err(|error| failed(error.to_string()))?;
         let result_transport = Arc::new(
-            NativeTaskResultTransport::new(&backends, self.data_runtime.clone()).map_err(failed)?,
+            NativeTaskResultTransport::new(
+                &backends,
+                self.data_runtime.clone(),
+                TaskReadGrace::new(
+                    self.task_execution_budgets
+                        .transport
+                        .frontend_queue_residence(),
+                ),
+            )
+            .map_err(failed)?,
         );
         let root_task = round.root_task();
 
@@ -1772,6 +1781,11 @@ impl FrontendDistributedQueryCoordinator {
         // Recorded rather than inferred, exactly as the old path recorded it: a
         // write commits on the strength of this fact.
         let mut observed_result_eof = false;
+        let mut last_root_poll = RootResultPoll::default();
+        let mut wait_witness = TaskRoundWaitWitness::new(
+            task_round_wait_facts(&round, root_task, 0, last_root_poll),
+            Instant::now(),
+        );
         let outcome = loop {
             // Recomputed each turn so the two gates and the classification
             // window are read from this turn's state rather than last turn's.
@@ -1804,12 +1818,18 @@ impl FrontendDistributedQueryCoordinator {
             }
             let now = Instant::now();
             if now >= statement_deadline {
+                // The message names the facts rather than only the elapsed
+                // time. A completion rule that waits on absent facts has to
+                // say which one was absent, or its timeout is indistinguishable
+                // from every other timeout.
+                let waiting_on =
+                    task_round_wait_facts(&round, root_task, batches.len(), last_root_poll);
                 break Err(self.fail_task_round(
                     query_id,
                     &mut round,
                     &split_delivery,
                     classification,
-                    format!("query timed out after {timeout_ms} ms"),
+                    format!("query timed out after {timeout_ms} ms waiting on {waiting_on}"),
                 ));
             }
 
@@ -1882,6 +1902,7 @@ impl FrontendDistributedQueryCoordinator {
                             ));
                         }
                         batches.push(batch);
+                        last_root_poll = RootResultPoll::Packet(packet_sequence);
                         moved = true;
                     }
                     Ok(RootResultOutcome::EndOfStream { packet_sequence }) => {
@@ -1896,9 +1917,13 @@ impl FrontendDistributedQueryCoordinator {
                             ));
                         }
                         observed_result_eof = true;
+                        last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
                         moved = true;
                     }
-                    Ok(RootResultOutcome::NotReady) => moved = true,
+                    Ok(RootResultOutcome::NotReady) => {
+                        last_root_poll = RootResultPoll::NotReady;
+                        moved = true;
+                    }
                     Ok(RootResultOutcome::Failed(detail)) => {
                         break Err(self.fail_task_round(
                             query_id,
@@ -1919,6 +1944,12 @@ impl FrontendDistributedQueryCoordinator {
                     }
                 }
             }
+
+            wait_witness.observe(
+                execution_id,
+                task_round_wait_facts(&round, root_task, batches.len(), last_root_poll),
+                Instant::now(),
+            );
 
             if round.client_visible_completion() {
                 match write_completion.as_mut() {
@@ -3253,6 +3284,163 @@ const TASK_ROUND_IDLE_WAIT: Duration = Duration::from_millis(5);
 /// same thread owns both, and a poll that parked for the whole statement
 /// budget would stop settling acknowledgements and opening edges.
 const MAX_ROOT_RESULT_WAIT: Duration = Duration::from_millis(200);
+
+/// How long an attempt may make no observable progress before it says, in the
+/// log, which facts its completion is still waiting on.
+const TASK_ROUND_WAIT_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What the last root result poll answered.
+///
+/// `NotPolledYet` is a distinct answer on purpose: the result plane refuses a
+/// poll for a task whose creation has not been acknowledged, so the loop does
+/// not make one. "Never polled" and "polled and told nothing" are different
+/// faults and must not read alike in a log.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+enum RootResultPoll {
+    #[default]
+    NotPolledYet,
+    NotReady,
+    Packet(u64),
+    EndOfStream(u64),
+}
+
+impl std::fmt::Display for RootResultPoll {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPolledYet => formatter.write_str("not polled yet"),
+            Self::NotReady => formatter.write_str("not ready"),
+            Self::Packet(sequence) => write!(formatter, "packet {sequence}"),
+            Self::EndOfStream(sequence) => write!(formatter, "end of stream at {sequence}"),
+        }
+    }
+}
+
+/// Every fact one attempt's client-visible completion is still waiting on.
+///
+/// A read completes only when the root task published `FINISHED` and this
+/// frontend consumed the end of the root result stream. Both halves tolerate
+/// absence by design -- a fact that has not arrived keeps the loop turning
+/// rather than failing it -- which is exactly why the loop has to be able to
+/// name the one that is missing. Without it, an attempt that waited out its
+/// whole statement budget reported only "query timed out", a message that
+/// names no fact and leaves the difference between "the root never finished",
+/// "the stream never ended" and "the root's create was never acknowledged, so
+/// nothing was ever polled" to be recovered from a cluster run per candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaskRoundWaitFacts {
+    contexts_established: bool,
+    tasks_created: bool,
+    read: crate::task_execution::completion::ReadVerdict,
+    /// `None` means no task of the root's id is in this attempt's state at
+    /// all, which is a different fault from a root that is still creating.
+    root_create: Option<RemoteTaskState>,
+    last_root_poll: RootResultPoll,
+    packets: usize,
+    tasks: Vec<(
+        TaskIdentity,
+        RemoteTaskState,
+        novarocks_execution::task_execution::TaskState,
+    )>,
+}
+
+impl std::fmt::Display for TaskRoundWaitFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "read={:?} contexts_established={} tasks_created={} root_create={} \
+             last_root_poll={} packets={} tasks=[",
+            self.read,
+            self.contexts_established,
+            self.tasks_created,
+            match self.root_create {
+                Some(state) => format!("{state:?}"),
+                None => "absent".to_owned(),
+            },
+            self.last_root_poll,
+            self.packets,
+        )?;
+        for (index, (identity, create, state)) in self.tasks.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{identity} {create:?}/{state}")?;
+        }
+        formatter.write_str("]")
+    }
+}
+
+/// Reads, without changing anything, every fact this attempt's completion
+/// still depends on.
+fn task_round_wait_facts(
+    round: &TaskRound,
+    root_task: TaskIdentity,
+    packets: usize,
+    last_root_poll: RootResultPoll,
+) -> TaskRoundWaitFacts {
+    let mut tasks = Vec::new();
+    for stage in round.execution().graph().stages() {
+        let Some(execution_stage) = round.execution().stage(stage.stage_id()) else {
+            continue;
+        };
+        for (_, task) in execution_stage.tasks() {
+            tasks.push((task.identity(), task.state(), task.task_state()));
+        }
+    }
+    TaskRoundWaitFacts {
+        contexts_established: round.contexts_established(),
+        tasks_created: round.tasks_created(),
+        read: round.execution().read_completion(),
+        root_create: round
+            .execution()
+            .task(root_task.task_id())
+            .map(crate::task_execution::remote_task::RemoteTask::state),
+        last_root_poll,
+        packets,
+        tasks,
+    }
+}
+
+/// Reports what an attempt is waiting on once it stops changing.
+///
+/// Driven by the facts rather than by a timer alone: an attempt that is still
+/// moving says nothing, and one that has stopped says what it stopped on, once
+/// per interval, for as long as it is stopped. One line at the end would not
+/// be enough -- the attempt's own timeout is one of the outcomes this has to
+/// explain, and a hang that is killed from outside never reaches an end.
+struct TaskRoundWaitWitness {
+    facts: TaskRoundWaitFacts,
+    unchanged_since: Instant,
+}
+
+impl TaskRoundWaitWitness {
+    const fn new(facts: TaskRoundWaitFacts, now: Instant) -> Self {
+        Self {
+            facts,
+            unchanged_since: now,
+        }
+    }
+
+    /// Records this turn's facts, reporting them when a whole interval passed
+    /// with none of them changing.
+    fn observe(&mut self, execution_id: QueryExecutionId, facts: TaskRoundWaitFacts, now: Instant) {
+        if self.facts != facts {
+            self.facts = facts;
+            self.unchanged_since = now;
+            return;
+        }
+        if now.duration_since(self.unchanged_since) < TASK_ROUND_WAIT_REPORT_INTERVAL {
+            return;
+        }
+        self.unchanged_since = now;
+        tracing::warn!(
+            execution_id = ?execution_id,
+            waiting_on = %self.facts,
+            "attempt made no observable progress for {:?}; these are the facts its \
+             client-visible completion is waiting on",
+            TASK_ROUND_WAIT_REPORT_INTERVAL,
+        );
+    }
+}
 
 /// Everything both execution paths receive from the shared preamble.
 ///

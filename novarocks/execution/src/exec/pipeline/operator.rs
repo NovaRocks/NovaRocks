@@ -109,6 +109,50 @@ pub trait Operator: Send {
     }
 }
 
+/// What an operator's unfinished `set_finishing` is waiting for.
+///
+/// The driver asks this one question for two different decisions, and the two
+/// need different answers, which is why this is not a boolean:
+///
+/// * whether the operator may be latched as finished with `set_finishing` —
+///   only [`Self::Complete`] may;
+/// * whether giving it another turn right now would accomplish anything —
+///   only [`Self::OwedOutput`] would.
+///
+/// Collapsing the two deadlocks the driver in one direction or spins it in the
+/// other. Reporting owed output as "cannot progress" parks a driver forever
+/// with the payload still in hand — measured on a real 1FE+3BE cluster as a
+/// distributed `SELECT` whose one row-carrying producer never sent its end of
+/// stream. Reporting a wait for an external event as "can progress" turns the
+/// park into a hot spin over an obstacle the operator cannot clear.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum FinishingWait {
+    /// Finishing is done for this operator; the driver may latch it.
+    #[default]
+    Complete,
+    /// Output the operator still owes and can push on its next turn: a payload
+    /// it has buffered, or an end-of-stream marker it has not sent. The driver
+    /// must give it that turn.
+    OwedOutput,
+    /// An event only something else can produce — an exchange sink's outbound
+    /// edge has not been granted send permission, for one. Another turn now
+    /// would do nothing, so the driver parks and its blocked-driver poller
+    /// re-asks.
+    ExternalEvent,
+}
+
+impl FinishingWait {
+    /// Whether finishing is still unfinished, whatever it is waiting for.
+    pub const fn is_pending(self) -> bool {
+        !matches!(self, Self::Complete)
+    }
+
+    /// Whether another turn right now would move this operator forward.
+    pub const fn can_progress(self) -> bool {
+        matches!(self, Self::OwedOutput)
+    }
+}
+
 /// Extended operator contract for processor stages with push/pull semantics.
 pub trait ProcessorOperator: Operator {
     fn need_input(&self) -> bool;
@@ -121,16 +165,16 @@ pub trait ProcessorOperator: Operator {
 
     fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String>;
 
-    /// Whether `set_finishing` still has work it could not complete.
+    /// What `set_finishing` could not complete, and whether another turn
+    /// would complete it.
     ///
-    /// Default false: for almost every operator, finishing completes in the
-    /// one call the driver makes. An operator that can be legitimately unable
-    /// to finish yet — an exchange sink whose outbound edge has not been
-    /// granted send permission, for instance — reports true so the driver
-    /// retries instead of latching it as done. It must become false on its
-    /// own once the obstacle clears; the driver never forces it.
-    fn finishing_is_pending(&self) -> bool {
-        false
+    /// Default [`FinishingWait::Complete`]: for almost every operator,
+    /// finishing completes in the one call the driver makes. An operator that
+    /// can be legitimately unable to finish yet reports which of the two
+    /// reasons it is, because the driver acts on them differently — see
+    /// [`FinishingWait`].
+    fn finishing_wait(&self) -> FinishingWait {
+        FinishingWait::Complete
     }
 
     /// Whether this operator can consume the given column in its current

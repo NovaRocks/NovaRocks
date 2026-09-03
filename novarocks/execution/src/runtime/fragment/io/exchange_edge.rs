@@ -35,8 +35,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
+use crate::exec::pipeline::schedule::observer::Observable;
 use novarocks_types::UniqueId;
 
 use crate::task_execution::descriptor::ExchangeEdge;
@@ -241,6 +242,21 @@ pub struct ExchangeEdgeGates {
     gates: BTreeMap<ExchangeEdgeId, Arc<EdgeSendGate>>,
     destinations: HashMap<ExchangeDestinationKey, Arc<EdgeSendGate>>,
     granted: Mutex<ExchangeEdgeDomain>,
+    /// Every producer driver that must be woken when an edge opens.
+    ///
+    /// A driver that parked because its edge was closed is parked on a
+    /// notification, not on a poll: the executor hands an output-blocked
+    /// driver to its event scheduler, which re-checks readiness only when an
+    /// observable that driver registered fires. So the open has to fire one,
+    /// or the driver waits for a wake-up that never comes. Measured on a real
+    /// 1FE+3BE cluster: the one producer of a distributed `SELECT` that had
+    /// rows parked its payload behind the closed edge and was never
+    /// rescheduled after the edge opened, so it never sent end of stream and
+    /// the query hung until its statement deadline.
+    ///
+    /// Weak, exactly as the send queue's own observer list is: a driver that
+    /// has gone away must not be kept alive by a gate set that outlives it.
+    open_waiters: Mutex<Vec<Weak<Observable>>>,
 }
 
 impl ExchangeEdgeGates {
@@ -269,6 +285,7 @@ impl ExchangeEdgeGates {
             gates,
             destinations,
             granted: Mutex::new(granted),
+            open_waiters: Mutex::new(Vec::new()),
         }))
     }
 
@@ -288,6 +305,41 @@ impl ExchangeEdgeGates {
                 .collect();
             (edge.edge_id(), keys)
         }))
+    }
+
+    /// Registers one producer driver's observable to be woken when an edge of
+    /// this set opens.
+    ///
+    /// Every sink bound to this gate set registers, because the open is one
+    /// decision for the whole set and any of them may be parked behind it.
+    pub fn register_open_waiter(&self, waiter: &Arc<Observable>) {
+        self.open_waiters
+            .lock()
+            .expect("exchange edge open waiter lock")
+            .push(Arc::downgrade(waiter));
+    }
+
+    /// Wakes every registered producer driver, dropping the ones that are gone.
+    fn notify_open_waiters(&self) {
+        let waiters = {
+            let mut guard = self
+                .open_waiters
+                .lock()
+                .expect("exchange edge open waiter lock");
+            let mut alive = Vec::new();
+            guard.retain(|weak| match weak.upgrade() {
+                Some(waiter) => {
+                    alive.push(waiter);
+                    true
+                }
+                None => false,
+            });
+            alive
+        };
+        for waiter in waiters {
+            let notify = waiter.defer_notify();
+            notify.arm();
+        }
     }
 
     pub fn gate(&self, edge: ExchangeEdgeId) -> Option<&Arc<EdgeSendGate>> {
@@ -335,6 +387,10 @@ impl ExchangeEdgeGates {
                         gate.grant_send_permission();
                     }
                 }
+                // Released before the wake, so a woken driver reads the open
+                // it was woken for rather than the state that parked it.
+                drop(granted);
+                self.notify_open_waiters();
                 Ok(EdgeOpenAccepted::Applied)
             }
             DomainProgression::Idempotent => Ok(EdgeOpenAccepted::Idempotent),
@@ -376,6 +432,7 @@ mod tests {
     };
     use crate::exec::fragment::program::FragmentNodeId;
     use crate::exec::fragment::sink::DataStreamPartitionType;
+    use crate::exec::pipeline::schedule::observer::Observable;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::task_execution::descriptor::{ExchangeDestination, ExchangeEdge};
     use crate::task_execution::domain::{
@@ -388,6 +445,7 @@ mod tests {
     };
     use std::num::NonZeroU32;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const NODE: i32 = 10;
 
@@ -406,6 +464,57 @@ mod tests {
     fn two_edges() -> Arc<ExchangeEdgeGates> {
         ExchangeEdgeGates::try_new([(edge(1), vec![key(1), key(2)]), (edge(2), vec![key(3)])])
             .expect("legal gate set")
+    }
+
+    /// The defect this catches: opening an edge granted send permission and
+    /// notified nobody. A producer driver that parked because its edge was
+    /// closed is parked on a notification -- the executor hands an
+    /// output-blocked driver to its event scheduler, which re-checks readiness
+    /// only when an observable that driver registered fires -- so the open
+    /// left it parked for the rest of the query.
+    ///
+    /// The consequence, measured on a real 1FE+3BE cluster: of three producers
+    /// of one distributed `SELECT`, the two with no rows to send never parked
+    /// and sealed their streams, while the one holding the two matching rows
+    /// parked with the payload in hand, never sent end of stream, and the
+    /// query timed out after 120 s with no failure reported anywhere.
+    #[test]
+    fn opening_an_edge_wakes_every_producer_parked_behind_it() {
+        let gates = two_edges();
+        let waiter = Arc::new(Observable::new());
+        let woken = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&woken);
+        waiter.add_observer(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        gates.register_open_waiter(&waiter);
+
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            gates.open(EdgeOpenVersion::FIRST, &[edge(1)]),
+            Ok(EdgeOpenAccepted::Applied)
+        );
+        assert_eq!(
+            woken.load(Ordering::SeqCst),
+            1,
+            "a granted edge has to wake the producers parked behind it"
+        );
+
+        // A replay grants nothing, so it wakes nobody: a wake per replay would
+        // spin every parked driver of the set.
+        assert_eq!(
+            gates.open(EdgeOpenVersion::FIRST, &[edge(1)]),
+            Ok(EdgeOpenAccepted::Idempotent)
+        );
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+
+        // A waiter whose driver is gone is dropped rather than kept alive.
+        drop(waiter);
+        assert_eq!(
+            gates.open(version(2), &[edge(2)]),
+            Ok(EdgeOpenAccepted::Applied)
+        );
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
     }
 
     #[test]

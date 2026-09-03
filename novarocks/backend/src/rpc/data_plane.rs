@@ -200,6 +200,15 @@ pub fn fetch_task_result(
         let detail = route
             .refusal_detail()
             .expect("only a served route has no refusal detail");
+        // A refusal fails the frontend's read, and the frontend sees only this
+        // text. Recording it here is what attributes it to a backend process
+        // and to the route that produced it: a coordinator log alone cannot
+        // say which of this backend's task states the poll landed in.
+        tracing::warn!(
+            task = %identity,
+            route = ?route,
+            "root result poll refused"
+        );
         emit_typed_fetch_marker(FetchStatus::Error as i32);
         return Ok(fetch_response(
             FetchStatus::Error,

@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::profile::{ProfileUnit, clamp_u128_to_i64};
@@ -1197,6 +1197,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             finishing: AtomicBool::new(false),
             finish_counted: AtomicBool::new(false),
             finish_completed_set: AtomicBool::new(false),
+            end_of_stream_sent: AtomicBool::new(false),
             send_tracker: ExchangeSendTracker::new(),
             send_observable,
             error_state: None,
@@ -1257,7 +1258,7 @@ struct DataStreamSinkOperator {
     /// sink's driver set.
     ///
     /// `set_finishing` is retried by the driver for as long as
-    /// `finishing_is_pending` says this operator is still waiting -- which is
+    /// `finishing_wait` says this operator is still waiting -- which is
     /// exactly what happens while the outbound edge has not been opened yet.
     /// Counting on every retry would let one driver consume the whole set and
     /// latch the sink's one-shot end-of-stream guard, after which no driver
@@ -1266,6 +1267,18 @@ struct DataStreamSinkOperator {
     /// Whether this driver was the one that completed the set, remembered so
     /// the retries after the edge opens still know who owes end-of-stream.
     finish_completed_set: AtomicBool,
+    /// Whether this driver has handed its destinations the end-of-stream
+    /// marker.
+    ///
+    /// It has to be a latch, because nothing else this operator can read tells
+    /// the two sides of that moment apart: "every edge is open and nothing is
+    /// parked" is equally true just before the marker is enqueued and just
+    /// after. A sink that judged itself finished from those two facts alone
+    /// latched `finished` in the window between its edge opening and the
+    /// driver's next `set_finishing`, and `set_finishing` then returns early on
+    /// `finished` -- so the marker was never sent and the receiver counted
+    /// senders until the statement deadline.
+    end_of_stream_sent: AtomicBool,
     send_tracker: Arc<ExchangeSendTracker>,
     send_observable: Arc<Observable>,
     error_state: Option<Arc<RuntimeErrorState>>,
@@ -1340,6 +1353,16 @@ impl Operator for DataStreamSinkOperator {
     fn prepare(&mut self) -> Result<(), String> {
         // Align with StarRocks: count actual sink drivers prepared, not planned DOP.
         self.finish_state.register_driver();
+        // The edge opening is the only event that can unpark this driver once
+        // its payload is parked behind a closed edge, and the executor
+        // re-checks an output-blocked driver only when an observable that
+        // driver registered fires. Registering here, rather than at runtime
+        // binding, is deliberate: `bind_runtime_state` returns early without
+        // an `ExecutionRuntime`, and the gate wake-up must not depend on
+        // whether a send queue was bound.
+        if let Some(gates) = self.edge_gates.as_ref() {
+            gates.register_open_waiter(&self.send_observable);
+        }
         tracing::debug!(
             "DataStreamSink registered driver: finst={} driver_id={} dest_node_id={} sender_id={} remaining_drivers={}",
             format_uuid(
@@ -1482,6 +1505,23 @@ impl DataStreamSinkOperator {
         self.has_pending_chunks() || self.has_pending_payloads()
     }
 
+    /// Whether this driver still owes its destinations the end-of-stream
+    /// marker.
+    ///
+    /// Only the driver that completed the sink's driver set sends it, so only
+    /// that driver can owe it; every other driver's `finish_completed_set` is
+    /// false and this is false with it.
+    ///
+    /// This is output the sink owes exactly like a parked payload, and it is
+    /// the one piece of owed output that cannot be derived from edge state or
+    /// from what is buffered: an open edge with nothing parked describes both
+    /// "the marker has not been sent yet" and "the marker is sent and this sink
+    /// is done".
+    fn owes_end_of_stream(&self) -> bool {
+        self.finish_completed_set.load(Ordering::SeqCst)
+            && !self.end_of_stream_sent.load(Ordering::SeqCst)
+    }
+
     fn pending_payloads_can_send(&self) -> bool {
         let max_inflight = self.exchange_queue().max_inflight_bytes();
         for (idx, payload) in self.pending_payloads_per_dest.iter().enumerate() {
@@ -1580,12 +1620,37 @@ impl DataStreamSinkOperator {
         // A destination still awaiting permission is owed its end-of-stream
         // even when no data is parked for it. Finishing without that marker
         // would leave the destination counting senders forever.
+        //
+        // `owes_end_of_stream` is the same rule for the moment after the edge
+        // opens. This predicate is read by `is_finished` and `need_input`,
+        // which the scheduler calls between driver turns, so without it the
+        // sink declares itself finished as soon as its edge opens -- before the
+        // driver has had a turn in which to send the marker, and `set_finishing`
+        // returns early once `finished` is latched.
         if self.finishing.load(Ordering::Acquire)
             && !self.has_pending_data()
             && !self.awaits_edge_permission()
+            && !self.owes_end_of_stream()
             && self.send_tracker.is_idle()
         {
-            self.finished.store(true, Ordering::Release);
+            if !self.finished.swap(true, Ordering::AcqRel) {
+                // The one line that says this sink stopped owing output, and
+                // on whose strength the driver terminates. Absent it, a sink
+                // that finished with its seal unsent is indistinguishable
+                // from one that never got that far.
+                tracing::debug!(
+                    "DataStreamSink finished: finst={} driver_id={} dest_node_id={} sender_id={} end_of_stream_sent={} last_driver={}",
+                    format_uuid(
+                        self.fragment_instance_id.high(),
+                        self.fragment_instance_id.low()
+                    ),
+                    self.driver_id,
+                    self.input.dest_node_id,
+                    self.sender_id,
+                    self.end_of_stream_sent.load(Ordering::SeqCst),
+                    self.finish_completed_set.load(Ordering::SeqCst),
+                );
+            }
             return true;
         }
         false
@@ -2102,12 +2167,23 @@ impl DataStreamSinkOperator {
         Ok(())
     }
 
+    /// Hands every destination this sink still owes one the end-of-stream
+    /// marker.
+    ///
+    /// Only the driver that completed the sink's driver set calls it, and only
+    /// once every edge is open and nothing is parked -- so a destination
+    /// skipped here is skipped for a reason that is permanent (it is a pruned
+    /// pseudo destination, or it withdrew), never because it is not ready yet.
+    /// That is what makes it sound to latch "the seal is sent" on return.
     fn send_eos(&mut self) -> Result<(), String> {
         self.ensure_pending_buffers_initialized();
         let dests: Vec<FragmentDestination> = self.destinations().to_vec();
+        let mut sealed = 0_usize;
+        let mut skipped = 0_usize;
         for (i, dest) in dests.iter().enumerate() {
             // No fragment instance is running for pseudo destinations — do not send EOS.
             if Self::is_pseudo_destination(dest) {
+                skipped += 1;
                 continue;
             }
             match self.destination_state_at(i) {
@@ -2115,35 +2191,73 @@ impl DataStreamSinkOperator {
                 // end-of-stream marker either.
                 Some(EdgeSendState::NormallyCanceled) => {
                     self.discard_pending_for_dest(i);
+                    skipped += 1;
                     continue;
                 }
-                // End-of-stream is output too, so it waits for permission
-                // like any other frame.
-                Some(EdgeSendState::AwaitingPermission) => continue,
+                // End-of-stream is output like any other frame, so it needs
+                // permission. The caller checks that no edge awaits permission
+                // before it calls this, and an edge never returns to awaiting
+                // permission once it leaves that state -- so this is
+                // unreachable, and it is refused rather than skipped: sealing
+                // some destinations and silently not others would latch "the
+                // seal is sent" over a sender the receiver keeps counting.
+                Some(EdgeSendState::AwaitingPermission) => {
+                    return Err(format!(
+                        "exchange send EOS reached destination {} whose edge is still awaiting \
+                         permission",
+                        dest.finst_id()
+                    ));
+                }
                 None | Some(EdgeSendState::Open) => {}
             }
             match self.transmit_partition(i, dest, &[], true, true)? {
-                PayloadEnqueue::Enqueued | PayloadEnqueue::Discarded => {}
+                PayloadEnqueue::Enqueued | PayloadEnqueue::Discarded => sealed += 1,
                 PayloadEnqueue::NoCapacity(_) => {
                     return Err("exchange send EOS unexpectedly blocked".to_string());
                 }
             }
         }
+        // Latched only now that every destination this sink owes has its
+        // marker: the receiver's sender count closes on this and on nothing
+        // else, so the latch has to describe the send that happened rather
+        // than the intent to send.
+        self.end_of_stream_sent.store(true, Ordering::SeqCst);
+        tracing::debug!(
+            "DataStreamSink end-of-stream sent: finst={} driver_id={} dest_node_id={} sender_id={} sealed={} skipped={}",
+            format_uuid(
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low()
+            ),
+            self.driver_id,
+            self.input.dest_node_id,
+            self.sender_id,
+            sealed,
+            skipped,
+        );
         Ok(())
     }
 }
 
 impl ProcessorOperator for DataStreamSinkOperator {
-    fn finishing_is_pending(&self) -> bool {
-        // "Do I still owe output?", not "is my edge closed?". A flush that
-        // parked a payload on a closed edge leaves that payload owed after the
-        // edge opens, and asking only about permission latches the operator
-        // the moment the gate lifts -- with the payload still in hand and
-        // nothing left to drive another flush. The driver treats `true` as "no
-        // progress, come back", so this is a park and not a spin, and every
-        // return through `set_finishing` re-attempts the flush.
-        self.finishing.load(Ordering::Acquire)
-            && (self.awaits_edge_permission() || self.has_pending_data())
+    fn finishing_wait(&self) -> FinishingWait {
+        if !self.finishing.load(Ordering::Acquire) {
+            return FinishingWait::Complete;
+        }
+        // Permission outranks owed output, and the order is load-bearing in
+        // both directions. While an edge is closed a flush can only park the
+        // payload again, so reporting owed output would spin the driver over
+        // an obstacle only the frontend's edge-open decision can clear. Once
+        // the edge is open, a parked payload and an unsent end-of-stream are
+        // output only this operator's own next turn can push -- and reporting
+        // *that* as a wait for an external event is what parked the driver
+        // forever with the rows in hand.
+        if self.awaits_edge_permission() {
+            return FinishingWait::ExternalEvent;
+        }
+        if self.has_pending_data() || self.owes_end_of_stream() {
+            return FinishingWait::OwedOutput;
+        }
+        FinishingWait::Complete
     }
 
     fn accepts_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
@@ -2297,7 +2411,7 @@ impl ProcessorOperator for DataStreamSinkOperator {
         }
         // End of stream must not overtake data this sink still owes. The
         // last-driver verdict is latched, so returning here keeps it for the
-        // retry that `finishing_is_pending` asks for: the receiver would
+        // retry that `finishing_wait` asks for: the receiver would
         // otherwise see the seal before the frames it seals and report the
         // exchange complete with rows still parked on the sender.
         if self.awaits_edge_permission() || self.has_pending_data() {
@@ -2486,6 +2600,7 @@ mod tests {
             finishing: AtomicBool::new(false),
             finish_counted: AtomicBool::new(false),
             finish_completed_set: AtomicBool::new(false),
+            end_of_stream_sent: AtomicBool::new(false),
             send_tracker: ExchangeSendTracker::new(),
             send_observable: Arc::new(Observable::new()),
             error_state: None,
@@ -2967,9 +3082,10 @@ mod tests {
         );
 
         op.finishing.store(true, Ordering::Release);
-        assert!(
-            ProcessorOperator::finishing_is_pending(&op),
-            "the driver must be told to come back"
+        assert_eq!(
+            ProcessorOperator::finishing_wait(&op),
+            FinishingWait::ExternalEvent,
+            "a closed edge is an obstacle this operator cannot clear, so the driver parks"
         );
         assert!(
             !op.maybe_mark_finished(),
@@ -2978,9 +3094,15 @@ mod tests {
 
         open_edges(&op, &[edge_id(1)]);
         assert!(!op.awaits_edge_permission());
+        assert_eq!(
+            ProcessorOperator::finishing_wait(&op),
+            FinishingWait::OwedOutput,
+            "with the edge open the parked payload is output only this operator can push, \
+             so the driver must give it a turn rather than park again"
+        );
         op.flush_pending(true, true)
             .expect("the drain now completes");
-        assert!(!ProcessorOperator::finishing_is_pending(&op));
+        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
     }
 
     /// The same race with nothing buffered. Only an end-of-stream is owed, and
@@ -3001,15 +3123,92 @@ mod tests {
             !op.maybe_mark_finished(),
             "an unsent end-of-stream is still output this sink owes"
         );
-        assert!(ProcessorOperator::finishing_is_pending(&op));
+        assert_eq!(
+            ProcessorOperator::finishing_wait(&op),
+            FinishingWait::ExternalEvent
+        );
 
         open_edges(&op, &[edge_id(1)]);
         op.send_eos().expect("the end-of-stream now goes out");
-        assert!(!ProcessorOperator::finishing_is_pending(&op));
+        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
+    }
+
+    /// The defect this catches: a sink that deferred its end-of-stream while
+    /// its edge was closed declared itself *finished* the moment that edge
+    /// opened, because "nothing parked and no closed edge" was the whole of
+    /// "I owe no more output". The scheduler reads that verdict through
+    /// `is_finished` and `need_input` between driver turns, and `set_finishing`
+    /// returns early once `finished` is latched -- so the marker was never
+    /// sent, by no race: the driver's own turn re-checks `is_finished` before
+    /// it re-checks the operator's pending finish.
+    ///
+    /// The consequence is a hang with no failure anywhere. The receiving
+    /// exchange keeps counting senders, so its scan never reaches end of
+    /// stream, the root fragment never fills its result buffer, and the
+    /// frontend's read completion -- which needs the root FINISHED and its own
+    /// end of stream, neither of which fails on absence -- waits out the whole
+    /// statement budget. Measured on a real 1FE+3BE cluster as a distributed
+    /// `SELECT ... ORDER BY` timing out after 120 s with two minutes of total
+    /// silence in every process's log.
+    #[test]
+    fn an_edge_opening_must_not_finish_a_sink_before_its_end_of_stream_is_sent() {
+        let runtime = RuntimeState::default();
+        let mut op = make_test_operator();
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        // One driver, so this operator is the one that completes the set and
+        // therefore the one that owes the marker.
+        op.finish_state.register_driver();
+        gate_destinations(&mut op, vec![make_test_destination()]);
+
+        // Nothing buffered: this producer's input drained before the frontend
+        // decided the edge, which is the ordinary shape for a fragment
+        // instance that read no matching rows at all.
+        ProcessorOperator::set_finishing(&mut op, &runtime)
+            .expect("a closed edge parks the seal rather than failing");
+        assert!(!op.has_pending_data());
+        assert_eq!(
+            op.shared_sequence.load(Ordering::SeqCst),
+            0,
+            "no frame may leave a sink whose edge has not been opened"
+        );
+
+        open_edges(&op, &[edge_id(1)]);
+
+        // Exactly what the scheduler asks between driver turns, and what the
+        // driver itself asks at the top of its next turn.
+        assert!(
+            !Operator::is_finished(&op),
+            "a sink that still owes its end-of-stream has not finished"
+        );
+        assert_eq!(
+            ProcessorOperator::finishing_wait(&op),
+            FinishingWait::OwedOutput,
+            "the driver must be told to come back and send it"
+        );
+        assert!(
+            ProcessorOperator::need_input(&op),
+            "the sink is not blocked; it is owed one more turn"
+        );
+
+        // The turn the driver is now still allowed to take.
+        ProcessorOperator::set_finishing(&mut op, &runtime).expect("the seal now goes out");
+        assert_eq!(
+            op.shared_sequence.load(Ordering::SeqCst),
+            1,
+            "exactly one frame left this sink, and with nothing buffered it is the end-of-stream"
+        );
+        assert!(
+            !op.owes_end_of_stream(),
+            "the sink no longer owes the marker once it has been enqueued"
+        );
+        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
+        // Whether the operator is *finished* additionally waits for the send
+        // queue to hand the frame off, which is asynchronous and not this
+        // test's subject.
     }
 
     /// The defect this catches: `set_finishing` counted this driver against
-    /// the sink's driver set on every call, while `finishing_is_pending` had
+    /// the sink's driver set on every call, while `finishing_wait` had
     /// the driver retry that same call for as long as the edge stayed closed.
     /// One driver's retries therefore consumed the whole set and latched the
     /// one-shot end-of-stream guard, so once the edge finally opened no driver
@@ -3041,7 +3240,7 @@ mod tests {
             ProcessorOperator::set_finishing(&mut first, &runtime)
                 .expect("a closed edge parks the drain rather than failing");
             assert!(
-                ProcessorOperator::finishing_is_pending(&first),
+                ProcessorOperator::finishing_wait(&first).is_pending(),
                 "the driver is told to come back while the edge is closed"
             );
         }
@@ -3061,7 +3260,7 @@ mod tests {
         ProcessorOperator::set_finishing(&mut second, &runtime)
             .expect("the end-of-stream now goes out");
         assert!(
-            !ProcessorOperator::finishing_is_pending(&second),
+            !ProcessorOperator::finishing_wait(&second).is_pending(),
             "the sink no longer owes output once the end-of-stream is enqueued"
         );
         assert!(

@@ -211,6 +211,34 @@ pub enum FinalTaskInfoRead {
 /// whole attempt to chase a pruning optimization.
 const DYNAMIC_FILTER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How much longer than the wait it asked for a task-addressed read may take
+/// before the backend is treated as having stopped answering.
+///
+/// A root result poll tells the backend how long it may block, so an answer
+/// that has not arrived by that wait plus this allowance is not a slow answer,
+/// it is no answer. Bounding it is not an optimization: the coordinator thread
+/// that makes this call is the same one that settles acknowledgements, folds
+/// status and opens exchange edges, so an unbounded call stops the whole
+/// attempt -- past its own statement deadline, silently, with no fact named.
+///
+/// The allowance is the transport's own frontend queue residence rather than a
+/// number invented here. That is already how long this attempt lets a released
+/// operation sit before it calls it lost, and a second number would put two
+/// answers on one question.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct TaskReadGrace(std::time::Duration);
+
+impl TaskReadGrace {
+    pub(crate) const fn new(grace: std::time::Duration) -> Self {
+        Self(grace)
+    }
+
+    /// The deadline for a read that asked the backend to block for `wait`.
+    fn deadline_for(self, wait: std::time::Duration) -> std::time::Duration {
+        wait.saturating_add(self.0)
+    }
+}
+
 /// What one dynamic filter read answered.
 ///
 /// A version of `None` is the settled "nothing to fetch": either the task has
@@ -308,6 +336,7 @@ pub(crate) struct NativeTaskResultTransport {
     clients: BTreeMap<BackendProcessId, Client>,
     endpoints: BTreeMap<BackendProcessId, RuntimeEndpoint>,
     data_runtime: FrontendDataRuntime,
+    grace: TaskReadGrace,
 }
 
 impl fmt::Debug for NativeTaskResultTransport {
@@ -327,6 +356,7 @@ impl NativeTaskResultTransport {
     pub(crate) fn new(
         backends: &[(BackendProcessId, RuntimeEndpoint)],
         data_runtime: FrontendDataRuntime,
+        grace: TaskReadGrace,
     ) -> Result<Self, String> {
         if backends.is_empty() {
             return Err("the root result transport requires at least one backend".to_owned());
@@ -344,6 +374,7 @@ impl NativeTaskResultTransport {
             clients,
             endpoints,
             data_runtime,
+            grace,
         })
     }
 
@@ -366,13 +397,30 @@ impl TaskResultTransport for NativeTaskResultTransport {
     ) -> Result<RootResultOutcome, String> {
         let (client, address) = self.client_of(root_task)?;
         let request = encode_fetch_task_result(root_task, max_wait);
+        let wait = max_wait.get();
+        let deadline = self.grace.deadline_for(wait);
         let response = self.data_runtime.block_on(async {
-            let mut grpc = client
-                .grpc_with_channel_error()
+            let mut grpc = tokio::time::timeout(deadline, client.grpc_with_channel_error())
                 .await
+                .map_err(|_| {
+                    format!(
+                        "{address}: root result poll for task {root_task} could not acquire a \
+                         channel within {deadline:?}"
+                    )
+                })?
                 .map_err(|error| error.to_string())?;
-            grpc.fetch_task_result(request)
+            // Bounded, and the bound names the fact: a poll that outlives the
+            // wait it asked for plus the transport's own residence budget is a
+            // backend that stopped answering, and reporting that is what keeps
+            // it from stopping this attempt's only thread indefinitely.
+            tokio::time::timeout(deadline, grpc.fetch_task_result(request))
                 .await
+                .map_err(|_| {
+                    format!(
+                        "{address}: root result poll for task {root_task} did not answer within \
+                         {deadline:?}; it was asked to wait at most {wait:?}"
+                    )
+                })?
                 .map(tonic::Response::into_inner)
                 .map_err(|error| format!("fetch_task_result rpc failed: {error}"))
         })??;
@@ -424,13 +472,30 @@ impl TaskResultTransport for NativeTaskResultTransport {
     fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
         let (client, address) = self.client_of(identity)?;
         let request = encode_get_final_task_info(identity);
+        // Final info is a projection of a retained record, answered
+        // immediately, so this bound only covers a backend that stopped
+        // answering. It has to be bounded for the same reason as the poll
+        // above, and more sharply: this read runs inside the attempt's drain,
+        // whose whole point is not to hold a client-visible completion.
+        let deadline = self.grace.deadline_for(std::time::Duration::ZERO);
         let response = self.data_runtime.block_on(async {
-            let mut grpc = client
-                .grpc_with_channel_error()
+            let mut grpc = tokio::time::timeout(deadline, client.grpc_with_channel_error())
                 .await
+                .map_err(|_| {
+                    format!(
+                        "{address}: final info read for task {identity} could not acquire a \
+                         channel within {deadline:?}"
+                    )
+                })?
                 .map_err(|error| error.to_string())?;
-            grpc.get_final_task_info(request)
+            tokio::time::timeout(deadline, grpc.get_final_task_info(request))
                 .await
+                .map_err(|_| {
+                    format!(
+                        "{address}: final info read for task {identity} did not answer within \
+                         {deadline:?}"
+                    )
+                })?
                 .map(tonic::Response::into_inner)
                 .map_err(|error| format!("get_final_task_info rpc failed: {error}"))
         })??;
