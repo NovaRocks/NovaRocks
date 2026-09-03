@@ -586,6 +586,18 @@ pub fn encode_neutral_query_context_domain(
     })
 }
 
+/// Wraps one split assignment as the codec-owned payload a domain carries.
+///
+/// The domain separation tag stays private here. A caller that built its own
+/// `WireContent` would have to name the tag, and a wrong tag produces a
+/// payload that decodes as a different domain's content -- which is exactly
+/// the confusion the tag exists to prevent.
+pub fn wire_split_assignment(
+    assignment: novarocks_proto_models::connector_read::SplitAssignment,
+) -> Arc<dyn CodecOwnedContent> {
+    Arc::new(WireContent::new(SPLIT_DOMAIN_TAG, assignment))
+}
+
 /// Encodes one task-scoped domain change the owner holds neutrally.
 ///
 /// The neutral update carries its payload behind a fingerprint, so this
