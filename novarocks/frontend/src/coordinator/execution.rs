@@ -3709,9 +3709,12 @@ fn drain_task_round(
             return;
         }
         if Instant::now() >= deadline {
+            let facts = round.execution().attempt_drain_facts();
             tracing::warn!(
                 execution_id = ?execution_id,
-                drained = round.attempt_drained(),
+                tasks_terminal = facts.all_tasks_terminal(),
+                output_released = facts.all_output_released(),
+                contexts_released = facts.all_contexts_released(),
                 split_worker_stopped,
                 "attempt did not finish draining inside its drain budget; \
                  the query execution lease closes what is left"

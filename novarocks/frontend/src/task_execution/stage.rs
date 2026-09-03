@@ -138,7 +138,21 @@ impl StageExecution {
     }
 
     pub fn all_output_released(&self) -> bool {
-        self.tasks.values().all(RemoteTask::output_released)
+        // Only a task that FINISHED owes an output responsibility. That state
+        // is constructible on the backend precisely when the responsibility is
+        // complete, so requiring the fact there is a real check.
+        //
+        // A task that terminated any other way -- canceled because it was no
+        // longer needed, aborted, or failed -- has no such responsibility to
+        // complete and will never publish it. Requiring it of every task made
+        // the attempt drain wait out its whole budget on every query with an
+        // early-terminating branch: a cross or semi join that stops reading, a
+        // non-root task stood down normally. The tasks were terminal, their
+        // resources released by that terminal, and the frontend sat waiting
+        // fifteen seconds for a fact that could not arrive.
+        self.tasks
+            .values()
+            .all(|task| task.task_state() != TaskState::Finished || task.output_released())
     }
 
     /// Stands down every task of this stage except the query's root.

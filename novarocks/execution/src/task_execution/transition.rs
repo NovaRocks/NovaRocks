@@ -526,6 +526,18 @@ impl AttemptDrainFacts {
     pub const fn drained(self) -> bool {
         self.all_tasks_terminal && self.all_output_released && self.all_contexts_released
     }
+
+    pub const fn all_tasks_terminal(self) -> bool {
+        self.all_tasks_terminal
+    }
+
+    pub const fn all_output_released(self) -> bool {
+        self.all_output_released
+    }
+
+    pub const fn all_contexts_released(self) -> bool {
+        self.all_contexts_released
+    }
 }
 
 /// The facts that decide a distributed write's success.

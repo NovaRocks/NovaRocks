@@ -568,14 +568,28 @@ impl QueryTaskExecution {
         };
         let context = task.context();
         let terminal = task.is_terminal();
-        let output_released = task.output_released();
+        // Only a task that FINISHED owes an output responsibility; that state
+        // is constructible on the backend precisely when the responsibility is
+        // complete. A task that terminated any other way -- canceled because
+        // it was no longer needed, aborted, or failed -- has none to complete
+        // and will never publish one.
+        //
+        // The owner's counter has to agree with that, or it never reaches
+        // `expected_tasks`, `locally_drained` stays false, and the release is
+        // never even requested: the context then holds its backend resources
+        // until the lease expires while the frontend waits out its whole drain
+        // budget. This is the per-context half of the same fact the
+        // attempt-level `all_output_released` checks; the two are derived
+        // separately on purpose, so both have to say it.
+        let output_settled =
+            terminal && (task.task_state() != TaskState::Finished || task.output_released());
         let Some(owner) = self.owners.get_mut(&context) else {
             return;
         };
         if terminal && self.drained_tasks.insert(task_id) {
             owner.note_task_drained();
         }
-        if output_released && self.released_outputs.insert(task_id) {
+        if output_settled && self.released_outputs.insert(task_id) {
             owner.note_output_released();
         }
     }
@@ -663,6 +677,18 @@ impl QueryTaskExecution {
 
     /// Whether the whole attempt has drained.
     pub fn attempt_drained(&self) -> bool {
+        self.attempt_drain_facts().drained()
+    }
+
+    /// The three facts a drain waits on, separately.
+    ///
+    /// A conjunction that fails has to be able to say which conjunct failed.
+    /// Reporting only "not drained" cost a full cluster run to narrow the one
+    /// time it mattered, and the three have entirely different causes: tasks
+    /// not terminal is the backends still working, output not released is this
+    /// frontend not having consumed what they produced, and contexts not
+    /// released is the release operation itself outstanding.
+    pub fn attempt_drain_facts(&self) -> AttemptDrainFacts {
         AttemptDrainFacts::new(
             self.stages.values().all(StageExecution::all_terminal),
             self.stages
@@ -670,7 +696,6 @@ impl QueryTaskExecution {
                 .all(StageExecution::all_output_released),
             self.owners.values().all(QueryContextOwner::is_released),
         )
-        .drained()
     }
 
     /// Where every task of one context has been observed to.
