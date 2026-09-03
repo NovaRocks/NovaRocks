@@ -682,6 +682,23 @@ fn build_lifecycle_config(
     .with_participant_fanout_max_inflight(timeouts.participant_fanout_max_inflight)
 }
 
+/// Whether this intent is the one still routed to the old lifecycle.
+///
+/// A named predicate rather than an inline comparison because the two
+/// directions of getting it wrong are not symmetric. Sending Statistics to the
+/// task path fails loudly -- that path refuses the intent outright. Sending
+/// anything else to the lifecycle path is silent: the query would simply run
+/// on the retired stack and succeed, and nothing downstream would say so.
+/// This is the half that needs to be assertable.
+const fn runs_on_query_lifecycle(intent: DistributedQueryIntent) -> bool {
+    match intent {
+        DistributedQueryIntent::Statistics => true,
+        DistributedQueryIntent::Result
+        | DistributedQueryIntent::Write
+        | DistributedQueryIntent::Profile => false,
+    }
+}
+
 impl FrontendDistributedQueryCoordinator {
     #[expect(
         private_interfaces,
@@ -1145,7 +1162,7 @@ impl FrontendDistributedQueryCoordinator {
             split_assignment_plan,
             scheduled_backend_ownership,
         };
-        if intent == DistributedQueryIntent::Statistics {
+        if runs_on_query_lifecycle(intent) {
             return self.execute_statistics_round_on_query_lifecycle(handoff);
         }
         self.execute_round_on_task_protocol(handoff)
@@ -2918,6 +2935,34 @@ mod tests {
     /// `reclassify_pre_ready_lifecycle_failure` always required: the
     /// membership owner independently proving that an exact captured process
     /// was replaced. Only the failure that evidence is applied to moved.
+    #[test]
+    fn exactly_one_intent_still_runs_on_the_retired_lifecycle() {
+        // The task protocol is the production path. Statistics is the single
+        // exception, because its payload is produced by the fragment terminal
+        // fact and NCP-8 owns moving it onto the root result plane.
+        //
+        // This asserts over every intent rather than over the exception, so
+        // adding an intent forces a decision here instead of inheriting one.
+        // The dangerous direction is silent: an intent that drifted onto the
+        // lifecycle path would run on the retired stack and succeed, with
+        // nothing downstream reporting it. The other direction is loud -- the
+        // task path refuses Statistics in its own intent match.
+        for intent in [
+            DistributedQueryIntent::Result,
+            DistributedQueryIntent::Write,
+            DistributedQueryIntent::Profile,
+        ] {
+            assert!(
+                !super::runs_on_query_lifecycle(intent),
+                "{intent:?} must run on the task protocol"
+            );
+        }
+        assert!(
+            super::runs_on_query_lifecycle(DistributedQueryIntent::Statistics),
+            "ANALYZE has no carrier on the task protocol until NCP-8 moves it"
+        );
+    }
+
     #[test]
     fn a_drain_never_inherits_the_remainder_of_a_long_statement_timeout() {
         // The client-visible answer is linearized before the drain starts, so
