@@ -1446,35 +1446,85 @@ fn build_fragment_lifecycle_projection(
         .with_frozen_live_backends(frozen_live_backends.into_values().collect())
 }
 
+/// Numbers every sender of one exchange node across the union of the
+/// fragments that feed it.
+///
+/// The sender set belongs to the exchange NODE, not to one producing
+/// fragment. A node fed by two fragments has one contiguous ordinal space
+/// spanning both, and its size is the total. Numbering per edge instead --
+/// each fragment restarting at zero and announcing only its own placement
+/// count -- disagrees with the two other places that derive the same fact:
+/// `populate_sender_counts` accumulates across edges into the receiver's
+/// `per_exch_num_senders`, and the task graph numbers the union in ascending
+/// fragment-then-instance order. Under the task protocol that disagreement is
+/// caught: the descriptor's frozen `expected_sender_count` is the union size,
+/// so a per-fragment count is refused as a sender-count mismatch and every
+/// multi-fed exchange -- a UNION ALL across fragments, for one -- fails.
+///
+/// The ordering here is the graph's ordering, so the two derivations are the
+/// same function of the same frozen schedule rather than two functions that
+/// happen to agree for the single-producer case.
 fn populate_destinations(
     schedule: &mut SchedulingPlan,
     edges: &[novarocks_sql::plan_read::FragmentEdge],
 ) {
+    // Group the feeding fragments per exchange node first: an ordinal cannot
+    // be assigned until every fragment reaching that node is known.
+    let mut feeders: BTreeMap<(u32, i32), Vec<u32>> = BTreeMap::new();
     for edge in edges {
+        let key = (edge.target_fragment_id, edge.target_exchange_node_id);
+        let sources = feeders.entry(key).or_default();
+        if !sources.contains(&edge.source_fragment_id) {
+            sources.push(edge.source_fragment_id);
+        }
+    }
+
+    for ((target_fragment_id, _), mut source_fragment_ids) in feeders {
+        // Ascending fragment id, then instance order, exactly as the task
+        // graph walks it.
+        source_fragment_ids.sort_unstable();
+        let mut ordinal_of = BTreeMap::new();
+        let mut next_ordinal = 0_u32;
+        for source_fragment_id in &source_fragment_ids {
+            let placements = schedule
+                .by_fragment
+                .get(source_fragment_id)
+                .map(Vec::len)
+                .unwrap_or_default();
+            for instance_index in 0..placements {
+                ordinal_of.insert((*source_fragment_id, instance_index), next_ordinal);
+                next_ordinal += 1;
+            }
+        }
+        let sender_count = next_ordinal;
+
         let destinations = schedule
             .by_fragment
-            .get(&edge.target_fragment_id)
+            .get(&target_fragment_id)
             .into_iter()
             .flatten()
             .map(|placement| (placement.finst_id, placement.endpoint.clone()))
             .collect::<Vec<_>>();
-        if let Some(sources) = schedule.by_fragment.get_mut(&edge.source_fragment_id) {
-            let sender_count =
-                u32::try_from(sources.len()).expect("native fragment source count fits in u32");
-            for (sender_ordinal, source) in sources.iter_mut().enumerate() {
-                let sender_ordinal = u32::try_from(sender_ordinal)
-                    .expect("native fragment sender ordinal fits in u32");
-                for (destination_finst_id, destination_endpoint) in &destinations {
-                    source.destinations.push(
-                        FragmentDestination::new(
-                            *destination_finst_id,
-                            destination_endpoint.clone(),
-                            source.finst_id,
-                            sender_ordinal,
-                            sender_count,
-                        )
-                        .expect("scheduled exchange destination has a valid sender set"),
-                    );
+        for source_fragment_id in &source_fragment_ids {
+            if let Some(sources) = schedule.by_fragment.get_mut(source_fragment_id) {
+                for (instance_index, source) in sources.iter_mut().enumerate() {
+                    let Some(&sender_ordinal) =
+                        ordinal_of.get(&(*source_fragment_id, instance_index))
+                    else {
+                        continue;
+                    };
+                    for (destination_finst_id, destination_endpoint) in &destinations {
+                        source.destinations.push(
+                            FragmentDestination::new(
+                                *destination_finst_id,
+                                destination_endpoint.clone(),
+                                source.finst_id,
+                                sender_ordinal,
+                                sender_count,
+                            )
+                            .expect("scheduled exchange destination has a valid sender set"),
+                        );
+                    }
                 }
             }
         }
@@ -2127,6 +2177,59 @@ mod tests {
         assert_ne!(
             derive_fragment_instance_id(second_attempt, 9, 3).expect("second fragment instance id"),
             first
+        );
+    }
+
+    #[test]
+    fn one_exchange_node_fed_by_two_fragments_numbers_its_senders_once() {
+        // The sender set belongs to the exchange node, not to one producing
+        // fragment. Numbering per edge -- each fragment restarting at zero and
+        // announcing only its own placement count -- disagrees with the two
+        // other derivations of the same fact: the receiver's
+        // per_exch_num_senders accumulates across edges, and the task
+        // descriptor freezes the union size as expected_sender_count. Under
+        // the task protocol that disagreement is caught rather than tolerated,
+        // so every multi-fed exchange -- a UNION ALL across fragments, for one
+        // -- would be refused as a sender-count mismatch.
+        let mut schedule = SchedulingPlan {
+            root_fragment_id: 30,
+            by_fragment: BTreeMap::from([
+                (
+                    10,
+                    vec![
+                        placement(10, 0, UniqueId::new(1, 1), 0),
+                        placement(10, 1, UniqueId::new(1, 2), 1),
+                    ],
+                ),
+                (20, vec![placement(20, 0, UniqueId::new(2, 1), 0)]),
+                (30, vec![placement(30, 0, UniqueId::new(3, 1), 0)]),
+            ]),
+            root_finst_id: UniqueId::new(3, 1),
+            root_backend_idx: 0,
+        };
+        // Both fragments reach the SAME exchange node of fragment 30.
+        let edges = vec![stream_edge(20, 30, 300), stream_edge(10, 30, 300)];
+        super::populate_destinations(&mut schedule, &edges);
+        super::populate_sender_counts(&mut schedule, &edges);
+
+        let mut seen = Vec::new();
+        for fragment_id in [10, 20] {
+            for source in &schedule.by_fragment[&fragment_id] {
+                for destination in &source.destinations {
+                    seen.push((destination.sender_ordinal(), destination.sender_count()));
+                }
+            }
+        }
+        seen.sort_unstable();
+
+        // Three senders over one contiguous ordinal space, every one of them
+        // announcing the same total.
+        assert_eq!(seen, vec![(0, 3), (1, 3), (2, 3)]);
+
+        // And that total is exactly what the receiver waits for.
+        assert_eq!(
+            schedule.by_fragment[&30][0].per_exch_num_senders[&300], 3,
+            "the announced sender count must equal the receiver's expectation"
         );
     }
 
