@@ -2,9 +2,9 @@
 id: ADR-0008
 title: "Use Three-Phase Startup for Distributed Queries"
 domain: [distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0134
 date: 2026-07-27
 provenance:
   - "discussion: 2026-07-27 three-phase distributed query startup"

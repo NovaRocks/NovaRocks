@@ -39,6 +39,7 @@
 //! fragment-based lifecycle stack still owns every query, and binding this
 //! owner to execution, then retiring the stack it replaces, are separate
 //! steps.
+// Design: ADR-0134 (docs/adr/ADR-0134-native-distributed-work-as-tasks.md)
 
 mod clock;
 mod context_host;

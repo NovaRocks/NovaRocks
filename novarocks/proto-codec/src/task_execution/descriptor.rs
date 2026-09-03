@@ -30,6 +30,7 @@
 //! the descriptor. The backend's own plan decoder is the single consumer that
 //! reads the message back out, which is what [`WireFragmentPlan::plan`] and
 //! [`WireFragmentPlan::instance_params`] exist for.
+// Design: ADR-0134 (docs/adr/ADR-0134-native-distributed-work-as-tasks.md)
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;

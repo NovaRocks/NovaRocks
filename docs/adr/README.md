@@ -65,10 +65,10 @@ code-anchors:
 - ADR-0043 — Runtime Filter row/scan evaluator 为何统一由 Execution 拥有、Backend 只提供 artifact query（active）
 - ADR-0044 — Runtime Filter participant 物理生命周期为何由 Backend 拥有、Execution 保留语义值与 evaluator（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
-- ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（active）
 
 #### 历史
 
+- ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（superseded → ADR-0134）
 - ADR-0041 — Runtime Filter scan-domain 评估为何由 Execution 拥有、Core 只提供中立 artifact capability（superseded → ADR-0043）
 - ADR-0076 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0078）
 - ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（superseded → ADR-0106）
@@ -161,15 +161,14 @@ code-anchors:
 丢失、过期 ownership 与进程失败，使分布式生命周期可测试、可观察并可独立演进。
 
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
-- ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（active）
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 - ADR-0102 — MySQL KILL 为何经 exact generation token 与 protocol-owned connection lifecycle 实现（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
-- ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
 - ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
+- ADR-0134 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（active）
 
 #### 历史
 
@@ -185,6 +184,8 @@ code-anchors:
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（superseded → ADR-0126）
 - ADR-0126 — Terminal delivery 为何以 participant attempt identity 而非 payload content identity 定位（superseded → ADR-0127）
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（superseded → ADR-0128）
+- ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（superseded → ADR-0134）
+- ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（superseded → ADR-0134）
 
 ### sql-compiler
 

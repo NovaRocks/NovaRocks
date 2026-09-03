@@ -29,6 +29,7 @@
 //! their own runtime state machines built on top of them; only immutable
 //! values, this module's pure validation, and the central codec are shared
 //! across the process boundary.
+// Design: ADR-0134 (docs/adr/ADR-0134-native-distributed-work-as-tasks.md)
 
 pub mod descriptor;
 pub mod domain;
