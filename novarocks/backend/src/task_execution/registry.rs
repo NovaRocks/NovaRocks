@@ -1362,6 +1362,12 @@ impl TaskExecutionRegistry {
     // --------------------------------------------------- abort query context
 
     pub fn abort_query_context(&self, request: &AbortQueryContext) -> QueryContextOutcome {
+        let receipt = self.apply_abort_query_context(request);
+        marker::abort_query_context(request.context(), &receipt);
+        receipt
+    }
+
+    fn apply_abort_query_context(&self, request: &AbortQueryContext) -> QueryContextOutcome {
         let operation = request.envelope().operation_id();
         let context = request.context();
         if context.backend_process_id() != self.config.backend_process_id {

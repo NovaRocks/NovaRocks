@@ -95,13 +95,22 @@ pub(crate) fn step_evidence_deadline(meta: &QueryMeta) -> Option<Instant> {
 }
 
 fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
+    // Every directive here names the retired Init/Stage/Start protocol, and
+    // the evidence this gates on -- NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,
+    // _CLEANUP and a reason= field -- exists only on that protocol.
+    //
+    // `kill_query_after_be_log_contains` is deliberately NOT in the list. It
+    // waits for whatever marker the case names, which makes it
+    // protocol-neutral: a case that triggers a kill from task-protocol
+    // evidence and asserts task-protocol evidence would otherwise be held to
+    // terminal facts that no longer have producers, and would fail for a
+    // reason unrelated to whether cancellation worked.
     meta.drop_next_init_ack_be_index.is_some()
         || meta.stop_query_control_heartbeat_be_index.is_some()
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.restart_be_after_init_ack_index.is_some()
         || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
-        || meta.kill_query_after_be_log_contains.is_some()
         || meta.query_control_fragment_backend_limit.is_some()
         || meta.query_lifecycle_fault.is_some()
 }

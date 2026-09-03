@@ -17,6 +17,17 @@
 
 -- @sequential=true
 
+-- KILL QUERY is client-facing, and after the cutover it had no coverage at
+-- all: both of this case's triggers waited on retired evidence, so the kill
+-- was never even sent and the query completed normally. A case that fails
+-- because its trigger never fires cannot tell "cancellation works" from
+-- "cancellation is broken", which is the worst of the three states to be in.
+--
+-- Retargeted onto task-protocol evidence. The trigger is a task actually
+-- being created on a backend, and the assertion is that every context was
+-- told to abort -- delivery of the abort, not merely the client seeing an
+-- error, because a client error is also what a timeout looks like.
+
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.kill_query (
@@ -38,10 +49,9 @@ INSERT INTO ${case_db}.kill_query VALUES (2, 10);
 INSERT INTO ${case_db}.kill_query VALUES (3, 10);
 
 -- query 5
--- @kill_query_after_control_ready_count=3
+-- @kill_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @expect_error=Query execution was interrupted
--- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
--- @be_log_count_at_least=reason=CoordinatorAbort,3
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,3
 SELECT COUNT(*)
 FROM ${case_db}.kill_query
 WHERE sleep(delay_s);
@@ -58,8 +68,7 @@ SELECT COUNT(*) FROM ${case_db}.kill_query;
 -- @expect_error=Query execution was interrupted
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,1
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,1
--- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
--- @be_log_count_at_least=reason=CoordinatorAbort,3
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,3
 SELECT COUNT(*)
 FROM ${case_db}.kill_query$files AS metadata
 JOIN ${case_db}.kill_query AS data ON TRUE

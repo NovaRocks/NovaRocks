@@ -160,3 +160,25 @@ pub(super) fn release_query_context(
     }
     emit_context("NOVAROCKS_TASK_RELEASE_APPLIED", context);
 }
+
+/// One applied context abort, with the cause the frontend sent.
+///
+/// Client cancellation reaches a backend as this operation, so without it
+/// there is no cluster-visible evidence that a KILL QUERY was delivered at
+/// all -- and the retired protocol's own abort markers are gone, so a case
+/// asserting cancellation has nothing left to count.
+pub(super) fn abort_query_context(context: QueryContextRef, receipt: &QueryContextOutcome) {
+    if !enabled() || receipt.outcome() != OperationOutcome::Accepted {
+        return;
+    }
+    let execution = context.query_execution_id();
+    println!(
+        "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED execution_id={}:{}:{} frontend={} backend={}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        context.frontend_process_id(),
+        context.backend_process_id(),
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
