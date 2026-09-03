@@ -741,7 +741,16 @@ fn a_conflicting_descriptor_does_not_preempt_a_creation_in_progress() {
     let registry = Arc::clone(&fixture.registry);
     let owner_request = fixture.create_request(identity, 5);
     let owner = std::thread::spawn(move || registry.create_task(&owner_request));
+    // Bounded, because the owner thread reaching its gate is a scheduling
+    // event this test does not control. An unbounded spin here turns a starved
+    // thread into a run that never ends, which is worse than a failure: it
+    // takes the whole suite with it and says nothing about why.
+    let rendezvous = std::time::Instant::now();
     while fixture.registry.in_flight_operations(context) == 0 {
+        assert!(
+            rendezvous.elapsed() < std::time::Duration::from_secs(30),
+            "the creation owner never reached its install gate"
+        );
         std::thread::yield_now();
     }
 
