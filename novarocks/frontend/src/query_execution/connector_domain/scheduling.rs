@@ -78,14 +78,27 @@ impl SplitSequenceAllocator {
         Self::default()
     }
 
+    /// Allocates the next sequence for one plan node, starting at one.
+    ///
+    /// One and not zero, for two reasons that point the same way. A split
+    /// sequence is a nonzero type on the task protocol, so a zero-based
+    /// allocation makes every plan node's *first* split unrepresentable and
+    /// its payload undecodable. And a receipt reports the highest accepted
+    /// sequence as a plain integer, so with a zero-based space `0` would mean
+    /// both "nothing accepted yet" and "accepted sequence zero" -- one of the
+    /// two readings has to be wrong, and a watermark that cannot tell them
+    /// apart cannot decide whether a resend is a duplicate.
     fn allocate(&mut self, plan_node_id: i32) -> u64 {
-        let slot = self.next.entry(plan_node_id).or_insert(0);
+        let slot = self.next.entry(plan_node_id).or_insert(1);
         let sequence = *slot;
         *slot += 1;
         sequence
     }
 
-    /// The next sequence a plan node will use; also the count already issued.
+    /// The next sequence a plan node will use.
+    ///
+    /// Zero means nothing has been issued, which is a distinct answer from
+    /// any sequence a split could carry.
     pub(crate) fn issued(&self, plan_node_id: i32) -> u64 {
         self.next.get(&plan_node_id).copied().unwrap_or_default()
     }
@@ -277,6 +290,34 @@ impl TaskUpdateRequest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_first_sequence_of_every_plan_node_is_representable() {
+        use novarocks_execution::task_execution::SplitSequence;
+
+        // A split sequence is nonzero on the task protocol. A zero-based
+        // allocation therefore makes the *first* split of every plan node
+        // undecodable, which is every scan's first batch -- and it also makes
+        // a receipt's "highest accepted sequence" ambiguous, because zero
+        // would mean both nothing-accepted and accepted-zero.
+        let mut allocator = SplitSequenceAllocator::new();
+        assert_eq!(
+            allocator.issued(7),
+            0,
+            "nothing issued is its own answer, distinct from any real sequence"
+        );
+
+        let first = allocator.allocate(7);
+        assert!(
+            SplitSequence::new(first).is_ok(),
+            "the first sequence must be representable, got {first}"
+        );
+        assert_eq!(allocator.allocate(7), first + 1);
+
+        // Each plan node has its own space, so a second node also starts
+        // representable rather than continuing the first node's count.
+        assert_eq!(allocator.allocate(9), first);
+    }
+
     use super::*;
 
     #[test]

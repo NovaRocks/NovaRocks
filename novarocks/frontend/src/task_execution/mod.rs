@@ -46,6 +46,7 @@ pub mod remote_task;
 pub(crate) mod round;
 pub mod sources;
 mod split_domain;
+pub(crate) mod split_transport;
 pub mod stage;
 pub mod status_intake;
 
@@ -72,6 +73,16 @@ pub use intent::{
 pub use remote_task::{
     CreateSettlement, RemoteTask, RemoteTaskState, TaskTerminalReport, UpdateAdmission,
     UpdateSettlement,
+};
+// The coordinator still owns split delivery, so nothing consumes these yet.
+// `expect` rather than `allow`, so the attribute itself stops compiling clean
+// once the cutover gives them a caller.
+#[expect(
+    unused_imports,
+    reason = "The split delivery bridge is wired by the coordinator cutover, which is a separate step."
+)]
+pub(crate) use split_transport::{
+    DeliveryId, PendingSplitDelivery, SettleVerdict, SplitDeliveryBridge, SplitDeliveryError,
 };
 pub use stage::{EdgeOpenTracker, StageExecution};
 pub use status_intake::{

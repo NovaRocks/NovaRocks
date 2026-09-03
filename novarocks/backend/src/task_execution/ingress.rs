@@ -497,8 +497,8 @@ mod tests {
             &self,
             _descriptor: &TaskDescriptor,
             _domain: &TaskDomainUpdate,
-        ) -> Result<(), HostRejection> {
-            Ok(())
+        ) -> Result<Option<u64>, HostRejection> {
+            Ok(None)
         }
     }
 

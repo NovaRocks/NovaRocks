@@ -1876,3 +1876,38 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     assert!(round.consume_root_result_packet(1, false).is_err());
     let _ = round.execution_mut();
 }
+
+#[test]
+fn a_terminal_marker_after_a_task_took_its_splits_is_admitted() {
+    // The sender gives every task of a plan node the terminal marker, so a
+    // task whose splits all arrived in an earlier batch receives a final
+    // message that re-offers its range and adds the seal. Judging it by the
+    // range alone calls it a regression, the frontend refuses to send it, and
+    // that task's scan waits forever for a terminal it was already told about.
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let mut harness = Harness::from_graph(graph);
+    let leaf = harness.stage_tasks(1)[0];
+
+    harness
+        .execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+        .expect("a first batch is admitted");
+
+    // The same range again, now carrying the seal.
+    harness
+        .execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, true))
+        .expect("the terminal marker for an already-accepted range is admitted");
+
+    // A seal is idempotent, but a genuinely older range without one is still
+    // a regression: the relaxation is exactly the seal, nothing wider.
+    assert!(
+        harness
+            .execution
+            .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+            .is_err(),
+        "a re-offered range that seals nothing is still a regression"
+    );
+}

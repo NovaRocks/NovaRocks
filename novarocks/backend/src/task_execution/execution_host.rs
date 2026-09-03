@@ -423,7 +423,7 @@ impl NativeTaskExecutionHost {
         &self,
         runtime: &TaskRuntime,
         assignment: &SplitAssignment,
-    ) -> Result<(), HostRejection> {
+    ) -> Result<u64, HostRejection> {
         let node = assignment.plan_node_id();
         let queue = runtime.splits.queue(node);
         let sequences: Vec<SplitSequenceEvidence> = assignment
@@ -464,8 +464,12 @@ impl NativeTaskExecutionHost {
         };
         queue
             .offer_splits(node, received, assignment.no_more_splits())
-            .map(|_| ())
-            .map_err(split_queue_rejection)
+            .map_err(split_queue_rejection)?;
+        // Measured after the offer, because that is what the sender needs:
+        // how full this node's queue is now, not how full it was before it
+        // sent. Defaulting it to zero would tell the sender the task is idle
+        // and invite it to keep filling a queue that is already full.
+        Ok(queue.stats().queued_splits as u64)
     }
 
     /// Recovers the typed split batch a neutral domain payload carries.
@@ -739,7 +743,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         &self,
         descriptor: &TaskDescriptor,
         domain: &TaskDomainUpdate,
-    ) -> Result<(), HostRejection> {
+    ) -> Result<Option<u64>, HostRejection> {
         let identity = descriptor.identity();
         let runtime = self.task_runtime(identity).ok_or_else(|| {
             internal(format!(
@@ -756,20 +760,23 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         assignment.plan_node_id()
                     )));
                 }
-                self.deliver_splits(&runtime, &assignment)
+                self.deliver_splits(&runtime, &assignment).map(Some)
             }
             TaskDomainUpdate::TaskDynamicFilter { version, payload } => {
-                self.context_facts.deliver_task_dynamic_filter(
-                    identity.query_execution_id(),
-                    descriptor.fragment_instance_id(),
-                    *version,
-                    payload,
-                )
+                self.context_facts
+                    .deliver_task_dynamic_filter(
+                        identity.query_execution_id(),
+                        descriptor.fragment_instance_id(),
+                        *version,
+                        payload,
+                    )
+                    // A filter domain has no queue to report.
+                    .map(|()| None)
             }
             TaskDomainUpdate::OpenExchangeEdges { version, edges } => runtime
                 .edges
                 .open(*version, edges)
-                .map(|_| ())
+                .map(|_| None)
                 .map_err(|conflict| {
                     protocol(format!("task {identity} edge open is illegal: {conflict}"))
                 }),

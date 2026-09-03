@@ -177,11 +177,18 @@ pub trait TaskExecutionHost: Send + Sync {
 
     /// Applies a task-scoped domain advance the owner already classified as
     /// applicable.
+    ///
+    /// Returns how many splits the plan node still holds after the offer, for
+    /// the domains that have a queue. The sender reads it as backpressure, so
+    /// it must be measured rather than defaulted: reporting zero for a domain
+    /// that never counted says the task is idle and invites the sender to keep
+    /// filling a queue that is already full. `None` means this domain has no
+    /// queue to report, which is a different statement from an empty one.
     fn apply_task_domain(
         &self,
         descriptor: &TaskDescriptor,
         domain: &TaskDomainUpdate,
-    ) -> Result<(), HostRejection>;
+    ) -> Result<Option<u64>, HostRejection>;
 }
 
 /// One task's readable dynamic filter domain.

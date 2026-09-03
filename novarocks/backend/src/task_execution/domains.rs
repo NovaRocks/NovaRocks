@@ -165,14 +165,20 @@ pub(super) fn plan_updates(
 pub(super) fn commit_updates(
     domains: &mut TaskDomains,
     updates: &[TaskDomainUpdate],
+    queued: &[Option<u64>],
 ) -> Result<(Vec<TaskDomainReceipt>, bool), DomainRejection> {
     let mut receipts = Vec::with_capacity(updates.len());
     let mut applied_any = false;
-    for update in updates {
+    for (index, update) in updates.iter().enumerate() {
         let mut speculative = domains.clone();
         let progression = classify(&mut speculative, update)?;
         applied_any |= matches!(progression, DomainProgression::Apply);
-        receipts.push(commit(domains, update, progression));
+        receipts.push(commit(
+            domains,
+            update,
+            progression,
+            queued.get(index).copied().flatten(),
+        ));
     }
     Ok((receipts, applied_any))
 }
@@ -188,8 +194,8 @@ pub(super) fn apply_updates(
     updates: &[TaskDomainUpdate],
 ) -> Result<(Vec<TaskDomainReceipt>, bool), DomainRejection> {
     let plan = plan_updates(descriptor, domains, updates)?;
-    apply_planned(host, descriptor, updates, &plan)?;
-    commit_updates(domains, updates)
+    let queued = apply_planned(host, descriptor, updates, &plan)?;
+    commit_updates(domains, updates, &queued)
 }
 
 /// Asks the execution side to apply exactly the updates the plan accepted.
@@ -201,14 +207,22 @@ pub(super) fn apply_planned(
     descriptor: &TaskDescriptor,
     updates: &[TaskDomainUpdate],
     plan: &[DomainProgression],
-) -> Result<(), DomainRejection> {
+) -> Result<Vec<Option<u64>>, DomainRejection> {
+    let mut queued = Vec::with_capacity(updates.len());
     for (update, progression) in updates.iter().zip(plan) {
         if matches!(progression, DomainProgression::Apply) {
-            host.apply_task_domain(descriptor, update)
-                .map_err(rejection_from_host)?;
+            queued.push(
+                host.apply_task_domain(descriptor, update)
+                    .map_err(rejection_from_host)?,
+            );
+        } else {
+            // Nothing was applied, so nothing was measured. The receipt
+            // reports the retained watermark without a depth rather than the
+            // depth of an offer that never landed.
+            queued.push(None);
         }
     }
-    Ok(())
+    Ok(queued)
 }
 
 fn rejection_from_host(rejection: HostRejection) -> DomainRejection {
@@ -232,7 +246,7 @@ fn classify(
     let progression = match update {
         TaskDomainUpdate::SplitAssignment(intent) => {
             let watermark = domains.splits.watermark(intent.node());
-            let progression = classify_split_batch(
+            let progression = SplitWatermark::classify_offer(
                 watermark,
                 intent.first(),
                 intent.last(),
@@ -241,7 +255,7 @@ fn classify(
             if matches!(progression, DomainProgression::Apply) {
                 domains.splits.set_watermark(
                     intent.node(),
-                    apply_split_batch(watermark, intent.last(), intent.no_more_splits()),
+                    watermark.apply_offer(intent.last(), intent.no_more_splits()),
                 );
             }
             progression
@@ -278,51 +292,28 @@ fn classify(
 /// watermark's own marker rule.
 ///
 /// A batch whose whole range is already accepted is `Idempotent` by the
-/// batch rule, which on its own would swallow the seal that the same request
-/// also carries. `classify_no_more` is the rule for exactly that fact, so a
-/// re-offered range that newly seals the node still seals it.
-fn classify_split_batch(
-    watermark: SplitWatermark,
-    first: SplitSequence,
-    last: SplitSequence,
-    no_more: bool,
-) -> DomainProgression {
-    let already_accepted = last.get() < watermark.next_expected();
-    if no_more && already_accepted && !watermark.no_more_splits() {
-        return watermark.classify_no_more(Some(last));
-    }
-    watermark.classify_batch(first, last, no_more)
-}
-
-fn apply_split_batch(
-    watermark: SplitWatermark,
-    last: SplitSequence,
-    no_more: bool,
-) -> SplitWatermark {
-    if last.get() < watermark.next_expected() {
-        // The range was already accepted; only the terminal marker is new.
-        return watermark.apply_no_more();
-    }
-    watermark.apply_batch(last, no_more)
-}
-
 fn commit(
     domains: &mut TaskDomains,
     update: &TaskDomainUpdate,
     progression: DomainProgression,
+    queued_splits: Option<u64>,
 ) -> TaskDomainReceipt {
     match update {
         TaskDomainUpdate::SplitAssignment(intent) => {
             let watermark = domains.splits.watermark(intent.node());
             let watermark = if matches!(progression, DomainProgression::Apply) {
-                let next = apply_split_batch(watermark, intent.last(), intent.no_more_splits());
+                let next = watermark.apply_offer(intent.last(), intent.no_more_splits());
                 domains.splits.set_watermark(intent.node(), next);
                 next
             } else {
                 watermark
             };
+            let mut node = PlanNodeSplitReceipt::new(intent.node(), watermark);
+            if let Some(depth) = queued_splits {
+                node = node.with_queued_splits(depth);
+            }
             TaskDomainReceipt::SplitAssignment {
-                nodes: vec![PlanNodeSplitReceipt::new(intent.node(), watermark)],
+                nodes: vec![node],
                 progression,
             }
         }

@@ -276,7 +276,12 @@ impl RemoteTask {
                     ));
                 }
                 let watermark = self.progress.splits.watermark(intent.node());
-                match watermark.classify_batch(
+                // The same rule the backend applies. Judging by the range
+                // alone rejects the terminal marker every task of a plan node
+                // receives once its splits already arrived, and that task's
+                // scan then waits forever for a seal it was already told
+                // about.
+                match watermark.classify_offer(
                     intent.first(),
                     intent.last(),
                     intent.no_more_splits(),
@@ -284,7 +289,7 @@ impl RemoteTask {
                     DomainProgression::Apply => {
                         self.progress.splits.set_watermark(
                             intent.node(),
-                            watermark.apply_batch(intent.last(), intent.no_more_splits()),
+                            watermark.apply_offer(intent.last(), intent.no_more_splits()),
                         );
                         Ok(())
                     }

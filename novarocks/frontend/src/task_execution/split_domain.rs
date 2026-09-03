@@ -25,7 +25,11 @@
 //! task protocol addresses the same tasks and reaches the same retry verdict
 //! as the driver does.
 
+use std::collections::BTreeMap;
+
 use novarocks_execution::task_execution::{FrontendAction, PlanNodeId};
+use novarocks_types::UniqueId;
+use novarocks_types::identity::TaskId;
 
 use super::graph::TaskGraph;
 use crate::query_execution::split_assignment::{AssignmentTarget, SplitAssignmentDriverError};
@@ -47,6 +51,24 @@ pub(crate) fn assignment_targets(graph: &TaskGraph, node: PlanNodeId) -> Vec<Ass
             backend_idx: task.backend_idx(),
             fragment_instance_id: task.fragment_instance_id(),
         })
+        .collect()
+}
+
+/// The task each driver address names, keyed by fragment instance id.
+///
+/// This is the same translation as [`assignment_targets`] read backwards, and
+/// it lives beside it for that reason: a lookup written next to a caller could
+/// disagree with this module about which task one driver target names. The
+/// graph builder already refuses two tasks that derive one kernel key, so
+/// collecting here cannot silently merge two tasks into one address.
+#[allow(
+    dead_code,
+    reason = "The task protocol is not routed into production yet; the adapter is exercised by this module's tests until the transport cutover lands."
+)]
+pub(crate) fn task_kernel_index(graph: &TaskGraph) -> BTreeMap<UniqueId, TaskId> {
+    graph
+        .tasks()
+        .map(|task| (task.fragment_instance_id(), task.task_id()))
         .collect()
 }
 

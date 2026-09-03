@@ -816,11 +816,17 @@ impl TaskExecutionRegistry {
                 );
             }
         };
-        if let Err(rejection) =
-            domains::apply_planned(&*self.task_host, &descriptor, request.domains(), &plan)
-        {
-            return OperationReceipt::rejected(operation, rejection.outcome(), rejection.detail());
-        }
+        let queued =
+            match domains::apply_planned(&*self.task_host, &descriptor, request.domains(), &plan) {
+                Ok(queued) => queued,
+                Err(rejection) => {
+                    return OperationReceipt::rejected(
+                        operation,
+                        rejection.outcome(),
+                        rejection.detail(),
+                    );
+                }
+            };
 
         let (receipts, applied) = {
             let mut state = self.state.lock().expect(REGISTRY_LOCK);
@@ -833,7 +839,7 @@ impl TaskExecutionRegistry {
             };
             // Re-classified against the tokens as they are now, so a
             // concurrent update cannot be rolled back by this one.
-            match domains::commit_updates(&mut live.domains, request.domains()) {
+            match domains::commit_updates(&mut live.domains, request.domains(), &queued) {
                 Ok(result) => result,
                 Err(rejection) => {
                     return OperationReceipt::rejected(

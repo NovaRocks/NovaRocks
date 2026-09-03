@@ -516,6 +516,39 @@ impl SplitWatermark {
         }
     }
 
+    /// Classifies one offered batch, including a re-offered range that newly
+    /// seals the node.
+    ///
+    /// [`Self::classify_batch`] answers about the range alone, so a range the
+    /// node already accepted is a duplicate whatever else the batch carries.
+    /// But the sender gives every task of a plan node the terminal marker,
+    /// including tasks whose splits all arrived in an earlier batch, and that
+    /// final message is a re-offered range plus a seal. Judging it by the
+    /// range alone rejects it as a regression and the scan waits forever for
+    /// a terminal it was already told about.
+    pub fn classify_offer(
+        self,
+        first: SplitSequence,
+        last: SplitSequence,
+        no_more: bool,
+    ) -> DomainProgression {
+        let already_accepted = last.get() < self.next_expected();
+        if no_more && already_accepted && !self.no_more_splits() {
+            return self.classify_no_more(Some(last));
+        }
+        self.classify_batch(first, last, no_more)
+    }
+
+    /// Applies an offer this watermark already classified as
+    /// [`DomainProgression::Apply`].
+    pub fn apply_offer(self, last: SplitSequence, no_more: bool) -> Self {
+        if last.get() < self.next_expected() {
+            // The range was already accepted; only the seal is new.
+            return self.apply_no_more();
+        }
+        self.apply_batch(last, no_more)
+    }
+
     /// Applies a standalone `no_more_splits` marker.
     pub const fn apply_no_more(self) -> Self {
         Self {

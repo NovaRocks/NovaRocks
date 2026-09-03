@@ -23,7 +23,7 @@
 //! balance rather than as an absence of a symptom.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -332,6 +332,8 @@ struct FakeTaskHost {
     fail_capability: AtomicBool,
     fail_submit: AtomicBool,
     fail_task_domain: AtomicBool,
+    /// What the fake reports a split node still holds after an offer.
+    queued_splits: AtomicU64,
     /// Held inside `submit_runnable`, after every install has succeeded.
     submit_gate: Arc<HostGate>,
     ignore_stand_down: Arc<AtomicBool>,
@@ -351,6 +353,7 @@ impl FakeTaskHost {
             fail_capability: AtomicBool::new(false),
             fail_submit: AtomicBool::new(false),
             fail_task_domain: AtomicBool::new(false),
+            queued_splits: AtomicU64::new(0),
             submit_gate: Arc::new(HostGate::opened()),
             ignore_stand_down: Arc::new(AtomicBool::new(false)),
             arrivals: AtomicUsize::new(0),
@@ -450,7 +453,7 @@ impl TaskExecutionHost for FakeTaskHost {
         &self,
         _descriptor: &TaskDescriptor,
         _domain: &TaskDomainUpdate,
-    ) -> Result<(), HostRejection> {
+    ) -> Result<Option<u64>, HostRejection> {
         if self.fail_task_domain.load(Ordering::SeqCst) {
             return Err(HostRejection::new(
                 TaskFailureCategory::ResourceExhausted,
@@ -460,7 +463,10 @@ impl TaskExecutionHost for FakeTaskHost {
         self.ledger
             .task_domains_applied
             .fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(match _domain {
+            TaskDomainUpdate::SplitAssignment(_) => Some(self.queued_splits.load(Ordering::SeqCst)),
+            _ => None,
+        })
     }
 }
 
@@ -1660,6 +1666,47 @@ fn running_status(identity: TaskIdentity, version: u64) -> TaskStatus {
 }
 
 // --------------------------------------------------------------- operations
+
+#[test]
+fn a_split_receipt_reports_the_queue_depth_the_offer_left_behind() {
+    // The sender reads this as backpressure. Reporting nothing lets it read
+    // an absent depth as zero and keep filling a queue that is already full,
+    // which is why the wire models it as optional and the execution side
+    // measures it after the offer rather than defaulting it.
+    let fixture = Fixture::new();
+    fixture.establish(1);
+    let identity = fixture.identity(1, 1, 1);
+    fixture.create(identity, 5);
+    fixture.task_host.queued_splits.store(7, Ordering::SeqCst);
+
+    let accepted = fixture.registry.update_task(
+        &UpdateTask::try_new(
+            TaskOperationId::new_v7(),
+            identity,
+            vec![split_update(3, 1, 4, false, 11)],
+        )
+        .expect("a legal update"),
+    );
+    assert_eq!(accepted.outcome(), OperationOutcome::Accepted);
+    let receipt = accepted
+        .acknowledgement()
+        .expect("an applied update carries its receipt");
+    let novarocks_execution::task_execution::operation::TaskDomainReceipt::SplitAssignment {
+        nodes,
+        ..
+    } = receipt
+        .domains()
+        .first()
+        .expect("the update carried one domain")
+    else {
+        panic!("a split update produces a split receipt");
+    };
+    assert_eq!(
+        nodes.first().expect("one plan node").queued_splits(),
+        Some(7),
+        "the depth the execution side measured must reach the sender"
+    );
+}
 
 #[test]
 fn a_task_update_advances_its_own_domains_atomically() {

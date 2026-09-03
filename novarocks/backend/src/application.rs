@@ -387,7 +387,7 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         &self,
         _descriptor: &TaskDescriptor,
         _domain: &TaskDomainUpdate,
-    ) -> Result<(), HostRejection> {
+    ) -> Result<Option<u64>, HostRejection> {
         Err(HostRejection::new(
             TaskFailureCategory::Internal,
             UNROUTED_DETAIL,
