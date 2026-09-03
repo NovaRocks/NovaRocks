@@ -53,7 +53,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use novarocks_connector_binding::ConnectorMaterializationErrorClass;
-use novarocks_execution::task_execution::identity::QueryContextRef;
+use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution::task_execution::operation::QueryContextDomainUpdate;
 use novarocks_execution::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::lifecycle::{QueryTerminationReason, RuntimeFilterContribution};
@@ -64,14 +64,17 @@ use novarocks_types::QueryExecutionId;
 use tracing::error;
 
 use super::credential_slot::QueryContextCredentialSlot;
+use super::feedback::TaskRuntimeFilterFeedbackEgress;
 use super::host::{HostRejection, QueryContextHost, SharedFactsRequest};
 use super::shared_facts::{catalog_bindings, credential_material, runtime_filter_install};
+use super::status::TaskStatusReporter;
 use crate::BackendDataRuntime;
 use crate::connector::ConnectorExecutionRoleBinding;
 use crate::connector::catalog_manager::{
     CatalogManager, CatalogManagerError, ConnectorExecutionRoleBindingFactorySet,
 };
 use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use crate::runtime_filter::domain::BackendFrontendFeedbackSink;
 use crate::runtime_filter::install_decode::{
     DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
 };
@@ -94,6 +97,13 @@ struct ContextFacts {
     /// `None` either because the query installs no runtime filter on this
     /// backend, or because the side that tore the context down already took it.
     participant: Option<Arc<RuntimeFilterParticipant>>,
+    /// The one task carrying this context's terminal filter feedback to the
+    /// frontend, and the only strong reference to that sink.
+    ///
+    /// The participant holds it weakly, so this is what keeps it alive. Taking
+    /// it at tear-down is what makes a released context stop publishing rather
+    /// than keep a status reporter reachable from a background publisher.
+    feedback: Option<Arc<TaskRuntimeFilterFeedbackEgress>>,
 }
 
 /// Everything one query context installed on this backend.
@@ -119,6 +129,7 @@ impl InstalledContext {
             facts: Mutex::new(ContextFacts {
                 released: true,
                 participant: None,
+                feedback: None,
             }),
         }
     }
@@ -286,6 +297,25 @@ impl NativeQueryContextHost {
         facts.participant.clone()
     }
 
+    /// Which task carries this query context's dynamic filter feedback.
+    ///
+    /// This is the supply observable of the backend half of that loop: a sink
+    /// that is built and never installed answers `None` here, and no test of
+    /// the sink itself can see that.
+    pub fn feedback_carrier(&self, execution: QueryExecutionId) -> Option<TaskIdentity> {
+        let context = self.context_for_execution(execution)?;
+        let contexts = self
+            .contexts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let installed = contexts.get(context)?;
+        let facts = installed
+            .facts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        facts.feedback.as_ref().map(|sink| sink.as_ref().carrier())
+    }
+
     pub fn context_for_execution(&self, execution: QueryExecutionId) -> Option<QueryContextRef> {
         self.contexts
             .lock()
@@ -346,6 +376,10 @@ impl NativeQueryContextHost {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             facts.released = true;
+            // Dropped with the participant: it is the only strong reference to
+            // the feedback sink, so releasing the context is what makes a late
+            // publication find nothing to publish through.
+            facts.feedback = None;
             facts.participant.take()
         };
         installed.credentials.clear();
@@ -849,7 +883,14 @@ mod tests {
         BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
         RuntimeFilterParticipantFactory,
     };
+    use crate::task_execution::clock::ProcessMonotonicClock;
+    use crate::task_execution::execution_host::TaskQueryContextFacts;
     use crate::task_execution::host::{QueryContextHost, SharedFactsRequest};
+    use crate::task_execution::observation::TaskStatusSource;
+    use crate::task_execution::status::{
+        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter,
+    };
+    use novarocks_execution::task_execution::identity::TaskIdentity;
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 
@@ -1859,6 +1900,113 @@ mod tests {
         );
     }
 
+    /// The first submitted task of a context becomes its feedback carrier.
+    #[test]
+    fn the_first_submitted_task_carries_the_context_dynamic_filter_feedback() {
+        // The defect this catches: nothing installed a feedback sink on the
+        // participant, so a reduced filter domain was published into a sink
+        // that did not exist and no frontend ever learned about it. The
+        // symptom is unpruned connector enumeration with identical rows, which
+        // no result assertion can see.
+        //
+        // It also pins first-wins. A second carrier would replace the sink on
+        // every channel session, so which task publishes a domain would depend
+        // on submission order and the frontend would be polling a task that no
+        // longer publishes.
+        let fixture = Fixture::new();
+        let context = context(1);
+        fixture
+            .establish(
+                context,
+                vec![],
+                participant_contribution(1),
+                &credential(1, SECRET_SENTINEL, live_until()),
+            )
+            .expect("establish with a participant");
+        let execution = context.query_execution_id();
+        assert_eq!(
+            fixture.host.feedback_carrier(execution),
+            None,
+            "an established context with no submitted task carries nothing yet"
+        );
+
+        let first = task_identity(context, 1);
+        let second = task_identity(context, 2);
+        let (_first_owner, first_reporter) = reporter_for(first);
+        let (_second_owner, second_reporter) = reporter_for(second);
+
+        assert!(
+            fixture
+                .host
+                .bind_runtime_filter_feedback(execution, first, &first_reporter),
+            "the first submitted task takes the carrier role"
+        );
+        assert_eq!(fixture.host.feedback_carrier(execution), Some(first));
+        assert!(
+            !fixture
+                .host
+                .bind_runtime_filter_feedback(execution, second, &second_reporter),
+            "a second task must not replace the carrier"
+        );
+        assert_eq!(
+            fixture.host.feedback_carrier(execution),
+            Some(first),
+            "the carrier is first-wins, not last-writer"
+        );
+
+        // Releasing the context drops the only strong reference to the sink,
+        // so a late publication finds nothing to publish through.
+        fixture.host.release(context);
+        assert_eq!(fixture.host.feedback_carrier(execution), None);
+    }
+
+    /// A query with no participant on this backend has nothing to carry.
+    #[test]
+    fn a_context_without_a_participant_declines_the_carrier_role() {
+        let fixture = Fixture::new();
+        let context = context(1);
+        fixture
+            .establish(
+                context,
+                vec![],
+                no_contribution(),
+                &credential(1, SECRET_SENTINEL, live_until()),
+            )
+            .expect("establish without a participant");
+        let execution = context.query_execution_id();
+        let task = task_identity(context, 1);
+        let (_owner, reporter) = reporter_for(task);
+
+        assert!(
+            !fixture
+                .host
+                .bind_runtime_filter_feedback(execution, task, &reporter),
+            "there is no channel that could ever reduce, so there is nothing to carry"
+        );
+        assert_eq!(fixture.host.feedback_carrier(execution), None);
+    }
+
+    /// One task of a context, on the exact backend process that context names.
+    fn task_identity(context: QueryContextRef, task: u32) -> TaskIdentity {
+        TaskIdentity::new(
+            context.query_execution_id(),
+            novarocks_types::identity::StageId::new(1).expect("nonzero stage"),
+            novarocks_types::identity::TaskId::new(task).expect("nonzero task"),
+            context.backend_process_id(),
+        )
+    }
+
+    fn reporter_for(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
+        let owner = Arc::new(TaskStatusOwner::new(
+            identity,
+            Arc::new(TaskStatusSource::new()),
+            Arc::new(ProcessMonotonicClock::new()),
+            METRIC_PUBLISH_MIN_INTERVAL,
+        ));
+        owner.release_to_observers();
+        (Arc::clone(&owner), TaskStatusReporter::new(owner))
+    }
+
     /// Nothing this host renders or refuses may carry credential material.
     #[test]
     fn credential_material_never_appears_in_a_rendering_or_a_rejection() {
@@ -1953,6 +2101,58 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
             participant: self.participant_for_execution(execution),
             fragment_instance_id,
         })
+    }
+
+    fn bind_runtime_filter_feedback(
+        &self,
+        execution: QueryExecutionId,
+        carrier: TaskIdentity,
+        reporter: &TaskStatusReporter,
+    ) -> bool {
+        let Some(context) = self.context_for_execution(execution) else {
+            return false;
+        };
+        let installed = {
+            let contexts = self
+                .contexts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match contexts.get(context) {
+                Some(installed) => Arc::clone(installed),
+                None => return false,
+            }
+        };
+        let mut facts = installed
+            .facts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if facts.released {
+            return false;
+        }
+        // First-wins. A second carrier would replace the sink on every channel
+        // session of the participant, so which task publishes a domain would
+        // depend on submission order and the frontend would poll a task that
+        // no longer publishes.
+        if facts.feedback.is_some() {
+            return false;
+        }
+        // A query with no participant on this backend has no channel that could
+        // ever reduce, so there is nothing to carry.
+        let Some(participant) = facts.participant.clone() else {
+            return false;
+        };
+        let sink = Arc::new(TaskRuntimeFilterFeedbackEgress::new(
+            carrier,
+            reporter.clone(),
+        ));
+        // The participant holds this weakly, exactly as the lifecycle egress
+        // was held: a background publisher must not be able to keep the query
+        // context alive through its own sink.
+        participant.set_frontend_feedback_sink(Arc::downgrade(
+            &(Arc::clone(&sink) as Arc<dyn BackendFrontendFeedbackSink>),
+        ));
+        facts.feedback = Some(sink);
+        true
     }
 
     fn deliver_task_dynamic_filter(

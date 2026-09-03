@@ -61,6 +61,36 @@ pub(crate) trait AcknowledgementObserver: Send + Sync {
     fn observe_acknowledgement(&self, ack: &OperationAcknowledgement) -> Result<(), String>;
 }
 
+/// One attempt-local owner the runner drives once per turn.
+///
+/// Two loops need exactly this and nothing more: the dynamic-filter feedback
+/// reader, which must fetch from every task whose freshly folded status
+/// advertises a newer version, and the credential rotation owner, which must
+/// mint an `AdvanceDomain` for every context that still owes the current
+/// epoch. Both are attempt-local state machines with their own progression,
+/// and neither belongs inside [`QueryTaskExecution`]: one reads over a data
+/// plane and the other talks to a credential provider, and the state machine
+/// opens no connection at all.
+///
+/// So they hang here instead, on one seam, rather than as two call sites
+/// wedged into the loop. A pump may read the state machine and enqueue work
+/// into it; it settles its own operations through
+/// [`AcknowledgementObserver`], which the runner already drains for every
+/// acknowledgement.
+pub(crate) trait TurnPump: Send {
+    /// A stable name for this owner, for the installation counter.
+    fn name(&self) -> &'static str;
+
+    /// Drives this owner once, reporting how many things it moved.
+    ///
+    /// A returned error fails the attempt. That is the point for the credential
+    /// owner -- a rotation that cannot complete before its hard deadline leaves
+    /// backends on an expiring secret, which the old supervisor also treated as
+    /// an abort -- so a pump that means "nothing happened" must say zero rather
+    /// than fail.
+    fn drive(&mut self, execution: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError>;
+}
+
 /// The one thing the runner asks of the status transport.
 ///
 /// Narrower than the subscriber it is implemented by: the runner starts
@@ -98,6 +128,9 @@ pub(crate) struct TurnReport {
     pub(crate) operations: usize,
     pub(crate) acknowledgements: usize,
     pub(crate) status_events: usize,
+    /// What the per-attempt pumps moved: filter versions ingested, credential
+    /// rotations started or advanced.
+    pub(crate) pumped: usize,
 }
 
 impl TurnReport {
@@ -107,7 +140,10 @@ impl TurnReport {
     /// a completion signal, because an attempt with nothing due is not an
     /// attempt that finished.
     pub(crate) const fn is_idle(self) -> bool {
-        self.operations == 0 && self.acknowledgements == 0 && self.status_events == 0
+        self.operations == 0
+            && self.acknowledgements == 0
+            && self.status_events == 0
+            && self.pumped == 0
     }
 }
 
@@ -118,6 +154,8 @@ pub(crate) struct TaskRound {
     establish: Box<dyn ContextEstablishSource>,
     subscriber: Arc<dyn StatusSubscriptions>,
     observers: Vec<Arc<dyn AcknowledgementObserver>>,
+    pumps: Vec<Box<dyn TurnPump>>,
+    pumps_sealed: bool,
 }
 
 impl TaskRound {
@@ -133,6 +171,8 @@ impl TaskRound {
             establish,
             subscriber,
             observers: Vec::new(),
+            pumps: Vec::new(),
+            pumps_sealed: false,
         }
     }
 
@@ -140,6 +180,52 @@ impl TaskRound {
     pub(crate) fn observing(mut self, observer: Arc<dyn AcknowledgementObserver>) -> Self {
         self.observers.push(observer);
         self
+    }
+
+    /// Adds one acknowledgement observer after construction.
+    ///
+    /// The credential rotation owner is both: it is driven every turn and it
+    /// settles its own advances from the acknowledgement stream, and it is
+    /// built after the runner because it needs the attempt's frozen credential
+    /// table.
+    pub(crate) fn add_observer(&mut self, observer: Arc<dyn AcknowledgementObserver>) {
+        self.observers.push(observer);
+    }
+
+    /// Adds one attempt-local owner this runner drives on every turn.
+    ///
+    /// Taken by `&mut self` rather than by value because the two production
+    /// pumps are built from things that only exist after the runner does: the
+    /// filter reader needs the root result transport, and the credential owner
+    /// needs the attempt's frozen credential table.
+    pub(crate) fn add_pump(&mut self, pump: Box<dyn TurnPump>) {
+        crate::native::task_transport::observe_attempt_pump_installed(pump.name());
+        self.pumps.push(pump);
+    }
+
+    /// Declares that this attempt's per-turn owners are all installed.
+    ///
+    /// Required before the first turn, and this is the point of it: the two
+    /// loops this seam exists for were both fully built, fully unit-tested and
+    /// never handed to a runner, and nothing failed. An attempt that never
+    /// declares its owners now fails on its first turn instead, so *forgetting*
+    /// the installation is no longer a silent absence. Declaring zero is legal
+    /// and explicit -- an attempt with no filter channels and no rotatable
+    /// credential really has nothing to drive.
+    pub(crate) fn seal_pumps(&mut self) {
+        self.pumps_sealed = true;
+    }
+
+    /// How many per-turn pumps are installed.
+    ///
+    /// The production observable of the same fact is the installation counter
+    /// `observe_attempt_pump_installed` raises; this is the direct accessor a
+    /// test asserts on. A pump that is built but never handed to the runner is
+    /// exactly the defect these loops had before, and it is invisible to any
+    /// test of the pump itself.
+    #[cfg(test)]
+    pub(crate) fn installed_pumps(&self) -> usize {
+        self.pumps.len()
     }
 
     /// Steps the attempt once.
@@ -150,7 +236,22 @@ impl TaskRound {
     /// open edges; submission runs last so it sees both. Doing it the other
     /// way round would submit against a state one turn stale and hold permits
     /// that were already free.
+    ///
+    /// The pumps sit between the status fold and submission, and both of the
+    /// two reasons are load-bearing. They run *after* status because that is
+    /// where their input comes from: a dynamic-filter fetch is triggered by an
+    /// advertisement this turn folded, and reading it before the fold would act
+    /// on last turn's version. They run *before* submission because that is
+    /// where their output goes: a credential rotation that became due this turn
+    /// enqueues an `AdvanceDomain` which this same turn then releases, instead
+    /// of sitting in the dispatcher for a whole turn while the credential it
+    /// replaces keeps expiring.
     pub(crate) fn turn(&mut self) -> Result<TurnReport, TaskExecutionError> {
+        if !self.pumps_sealed {
+            return Err(TaskExecutionError::Schedule(
+                "the attempt's per-turn owners were never declared".to_owned(),
+            ));
+        }
         let mut report = TurnReport::default();
 
         for ack in self.acks.drain() {
@@ -168,6 +269,10 @@ impl TaskRound {
 
         let status = self.execution.apply_status(STATUS_EVENTS_PER_TURN)?;
         report.status_events = status.accepted + status.ignored;
+
+        for pump in &mut self.pumps {
+            report.pumped += pump.drive(&mut self.execution)?;
+        }
 
         let pumped = self.execution.pump(self.establish.as_ref())?;
         report.operations = pumped.operations;

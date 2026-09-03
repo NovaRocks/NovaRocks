@@ -30,15 +30,22 @@ use std::fmt;
 
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution::task_execution::{FinalTaskInfo, MaxWait, OperationOutcome, TaskIdentity};
+use novarocks_execution::task_execution::domain::DomainVersion;
+use novarocks_execution::task_execution::operation::FetchTaskDynamicFilters;
+use novarocks_execution::task_execution::{
+    FinalTaskInfo, MaxWait, OperationOutcome, TaskIdentity, TaskOperationId,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::task_execution::operation::{
-    decode_operation_outcome, encode_fetch_task_result, encode_get_final_task_info,
+    decode_operation_outcome, encode_fetch_dynamic_filters, encode_fetch_task_result,
+    encode_get_final_task_info,
 };
 use novarocks_proto_codec::task_execution::status::decode_final_task_info;
 use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::BackendProcessId;
+
+use crate::runtime_filter::feedback::TaskRuntimeFilterFeedback;
 
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::Client;
@@ -194,9 +201,74 @@ pub enum FinalTaskInfoRead {
     Unavailable(OperationOutcome),
 }
 
-/// The task protocol's two observation reads over the data plane.
+/// The longest one dynamic filter read may hold the coordinator's turn.
 ///
-/// Both are addressed by exact [`TaskIdentity`]; neither creates a task,
+/// The read is answered immediately by the backend -- it is a projection of a
+/// retained payload, not a long poll -- so this only bounds a backend that has
+/// stopped answering. It has to be bounded here because the request carries no
+/// wait field of its own, and the same thread that makes this call also settles
+/// acknowledgements and opens exchange edges: an unbounded read would stop the
+/// whole attempt to chase a pruning optimization.
+const DYNAMIC_FILTER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What one dynamic filter read answered.
+///
+/// A version of `None` is the settled "nothing to fetch": either the task has
+/// advertised nothing at all, or it went terminal and no longer retains the
+/// payload it advertised. Both are answers, not failures -- the split source's
+/// own wait cap degrades to unpruned enumeration -- so neither is an error
+/// here.
+#[derive(Clone, Debug)]
+pub struct DynamicFilterRead {
+    version: Option<DomainVersion>,
+    feedback: Vec<TaskRuntimeFilterFeedback>,
+}
+
+impl DynamicFilterRead {
+    /// The transport builds this from a decoded response; only a test that
+    /// scripts a read builds one directly.
+    #[cfg(test)]
+    pub(crate) const fn new(
+        version: Option<DomainVersion>,
+        feedback: Vec<TaskRuntimeFilterFeedback>,
+    ) -> Self {
+        Self { version, feedback }
+    }
+
+    pub const fn version(&self) -> Option<DomainVersion> {
+        self.version
+    }
+
+    pub fn feedback(&self) -> &[TaskRuntimeFilterFeedback] {
+        &self.feedback
+    }
+}
+
+/// Why one dynamic filter read produced no answer.
+///
+/// The two are acted on differently and must not be collapsed. `Unavailable`
+/// means the read did not complete -- the next turn asks again, and the split
+/// source keeps waiting inside its own cap. `Refused` means the backend
+/// answered that the request itself is not legal against the task it names,
+/// which is a real disagreement between this frontend's view of the task and
+/// the backend's, and is never repaired by asking again.
+#[derive(Clone, Debug)]
+pub enum DynamicFilterReadError {
+    Unavailable(String),
+    Refused(String),
+}
+
+impl fmt::Display for DynamicFilterReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(detail) | Self::Refused(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+/// The task protocol's three observation reads over the data plane.
+///
+/// All three are addressed by exact [`TaskIdentity`]; none creates a task,
 /// advances a status, or renews a lease.
 #[allow(
     dead_code,
@@ -213,6 +285,13 @@ pub trait TaskResultTransport: Send + Sync + 'static {
 
     /// Reads one terminal task's bounded final info.
     fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String>;
+
+    /// Reads whatever one task advertised above the reader's own cursor.
+    fn dynamic_filters(
+        &self,
+        identity: TaskIdentity,
+        acknowledged: Option<DomainVersion>,
+    ) -> Result<DynamicFilterRead, DynamicFilterReadError>;
 }
 
 /// The native implementation over one frozen backend process set.
@@ -370,6 +449,116 @@ impl TaskResultTransport for NativeTaskResultTransport {
                 .map(FinalTaskInfoRead::Unavailable)
                 .map_err(|error| format!("{address}: {error}")),
         }
+    }
+
+    fn dynamic_filters(
+        &self,
+        identity: TaskIdentity,
+        acknowledged: Option<DomainVersion>,
+    ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
+        let (client, address) = self
+            .client_of(identity)
+            .map_err(DynamicFilterReadError::Refused)?;
+        // The operation identity is minted per call and never replayed: this
+        // read creates nothing, so there is nothing for a replay to be
+        // idempotent against.
+        let request = encode_fetch_dynamic_filters(FetchTaskDynamicFilters::new(
+            TaskOperationId::new_v7(),
+            identity,
+            acknowledged,
+        ));
+        let response = self
+            .data_runtime
+            .block_on(async {
+                let mut grpc = tokio::time::timeout(
+                    DYNAMIC_FILTER_READ_TIMEOUT,
+                    client.grpc_with_channel_error(),
+                )
+                .await
+                .map_err(|_| {
+                    DynamicFilterReadError::Unavailable(format!(
+                        "{address}: dynamic filter read could not acquire a channel in time"
+                    ))
+                })?
+                .map_err(|error| DynamicFilterReadError::Unavailable(error.to_string()))?;
+                tokio::time::timeout(
+                    DYNAMIC_FILTER_READ_TIMEOUT,
+                    grpc.fetch_task_dynamic_filters(request),
+                )
+                .await
+                .map_err(|_| {
+                    DynamicFilterReadError::Unavailable(format!(
+                        "{address}: dynamic filter read did not answer in time"
+                    ))
+                })?
+                .map(tonic::Response::into_inner)
+                .map_err(|error| classify_dynamic_filter_status(&address, &error))
+            })
+            .map_err(DynamicFilterReadError::Unavailable)??;
+        let answered = response
+            .identity
+            .as_ref()
+            .map(|answered| {
+                novarocks_proto_codec::task_execution::identity::decode_task_identity(
+                    answered,
+                    FieldPath::root("fetch_task_dynamic_filters").field("identity"),
+                )
+            })
+            .transpose()
+            .map_err(|error| DynamicFilterReadError::Refused(format!("{address}: {error}")))?
+            .ok_or_else(|| {
+                DynamicFilterReadError::Refused(format!(
+                    "{address}: dynamic filter read answered without a task identity"
+                ))
+            })?;
+        // A read that agrees with itself proves nothing. This is the identity
+        // this frontend asked about, so an answer naming another task is
+        // refused rather than admitted as that task's feedback.
+        if answered != identity {
+            return Err(DynamicFilterReadError::Refused(format!(
+                "{address}: dynamic filter read for {identity} answered for {answered}"
+            )));
+        }
+        let version = DomainVersion::new(response.version).ok();
+        if version.is_none() && !response.domains.is_empty() {
+            return Err(DynamicFilterReadError::Refused(format!(
+                "{address}: dynamic filter read carries domains under version zero"
+            )));
+        }
+        let mut feedback = Vec::with_capacity(response.domains.len());
+        for domain in &response.domains {
+            let envelope = domain.envelope.as_ref().ok_or_else(|| {
+                DynamicFilterReadError::Refused(format!(
+                    "{address}: dynamic filter domain carries no envelope"
+                ))
+            })?;
+            feedback.push(
+                TaskRuntimeFilterFeedback::parse(envelope).map_err(|error| {
+                    DynamicFilterReadError::Refused(format!("{address}: {error}"))
+                })?,
+            );
+        }
+        Ok(DynamicFilterRead { version, feedback })
+    }
+}
+
+/// Classifies one dynamic filter read failure by type.
+///
+/// A status that leaves the read unfinished is `Unavailable`, and the next turn
+/// asks again. Everything else is the backend having answered that the request
+/// is illegal against the task it names, which asking again cannot repair.
+fn classify_dynamic_filter_status(address: &str, status: &tonic::Status) -> DynamicFilterReadError {
+    let detail = format!(
+        "{address}: fetch_task_dynamic_filters rpc failed: {}",
+        status.message()
+    );
+    match status.code() {
+        tonic::Code::Unavailable
+        | tonic::Code::DeadlineExceeded
+        | tonic::Code::Cancelled
+        | tonic::Code::Unknown
+        | tonic::Code::ResourceExhausted => DynamicFilterReadError::Unavailable(detail),
+        _ => DynamicFilterReadError::Refused(detail),
     }
 }
 

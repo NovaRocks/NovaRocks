@@ -31,11 +31,12 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     AbortCause, CancelReason, CodecOwnedContent, ConfidentialContent, ContentFingerprint,
     CreateTaskReceipt, CredentialEpoch, CredentialLeaseId, CredentialUpdate, DispatchBudget,
-    DispatchLane, LeaseReceipt, LeaseSequence, LeaseValidFor, MonotonicInstant, OperationKind,
-    OperationOutcome, PhysicalFragmentPlan, PlanNodeId, QueryContextReceipt, QueryContextRef,
-    QueryContextState, ReleaseOutcome, RenewSchedule, SplitAssignmentIntent, SplitSequence,
-    StageState, TaskDomainUpdate, TaskIdentity, TaskOutputFacts, TaskState, TaskStatus,
-    TaskStatusVersion, TerminationDetail, TransportBudget, UpdateTaskReceipt,
+    DispatchLane, DomainVersion, DynamicFilterAdvertisement, LeaseReceipt, LeaseSequence,
+    LeaseValidFor, MonotonicInstant, OperationKind, OperationOutcome, PhysicalFragmentPlan,
+    PlanNodeId, QueryContextReceipt, QueryContextRef, QueryContextState, ReleaseOutcome,
+    RenewSchedule, SplitAssignmentIntent, SplitSequence, StageState, TaskDomainUpdate,
+    TaskIdentity, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
+    TransportBudget, UpdateTaskReceipt,
 };
 use novarocks_sql::plan_read::{
     DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
@@ -590,10 +591,22 @@ impl Harness {
         termination: Option<TerminationDetail>,
         output_complete: bool,
     ) {
+        self.publish_with_filters(task_id, state, termination, output_complete, None);
+    }
+
+    /// Publishes one status snapshot, optionally advertising a filter version.
+    fn publish_with_filters(
+        &mut self,
+        task_id: TaskId,
+        state: TaskState,
+        termination: Option<TerminationDetail>,
+        output_complete: bool,
+        filters: Option<DynamicFilterAdvertisement>,
+    ) {
         let identity = self.identity(task_id);
         let version = self.statuses.entry(task_id).or_insert(1);
         *version += 1;
-        let status = TaskStatus::try_new(
+        let mut status = TaskStatus::try_new(
             identity,
             TaskStatusVersion::new(*version).expect("a nonzero version"),
             state,
@@ -605,6 +618,9 @@ impl Harness {
             },
         )
         .expect("a legal status snapshot");
+        if let Some(filters) = filters {
+            status = status.with_dynamic_filters(filters);
+        }
         assert_eq!(
             self.execution
                 .intake()
@@ -1837,6 +1853,11 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
         Box::new(FakeEstablish),
         Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
     );
+    // This attempt has no filter channel and no rotatable credential, so its
+    // per-turn owner set is empty -- but it still has to say so. The runner
+    // refuses to turn until the set is declared, which is what keeps the
+    // production installation from being forgotten again.
+    round.seal_pumps();
 
     let first = round.turn().expect("a turn on a fresh attempt");
     assert!(
@@ -1998,4 +2019,957 @@ fn a_terminal_marker_after_a_task_took_its_splits_is_admitted() {
             .is_err(),
         "a re-offered range that seals nothing is still a regression"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The per-turn owner seam, and the two loops that hang on it
+// ---------------------------------------------------------------------------
+
+/// One feedback channel whose only authorized publisher is `process`.
+fn feedback_declaration(
+    process: BackendProcessId,
+) -> crate::runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration {
+    use crate::runtime_filter::install_encoder::{
+        FrontendRuntimeFilterFeedbackChannel, FrontendRuntimeFilterFeedbackDeclaration,
+        FrontendRuntimeFilterFeedbackPublisherOwner, FrontendRuntimeFilterFeedbackPublisherSlot,
+        FrontendRuntimeFilterFeedbackScanBinding, FrontendRuntimeFilterFeedbackWaitEligibility,
+    };
+
+    FrontendRuntimeFilterFeedbackDeclaration::new([FrontendRuntimeFilterFeedbackChannel {
+        channel_id: 7,
+        contract_digest: [9; 32],
+        max_encoded_domain_bytes: 64 * 1024,
+        publishers: vec![FrontendRuntimeFilterFeedbackPublisherSlot {
+            participant_id: 5,
+            backend_process_id: process,
+            owner: FrontendRuntimeFilterFeedbackPublisherOwner::Aggregator,
+        }],
+        scan_bindings: vec![FrontendRuntimeFilterFeedbackScanBinding {
+            fragment_id: LEAF_FRAGMENT,
+            plan_node_id: SCAN_NODE,
+            binding_id: 7,
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }],
+        wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
+    }])
+    .expect("a legal declaration")
+}
+
+/// The canonical encoding of a one-value membership domain.
+fn exact_domain(value: i64) -> Vec<u8> {
+    use novarocks_execution::runtime_filter::contribution::{MembershipValues, ValueDomainDelta};
+    use novarocks_execution::runtime_filter::feedback_domain::RuntimeFilterFeedbackDomain;
+
+    RuntimeFilterFeedbackDomain::Exact(ValueDomainDelta::new(
+        MembershipValues::int64([value]),
+        false,
+    ))
+    .encode(64 * 1024)
+    .expect("a canonical domain")
+}
+
+/// The envelope a carrier task retains for one channel's terminal domain.
+fn feedback_envelope(
+    channel_id: u32,
+    digest: [u8; 32],
+    payload: Vec<u8>,
+) -> crate::runtime_filter::feedback::TaskRuntimeFilterFeedback {
+    use novarocks_proto_models::filter;
+
+    let execution = execution_id();
+    let envelope = filter::RuntimeFilterEnvelope {
+        kind: filter::RuntimeFilterEnvelopeKind::DegradedLogical as i32,
+        query_id: Some(novarocks_proto_models::common::UniqueId {
+            hi: execution.query_id().high(),
+            lo: execution.query_id().low(),
+        }),
+        channel_id,
+        deployment_epoch: execution.attempt_id().get(),
+        route_identity: None,
+        schema_digest: digest.to_vec(),
+        payload,
+        producer_open: None,
+    };
+    crate::runtime_filter::feedback::TaskRuntimeFilterFeedback::parse(&envelope)
+        .expect("a legal feedback envelope")
+}
+
+/// A scripted dynamic filter transport that records every read it answered.
+#[derive(Default)]
+struct RecordingFilterReads {
+    answers: Mutex<
+        BTreeMap<
+            TaskId,
+            std::collections::VecDeque<
+                Result<
+                    crate::native::fragment_transport::DynamicFilterRead,
+                    crate::native::fragment_transport::DynamicFilterReadError,
+                >,
+            >,
+        >,
+    >,
+    requested: Mutex<Vec<(TaskId, Option<DomainVersion>)>>,
+}
+
+impl RecordingFilterReads {
+    fn script(
+        &self,
+        task_id: TaskId,
+        answer: Result<
+            crate::native::fragment_transport::DynamicFilterRead,
+            crate::native::fragment_transport::DynamicFilterReadError,
+        >,
+    ) {
+        self.answers
+            .lock()
+            .expect("scripted answers")
+            .entry(task_id)
+            .or_default()
+            .push_back(answer);
+    }
+
+    fn requested(&self) -> Vec<(TaskId, Option<DomainVersion>)> {
+        self.requested.lock().expect("requested reads").clone()
+    }
+}
+
+impl crate::task_execution::feedback_pump::TaskDynamicFilterReads for RecordingFilterReads {
+    fn dynamic_filters(
+        &self,
+        identity: TaskIdentity,
+        acknowledged: Option<DomainVersion>,
+    ) -> Result<
+        crate::native::fragment_transport::DynamicFilterRead,
+        crate::native::fragment_transport::DynamicFilterReadError,
+    > {
+        self.requested
+            .lock()
+            .expect("requested reads")
+            .push((identity.task_id(), acknowledged));
+        self.answers
+            .lock()
+            .expect("scripted answers")
+            .get_mut(&identity.task_id())
+            .and_then(std::collections::VecDeque::pop_front)
+            .unwrap_or_else(|| {
+                Ok(crate::native::fragment_transport::DynamicFilterRead::new(
+                    None,
+                    Vec::new(),
+                ))
+            })
+    }
+}
+
+fn round_of(harness: Harness) -> (TaskRoundForTest, Arc<CountingWake>) {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let wake = Arc::clone(&harness.wake);
+    let round = TaskRound::new(
+        harness.execution,
+        TaskAckIntake::new(Arc::clone(&wake) as Arc<dyn StatusIntakeWake>),
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default())
+            as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    (round, wake)
+}
+
+type TaskRoundForTest = crate::task_execution::round::TaskRound;
+
+#[test]
+fn a_runner_refuses_to_turn_until_its_per_turn_owners_are_declared() {
+    // The defect this catches, and it is the reason the check exists at all:
+    // two fully built, fully unit-tested loops -- dynamic filter feedback and
+    // credential rotation -- were never handed to a runner, and every query
+    // ran clean. A missing pump is now a query failure on the first turn
+    // rather than a loop that silently never runs.
+    let harness = Harness::new(&[0], &[0], 64);
+    let (mut round, _wake) = round_of(harness);
+
+    let error = round
+        .turn()
+        .expect_err("a runner with undeclared owners must not turn");
+    assert!(
+        error
+            .to_string()
+            .contains("per-turn owners were never declared"),
+        "{error}"
+    );
+
+    // Declaring zero is legal and explicit: an attempt with no filter channel
+    // and no rotatable credential really has nothing to drive.
+    round.seal_pumps();
+    round.turn().expect("a declared attempt turns");
+}
+
+#[test]
+fn installing_the_attempt_pumps_supplies_both_feedback_loops() {
+    use crate::coordinator::task_round::{AttemptPumps, install_attempt_pumps};
+    use crate::native::task_transport::installed_attempt_pumps;
+    use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::feedback_pump::DynamicFilterFeedbackPump;
+
+    // The defect this catches: an owner that is constructed and then dropped.
+    // Both loops were exactly that, and no test of either could see it,
+    // because each component was individually correct. This asserts the
+    // *supply*: the one production installation path hands both to a runner.
+    let harness = Harness::new(&[0], &[0], 64);
+    let publisher = harness
+        .identity(TaskId::new(1).expect("nonzero"))
+        .backend_process_id();
+    let (mut round, _wake) = round_of(harness);
+
+    let declaration = feedback_declaration(publisher);
+    let feedback = Arc::new(
+        RuntimeFilterFeedbackState::new(execution_id(), declaration.clone()).expect("state"),
+    );
+    let (storage, credential) = refreshable_credential_storage();
+
+    let before_filters = installed_attempt_pumps(DynamicFilterFeedbackPump::PUMP_NAME);
+    let before_credential = installed_attempt_pumps(CredentialRotationPump::PUMP_NAME);
+
+    let rotation = install_attempt_pumps(
+        &mut round,
+        AttemptPumps {
+            execution_id: execution_id(),
+            feedback_state: Arc::clone(&feedback),
+            declared_feedback_channels: declaration.channels().len(),
+            reads: Arc::new(RecordingFilterReads::default())
+                as Arc<dyn crate::task_execution::feedback_pump::TaskDynamicFilterReads>,
+            initial_credential: &credential,
+            credential_storage: Some(Arc::clone(&storage)),
+        },
+    );
+
+    assert_eq!(
+        round.installed_pumps(),
+        2,
+        "a declared filter channel and a rotatable credential are two per-turn owners"
+    );
+    assert!(
+        rotation.is_some(),
+        "the caller must get the rotation owner back so it can stop it at completion"
+    );
+    assert_eq!(
+        installed_attempt_pumps(DynamicFilterFeedbackPump::PUMP_NAME),
+        before_filters + 1
+    );
+    assert_eq!(
+        installed_attempt_pumps(CredentialRotationPump::PUMP_NAME),
+        before_credential + 1
+    );
+    // And the runner will turn, which is what `seal_pumps` inside the
+    // installation is for.
+    round.turn().expect("an installed attempt turns");
+}
+
+#[test]
+fn an_attempt_with_no_channel_and_no_vended_credential_installs_no_owner() {
+    use crate::coordinator::task_round::{AttemptPumps, install_attempt_pumps};
+    use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+
+    // The other half of the supply rule: "declared zero" must stay reachable,
+    // or every query without runtime filters would fail its first turn.
+    let harness = Harness::new(&[0], &[0], 64);
+    let (mut round, _wake) = round_of(harness);
+    let feedback = Arc::new(
+        RuntimeFilterFeedbackState::new(execution_id(), Default::default()).expect("state"),
+    );
+    let credential = CredentialUpdate::new(
+        CredentialLeaseId::new(1),
+        CredentialEpoch::FIRST,
+        Arc::new(FakeSecret) as Arc<dyn ConfidentialContent>,
+    );
+
+    let rotation = install_attempt_pumps(
+        &mut round,
+        AttemptPumps {
+            execution_id: execution_id(),
+            feedback_state: feedback,
+            declared_feedback_channels: 0,
+            reads: Arc::new(RecordingFilterReads::default())
+                as Arc<dyn crate::task_execution::feedback_pump::TaskDynamicFilterReads>,
+            initial_credential: &credential,
+            credential_storage: None,
+        },
+    );
+
+    assert_eq!(round.installed_pumps(), 0);
+    assert!(rotation.is_none());
+    round.turn().expect("an attempt with no owners still turns");
+}
+
+/// One attempt credential table holding a single refreshable vended lease.
+///
+/// The refresher is scripted: it advances the provider epoch and pushes the
+/// expiry out, which is exactly what the table's install rules require.
+fn refreshable_credential_storage() -> (
+    Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>,
+    CredentialUpdate,
+) {
+    let (storage, credential, _) = refreshable_credential_storage_with_refresher(0);
+    (storage, credential)
+}
+
+fn refreshable_credential_storage_with_refresher(
+    remaining_ms: u64,
+) -> (
+    Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>,
+    CredentialUpdate,
+    Arc<ScriptedRefresher>,
+) {
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::lifecycle::{
+        CredentialLeaseSecretEnvelope, encode_credential_lease_descriptor,
+        encode_credential_lease_secret_envelope,
+    };
+    use novarocks_proto_codec::task_execution::domain::WireCredential;
+    use novarocks_spi::connector::{
+        CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor, CredentialLeaseProvider,
+        StorageAccessDomainId, StorageCredentialScopePrefix,
+    };
+
+    let owner = novarocks_spi::connector::CatalogHandle::new(
+        ConnectorInstanceId::try_from_canonical("catalog.analytics").expect("catalog id"),
+        CatalogVersion::from_bytes([7; 32]),
+    );
+    let not_after = now_unix_ms() + remaining_ms;
+    let descriptor = CredentialLeaseDescriptor::try_new(
+        novarocks_spi::connector::CredentialLeaseId::try_from_bytes([3; 16]).expect("lease id"),
+        1,
+        owner,
+        CredentialLeaseProvider::S3,
+        vec![StorageCredentialScopePrefix::try_from_normalized("s3://bucket/a").expect("prefix")],
+        not_after,
+        true,
+        StorageAccessDomainId::from_bytes([8; 32]),
+    )
+    .expect("a legal descriptor");
+    let envelope = CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
+        descriptor.lease_id(),
+        1,
+        "access-key".to_owned(),
+        "secret".to_owned(),
+        "session-token".to_owned(),
+        not_after,
+    )
+    .expect("a legal envelope");
+    let refresher = Arc::new(ScriptedRefresher::default());
+    let lease = crate::query_execution::lifecycle_plan::QueryCredentialLease::try_new(
+        descriptor.clone(),
+        envelope.clone(),
+        Some(Arc::clone(&refresher)
+            as Arc<
+                dyn crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher,
+            >),
+    )
+    .expect("a legal lease");
+    let storage =
+        crate::query_execution::lifecycle_plan::QueryCredentialLeases::try_new(vec![lease])
+            .expect("a legal table")
+            .into_attempt_storage_resolver()
+            .expect("a non-empty table");
+
+    let material = Arc::new(
+        WireCredential::decode(
+            &[encode_credential_lease_descriptor(&descriptor)],
+            &[encode_credential_lease_secret_envelope(&envelope)],
+            FieldPath::root("initial_credential"),
+        )
+        .expect("a legal rotation"),
+    );
+    let credential = CredentialUpdate::new(
+        CredentialLeaseId::new(1),
+        CredentialEpoch::FIRST,
+        material as Arc<dyn ConfidentialContent>,
+    );
+    (storage, credential, refresher)
+}
+
+fn now_unix_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis(),
+    )
+    .expect("representable")
+}
+
+/// A credential provider that advances the epoch, or refuses on demand.
+#[derive(Default)]
+struct ScriptedRefresher {
+    calls: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for ScriptedRefresher {
+    fn refresh(
+        &self,
+        current: &novarocks_spi::connector::CredentialLeaseDescriptor,
+    ) -> Result<crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresh, String> {
+        use novarocks_proto_codec::lifecycle::CredentialLeaseSecretEnvelope;
+        use novarocks_spi::connector::CredentialLeaseDescriptor;
+
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("scripted provider failure".to_owned());
+        }
+        let epoch = current.epoch() + 1;
+        let not_after = current.not_after_unix_ms() + 600_000;
+        let descriptor = CredentialLeaseDescriptor::try_new(
+            current.lease_id(),
+            epoch,
+            current.owner().clone(),
+            current.provider(),
+            current.prefixes().to_vec(),
+            not_after,
+            true,
+            current.storage_access_domain_id(),
+        )
+        .map_err(|error| error.to_string())?;
+        let envelope = CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
+            current.lease_id(),
+            epoch,
+            "access-key".to_owned(),
+            "rotated-secret".to_owned(),
+            "session-token".to_owned(),
+            not_after,
+        )
+        .map_err(|error| error.to_string())?;
+        crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresh::try_new(
+            descriptor, envelope,
+        )
+        .map_err(|error| error.message().to_owned())
+    }
+}
+
+#[test]
+fn the_feedback_reader_ingests_each_task_version_once_and_keeps_a_cursor_per_task() {
+    use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+    use crate::task_execution::feedback_pump::DynamicFilterFeedbackPump;
+    use crate::task_execution::round::TurnPump;
+
+    // The consumer side of the loop. Two facts are load-bearing and neither is
+    // visible from a test of the feedback state alone: the version is fetched
+    // exactly once per advertisement, and the cursor is per task -- one task's
+    // version must never suppress another's fetch, because versions are minted
+    // per task and two tasks can both sit at version one with different
+    // payloads.
+    // Both tasks are placed on one backend, so both speak for the same
+    // declared publisher: what is being pinned here is the per-task cursor,
+    // not the per-process authorization, which has its own test.
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let first = TaskId::new(1).expect("nonzero");
+    let second = TaskId::new(2).expect("nonzero");
+    let publisher = harness.identity(first).backend_process_id();
+    assert_eq!(
+        harness.identity(second).backend_process_id(),
+        publisher,
+        "this fixture places both tasks on one backend"
+    );
+    let feedback = Arc::new(
+        RuntimeFilterFeedbackState::new(execution_id(), feedback_declaration(publisher))
+            .expect("state"),
+    );
+    let reads = Arc::new(RecordingFilterReads::default());
+    let domain = exact_domain(41);
+    reads.script(
+        first,
+        Ok(crate::native::fragment_transport::DynamicFilterRead::new(
+            Some(DomainVersion::new(1).expect("nonzero")),
+            vec![feedback_envelope(7, [9; 32], domain.clone())],
+        )),
+    );
+    let mut pump = DynamicFilterFeedbackPump::new(
+        Arc::clone(&feedback),
+        Arc::clone(&reads) as Arc<dyn crate::task_execution::feedback_pump::TaskDynamicFilterReads>,
+        1,
+    )
+    .expect("a declared channel means there is something to read");
+
+    // Nothing advertised yet: no read is made at all.
+    assert_eq!(pump.drive(&mut harness.execution).expect("a clean turn"), 0);
+    assert!(reads.requested().is_empty());
+
+    harness.publish_with_filters(
+        first,
+        TaskState::Running,
+        None,
+        false,
+        Some(DynamicFilterAdvertisement::new(
+            DomainVersion::new(1).expect("nonzero"),
+            1,
+        )),
+    );
+    assert_eq!(pump.drive(&mut harness.execution).expect("a clean turn"), 1);
+    assert_eq!(pump.ingested(), 1);
+    assert_eq!(reads.requested(), vec![(first, None)]);
+    assert!(
+        !feedback.is_initial_wait_blocked(SCAN_NODE, [7]),
+        "an admitted exact domain releases the split source's initial wait"
+    );
+
+    // The same advertisement is not fetched again.
+    assert_eq!(pump.drive(&mut harness.execution).expect("a clean turn"), 0);
+    assert_eq!(reads.requested().len(), 1);
+
+    // A second task at the same version is its own cursor. A shared cursor
+    // would silently drop this one. It republishes the identical domain, which
+    // admission treats as idempotent rather than as a conflicting winner.
+    reads.script(
+        second,
+        Ok(crate::native::fragment_transport::DynamicFilterRead::new(
+            Some(DomainVersion::new(1).expect("nonzero")),
+            vec![feedback_envelope(7, [9; 32], domain.clone())],
+        )),
+    );
+    harness.publish_with_filters(
+        second,
+        TaskState::Running,
+        None,
+        false,
+        Some(DynamicFilterAdvertisement::new(
+            DomainVersion::new(1).expect("nonzero"),
+            1,
+        )),
+    );
+    assert_eq!(pump.drive(&mut harness.execution).expect("a clean turn"), 1);
+    assert_eq!(
+        reads.requested(),
+        vec![(first, None), (second, None)],
+        "the second task must be read even though the first already settled version one"
+    );
+}
+
+#[test]
+fn a_refused_dynamic_filter_read_fails_the_attempt_and_a_lost_one_is_retried() {
+    use crate::native::fragment_transport::DynamicFilterReadError;
+    use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+    use crate::task_execution::feedback_pump::DynamicFilterFeedbackPump;
+    use crate::task_execution::round::TurnPump;
+
+    // The two failures are different facts. A read that did not complete costs
+    // pruning and is retried; a read the backend *refused* says this frontend
+    // and that backend disagree about the task, and swallowing it would hide a
+    // real protocol disagreement behind a silent loss of pruning.
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let task = TaskId::new(1).expect("nonzero");
+    let publisher = harness.identity(task).backend_process_id();
+    let feedback = Arc::new(
+        RuntimeFilterFeedbackState::new(execution_id(), feedback_declaration(publisher))
+            .expect("state"),
+    );
+    let reads = Arc::new(RecordingFilterReads::default());
+    reads.script(
+        task,
+        Err(DynamicFilterReadError::Unavailable("no channel".to_owned())),
+    );
+    reads.script(
+        task,
+        Err(DynamicFilterReadError::Refused("not observable".to_owned())),
+    );
+    let mut pump = DynamicFilterFeedbackPump::new(
+        feedback,
+        Arc::clone(&reads) as Arc<dyn crate::task_execution::feedback_pump::TaskDynamicFilterReads>,
+        1,
+    )
+    .expect("a declared channel");
+
+    harness.publish_with_filters(
+        task,
+        TaskState::Running,
+        None,
+        false,
+        Some(DynamicFilterAdvertisement::new(
+            DomainVersion::new(1).expect("nonzero"),
+            1,
+        )),
+    );
+
+    assert_eq!(
+        pump.drive(&mut harness.execution)
+            .expect("a lost read is not a query failure"),
+        0
+    );
+    let error = pump
+        .drive(&mut harness.execution)
+        .expect_err("a refused read is a disagreement, not a lost optimization");
+    assert!(error.to_string().contains("was refused"), "{error}");
+    assert_eq!(
+        reads.requested().len(),
+        2,
+        "the cursor stays put after a lost read, so the next turn asks again"
+    );
+}
+
+#[test]
+fn an_advertised_version_that_is_no_longer_retained_stops_being_asked_for() {
+    use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+    use crate::task_execution::feedback_pump::DynamicFilterFeedbackPump;
+    use crate::task_execution::round::TurnPump;
+
+    // A carrier task that went terminal keeps no payload, and the read is
+    // settled with version zero. Leaving the cursor behind would re-ask every
+    // turn for a payload that is gone, which is a busy loop for the whole
+    // remaining life of the query.
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let task = TaskId::new(1).expect("nonzero");
+    let publisher = harness.identity(task).backend_process_id();
+    let feedback = Arc::new(
+        RuntimeFilterFeedbackState::new(execution_id(), feedback_declaration(publisher))
+            .expect("state"),
+    );
+    let reads = Arc::new(RecordingFilterReads::default());
+    let mut pump = DynamicFilterFeedbackPump::new(
+        feedback,
+        Arc::clone(&reads) as Arc<dyn crate::task_execution::feedback_pump::TaskDynamicFilterReads>,
+        1,
+    )
+    .expect("a declared channel");
+
+    harness.publish_with_filters(
+        task,
+        TaskState::Running,
+        None,
+        false,
+        Some(DynamicFilterAdvertisement::new(
+            DomainVersion::new(4).expect("nonzero"),
+            1,
+        )),
+    );
+    // The default scripted answer is a settled empty read.
+    assert_eq!(pump.drive(&mut harness.execution).expect("a turn"), 0);
+    assert_eq!(pump.drive(&mut harness.execution).expect("a turn"), 0);
+    assert_eq!(
+        reads.requested().len(),
+        1,
+        "an unretained version is asked for once, not on every turn"
+    );
+}
+
+/// Answers one released credential advance with the epoch it carried.
+fn credential_ack(
+    execution: &mut QueryTaskExecution,
+    observer: &dyn crate::task_execution::round::AcknowledgementObserver,
+    intent: &OperationIntent,
+    outcome: OperationOutcome,
+) {
+    use novarocks_execution::task_execution::domain::DomainProgression;
+    use novarocks_execution::task_execution::operation::{
+        QueryContextDomainReceipt, QueryContextDomainUpdate, UpdateQueryContext,
+    };
+
+    let OperationIntent::UpdateQueryContext(request) = intent else {
+        unreachable!("a credential advance is a context update");
+    };
+    let UpdateQueryContext::AdvanceDomain(advance) = request.as_ref() else {
+        unreachable!("a rotation is an advance");
+    };
+    let QueryContextDomainUpdate::Credential(update) = advance.domain() else {
+        unreachable!("a rotation carries the credential domain");
+    };
+    let payload = if matches!(outcome, OperationOutcome::Accepted) {
+        AckPayload::Context(
+            QueryContextReceipt::new(advance.context(), QueryContextState::Active).with_domains(
+                vec![QueryContextDomainReceipt::Credential {
+                    lease_id: update.lease_id(),
+                    accepted_epoch: update.epoch(),
+                    progression: DomainProgression::Apply,
+                }],
+            ),
+        )
+    } else {
+        AckPayload::None
+    };
+    let ack = OperationAcknowledgement::new(
+        intent.operation_id(),
+        OperationKind::UpdateQueryContext,
+        outcome,
+        payload,
+    );
+    observer
+        .observe_acknowledgement(&ack)
+        .expect("the rotation owner settles its own advance");
+    execution
+        .acknowledge(&ack)
+        .expect("the state machine releases the permit");
+}
+
+fn is_credential_advance(intent: &OperationIntent) -> bool {
+    use novarocks_execution::task_execution::operation::{
+        QueryContextDomainUpdate, UpdateQueryContext,
+    };
+
+    matches!(
+        intent,
+        OperationIntent::UpdateQueryContext(request)
+            if matches!(
+                request.as_ref(),
+                UpdateQueryContext::AdvanceDomain(advance)
+                    if matches!(advance.domain(), QueryContextDomainUpdate::Credential(_))
+            )
+    )
+}
+
+/// Turns until the rotation the provider produced reaches the wire.
+///
+/// The provider call runs off the turn on purpose -- the same thread owns the
+/// result loop -- so a test has to turn until it lands rather than assume one
+/// turn is enough.
+fn drive_until_rotation_released(
+    pump: &mut Arc<crate::task_execution::credential_pump::CredentialRotationPump>,
+    harness: &mut Harness,
+) -> Vec<OperationIntent> {
+    use crate::task_execution::round::TurnPump;
+
+    for _ in 0..600 {
+        pump.drive(&mut harness.execution)
+            .expect("a clean rotation turn");
+        let advances = harness
+            .released()
+            .into_iter()
+            .filter(is_credential_advance)
+            .collect::<Vec<_>>();
+        if !advances.is_empty() {
+            return advances;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the rotation never reached the wire");
+}
+
+#[test]
+fn a_credential_rotation_reaches_every_context_and_is_reported_once() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::round::AcknowledgementObserver;
+
+    // The defect this catches: `CredentialRefreshOwner` was complete and had
+    // nine tests, and nothing drove it. A long query on a vended-credential
+    // deployment therefore kept reading with material the provider had stopped
+    // honouring, and failed somewhere inside a connector instead. This asserts
+    // the loop runs end to end: the provider is called, the attempt's own
+    // table takes the new epoch, and every context is sent the rotation.
+    let mut harness = Harness::new(&[0, 1], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(contexts.len(), 2, "two backends, two query contexts");
+
+    let (storage, credential, refresher) = refreshable_credential_storage_with_refresher(60_000);
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
+        Arc::clone(&storage),
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+    )
+    .expect("a refreshable lease means there is something to rotate");
+    let mut driver = Arc::clone(&pump);
+
+    // Before the soft delay nothing is asked of the provider: rotating on the
+    // first turn would burn a provider call on every query.
+    use crate::task_execution::round::TurnPump;
+    assert_eq!(
+        driver.drive(&mut harness.execution).expect("a clean turn"),
+        0
+    );
+    assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // Past the soft delay the provider is called exactly once, off the turn.
+    clock.advance(Duration::from_secs(120));
+    let advances = drive_until_rotation_released(&mut driver, &mut harness);
+    assert_eq!(
+        refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the provider is called once, not once per turn"
+    );
+    assert_eq!(
+        advances.len(),
+        contexts.len(),
+        "every participating context is sent the rotation"
+    );
+    assert_eq!(pump.rotations_applied(), 0, "nothing has accepted it yet");
+
+    for intent in &advances {
+        credential_ack(
+            &mut harness.execution,
+            pump.as_ref() as &dyn AcknowledgementObserver,
+            intent,
+            OperationOutcome::Accepted,
+        );
+    }
+    assert_eq!(
+        pump.rotations_applied(),
+        1,
+        "one rotation, reported once every context has accepted it"
+    );
+
+    // And the attempt's own table advanced with them: the frontend reads
+    // object storage through this table, so a table that lagged the backends
+    // would leave this process using the epoch it just replaced.
+    assert_eq!(
+        storage
+            .refreshable()
+            .first()
+            .map(|(_, not_after)| *not_after > now_unix_ms() + 60_000),
+        Some(true)
+    );
+}
+
+#[test]
+fn a_rotation_that_cannot_be_accepted_before_its_hard_deadline_fails_the_attempt() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::round::TurnPump;
+
+    // The old supervisor aborted the query when a rotation failed, and so does
+    // this. Degrading instead would leave every backend on material the
+    // provider has stopped honouring, and the query would fail later, deeper,
+    // and with an error about access rather than about a lease.
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let (storage, credential, refresher) = refreshable_credential_storage_with_refresher(60_000);
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
+        storage,
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    // One turn before the soft delay, so the schedule is taken from the
+    // lifetime the lease had when this attempt first saw it.
+    driver
+        .drive(&mut harness.execution)
+        .expect("a clean turn before the soft delay");
+    clock.advance(Duration::from_secs(120));
+    let advances = drive_until_rotation_released(&mut driver, &mut harness);
+    assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!advances.is_empty());
+    // The advance was released and nobody answered. Past the point the minted
+    // epoch stops being usable, this is a query failure.
+    clock.advance(Duration::from_secs(600));
+    let error = driver
+        .drive(&mut harness.execution)
+        .expect_err("an unaccepted rotation past its hard deadline fails the attempt");
+    assert!(
+        error.to_string().contains("stopped being usable"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_wiped_rotation_owner_stops_driving_the_credential_domain() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::round::TurnPump;
+
+    // The runner keeps turning through the drain, after the client's answer is
+    // already linearized. A rotation started there would be judged against a
+    // hard deadline for material no task still reads, which would turn a
+    // completed query into a failure.
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let (storage, credential, refresher) = refreshable_credential_storage_with_refresher(60_000);
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
+        storage,
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    pump.wipe();
+    clock.advance(Duration::from_secs(3600));
+    assert_eq!(
+        driver.drive(&mut harness.execution).expect("a clean turn"),
+        0
+    );
+    assert_eq!(
+        refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a wiped owner asks the provider for nothing"
+    );
+}
+
+#[test]
+fn a_context_that_is_already_over_is_retired_rather_than_failing_the_rotation() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::round::{AcknowledgementObserver, TurnPump};
+
+    // A released context has no task left that could read through the
+    // credential and can never acknowledge anything again. Treating its
+    // refusal as a rotation failure would fail a healthy query; leaving it a
+    // participant would stall every later rotation behind it and then fail the
+    // attempt on that rotation's hard deadline.
+    let mut harness = Harness::new(&[0, 1], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let (storage, credential, _) = refreshable_credential_storage_with_refresher(60_000);
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
+        storage,
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    driver.drive(&mut harness.execution).expect("a clean turn");
+    clock.advance(Duration::from_secs(120));
+    let advances = drive_until_rotation_released(&mut driver, &mut harness);
+    assert_eq!(advances.len(), 2);
+
+    // One context accepts; the other is already gone.
+    credential_ack(
+        &mut harness.execution,
+        pump.as_ref() as &dyn AcknowledgementObserver,
+        &advances[0],
+        OperationOutcome::Accepted,
+    );
+    credential_ack(
+        &mut harness.execution,
+        pump.as_ref() as &dyn AcknowledgementObserver,
+        &advances[1],
+        OperationOutcome::Gone,
+    );
+    assert_eq!(
+        pump.rotations_applied(),
+        1,
+        "a retired context does not hold the rotation open"
+    );
+
+    // And the next hard deadline cannot fail the attempt on its behalf.
+    clock.advance(Duration::from_secs(3600));
+    driver
+        .drive(&mut harness.execution)
+        .expect("a retired context leaves nothing outstanding");
 }

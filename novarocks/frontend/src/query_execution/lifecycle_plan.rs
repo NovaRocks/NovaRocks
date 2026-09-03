@@ -32,6 +32,10 @@ use novarocks_proto_codec::lifecycle::{
     ParticipantManifest, ParticipantManifestDigest, QueryControlEndpoint, QueryExecutionId,
     QueryOptions as ProtocolQueryOptions, RuntimeFilterContribution,
 };
+use novarocks_proto_codec::lifecycle::{
+    encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
+};
+use novarocks_proto_codec::task_execution::domain::WireCredential;
 use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
 use novarocks_spi::connector::{
@@ -706,7 +710,7 @@ impl QueryCredentialLeases {
             return None;
         }
         let owner = Arc::new(AttemptCredentialStorage {
-            leases: self.leases,
+            leases: Mutex::new(self.leases),
             route: self.storage_route.clone(),
         });
         if let Some(route) = &self.storage_route {
@@ -723,9 +727,122 @@ impl QueryCredentialLeases {
 /// there is none to consult: the frontend holds the table itself, and the call
 /// site that hands this to a write session is the one that already proved the
 /// attempt completed.
+/// The table is behind a lock because a long query rotates it in place: the
+/// frontend is the credential principal, so it is this table that must hold the
+/// current epoch of every vended lease -- both for its own reads and for the
+/// material each rotation hands to the backends.
 pub(crate) struct AttemptCredentialStorage {
-    leases: Vec<QueryCredentialLease>,
+    leases: Mutex<Vec<QueryCredentialLease>>,
     route: Option<Arc<AttemptCredentialLeaseStorageRoute>>,
+}
+
+impl AttemptCredentialStorage {
+    /// Every lease that can be rotated, with the instant it stops being usable.
+    pub(crate) fn refreshable(&self) -> Vec<(CredentialLeaseId, u64)> {
+        self.leases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|lease| lease.refresher().is_some())
+            .map(|lease| {
+                (
+                    lease.descriptor().lease_id(),
+                    lease.descriptor().not_after_unix_ms(),
+                )
+            })
+            .collect()
+    }
+
+    /// The current descriptor of one lease and the source that can refresh it.
+    ///
+    /// The descriptor is what the provider is asked to advance from, so it is
+    /// read under the same lock that a rotation writes: asking from a stale
+    /// descriptor would produce an epoch this table would then refuse.
+    pub(crate) fn refresh_source(
+        &self,
+        lease_id: CredentialLeaseId,
+    ) -> Option<(
+        CredentialLeaseDescriptor,
+        Arc<dyn QueryCredentialLeaseRefresher>,
+    )> {
+        let leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let index = leases
+            .binary_search_by_key(&lease_id, |lease| lease.descriptor().lease_id())
+            .ok()?;
+        let lease = &leases[index];
+        Some((lease.descriptor().clone(), Arc::clone(lease.refresher()?)))
+    }
+
+    /// Installs one refreshed lease, keeping every immutable fact of it.
+    ///
+    /// The rules are the ones the lifecycle owner applied: the same refresh
+    /// scope, the exact next provider epoch, a later expiry, and an envelope
+    /// that matches its own descriptor. Anything else is refused rather than
+    /// installed, because a table that accepted a re-scoped lease would hand
+    /// out access nobody vended.
+    pub(crate) fn apply_refresh(
+        &self,
+        refreshed: &QueryCredentialLeaseRefresh,
+    ) -> Result<(), DistributedQueryError> {
+        let descriptor = refreshed.descriptor();
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let index = leases
+            .binary_search_by_key(&descriptor.lease_id(), |lease| {
+                lease.descriptor().lease_id()
+            })
+            .map_err(|_| {
+                contract_error("query credential lease refresh references an unknown lease")
+            })?;
+        let lease = &mut leases[index];
+        if !lease.descriptor.has_same_refresh_scope(descriptor)
+            || descriptor.epoch() != lease.descriptor.epoch().saturating_add(1)
+            || descriptor.not_after_unix_ms() <= lease.descriptor.not_after_unix_ms()
+            || !refreshed.envelope().matches_descriptor(descriptor)
+        {
+            return Err(contract_error(
+                "query credential lease refresh changed immutable scope or epoch",
+            ));
+        }
+        lease.descriptor = descriptor.clone();
+        lease.envelope = refreshed.envelope().clone();
+        Ok(())
+    }
+
+    /// The whole table as the wire material one rotation carries.
+    ///
+    /// The whole table, not the lease that moved: a credential domain epoch
+    /// counts rotations of the batch, and a backend installs what it is handed,
+    /// so a partial batch would revoke the leases it left out.
+    pub(crate) fn freeze_material(&self) -> Result<WireCredential, DistributedQueryError> {
+        let leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut descriptors = Vec::with_capacity(leases.len());
+        let mut envelopes = Vec::with_capacity(leases.len());
+        for lease in leases.iter() {
+            descriptors.push(encode_credential_lease_descriptor(lease.descriptor()));
+            envelopes.push(encode_credential_lease_secret_envelope(lease.envelope()));
+        }
+        // The codec's own message carries no secret, and the material never
+        // reaches a rendering.
+        WireCredential::decode(
+            &descriptors,
+            &envelopes,
+            novarocks_proto_codec::FieldPath::root("rotated_credential"),
+        )
+        .map_err(|error| {
+            contract_error(format!(
+                "rotated credential contribution is not installable: {error}"
+            ))
+        })
+    }
 }
 
 impl ConnectorStorageResolver for AttemptCredentialStorage {
@@ -733,7 +850,13 @@ impl ConnectorStorageResolver for AttemptCredentialStorage {
         &self,
         request: &StorageAccessRequest,
     ) -> Result<ResolvedVendedS3Access, ConnectorError> {
-        resolve_vended_s3_access(&self.leases, request)
+        resolve_vended_s3_access(
+            &self
+                .leases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            request,
+        )
     }
 }
 

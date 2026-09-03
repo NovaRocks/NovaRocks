@@ -31,7 +31,7 @@ use novarocks_execution::task_execution::{
     AbortCause, AttemptDrainFacts, DispatchBudget, GoneObservation, LatchOutcome, OperationKind,
     QueryContextRef, StageState, StatusObservation, TaskDomainUpdate, TaskIdentity,
     TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, TerminationLatch,
-    TransportBudget, parent_released_children,
+    TransportBudget, UpdateQueryContext, parent_released_children,
 };
 use novarocks_types::identity::{StageId, TaskId};
 
@@ -51,8 +51,21 @@ use super::status_intake::{StatusEvent, StatusIntake};
 /// Which owner settles one released operation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum OperationTarget {
-    Task { stage: StageId, task: TaskId },
+    Task {
+        stage: StageId,
+        task: TaskId,
+    },
     Context(QueryContextRef),
+    /// One shared-domain advance whose progression belongs to an attempt-local
+    /// owner outside this state machine.
+    ///
+    /// The credential domain is the only such owner: the frontend is the
+    /// credential principal, so the epoch it advances is minted from a provider
+    /// this state machine must not know about. Settling one here releases the
+    /// dispatch permit and nothing else; the owner learns the outcome through
+    /// the runner's acknowledgement-observer seam, which sees every
+    /// acknowledgement before it is settled.
+    ContextDomain(QueryContextRef),
 }
 
 /// What one pump released.
@@ -280,6 +293,38 @@ impl QueryTaskExecution {
             .enqueue_update(update)
     }
 
+    /// Releases one shared-domain advance an attempt-local owner minted.
+    ///
+    /// This is the seam the credential rotation owner sends through. It takes
+    /// only an advance: an establish and a renewal belong to the context owner,
+    /// which mints their lease sequences, and letting a domain owner send one
+    /// would put two producers on the lease progression.
+    ///
+    /// The operation is enqueued rather than sent, so it obeys the same bounded
+    /// per-backend dispatch as everything else and cannot jump a queue that is
+    /// already full of this backend's creates.
+    pub fn enqueue_context_domain(
+        &mut self,
+        request: UpdateQueryContext,
+    ) -> Result<TaskOperationId, TaskExecutionError> {
+        let UpdateQueryContext::AdvanceDomain(advance) = &request else {
+            return Err(TaskExecutionError::Schedule(
+                "only a shared-domain advance may be sent by a domain owner".to_owned(),
+            ));
+        };
+        let context = advance.context();
+        if !self.owners.contains_key(&context) {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        let operation_id = advance.envelope().operation_id();
+        let now = self.clock.now();
+        self.operation_targets
+            .insert(operation_id, OperationTarget::ContextDomain(context));
+        self.dispatcher
+            .enqueue(OperationIntent::UpdateQueryContext(Arc::new(request)), now)?;
+        Ok(operation_id)
+    }
+
     /// Forces one context down, ahead of everything queued for it.
     pub fn abort_context(
         &mut self,
@@ -317,6 +362,11 @@ impl QueryTaskExecution {
         match target {
             OperationTarget::Task { stage, task } => self.acknowledge_task(stage, task, ack),
             OperationTarget::Context(context) => self.acknowledge_context(context, ack),
+            // The permit is already released above. The verdict belongs to the
+            // domain owner, which read this acknowledgement from the observer
+            // seam before the runner got here, so applying it a second time
+            // would be a second authority over the same progression.
+            OperationTarget::ContextDomain(_) => Ok(()),
         }
     }
 

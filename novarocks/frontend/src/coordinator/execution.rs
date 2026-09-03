@@ -74,7 +74,9 @@ use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard, assignment_endpoints, assignment_targets,
 };
-use super::task_round::{AssembledRound, AttemptTransport, assemble_round};
+use super::task_round::{
+    AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
+};
 use crate::metrics::{
     observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
     record_pre_ready_replan,
@@ -93,6 +95,7 @@ use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 use crate::task_execution::completion::{WriteCompletionTracker, accept_final_info};
 use crate::task_execution::error::TaskExecutionError;
+use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::graph::TaskNode;
 use crate::task_execution::remote_task::RemoteTaskState;
 use crate::task_execution::round::{TaskRound, TurnReport};
@@ -1538,8 +1541,8 @@ impl FrontendDistributedQueryCoordinator {
             retry_boundary,
             runtime_filter_ready,
             init_options,
-            feedback_declaration: _,
-            feedback_state: _,
+            feedback_declaration,
+            feedback_state,
             split_assignment_plan,
             scheduled_backend_ownership,
         } = handoff;
@@ -1625,6 +1628,10 @@ impl FrontendDistributedQueryCoordinator {
             prepared.init_options().credential_leases(),
         )
         .map_err(|error| failed(error.to_string()))?;
+        // Taken before the facts are handed to the runner: the rotation owner
+        // has to start from the exact domain every establish installs, or its
+        // first rotation would be a gap every context refuses.
+        let initial_credential = establish.credential().clone();
         // Taken now that the establish holds its own wire copy: the attempt
         // keeps one owner of the vended material, and the connectors' planning
         // route is re-pointed at it. Held to the end of this call so neither
@@ -1677,9 +1684,27 @@ impl FrontendDistributedQueryCoordinator {
             },
         )
         .map_err(|error| failed(error.to_string()))?;
-        let result_transport =
-            NativeTaskResultTransport::new(&backends, self.data_runtime.clone()).map_err(failed)?;
+        let result_transport = Arc::new(
+            NativeTaskResultTransport::new(&backends, self.data_runtime.clone()).map_err(failed)?,
+        );
         let root_task = round.root_task();
+
+        // The two per-attempt feedback loops. Both hang on the runner's one
+        // pump seam rather than on call sites in the drive loop below: see
+        // `TaskRound::turn` for why they land between the status fold and
+        // submission. The runner refuses to turn until this has run, so
+        // omitting it is a query failure rather than a silently missing loop.
+        let credential_rotation = install_attempt_pumps(
+            &mut round,
+            AttemptPumps {
+                execution_id,
+                feedback_state: Arc::clone(&feedback_state),
+                declared_feedback_channels: feedback_declaration.channels().len(),
+                reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
+                initial_credential: &initial_credential,
+                credential_storage: attempt_storage.clone(),
+            },
+        );
 
         let mut write_completion = if intent == DistributedQueryIntent::Write {
             let writers = round
@@ -1710,7 +1735,7 @@ impl FrontendDistributedQueryCoordinator {
         });
 
         let mut final_task_info = FinalTaskInfoCollector::new(
-            &result_transport,
+            result_transport.as_ref(),
             intent == DistributedQueryIntent::Profile,
         );
         // The task protocol's analogue of the two lifecycle gates: every query
@@ -1899,6 +1924,17 @@ impl FrontendDistributedQueryCoordinator {
                 wake.wait(TASK_ROUND_IDLE_WAIT);
             }
         };
+        // Nothing rotates or prunes for a query whose answer is already
+        // decided, success or failure. Both loops are stopped before the
+        // outcome is propagated: the drain below keeps turning, and a rotation
+        // started there would be judged against a hard deadline for material
+        // no task still reads -- which would turn a linearized completion into
+        // a failure. Closing the feedback state also wakes any split source
+        // still inside its initial wait.
+        if let Some(rotation) = &credential_rotation {
+            rotation.wipe();
+        }
+        feedback_state.close();
         outcome?;
 
         // The client-visible completion is linearized. Draining closes this

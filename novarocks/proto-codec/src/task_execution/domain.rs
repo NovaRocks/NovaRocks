@@ -598,6 +598,20 @@ pub fn wire_split_assignment(
     Arc::new(WireContent::new(SPLIT_DOMAIN_TAG, assignment))
 }
 
+/// Wraps one runtime filter envelope as the codec-owned payload a task's
+/// dynamic filter domain carries.
+///
+/// The same tag serves both directions of that domain: a frontend push decodes
+/// through [`decode_task_domain`], and a backend that advertised a domain
+/// retains this so [`encode_task_dynamic_filter_domain`] can project it back
+/// onto a fetch response. Keeping the tag private is what stops a producer from
+/// retaining content under a tag that would decode as another domain.
+pub fn wire_task_dynamic_filter(
+    envelope: novarocks_proto_models::filter::RuntimeFilterEnvelope,
+) -> Arc<dyn CodecOwnedContent> {
+    Arc::new(WireContent::new(TASK_FILTER_DOMAIN_TAG, envelope))
+}
+
 /// Encodes one task-scoped domain change the owner holds neutrally.
 ///
 /// The neutral update carries its payload behind a fingerprint, so this

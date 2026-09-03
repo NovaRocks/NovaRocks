@@ -511,6 +511,16 @@ impl AttemptEstablishFacts {
     }
 }
 
+impl AttemptEstablishFacts {
+    /// The credential domain every context of this attempt installs.
+    ///
+    /// The rotation owner adopts exactly this, so an install and its first
+    /// rotation are provably the same domain at the same starting epoch.
+    pub fn credential(&self) -> &CredentialUpdate {
+        &self.credential
+    }
+}
+
 impl ContextEstablishSource for AttemptEstablishFacts {
     fn facts_for(
         &self,

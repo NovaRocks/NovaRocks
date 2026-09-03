@@ -63,6 +63,7 @@ use novarocks_execution::task_execution::{
     CredentialUpdate, MonotonicInstant, QueryContextDomainUpdate, QueryContextRef, TaskOperationId,
     UpdateQueryContext,
 };
+use novarocks_types::QueryExecutionId;
 
 use super::error::TaskExecutionError;
 
@@ -100,11 +101,22 @@ impl RefreshTiming {
 
 /// Derives one rotation's timing from the remaining lifetime.
 ///
-/// The jitter is derived from the lease identity rather than from a random
-/// source, so two attempts holding leases that expire together still spread
-/// their rotations, and a replay of the same decision reaches the same
-/// conclusion. The identity is not secret; the material never enters this.
-pub fn refresh_timing(lease_id: CredentialLeaseId, remaining: Duration) -> RefreshTiming {
+/// The jitter is derived from identity rather than from a random source, so a
+/// replay of the same decision reaches the same conclusion. Both halves of
+/// that identity are required because each spreads a different collision:
+/// the lease id spreads two leases of one attempt that expire together, and
+/// the attempt id spreads the far more common case -- many concurrent queries
+/// rotating the *same* credential, which would otherwise hit the provider in
+/// lockstep and be rate-limited into failing every one of them. A caller that
+/// passed only the domain token would get no spread at all, because that token
+/// is the same constant for every attempt.
+///
+/// Neither identity is secret; the material never enters this.
+pub fn refresh_timing(
+    execution_id: QueryExecutionId,
+    lease_id: CredentialLeaseId,
+    remaining: Duration,
+) -> RefreshTiming {
     let soft_margin = (remaining / 5).clamp(SOFT_MARGIN_MIN, SOFT_MARGIN_MAX);
     let hard_margin = (remaining / 20).clamp(HARD_MARGIN_MIN, HARD_MARGIN_MAX);
     let max_jitter = (remaining / 20).min(JITTER_MAX);
@@ -112,6 +124,9 @@ pub fn refresh_timing(lease_id: CredentialLeaseId, remaining: Duration) -> Refre
         .get()
         .to_be_bytes()
         .iter()
+        .chain(execution_id.query_id().high().to_be_bytes().iter())
+        .chain(execution_id.query_id().low().to_be_bytes().iter())
+        .chain(execution_id.attempt_id().get().to_be_bytes().iter())
         .fold(0_u64, |seed, byte| seed.rotate_left(5) ^ u64::from(*byte));
     let jitter = if max_jitter.is_zero() {
         Duration::ZERO
@@ -627,7 +642,11 @@ mod tests {
         // A one-hour credential rotates well before expiry but not absurdly
         // early, and the hard margin is capped so a long lease does not
         // reserve minutes it cannot use.
-        let hour = refresh_timing(CredentialLeaseId::new(1), Duration::from_secs(3600));
+        let hour = refresh_timing(
+            execution(),
+            CredentialLeaseId::new(1),
+            Duration::from_secs(3600),
+        );
         assert!(hour.soft_delay() < hour.hard_delay());
         assert_eq!(
             Duration::from_secs(3600) - hour.hard_delay(),
@@ -639,7 +658,11 @@ mod tests {
         // soft margin is raised to the five-second floor, so rotation starts at
         // the halfway point rather than immediately: raising the margin moves
         // the delay earlier, it does not erase it.
-        let short = refresh_timing(CredentialLeaseId::new(1), Duration::from_secs(10));
+        let short = refresh_timing(
+            execution(),
+            CredentialLeaseId::new(1),
+            Duration::from_secs(10),
+        );
         assert!(
             short.soft_delay() <= Duration::from_secs(5)
                 && short.soft_delay() > Duration::from_secs(4),
@@ -652,7 +675,11 @@ mod tests {
         // Only a lease shorter than the floor itself rotates immediately. This
         // is the branch that matters for a credential whose remaining lifetime
         // is already inside the margin we reserve to fail in.
-        let expiring = refresh_timing(CredentialLeaseId::new(1), Duration::from_secs(4));
+        let expiring = refresh_timing(
+            execution(),
+            CredentialLeaseId::new(1),
+            Duration::from_secs(4),
+        );
         assert_eq!(
             expiring.soft_delay(),
             Duration::ZERO,
@@ -660,15 +687,47 @@ mod tests {
         );
         assert_eq!(expiring.hard_delay(), Duration::from_secs(3));
 
-        // The jitter is derived from the identity, so two leases expiring
-        // together do not rotate in the same instant, and the same identity
-        // always reaches the same decision.
-        let first = refresh_timing(CredentialLeaseId::new(1), Duration::from_secs(3600));
-        let second = refresh_timing(CredentialLeaseId::new(2), Duration::from_secs(3600));
+        // The jitter is derived from identity, so two leases expiring together
+        // do not rotate in the same instant, and the same identity always
+        // reaches the same decision.
+        let first = refresh_timing(
+            execution(),
+            CredentialLeaseId::new(1),
+            Duration::from_secs(3600),
+        );
+        let second = refresh_timing(
+            execution(),
+            CredentialLeaseId::new(2),
+            Duration::from_secs(3600),
+        );
         assert_ne!(first.soft_delay(), second.soft_delay());
         assert_eq!(
             first,
-            refresh_timing(CredentialLeaseId::new(1), Duration::from_secs(3600))
+            refresh_timing(
+                execution(),
+                CredentialLeaseId::new(1),
+                Duration::from_secs(3600)
+            )
+        );
+
+        // And the case that actually matters in production: many concurrent
+        // queries rotating the SAME credential. The domain token is the same
+        // constant for every attempt, so seeding from it alone would send every
+        // query to the provider in the same instant -- rate-limited into
+        // failing all of them at once. Two attempts must therefore differ even
+        // when their lease id does not.
+        let other_attempt =
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(2).expect("nonzero"))
+                .expect("legal execution");
+        assert_ne!(
+            first.soft_delay(),
+            refresh_timing(
+                other_attempt,
+                CredentialLeaseId::new(1),
+                Duration::from_secs(3600)
+            )
+            .soft_delay(),
+            "one credential rotated by two attempts must not rotate in lockstep"
         );
     }
 }

@@ -1361,6 +1361,17 @@ static TASK_LEASE_RENEWALS: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("register novarocks_task_lease_renewal_total")
 });
 
+static TASK_ATTEMPT_PUMPS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_task_attempt_pump_installed_total",
+            "Per-attempt owners handed to a task runner, by owner.",
+        ),
+        &["pump"],
+    )
+    .expect("register novarocks_task_attempt_pump_installed_total")
+});
+
 /// Registers every task transport collector.
 ///
 /// The frontend management host owns the role-local registry; this is the one
@@ -1375,12 +1386,29 @@ pub(crate) fn register_metric_collectors(registry: &Registry) -> Result<(), Stri
         Box::new(TASK_STATUS_SUBSCRIPTION_STATE.clone()),
         Box::new(TASK_STATUS_RESUBSCRIPTIONS.clone()),
         Box::new(TASK_LEASE_RENEWALS.clone()),
+        Box::new(TASK_ATTEMPT_PUMPS.clone()),
     ] {
         registry
             .register(collector)
             .map_err(|error| format!("register task transport metrics failed: {error}"))?;
     }
     Ok(())
+}
+
+/// Records that one attempt-local owner was handed to a task runner.
+///
+/// This is the supply observable of the per-turn owners. It counts installs,
+/// not constructions: an owner that is built and then dropped -- which is
+/// exactly how the dynamic filter and credential loops were lost -- never
+/// reaches this.
+pub(crate) fn observe_attempt_pump_installed(pump: &'static str) {
+    TASK_ATTEMPT_PUMPS.with_label_values(&[pump]).inc();
+}
+
+/// The installs recorded for one owner so far.
+#[cfg(test)]
+pub(crate) fn installed_attempt_pumps(pump: &str) -> u64 {
+    TASK_ATTEMPT_PUMPS.with_label_values(&[pump]).get()
 }
 
 /// Publishes one dispatch lane's depth.

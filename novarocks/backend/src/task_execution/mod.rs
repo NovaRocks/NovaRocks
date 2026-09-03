@@ -46,6 +46,7 @@ mod credential_slot;
 mod domains;
 mod entry;
 mod execution_host;
+mod feedback;
 mod host;
 pub(crate) mod ingress;
 mod observation;

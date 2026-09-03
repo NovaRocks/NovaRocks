@@ -960,6 +960,22 @@ pub fn decode_operation_outcome(
     decode_outcome(value, path)
 }
 
+/// Encodes a dynamic filter read request.
+///
+/// `acknowledged` is the reader's own cursor, and version zero is its "nothing
+/// acknowledged yet" -- a published `DomainVersion` is nonzero, so the two
+/// cannot collide.
+pub fn encode_fetch_dynamic_filters(
+    request: FetchTaskDynamicFilters,
+) -> novarocks::FetchTaskDynamicFiltersRequest {
+    novarocks::FetchTaskDynamicFiltersRequest {
+        identity: Some(crate::task_execution::identity::encode_task_identity(
+            request.identity(),
+        )),
+        acknowledged_version: request.acknowledged_version().map_or(0, DomainVersion::get),
+    }
+}
+
 /// Encodes a final info read request.
 pub fn encode_get_final_task_info(identity: TaskIdentity) -> novarocks::GetFinalTaskInfoRequest {
     novarocks::GetFinalTaskInfoRequest {

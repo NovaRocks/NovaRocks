@@ -127,6 +127,21 @@ pub trait TaskQueryContextFacts: Send + Sync {
         fragment_instance_id: UniqueId,
     ) -> Arc<dyn FragmentEventSink>;
 
+    /// Offers this task as the query context's dynamic filter carrier.
+    ///
+    /// The filter participant is the query context's, but a status version and
+    /// a retained payload are a task's, so one task has to carry the context's
+    /// terminal feedback to the frontend. The first submitted task of a context
+    /// that installed a participant takes the role and keeps it; later ones are
+    /// told `false`. A query with no filter participant on this backend also
+    /// answers `false`, which is the ordinary case and not a failure.
+    fn bind_runtime_filter_feedback(
+        &self,
+        execution: QueryExecutionId,
+        carrier: TaskIdentity,
+        reporter: &TaskStatusReporter,
+    ) -> bool;
+
     /// Delivers one task-scoped dynamic filter the frontend pushed down.
     fn deliver_task_dynamic_filter(
         &self,
@@ -841,6 +856,17 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // The metrics owner can only report onto a task that has a reporter,
         // and this is the first moment one exists.
         runtime.operator_statistics.bind(reporter.clone());
+        // Same reason for the filter feedback carrier: the domain a channel
+        // reduces is advertised through a task's status, and a task has a
+        // status owner only once it is being submitted. Before the worker
+        // starts, because a producer can close its channel almost immediately
+        // after the drivers begin.
+        if self
+            .context_facts
+            .bind_runtime_filter_feedback(execution, identity, &reporter)
+        {
+            debug!("task {identity} carries its query context's dynamic filter feedback");
+        }
 
         let task = Arc::new(NativeRunnableTask::new(identity, kernel_key));
         let worker = Arc::clone(&task);
@@ -1453,6 +1479,12 @@ mod tests {
     struct StubContextFacts {
         filter_sessions_requested: AtomicUsize,
         dynamic_filters_delivered: AtomicUsize,
+        /// Every task this host offered as the context's feedback carrier.
+        ///
+        /// It is the supply observable of the backend half of the dynamic
+        /// filter loop: it records the offer, so a submission path that stopped
+        /// making one is visible from here.
+        feedback_carriers: Mutex<Vec<TaskIdentity>>,
     }
 
     impl TaskQueryContextFacts for StubContextFacts {
@@ -1473,6 +1505,21 @@ mod tests {
             _fragment_instance_id: UniqueId,
         ) -> Arc<dyn FragmentEventSink> {
             Arc::new(NoopFragmentEventSink)
+        }
+
+        fn bind_runtime_filter_feedback(
+            &self,
+            _execution: QueryExecutionId,
+            carrier: TaskIdentity,
+            _reporter: &TaskStatusReporter,
+        ) -> bool {
+            self.feedback_carriers
+                .lock()
+                .expect("stub feedback carriers")
+                .push(carrier);
+            // No participant is installed in this stub, so the offer is
+            // recorded and declined exactly as the real host would decline it.
+            false
         }
 
         fn deliver_task_dynamic_filter(
@@ -2205,6 +2252,44 @@ mod tests {
         // Standing a finished task down must be inert rather than a panic on
         // an already-consumed handle.
         runnable.abort(AbortCause::QueryFailed);
+
+        host.remove_inbound_capability(&descriptor);
+        host.remove_receiver(&descriptor);
+    }
+
+    #[test]
+    fn submitting_a_task_offers_it_as_the_context_dynamic_filter_carrier() {
+        // The defect this catches: the dynamic filter feedback sink was fully
+        // built and fully unit-tested, and nothing in the submission path ever
+        // installed it. A reduced filter domain then reached no frontend, every
+        // channel stayed pending, and each connector split source waited out
+        // its own cap and enumerated unpruned -- with identical rows, so no
+        // result assertion anywhere could see it.
+        //
+        // The offer is what this asserts, because the offer is the supply.
+        // Whether a query has a participant to accept it is the context host's
+        // question, and that is asserted where the context host lives.
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let task = identity(26, 1, 1);
+        let descriptor = consistent_descriptor(task, UniqueId::new(211, 212));
+        let (owner, reporter) = reporter_for(task);
+
+        host.install_receiver(&descriptor).expect("prepares");
+        host.install_inbound_capability(&descriptor)
+            .expect("installs");
+        host.submit_runnable(&descriptor, reporter)
+            .expect("a prepared fragment starts");
+        assert_eq!(await_terminal(&owner), TaskState::Finished);
+
+        assert_eq!(
+            *facts
+                .feedback_carriers
+                .lock()
+                .expect("stub feedback carriers"),
+            vec![task],
+            "submitting a task must offer it as its query context's feedback carrier"
+        );
 
         host.remove_inbound_capability(&descriptor);
         host.remove_receiver(&descriptor);

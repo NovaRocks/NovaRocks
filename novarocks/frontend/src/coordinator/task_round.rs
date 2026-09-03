@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_execution::task_execution::{DispatchBudget, TransportBudget};
 use novarocks_sql::plan_read::FragmentEdge;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
@@ -35,10 +36,15 @@ use crate::native::task_transport::{
     AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskStatusSubscriber,
 };
 use crate::query_execution::artifact::ValidatedNativeSubmission;
+use crate::query_execution::lifecycle_plan::AttemptCredentialStorage;
 use crate::query_execution::schedule::SchedulingPlan;
+use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::clock::ProcessMonotonicClock;
+use crate::task_execution::credential::CredentialRefreshOwner;
+use crate::task_execution::credential_pump::CredentialRotationPump;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
+use crate::task_execution::feedback_pump::{DynamicFilterFeedbackPump, TaskDynamicFilterReads};
 use crate::task_execution::graph::{TaskGraphInputs, build_task_graph};
 use crate::task_execution::intent::TaskOperationSink;
 use crate::task_execution::round::{AcknowledgementObserver, StatusSubscriptions, TaskRound};
@@ -71,6 +77,67 @@ pub(crate) struct AttemptTransport {
 pub(crate) struct AssembledRound {
     pub(crate) round: TaskRound,
     pub(crate) split_delivery: Arc<SplitDeliveryBridge>,
+}
+
+/// Everything the two per-attempt feedback loops are built from.
+///
+/// It is one struct rather than seven parameters so the one call site cannot
+/// silently drop a fact by reordering: every field here is a loop's only
+/// source, and a loop with a missing source is a loop that never runs.
+pub(crate) struct AttemptPumps<'a> {
+    pub(crate) execution_id: QueryExecutionId,
+    pub(crate) feedback_state: Arc<RuntimeFilterFeedbackState>,
+    /// How many feedback channels the sealed filter deployment declared.
+    pub(crate) declared_feedback_channels: usize,
+    pub(crate) reads: Arc<dyn TaskDynamicFilterReads>,
+    /// The credential domain every establish of this attempt installs.
+    pub(crate) initial_credential: &'a CredentialUpdate,
+    /// This attempt's own credential table, absent when it vended none.
+    pub(crate) credential_storage: Option<Arc<AttemptCredentialStorage>>,
+}
+
+/// Installs one attempt's per-turn owners and declares the set complete.
+///
+/// This is the whole supply of both feedback loops, in one place with one
+/// caller. It returns the credential owner because the caller has to stop it
+/// once the query has answered: a rotation started during the drain would be
+/// judged against a hard deadline for material no task still reads.
+pub(crate) fn install_attempt_pumps(
+    round: &mut TaskRound,
+    pumps: AttemptPumps<'_>,
+) -> Option<Arc<CredentialRotationPump>> {
+    // The dynamic filter reader closes the loop the connector split sources
+    // are already waiting on. Without it every channel stays pending, each
+    // source waits out its own initial cap and then enumerates unpruned --
+    // which changes pruning and latency but no rows, so no result assertion
+    // anywhere can see its absence.
+    if let Some(pump) = DynamicFilterFeedbackPump::new(
+        pumps.feedback_state,
+        pumps.reads,
+        pumps.declared_feedback_channels,
+    ) {
+        round.add_pump(Box::new(pump));
+    }
+    // The credential rotation owner. Without it a query that outlives its
+    // vended credential keeps reading with material the provider has stopped
+    // honouring, and fails somewhere inside a connector instead.
+    let credential = pumps.credential_storage.and_then(|storage| {
+        CredentialRotationPump::new(
+            pumps.execution_id,
+            CredentialRefreshOwner::from_establish(
+                pumps.initial_credential,
+                round.execution().graph().contexts().copied(),
+            ),
+            storage,
+            Arc::new(ProcessMonotonicClock::new()),
+        )
+    });
+    if let Some(pump) = &credential {
+        round.add_pump(Box::new(Arc::clone(pump)));
+        round.add_observer(Arc::clone(pump) as Arc<dyn AcknowledgementObserver>);
+    }
+    round.seal_pumps();
+    credential
 }
 
 /// Builds the runner for one attempt.

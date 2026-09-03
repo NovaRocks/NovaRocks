@@ -12,6 +12,7 @@ use novarocks_spi::connector::read_stack::{
     Bound, ConnectorReadColumnHandle, ConnectorReadDynamicFilterSnapshot, ConnectorValue, Domain,
     Range, TupleDomain, ValueSet,
 };
+use novarocks_types::{BackendProcessId, QueryId};
 
 use super::install_encoder::{
     FrontendRuntimeFilterFeedbackDeclaration, FrontendRuntimeFilterFeedbackPublisherSlot,
@@ -32,7 +33,16 @@ struct ChannelState {
     publishers: BTreeMap<u32, FrontendRuntimeFilterFeedbackPublisherSlot>,
     scan_bindings: BTreeSet<(i32, u32)>,
     wait_eligible: bool,
-    unavailable: BTreeMap<u32, i32>,
+    /// Which authorized publishers reported that they will never produce a
+    /// usable domain for this channel.
+    ///
+    /// The set, not the reasons. Only its size is ever read -- a channel is
+    /// terminal once every any-of publisher has closed -- and the two carriers
+    /// cannot say the same thing about *why*: the task carrier's envelope has
+    /// one unavailable kind where the control stream had four reasons. Keeping
+    /// a reason here would mean one carrier storing a value it invented, so
+    /// the reason stays where it is produced, in the backend's own log.
+    unavailable: BTreeSet<u32>,
     winner: Option<Vec<u8>>,
 }
 
@@ -250,44 +260,129 @@ impl RuntimeFilterFeedbackState {
         if feedback_participant != *participant {
             return Ok(RuntimeFilterFeedbackAdmission::RejectedForeignParticipant);
         }
-        if feedback.as_proto().deployment_epoch != self.execution_id.attempt_id().get() {
+        let participant_process = participant
+            .backend_process_id()
+            .map_err(|error| error.to_string())?;
+        let outcome = match feedback.as_proto().terminal_outcome.as_ref() {
+            Some(TerminalOutcome::CanonicalDomain(encoded)) => {
+                TerminalFeedback::CanonicalDomain(encoded.as_slice())
+            }
+            // The reason is dropped here rather than stored: nothing reads it,
+            // and the task carrier cannot produce one. It is logged so the fact
+            // is not lost from an operator's view.
+            Some(TerminalOutcome::UnavailableReason(reason)) => {
+                tracing::debug!(
+                    channel_id = feedback.as_proto().channel_id,
+                    participant_id = feedback.as_proto().participant_id,
+                    reason,
+                    "runtime filter feedback reports an unavailable channel"
+                );
+                TerminalFeedback::Unavailable
+            }
+            None => return Err("runtime filter feedback terminal outcome is absent".into()),
+        };
+        self.admit_terminal(
+            &TerminalFeedbackFacts {
+                channel_id: feedback.as_proto().channel_id,
+                deployment_epoch: feedback.as_proto().deployment_epoch,
+                contract_digest: feedback.as_proto().contract_digest.as_slice(),
+                publisher: PublisherIdentity::Declared {
+                    participant_id: feedback.as_proto().participant_id,
+                },
+                publisher_process: participant_process,
+            },
+            outcome,
+        )
+    }
+
+    /// Admits one publisher's terminal feedback as the task carrier delivers it.
+    ///
+    /// It presents the same authorization facts as the control-stream carrier,
+    /// with one difference that is a property of the carrier rather than a
+    /// relaxation: the task path is keyed by the backend process that actually
+    /// ran the producing task. A `TaskIdentity` names that process, so the
+    /// declared publisher slot is found *by* it instead of being named on the
+    /// wire and then checked against it. There is no way to claim another
+    /// process's slot, because the claim never travels.
+    pub(crate) fn admit_task_feedback(
+        &self,
+        feedback: &TaskRuntimeFilterFeedback,
+        publisher_process: BackendProcessId,
+    ) -> Result<RuntimeFilterFeedbackAdmission, String> {
+        if feedback.query_id != self.execution_id.query_id() {
+            return Ok(RuntimeFilterFeedbackAdmission::IgnoredRetiredAttempt);
+        }
+        self.admit_terminal(
+            &TerminalFeedbackFacts {
+                channel_id: feedback.channel_id,
+                deployment_epoch: feedback.deployment_epoch,
+                contract_digest: &feedback.contract_digest,
+                publisher: PublisherIdentity::ByProcess,
+                publisher_process,
+            },
+            match &feedback.outcome {
+                TaskFeedbackOutcome::CanonicalDomain(encoded) => {
+                    TerminalFeedback::CanonicalDomain(encoded.as_slice())
+                }
+                TaskFeedbackOutcome::Unavailable => TerminalFeedback::Unavailable,
+            },
+        )
+    }
+
+    /// The one admission core both carriers reach.
+    fn admit_terminal(
+        &self,
+        facts: &TerminalFeedbackFacts<'_>,
+        outcome: TerminalFeedback<'_>,
+    ) -> Result<RuntimeFilterFeedbackAdmission, String> {
+        if facts.deployment_epoch != self.execution_id.attempt_id().get() {
             return Err(
                 "runtime filter feedback deployment epoch differs from active attempt".into(),
             );
         }
-        let participant_process = participant
-            .backend_process_id()
-            .map_err(|error| error.to_string())?;
         let mut state = self.state.0.lock().expect("runtime filter feedback state");
         if state.closed {
             return Ok(RuntimeFilterFeedbackAdmission::Applied);
         }
         let channel = state
             .channels
-            .get_mut(&feedback.as_proto().channel_id)
+            .get_mut(&facts.channel_id)
             .ok_or("runtime filter feedback channel is not declared for this attempt")?;
-        if feedback.as_proto().contract_digest.as_slice() != channel.contract_digest {
+        if facts.contract_digest != channel.contract_digest {
             return Err("runtime filter feedback contract digest differs from declaration".into());
         }
-        let slot = channel
-            .publishers
-            .get(&feedback.as_proto().participant_id)
-            .ok_or("runtime filter feedback publisher is not authorized")?;
-        if slot.backend_process_id != participant_process {
-            return Err(
-                "runtime filter feedback publisher process differs from declaration".into(),
-            );
-        }
-        match feedback.as_proto().terminal_outcome.as_ref() {
-            Some(TerminalOutcome::CanonicalDomain(encoded)) => {
+        let participant_id = match facts.publisher {
+            PublisherIdentity::Declared { participant_id } => {
+                let slot = channel
+                    .publishers
+                    .get(&participant_id)
+                    .ok_or("runtime filter feedback publisher is not authorized")?;
+                if slot.backend_process_id != facts.publisher_process {
+                    return Err(
+                        "runtime filter feedback publisher process differs from declaration".into(),
+                    );
+                }
+                participant_id
+            }
+            PublisherIdentity::ByProcess => {
+                channel
+                    .publishers
+                    .values()
+                    .find(|slot| slot.backend_process_id == facts.publisher_process)
+                    .ok_or("runtime filter feedback publisher is not authorized")?
+                    .participant_id
+            }
+        };
+        match outcome {
+            TerminalFeedback::CanonicalDomain(encoded) => {
                 RuntimeFilterFeedbackDomain::decode(
-                    encoded.as_slice(),
+                    encoded,
                     &channel.data_type,
                     channel.max_encoded_domain_bytes,
                 )
                 .map_err(|error| error.to_string())?;
                 match &channel.winner {
-                    Some(existing) if existing == encoded => {
+                    Some(existing) if existing.as_slice() == encoded => {
                         Ok(RuntimeFilterFeedbackAdmission::Applied)
                     }
                     Some(_) => Err(
@@ -295,25 +390,131 @@ impl RuntimeFilterFeedbackState {
                             .into(),
                     ),
                     None => {
-                        channel.winner = Some(encoded.clone());
+                        channel.winner = Some(encoded.to_vec());
                         state.generation = state.generation.saturating_add(1);
                         self.state.1.notify_all();
                         Ok(RuntimeFilterFeedbackAdmission::Applied)
                     }
                 }
             }
-            Some(TerminalOutcome::UnavailableReason(reason)) => {
+            TerminalFeedback::Unavailable => {
                 if channel.winner.is_none() {
-                    channel
-                        .unavailable
-                        .insert(feedback.as_proto().participant_id, *reason);
+                    channel.unavailable.insert(participant_id);
                     state.generation = state.generation.saturating_add(1);
                     self.state.1.notify_all();
                 }
                 Ok(RuntimeFilterFeedbackAdmission::Applied)
             }
-            None => Err("runtime filter feedback terminal outcome is absent".into()),
         }
+    }
+}
+
+/// How one carrier names the publisher of a terminal feedback.
+#[derive(Copy, Clone, Debug)]
+enum PublisherIdentity {
+    /// The carrier names a participant slot, which is then checked against the
+    /// process the carrier authenticated.
+    Declared { participant_id: u32 },
+    /// The carrier names no slot; the authenticated process selects its own.
+    ByProcess,
+}
+
+/// The fences one terminal feedback must clear, independent of its carrier.
+struct TerminalFeedbackFacts<'a> {
+    channel_id: u32,
+    deployment_epoch: u64,
+    contract_digest: &'a [u8],
+    publisher: PublisherIdentity,
+    publisher_process: BackendProcessId,
+}
+
+/// What one publisher says is final for one channel.
+enum TerminalFeedback<'a> {
+    CanonicalDomain(&'a [u8]),
+    Unavailable,
+}
+
+/// What one publisher reported for one channel, as the task carrier delivers it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TaskFeedbackOutcome {
+    CanonicalDomain(Vec<u8>),
+    /// This publisher will never produce a usable domain for this channel.
+    Unavailable,
+}
+
+/// One channel's terminal feedback, recovered from a task's dynamic filter
+/// domain.
+///
+/// This is the read side of what a backend advertises through its task status
+/// and retains for a `FetchTaskDynamicFilters`. It is parsed here, beside the
+/// admission that consumes it, so the wire shape has exactly one reader.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaskRuntimeFilterFeedback {
+    query_id: QueryId,
+    channel_id: u32,
+    deployment_epoch: u64,
+    contract_digest: [u8; 32],
+    outcome: TaskFeedbackOutcome,
+}
+
+impl TaskRuntimeFilterFeedback {
+    /// Recovers one channel's feedback from the envelope a task advertised.
+    ///
+    /// Every field is required. A kind this carrier does not use, a digest of
+    /// the wrong width, or a canonical domain with no payload is refused rather
+    /// than read as an empty or default statement: an unusable envelope is a
+    /// disagreement about the carrier, not a channel that reported nothing.
+    pub(crate) fn parse(
+        envelope: &novarocks_proto_models::filter::RuntimeFilterEnvelope,
+    ) -> Result<Self, String> {
+        use novarocks_proto_models::filter::RuntimeFilterEnvelopeKind;
+
+        let kind = RuntimeFilterEnvelopeKind::try_from(envelope.kind).map_err(|_| {
+            format!(
+                "task runtime filter feedback kind {} is unknown",
+                envelope.kind
+            )
+        })?;
+        let outcome = match kind {
+            RuntimeFilterEnvelopeKind::DegradedLogical => {
+                if envelope.payload.is_empty() {
+                    return Err(
+                        "task runtime filter feedback claims a canonical domain but carries no \
+                         payload"
+                            .into(),
+                    );
+                }
+                TaskFeedbackOutcome::CanonicalDomain(envelope.payload.clone())
+            }
+            RuntimeFilterEnvelopeKind::Unavailable => TaskFeedbackOutcome::Unavailable,
+            other => {
+                return Err(format!(
+                    "task runtime filter feedback carries envelope kind {other:?}, which is not a \
+                     terminal logical outcome"
+                ));
+            }
+        };
+        let query_id = envelope
+            .query_id
+            .as_ref()
+            .map(|id| QueryId::new(id.hi, id.lo))
+            .ok_or("task runtime filter feedback carries no query id")?;
+        let contract_digest: [u8; 32] = envelope
+            .schema_digest
+            .as_slice()
+            .try_into()
+            .map_err(|_| "task runtime filter feedback contract digest is not 32 bytes")?;
+        Ok(Self {
+            query_id,
+            channel_id: envelope.channel_id,
+            deployment_epoch: envelope.deployment_epoch,
+            contract_digest,
+            outcome,
+        })
+    }
+
+    pub(crate) const fn channel_id(&self) -> u32 {
+        self.channel_id
     }
 }
 
@@ -356,7 +557,7 @@ fn channel_states(
                     channel.wait_eligibility(),
                     FrontendRuntimeFilterFeedbackWaitEligibility::Eligible
                 ),
-                unavailable: BTreeMap::new(),
+                unavailable: BTreeSet::new(),
                 winner: None,
             },
         );
@@ -780,6 +981,153 @@ mod tests {
         let state = state.state.0.lock().expect("feedback state");
         assert!(state.closed);
         assert!(state.channels[&7].winner.is_none());
+    }
+
+    fn task_envelope(
+        execution_id: QueryExecutionId,
+        channel_id: u32,
+        digest: [u8; 32],
+        payload: Vec<u8>,
+    ) -> novarocks_proto_models::filter::RuntimeFilterEnvelope {
+        use novarocks_proto_models::filter;
+
+        filter::RuntimeFilterEnvelope {
+            kind: filter::RuntimeFilterEnvelopeKind::DegradedLogical as i32,
+            query_id: Some(novarocks_proto_models::common::UniqueId {
+                hi: execution_id.query_id().high(),
+                lo: execution_id.query_id().low(),
+            }),
+            channel_id,
+            deployment_epoch: execution_id.attempt_id().get(),
+            route_identity: None,
+            schema_digest: digest.to_vec(),
+            payload,
+            producer_open: None,
+        }
+    }
+
+    #[test]
+    fn the_task_carrier_is_authorized_by_the_process_that_ran_the_producing_task() {
+        // The task carrier names no participant slot on the wire, so the slot
+        // is found *by* the backend process the task identity already fences.
+        // That is the same authorization fact the control stream presented; it
+        // just cannot be claimed, because the claim never travels. A process
+        // that declares no publisher for the channel is refused.
+        let execution_id = execution_id();
+        let process = BackendProcessId::new_v7();
+        let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
+            .expect("feedback state");
+        let domain = exact(41);
+        let feedback = TaskRuntimeFilterFeedback::parse(&task_envelope(
+            execution_id,
+            7,
+            [9; 32],
+            domain.clone(),
+        ))
+        .expect("a legal envelope");
+
+        let stranger = state
+            .admit_task_feedback(&feedback, BackendProcessId::new_v7())
+            .expect_err("an undeclared process is not a publisher of this channel");
+        assert!(
+            stranger.contains("publisher is not authorized"),
+            "{stranger}"
+        );
+        assert!(
+            state.state.0.lock().expect("state").channels[&7]
+                .winner
+                .is_none()
+        );
+
+        assert_eq!(
+            state
+                .admit_task_feedback(&feedback, process)
+                .expect("the declared publisher is admitted"),
+            RuntimeFilterFeedbackAdmission::Applied
+        );
+        assert_eq!(
+            state.state.0.lock().expect("state").channels[&7]
+                .winner
+                .as_deref(),
+            Some(domain.as_slice())
+        );
+
+        // The same fences the control-stream carrier applies still apply: a
+        // digest that is not the declared contract's, and an attempt that is
+        // not the active one.
+        let wrong_digest =
+            TaskRuntimeFilterFeedback::parse(&task_envelope(execution_id, 7, [1; 32], exact(41)))
+                .expect("a legal envelope");
+        let refused = state
+            .admit_task_feedback(&wrong_digest, process)
+            .expect_err("a foreign contract digest is refused");
+        assert!(refused.contains("contract digest differs"), "{refused}");
+
+        let retired = QueryExecutionId::new(
+            QueryId::new(99, 99),
+            AttemptId::new(3).expect("valid attempt"),
+        )
+        .expect("valid execution id");
+        let foreign_query =
+            TaskRuntimeFilterFeedback::parse(&task_envelope(retired, 7, [9; 32], exact(41)))
+                .expect("a legal envelope");
+        assert_eq!(
+            state
+                .admit_task_feedback(&foreign_query, process)
+                .expect("a retired attempt is ignored, not an error"),
+            RuntimeFilterFeedbackAdmission::IgnoredRetiredAttempt
+        );
+    }
+
+    #[test]
+    fn an_unavailable_task_envelope_closes_the_channel_without_a_domain() {
+        use novarocks_proto_models::filter;
+
+        // The carrier has one unavailable kind where the control stream had
+        // four reasons. Nothing reads the reason, so the fact that survives is
+        // the one that matters: this publisher will never produce a usable
+        // domain, which makes an any-of channel terminal.
+        let execution_id = execution_id();
+        let process = BackendProcessId::new_v7();
+        let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
+            .expect("feedback state");
+        let mut envelope = task_envelope(execution_id, 7, [9; 32], Vec::new());
+        envelope.kind = filter::RuntimeFilterEnvelopeKind::Unavailable as i32;
+        let feedback = TaskRuntimeFilterFeedback::parse(&envelope).expect("a legal envelope");
+
+        assert!(!state.state.0.lock().expect("state").channels[&7].is_terminal());
+        state
+            .admit_task_feedback(&feedback, process)
+            .expect("an unavailable channel is admitted");
+        let locked = state.state.0.lock().expect("state");
+        assert!(locked.channels[&7].winner.is_none());
+        assert!(locked.channels[&7].is_terminal());
+    }
+
+    #[test]
+    fn a_task_envelope_this_carrier_cannot_mean_is_refused_rather_than_read_as_empty() {
+        use novarocks_proto_models::filter;
+
+        // Every field is required. An artifact envelope, a canonical domain
+        // with no payload, or a digest of the wrong width is a disagreement
+        // about the carrier, not a channel that reported nothing.
+        let execution_id = execution_id();
+        let mut artifact = task_envelope(execution_id, 7, [9; 32], vec![1]);
+        artifact.kind = filter::RuntimeFilterEnvelopeKind::Artifact as i32;
+        assert!(TaskRuntimeFilterFeedback::parse(&artifact).is_err());
+
+        let empty_domain = task_envelope(execution_id, 7, [9; 32], Vec::new());
+        let error = TaskRuntimeFilterFeedback::parse(&empty_domain)
+            .expect_err("a canonical domain with no payload says nothing");
+        assert!(error.contains("carries no payload"), "{error}");
+
+        let mut short_digest = task_envelope(execution_id, 7, [9; 32], vec![1]);
+        short_digest.schema_digest = vec![9; 16];
+        assert!(TaskRuntimeFilterFeedback::parse(&short_digest).is_err());
+
+        let mut no_query = task_envelope(execution_id, 7, [9; 32], vec![1]);
+        no_query.query_id = None;
+        assert!(TaskRuntimeFilterFeedback::parse(&no_query).is_err());
     }
 
     #[test]
