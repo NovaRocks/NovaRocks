@@ -594,6 +594,13 @@ impl Harness {
         self.publish_with_filters(task_id, state, termination, output_complete, None);
     }
 
+    /// Advances this task's status version counter without publishing, the way
+    /// a subscription's catch-up leaves a gap: it replays only the latest
+    /// version per cursor, so every version in between is never delivered.
+    fn skip_status_versions(&mut self, task_id: TaskId, count: u64) {
+        *self.statuses.entry(task_id).or_insert(1) += count;
+    }
+
     /// Publishes one status snapshot, optionally advertising a filter version.
     fn publish_with_filters(
         &mut self,
@@ -2167,6 +2174,83 @@ fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
     assert!(
         probe.tasks_created(),
         "every task answered its create, so the attempt finished starting"
+    );
+}
+
+#[test]
+fn a_status_several_versions_ahead_is_adopted_rather_than_called_an_illegal_jump() {
+    // A subscription's catch-up replays only the latest version per cursor, so
+    // an observation loss and its resubscription hand this owner a version
+    // several ahead of the one it holds. The states in between existed and
+    // were passed through; they were simply not seen.
+    //
+    // Judging that jump by the adjacent-transition table refuses it, and the
+    // refusal fails the whole query -- so a dropped status stream, which is a
+    // recoverable observation problem by construction, became a lost query.
+    // Measured with the task-status-subscription-drop fault: "task execution
+    // did not advance: task state PLANNED may not become FINISHED".
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let mut harness = Harness::from_graph(graph);
+    let leaf = harness.stage_tasks(1)[0];
+    let identity = harness.identity(leaf);
+
+    let status_at = |version: u64, state: TaskState| {
+        TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(version).expect("a nonzero version"),
+            state,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("a legal status snapshot")
+    };
+    let publish = |harness: &Harness, status| {
+        harness
+            .execution
+            .intake()
+            .handle()
+            .publish(StatusEvent::Published(status));
+    };
+
+    // Held at PLANNED first, so there is something for the jump to be judged
+    // against: with no held status the transition table is never consulted and
+    // this case would pass either way.
+    publish(&harness, status_at(1, TaskState::Planned));
+    let held = harness
+        .execution
+        .apply_status(8)
+        .expect("the first snapshot is adopted");
+    assert_eq!(held.accepted, 1);
+    assert_eq!(
+        harness
+            .execution
+            .task(leaf)
+            .expect("the leaf is owned")
+            .task_state(),
+        TaskState::Planned
+    );
+
+    // Version five, not two: every version between was published while nothing
+    // was listening. PLANNED to FINISHED is illegal between neighbours and
+    // unremarkable across a gap.
+    publish(&harness, status_at(5, TaskState::Finished));
+    let report = harness
+        .execution
+        .apply_status(8)
+        .expect("a version several ahead is a gap, not an illegal transition");
+    assert_eq!(
+        report.accepted, 1,
+        "the skipped-ahead status was accepted, not refused"
+    );
+    assert_eq!(
+        harness
+            .execution
+            .task(leaf)
+            .expect("the leaf is owned")
+            .task_state(),
+        TaskState::Finished
     );
 }
 

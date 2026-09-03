@@ -515,7 +515,32 @@ impl RemoteTask {
     }
 
     fn adopt_status(&mut self, observed: &TaskStatus) -> Result<(), TaskExecutionError> {
-        if let Some(held) = &self.status
+        // Transition legality is a statement about consecutive versions, so it
+        // may only be asked of consecutive versions. A status is an immutable
+        // versioned snapshot rather than an event: a subscription's catch-up
+        // replays only the latest version per cursor, so any resubscription --
+        // which is what an observation loss produces -- can legitimately hand
+        // this owner a version several ahead of the one it holds. The states in
+        // between existed and were passed through; they were simply not seen.
+        //
+        // Judging such a jump by the adjacent-transition table refuses it:
+        // PLANNED to FINISHED is illegal between neighbours and unremarkable
+        // across a gap. That refusal failed the whole query, so a dropped
+        // status stream -- a recoverable observation problem by construction --
+        // became a lost query.
+        //
+        // What is deliberately still enforced across a gap: a terminal state
+        // never becomes anything else, which `classify_task_transition`
+        // reports as `AlreadyTerminal` rather than `Illegal`, and the terminal
+        // content agreement the final-info acceptance checks. Neither depends
+        // on adjacency.
+        let adjacent = self
+            .status
+            .as_ref()
+            .and_then(|held| held.version().next())
+            .is_some_and(|next| next == observed.version());
+        if adjacent
+            && let Some(held) = &self.status
             && matches!(
                 classify_task_transition(held.state(), observed.state()),
                 TaskTransition::Illegal
