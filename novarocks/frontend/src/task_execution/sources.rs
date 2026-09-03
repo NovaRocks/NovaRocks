@@ -23,16 +23,35 @@
 //! output so a builder never has to know which artifact a fact came from.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use novarocks_execution::task_execution::domain::{
+    CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
+};
+use novarocks_execution::task_execution::identity::QueryContextRef;
+use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_proto_codec::FieldPath;
+
+use novarocks_proto_codec::lifecycle::{
+    encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
+};
 use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
+use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
+use novarocks_proto_codec::task_execution::operation::{
+    ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG,
+};
+use novarocks_proto_models::catalog::CatalogSet;
+use novarocks_proto_models::novarocks::RuntimeFilterContribution;
+use novarocks_types::identity::BackendProcessId;
 
 use novarocks_sql::plan_read::FragmentId;
 
 use crate::query_execution::artifact::ValidatedNativeSubmission;
+use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
 use crate::query_execution::schedule::SchedulingPlan;
+use crate::task_execution::context_owner::{ContextEstablishFacts, ContextEstablishSource};
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::graph::{FragmentPlanFacts, FragmentPlanSource};
 
@@ -310,5 +329,204 @@ mod tests {
             .expect_err("a zero dop is refused")
             .to_string();
         assert!(error.contains("no positive pipeline dop"), "{error}");
+    }
+
+    #[test]
+    fn each_backend_establishes_its_own_filter_contribution() {
+        use novarocks_execution::task_execution::identity::QueryContextRef;
+        use novarocks_proto_codec::task_execution::domain::stored_message;
+        use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
+
+        use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
+        use crate::task_execution::context_owner::ContextEstablishSource;
+
+        // A filter deployment gives each backend the role bindings its own
+        // tasks play. Handing one backend another's contribution would install
+        // the wrong producer and consumer identities, and nothing downstream
+        // would notice until a filter reached the wrong place.
+        let first = BackendProcessId::new_v7();
+        let second = BackendProcessId::new_v7();
+        let facts = AttemptEstablishFacts::freeze(
+            CatalogSet::default(),
+            vec![
+                (
+                    first,
+                    RuntimeFilterContribution {
+                        participant_id: 11,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    second,
+                    RuntimeFilterContribution {
+                        participant_id: 22,
+                        ..Default::default()
+                    },
+                ),
+            ],
+            &QueryCredentialLeases::empty(),
+        )
+        .expect("a legal attempt");
+
+        let frontend = FrontendProcessId::new_v7();
+        for (backend, expected) in [(first, 11), (second, 22)] {
+            let context = QueryContextRef::new(execution_id(), frontend, backend);
+            let established = facts.facts_for(context).expect("a scheduled backend");
+            let contribution = stored_message::<RuntimeFilterContribution>(
+                established.initial_runtime_filter.as_ref(),
+            )
+            .expect("this codec produced it");
+            assert_eq!(contribution.participant_id, expected);
+        }
+
+        // A backend that hosts tasks but compiled no contribution is a
+        // disagreement between the filter compiler and the scheduler, not an
+        // empty install.
+        let stranger = QueryContextRef::new(execution_id(), frontend, BackendProcessId::new_v7());
+        assert!(facts.facts_for(stranger).is_err());
+    }
+
+    #[test]
+    fn the_credential_domain_survives_into_the_refresh_owner() {
+        use novarocks_execution::task_execution::identity::QueryContextRef;
+        use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
+
+        use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
+        use crate::task_execution::context_owner::ContextEstablishSource;
+        use crate::task_execution::credential::CredentialRefreshOwner;
+
+        // The owner adopts the establish's domain. If they disagreed, the
+        // first rotation would advance a domain nobody installed and every
+        // context would refuse it as a gap.
+        let backend = BackendProcessId::new_v7();
+        let facts = AttemptEstablishFacts::freeze(
+            CatalogSet::default(),
+            vec![(backend, RuntimeFilterContribution::default())],
+            &QueryCredentialLeases::empty(),
+        )
+        .expect("a legal attempt");
+        let context = QueryContextRef::new(execution_id(), FrontendProcessId::new_v7(), backend);
+        let established = facts.facts_for(context).expect("its own backend");
+
+        let owner = CredentialRefreshOwner::from_establish(
+            &established.initial_credential,
+            std::iter::once(context),
+        );
+        assert_eq!(owner.lease_id(), ATTEMPT_CREDENTIAL_DOMAIN);
+        assert_eq!(owner.minted_epoch(), established.initial_credential.epoch());
+
+        // And nothing about the facts renders the material.
+        assert!(!format!("{facts:?}").contains("secret"));
+    }
+}
+
+/// The credential domain every attempt installs.
+///
+/// One query context has exactly one, so the value only has to be stable and
+/// nonzero. It is the protocol's own numbering, unrelated to a vended lease's
+/// sixteen-byte storage identity.
+const ATTEMPT_CREDENTIAL_DOMAIN: CredentialLeaseId = CredentialLeaseId::new(1);
+
+/// The shared facts one attempt establishes on every backend it scheduled.
+///
+/// The catalog set and the credential table are query-wide; the runtime-filter
+/// contribution is not. A filter deployment gives each backend the role
+/// bindings its own tasks play, so handing one backend another's contribution
+/// would install the wrong producer and consumer identities. That is why this
+/// is keyed by backend and why a scheduled backend with no contribution is an
+/// error rather than an empty install.
+pub struct AttemptEstablishFacts {
+    catalog_binding: Arc<dyn CodecOwnedContent>,
+    filters: BTreeMap<BackendProcessId, Arc<dyn CodecOwnedContent>>,
+    credential: CredentialUpdate,
+}
+
+impl fmt::Debug for AttemptEstablishFacts {
+    /// Renders only the shape: this transitively holds credential material.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttemptEstablishFacts")
+            .field("backends", &self.filters.len())
+            .finish()
+    }
+}
+
+impl AttemptEstablishFacts {
+    /// Freezes one attempt's shared facts.
+    ///
+    /// The credential progression token names the lease whose rotation this
+    /// update represents; an initial install carries the whole table at its
+    /// starting epochs, so the token is the lowest lease id present. An
+    /// attempt with no vended credential carries an empty table rather than a
+    /// missing one, because the backend installs what it is given and an
+    /// absent domain would be a different statement.
+    pub fn freeze(
+        catalog_set: CatalogSet,
+        filters: impl IntoIterator<Item = (BackendProcessId, RuntimeFilterContribution)>,
+        leases: &QueryCredentialLeases,
+    ) -> Result<Self, TaskExecutionError> {
+        let mut descriptors = Vec::new();
+        let mut envelopes = Vec::new();
+        for lease in leases.leases() {
+            descriptors.push(encode_credential_lease_descriptor(lease.descriptor()));
+            envelopes.push(encode_credential_lease_secret_envelope(lease.envelope()));
+        }
+        let material = WireCredential::decode(
+            &descriptors,
+            &envelopes,
+            FieldPath::root("initial_credential"),
+        )
+        .map_err(|error| {
+            // The message is the codec's own and carries no secret; the
+            // material never reaches a rendering.
+            TaskExecutionError::Schedule(format!(
+                "credential contribution is not installable: {error}"
+            ))
+        })?;
+
+        Ok(Self {
+            catalog_binding: Arc::new(WireContent::new(ESTABLISH_CATALOG_DOMAIN_TAG, catalog_set)),
+            filters: filters
+                .into_iter()
+                .map(|(backend, contribution)| {
+                    (
+                        backend,
+                        Arc::new(WireContent::new(ESTABLISH_FILTER_DOMAIN_TAG, contribution))
+                            as Arc<dyn CodecOwnedContent>,
+                    )
+                })
+                .collect(),
+            // The protocol's lease id names the attempt's credential domain,
+            // not a storage lease: a query context has exactly one such
+            // domain, and each vended lease keeps its own sixteen-byte
+            // identity inside the table. The refresh owner adopts this value
+            // from the establish, so an install and its first rotation are
+            // provably the same domain.
+            credential: CredentialUpdate::new(
+                ATTEMPT_CREDENTIAL_DOMAIN,
+                CredentialEpoch::FIRST,
+                Arc::new(material),
+            ),
+        })
+    }
+}
+
+impl ContextEstablishSource for AttemptEstablishFacts {
+    fn facts_for(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<ContextEstablishFacts, TaskExecutionError> {
+        let backend = context.backend_process_id();
+        let initial_runtime_filter = self.filters.get(&backend).cloned().ok_or_else(|| {
+            TaskExecutionError::Schedule(format!(
+                "backend {backend} hosts tasks but this attempt compiled no runtime filter \
+                 contribution for it"
+            ))
+        })?;
+        Ok(ContextEstablishFacts {
+            catalog_binding: Arc::clone(&self.catalog_binding),
+            initial_runtime_filter,
+            initial_credential: self.credential.clone(),
+        })
     }
 }

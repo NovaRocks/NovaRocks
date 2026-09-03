@@ -56,9 +56,9 @@ use crate::task_execution::domain::{
 /// Domain separation tags for the two shared facts an establish installs.
 /// They are distinct from the tags an advance uses, because the same content
 /// arriving as an install and as a rotation is not the same operation.
-const ESTABLISH_CATALOG_DOMAIN_TAG: &[u8] =
+pub const ESTABLISH_CATALOG_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.catalog_binding.v1";
-const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
+pub const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.initial_runtime_filter.v1";
 use crate::task_execution::identity::{
     decode_query_context_ref, decode_task_operation_id, encode_query_context_ref,
