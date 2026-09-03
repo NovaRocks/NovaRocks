@@ -46,6 +46,17 @@ pub trait OperatorFactory: Send + Sync {
         false
     }
 
+    /// Whether this factory's sinks are bound by an exchange edge gate set.
+    ///
+    /// Only push exchange sinks can be, and only when a caller supplied the
+    /// gates. It exists so materialization can be shown to have supplied them:
+    /// the builder that accepts them once had no caller at all, and nothing
+    /// about a sink's behaviour made that visible until a frame was sent.
+    #[cfg(test)]
+    fn is_edge_gated(&self) -> bool {
+        false
+    }
+
     fn is_sink(&self) -> bool {
         false
     }

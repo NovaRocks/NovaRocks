@@ -1081,6 +1081,15 @@ impl DataStreamSinkFactory {
         self
     }
 
+    /// Whether this sink is bound by a gate set.
+    ///
+    /// The barrier's behavior is covered at the operator level; this exists so
+    /// materialization can be shown to have supplied the gates at all, which
+    /// is the failure it actually had.
+    pub(crate) const fn is_edge_gated(&self) -> bool {
+        self.edge_gates.is_some()
+    }
+
     /// The outbound edges a normal downstream cancellation closed, lowest id
     /// first, so a status producer can report normal downstream cancellation
     /// rather than a failure. Empty for an ungated sink.
@@ -1100,6 +1109,11 @@ impl DataStreamSinkFactory {
 }
 
 impl OperatorFactory for DataStreamSinkFactory {
+    #[cfg(test)]
+    fn is_edge_gated(&self) -> bool {
+        Self::is_edge_gated(self)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

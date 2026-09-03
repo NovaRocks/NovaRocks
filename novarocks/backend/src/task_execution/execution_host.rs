@@ -583,7 +583,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             )
             .with_fragment_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
-            .with_execution_runtime(Arc::clone(&self.execution_runtime));
+            .with_execution_runtime(Arc::clone(&self.execution_runtime))
+            // Binding the gates here is what makes the closed-edge barrier
+            // real: the sinks this fragment builds consult them before every
+            // send, so a producer cannot reach a destination that has not
+            // acknowledged its own creation.
+            .with_edge_gates(Arc::clone(&edges));
 
         // This is the receiver install. It registers every inbound exchange
         // receiver and builds the pipeline in one step, and its rollback is

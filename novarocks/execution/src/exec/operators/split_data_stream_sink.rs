@@ -23,6 +23,8 @@
 
 use std::sync::Arc;
 
+use crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates;
+
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::filter_record_batch;
 
@@ -108,9 +110,36 @@ impl SplitDataStreamSinkFactory {
             sinks: sinks_out,
         }
     }
+
+    /// Grants the inner sinks the edge gates their destinations are bound by.
+    ///
+    /// A composite sink's branches all belong to the same task, so one gate
+    /// set governs all of them; forwarding here keeps the send path's
+    /// permission check in exactly one place.
+    /// Whether every branch is bound by a gate set.
+    pub(crate) fn is_edge_gated(&self) -> bool {
+        !self.sinks.is_empty() && self.sinks.iter().all(|spec| spec.factory.is_edge_gated())
+    }
+
+    pub fn with_edge_gates(mut self, gates: Arc<ExchangeEdgeGates>) -> Self {
+        self.sinks = self
+            .sinks
+            .into_iter()
+            .map(|mut spec| {
+                spec.factory = spec.factory.with_edge_gates(Arc::clone(&gates));
+                spec
+            })
+            .collect();
+        self
+    }
 }
 
 impl OperatorFactory for SplitDataStreamSinkFactory {
+    #[cfg(test)]
+    fn is_edge_gated(&self) -> bool {
+        Self::is_edge_gated(self)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
