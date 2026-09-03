@@ -173,6 +173,15 @@ impl RemoteTask {
         self.create.identity()
     }
 
+    /// Where this task's status observation has reached.
+    ///
+    /// A resubscription replays from here rather than from nothing, so a
+    /// transport that dropped does not re-deliver every version this task ever
+    /// published.
+    pub const fn cursor(&self) -> TaskStatusCursor {
+        self.cursor
+    }
+
     pub fn context(&self) -> QueryContextRef {
         self.create.context()
     }

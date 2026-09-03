@@ -43,6 +43,7 @@ pub mod execution;
 pub mod graph;
 pub mod intent;
 pub mod remote_task;
+pub(crate) mod round;
 pub mod sources;
 mod split_domain;
 pub mod stage;

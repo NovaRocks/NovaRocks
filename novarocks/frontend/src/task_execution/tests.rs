@@ -1793,3 +1793,86 @@ fn an_accepted_create_without_its_receipt_is_refused() {
         TaskExecutionError::MissingReceipt(OperationKind::CreateTask)
     ));
 }
+
+/// The runner records which contexts it started subscriptions for.
+#[derive(Debug, Default)]
+struct RecordingSubscriptions {
+    ensured: Mutex<Vec<(QueryContextRef, usize)>>,
+}
+
+impl crate::task_execution::round::StatusSubscriptions for RecordingSubscriptions {
+    fn ensure(
+        &self,
+        context: QueryContextRef,
+        cursors: Vec<novarocks_execution::task_execution::TaskStatusCursor>,
+    ) -> Result<(), String> {
+        self.ensured
+            .lock()
+            .expect("subscription ledger")
+            .push((context, cursors.len()));
+        Ok(())
+    }
+}
+
+#[test]
+fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    // The runner owns no policy: a turn moves the state machine and reports
+    // what moved. What it does own is the order -- acknowledgements settle
+    // before the pump, so a permit freed this turn is usable this turn rather
+    // than a turn later -- and starting exactly one subscription per context.
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let contexts = graph.contexts().count();
+    let harness = Harness::from_graph(graph);
+    let wake = Arc::clone(&harness.wake);
+    let subscriptions = Arc::new(RecordingSubscriptions::default());
+
+    let mut round = TaskRound::new(
+        harness.execution,
+        TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>),
+        Box::new(FakeEstablish),
+        Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+
+    let first = round.turn().expect("a turn on a fresh attempt");
+    assert!(
+        first.operations > 0,
+        "the first turn owes an establish to every context"
+    );
+    assert!(!first.is_idle());
+
+    let ensured = subscriptions.ensured.lock().expect("ledger").len();
+    assert_eq!(
+        ensured, contexts,
+        "every context needs its one subscription"
+    );
+
+    // `ensure` is idempotent, so a second turn does not start a second
+    // subscription for a context that already has one -- but the runner still
+    // calls it, because a context that lost its transport has to be restarted
+    // by exactly this path.
+    let second = round.turn().expect("a second turn");
+    assert!(second.acknowledgements == 0, "nothing answered yet");
+    assert_eq!(
+        subscriptions.ensured.lock().expect("ledger").len(),
+        ensured + contexts
+    );
+
+    // An attempt that has only sent its establishes reports nothing finished.
+    // These are the verdicts the caller reads instead of inferring completion
+    // from the loop having run, which is how a query reports success it cannot
+    // substantiate.
+    assert!(!round.client_visible_completion());
+    assert!(!round.attempt_drained());
+    assert!(round.failure_cause().is_none());
+    assert_eq!(round.root_task(), round.execution().graph().root_identity());
+
+    // The root's stream has not started, so a packet claiming to be its second
+    // is a gap rather than something to absorb.
+    assert!(round.consume_root_result_packet(1, false).is_err());
+    let _ = round.execution_mut();
+}

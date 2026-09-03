@@ -30,8 +30,8 @@ use std::sync::Arc;
 use novarocks_execution::task_execution::{
     AbortCause, AttemptDrainFacts, DispatchBudget, GoneObservation, LatchOutcome, OperationKind,
     QueryContextRef, StageState, StatusObservation, TaskDomainUpdate, TaskIdentity,
-    TaskOperationId, TaskState, TaskStatus, TerminationDetail, TerminationLatch, TransportBudget,
-    parent_released_children,
+    TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, TerminationLatch,
+    TransportBudget, parent_released_children,
 };
 use novarocks_types::identity::{StageId, TaskId};
 
@@ -595,6 +595,19 @@ impl QueryTaskExecution {
             self.owners.values().all(QueryContextOwner::is_released),
         )
         .drained()
+    }
+
+    /// Where every task of one context has been observed to.
+    ///
+    /// This is what a subscription starts from, so a transport that dropped
+    /// resumes rather than replaying a task's whole version history.
+    pub fn status_cursors(&self, context: QueryContextRef) -> Vec<TaskStatusCursor> {
+        self.stages
+            .values()
+            .flat_map(StageExecution::tasks)
+            .filter(|(_, task)| task.context() == context)
+            .map(|(_, task)| task.cursor())
+            .collect()
     }
 
     /// The first termination cause of this attempt, if one was latched.
